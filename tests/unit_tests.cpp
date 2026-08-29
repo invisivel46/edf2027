@@ -130,6 +130,26 @@ void TestGraphicsMapping() {
   CHECK(edf::AnisotropicValue(-5) == -1 && edf::AnisotropicValue(6) == 5 && edf::AnisotropicValue(99) == 5);
   CHECK(edf::FxaaValue(-1) == "none" && edf::FxaaValue(1) == "fxaa" && edf::FxaaValue(2) == "fxaa_extreme");
   CHECK(edf::UpscaleValue(-1) == "bilinear" && edf::UpscaleValue(1) == "cas" && edf::UpscaleValue(2) == "fsr");
+  CHECK(edf::UpscaleValue(3) == "fsr2" && edf::UpscaleValue(4) == "fsr3" && edf::UpscaleValue(9) == "bilinear");
+  // Index and value must round-trip, or the dialog reopens on a different entry than it saved.
+  for (int i = 0; i < 5; ++i) CHECK(edf::UpscaleIndex(edf::UpscaleValue(i)) == i);
+  CHECK(edf::UpscaleIndex("nonsense") == 0);
+
+  // Quality mode is only consulted by the runtime on the temporal (fsr2/fsr3) paths.
+  CHECK(!edf::UsesTemporalUpscaler("bilinear") && !edf::UsesTemporalUpscaler("cas"));
+  CHECK(!edf::UsesTemporalUpscaler("fsr"));
+  CHECK(edf::UsesTemporalUpscaler("fsr2") && edf::UsesTemporalUpscaler("fsr3"));
+
+  // These strings must match the runtime's .allowed() list, or the cvar is rejected.
+  CHECK(edf::FsrQualityValue(0) == "auto" && edf::FsrQualityValue(1) == "nativeaa");
+  CHECK(edf::FsrQualityValue(2) == "quality" && edf::FsrQualityValue(3) == "balanced");
+  CHECK(edf::FsrQualityValue(4) == "performance" && edf::FsrQualityValue(5) == "ultra_performance");
+  CHECK(edf::FsrQualityValue(-1) == "auto" && edf::FsrQualityValue(6) == "auto");
+  for (int i = 0; i < 6; ++i) CHECK(edf::FsrQualityIndex(edf::FsrQualityValue(i)) == i);
+  CHECK(edf::FsrQualityIndex("nonsense") == 0);
+
+  CHECK(edf::FsrPassesValue(0) == 1 && edf::FsrPassesValue(1) == 1 && edf::FsrPassesValue(4) == 4);
+  CHECK(edf::FsrPassesValue(99) == 4 && edf::FsrPassesValue(-3) == 1);
 }
 
 void PutLe16(std::vector<uint8_t>& bytes, size_t offset, uint16_t value) {

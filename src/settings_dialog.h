@@ -60,9 +60,11 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     msaa_ = GetBool("native_2x_msaa", true);
     { const std::string v = GetStr("swap_post_effect", "none"); fxaa_index_ = v == "fxaa" ? 1 : v == "fxaa_extreme" ? 2 : 0; }
     aspect_index_ = AspectIndex(REXCVAR_GET(edf_aspect));
-    { const std::string v = GetStr("present_effect", "bilinear"); upscale_index_ = v == "cas" ? 1 : v == "fsr" ? 2 : 0; }
+    upscale_index_ = UpscaleIndex(GetStr("present_effect", "bilinear"));
+    fsr_quality_index_ = FsrQualityIndex(GetStr("present_fsr_quality_mode", "auto"));
     cas_sharp_ = static_cast<float>(GetDouble("present_cas_additional_sharpness", 0.0));
     fsr_sharp_ = static_cast<float>(GetDouble("present_fsr_sharpness_reduction", 0.2));
+    fsr_passes_ = FsrPassesValue(GetInt("present_fsr_max_upsampling_passes", 4));
     dither_ = GetBool("present_dither", false);
     async_shaders_ = GetBool("async_shader_compilation", true);
     int refresh = static_cast<int>(GetDouble("video_mode_refresh_rate", 60));
@@ -115,13 +117,43 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     const bool fidelity_fx = HasFidelityFx();
     if (!fidelity_fx) ImGui::TextDisabled("Unavailable: amd_fidelityfx_dx12.dll is not next to the executable.");
     ImGui::BeginDisabled(!fidelity_fx);
-    if (ImGui::Combo("Effect *", &upscale_index_, "Off (bilinear)\0" "CAS (sharpen)\0" "FSR 1.0\0")) {
+    if (ImGui::Combo("Effect *", &upscale_index_, "Off (bilinear)\0" "CAS (sharpen)\0" "FSR 1.0\0"
+                                                  "FSR 2 (experimental)\0" "FSR 3 (experimental)\0")) {
       rex::cvar::SetFlagByName("present_effect", std::string(UpscaleValue(upscale_index_))); restart_ = true;
     }
-    if (upscale_index_ == 1 && ImGui::SliderFloat("CAS sharpness", &cas_sharp_, 0.0f, 1.0f, "%.2f"))
-      rex::cvar::SetFlagByName("present_cas_additional_sharpness", std::to_string(cas_sharp_));
-    if (upscale_index_ == 2 && ImGui::SliderFloat("FSR sharpness reduction", &fsr_sharp_, 0.0f, 2.0f, "%.2f stops"))
-      rex::cvar::SetFlagByName("present_fsr_sharpness_reduction", std::to_string(fsr_sharp_));
+    ImGui::SameLine(); HelpMarker("FSR only sharpens unless the game renders below the output size - lower the render "
+                                  "resolution scale above to give it something to upscale. FSR 2/3 feed the runtime's "
+                                  "temporal upscaler with synthesized depth and motion, and may fall back to spatial FSR.");
+    if (upscale_index_ == 1 && ImGui::SliderFloat("CAS sharpness *", &cas_sharp_, 0.0f, 1.0f, "%.2f")) {
+      rex::cvar::SetFlagByName("present_cas_additional_sharpness", std::to_string(cas_sharp_)); restart_ = true;
+    }
+    if (upscale_index_ >= 2) {
+      if (ImGui::SliderFloat("FSR sharpness reduction *", &fsr_sharp_, 0.0f, 2.0f, "%.2f stops")) {
+        rex::cvar::SetFlagByName("present_fsr_sharpness_reduction", std::to_string(fsr_sharp_)); restart_ = true;
+      }
+      if (ImGui::SliderInt("FSR upsampling passes *", &fsr_passes_, 1, 4)) {
+        rex::cvar::SetFlagByName("present_fsr_max_upsampling_passes", std::to_string(FsrPassesValue(fsr_passes_)));
+        restart_ = true;
+      }
+      ImGui::SameLine(); HelpMarker("Chained EASU passes. Each one doubles at most; more passes look more stable "
+                                    "at large upscaling ratios and cost a little performance.");
+      // Quality mode picks the temporal upscaler's render resolution, which the runtime only
+      // reads on the fsr2/fsr3 paths - it does nothing for spatial FSR 1.0.
+      const bool temporal = UsesTemporalUpscaler(UpscaleValue(upscale_index_));
+      ImGui::BeginDisabled(!temporal);
+      if (ImGui::Combo("FSR quality mode *", &fsr_quality_index_, "Auto\0" "Native AA\0" "Quality\0"
+                                                                 "Balanced\0" "Performance\0"
+                                                                 "Ultra performance\0")) {
+        rex::cvar::SetFlagByName("present_fsr_quality_mode", std::string(FsrQualityValue(fsr_quality_index_)));
+        restart_ = true;
+      }
+      ImGui::EndDisabled();
+      if (!temporal) {
+        ImGui::SameLine();
+        HelpMarker("Only applies to FSR 2 and FSR 3. FSR 1.0 upscales from whatever resolution the "
+                   "game already rendered at.");
+      }
+    }
     if (ImGui::Checkbox("Output dithering *", &dither_)) {
       rex::cvar::SetFlagByName("present_dither", dither_ ? "true" : "false"); restart_ = true;
     }
@@ -243,6 +275,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   bool show_fps_ = false, frametime_log_ = false, trace_input_ = false;
   float mnk_sens_ = 1.0f;
   int af_index_ = 4, fxaa_index_ = 0, aspect_index_ = 0, upscale_index_ = 0, refresh_index_ = 0;
+  int fsr_quality_index_ = 0, fsr_passes_ = 4;
   bool msaa_ = true, dither_ = false, async_shaders_ = true;
   float cas_sharp_ = 0.0f, fsr_sharp_ = 0.2f;
 };

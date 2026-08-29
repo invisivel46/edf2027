@@ -36,8 +36,12 @@ Your choice is remembered; later runs boot directly.
 * **F1** in game — EDF2027 settings: display mode, window and render
   resolution, native/ultrawide Hor+/letterboxed/stretched aspect handling, VSync, FPS cap,
   refresh rate, anisotropic filtering, MSAA, FXAA, shader compilation,
-  FidelityFX CAS/FSR when supported, audio, controls, and diagnostics.
+  FidelityFX upscaling when supported, audio, controls, and diagnostics.
   **Save** writes them to the config file; items marked `*` need a restart.
+  Upscaling offers CAS, FSR 1.0, and the experimental FSR 2/FSR 3 paths, with
+  sharpness, EASU pass count, and (FSR 2/3 only) a quality mode. FSR only
+  upscales when the game renders below the output size, so pair it with a lower
+  render resolution scale — at 1:1 it just sharpens.
 * **F2** — toggle the compact FPS overlay.
 * **F4** — advanced ReXGlue settings (every runtime option).
 * **F3** — debug overlay, **`** — console.

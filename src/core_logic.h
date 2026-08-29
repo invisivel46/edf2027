@@ -90,7 +90,34 @@ inline int RefreshValue(int index) { constexpr int values[]{60, 30, 120, 144}; r
 inline int ResolutionScaleValue(int index) { return std::clamp(index, 0, 3) + 1; }
 inline int AnisotropicValue(int index) { return std::clamp(index, 0, 6) - 1; }
 inline std::string_view FxaaValue(int index) { return index == 1 ? "fxaa" : index == 2 ? "fxaa_extreme" : "none"; }
-inline std::string_view UpscaleValue(int index) { return index == 1 ? "cas" : index == 2 ? "fsr" : "bilinear"; }
+// present_effect. fsr2/fsr3 drive the runtime's temporal upscaler from synthesized
+// depth/motion inputs and may fall back to spatial FSR, so they are labelled experimental.
+inline std::string_view UpscaleValue(int index) {
+  return index == 1 ? "cas" : index == 2 ? "fsr" : index == 3 ? "fsr2" : index == 4 ? "fsr3" : "bilinear";
+}
+inline int UpscaleIndex(std::string_view value) {
+  return value == "cas" ? 1 : value == "fsr" ? 2 : value == "fsr2" ? 3 : value == "fsr3" ? 4 : 0;
+}
+
+// present_fsr_quality_mode picks the render resolution the temporal upscaler runs at.
+// The runtime only consults it on the fsr2/fsr3 paths - spatial FSR 1.0 upsamples from
+// whatever the guest already rendered - so the control is meaningless for anything else.
+inline bool UsesTemporalUpscaler(std::string_view effect) {
+  return effect == "fsr2" || effect == "fsr3";
+}
+inline std::string_view FsrQualityValue(int index) {
+  constexpr std::string_view values[]{"auto", "nativeaa", "quality", "balanced", "performance",
+                                      "ultra_performance"};
+  return index >= 0 && index < 6 ? values[index] : values[0];
+}
+inline int FsrQualityIndex(std::string_view value) {
+  for (int i = 0; i < 6; ++i)
+    if (FsrQualityValue(i) == value) return i;
+  return 0;
+}
+
+// Chained EASU passes; the runtime clamps to [1, kFsrMaxUpscalingPassesMax].
+inline int FsrPassesValue(int passes) { return std::clamp(passes, 1, 4); }
 
 struct FrameSummary {
   double average_ms = 0, minimum_ms = 0, maximum_ms = 0, low_1_percent_ms = 0;
