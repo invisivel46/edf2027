@@ -16,6 +16,7 @@
 #endif
 #include <functional>
 #include <string>
+#include "keybind_logic.h"
 #include "launcher.h"
 #include "ui_strings.h"
 
@@ -72,6 +73,28 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   }
   static SettingsDialog*& Current() { static SettingsDialog* s = nullptr; return s; }
   void Dismiss() { Close(); }
+
+  // ---- Rebind capture -------------------------------------------------------------
+  // Capture runs off the app's key events rather than ImGui's, for two reasons: the
+  // events carry VirtualKey values, which are already the vocabulary the keybind_*
+  // cvars are written in, and routing them here lets Escape cancel a capture instead of
+  // quitting the game (Edf2017App::OnKeyDown) and lets F1/F2 be bound like any other key.
+  bool capturing() const { return !capture_cvar_.empty(); }
+
+  // Returns true if the key was consumed. `key` is a name from the SDK's key table, or
+  // empty for a key it does not know; kNone/unknown keys are swallowed so a stray
+  // modifier press does not end the capture.
+  bool FeedCapturedKey(const std::string& key, bool shift, bool ctrl, bool alt, bool cancel) {
+    if (!capturing()) return false;
+    if (cancel) { capture_cvar_.clear(); return true; }
+    if (key.empty() || key == "Shift" || key == "Control" || key == "Alt") return true;
+    const std::string token = FormatBindToken(shift, ctrl, alt, key);
+    const std::string current = rex::cvar::GetFlagByName(capture_cvar_);
+    rex::cvar::SetFlagByName(capture_cvar_,
+                             capture_replace_ ? token : AddBindAlternative(current, token));
+    capture_cvar_.clear();
+    return true;
+  }
 
  protected:
   void OnClose() override {
@@ -167,9 +190,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     if (ImGui::Checkbox("Keyboard & mouse controller emulation *", &mnk_)) restart_ = true;
     if (ImGui::Checkbox("Mouse look (right stick)", &mnk_mouse_)) rex::cvar::SetFlagByName("mnk_mouse", mnk_mouse_ ? "true" : "false");
     if (ImGui::SliderFloat("Mouse sensitivity", &mnk_sens_, 0.1f, 5.0f, "%.2f")) rex::cvar::SetFlagByName("mnk_sensitivity", std::to_string(mnk_sens_));
-    ImGui::TextDisabled("WASD move | mouse look (IJKL fallback) | LMB / Ctrl = fire (RT) | RMB / Alt = zoom (LT)\n"
-                        "Space = jump/roll (A) | R = reload (B) | Q = weapon (X) | E = vehicle (Y) | 1 / 3 = radio (LB / RB)\n"
-                        "Enter = Start | Tab = Back | Esc = quit | Arrows = D-pad | F / C = stick press   (remap: F4 > Input)");
+    DrawKeybinds();
     ImGui::SeparatorText("Diagnostics");
     if (ImGui::Checkbox("Show FPS", &show_fps_))
       rex::cvar::SetFlagByName("edf_show_fps", show_fps_ ? "true" : "false");
@@ -203,6 +224,90 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       {"5120 x 1440 (32:9)", 5120, 1440}, {"Custom", 0, 0}}};
   static constexpr int kFpsCaps[4] = {0, 30, 60, 120};
   static constexpr int kRefresh[4] = {60, 30, 120, 144};
+
+  void BeginCapture(const char* cvar, bool replace) {
+    capture_cvar_ = cvar;
+    capture_replace_ = replace;
+  }
+
+  // One action row: current binding, then rebind / add / clear.
+  void DrawBindRow(const PadAction& action) {
+    const std::string value = rex::cvar::GetFlagByName(action.cvar);
+    const bool capturing_this = capture_cvar_ == action.cvar;
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextUnformatted(action.label);
+    ImGui::TableSetColumnIndex(1);
+    if (capturing_this) {
+      ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "press a key (Esc cancels)");
+    } else {
+      const std::string pretty = PrettyBind(value);
+      if (value.empty()) ImGui::TextDisabled("%s", pretty.c_str());
+      else ImGui::TextUnformatted(pretty.c_str());
+    }
+    ImGui::TableSetColumnIndex(2);
+    ImGui::PushID(action.cvar);
+    ImGui::BeginDisabled(capturing() && !capturing_this);
+    if (ImGui::SmallButton(capturing_this ? "Cancel" : "Set")) {
+      if (capturing_this) capture_cvar_.clear(); else BeginCapture(action.cvar, true);
+    }
+    ImGui::SameLine();
+    // A second binding for the same action, matching the SDK's comma-separated alternatives.
+    if (ImGui::SmallButton("Add")) BeginCapture(action.cvar, false);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(value.empty());
+    if (ImGui::SmallButton("Clear")) rex::cvar::SetFlagByName(action.cvar, "");
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    ImGui::PopID();
+  }
+
+  void DrawMouseRow(const PadAction& action) {
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::TextUnformatted(action.label);
+    ImGui::TableSetColumnIndex(1);
+    int index = MouseTargetIndex(rex::cvar::GetFlagByName(action.cvar));
+    ImGui::PushID(action.cvar);
+    ImGui::SetNextItemWidth(-1);
+    std::string labels;
+    for (const auto& target : kMouseTargets) { labels += target.label; labels.push_back('\0'); }
+    if (ImGui::Combo("##target", &index, labels.c_str()))
+      rex::cvar::SetFlagByName(action.cvar, MouseTargetAt(index).value);
+    ImGui::PopID();
+    ImGui::TableSetColumnIndex(2);
+  }
+
+  void DrawKeybinds() {
+    if (!ImGui::CollapsingHeader("Key bindings")) return;
+    if (!mnk_) ImGui::TextDisabled("Enable keyboard & mouse emulation above to use these.");
+    ImGui::TextDisabled("Bindings apply immediately. Escape stays bound to quitting the game.");
+    constexpr ImGuiTableFlags kFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg;
+    const char* group = nullptr;
+    if (ImGui::BeginTable("keybinds", 3, kFlags)) {
+      ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.40f);
+      ImGui::TableSetupColumn("Bound to", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+      ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 0.25f);
+      for (const auto& action : kPadActions) {
+        if (!group || std::string_view(group) != action.group) {
+          group = action.group;
+          ImGui::TableNextRow();
+          ImGui::TableSetColumnIndex(0);
+          ImGui::SeparatorText(group);
+        }
+        DrawBindRow(action);
+      }
+      ImGui::TableNextRow();
+      ImGui::TableSetColumnIndex(0);
+      ImGui::SeparatorText("Mouse");
+      for (const auto& action : kMouseActions) DrawMouseRow(action);
+      ImGui::EndTable();
+    }
+    if (ImGui::Button("Reset bindings to defaults", ImVec2(220, 0))) {
+      capture_cvar_.clear();
+      ResetKeyboardDefaults();
+    }
+  }
 
   static std::string GetStr(const char* name, const char* fallback) {
     std::string value = rex::cvar::GetFlagByName(name);
@@ -276,6 +381,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   float mnk_sens_ = 1.0f;
   int af_index_ = 4, fxaa_index_ = 0, aspect_index_ = 0, upscale_index_ = 0, refresh_index_ = 0;
   int fsr_quality_index_ = 0, fsr_passes_ = 4;
+  std::string capture_cvar_;      // empty when not rebinding
+  bool capture_replace_ = true;   // Set replaces the binding, Add appends an alternative
   bool msaa_ = true, dither_ = false, async_shaders_ = true;
   float cas_sharp_ = 0.0f, fsr_sharp_ = 0.2f;
 };

@@ -19,25 +19,35 @@ REXCVAR_DEFINE_INT32(edf_frame_pacer_spin_us, 250, "EDF2027", "Busy-wait portion
 
 #include <SDL3/SDL.h>
 #include <filesystem>
+#include "keybind_logic.h"
+
+// Mouse buttons are absent from the SDK's mnk driver, so bind them here; input_hooks.cpp
+// folds the result into the guest's XInput state. Values are kMouseTargets tokens.
+REXCVAR_DEFINE_STRING(edf_mouse_left, "right_trigger", "EDF2027", "Pad action for the left mouse button");
+REXCVAR_DEFINE_STRING(edf_mouse_right, "left_trigger", "EDF2027", "Pad action for the right mouse button");
+REXCVAR_DEFINE_STRING(edf_mouse_middle, "lstick_press", "EDF2027", "Pad action for the middle mouse button");
 
 namespace edf {
 
-// Keyboard & mouse defaults for this game (applied only where the user has not set a value).
-// Pad actions in EDF 2017: RT fire, LT zoom, A jump/roll, B reload, X weapon change, Y vehicle,
-// LB/RB radio chat, Start pause, Back retire. Mouse buttons are handled in input_hooks.cpp.
+// Keyboard & mouse defaults for this game; the binding table lives in keybind_logic.h so the
+// settings dialog and these defaults cannot drift apart. Pad actions in EDF 2017: RT fire,
+// LT zoom, A jump/roll, B reload, X weapon change, Y vehicle, LB/RB radio chat, Start pause,
+// Back retire.
 void ApplyKeyboardDefaults() {
-  static const char* kDefaults[][2] = {
-      {"mnk_mode", "true"}, {"mnk_mouse", "true"}, {"mnk_sensitivity", "1.0"},
-      {"keybind_lstick_up", "W"}, {"keybind_lstick_down", "S"}, {"keybind_lstick_left", "A"}, {"keybind_lstick_right", "D"},
-      {"keybind_rstick_up", "I"}, {"keybind_rstick_down", "K"}, {"keybind_rstick_left", "J"}, {"keybind_rstick_right", "L"},
-      {"keybind_a", "Space"}, {"keybind_b", "R"}, {"keybind_x", "Q"}, {"keybind_y", "E"},
-      {"keybind_left_trigger", "Alt,Z"}, {"keybind_right_trigger", "Ctrl,X"},
-      {"keybind_left_shoulder", "1"}, {"keybind_right_shoulder", "3"},
-      {"keybind_lstick_press", "F"}, {"keybind_rstick_press", "C"},
-      {"keybind_dpad_up", "Up"}, {"keybind_dpad_down", "Down"}, {"keybind_dpad_left", "Left"}, {"keybind_dpad_right", "Right"},
-      {"keybind_start", "Return"}, {"keybind_back", "Tab"}, {"keybind_guide", ""}};
-  for (auto& kv : kDefaults)
+  static const char* kModeDefaults[][2] = {
+      {"mnk_mode", "true"}, {"mnk_mouse", "true"}, {"mnk_sensitivity", "1.0"}};
+  for (auto& kv : kModeDefaults)
     if (!rex::cvar::HasNonDefaultValue(kv[0])) rex::cvar::SetFlagByName(kv[0], kv[1]);
+  for (const auto& action : kPadActions)
+    if (!rex::cvar::HasNonDefaultValue(action.cvar)) rex::cvar::SetFlagByName(action.cvar, action.default_value);
+  for (const auto& action : kMouseActions)
+    if (!rex::cvar::HasNonDefaultValue(action.cvar)) rex::cvar::SetFlagByName(action.cvar, action.default_value);
+}
+
+// "Reset to defaults" in the settings dialog: overwrite whatever the user has set.
+void ResetKeyboardDefaults() {
+  for (const auto& action : kPadActions) rex::cvar::SetFlagByName(action.cvar, action.default_value);
+  for (const auto& action : kMouseActions) rex::cvar::SetFlagByName(action.cvar, action.default_value);
 }
 
 // Point the SDK at the gamecontrollerdb.txt shipped next to the executable (silences the missing-file warning).

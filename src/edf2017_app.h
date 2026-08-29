@@ -123,6 +123,16 @@ class Edf2017App : public rex::ReXApp {
   }
 
   void OnKeyDown(rex::ui::KeyEvent& event) override {
+    // While the settings dialog is capturing a rebind, every key belongs to it: Escape
+    // cancels the capture instead of quitting, and F1/F2 can be bound like any other key.
+    if (auto* settings = edf::SettingsDialog::Current(); settings && settings->capturing()) {
+      const bool cancel = event.virtual_key() == rex::ui::VirtualKey::kEscape;
+      settings->FeedCapturedKey(rex::ui::VirtualKeyToString(event.virtual_key()),
+                                event.is_shift_pressed(), event.is_ctrl_pressed(),
+                                event.is_alt_pressed(), cancel);
+      event.set_handled(true);
+      return;
+    }
     if (event.virtual_key() == rex::ui::VirtualKey::kEscape) {
       event.set_handled(true);
       window()->RequestClose();

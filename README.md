@@ -63,18 +63,25 @@ box; `gamecontrollerdb.txt` adds community mappings. Prefer XInput with
 
 Keyboard & mouse (enable *Keyboard & mouse controller emulation* in F1 settings):
 
-| Key | Pad | Key | Pad |
+| Key | Action | Key | Action |
 |---|---|---|---|
-| W A S D | Left stick | Arrows | Right stick |
-| Shift + arrows | D-pad | Space / ; | A |
-| Backspace / ' | B | L | X |
-| P | Y | 1 / 3 | LB / RB |
-| Q / I | LT / RT | Enter | Start |
-| Tab | Back | | |
+| W A S D | Move | I J K L | Look (mouse-look fallback) |
+| Mouse | Look (right stick) | Arrows | D-pad |
+| Left mouse / Ctrl / X | Fire (RT) | Right mouse / Alt / Z | Zoom (LT) |
+| Space | Jump / roll (A) | R | Reload (B) |
+| Q | Change weapon (X) | E | Enter vehicle (Y) |
+| 1 / 3 | Radio chat (LB / RB) | F / C | Stick press (L3 / R3) |
+| Enter | Pause (Start) | Tab | Retire (Back) |
 
-Keys are remappable in the F4 settings (Keybinds category, `keybind_*`).
+Everything above is rebindable in the F1 settings under **Controls → Key
+bindings**: *Set* replaces a binding, *Add* gives an action a second key, and
+each mouse button can be pointed at any pad action. Bindings apply immediately
+and are written to the config file on **Save**. Modifiers are matched exactly,
+so a binding of `W` does not fire while Shift is held — bind `Shift+W` for that.
+The same settings are also editable as raw `keybind_*` cvars in the F4 overlay.
+
 Controller vibration can be enabled or disabled in the F1 settings.
-Press **Escape** at any time to quit the game.
+Press **Escape** at any time to quit the game; it cannot be rebound.
 
 ## Command line (optional)
 

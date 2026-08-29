@@ -1,5 +1,6 @@
 #include "core_logic.h"
 #include "scripted_input_logic.h"
+#include "keybind_logic.h"
 #include "xdvdfs.h"
 
 #include <algorithm>
@@ -256,6 +257,65 @@ void TestXdvdfs() {
   CHECK(!edf::xdvdfs::IsSafeName("") && !edf::xdvdfs::IsSafeName(".."));
   CHECK(!edf::xdvdfs::IsSafeName("a/b") && !edf::xdvdfs::IsSafeName("a\\b"));
 }
+void TestKeybinds() {
+  // The driver's grammar: comma-separated alternatives, "Mod+Mod+Key" per alternative.
+  CHECK(edf::SplitBind("").empty());
+  CHECK(edf::SplitBind("W").size() == 1);
+  { const auto t = edf::SplitBind(" Ctrl+X , Z ,, "); CHECK(t.size() == 2 && t[0] == "Ctrl+X" && t[1] == "Z"); }
+  CHECK(edf::JoinBind({"A", "B"}) == "A,B");
+  CHECK(edf::JoinBind({}).empty());
+
+  CHECK(edf::FormatBindToken(false, false, false, "W") == "W");
+  CHECK(edf::FormatBindToken(true, false, false, "Up") == "Shift+Up");
+  CHECK(edf::FormatBindToken(false, true, false, "X") == "Ctrl+X");
+  CHECK(edf::FormatBindToken(false, false, true, "Z") == "Alt+Z");
+  // Fixed modifier order, so the same combination always yields the same string.
+  CHECK(edf::FormatBindToken(true, true, true, "Q") == "Shift+Ctrl+Alt+Q");
+  CHECK(edf::FormatBindToken(true, true, true, "").empty());
+
+  CHECK(edf::BindContains("Space,Semicolon", "Semicolon"));
+  CHECK(!edf::BindContains("Space,Semicolon", "Space2"));
+  CHECK(!edf::BindContains("", "Space"));
+
+  CHECK(edf::AddBindAlternative("Space", "R") == "Space,R");
+  CHECK(edf::AddBindAlternative("", "R") == "R");
+  CHECK(edf::AddBindAlternative("Space", "Space") == "Space");  // no duplicates
+  CHECK(edf::AddBindAlternative("Space", "") == "Space");
+  CHECK(edf::RemoveBindAlternative("Space,R,Q", 1) == "Space,Q");
+  CHECK(edf::RemoveBindAlternative("Space", 0).empty());
+  CHECK(edf::RemoveBindAlternative("Space", 7) == "Space");
+
+  CHECK(edf::PrettyBind("") == "(unbound)");
+  CHECK(edf::PrettyBind("Space") == "Space");
+  CHECK(edf::PrettyBind("Space,R") == "Space  or  R");
+
+  // Mouse targets: tokens are what input_hooks.cpp folds into the guest pad state.
+  CHECK(edf::MouseTargetIndex("none") == 0);
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("right_trigger")).right_trigger);
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("left_trigger")).left_trigger);
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("lstick_press")).button_mask == 0x0040);
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("a")).button_mask == 0x1000);
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("start")).button_mask == 0x0010);
+  // Unknown or out-of-range values fall back to "unbound" rather than a random action.
+  CHECK(edf::MouseTargetIndex("nonsense") == 0);
+  CHECK(edf::MouseTargetAt(-1).button_mask == 0 && edf::MouseTargetAt(999).button_mask == 0);
+  for (int i = 0; i < edf::kMouseTargetCount; ++i)
+    CHECK(edf::MouseTargetIndex(edf::MouseTargetAt(i).value) == i);
+
+  // Every action needs a distinct cvar, or two rows would edit the same binding.
+  for (size_t i = 0; i < std::size(edf::kPadActions); ++i) {
+    CHECK(edf::kPadActions[i].label && edf::kPadActions[i].group);
+    for (size_t j = i + 1; j < std::size(edf::kPadActions); ++j)
+      CHECK(std::string_view(edf::kPadActions[i].cvar) != edf::kPadActions[j].cvar);
+  }
+
+  // Defaults must not collide, or an action would silently shadow another in game.
+  std::vector<std::pair<std::string, std::string>> defaults;
+  for (const auto& action : edf::kPadActions) defaults.emplace_back(action.cvar, action.default_value);
+  for (const auto& action : edf::kPadActions)
+    for (const auto& token : edf::SplitBind(action.default_value))
+      CHECK(edf::ConflictingAction(token, action.cvar, defaults).empty());
+}
 }  // namespace
 
 int main() {
@@ -265,6 +325,7 @@ int main() {
   TestFrameLogic();
   TestGraphicsMapping();
   TestXdvdfs();
+  TestKeybinds();
   if (failures) std::cerr << failures << " test assertion(s) failed\n";
   else std::cout << "All unit tests passed\n";
   return failures ? 1 : 0;

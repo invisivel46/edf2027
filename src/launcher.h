@@ -27,6 +27,7 @@ REXCVAR_DECLARE(int32_t, edf_frame_pacer_spin_us);
 namespace edf {
 
 void ApplyKeyboardDefaults();
+void ResetKeyboardDefaults();
 void ApplyControllerDbDefault();
 
 constexpr uint32_t kTitleId = 0x445007D3;  // Earth Defense Force 2017 (USA/Europe)
