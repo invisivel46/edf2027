@@ -42,3 +42,7 @@ Desktop.ini
 
 # Local Codex/Claude handoff notes
 /SESSION_RESUME.md
+
+*.mp4
+*.mkv
+
