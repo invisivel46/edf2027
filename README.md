@@ -29,7 +29,11 @@ or `sha1sum <file>.iso` elsewhere.
 3. The game boots straight into the title screen. Press **Start twice** on the
    title (the first press skips the intro).
 
-Your choice is remembered; later runs boot directly.
+## OS X
+
+ ... Soon
+## Linux 
+ ... Soon
 
 ## Settings
 
