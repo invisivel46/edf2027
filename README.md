@@ -7,7 +7,6 @@ made with static recompilation on the [ReXGlue](https://github.com/rexglue) SDK.
 
 ![Gameplay clip](docs/media/gameplay.gif)
 
-*Mission 1 at 1280x720/60 fps. Longer clip: [`docs/media/gameplay.mp4`](docs/media/gameplay.mp4).*
 
 **This package contains no game data.** You need your own copy of the game
 (Xbox 360 disc, dumped as an `.iso`, title id `445007D3`).
