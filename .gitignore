@@ -1,0 +1,44 @@
+# CMake and compiler output
+/out/
+/build/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.obj
+*.o
+*.pch
+*.pdb
+*.ilk
+
+# Runtime and diagnostic output
+*.log
+*.dmp
+*.trace
+
+# Local ReXGlue SDK checkouts/installations
+/rexglue-sdk/
+/sdk/
+
+# Copyrighted game data (never commit)
+*.iso
+*.xex
+/game/
+/game_data/
+/work/
+
+# Generated codegen bookkeeping (generated C++ is intentionally tracked)
+/generated/**/codegen.d
+/generated/**/codegen.stamp
+
+# IDE and OS files
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.user
+*.suo
+
+# Local Codex/Claude handoff notes
+/SESSION_RESUME.md

@@ -1,0 +1,11 @@
+* text=auto
+*.cpp text eol=lf
+*.h text eol=lf
+*.cmake text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+
+# Preserve generator/upstream formatting without noisy whitespace diagnostics.
+generated/** whitespace=-blank-at-eol,-blank-at-eof
+LICENSES/** whitespace=-blank-at-eol,-blank-at-eof
