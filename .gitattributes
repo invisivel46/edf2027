@@ -9,3 +9,6 @@
 # Preserve generator/upstream formatting without noisy whitespace diagnostics.
 generated/** whitespace=-blank-at-eol,-blank-at-eof
 LICENSES/** whitespace=-blank-at-eol,-blank-at-eof
+
+# Screenshots and capture clips must never go through EOL conversion.
+docs/media/** binary

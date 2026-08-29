@@ -3,6 +3,12 @@
 A native PC build of the Xbox 360 game *Earth Defense Force 2017* (USA/Europe),
 made with static recompilation on the [ReXGlue](https://github.com/rexglue) SDK.
 
+![Mission 1 running at 1280x720, 60 fps](docs/media/gameplay.jpg)
+
+![Gameplay clip](docs/media/gameplay.gif)
+
+*Mission 1 at 1280x720/60 fps. Longer clip: [`docs/media/gameplay.mp4`](docs/media/gameplay.mp4).*
+
 **This package contains no game data.** You need your own copy of the game
 (Xbox 360 disc, dumped as an `.iso`, title id `445007D3`).
 
@@ -51,6 +57,11 @@ or `sha1sum <file>.iso` elsewhere.
 * **F3** — debug overlay, **`** — console.
 * `edf2027.exe --settings` opens the settings screen before the game boots.
 
+<img src="docs/media/settings.png" alt="EDF2027 settings screen" width="520">
+
+*The F1 settings screen. FSR quality mode is greyed out here because it only
+applies to the FSR 2/3 temporal paths, not FSR 1.0.*
+
 Config file: `%APPDATA%\edf2027\edf2027.toml` (Windows),
 `~/.local/share/edf2027/edf2027.toml` (Linux), `~/Library/Application Support/edf2027/` (macOS).
 Extracted game: `<same folder>\game\`. Delete the config file to run setup again.
@@ -79,6 +90,18 @@ each mouse button can be pointed at any pad action. Bindings apply immediately
 and are written to the config file on **Save**. Modifiers are matched exactly,
 so a binding of `W` does not fire while Shift is held — bind `Shift+W` for that.
 The same settings are also editable as raw `keybind_*` cvars in the F4 overlay.
+
+<img src="docs/media/keybinds.png" alt="Key bindings list" width="520">
+
+*Every action, its current keys, and the mouse-button assignments. `Ctrl or X`
+means either key works — that is what **Add** creates.*
+
+<img src="docs/media/rebind.png" alt="Rebinding prompt" width="420">
+<img src="docs/media/conflict.png" alt="Conflicting binding warning" width="420">
+
+*Left: pressing **Set** waits for a key, and Escape cancels instead of quitting.
+Right: binding a key that another action already uses flags both rows, since
+only one of them would respond in game.*
 
 Controller vibration can be enabled or disabled in the F1 settings.
 Press **Escape** at any time to quit the game; it cannot be rebound.

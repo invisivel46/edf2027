@@ -16,6 +16,8 @@
 #endif
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 #include "keybind_logic.h"
 #include "launcher.h"
 #include "ui_strings.h"
@@ -231,7 +233,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   }
 
   // One action row: current binding, then rebind / add / clear.
-  void DrawBindRow(const PadAction& action) {
+  void DrawBindRow(const PadAction& action,
+                   const std::vector<std::pair<std::string, std::string>>& bindings) {
     const std::string value = rex::cvar::GetFlagByName(action.cvar);
     const bool capturing_this = capture_cvar_ == action.cvar;
     ImGui::TableNextRow();
@@ -244,6 +247,16 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       const std::string pretty = PrettyBind(value);
       if (value.empty()) ImGui::TextDisabled("%s", pretty.c_str());
       else ImGui::TextUnformatted(pretty.c_str());
+      // A key bound to two actions silently drives only one of them in game, so say so.
+      for (const auto& token : SplitBind(value)) {
+        const std::string_view other = ConflictingAction(token, action.cvar, bindings);
+        if (other.empty()) continue;
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1, 0.45f, 0.35f, 1), "(!)");
+        if (ImGui::IsItemHovered())
+          ImGui::SetTooltip("%s is also bound to %s", token.c_str(), std::string(ActionLabel(other)).c_str());
+        break;
+      }
     }
     ImGui::TableSetColumnIndex(2);
     ImGui::PushID(action.cvar);
@@ -283,6 +296,11 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     if (!mnk_) ImGui::TextDisabled("Enable keyboard & mouse emulation above to use these.");
     ImGui::TextDisabled("Bindings apply immediately. Escape stays bound to quitting the game.");
     constexpr ImGuiTableFlags kFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg;
+    // Snapshot every binding once per frame so each row can spot a key it shares.
+    std::vector<std::pair<std::string, std::string>> bindings;
+    bindings.reserve(std::size(kPadActions));
+    for (const auto& action : kPadActions)
+      bindings.emplace_back(action.cvar, rex::cvar::GetFlagByName(action.cvar));
     const char* group = nullptr;
     if (ImGui::BeginTable("keybinds", 3, kFlags)) {
       ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.40f);
@@ -295,7 +313,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
           ImGui::TableSetColumnIndex(0);
           ImGui::SeparatorText(group);
         }
-        DrawBindRow(action);
+        DrawBindRow(action, bindings);
       }
       ImGui::TableNextRow();
       ImGui::TableSetColumnIndex(0);

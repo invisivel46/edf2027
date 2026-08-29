@@ -174,6 +174,15 @@ inline std::string PrettyBind(std::string_view value) {
   return out;
 }
 
+// Display name for a cvar, for messages that name the other side of a conflict.
+inline std::string_view ActionLabel(std::string_view cvar) {
+  for (const auto& action : kPadActions)
+    if (cvar == action.cvar) return action.label;
+  for (const auto& action : kMouseActions)
+    if (cvar == action.cvar) return action.label;
+  return cvar;
+}
+
 // Every cvar an action list touches, used to detect a binding shared by two actions.
 inline std::string_view ConflictingAction(std::string_view token,
                                           std::string_view skip_cvar,
