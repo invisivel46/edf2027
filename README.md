@@ -1,4 +1,4 @@
-# Earth Defense Force 2017 — PC port (v0.2.0)
+# EDF2027 — Earth Defense Force 2017 PC port (v0.2.0)
 
 A native PC build of the Xbox 360 game *Earth Defense Force 2017* (USA/Europe),
 made with static recompilation on the [ReXGlue](https://github.com/rexglue) SDK.
@@ -6,9 +6,21 @@ made with static recompilation on the [ReXGlue](https://github.com/rexglue) SDK.
 **This package contains no game data.** You need your own copy of the game
 (Xbox 360 disc, dumped as an `.iso`, title id `445007D3`).
 
+The dump this port is developed against:
+
+| | |
+|---|---|
+| Size | 7,835,492,352 bytes |
+| SHA-1 | `3F5DADC9BD11399E3EF260018A058F420EAFB1F6` |
+
+Other dumps of the same release should work — the setup screen checks the title
+id in `default.xex`, not the image hash — but this is the one that has been
+tested. Verify yours with `Get-FileHash -Algorithm SHA1 <file>.iso` on Windows
+or `sha1sum <file>.iso` elsewhere.
+
 ## Quick start (Windows)
 
-1. Unzip anywhere, run `edf2017.exe`.
+1. Unzip anywhere, run `edf2027.exe`.
 2. On first run the setup screen appears. Click **Select disc image (.iso)…**
    and pick your dump. The game is extracted (about 6 GB) into your user
    folder; a progress bar shows the copy. If you already have the disc
@@ -21,7 +33,7 @@ Your choice is remembered; later runs boot directly.
 
 ## Settings
 
-* **F1** in game — EDF 2017 settings: display mode, window and render
+* **F1** in game — EDF2027 settings: display mode, window and render
   resolution, native/ultrawide Hor+/letterboxed/stretched aspect handling, VSync, FPS cap,
   refresh rate, anisotropic filtering, MSAA, FXAA, shader compilation,
   FidelityFX CAS/FSR when supported, audio, controls, and diagnostics.
@@ -29,10 +41,10 @@ Your choice is remembered; later runs boot directly.
 * **F2** — toggle the compact FPS overlay.
 * **F4** — advanced ReXGlue settings (every runtime option).
 * **F3** — debug overlay, **`** — console.
-* `edf2017.exe --settings` opens the settings screen before the game boots.
+* `edf2027.exe --settings` opens the settings screen before the game boots.
 
-Config file: `%APPDATA%\edf2017\edf2017.toml` (Windows),
-`~/.local/share/edf2017/edf2017.toml` (Linux), `~/Library/Application Support/edf2017/` (macOS).
+Config file: `%APPDATA%\edf2027\edf2027.toml` (Windows),
+`~/.local/share/edf2027/edf2027.toml` (Linux), `~/Library/Application Support/edf2027/` (macOS).
 Extracted game: `<same folder>\game\`. Delete the config file to run setup again.
 
 ## Controls
@@ -59,7 +71,7 @@ Press **Escape** at any time to quit the game.
 ## Command line (optional)
 
 ```
-edf2017.exe [--game_data_root <folder>] [--settings] [--fullscreen true|false]
+edf2027.exe [--game_data_root <folder>] [--settings] [--fullscreen true|false]
             [--window_width N --window_height N] [--draw_resolution_scale_x N --draw_resolution_scale_y N]
             [--vsync true|false] [--edf_fps_cap N] [--audio_mute true|false] [--log_file run.log]
             [--edf_show_fps true|false] [--edf_frametime_log true|false] [--edf_rumble true|false]
@@ -78,7 +90,7 @@ Every option in the config file can also be given as `--name value`.
 ## Licenses
 
 `LICENSES/` contains the licenses of the bundled components: ReXGlue SDK,
-SDL3, Dear ImGui, extract-xiso (BSD), SDL_GameControllerDB (zlib). The port's
+SDL3, Dear ImGui, AMD FidelityFX SDK (MIT), SDL_GameControllerDB (zlib). The port's
 own code is provided as-is; the game and its data remain the property of
 D3 Publisher / Sandlot.
 
@@ -93,6 +105,12 @@ cmake --preset win-amd64-release -DCMAKE_PREFIX_PATH=C:\path\to\rexglue-sdk
 cmake --build --preset win-amd64-release
 ```
 
+The FidelityFX CAS/FSR settings need an SDK built with
+`-DREXGLUE_ENABLE_FIDELITYFX=ON`; against any other SDK the port builds and runs
+normally but those controls stay disabled. Configure prints which case applies.
+Note that `find_package` caches `rexglue_DIR`, so switching a build directory
+between SDKs needs its `CMakeCache.txt` deleted first.
+
 On Windows, `build.cmd` performs both steps using the Visual Studio developer
 environment. Set `REXGLUE_SDK` first if the SDK is not in the default local
 development location. It defaults to two parallel compiler jobs to avoid
@@ -101,7 +119,7 @@ this. Optional arguments select the preset and target:
 
 ```cmd
 build.cmd
-build.cmd win-amd64-debug edf2017
+build.cmd win-amd64-debug edf2027
 ```
 
 The generated recompilation C++ is tracked. To regenerate it, edit
@@ -109,11 +127,9 @@ The generated recompilation C++ is tracked. To regenerate it, edit
 extracted disc, then build the `edf2017_codegen` target. Game data must never
 be committed.
 
-To create a redistributable package, also provide `extract-xiso`:
+Disc-image extraction is built in (`src/xdvdfs.h` reads the XDVDFS game
+partition directly), so a release package needs no external tools:
 
 ```powershell
-cmake --preset win-amd64-release `
-  -DCMAKE_PREFIX_PATH=C:\path\to\rexglue-sdk `
-  -DEDF2017_TOOLS=C:\path\to\extract-xiso
 cmake --build out/build/win-amd64-release --target package_release
 ```

@@ -1,4 +1,4 @@
-// edf2017 - ReXGlue Recompiled Project (EDF 2017 PC)
+// EDF2027 - ReXGlue Recompiled Project
 //
 // Adds a first-run setup screen (ISO -> extracted game folder), a per-user
 // config file, an F1 settings screen and display-mode handling on top of ReXApp.
@@ -25,7 +25,7 @@ class Edf2017App : public rex::ReXApp {
   using rex::ReXApp::ReXApp;
 
   static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
-    return std::unique_ptr<Edf2017App>(new Edf2017App(ctx, "edf2017", PPCImageConfig));
+    return std::unique_ptr<Edf2017App>(new Edf2017App(ctx, "edf2027", PPCImageConfig));
   }
 
   // Runs before the config file is loaded: pick a per-user config path and make
@@ -38,7 +38,7 @@ class Edf2017App : public rex::ReXApp {
         if (!rex::cvar::HasNonDefaultValue("cache_root")) paths.cache_root = pref / "cache";
       }
     }
-    paths.config_path = paths.user_data_root / "edf2017.toml";
+    paths.config_path = paths.user_data_root / "edf2027.toml";
     if (!rex::cvar::HasNonDefaultValue("fullscreen")) rex::cvar::SetFlagByName("fullscreen", "false");
     rex::cvar::SetFlagByName("present_letterbox", REXCVAR_GET(edf_aspect) == "stretch" ? "false" : "true");
     if (edf::ForcesConsoleAspect(REXCVAR_GET(edf_aspect)) && REXCVAR_GET(window_width) > 0)
@@ -87,7 +87,7 @@ class Edf2017App : public rex::ReXApp {
     }
 
     if (!paths.game_data_root.empty() && !ShowSettingsRequested()) {
-      REXLOG_INFO("EDF2017: game folder {}", paths.game_data_root.string());
+      REXLOG_INFO("EDF2027: game folder {}", paths.game_data_root.string());
       return paths;
     }
     if (!paths.game_data_root.empty()) {
@@ -105,7 +105,7 @@ class Edf2017App : public rex::ReXApp {
           rex::cvar::SetFlagByName("edf_game_path", dir.generic_string());  // forward slashes: TOML strings treat backslash as escape
           rex::cvar::SetFlagByName("edf_setup_done", "true");
           SaveConfig();
-          REXLOG_INFO("EDF2017: setup complete, game folder {}", dir.string());
+          REXLOG_INFO("EDF2027: setup complete, game folder {}", dir.string());
           resume(paths);
         },
         [this]() { window()->RequestClose(); });
@@ -116,7 +116,7 @@ class Edf2017App : public rex::ReXApp {
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     auto* overlay = new edf::FpsOverlay(drawer);
     edf::FpsOverlay::Current() = overlay;
-    rex::ui::RegisterBind("bind_edf_settings", "F1", "EDF 2017 settings", [this]() { ToggleSettings(); });
+    rex::ui::RegisterBind("bind_edf_settings", "F1", "EDF2027 settings", [this]() { ToggleSettings(); });
     rex::ui::RegisterBind("bind_edf_fps", "F2", "Toggle FPS overlay", []() {
       rex::cvar::SetFlagByName("edf_show_fps", REXCVAR_GET(edf_show_fps) ? "false" : "true");
     });
@@ -163,9 +163,9 @@ class Edf2017App : public rex::ReXApp {
     const char* base = SDL_GetBasePath();
     if (!base) return false;
 #if defined(_WIN32)
-    const std::filesystem::path executable = std::filesystem::path(base) / "edf2017.exe";
+    const std::filesystem::path executable = std::filesystem::path(base) / "edf2027.exe";
 #else
-    const std::filesystem::path executable = std::filesystem::path(base) / "edf2017";
+    const std::filesystem::path executable = std::filesystem::path(base) / "edf2027";
 #endif
     const std::string executable_string = executable.string();
     const char* arguments[] = {executable_string.c_str(), nullptr};

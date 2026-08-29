@@ -1,4 +1,4 @@
-// EDF 2017 PC - launcher helpers: config cvars, user paths, XEX identification.
+// EDF2027 - launcher helpers: config cvars, user paths, XEX identification.
 #pragma once
 #include <SDL3/SDL.h>
 #include <rex/cvar.h>
@@ -67,11 +67,11 @@ inline void SaveUserConfig(const std::filesystem::path& path) {
   std::ofstream(path, std::ios::trunc) << out;
 }
 
-// Per-user data folder (Windows: %APPDATA%\edf2017, Linux: ~/.local/share/edf2017,
-// macOS: ~/Library/Application Support/edf2017). Kept out of Documents so the
+// Per-user data folder (Windows: %APPDATA%\edf2027, Linux: ~/.local/share/edf2027,
+// macOS: ~/Library/Application Support/edf2027). Kept out of Documents so the
 // extracted game data does not land in cloud-synced folders.
 inline std::filesystem::path PrefPath() {
-  char* p = SDL_GetPrefPath("", "edf2017");
+  char* p = SDL_GetPrefPath("", "edf2027");
   std::filesystem::path r = p ? std::filesystem::path(p) : std::filesystem::path();
   if (p) SDL_free(p);
   return r;

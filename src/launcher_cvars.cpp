@@ -1,21 +1,21 @@
-// EDF 2017 PC - launcher cvars (persisted to the per-user edf2017.toml).
+// EDF2027 - launcher cvars (persisted to the per-user edf2027.toml).
 #include <rex/cvar.h>
 #include <cstdint>
 #include <string>
 
-REXCVAR_DEFINE_STRING(edf_game_path, "", "EDF2017", "Folder containing the extracted game disc (default.xex)");
-REXCVAR_DEFINE_STRING(edf_display_mode, "windowed", "EDF2017", "Display mode: windowed or borderless").allowed({"windowed", "borderless"});
-REXCVAR_DEFINE_INT32(edf_fps_cap, 0, "EDF2017", "Frame rate cap (0 = off)").range(0, 480);
-REXCVAR_DEFINE_BOOL(edf_show_settings, false, "EDF2017", "Open the settings screen at startup");
-REXCVAR_DEFINE_BOOL(settings, false, "EDF2017", "Alias of edf_show_settings (--settings)");
-REXCVAR_DEFINE_BOOL(edf_setup_done, false, "EDF2017", "First-run setup completed");
-REXCVAR_DEFINE_STRING(edf_aspect, "native", "EDF2017", "Aspect handling: native, Hor+ ultrawide, 16:9 letterbox, or 16:9 stretch")
+REXCVAR_DEFINE_STRING(edf_game_path, "", "EDF2027", "Folder containing the extracted game disc (default.xex)");
+REXCVAR_DEFINE_STRING(edf_display_mode, "windowed", "EDF2027", "Display mode: windowed or borderless").allowed({"windowed", "borderless"});
+REXCVAR_DEFINE_INT32(edf_fps_cap, 0, "EDF2027", "Frame rate cap (0 = off)").range(0, 480);
+REXCVAR_DEFINE_BOOL(edf_show_settings, false, "EDF2027", "Open the settings screen at startup");
+REXCVAR_DEFINE_BOOL(settings, false, "EDF2027", "Alias of edf_show_settings (--settings)");
+REXCVAR_DEFINE_BOOL(edf_setup_done, false, "EDF2027", "First-run setup completed");
+REXCVAR_DEFINE_STRING(edf_aspect, "native", "EDF2027", "Aspect handling: native, Hor+ ultrawide, 16:9 letterbox, or 16:9 stretch")
     .allowed({"native", "ultrawide", "letterbox", "stretch"});
-REXCVAR_DEFINE_BOOL(edf_show_fps, false, "EDF2017", "Show the frame-rate overlay");
-REXCVAR_DEFINE_BOOL(edf_frametime_log, false, "EDF2017", "Log frame-time statistics (min/avg/max/1% low) every 5 s");
-REXCVAR_DEFINE_BOOL(edf_trace_input, false, "EDF2017", "Log verbose guest input and XAM diagnostics");
-REXCVAR_DEFINE_BOOL(edf_rumble, true, "EDF2017", "Enable controller vibration");
-REXCVAR_DEFINE_INT32(edf_frame_pacer_spin_us, 250, "EDF2017", "Busy-wait portion of the frame limiter in microseconds").range(0, 2000);
+REXCVAR_DEFINE_BOOL(edf_show_fps, false, "EDF2027", "Show the frame-rate overlay");
+REXCVAR_DEFINE_BOOL(edf_frametime_log, false, "EDF2027", "Log frame-time statistics (min/avg/max/1% low) every 5 s");
+REXCVAR_DEFINE_BOOL(edf_trace_input, false, "EDF2027", "Log verbose guest input and XAM diagnostics");
+REXCVAR_DEFINE_BOOL(edf_rumble, true, "EDF2027", "Enable controller vibration");
+REXCVAR_DEFINE_INT32(edf_frame_pacer_spin_us, 250, "EDF2027", "Busy-wait portion of the frame limiter in microseconds").range(0, 2000);
 
 #include <SDL3/SDL.h>
 #include <filesystem>

@@ -5,10 +5,12 @@ set "PROJECT_DIR=%~dp0"
 set "VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Community"
 set "VSDEVCMD=%VS_ROOT%\Common7\Tools\VsDevCmd.bat"
 
-if not defined REXGLUE_SDK set "REXGLUE_SDK=D:\roms2\edf3-translation-project\rexglue\sdk\win-amd64"
+rem The sdk_ffx install is the one configured with REXGLUE_ENABLE_FIDELITYFX=ON; the plain
+rem sdk install has no FidelityFX, which leaves the CAS/FSR settings permanently disabled.
+if not defined REXGLUE_SDK set "REXGLUE_SDK=D:\roms2\edf3-translation-project\rexglue\sdk_ffx\win-amd64"
 if not defined BUILD_JOBS set "BUILD_JOBS=2"
 if "%~1"=="" (set "BUILD_PRESET=win-amd64-release") else (set "BUILD_PRESET=%~1")
-if "%~2"=="" (set "BUILD_TARGET=edf2017") else (set "BUILD_TARGET=%~2")
+if "%~2"=="" (set "BUILD_TARGET=edf2027") else (set "BUILD_TARGET=%~2")
 
 if not exist "%VSDEVCMD%" (
   echo ERROR: Visual Studio developer environment not found:

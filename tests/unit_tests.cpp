@@ -1,7 +1,10 @@
 #include "core_logic.h"
 #include "scripted_input_logic.h"
+#include "xdvdfs.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -128,6 +131,111 @@ void TestGraphicsMapping() {
   CHECK(edf::FxaaValue(-1) == "none" && edf::FxaaValue(1) == "fxaa" && edf::FxaaValue(2) == "fxaa_extreme");
   CHECK(edf::UpscaleValue(-1) == "bilinear" && edf::UpscaleValue(1) == "cas" && edf::UpscaleValue(2) == "fsr");
 }
+
+void PutLe16(std::vector<uint8_t>& bytes, size_t offset, uint16_t value) {
+  bytes[offset] = static_cast<uint8_t>(value);
+  bytes[offset + 1] = static_cast<uint8_t>(value >> 8);
+}
+
+void PutLe32(std::vector<uint8_t>& bytes, size_t offset, uint32_t value) {
+  for (int i = 0; i < 4; ++i) bytes[offset + i] = static_cast<uint8_t>(value >> (8 * i));
+}
+
+// Writes one XDVDFS directory entry; child links are dword offsets into the table.
+void PutDirent(std::vector<uint8_t>& bytes, size_t at, uint16_t left, uint16_t right,
+               uint32_t sector, uint32_t size, uint8_t attributes, const std::string& name) {
+  PutLe16(bytes, at, left);
+  PutLe16(bytes, at + 2, right);
+  PutLe32(bytes, at + 4, sector);
+  PutLe32(bytes, at + 8, size);
+  bytes[at + 12] = attributes;
+  bytes[at + 13] = static_cast<uint8_t>(name.size());
+  std::copy(name.begin(), name.end(), bytes.begin() + at + 14);
+}
+
+// A minimal but structurally real volume: root holds default.xex plus a media/
+// subdirectory holding sound.bin.
+std::vector<uint8_t> MakeDiscImage() {
+  constexpr size_t kSector = edf::xdvdfs::kSectorSize;
+  std::vector<uint8_t> image(40 * kSector, 0);
+
+  const size_t descriptor = 32 * kSector;
+  std::memcpy(image.data() + descriptor, edf::xdvdfs::kMagic, edf::xdvdfs::kMagicLength);
+  std::memcpy(image.data() + descriptor + kSector - edf::xdvdfs::kMagicLength,
+              edf::xdvdfs::kMagic, edf::xdvdfs::kMagicLength);
+  PutLe32(image, descriptor + 0x14, 33);
+  PutLe32(image, descriptor + 0x18, static_cast<uint32_t>(kSector));
+
+  const size_t root = 33 * kSector;
+  std::fill(image.begin() + root, image.begin() + root + kSector, 0xFF);  // padding
+  PutDirent(image, root, 0xFFFF, 7, 35, 19, 0x20, "default.xex");
+  PutDirent(image, root + 28, 0xFFFF, 0xFFFF, 34, static_cast<uint32_t>(kSector), 0x10, "media");
+
+  const size_t media = 34 * kSector;
+  std::fill(image.begin() + media, image.begin() + media + kSector, 0xFF);
+  PutDirent(image, media, 0xFFFF, 0xFFFF, 36, 4, 0x20, "sound.bin");
+
+  const std::string xex = "default.xex content";
+  std::copy(xex.begin(), xex.end(), image.begin() + 35 * kSector);
+  const std::string sound = "abcd";
+  std::copy(sound.begin(), sound.end(), image.begin() + 36 * kSector);
+  return image;
+}
+
+void TestXdvdfs() {
+  const std::vector<uint8_t> image = MakeDiscImage();
+  // Presents the volume `shift` bytes into an image that is zero-filled before it.
+  auto reader = [&image](uint64_t shift) {
+    const uint64_t total = shift + image.size();
+    return edf::xdvdfs::ReadFn([&image, shift, total](uint64_t offset, void* dst, size_t size) {
+      if (offset > total || total - offset < size) return false;
+      std::memset(dst, 0, size);
+      for (size_t i = 0; i < size; ++i) {
+        const uint64_t at = offset + i;
+        if (at >= shift && at - shift < image.size())
+          static_cast<uint8_t*>(dst)[i] = image[static_cast<size_t>(at - shift)];
+      }
+      return true;
+    });
+  };
+
+  uint64_t base = 1;
+  CHECK(edf::xdvdfs::FindPartition(reader(0), &base));
+  CHECK(base == 0);
+
+  std::vector<edf::xdvdfs::Entry> entries;
+  std::string error;
+  CHECK(edf::xdvdfs::List(reader(0), 0, &entries, &error));
+  CHECK(entries.size() == 3);
+  if (entries.size() == 3) {
+    CHECK(entries[0].path == "media" && entries[0].directory);
+    CHECK(entries[0].offset == 34 * 2048);
+    CHECK(entries[1].path == "default.xex" && !entries[1].directory);
+    CHECK(entries[1].offset == 35 * 2048 && entries[1].size == 19);
+    CHECK(entries[2].path == "media/sound.bin" && !entries[2].directory);
+    CHECK(entries[2].offset == 36 * 2048 && entries[2].size == 4);
+  }
+
+  // XGD3 layout: the same volume, 0x2080000 bytes into the image.
+  base = 1;
+  CHECK(edf::xdvdfs::FindPartition(reader(0x02080000ULL), &base));
+  CHECK(base == 0x02080000ULL);
+
+  // Anything that is not a disc image has no volume descriptor at any offset.
+  const std::vector<uint8_t> junk(80 * 1024, 0);
+  const edf::xdvdfs::ReadFn read_junk = [&junk](uint64_t offset, void* dst, size_t size) {
+    if (offset > junk.size() || junk.size() - offset < size) return false;
+    std::memcpy(dst, junk.data() + offset, size);
+    return true;
+  };
+  CHECK(!edf::xdvdfs::FindPartition(read_junk, &base));
+  CHECK(!edf::xdvdfs::List(read_junk, 0, &entries, &error));
+  CHECK(!error.empty());
+
+  CHECK(edf::xdvdfs::IsSafeName("default.xex"));
+  CHECK(!edf::xdvdfs::IsSafeName("") && !edf::xdvdfs::IsSafeName(".."));
+  CHECK(!edf::xdvdfs::IsSafeName("a/b") && !edf::xdvdfs::IsSafeName("a\\b"));
+}
 }  // namespace
 
 int main() {
@@ -136,6 +244,7 @@ int main() {
   TestScriptedInput();
   TestFrameLogic();
   TestGraphicsMapping();
+  TestXdvdfs();
   if (failures) std::cerr << failures << " test assertion(s) failed\n";
   else std::cout << "All unit tests passed\n";
   return failures ? 1 : 0;

@@ -1,4 +1,4 @@
-// EDF 2017 PC - small frame-rate overlay (settings: "Show FPS"), fed by the VdSwap hook statistics.
+// EDF2027 - small frame-rate overlay (settings: "Show FPS"), fed by the VdSwap hook statistics.
 #pragma once
 #include <rex/cvar.h>
 #include <rex/ui/imgui_dialog.h>

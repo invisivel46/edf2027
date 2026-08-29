@@ -18,10 +18,11 @@ cmake --build --preset win-amd64-release
 Run the dependency-free unit suite (no game data, display, or GPU required):
 
 ```powershell
-build.cmd win-amd64-release edf2017_tests
-out\build\win-amd64-release\edf2017_tests.exe
+build.cmd win-amd64-release edf2027_tests
+out\build\win-amd64-release\edf2027_tests.exe
 ```
 
 The suite covers XEX header validation, persisted-config filtering, scripted
-input parsing and transitions, frame statistics/pacing calculations, and
-graphics-setting mappings.
+input parsing and transitions, frame statistics/pacing calculations,
+graphics-setting mappings, and XDVDFS disc-image parsing (against a synthetic
+in-memory image — no disc image needed).

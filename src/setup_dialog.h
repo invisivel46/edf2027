@@ -1,5 +1,5 @@
-// EDF 2017 PC - first-run setup screen: pick the disc image (extracted with extract-xiso)
-// or an already extracted game folder. Portable: SDL3 native dialogs + SDL3 process API.
+// EDF 2017 PC - first-run setup screen: pick the disc image (extracted in-process by
+// IsoExtractor) or an already extracted game folder. Portable: SDL3 native dialogs.
 #pragma once
 #include <SDL3/SDL.h>
 #include <rex/ui/imgui_dialog.h>

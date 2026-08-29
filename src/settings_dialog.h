@@ -113,7 +113,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       rex::cvar::SetFlagByName("async_shader_compilation", async_shaders_ ? "true" : "false");
     ImGui::SeparatorText("Upscaling (AMD FidelityFX)");
     const bool fidelity_fx = HasFidelityFx();
-    if (!fidelity_fx) ImGui::TextDisabled("Unavailable: runtime was built without FidelityFX.");
+    if (!fidelity_fx) ImGui::TextDisabled("Unavailable: amd_fidelityfx_dx12.dll is not next to the executable.");
     ImGui::BeginDisabled(!fidelity_fx);
     if (ImGui::Combo("Effect *", &upscale_index_, "Off (bilinear)\0" "CAS (sharpen)\0" "FSR 1.0\0")) {
       rex::cvar::SetFlagByName("present_effect", std::string(UpscaleValue(upscale_index_))); restart_ = true;
