@@ -48,8 +48,12 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     res_index_ = (int)kPresets.size() - 1;
     for (size_t i = 0; i + 1 < kPresets.size(); i++) if (kPresets[i].w == w && kPresets[i].h == h) res_index_ = (int)i;
     custom_w_ = w; custom_h_ = h;
-    scale_index_ = std::max(0, std::min(3, std::atoi(rex::cvar::GetFlagByName("draw_resolution_scale_x").c_str()) - 1));
-    vsync_ = rex::cvar::GetFlagByName("vsync") != "false";
+    render_w_=GetInt("edf_native_render_width",0);
+    render_h_=GetInt("edf_native_render_height",0);
+    render_index_=int(kRenderPresets.size())-1;
+    for(size_t i=0;i+1<kRenderPresets.size();++i)
+      if(kRenderPresets[i].w==render_w_ && kRenderPresets[i].h==render_h_) render_index_=int(i);
+    vsync_ = rex::cvar::GetFlagByName("edf_native_vsync") != "false";
     fps_cap_index_ = 0; for (int i = 0; i < 4; i++) if (kFpsCaps[i] == REXCVAR_GET(edf_fps_cap)) fps_cap_index_ = i;
     mute_ = REXCVAR_GET(audio_mute);
     mnk_ = REXCVAR_GET(mnk_mode);
@@ -59,8 +63,9 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     show_fps_ = REXCVAR_GET(edf_show_fps);
     frametime_log_ = REXCVAR_GET(edf_frametime_log);
     trace_input_ = REXCVAR_GET(edf_trace_input);
-    af_index_ = std::clamp(GetInt("anisotropic_override", 3) + 1, 0, 6);
-    msaa_ = GetBool("native_2x_msaa", true);
+    af_index_ = std::clamp(GetInt("edf_native_anisotropic_filtering", -1) + 1, 0, 6);
+    const int samples=GetInt("edf_native_msaa",0);
+    msaa_index_=samples==1?1:samples==2?2:samples==4?3:0;
     { const std::string v = GetStr("swap_post_effect", "none"); fxaa_index_ = v == "fxaa" ? 1 : v == "fxaa_extreme" ? 2 : 0; }
     aspect_index_ = AspectIndex(REXCVAR_GET(edf_aspect));
     upscale_index_ = UpscaleIndex(GetStr("present_effect", "bilinear"));
@@ -113,13 +118,24 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     std::string labels; for (auto& p : kPresets) { labels += p.name; labels.push_back('\0'); }
     if (ImGui::Combo("Window size *", &res_index_, labels.c_str())) restart_ = true;
     if (res_index_ == (int)kPresets.size() - 1) { ImGui::InputInt("Width", &custom_w_); ImGui::InputInt("Height", &custom_h_); }
-    if (ImGui::Combo("Render resolution scale *", &scale_index_, "1x (native 720p)\0" "2x\0" "3x\0" "4x\0")) restart_ = true;
-    if (ImGui::Checkbox("VSync", &vsync_)) rex::cvar::SetFlagByName("vsync", vsync_ ? "true" : "false");
-    if (ImGui::Combo("FPS cap", &fps_cap_index_, "Off\0" "30\0" "60\0" "120\0")) rex::cvar::SetFlagByName("edf_fps_cap", std::to_string(FpsCapValue(fps_cap_index_)));
-    if (ImGui::Combo("Game refresh rate *", &refresh_index_, "60 Hz (original)\0" "30 Hz\0" "120 Hz\0" "144 Hz\0")) {
-      rex::cvar::SetFlagByName("video_mode_refresh_rate", std::to_string(RefreshValue(refresh_index_))); restart_ = true;
+    ImGui::TextDisabled("Renderer: native Direct3D 11");
+    std::string render_labels; for(const auto& p:kRenderPresets) { render_labels+=p.name; render_labels.push_back('\0'); }
+    if(ImGui::Combo("Render resolution *",&render_index_,render_labels.c_str())) {
+      if(render_index_!=int(kRenderPresets.size())-1) {
+        render_w_=kRenderPresets[render_index_].w; render_h_=kRenderPresets[render_index_].h;
+      } else if(!render_w_ || !render_h_) { render_w_=1280; render_h_=720; }
+      restart_=true;
     }
-    ImGui::SameLine(); HelpMarker("The game ties logic to the console vertical blank. Rates other than 60 Hz change game speed; keep 60 unless testing.");
+    if(render_index_==int(kRenderPresets.size())-1) {
+      if(ImGui::InputInt("Render width",&render_w_)) restart_=true;
+      if(ImGui::InputInt("Render height",&render_h_)) restart_=true;
+    }
+    ImGui::TextDisabled("Experimental: changes scene resolution, not window size. Restart required.");
+    if(!ValidNativeRenderMode(render_w_,render_h_))
+      ImGui::TextColored(ImVec4(1,.4f,.3f,1),"Render size must be 640..4095 x 480..4095, or 0 x 0 (original).");
+    if (ImGui::Checkbox("VSync", &vsync_)) rex::cvar::SetFlagByName("edf_native_vsync", vsync_ ? "true" : "false");
+    if (ImGui::Combo("FPS cap", &fps_cap_index_, "Off\0" "30\0" "60\0" "120\0")) rex::cvar::SetFlagByName("edf_fps_cap", std::to_string(FpsCapValue(fps_cap_index_)));
+    ImGui::TextDisabled("Game simulation clock: 60 Hz (original)");
     if (ImGui::Combo("Aspect ratio *", &aspect_index_,
                      "Native (fills window)\0" "Ultrawide Hor+ (21:9 / 32:9)\0"
                      "16:9 letterbox\0" "16:9 stretched\0")) {
@@ -129,10 +145,12 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     ImGui::SameLine(); HelpMarker("Ultrawide Hor+ gives the guest the full window dimensions, expanding horizontal view without stretching. Native does the same for any aspect. The 16:9 modes preserve the console-shaped render.");
     ImGui::SeparatorText("Quality");
     if (ImGui::Combo("Anisotropic filtering", &af_index_, "Game default\0" "Off\0" "1x\0" "2x\0" "4x\0" "8x\0" "16x\0"))
-      rex::cvar::SetFlagByName("anisotropic_override", std::to_string(AnisotropicValue(af_index_)));
-    if (ImGui::Checkbox("Native 2x MSAA (where requested) *", &msaa_)) {
-      rex::cvar::SetFlagByName("native_2x_msaa", msaa_ ? "true" : "false"); restart_ = true;
-    }
+      rex::cvar::SetFlagByName("edf_native_anisotropic_filtering", std::to_string(AnisotropicValue(af_index_)));
+    ImGui::SameLine(); HelpMarker("Applies immediately to linearly filtered, mipmapped materials. Point filtering, movies and UI are preserved.");
+    if (ImGui::Combo("Scene anti-aliasing *", &msaa_index_, "Game default\0" "Off\0" "2x MSAA\0" "4x MSAA\0")) restart_=true;
+    ImGui::SameLine(); HelpMarker("Native D3D11 scene color and depth sampling. Game default preserves the game's request (normally 2x). Save and restart to apply. Higher sample counts use more GPU time and memory; UI and post-processing remain single-sampled.");
+    ImGui::TextDisabled("The options below still need native implementations.");
+    ImGui::BeginDisabled();
     if (ImGui::Combo("Post anti-aliasing *", &fxaa_index_, "Off\0" "FXAA\0" "FXAA extreme\0")) {
       rex::cvar::SetFlagByName("swap_post_effect", std::string(FxaaValue(fxaa_index_))); restart_ = true;
     }
@@ -183,6 +201,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       rex::cvar::SetFlagByName("present_dither", dither_ ? "true" : "false"); restart_ = true;
     }
     ImGui::EndDisabled();
+    ImGui::EndDisabled();
     ImGui::SeparatorText("Audio");
     if (ImGui::Checkbox("Mute", &mute_)) rex::cvar::SetFlagByName("audio_mute", mute_ ? "true" : "false");
     ImGui::SeparatorText("Controls");
@@ -202,6 +221,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       rex::cvar::SetFlagByName("edf_trace_input", trace_input_ ? "true" : "false");
     ImGui::Spacing();
     if (restart_) ImGui::TextColored(ImVec4(1, 0.8f, 0.3f, 1), "%s", str::kRestartNote);
+    ImGui::BeginDisabled(!ValidNativeRenderMode(render_w_,render_h_));
     if (ImGui::Button("Save", ImVec2(120, 0))) { Save(); saved_ = true; }
     ImGui::SameLine();
     if (ImGui::Button("Save and restart", ImVec2(150, 0))) {
@@ -209,6 +229,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       saved_ = true;
       restart_failed_ = !on_restart_ || !on_restart_();
     }
+    ImGui::EndDisabled();
     ImGui::SameLine(); if (ImGui::Button("Close", ImVec2(120, 0))) open = false;
     if (saved_) { ImGui::SameLine(); ImGui::TextDisabled("saved to %s", config_path_.filename().string().c_str()); }
     if (restart_failed_) ImGui::TextColored(ImVec4(1, 0.35f, 0.3f, 1), "Could not restart the game: %s", SDL_GetError());
@@ -218,6 +239,9 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
 
  private:
   struct Preset { const char* name; int w, h; };
+  static constexpr std::array<Preset,7> kRenderPresets{{
+    {"Original game size",0,0},{"1280 x 720",1280,720},{"1600 x 900",1600,900},
+    {"1920 x 1080",1920,1080},{"2560 x 1440",2560,1440},{"3840 x 2160",3840,2160},{"Custom",0,0}}};
   static constexpr std::array<Preset, 10> kPresets{{
       {"1280 x 720 (16:9)", 1280, 720}, {"1600 x 900 (16:9)", 1600, 900},
       {"1920 x 1080 (16:9)", 1920, 1080}, {"2560 x 1080 (21:9)", 2560, 1080},
@@ -378,21 +402,27 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     rex::cvar::SetFlagByName("fullscreen", display_mode_ == 1 ? "true" : "false");  // hot-reload: ReXApp toggles the window
   }
   void Save() {
+    if(!ValidNativeRenderMode(render_w_,render_h_)) return;
+    rex::cvar::SetFlagByName("edf_native_render_width",std::to_string(render_w_));
+    rex::cvar::SetFlagByName("edf_native_render_height",std::to_string(render_h_));
+    constexpr int sample_counts[]{0,1,2,4};
+    rex::cvar::SetFlagByName("edf_native_msaa",std::to_string(sample_counts[std::clamp(msaa_index_,0,3)]));
     int w = res_index_ == (int)kPresets.size() - 1 ? custom_w_ : kPresets[res_index_].w;
     int h = res_index_ == (int)kPresets.size() - 1 ? custom_h_ : kPresets[res_index_].h;
     if (w >= 640 && h >= 480) {
       rex::cvar::SetFlagByName("window_width", std::to_string(w)); rex::cvar::SetFlagByName("window_height", std::to_string(h));
       ApplyVideoMode(w, h);
     }
-    std::string s = std::to_string(ResolutionScaleValue(scale_index_));
-    rex::cvar::SetFlagByName("draw_resolution_scale_x", s); rex::cvar::SetFlagByName("draw_resolution_scale_y", s);
+    // Retain legacy quality settings on disk, but do not apply unsupported
+    // GPU-plugin controls to the native renderer.
     rex::cvar::SetFlagByName("mnk_mode", mnk_ ? "true" : "false");
     SaveUserConfig(config_path_);
   }
 
   std::filesystem::path config_path_; std::string pad_name_; std::function<void()> on_close_;
   std::function<bool()> on_restart_;
-  int display_mode_ = 0, res_index_ = 0, custom_w_ = 1280, custom_h_ = 720, scale_index_ = 0, fps_cap_index_ = 0;
+  int display_mode_ = 0, res_index_ = 0, custom_w_ = 1280, custom_h_ = 720, fps_cap_index_ = 0;
+  int render_index_=0,render_w_=0,render_h_=0;
   bool vsync_ = true, mute_ = false, mnk_ = false, mnk_mouse_ = true, rumble_ = true;
   bool restart_ = false, saved_ = false, restart_failed_ = false;
   bool show_fps_ = false, frametime_log_ = false, trace_input_ = false;
@@ -401,7 +431,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   int fsr_quality_index_ = 0, fsr_passes_ = 4;
   std::string capture_cvar_;      // empty when not rebinding
   bool capture_replace_ = true;   // Set replaces the binding, Add appends an alternative
-  bool msaa_ = true, dither_ = false, async_shaders_ = true;
+  int msaa_index_ = 0;
+  bool dither_ = false, async_shaders_ = true;
   float cas_sharp_ = 0.0f, fsr_sharp_ = 0.2f;
 };
 

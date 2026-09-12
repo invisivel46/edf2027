@@ -3,6 +3,50 @@
 A native PC build of the Xbox 360 game *Earth Defense Force 2017* (USA/Europe),
 made with static recompilation on the [ReXGlue](https://github.com/rexglue) SDK.
 
+The current Windows worktree uses a native Direct3D 11 renderer and no longer
+selects or packages the Xenos GPU plugin. This migration is still in development:
+mission player/HUD rendering is verified, but full rendering coverage, sustained
+combat, native synchronization and handheld performance are not yet certified.
+The screenshots and graphics-option descriptions below include the older build.
+GPU-plugin quality and upscaling controls are disabled in the native path.
+Native VSync uses `edf_native_vsync` independently of the old GPU-plugin setting;
+it changes display synchronization, not the fixed 60 Hz simulation clock.
+Old build folders may still contain previously copied DLLs; use a fresh output
+folder to verify the native distribution. No game data is included.
+
+Native reads now validate live SDK commitment/protection metadata, with Windows
+validation for untracked or unsupported ranges. For diagnostic comparison,
+`--edf_native_guest_heap_reads=false` forces the slower Windows-query path.
+
+Native render-state ownership is enabled by default: draw-state words,
+scissor-enable and blend-factor colors come from setter-owned CPU snapshots.
+`--edf_native_owned_render_state=false` restores the older live state readers
+for regression diagnosis; `--edf_native_render_state_audit=true` compares native
+state with those readers.
+
+Indexed geometry is no longer re-read and compared on every draw. A model's
+vertex and index buffers are snapshotted once, and a later draw reuses that
+snapshot whenever the write-tracking registry proves nothing has changed since
+it was taken. The comparison is sampled rather than abandoned: the first
+`--edf_native_geometry_verify_initial` observations of each buffer and every
+`--edf_native_geometry_verify_interval`-th observation afterwards still read and
+compare the guest bytes, and a single disagreement permanently restores full
+comparison for the rest of the run and logs a warning.
+`--edf_native_geometry_verify_interval=0` compares every draw.
+
+The guest's `PA_SU_VTX_CNTL` pixel-centre mode is applied to the game's
+full-screen post-processing passes, which is what its downsample chain's
+half-texel sampling offsets assume. `--edf_native_pixel_centers=false` restores
+the unshifted viewport for regression diagnosis.
+
+From a Visual Studio developer shell, `cmake --build <build-dir> --target
+audit_native_dependencies` checks the game's transitive non-system PE imports
+and rejects Xenos DLLs or dependencies resolved outside the executable folder.
+To check a separate staging folder, run `cmake -DEXECUTABLE=<absolute-exe-path>
+-P tools/audit-native-dependencies.cmake`. Windows system libraries are treated
+as prerequisites; this does not replace runtime testing or detect every dynamic
+plugin load.
+
 ![Mission 1 running at 1280x720, 60 fps](docs/media/gameplay.jpg)
 
 ![Gameplay clip](docs/media/gameplay.gif)
@@ -42,15 +86,14 @@ or `sha1sum <file>.iso` elsewhere.
 
 ## Settings
 
-* **F1** in game — EDF2027 settings: display mode, window and render
-  resolution, native/ultrawide Hor+/letterboxed/stretched aspect handling, VSync, FPS cap,
-  refresh rate, anisotropic filtering, MSAA, FXAA, shader compilation,
-  FidelityFX upscaling when supported, audio, controls, and diagnostics.
+* **F1** in game — EDF2027 settings: display mode, window size, aspect handling,
+  native VSync, FPS cap, audio, controls, and diagnostics.
   **Save** writes them to the config file; items marked `*` need a restart.
-  Upscaling offers CAS, FSR 1.0, and the experimental FSR 2/FSR 3 paths, with
-  sharpness, EASU pass count, and (FSR 2/3 only) a quality mode. FSR only
-  upscales when the game renders below the output size, so pair it with a lower
-  render resolution scale — at 1:1 it just sharpens.
+  The native renderer currently uses the game's render size. Render-resolution
+  scaling and legacy anisotropic-filtering, MSAA, FXAA, background-compilation,
+  CAS and FSR controls are disabled. The simulation clock remains 60 Hz.
+  Some SDK builds require `amd_fidelityfx_dx12.dll` for loading `rexruntime.dll`;
+  its presence does not enable native FidelityFX upscaling.
 * **F2** — toggle the compact FPS overlay.
 * **F4** — advanced ReXGlue settings (every runtime option).
 * **F3** — debug overlay, **`** — console.
@@ -58,8 +101,8 @@ or `sha1sum <file>.iso` elsewhere.
 
 <img src="docs/media/settings.png" alt="EDF2027 settings screen" width="520">
 
-*The F1 settings screen. FSR quality mode is greyed out here because it only
-applies to the FSR 2/3 temporal paths, not FSR 1.0.*
+*Historical F1 screenshot from the GPU-plugin build. The native build disables
+the legacy quality/upscaling controls described above.*
 
 Config file: `%APPDATA%\edf2027\edf2027.toml` (Windows),
 `~/.local/share/edf2027/edf2027.toml` (Linux), `~/Library/Application Support/edf2027/` (macOS).
@@ -108,20 +151,24 @@ Press **Escape** at any time to quit the game; it cannot be rebound.
 ## Command line (optional)
 
 ```
-edf2027.exe [--game_data_root <folder>] [--settings] [--fullscreen true|false]
+edf2027.exe [--game_data_root <folder>] [--settings] [--fullscreen=true|false]
             [--window_width N --window_height N] [--draw_resolution_scale_x N --draw_resolution_scale_y N]
-            [--vsync true|false] [--edf_fps_cap N] [--audio_mute true|false] [--log_file run.log]
-            [--edf_show_fps true|false] [--edf_frametime_log true|false] [--edf_rumble true|false]
-            [--edf_trace_input true|false] [--edf_frame_pacer_spin_us N]
+            [--edf_native_vsync=true|false] [--edf_fps_cap N] [--audio_mute=true|false] [--log_file run.log]
+            [--edf_show_fps=true|false] [--edf_frametime_log=true|false] [--edf_rumble=true|false]
+            [--edf_trace_input=true|false] [--edf_frame_pacer_spin_us N]
 ```
-Every option in the config file can also be given as `--name value`.
+Use `--name=value` for config options on the command line. Boolean options also
+accept `--name` (true) or `--no-name` (false). Do not use `--name false`: the
+separate word does not disable the flag. Native presentation uses
+`edf_native_vsync`, not the legacy GPU-plugin `vsync` option.
 
 ## Troubleshooting
 
 * *"That disc image is not Earth Defense Force 2017"*: the title id in
   `default.xex` did not match `445007D3`; only the USA/Europe release is supported.
-* Black window / GPU error: the Xenos GPU plugin needs a D3D12-capable GPU on
-  Windows (Vulkan on Linux/macOS).
+* Black window / GPU error: this worktree uses native Direct3D 11 on Windows.
+  Check the log for native shader, draw or presentation failures. Installing a
+  Xenos plugin is not a fix; this port no longer selects one.
 * Logs: `--log_file run.log` writes next to the exe.
 
 ## Licenses
@@ -142,9 +189,8 @@ cmake --preset win-amd64-release -DCMAKE_PREFIX_PATH=C:\path\to\rexglue-sdk
 cmake --build --preset win-amd64-release
 ```
 
-The FidelityFX CAS/FSR settings need an SDK built with
-`-DREXGLUE_ENABLE_FIDELITYFX=ON`; against any other SDK the port builds and runs
-normally but those controls stay disabled. Configure prints which case applies.
+The native D3D11 renderer does not use the SDK's DX12/Vulkan FidelityFX path,
+so CAS/FSR controls remain disabled even when those SDK DLLs are available.
 Note that `find_package` caches `rexglue_DIR`, so switching a build directory
 between SDKs needs its `CMakeCache.txt` deleted first.
 

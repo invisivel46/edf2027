@@ -1,0 +1,99 @@
+#pragma once
+#include <d3d11.h>
+#include <wrl/client.h>
+#include <span>
+#include <cstdint>
+#include <vector>
+#include <array>
+#include <stdexcept>
+
+namespace edf::native {
+// Scene-only override; post-processing and UI targets stay single-sampled.
+inline uint32_t NativeSceneSamples(uint32_t guest_mode, int32_t override_samples) {
+  if (guest_mode>2) throw std::runtime_error("unsupported guest scene sample mode");
+  if (override_samples==0) return 1u<<guest_mode;
+  if (override_samples==1 || override_samples==2 || override_samples==4)
+    return static_cast<uint32_t>(override_samples);
+  throw std::runtime_error("native MSAA must be 0 (game default), 1 (off), 2 or 4");
+}
+struct NativeTexture {
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> resource;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
+  uint32_t width = 0, height = 0, mip_count = 0;
+  bool cube = false;
+  // Describes initialized pixel data, not complete game-frame fidelity.
+  // DDS imports are initialized. Render-target textures become valid only
+  // after initialized surface contents are resolved; allocation alone isn't data.
+  bool content_valid = true;
+};
+struct NativeRenderTarget {
+  enum class Conversion { none, luminance, rgba8 };
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> surface;
+  Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
+  NativeTexture sampled;
+  bool content_valid = false;
+  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> resolve_source;
+  Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> resolve_destination;
+  Microsoft::WRL::ComPtr<ID3D11ComputeShader> resolve_shader;
+  Conversion conversion=Conversion::none;
+};
+struct NativeDepthTarget {
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> surface;
+  Microsoft::WRL::ComPtr<ID3D11DepthStencilView> target;
+  uint32_t width = 0, height = 0;
+  bool has_stencil = false;
+  bool depth_valid = false, stencil_valid = false;
+};
+// Native host depth storage. Guest depth format mapping and explicit
+// depth resolves are separate contracts; no implicit conversion is performed.
+NativeDepthTarget CreateNativeDepthTarget(ID3D11Device& device,uint32_t width,
+                                          uint32_t height,DXGI_FORMAT format,uint32_t samples=1);
+void ClearNativeDepthTarget(ID3D11DeviceContext& context,NativeDepthTarget& target,
+                            bool depth,bool stencil,float depth_value,uint8_t stencil_value);
+NativeRenderTarget CreateNativeRenderTarget(ID3D11Device& device, uint32_t width,
+                                           uint32_t height, DXGI_FORMAT format,uint32_t samples=1);
+// Separate surface and sampled texture retain the guest's explicit resolve
+// boundary and permit a pass to sample the previous resolved contents.
+void ResolveNativeRenderTarget(ID3D11DeviceContext& context, NativeRenderTarget& target);
+// Full-surface packed ARGB clear. Does not implicitly resolve the sampled view.
+void ClearNativeColorTarget(ID3D11DeviceContext& context, NativeRenderTarget& target,
+                           uint32_t argb);
+// Luminance pair: R32F surface -> half-precision R111 sampled values.
+// RGBA16F host storage represents the guest texture's fixed channel mapping.
+NativeRenderTarget CreateNativeLuminanceTarget(ID3D11Device& device,uint32_t width,uint32_t height);
+// HDR render surface -> clamped/quantized RGBA8 sampled bloom texture.
+NativeRenderTarget CreateNativeBloomTarget(ID3D11Device& device,uint32_t width,uint32_t height);
+NativeRenderTarget CreateNativeOpaqueFrameTarget(ID3D11Device& device,uint32_t width,uint32_t height);
+// Direct color resolve to RGBA8, without exposure, bloom or gamma. Destination
+// is a dedicated bloom/opaque-frame conversion pair, never the HDR history.
+void ResolveNativeRgba8Frame(ID3D11DeviceContext& context,const NativeRenderTarget& source,
+                             NativeRenderTarget& destination);
+// Initial upload only: a 1x1 R16F texture fits in its first 4KiB backing page.
+// Uniform zero bytes have the same value for any tiling/endian layout.
+bool ImportZeroLuminanceHistory(ID3D11DeviceContext& context,NativeRenderTarget& target,
+                                std::span<const uint8_t> initial_page);
+// Native DDS upload: retains BC1/BC2/BC3 compression and all authored mip/face
+// data. RGB mask formats and alpha-only A8 are converted to RGBA8. No Xbox texture descriptors,
+// tiled GPU memory, or GPU command processing is involved.
+NativeTexture CreateNativeDdsTexture(ID3D11Device& device, std::span<const uint8_t> dds);
+// Diagnostic only: clamp linear HDR RGB to [0,1], or retain RGBA8 output bytes,
+// in a top-down 24-bit BMP.
+// Nonfinite RGB becomes magenta. This is not the game's tone mapping, and
+// reading a partial target does not mark its contents valid for presentation.
+std::vector<uint8_t> CaptureNativeHdrBmp(ID3D11DeviceContext& context,ID3D11Texture2D& surface);
+// Diagnostic one-pixel readback, without quantizing HDR or changing validity.
+std::array<float,4> ReadNativeColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,uint32_t x,uint32_t y);
+// Diagnostic region scan. Returns the first nonfinite RGB pixel in row order;
+// finite magenta and nonfinite alpha alone are not errors. No rendering state
+// or content-validity flag is changed. Coordinates are absolute surface pixels.
+bool FindNativeInvalidColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,
+                                uint32_t x,uint32_t y,uint32_t width,uint32_t height,
+                                uint32_t& found_x,uint32_t& found_y);
+struct NativeDepthCoverage {
+  uint64_t changed_pixels=0,nonfinite_pixels=0;
+  float minimum=1,maximum=0;
+  std::array<uint64_t,3> vertical_bands{};
+};
+// Read the development scene's D32/D32S8 depth, without altering validity.
+NativeDepthCoverage InspectNativeDepth(ID3D11DeviceContext& context,ID3D11Texture2D& surface,float clear_depth);
+}

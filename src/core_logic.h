@@ -64,6 +64,10 @@ inline std::string FilterPersistentConfig(std::string_view config) {
 }
 
 struct VideoMode { int width; int height; };
+inline bool ValidNativeRenderMode(int width,int height) {
+  return (width==0 && height==0) ||
+    (width>=640 && width<=4095 && height>=480 && height<=4095);
+}
 
 inline bool ForcesConsoleAspect(std::string_view aspect) {
   return aspect == "letterbox" || aspect == "stretch";

@@ -1,0 +1,16 @@
+# Automated title/story skip and default Mission 1 confirmations.
+# Milliseconds from first controller poll; no gameplay movement or firing.
+20000 1000 0010
+25000 1000 0010
+30000 1000 1000
+35000 1000 1000
+40000 1000 1000
+45000 1000 1000
+50000 1000 1000
+55000 1000 1000
+60000 1000 1000
+65000 1000 1000
+70000 1000 1000
+# Late confirmations cover the difficulty dialog on slower diagnostic starts.
+150000 1000 1000
+155000 1000 1000

@@ -1,0 +1,13 @@
+Function,StorePC,Width,Destination,AllocationPath,GeometryStatus
+821B7948,821B7A98,2,new allocation plus insertion offset,820A0420->820B24A8->process heap,normal direct chain starts empty local string-conversion vector at 821B8090
+821B7948,821B7B78,2,retained vector end,existing capacity,not selected from initially empty 821B8090 vector; other entry paths unproven
+821B7948,821B7BA4,2,retained insertion iterator,existing capacity,not selected from initially empty 821B8090 vector; other entry paths unproven
+821B7948,821B7C10,2,retained insertion iterator,existing capacity,not selected from initially empty 821B8090 vector; other entry paths unproven
+821BA368,821BA4B8,4,new allocation plus insertion offset,821B8DD0->820B24A8->process heap,both direct callers classified as bitset or pointer-vector growth; indirect entry and later aliases unproven
+821BA368,821BA598,4,retained vector end,CPU-heap backing on classified direct chains,bitset resize or pointer-vector append; indirect entry and later aliases unproven
+821BA368,821BA5C4,4,retained insertion iterator,CPU-heap backing on classified direct chains,normal direct callers construct end insertion iterators; arbitrary entry and malformed ranges unproven
+821BA368,821BA630,4,retained insertion iterator,CPU-heap backing on classified direct chains,normal direct callers construct end insertion iterators; arbitrary entry and malformed ranges unproven
+821C8A20,821C8A7C,4,retained vector end,CPU-heap-backed local or conversion-tracker vectors on classified direct paths,all eight direct callers classified in geometry-append-callers.csv; later aliases and reentrant conversion remain open
+821BAE98,821BAFC4,4,last retained bit-storage word,CPU-heap-backed local bitset on normal direct path,resize and iterator chain traced to 821BBAD8; indirect entry and escaping aliases unproven
+821B9EA8,821B9F1C,4,iterator word pointer at argument plus4,CPU-heap-backed local bitset on normal direct paths,bit set; all four direct caller chains classified in geometry-bit-vector-ownership.md; indirect entry and escaping aliases unproven
+821B9EA8,821B9F88,4,iterator word pointer at argument plus4,CPU-heap-backed local bitset on normal direct paths,bit clear; all four direct caller chains classified in geometry-bit-vector-ownership.md; indirect entry and escaping aliases unproven

@@ -106,6 +106,14 @@ void TestFrameLogic() {
 
 void TestGraphicsMapping() {
   auto mode = edf::GuestVideoMode(1920, 1080, "native");
+  CHECK(edf::ValidNativeRenderMode(0,0));
+  CHECK(edf::ValidNativeRenderMode(1920,1080));
+  CHECK(edf::ValidNativeRenderMode(640,480));
+  CHECK(edf::ValidNativeRenderMode(4095,4095));
+  CHECK(!edf::ValidNativeRenderMode(0,720));
+  CHECK(!edf::ValidNativeRenderMode(1280,0));
+  CHECK(!edf::ValidNativeRenderMode(4096,2160));
+  CHECK(!edf::ValidNativeRenderMode(640,479));
   CHECK(mode.width == 1920 && mode.height == 1080);
   mode = edf::GuestVideoMode(1920, 1200, "native");
   CHECK(mode.width == 1920 && mode.height == 1200);

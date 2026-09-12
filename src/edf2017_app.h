@@ -15,10 +15,21 @@
 #include "scripted_input.h"
 #include "settings_dialog.h"
 #include "setup_dialog.h"
+#if defined(_WIN32)
+#include "native_graphics/guest_shader_bridge.h"
+#include "native_graphics/guest_mesh_watch_audit.h"
+#include "native_graphics/native_preview_window.h"
+#include "native_graphics/native_host_surface.h"
+#include "native_graphics/native_immediate_drawer.h"
+#endif
 
 REXCVAR_DECLARE(std::string, game_data_root);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
+REXCVAR_DECLARE(bool, edf_native_preview_window);
+REXCVAR_DECLARE(bool, edf_native_host);
+REXCVAR_DECLARE(bool, edf_native_untiled_scene);
+REXCVAR_DECLARE(bool, edf_native_mesh_watch_audit);
 
 class Edf2017App : public rex::ReXApp {
  public:
@@ -47,12 +58,59 @@ class Edf2017App : public rex::ReXApp {
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
-    config.gpu_plugin = "xenos";  // Xenia-derived Xenos GPU emulation (D3D12 on Windows)
+    // This port has no GPU-emulation fallback. Migrate old saved settings too,
+    // before SDK setup and immediate-drawer creation.
+    config.gpu_plugin.clear();
+#if defined(_WIN32)
+    if(!REXCVAR_GET(edf_native_host))
+      REXLOG_INFO("EDF2027: ignoring legacy edf_native_host=false; the port uses native D3D11");
+    rex::cvar::SetFlagByName("edf_native_host","true");
+    if(!REXCVAR_GET(edf_native_untiled_scene))
+      REXLOG_INFO("EDF2027: ignoring legacy edf_native_untiled_scene=false; Xbox tile recording is not supported");
+    rex::cvar::SetFlagByName("edf_native_untiled_scene","true");
+    if(REXCVAR_GET(edf_native_preview_window)) throw std::runtime_error("native host and preview modes are mutually exclusive");
+    rex::cvar::SetFlagByName("edf_native_shader_bridge","true");
+    rex::cvar::SetFlagByName("edf_native_publish_frames","true");
+#endif
     config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
     config.input_factory = REX_INPUT_BACKEND(CreateEdfInputSystem);  // SDL + NOP + optional scripted pad (EDF_INPUT_SCRIPT)
   }
 
+  std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
+#if defined(_WIN32)
+    if(REXCVAR_GET(edf_native_host)) {
+      edf::native::InitializeGuestShaderBridge({});
+      std::unique_ptr<edf::native::NativeImmediateDrawer> drawer;
+      edf::native::VisitNativePresentationContext([&](auto& device,auto& context) {
+        drawer=std::make_unique<edf::native::NativeImmediateDrawer>(device,context);
+      });
+      if(!drawer) throw std::runtime_error("native host has no rendering context");
+      native_immediate_=drawer.get();
+      native_host_=edf::native::NativeHostSurface::Create(
+        static_cast<HWND>(window()->GetNativeWindowHandle()),[this](UINT width,UINT height) {
+          if(!imgui_drawer()) return;
+          rex::ui::AppUIDrawContext context(width,height);
+          try { imgui_drawer()->Draw(context); }
+          catch(...) { if(native_immediate_) native_immediate_->End(); throw; }
+        },[context=&app_context()](std::function<void()> callback) {
+          return context->CallInUIThreadDeferred(std::move(callback));
+        });
+      return drawer;
+    }
+#endif
+    return nullptr;
+  }
+
   void OnPostSetup() override {
+#if defined(_WIN32)
+    edf::native::InitializeGuestShaderBridge(runtime()->game_data_root());
+    if(REXCVAR_GET(edf_native_mesh_watch_audit)) {
+      native_mesh_audit_=std::make_shared<edf::native::GuestMeshWatchAudit>(*runtime()->memory());
+      edf::native::SetNativeMeshWatchAudit(native_mesh_audit_);
+    }
+    if(REXCVAR_GET(edf_native_preview_window))
+      native_preview_=std::make_unique<edf::native::NativePreviewWindow>();
+#endif
     // ReXApp's default mouse-look gate only knows about its built-in dialogs.
     // EDF's setup and F1 settings are custom dialogs, so use ImGui's capture
     // state directly. This releases relative mouse mode and restores the OS
@@ -141,7 +199,30 @@ class Edf2017App : public rex::ReXApp {
     rex::ui::ProcessKeyEvent(event);
   }
 
+  void OnShutdown() override {
+#if defined(_WIN32)
+    edf::native::SetNativeMeshWatchAudit({});
+    native_mesh_audit_.reset();
+    if(native_host_) native_host_->Stop();
+    native_host_.reset(); native_immediate_=nullptr;
+    native_preview_.reset();
+#endif
+  }
+  bool OnWindowCloseRequested() override {
+#if defined(_WIN32)
+    if(native_host_) native_host_->Stop();
+    native_host_.reset(); native_immediate_=nullptr;
+    native_preview_.reset();
+#endif
+    return true;
+  }
  private:
+#if defined(_WIN32)
+  std::unique_ptr<edf::native::NativePreviewWindow> native_preview_;
+  std::shared_ptr<edf::native::GuestMeshWatchAudit> native_mesh_audit_;
+  std::shared_ptr<edf::native::NativeHostSurface> native_host_;
+  edf::native::NativeImmediateDrawer* native_immediate_=nullptr; // Owned by SDK.
+#endif
   void ApplyDisplayMode() {
     bool borderless = edf::DisplayMode() == "borderless";
     rex::cvar::SetFlagByName("fullscreen", borderless ? "true" : "false");  // change callback resizes the window

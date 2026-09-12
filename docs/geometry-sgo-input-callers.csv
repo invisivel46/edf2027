@@ -1,0 +1,14 @@
+Caller,CallPC,InputSource,Status
+820AFAC0,820AFBA0,820AB608 result from local cache handle,normal 821B24C0 miss loads CPU-heap buffer at node plus44; hit history and later aliases unresolved
+821256A8,8212578C,node plus44 through local handle,821B24C0 at 82125708 populates same handle; normal cache preparation traced; aliases and exceptional paths unresolved
+821C2090,821C22A0,context pointer loaded from global 8257C310 then context plus68,821A6278 publishes map payload and 821A6E08 cache payload; 821A5EF0 sets null; other factories and reentrancy unresolved
+820E1B60,820E1C90,node plus44 through retained handle,821B24C0 at 820E1BD0 populates same handle; normal cache preparation traced; aliases and exceptional paths unresolved
+821A6E08,821A6ECC,node plus44 through local handle,821B24C0 at 821A6E34 populates same handle; normal cache preparation traced; aliases and exceptional paths unresolved
+821E50C0,821E514C,entry owner plus0 after 821A0EB0,normal successful preparation uses CPU heap; loader false skips conversion; preparation failures unresolved
+82199F28,82199FB0,entry owner plus4 after 821A0EB0,normal successful preparation uses CPU heap; loader false skips conversion; preparation failures unresolved
+820A3488,820A3508,entry owner plus0 after 821A0EB0,normal successful preparation uses CPU heap; caller ignores loader false so failure path unresolved
+820D1F50,820D20BC,entry owner plus728 after 821A0EB0 at 820D2084,initially empty buffer; successful preparation CPU heap; load failure logs then continues toward conversion
+820F1870,820F1B88,node plus44 through retained handle,821B24C0 at 820F1B38 populates same handle; normal cache preparation traced; empty-handle and alias paths unresolved
+821A6278,821A62A4,entry r5 from 820B4D58 call at 820B51A0,nested record in map from 821B24C0 cache; normal preparation CPU heap; relative bounds and missing-record failure unresolved
+820ADF60,820AE0BC,node plus44 through local handle,821B24C0 at 820AE00C populates same handle; normal cache preparation traced; aliases and exceptional paths unresolved
+8212A208,8212A3B4,node plus44 through retained handle,821B24C0 at 8212A348 populates same handle; normal cache preparation traced; empty-handle and alias paths unresolved

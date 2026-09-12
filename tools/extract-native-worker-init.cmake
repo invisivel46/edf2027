@@ -1,0 +1,36 @@
+# Retain worker CPU records, thread creation and error/ABI paths, without the
+# four-word Xbox worker setup packet or its command-buffer rollover.
+file(READ "${SOURCE_DIR}/generated/default/edf2017_recomp.51.cpp" source)
+string(REPLACE "\r\n" "\n" source "${source}")
+string(FIND "${source}" "DEFINE_REX_FUNC(sub_8214EE50) {" begin)
+if(begin LESS 0)
+    message(FATAL_ERROR "Missing worker initializer")
+endif()
+string(SUBSTRING "${source}" ${begin} -1 tail)
+string(FIND "${tail}" "\nDEFINE_REX_FUNC(" end)
+if(end LESS 0)
+    message(FATAL_ERROR "Missing worker initializer boundary")
+endif()
+string(SUBSTRING "${tail}" 0 ${end} body)
+string(SHA256 fingerprint "${body}")
+if(NOT fingerprint STREQUAL "f480aeda7239f79f4f55bf237b5fcdf54d5c3c050034068a2e9be1c355916fff")
+    message(FATAL_ERROR "Worker initializer changed; re-audit CPU/thread/packet boundaries")
+endif()
+string(REPLACE "DEFINE_REX_FUNC(sub_8214EE50)" "DEFINE_REX_FUNC(edf_native_worker_init)" body "${body}")
+string(REPLACE "ctx.r11.u64 = REX_LOAD_U32(ctx.r30.u32 + 13476);"
+    "ctx.r11.u64 = 0; // Native worker has no GPU ring storage alias." body "${body}")
+string(FIND "${body}" "\t// lwz r3,40(r30)" packet_begin)
+string(FIND "${body}" "loc_8214EF3C:" packet_end)
+if(packet_begin LESS 0 OR packet_end LESS packet_begin)
+    message(FATAL_ERROR "Missing worker packet reservation boundary")
+endif()
+string(SUBSTRING "${body}" 0 ${packet_begin} prefix)
+string(SUBSTRING "${body}" ${packet_end} -1 suffix)
+set(body "${prefix}${suffix}")
+# Keep all CPU setup/argument arithmetic. Only these four packet stores and
+# the packet cursor publication disappear. Thread records remain unchanged.
+foreach(store "REX_STORE_U32(ea, ctx.r11.u32);" "REX_STORE_U32(ea, ctx.r22.u32);"
+              "REX_STORE_U32(ea, ctx.r10.u32);" "REX_STORE_U32(ctx.r30.u32 + 40, ctx.r11.u32);")
+    string(REPLACE "${store}" "// Native worker signalling owns this Xbox packet side effect." body "${body}")
+endforeach()
+file(WRITE "${OUTPUT}" "// Generated native worker initialization. Do not edit.\n#include \"edf2017_funcs.51.h\"\n${body}\n")

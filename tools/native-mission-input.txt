@@ -1,0 +1,16 @@
+# Wall-clock milliseconds from the first pad poll. Slow development dual-renderer startup.
+# Start is delayed until the title screen; remaining inputs confirm default menus.
+45000 1000 0010
+55000 1000 1000
+65000 1000 1000
+75000 1000 1000
+85000 1000 1000
+95000 1000 1000
+# Skip the opening story movie after the title-screen confirmation.
+100000 1000 0010
+105000 1000 1000
+115000 1000 1000
+125000 1000 1000
+145000 2000 1000
+165000 2000 1000
+185000 2000 1000

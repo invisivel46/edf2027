@@ -1,0 +1,17 @@
+Caller,DirectSites,ReviewState,ObservedDestination,OpenBoundary
+sub_82438B38,4,body_reviewed_partial,Fresh buffer or cache pointer retained in bit-reader state by 82460238,Bit-reader outputs and refill callback plus remaining aliases
+sub_82443408,2,body_reviewed_partial,Stack header and context cursor,Delegates to 824429C0 and 82442F18
+sub_82442810,3,body_reviewed_partial,Fresh allocation stored at context+0xE0,Allocation lifetime and downstream consumers
+sub_824410E0,1,body_reviewed_partial,Context scalar metadata,Verify decompiler argument flow against instructions
+sub_82441F70,1,body_reviewed_partial,Fresh metadata record and five copied fields,Downstream metadata lifetime
+sub_82440A18,1,body_reviewed_partial,Fresh length+2 allocation,Caller output slots and returned allocation lifetime
+sub_82443BF0,14,body_reviewed_partial,Instruction-verified context scalar packet stores,Caller context identity and downstream lifetime
+sub_82440B58,1,body_reviewed_partial,Caller output fields,Classify all output-pointer callers
+sub_82444210,12,body_reviewed_partial,Instruction-verified context scalar payload stores,Caller context identity and downstream lifetime
+sub_82441350,3,body_reviewed_partial,Context format fields and stack identifiers,Fragmented switch instruction coverage
+sub_82442F18,4,body_reviewed_partial,Context inline descriptor array and stack header,Bounded array indexing plus delegated 82441350
+sub_824429C0,3,body_reviewed_partial,Fresh record table and copied values,Fragmented switch and downstream lifetime
+sub_82442338,4,body_reviewed_partial,Fresh record table and copied values,Fragmented switch and downstream lifetime
+sub_82440D28,1,body_reviewed_partial,Caller output fields,Classify all output-pointer callers
+sub_82441C38,8,body_reviewed_partial,Instruction-bounded context copies at +0x76 +0x9C +0xAC,Caller context identity and downstream lifetime
+sub_82440EE8,1,body_reviewed_partial,Stack header and context metadata,Verify decompiler stack data flow

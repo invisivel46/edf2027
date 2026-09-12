@@ -1,0 +1,6 @@
+[fixture 1] Native geometry writer site: file=D:/fixture/writer.cpp, line=103, owner=0x1, lifetime=1, calls=3, first_physical=0x1000, first_bytes=4
+[fixture 1] Native geometry writer site: file=D:/fixture/writer.cpp, line=103, owner=0x1, lifetime=1, calls=3, first_physical=0x1000, first_bytes=4
+[fixture 2] Native geometry writer site: file=D:/fixture/writer.cpp, line=103, owner=0x1, lifetime=1, calls=2, first_physical=0x1004, first_bytes=4
+[fixture 3] Native geometry writer site: file=D:/fixture/writer.cpp, line=103, owner=0x1, lifetime=2, calls=1, first_physical=0x1000, first_bytes=4
+[fixture 4] Native geometry writer site: file=D:/fixture/writer.cpp, line=115, owner=0x2, lifetime=3, calls=1, first_physical=0x2000, first_bytes=4
+[fixture 5] Native geometry writer inventory incomplete: omitted_hits=7 (64 site/owner/lifetime keys per batch)

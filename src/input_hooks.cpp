@@ -137,6 +137,14 @@ namespace edf {
 FrameStats& CurrentFrameStats() { static FrameStats s; return s; }
 }
 REX_EXTERN(__imp__sub_82151460);
+REX_EXTERN(__imp__edf_native_present_cpu_tail);
+REXCVAR_DECLARE(bool, edf_native_host);
+REX_EXTERN(__imp__sub_82151168);
+REX_EXTERN(__imp__edf_native_color_cpu_tail);
+REX_HOOK_RAW(sub_82151168) {
+  if(REXCVAR_GET(edf_native_host)) __imp__edf_native_color_cpu_tail(ctx,base);
+  else __imp__sub_82151168(ctx,base);
+}
 REX_HOOK_RAW(sub_82151460) {
   using clock = std::chrono::steady_clock;
   static auto t0 = clock::now();
@@ -145,7 +153,8 @@ REX_HOOK_RAW(sub_82151460) {
   static std::vector<double> frame_ms;
   static uint32_t frames = 0, total = 0;
   static int previous_cap = 0;
-  __imp__sub_82151460(ctx, base);
+  if(REXCVAR_GET(edf_native_host)) __imp__edf_native_present_cpu_tail(ctx, base);
+  else __imp__sub_82151460(ctx, base);
   int cap = REXCVAR_GET(edf_fps_cap);
   if (cap > 0) {
     auto period = std::chrono::nanoseconds(edf::FramePeriodNanoseconds(cap));

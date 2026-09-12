@@ -1,0 +1,19 @@
+# Mission 1 entry followed by a retry-menu test. Inspect confirmation before accepting.
+# Milliseconds from first controller poll. No automatic quit/save selection.
+20000 1000 0010
+25000 1000 0010
+30000 1000 1000
+35000 1000 1000
+40000 1000 1000
+45000 1000 1000
+50000 1000 1000
+55000 1000 1000
+60000 1000 1000
+# Allow the full intro to finish before opening pause (145s was too early in
+# the fresh-settings index-validation run). Inspect the resulting dialog.
+210000 500 0010
+215000 100 0002
+218000 100 1000
+# Confirmed live: retry dialog defaults to No. Up selects Yes; A accepts.
+260000 200 0001
+263000 200 1000
