@@ -347,6 +347,64 @@ NativeTexture CreateNativeDdsTexture(ID3D11Device& device, std::span<const uint8
     throw std::runtime_error("native DDS view creation failed");
   return result;
 }
+NativeHdrRange InspectNativeHdrColor(ID3D11DeviceContext& context,ID3D11Texture2D& surface) {
+  if(auto resolved=ResolveDiagnosticColor(context,surface))
+    return InspectNativeHdrColor(context,*resolved.Get());
+  D3D11_TEXTURE2D_DESC desc{}; surface.GetDesc(&desc);
+  if ((desc.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM) ||
+      desc.SampleDesc.Count!=1 || desc.ArraySize!=1 || desc.MipLevels!=1 ||
+      !desc.Width || !desc.Height || desc.Width>4096 || desc.Height>4096)
+    throw std::runtime_error("unsupported diagnostic HDR range resource");
+  desc.Usage=D3D11_USAGE_STAGING; desc.BindFlags=desc.MiscFlags=0; desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+  Microsoft::WRL::ComPtr<ID3D11Device> device; context.GetDevice(&device);
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+  if (FAILED(device->CreateTexture2D(&desc,nullptr,&staging))) throw std::runtime_error("HDR range staging failed");
+  context.CopyResource(staging.Get(),&surface);
+  D3D11_MAPPED_SUBRESOURCE mapped{};
+  if (FAILED(context.Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped))) throw std::runtime_error("HDR range mapping failed");
+  auto half=[](uint16_t bits) {
+    const int exponent=(bits>>10)&31,mantissa=bits&1023;
+    if (exponent==31) return mantissa ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity();
+    const float value=exponent ? std::ldexp(float(1024+mantissa),exponent-25) : std::ldexp(float(mantissa),-24);
+    return bits&0x8000 ? -value : value;
+  };
+  NativeHdrRange range;
+  float worst=0;
+  range.minimum.fill(std::numeric_limits<float>::infinity());
+  range.maximum.fill(-std::numeric_limits<float>::infinity());
+  std::array<double,3> totals{};
+  for (UINT y=0;y<desc.Height;++y) {
+    const auto* row=static_cast<const uint8_t*>(mapped.pData)+size_t(y)*mapped.RowPitch;
+    for (UINT x=0;x<desc.Width;++x) {
+      std::array<float,3> rgb{};
+      if (desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM)
+        for (size_t i=0;i<3;++i) rgb[i]=row[size_t(x)*4+i]/255.0f;
+      else for (size_t i=0;i<3;++i) rgb[i]=half(reinterpret_cast<const uint16_t*>(row)[size_t(x)*4+i]);
+      if (!std::isfinite(rgb[0]) || !std::isfinite(rgb[1]) || !std::isfinite(rgb[2])) {
+        ++range.nonfinite_pixels; continue;
+      }
+      ++range.pixels;
+      float peak=rgb[0],trough=rgb[0];
+      for (size_t i=0;i<3;++i) {
+        range.minimum[i]=(std::min)(range.minimum[i],rgb[i]);
+        range.maximum[i]=(std::max)(range.maximum[i],rgb[i]);
+        totals[i]+=rgb[i];
+        peak=(std::max)(peak,rgb[i]);
+        trough=(std::min)(trough,rgb[i]);
+      }
+      if (trough<0) {
+        ++range.negative_pixels;
+        if (trough<=worst) { worst=trough; range.worst_x=x; range.worst_y=y; }
+      }
+      for (size_t threshold=0;threshold<range.above.size();++threshold)
+        if (peak>float(1u<<threshold)) ++range.above[threshold];
+    }
+  }
+  context.Unmap(staging.Get(),0);
+  if (range.pixels) for (size_t i=0;i<3;++i) range.mean[i]=totals[i]/double(range.pixels);
+  else { range.minimum={}; range.maximum={}; }
+  return range;
+}
 std::array<float,4> ReadNativeColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,uint32_t x,uint32_t y) {
   if(auto resolved=ResolveDiagnosticColor(context,surface))
     return ReadNativeColorPixel(context,*resolved.Get(),x,y);
@@ -378,9 +436,10 @@ std::array<float,4> ReadNativeColorPixel(ID3D11DeviceContext& context,ID3D11Text
   return result;
 }
 bool FindNativeInvalidColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,
-    uint32_t x,uint32_t y,uint32_t width,uint32_t height,uint32_t& found_x,uint32_t& found_y) {
+    uint32_t x,uint32_t y,uint32_t width,uint32_t height,uint32_t& found_x,uint32_t& found_y,
+    bool include_negative) {
   if(auto resolved=ResolveDiagnosticColor(context,surface))
-    return FindNativeInvalidColorPixel(context,*resolved.Get(),x,y,width,height,found_x,found_y);
+    return FindNativeInvalidColorPixel(context,*resolved.Get(),x,y,width,height,found_x,found_y,include_negative);
   D3D11_TEXTURE2D_DESC desc{}; surface.GetDesc(&desc);
   if((desc.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM) ||
      desc.SampleDesc.Count!=1 || desc.ArraySize!=1 || desc.MipLevels!=1 ||
@@ -403,8 +462,15 @@ bool FindNativeInvalidColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& s
   for(uint32_t row=0;row<height && !found;++row) {
     const auto* pixels=reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(mapped.pData)+size_t(row)*mapped.RowPitch);
     for(uint32_t column=0;column<width;++column) {
-      if((pixels[column*4]&0x7c00)==0x7c00 || (pixels[column*4+1]&0x7c00)==0x7c00 ||
-         (pixels[column*4+2]&0x7c00)==0x7c00) {
+      // Half-float bit patterns at or above 0xbc00 are negatives of magnitude
+      // 1 or more, because sign-magnitude ordering is monotonic per sign.
+      constexpr uint16_t negative_one=0xbc00;
+      bool invalid=false;
+      for(size_t channel=0;channel<3;++channel) {
+        const auto bits=pixels[column*4+channel];
+        invalid|=(bits&0x7c00)==0x7c00 || (include_negative && bits>=negative_one);
+      }
+      if(invalid) {
         found_x=x+column; found_y=y+row; found=true; break;
       }
     }

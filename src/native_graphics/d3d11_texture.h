@@ -86,9 +86,29 @@ std::array<float,4> ReadNativeColorPixel(ID3D11DeviceContext& context,ID3D11Text
 // Diagnostic region scan. Returns the first nonfinite RGB pixel in row order;
 // finite magenta and nonfinite alpha alone are not errors. No rendering state
 // or content-validity flag is changed. Coordinates are absolute surface pixels.
+// With include_negative, a channel at or below -1 also stops the scan: the
+// game's tone curve turns a large negative into saturated white, so it is a
+// visible defect even though it is a perfectly finite value.
 bool FindNativeInvalidColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,
                                 uint32_t x,uint32_t y,uint32_t width,uint32_t height,
-                                uint32_t& found_x,uint32_t& found_y);
+                                uint32_t& found_x,uint32_t& found_y,bool include_negative=false);
+// Unquantized HDR range of a whole diagnostic color surface. The BMP capture
+// clamps to [0,1], so it cannot show whether a scene still carries highlights
+// above 1 for the tone curve to compress. This reads the real values instead.
+// Nonfinite pixels are counted, not folded into the min/max or the mean.
+struct NativeHdrRange {
+  uint64_t pixels=0,nonfinite_pixels=0;
+  std::array<float,3> minimum{},maximum{};
+  std::array<double,3> mean{};
+  // Pixels whose maximum finite channel exceeds 1, 2, 4 and 8.
+  std::array<uint64_t,4> above{};
+  // Negative radiance cannot come from a correct scene, and the game's tone
+  // curve turns a large negative into saturated white, so count it separately
+  // and keep the worst pixel's coordinates for the invalid-RGB draw probe.
+  uint64_t negative_pixels=0;
+  uint32_t worst_x=0,worst_y=0;
+};
+NativeHdrRange InspectNativeHdrColor(ID3D11DeviceContext& context,ID3D11Texture2D& surface);
 struct NativeDepthCoverage {
   uint64_t changed_pixels=0,nonfinite_pixels=0;
   float minimum=1,maximum=0;

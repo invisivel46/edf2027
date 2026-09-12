@@ -374,6 +374,24 @@ float4 WhitePS():SV_TARGET { return 1; }
     Require(packing.SetGuestFloatRegisters("rowM", GuestRegisters(rows)), "row matrix import");
     Require(packing.SetGuestFloatRegisters("vectorArr", GuestRegisters(vectors)), "vector array import");
     Require(packing.SetGuestFloatRegisters("scalarArr", GuestRegisters(scalars)), "scalar array import");
+    // Flattened array reads must skip each element's 16-byte padding and must
+    // not accept a matrix, a plain vector, or be accepted by the vector reader.
+    Require(packing.ReadFloatArray("vectorArr")==std::vector<float>{.1f,.2f,.3f,.75f},
+      "float2 array read kept element padding or transposed elements");
+    Require(packing.ReadFloatArray("scalarArr")==std::vector<float>{.1f,1.f},
+      "scalar array read used the wrong element stride");
+    Require(packing.ReadFloatArray("absent").empty(),"absent diagnostic array invented");
+    for(const auto* rejected_name:{"columnM","rowM"}) {
+      bool refused=false;
+      try { packing.ReadFloatArray(rejected_name); } catch(const std::runtime_error&) { refused=true; }
+      Require(refused,"matrix accepted as a diagnostic float array");
+    }
+    bool vector_as_array_refused=false;
+    try { ps.ReadFloatArray("bias"); } catch(const std::runtime_error&) { vector_as_array_refused=true; }
+    Require(vector_as_array_refused,"non-array vector accepted as a diagnostic float array");
+    bool array_as_vector_refused=false;
+    try { packing.ReadFloatVector("vectorArr"); } catch(const std::runtime_error&) { array_as_vector_refused=true; }
+    Require(array_as_vector_refused,"array accepted as a single diagnostic vector");
     draw(packing, {64,128,191,255});
     for(const auto& [name,source]:std::array<std::pair<const char*,std::vector<uint8_t>>,4>{{
         {"columnM",GuestRegisters(columns)},{"rowM",GuestRegisters(rows)},

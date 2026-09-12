@@ -60,6 +60,10 @@ class ShaderBindings {
   bool HasAllTextureInputs() const;
   bool UsesTextureResource(ID3D11Resource& resource) const;
   std::vector<float> ReadFloatVector(const std::string& name) const;
+  // Flattened float array: `Elements * Columns` values, skipping each element's
+  // constant-buffer padding. Missing/optimized-out names return an empty span;
+  // a non-array or non-float name is rejected rather than reinterpreted.
+  std::vector<float> ReadFloatArray(const std::string& name) const;
   // Logical row-major values, independent of the reflected storage layout.
   // Missing/optimized-out names return nullopt; other types are rejected.
   std::optional<std::array<float,16>> ReadFloat4x4(const std::string& name) const;

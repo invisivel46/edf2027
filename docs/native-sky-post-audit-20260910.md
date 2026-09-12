@@ -359,3 +359,93 @@ the washout is introduced by the exposure/bloom chain, not by the scene render.
 `g_PostEffect_MiddleGray` 0.8 and `g_PostEffect_LuminanceWhite` 1.5 match the
 retail constants, so the next trace should target the luminance reduction chain
 that produces the 1x1 tone value, not the final pass.
+
+## Post chain exonerated; shared-constant divergence found instead (2026-09-12)
+
+Traced the washout end to end against the decoded retail `PostEffect.dxsl`.
+Every stage of the chain does what the source says, so the brightness defect is
+**not** in post-processing.
+
+### What was checked, and why each is now ruled out
+
+Added `ShaderBindings::ReadFloatArray` (flattened float arrays, skipping the
+16-byte constant-buffer element padding; WARP tests cover the layout, a matrix,
+a plain vector and the reverse misuse) and extended the opt-in post-chain
+capture to log the sampling geometry and the true HDR range of each pass input.
+
+- **Reduction chain.** 1280x720 -> 640x360 -> 320x180 -> 160x90 -> 80x45 ->
+  40x22 (Mono) -> 16x16 -> 8x8 -> 4x4 -> 2x2 -> 1x1. Mean luminance is
+  preserved throughout (0.4403 -> 0.4443), so no stage loses or gains energy.
+- **Downsample offsets.** `m_DownsampleUVOffset` is a 2x2 box in the +UV
+  quadrant at exactly one source texel: pass 1 uses (0,0), (1/1280,0),
+  (1/1280,1/720), (0,1/720). With the pixel-centre shift now enabled this lands
+  on a disjoint 2x2 source box, matching the standalone oracle.
+- **Blur kernel.** `m_GaussBlurUVOffset` is a 15-tap sigma=3 Gaussian whose
+  weights sum to **1.2349775**, i.e. an authored 1.25x gain per pass. The
+  captured means grow x1.238 and x1.233 across the two passes - the kernel is
+  applied exactly as authored. This was the main suspicion and it is disproved.
+- **Constants.** `g_PostEffect_MiddleGray` 0.8 and `g_PostEffect_ToneMap` 0.8
+  are genuinely supplied by the game (the authored defaults are 0.5 and 1.0),
+  and `LuminanceWhite` 1.5 matches. Exposure `0.8/(tone+0.001)` with tone 0.478
+  gives 1.67, and the Reinhard curve plus additive bloom reproduce the captured
+  output mean. The checker's 12/12 arithmetic cases already covered the algebra.
+
+### The actual defects
+
+**1. Negative radiance in the scene target.** The new `InspectNativeHdrColor`
+reports the unquantized range of each post input - the BMP capture clamps to
+[0,1] and hid this. At frame 600 the 1280x720 scene reads
+min = (-24.70, -24.20, -18.64), max = (2.98, 2.93, 3.17), nonfinite 0.
+Negative colour is not merely wrong, it is *inverted* by the tone curve: for
+C = -24.7, exposure gives -41.2, `C *= (1+C/1.5)` gives +1092 and `C /= (1+C)`
+gives 0.999, so a large negative pixel renders as saturated **white**.
+
+`FindNativeInvalidColorPixel` now optionally stops on a channel at or below -1
+(`--edf_native_probe_negative`), reusing the existing invalid-RGB draw probe.
+It named the first producer at frame 600: pixel 757,590, indexed draw 1011222,
+`VS_Blend` / `PS_Main` of source `0x91d077f54e255d81` (c_Mech01-shaped skinned
+material), rgba = (-1.366, -1.254, -1.149, 1). `Lighting()` cannot go negative
+(`lit` clamps both terms and the hemisphere lerp is in range) and HLSL
+`smoothstep` saturates, so fog cannot either; the remaining unclamped operation
+in `PS_Main` is `lerp(Dtex*LC, texCUBE(...), m_RefrectionRate*Pr.z)`, which
+extrapolates when that factor exceeds 1. That is a hypothesis, not yet measured.
+
+**2. Common.fx globals reach only one shader stage per effect.** The probe's
+constant dump showed the vertex and pixel stage of *the same draw, from the same
+source file*, holding different values for the same global. A bounded audit
+(`--edf_native_shared_constant_audit=N`) confirms it is systemic: over 20,000
+indexed draws, **117,342 mismatching reads across 112 distinct
+(vertex, pixel, parameter) combinations and 7 distinct effect sources**.
+
+Example, `0x9b2c2827c6c18465`, five different vertex entries against one
+`PS_Main`, with the vertex stage on the authored defaults:
+
+| global | vertex stage | pixel stage | Common.fx default |
+|---|---|---|---|
+| `g_LightVector` | 0.577,-0.577,0.577 | 0.5906,-0.7007,-0.4004 | 0.577,-0.577,0.577 |
+| `g_LightDiffuse` | 0.7,0.7,0.7,1 | 1.7,1.7,1.7,1 | 0.7,0.7,0.7,1 |
+| `g_HemiSphereColor1` | 0.65,0.7,0.8 | 0.41,0.44,0.5 | 0.65,0.7,0.8 |
+| `g_HemiSphereColor2` | 0.55,0.5,0.5 | 0.188,0.17,0.17 | 0.55,0.5,0.5 |
+| `g_FogParam` | -400,-600,-900,-1000 | -500,-1000,-900,-1000 | -400,-600,-900,-1000 |
+| `g_FogColor` | 0.7,0.7,1,0.5 | 0.75,0.85,0.95,1 | 0.7,0.7,1,0.5 |
+
+The polarity is not fixed: the earlier c_Mech01 probe had the *vertex* stage
+live and the *pixel* stage on defaults. Whichever stage the engine last set
+wins and the other keeps the value our HLSL compilation baked in.
+
+The strongest single case is `g_FogParam` on the vertex stage: `VS_Blend`
+demonstrably calls `FogParam(P)`, so the original vertex microcode used that
+constant too and the engine must have uploaded it. A stage sitting on the
+*authored source default* is evidence of a missing upload in this port, because
+the Xbox microcode has no such default to fall back to.
+
+One alternative must still be excluded before fixing: compiling from Common.fx
+source gives both stages every global, whereas the original per-stage microcode
+may have referenced fewer, so a stage could legitimately never be set for a
+constant its original microcode did not use. That does not apply to the
+`g_FogParam` case above, but it must be checked per parameter.
+
+Next: resolve where the native parameter path decides a stage's destination for
+a non-material global, and check it against the guest setter for both register
+files. Do not "fix" this by copying one stage's values to the other before that
+is established - the two register files are genuinely separate on this hardware.

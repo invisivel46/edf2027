@@ -255,6 +255,29 @@ std::vector<float> ShaderBindings::ReadFloatVector(const std::string& name) cons
   std::memcpy(values.data(),buffers_.at(v.buffer).bytes.data()+v.offset,v.size);
   return values;
 }
+std::vector<float> ShaderBindings::ReadFloatArray(const std::string& name) const {
+  const auto found=variables_.find(name);
+  if (found==variables_.end()) return {};
+  const auto& v=found->second;
+  if (v.type.Type!=D3D_SVT_FLOAT || !v.type.Elements || v.type.Members || v.type.Rows!=1 ||
+      !v.type.Columns || v.type.Columns>4 ||
+      (v.type.Class!=D3D_SVC_SCALAR && v.type.Class!=D3D_SVC_VECTOR))
+    throw std::runtime_error("diagnostic constant is not a float array: "+name);
+  // Array elements are 16-byte aligned; the last element keeps only its used
+  // columns. Reject any layout that does not match that exact contract.
+  constexpr uint32_t stride=16;
+  const uint32_t used=v.type.Columns*uint32_t(sizeof(float));
+  if (v.size!=(v.type.Elements-1)*stride+used)
+    throw std::runtime_error("diagnostic float array layout mismatch: "+name);
+  const auto& bytes=buffers_.at(v.buffer).bytes;
+  if (v.offset>bytes.size() || v.size>bytes.size()-v.offset)
+    throw std::runtime_error("diagnostic float array outside its buffer: "+name);
+  std::vector<float> values(size_t(v.type.Elements)*v.type.Columns);
+  for (uint32_t element=0;element<v.type.Elements;++element)
+    std::memcpy(values.data()+size_t(element)*v.type.Columns,
+                bytes.data()+v.offset+size_t(element)*stride,used);
+  return values;
+}
 std::optional<std::array<float,16>> ShaderBindings::ReadFloat4x4(const std::string& name) const {
   const auto found=variables_.find(name);
   if(found==variables_.end()) return std::nullopt;

@@ -65,6 +65,7 @@
 #include <rex/memory.h>
 #include <rex/thread/mutex.h>
 #include <cstring>
+#include <format>
 #include <bit>
 #include <atomic>
 #include <mutex>
@@ -122,6 +123,10 @@ REXCVAR_DEFINE_INT32(edf_native_probe_frame, 0, "EDF2027",
 REXCVAR_DEFINE_INT32(edf_native_probe_width, 1, "EDF2027", "Invalid-RGB diagnostic region width");
 REXCVAR_DEFINE_INT32(edf_native_probe_height, 1, "EDF2027", "Invalid-RGB diagnostic region height");
 REXCVAR_DEFINE_INT32(edf_native_probe_draw_limit, 4096, "EDF2027", "Maximum invalid-RGB diagnostic draws, capped at 65536");
+REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
+                   "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
+REXCVAR_DEFINE_INT32(edf_native_shared_constant_audit, 0, "EDF2027",
+                    "Compare Common.fx globals between the bound vertex and pixel stage for this many indexed draws; 0 disables (development)");
 REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
                    "Log inclusive CPU wall times for native/original graphics hook phases (development)");
 REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
@@ -539,6 +544,8 @@ struct Bridge {
   uint64_t output_unhandled=0;
   // Sentinel distinguishes "not observed" from a real zero register word.
   uint64_t vertex_center_word=UINT64_MAX;
+  uint64_t shared_constant_draws=0,shared_constant_mismatches=0;
+  std::set<std::array<uint32_t,3>> shared_constant_reported;
   uint64_t movie_uploads=0, movie_upload_errors=0;
   uint64_t movie_draws=0, movie_draw_errors=0;
   std::unique_ptr<ShaderBindings> movie_vertex,movie_pixel,movie_pixel_sd;
@@ -4454,6 +4461,44 @@ REX_HOOK_RAW(sub_821FE358) {
         mesh_timing.Finish();
         ++state.indexed_uploads;
         if (scene_draw) {
+          // Common.fx declares these once and the engine sets them per scene, so
+          // a bound vertex/pixel pair compiled from one source must see the same
+          // values. A stage still holding its authored default has not received
+          // the scene's upload; report the pair once per shader/name.
+          if(const auto audit_draws=REXCVAR_GET(edf_native_shared_constant_audit);
+             audit_draws>0 && state.shared_constant_draws<uint64_t(audit_draws)) {
+            ++state.shared_constant_draws;
+            try {
+              const auto& vertex_stage=bindings;
+              const auto& pixel_stage=*state.shaders.at(state.linked_pixel).bindings;
+              if(vertex_stage.shader().source_fingerprint==pixel_stage.shader().source_fingerprint) {
+                uint32_t name_index=0;
+                for(const auto* name:{"g_LightVector","g_LightDiffuse","g_HemiSphereVector",
+                    "g_HemiSphereColor1","g_HemiSphereColor2","g_FogParam","g_FogColor"}) {
+                  const auto in_vertex=vertex_stage.ReadFloatVector(name);
+                  const auto in_pixel=pixel_stage.ReadFloatVector(name);
+                  ++name_index;
+                  if(in_vertex.empty() || in_pixel.empty() || in_vertex==in_pixel) continue;
+                  ++state.shared_constant_mismatches;
+                  const std::array<uint32_t,3> identity{state.active_vertex,state.linked_pixel,name_index};
+                  if(!state.shared_constant_reported.insert(identity).second ||
+                     state.shared_constant_reported.size()>64) continue;
+                  std::string vertex_text,pixel_text;
+                  for(const auto value:in_vertex) vertex_text+=(vertex_text.empty()?"":",")+std::format("{}",value);
+                  for(const auto value:in_pixel) pixel_text+=(pixel_text.empty()?"":",")+std::format("{}",value);
+                  REXLOG_WARN("Native shared constant divergence: name={}, VS={:#x} {}, PS={:#x} {}, vertex=[{}], pixel=[{}], source={:#x} (one Common.fx global, two values in one draw)",
+                    name,state.active_vertex,vertex_stage.shader().entry.name,state.linked_pixel,
+                    pixel_stage.shader().entry.name,vertex_text,pixel_text,
+                    vertex_stage.shader().source_fingerprint);
+                }
+              }
+              if(state.shared_constant_draws==uint64_t(audit_draws))
+                REXLOG_INFO("Native shared constant audit: draws={}, mismatching_reads={}, distinct_pairs={} (same-source vertex/pixel pairs only)",
+                  state.shared_constant_draws,state.shared_constant_mismatches,state.shared_constant_reported.size());
+            } catch(const std::exception& error) {
+              REXLOG_ERROR("Native shared constant audit: {}",error.what());
+            }
+          }
           edf::native::HookTiming binding_timing(edf::native::HookPhase::IndexedBindings);
           const auto key=edf::native::ReadAuditedRenderStateWords(reader,ctx.r3.u32);
           auto found=state.render_states.find(key);
@@ -4552,14 +4597,19 @@ REX_HOOK_RAW(sub_821FE358) {
               const auto width=REXCVAR_GET(edf_native_probe_width),height=REXCVAR_GET(edf_native_probe_height);
               if(width<=0 || height<=0) throw std::runtime_error("invalid diagnostic region size");
               std::array<float,4> rgba{};
+              const bool probe_negative=REXCVAR_GET(edf_native_probe_negative);
               if((width==1 && height==1) || edf::native::FindNativeInvalidColorPixel(
                   *state.context.Get(),*scene.color.surface.Get(),sample_x,sample_y,
-                  uint32_t(width),uint32_t(height),sample_x,sample_y))
+                  uint32_t(width),uint32_t(height),sample_x,sample_y,probe_negative))
                 rgba=edf::native::ReadNativeColorPixel(*state.context.Get(),*scene.color.surface.Get(),sample_x,sample_y);
               ++state.color_probe_draws;
-              if(!std::isfinite(rgba[0]) || !std::isfinite(rgba[1]) || !std::isfinite(rgba[2])) {
+              const bool nonfinite=!std::isfinite(rgba[0]) || !std::isfinite(rgba[1]) || !std::isfinite(rgba[2]);
+              const bool negative=probe_negative &&
+                (rgba[0]<=-1.f || rgba[1]<=-1.f || rgba[2]<=-1.f);
+              if(nonfinite || negative) {
                 state.color_probe_done=true;
-                REXLOG_INFO("Native invalid RGB frame: next_output_candidate={}",state.indexed_output_frames+1);
+                REXLOG_INFO("Native invalid RGB frame: next_output_candidate={}, kind={}",
+                  state.indexed_output_frames+1,nonfinite?"nonfinite":"negative");
                 REXLOG_INFO("Native invalid RGB origin: pixel={},{} draw={} VS={:#x} {} source={:#x} PS={:#x} {} source={:#x} rgba={},{},{},{}",
                   sample_x,sample_y,state.indexed_submitted,state.active_vertex,bindings.shader().entry.name,
                   state.shaders.at(state.active_vertex).source_fingerprint,state.linked_pixel,
@@ -5452,6 +5502,16 @@ REX_HOOK_RAW(sub_821FD8F8) {
               const auto value=edf::native::ReadNativeColorPixel(*state.context.Get(),*texture.Get(),desc.Width/2,desc.Height/2);
               REXLOG_INFO("Native exact post input: frame={}, pass={}, name={}, {}x{}, view_format={}, center={},{},{},{}",
                 post_frame,pass,name,desc.Width,desc.Height,uint32_t(view_desc.Format),value[0],value[1],value[2],value[3]);
+              // The saved BMP clamps to [0,1]; the tone curve's behaviour depends
+              // on whether anything actually exceeds 1. Report the real range.
+              const auto hdr=edf::native::InspectNativeHdrColor(*state.context.Get(),*texture.Get());
+              REXLOG_INFO("Native exact post input range: frame={}, pass={}, name={}, pixels={}, nonfinite={}, min={},{},{}, max={},{},{}, mean={},{},{}, above_1={}, above_2={}, above_4={}, above_8={}",
+                post_frame,pass,name,hdr.pixels,hdr.nonfinite_pixels,
+                hdr.minimum[0],hdr.minimum[1],hdr.minimum[2],hdr.maximum[0],hdr.maximum[1],hdr.maximum[2],
+                hdr.mean[0],hdr.mean[1],hdr.mean[2],hdr.above[0],hdr.above[1],hdr.above[2],hdr.above[3]);
+              if(hdr.negative_pixels)
+                REXLOG_WARN("Native exact post input negatives: frame={}, pass={}, name={}, negative_pixels={} of {}, worst_at={},{} (negative radiance; the tone curve maps a large negative to white)",
+                  post_frame,pass,name,hdr.negative_pixels,hdr.pixels,hdr.worst_x,hdr.worst_y);
               const auto path=std::filesystem::path(post_prefix+".pass."+std::to_string(pass)+"."+pixel.shader().entry.name+".input."+name+"."+std::to_string(post_frame)+".bmp");
               if(std::filesystem::exists(path)) throw std::runtime_error("post input capture already exists");
               const auto bmp=edf::native::CaptureNativeHdrBmp(*state.context.Get(),*texture.Get());
@@ -5459,9 +5519,30 @@ REX_HOOK_RAW(sub_821FD8F8) {
               file.write(reinterpret_cast<const char*>(bmp.data()),bmp.size()); file.close();
               if(!file) throw std::runtime_error("post input capture write failed");
             }
-            for(const auto* name:{"g_PostEffect_MiddleGray","g_PostEffect_LuminanceWhite"}) {
+            for(const auto* name:{"g_PostEffect_MiddleGray","g_PostEffect_LuminanceWhite",
+                                  "g_PostEffect_ToneMap"}) {
               const auto value=pixel.ReadFloatVector(name);
               if(!value.empty()) REXLOG_INFO("Native exact post constant: frame={}, pass={}, {}={}",post_frame,pass,name,value[0]);
+            }
+            // The sampling geometry decides whether a reduction averages the
+            // intended footprint and whether a blur preserves its input's mean.
+            // Report the authored values, not an assumed normalized kernel.
+            if(const auto offsets=pixel.ReadFloatArray("m_DownsampleUVOffset");!offsets.empty()) {
+              std::string text;
+              for(size_t i=0;i+1<offsets.size();i+=2)
+                text+=std::format("{}({},{})",text.empty()?"":" ",offsets[i],offsets[i+1]);
+              REXLOG_INFO("Native exact post downsample offsets: frame={}, pass={}, count={}, uv={}",
+                post_frame,pass,offsets.size()/2,text);
+            }
+            if(const auto taps=pixel.ReadFloatArray("m_GaussBlurUVOffset");!taps.empty()) {
+              float weight_sum=0;
+              std::string text;
+              for(size_t i=0;i+2<taps.size();i+=3) {
+                weight_sum+=taps[i+2];
+                text+=std::format("{}({},{})*{}",text.empty()?"":" ",taps[i],taps[i+1],taps[i+2]);
+              }
+              REXLOG_INFO("Native exact post blur kernel: frame={}, pass={}, taps={}, weight_sum={}, offsets={}",
+                post_frame,pass,taps.size()/3,weight_sum,text);
             }
           } catch(const std::exception& error) {
             // Optional diagnostics must never suppress the real draw.
