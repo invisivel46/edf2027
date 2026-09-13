@@ -1036,11 +1036,16 @@ class D3D12Backend final : public NativeRenderBackend {
 
   uint64_t SignalShared(NativeBackendSharedSurface& surface) override {
     auto& concrete=static_cast<D3D12SharedSurface&>(surface);
-    const auto value=concrete.Advance();
     // A queue signal, so it lands after everything already submitted - which
     // is why this has to be called after Submit and not inside the frame.
+    //
+    // The value is only committed once the signal is accepted. Committing it
+    // first and failing would leave the consumer waiting on the GPU for a
+    // value that is never going to arrive, which is not an error anywhere - it
+    // is the window quietly never drawing again.
+    const auto value=concrete.value()+1;
     if(FAILED(gpu_.queue()->Signal(concrete.fence(),value))) return concrete.value();
-    return value;
+    return concrete.Advance();
   }
 
   bool WaitSharedFence(void* handle, uint64_t value) override {

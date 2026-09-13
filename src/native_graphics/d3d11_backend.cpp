@@ -821,11 +821,12 @@ class D3D11Backend final : public NativeRenderBackend {
     auto& concrete=static_cast<D3D11SharedSurface&>(surface);
     ComPtr<ID3D11DeviceContext4> fenced;
     if(FAILED(context_->QueryInterface(IID_PPV_ARGS(&fenced)))) return concrete.value();
-    const auto value=concrete.Advance();
-    // The immediate context orders this after the copy on its own; there is no
-    // separate queue to signal on.
-    fenced->Signal(concrete.fence(),value);
-    return value;
+    // Committed only once the signal is accepted; see the D3D12 backend's copy
+    // of this reasoning. The immediate context orders it after the copy on its
+    // own, so there is no separate queue to signal on.
+    const auto value=concrete.value()+1;
+    if(FAILED(fenced->Signal(concrete.fence(),value))) return concrete.value();
+    return concrete.Advance();
   }
 
   bool WaitSharedFence(void* handle, uint64_t value) override {
