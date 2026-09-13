@@ -115,15 +115,51 @@ prerequisite for both, and it pays 1.87x on D3D11 as it stands, with no
 backend migration at all. It should come first. D3D12 then removes the ceiling
 that restructuring runs into.
 
-### Caveat that could overturn this
+### The caveat, answered: why the current code cannot be threaded at all
 
-The simulated work is perfectly parallel: no shared state, no locks, no guest
-memory. The real work reads guest memory through the write-ownership registry
-and the parameter decode paths, and how much of that can run concurrently is
-not known yet. If it turns out to be mostly serialised, the 3.59x is an upper
-bound nothing reaches, and the honest answer would be that neither the
-restructuring nor the migration pays. That is the next thing to measure, and
-it should be measured before either is built.
+The simulated work above is perfectly parallel - no shared state, no locks.
+The real work is not, and the reason is sharper than "some shared state".
+
+Every registered shader owns one `ShaderBindings`, and inside it **one GPU
+constant buffer per constant slot**, with a CPU byte image beside it. A
+material activation writes that byte image; the draw that follows calls
+`Bind`, which does `UpdateSubresource` into that one buffer and clears a
+dirty flag. So a frame's 44,917 activations are not independent work items:
+they are overwrites of a single buffer per shader, and correctness depends
+entirely on each draw being submitted between one activation and the next.
+
+Two consequences, and the second is the important one.
+
+**Threads cannot be added to the current code, on either API.** This is not a
+data race that a mutex would fix. One buffer can hold one material's values
+at a time, so two draws with the same shader cannot be in flight with
+different constants no matter how they are synchronised. This game reuses
+shaders heavily - 130 shader entries across ~2,370 draws a frame - so that is
+the common case, not an edge one.
+
+This also corrects the D3D11 control in the table above. It assumed the
+non-API work could be split off and submitted serially. In the code as it
+stands it cannot: the "decode" *is* the mutation of the shared buffer. The
+1.87x is what a restructured D3D11 could reach, not what today's could.
+
+**The fix is the thing D3D12 already does.** Making draws independent means
+each carrying its own resolved constant bytes instead of pointing at one
+shared buffer. That is exactly `NativeBackendRecorder::SetConstants(stage,
+slot, bytes)`: bytes go into the fenced upload ring and their address into a
+root CBV, so every draw has its own copy and nothing is overwritten in place.
+The seam was designed that way because D3D11's renaming had no equivalent,
+and it turns out to be the same change parallelism needs.
+
+So the honest summary is better than the one the measurement alone gave:
+restructuring is required either way, it is the larger part of the work, and
+on D3D11 it buys 1.87x and then stops on serial submission, while the D3D12
+backend needs no further change to go past it.
+
+What remains genuinely unmeasured is contention elsewhere in the draw path -
+`model_buffers` retain/acquire, the render-state cache, the write-ownership
+registry. Those are ordinary shared containers and can be sharded or made
+lock-free; none has the one-buffer-per-shader property that makes the
+constant path structurally serial.
 
 ## Measured surface to replace
 
@@ -258,15 +294,20 @@ Working, each verified by reading pixels back rather than by inspection:
   checked so a flip or row swap cannot pass.
 - Indexed instanced draw with a per-instance input element: four instances,
   one per quadrant, nothing in the centre. This is the stage-0 primitive.
+- Presentation: flip-discard, three buffers, nine frames to a real window.
+- Parallel recording from two threads: 1,024 pixels from each, neither
+  writing into the other's half.
+- Occlusion query returning 2,016 samples, matching the pixel count the flat
+  triangle test measures independently.
+- Mipped texture upload, checked by sampling level 1 explicitly.
 
 Not done, and loud rather than silent about it:
 
-- **No presentation.** Frames render to a texture; nothing reaches a window.
+- **The bridge still calls D3D11 directly.** Not wired to the game.
 - No vertex-stage textures or samplers (no disc shader uses any).
-- No MSAA resolve, no query readback, no mipped texture upload.
-- `SupportsParallelRecording()` returns false, because it is stage 3.
-- **The bridge still calls D3D11 directly.** This backend is not wired to the
-  game; that is the 13 touchpoints and it is the largest remaining piece.
+- No MSAA resolve.
+- Wiring is the 13 touchpoints and is the largest remaining piece, and it
+  cannot be a translation: see the constant-buffer finding below.
 
 ### Consequence 5 is no longer a prediction
 
