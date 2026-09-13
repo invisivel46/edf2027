@@ -147,7 +147,10 @@ class NativeBackendRecorder {
 // encoded value and Vulkan does not. A backend encodes it however its API
 // wants; callers describe what they mean.
 enum class NativeBackendFilter : uint32_t { Point, Linear, Anisotropic };
-enum class NativeBackendAddress : uint32_t { Wrap, Mirror, Clamp, Border };
+// MirrorOnce is here because the renderer's guest sampler decode produces it;
+// leaving it out would make those samplers inexpressible through the seam and
+// would show as one surface tiled wrongly at its edges.
+enum class NativeBackendAddress : uint32_t { Wrap, Mirror, Clamp, Border, MirrorOnce };
 struct NativeBackendSamplerDesc {
   NativeBackendFilter min=NativeBackendFilter::Linear,mag=NativeBackendFilter::Linear,
                       mip=NativeBackendFilter::Linear;

@@ -23,10 +23,10 @@ struct NativeDxgiFormatInfo {
 // plausible size and silently reading the wrong number of bytes.
 inline NativeDxgiFormatInfo DescribeNativeDxgiFormat(uint32_t format) {
   switch(format) {
-    case 71: case 72: case 73:          // BC1_TYPELESS / BC1_UNORM / BC1_UNORM_SRGB
+    case 70: case 71: case 72:          // BC1_TYPELESS / BC1_UNORM / BC1_UNORM_SRGB
       return {8,4,4};
-    case 74: case 75: case 76:          // BC2
-    case 77: case 78: case 79:          // BC3
+    case 73: case 74: case 75:          // BC2_TYPELESS / BC2_UNORM / BC2_UNORM_SRGB
+    case 76: case 77: case 78:          // BC3_TYPELESS / BC3_UNORM / BC3_UNORM_SRGB
       return {16,4,4};
     case 28: case 29:                   // R8G8B8A8_UNORM / _SRGB
     case 87: case 91:                   // B8G8R8A8_UNORM / _SRGB

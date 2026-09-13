@@ -115,9 +115,27 @@ D3D11_TEXTURE_ADDRESS_MODE AddressMode(NativeBackendAddress address) {
     case NativeBackendAddress::Mirror: return D3D11_TEXTURE_ADDRESS_MIRROR;
     case NativeBackendAddress::Clamp: return D3D11_TEXTURE_ADDRESS_CLAMP;
     case NativeBackendAddress::Border: return D3D11_TEXTURE_ADDRESS_BORDER;
+    case NativeBackendAddress::MirrorOnce: return D3D11_TEXTURE_ADDRESS_MIRROR_ONCE;
   }
   throw std::runtime_error("unknown backend address mode");
 }
+
+// The shared format table is written in raw DXGI numbers so it does not drag a
+// graphics header into the API-independent side. That is only safe if the
+// numbers are right, and getting one wrong reads the wrong number of bytes per
+// texture rather than failing - so they are proved here instead of trusted.
+// Two of them were in fact wrong when first written: the BC groupings were
+// shifted by one, which put BC4's 8-byte blocks in with BC3's 16-byte ones.
+static_assert(DXGI_FORMAT_BC1_TYPELESS==70 && DXGI_FORMAT_BC1_UNORM==71 && DXGI_FORMAT_BC1_UNORM_SRGB==72);
+static_assert(DXGI_FORMAT_BC2_TYPELESS==73 && DXGI_FORMAT_BC2_UNORM==74 && DXGI_FORMAT_BC2_UNORM_SRGB==75);
+static_assert(DXGI_FORMAT_BC3_TYPELESS==76 && DXGI_FORMAT_BC3_UNORM==77 && DXGI_FORMAT_BC3_UNORM_SRGB==78);
+static_assert(DXGI_FORMAT_R32G32B32A32_FLOAT==2 && DXGI_FORMAT_R16G16B16A16_FLOAT==10);
+static_assert(DXGI_FORMAT_D32_FLOAT_S8X24_UINT==20 && DXGI_FORMAT_R10G10B10A2_UNORM==24);
+static_assert(DXGI_FORMAT_R8G8B8A8_UNORM==28 && DXGI_FORMAT_R8G8B8A8_UNORM_SRGB==29);
+static_assert(DXGI_FORMAT_R16G16_FLOAT==34 && DXGI_FORMAT_D32_FLOAT==40 && DXGI_FORMAT_R32_FLOAT==41);
+static_assert(DXGI_FORMAT_D24_UNORM_S8_UINT==45 && DXGI_FORMAT_R8G8_UNORM==49);
+static_assert(DXGI_FORMAT_R16_FLOAT==54 && DXGI_FORMAT_R8_UNORM==61);
+static_assert(DXGI_FORMAT_B8G8R8A8_UNORM==87 && DXGI_FORMAT_B8G8R8A8_UNORM_SRGB==91);
 
 constexpr uint32_t kTextureSlots=8,kSamplerSlots=8,kConstantSlots=4;
 
@@ -492,7 +510,10 @@ class D3D11Backend final : public NativeRenderBackend {
     native.AddressW=AddressMode(desc.w);
     native.MipLODBias=desc.mip_lod_bias;
     native.MaxAnisotropy=anisotropic?(desc.max_anisotropy?desc.max_anisotropy:16):1;
-    native.ComparisonFunc=D3D11_COMPARISON_NEVER;
+    // ALWAYS, matching what the renderer's own sampler decode emits. It is
+    // ignored for the standard reduction these filters use, but a backend that
+    // quietly differs from the thing it replaces is a bad habit to start.
+    native.ComparisonFunc=D3D11_COMPARISON_ALWAYS;
     for(size_t index=0;index<4;++index) native.BorderColor[index]=desc.border[index];
     native.MinLOD=desc.min_lod;
     native.MaxLOD=desc.max_lod;

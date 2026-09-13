@@ -125,6 +125,7 @@ D3D12_TEXTURE_ADDRESS_MODE AddressMode(NativeBackendAddress address) {
     case NativeBackendAddress::Mirror: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
     case NativeBackendAddress::Clamp: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
     case NativeBackendAddress::Border: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+    case NativeBackendAddress::MirrorOnce: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE;
   }
   throw std::runtime_error("unknown backend address mode");
 }
@@ -144,7 +145,8 @@ D3D12_SAMPLER_DESC SamplerDesc(const NativeBackendSamplerDesc& desc) {
   native.AddressW=AddressMode(desc.w);
   native.MipLODBias=desc.mip_lod_bias;
   native.MaxAnisotropy=anisotropic?(desc.max_anisotropy?desc.max_anisotropy:16):1;
-  native.ComparisonFunc=D3D12_COMPARISON_FUNC_NEVER;
+  // ALWAYS, matching the renderer's own sampler decode and the D3D11 backend.
+  native.ComparisonFunc=D3D12_COMPARISON_FUNC_ALWAYS;
   for(size_t index=0;index<4;++index) native.BorderColor[index]=desc.border[index];
   native.MinLOD=desc.min_lod;
   native.MaxLOD=desc.max_lod;
