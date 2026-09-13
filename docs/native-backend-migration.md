@@ -426,6 +426,51 @@ conformance test already says the two backends agree on everything the
 renderer does.
 
 
+## The frame-time finding that none of the reasoning found
+
+Everything above about threading was reasoned from per-draw arithmetic in a
+menu scene. Scripted combat, seven minutes of it, found something none of that
+arithmetic could have:
+
+| | frames | fps | `immediate.context_wait` |
+|---|---|---|---|
+| present inside the renderer's lock | 3,072 | 7.3 | 11.043 us/call |
+| present outside it | 24,508 | **58.4** | **0.021 us/call** |
+
+The draw thread was spending 21.4 seconds of a 420-second run blocked on the
+renderer's context mutex - about 11 microseconds on each of 1.9 million
+immediate draws. `immediate.native` fell from 12.250 to 1.239 us per call, and
+the entire difference is that wait. The work was always about 1.2 us.
+
+The cause was the host surface presenting inside the frame visitor, which
+holds the renderer's lock. Necessary for the D3D11 compositor, which shares
+the context; not necessary for a backend presenting from its own device, and
+expensive, because that present waits on a fence for a frame slot - holding
+the renderer's lock while waiting on a GPU.
+
+### Why the menu measurements missed it
+
+A menu scene is 97% vsync idle. Contention on a lock shows up as a wait, and
+a thread that has nothing to wait for does not contend. Every per-draw figure
+taken there was accurate and every conclusion drawn from it about where frame
+time goes was wrong, because the scene had no frame-time pressure to expose.
+
+The lesson is cheap to state and was expensive to learn: **measure the
+workload that matters, even when a representative one is inconvenient to
+produce.** `EDF_INPUT_SCRIPT=tools/native-combat-input.txt` drives it without
+a human at the controls, and it cost seven minutes.
+
+### Where the frame goes now
+
+At 58.4 fps, per frame: 8.6 ms waiting for vsync, 3.1 ms in the game's own 60
+Hz pacing sleep, 2.35 ms waiting for the GPU, and about 1.5 ms of our CPU work
+across the immediate and XUI paths. The game is at its frame cap.
+
+That is a UI-heavy scene, though - the run recorded no indexed draws at all,
+so the geometry path and the two binding optimisations built for it are still
+unmeasured. The combat script runs to 775 seconds and the run was cut off at
+420, which is the whole reason: it measured the menu.
+
 ## Threading: three designs, and why only one of them can work
 
 The simulation said 3.59x at four threads. Getting there needs a design that
