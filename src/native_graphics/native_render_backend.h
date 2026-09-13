@@ -71,6 +71,27 @@ class NativeBackendRenderTarget {
   // wrapper would transition it behind the first one's back.
   virtual NativeBackendTexture* texture() { return nullptr; }
 };
+// The producing half of cross-API sharing: a surface another API can open,
+// and a fence this backend signals when a frame has finished being written
+// into it. `OpenSharedTexture` and `WaitSharedFence` below are the consuming
+// half, and the two have existed apart until now - which is why a scene on one
+// backend could not reach a window on another.
+//
+// The handles stay owned here and stay valid for the life of the surface, so a
+// consumer may keep whatever it opened from them.
+class NativeBackendSharedSurface {
+ public:
+  virtual ~NativeBackendSharedSurface()=default;
+  virtual void* texture_handle() const=0;
+  virtual void* fence_handle() const=0;
+  virtual uint32_t width() const=0;
+  virtual uint32_t height() const=0;
+  virtual uint32_t format() const=0;
+  // The value a consumer must wait for before sampling. Increases with every
+  // publication; zero means nothing has been published yet.
+  virtual uint64_t value() const=0;
+};
+
 enum class NativeBackendQueryKind : uint32_t { Occlusion, Timestamp, TimestampDisjoint };
 class NativeBackendQuery {
  public:
@@ -140,6 +161,11 @@ class NativeBackendRecorder {
                                     uint32_t first_index,int32_t base_vertex,uint32_t first_instance)=0;
 
   virtual void CopyTexture(NativeBackendTexture& destination,NativeBackendTexture& source)=0;
+  // Copies a finished frame into a shared surface, resolving it if the source
+  // is multisampled. Recorded, not immediate: the copy has to be ordered
+  // against the draws that produced it.
+  virtual void CopyToShared(NativeBackendSharedSurface& destination,
+                            NativeBackendRenderTarget& source)=0;
   virtual void ResolveTarget(NativeBackendTexture& destination,NativeBackendRenderTarget& source)=0;
   virtual void UpdateBuffer(NativeBackendBuffer& buffer,uint32_t offset,std::span<const uint8_t> bytes)=0;
   // Replace a texture's top level. Bytes are tightly packed, smallest stride,
@@ -330,6 +356,17 @@ class NativeRenderBackend {
   // like a missing synchronisation. Returns false if the fence cannot be
   // opened, in which case the caller must not use the shared surface.
   virtual bool WaitSharedFence(void* handle, uint64_t value)=0;
+
+  // A surface for another API to sample, and the fence that says when it is
+  // finished. Null when this backend cannot share, which the caller must
+  // handle rather than assume.
+  virtual std::unique_ptr<NativeBackendSharedSurface> CreateSharedSurface(
+      const NativeBackendTextureDesc& desc)=0;
+  // Signals the shared fence after everything submitted so far, and returns the
+  // value signalled - which is what the consumer waits for. On a backend with a
+  // queue this is a queue signal, so it must follow Submit; on one without, the
+  // context's own ordering already places it after the copy.
+  virtual uint64_t SignalShared(NativeBackendSharedSurface& surface)=0;
 };
 
 // Backends register here; selection is by name so a run can A/B them without a

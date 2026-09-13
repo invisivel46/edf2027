@@ -75,6 +75,36 @@ class D3D11RenderTarget final : public NativeBackendRenderTarget {
   uint32_t width_,height_;
 };
 
+class D3D11SharedSurface final : public NativeBackendSharedSurface {
+ public:
+  D3D11SharedSurface(ComPtr<ID3D11Texture2D> texture, ComPtr<ID3D11Fence> fence,
+                     void* texture_handle, void* fence_handle,
+                     uint32_t width, uint32_t height, uint32_t format)
+      : texture_(std::move(texture)),fence_(std::move(fence)),
+        texture_handle_(texture_handle),fence_handle_(fence_handle),
+        width_(width),height_(height),format_(format) {}
+  ~D3D11SharedSurface() override {
+    if(texture_handle_) CloseHandle(texture_handle_);
+    if(fence_handle_) CloseHandle(fence_handle_);
+  }
+  void* texture_handle() const override { return texture_handle_; }
+  void* fence_handle() const override { return fence_handle_; }
+  uint32_t width() const override { return width_; }
+  uint32_t height() const override { return height_; }
+  uint32_t format() const override { return format_; }
+  uint64_t value() const override { return value_; }
+  ID3D11Texture2D* texture() const { return texture_.Get(); }
+  ID3D11Fence* fence() const { return fence_.Get(); }
+  uint64_t Advance() { return ++value_; }
+ private:
+  ComPtr<ID3D11Texture2D> texture_;
+  ComPtr<ID3D11Fence> fence_;
+  void* texture_handle_=nullptr;
+  void* fence_handle_=nullptr;
+  uint32_t width_,height_,format_;
+  uint64_t value_=0;
+};
+
 class D3D11Sampler final : public NativeBackendSampler {
  public:
   explicit D3D11Sampler(ComPtr<ID3D11SamplerState> state) : state_(std::move(state)) {}
@@ -300,6 +330,16 @@ class D3D11Recorder final : public NativeBackendRecorder {
   }
   void ResolveTarget(NativeBackendTexture& destination, NativeBackendRenderTarget& source) override {
     auto& to=static_cast<D3D11Texture&>(destination);
+    auto& from=static_cast<D3D11RenderTarget&>(source);
+    D3D11_TEXTURE2D_DESC description{};
+    from.resource()->GetDesc(&description);
+    if(description.SampleDesc.Count>1)
+      context_->ResolveSubresource(to.texture(),0,from.resource(),0,description.Format);
+    else context_->CopyResource(to.texture(),from.resource());
+  }
+  void CopyToShared(NativeBackendSharedSurface& destination,
+                    NativeBackendRenderTarget& source) override {
+    auto& to=static_cast<D3D11SharedSurface&>(destination);
     auto& from=static_cast<D3D11RenderTarget&>(source);
     D3D11_TEXTURE2D_DESC description{};
     from.resource()->GetDesc(&description);
@@ -743,6 +783,49 @@ class D3D11Backend final : public NativeRenderBackend {
     ComPtr<ID3D11ShaderResourceView> view;
     if(FAILED(device_->CreateShaderResourceView(texture.Get(),nullptr,&view))) return {};
     return std::make_unique<D3D11Texture>(std::move(texture),std::move(view),desc.width,desc.height);
+  }
+
+  std::unique_ptr<NativeBackendSharedSurface> CreateSharedSurface(
+      const NativeBackendTextureDesc& desc) override {
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width=desc.width;
+    description.Height=desc.height;
+    description.MipLevels=description.ArraySize=1;
+    description.Format=static_cast<DXGI_FORMAT>(desc.format);
+    description.SampleDesc={1,0};
+    description.Usage=D3D11_USAGE_DEFAULT;
+    description.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
+    description.MiscFlags=D3D11_RESOURCE_MISC_SHARED_NTHANDLE|D3D11_RESOURCE_MISC_SHARED;
+    ComPtr<ID3D11Texture2D> texture;
+    if(FAILED(device_->CreateTexture2D(&description,nullptr,&texture))) return nullptr;
+    ComPtr<IDXGIResource1> shareable;
+    void* texture_handle=nullptr;
+    if(FAILED(texture.As(&shareable)) ||
+       FAILED(shareable->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ|DXGI_SHARED_RESOURCE_WRITE,
+                                            nullptr,&texture_handle)))
+      return nullptr;
+    ComPtr<ID3D11Device5> fencing;
+    ComPtr<ID3D11Fence> fence;
+    void* fence_handle=nullptr;
+    if(FAILED(device_->QueryInterface(IID_PPV_ARGS(&fencing))) ||
+       FAILED(fencing->CreateFence(0,D3D11_FENCE_FLAG_SHARED,IID_PPV_ARGS(&fence))) ||
+       FAILED(fence->CreateSharedHandle(nullptr,GENERIC_ALL,nullptr,&fence_handle))) {
+      CloseHandle(texture_handle);
+      return nullptr;
+    }
+    return std::make_unique<D3D11SharedSurface>(std::move(texture),std::move(fence),
+      texture_handle,fence_handle,desc.width,desc.height,desc.format);
+  }
+
+  uint64_t SignalShared(NativeBackendSharedSurface& surface) override {
+    auto& concrete=static_cast<D3D11SharedSurface&>(surface);
+    ComPtr<ID3D11DeviceContext4> fenced;
+    if(FAILED(context_->QueryInterface(IID_PPV_ARGS(&fenced)))) return concrete.value();
+    const auto value=concrete.Advance();
+    // The immediate context orders this after the copy on its own; there is no
+    // separate queue to signal on.
+    fenced->Signal(concrete.fence(),value);
+    return value;
   }
 
   bool WaitSharedFence(void* handle, uint64_t value) override {

@@ -617,6 +617,19 @@ struct Bridge {
   // did not, which is why nothing needed this until now.
   bool scene_frame_open=false;
   uint64_t scene_frames=0;
+  // The scene's finished frame, in a surface the window's backend can open.
+  //
+  // This is how a scene drawn on one backend reaches a window presented by
+  // another. The D3D11 path hands the compositor an ID3D11ShaderResourceView
+  // instead, which is exactly what a D3D12 scene cannot produce.
+  std::unique_ptr<edf::native::NativeBackendSharedSurface> scene_shared;
+  uint32_t scene_shared_width=0,scene_shared_height=0;
+  // Set when a copy into it has been recorded and not yet signalled. The
+  // signal is a queue signal on the backends that have a queue, so it has to
+  // happen after the frame is submitted, not while it is still open.
+  bool scene_shared_pending=false;
+  uint64_t scene_shared_sequence=0;
+  bool scene_shared_refused=false;
   // What the last recorded draw left the recorder holding.
   //
   // The same reasoning the direct path already uses: 77.4% of this game's
@@ -784,6 +797,10 @@ Bridge& State() { static Bridge state; return state; }
 edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state);
 // The scene backend's recorder, with a frame open.
 edf::native::NativeBackendRecorder& SceneRecorderLocked(Bridge& state);
+// Records a copy of a finished frame into the scene's shared surface. Does
+// nothing when the scene is on D3D11, whose frames reach the window through
+// the compositor, or when the backend cannot share.
+void PublishSceneSharedLocked(Bridge& state,const NativeRenderTarget& output);
 // Closes the frame if one is open. Safe to call when none is.
 void SubmitSceneFrameLocked(Bridge& state);
 // Called under the registry lock at consumption, never from a writer callback.
@@ -1860,6 +1877,34 @@ edf::native::NativeBackendRecorder& SceneRecorderLocked(Bridge& state) {
   // be independent first, which is what moving them here is for.
   return backend.Recorder(0);
 }
+void PublishSceneSharedLocked(Bridge& state,const NativeRenderTarget& output) {
+  if(state.scene_shared_refused || !state.scene_backend || !output.backend_surface) return;
+  // The compositor already carries a D3D11 scene to the window, with the
+  // letterboxing and the display gamma it applies. Sharing one as well would
+  // be a second copy of a frame that already arrived.
+  if(state.scene_backend->name()=="d3d11") return;
+  const auto width=output.sampled.width,height=output.sampled.height;
+  if(!width || !height) return;
+  if(!state.scene_shared || state.scene_shared_width!=width || state.scene_shared_height!=height) {
+    edf::native::NativeBackendTextureDesc desc{};
+    desc.width=width; desc.height=height; desc.levels=1;
+    desc.format=output.format;
+    state.scene_shared=state.scene_backend->CreateSharedSurface(desc);
+    if(!state.scene_shared) {
+      // Said once: a backend that cannot share is a fact about the backend,
+      // not a per-frame event worth repeating sixty times a second.
+      state.scene_shared_refused=true;
+      REXLOG_WARN("Native scene frame sharing: the {} backend cannot create a shared surface, so its frames cannot reach the window",
+        std::string(state.scene_backend->name()));
+      return;
+    }
+    state.scene_shared_width=width; state.scene_shared_height=height;
+    REXLOG_INFO("Native scene frame sharing: {}x{} format={} on the {} backend; the window opens this rather than a copy through system memory",
+      width,height,output.format,std::string(state.scene_backend->name()));
+  }
+  SceneRecorderLocked(state).CopyToShared(*state.scene_shared,*output.backend_surface);
+  state.scene_shared_pending=true;
+}
 void SubmitSceneFrameLocked(Bridge& state) {
   if(!state.scene_frame_open) return;
   state.scene_frame_open=false;
@@ -1873,6 +1918,18 @@ void SubmitSceneFrameLocked(Bridge& state) {
     // A frame that cannot be submitted is lost either way; what must not
     // happen is the next frame finding one still open and refusing to start.
     REXLOG_ERROR("Native scene frame submit: {} (frame {})",error.what(),state.scene_frames);
+  }
+  // After the submit, never inside the frame: on a backend with a queue this
+  // is a queue signal, and signalling before the work is submitted would tell
+  // the consumer a frame is ready that has not been recorded yet.
+  if(state.scene_shared_pending) {
+    state.scene_shared_pending=false;
+    try {
+      state.scene_backend->SignalShared(*state.scene_shared);
+      ++state.scene_shared_sequence;
+    } catch(const std::exception& error) {
+      REXLOG_ERROR("Native scene frame sharing: {}",error.what());
+    }
   }
   for(const auto& message:state.scene_backend->DrainValidationMessages())
     REXLOG_WARN("Native scene backend validation: {}",message);
@@ -1946,6 +2003,19 @@ NativeRenderBackend* EnsureNativeRenderBackend() {
 bool VisitNativePresentationSharedFrame(NativeFrameHandoff::SharedFrame& shared,uint64_t& sequence) {
   auto& state=State();
   std::lock_guard lock(state.mutex);
+  // The scene's own shared surface first. When the scene is not on D3D11 this
+  // is the only route to the window, and when it is, this is empty and the
+  // handoff below is the one that has a frame.
+  if(state.scene_shared && state.scene_shared_sequence) {
+    shared.texture=state.scene_shared->texture_handle();
+    shared.fence=state.scene_shared->fence_handle();
+    shared.value=state.scene_shared->value();
+    shared.width=state.scene_shared->width();
+    shared.height=state.scene_shared->height();
+    shared.format=state.scene_shared->format();
+    sequence=state.scene_shared_sequence;
+    return bool(shared);
+  }
   if(!state.presentation_frames) return false;
   shared=state.presentation_frames->Shared();
   sequence=state.presentation_frames->SharedSequence();
@@ -4597,11 +4667,16 @@ REX_HOOK_RAW(sub_8219C840) {
       if(state.presentation_frames) {
         state.presentation_frames->Invalidate();
         if(scene.output.content_valid) {
-          try { if(!scene.output.surface) throw std::runtime_error(
-                  "frame publication needs a D3D11 texture; the scene is on the "+
-                  std::string(state.scene_backend?state.scene_backend->name():"?")+" backend");
-                state.presentation_frames->Publish(*scene.output.surface.Get(),edf::native::NativeFrameKind::PartialScene,
-            state.display_gamma?&*state.display_gamma:nullptr); }
+          // Two ways to the window, and which one applies is decided by what
+          // the scene is drawn on rather than by a flag. A D3D11 scene has an
+          // ID3D11ShaderResourceView the compositor can take; anything else
+          // has a shared surface the window's backend opens.
+          try {
+            if(scene.output.surface)
+              state.presentation_frames->Publish(*scene.output.surface.Get(),edf::native::NativeFrameKind::PartialScene,
+                state.display_gamma?&*state.display_gamma:nullptr);
+            else edf::native::PublishSceneSharedLocked(state,scene.output);
+          }
           catch(const std::exception& error) { REXLOG_ERROR("Native frame publication: {}",error.what()); }
         }
       }

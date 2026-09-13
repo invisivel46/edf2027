@@ -51,6 +51,9 @@ class NativeHostSurface : public std::enable_shared_from_this<NativeHostSurface>
   // Owned, and on its own device; see NativeHostBackendFactory.
   std::unique_ptr<NativeRenderBackend> present_backend_;
   std::unique_ptr<NativeBackendWindowPresenter> backend_presenter_;
+  // The last scene-shared frame presented, so the same one is not presented
+  // twice while the renderer is between frames.
+  uint64_t shared_scene_sequence_=0;
   NativeSharedSurface shared_;
   bool backend_present_failed_=false;
   bool logged_backend_present_=false;

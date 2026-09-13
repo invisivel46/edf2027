@@ -184,8 +184,35 @@ void NativeHostSurface::Paint() {
           paints_,frame!=nullptr,presented,GetModuleHandleW(L"rexgpu-xenos.dll")!=nullptr);
       if(frame) logged_game_frame_=true;
     };
-    if(!VisitNativePresentationFrame([&](auto& d,auto& c,auto& image,auto serial,auto,auto* gamma) {sequence=serial; render(d,c,&image,gamma);}))
-      VisitNativePresentationContext([&](auto& d,auto& c) {render(d,c,nullptr,nullptr);});
+    // A scene drawn on a backend that is not D3D11 has no view for the
+    // compositor to take, and arrives as a shared surface instead. It is
+    // presented directly: the compositor's letterboxing is what the backend
+    // presenter does anyway, and its display gamma is the one thing this route
+    // gives up - which is worth saying, because it is a visible difference and
+    // not an oversight.
+    bool shared_scene=false;
+    if(backend && !backend_present_failed_) {
+      NativeFrameHandoff::SharedFrame scene{};
+      uint64_t scene_sequence=0;
+      if(VisitNativePresentationSharedFrame(scene,scene_sequence) && scene &&
+         scene_sequence!=shared_scene_sequence_) {
+        if(!backend_presenter_)
+          backend_presenter_=std::make_unique<NativeBackendWindowPresenter>(*backend);
+        if(!backend_presenter_->refused()) {
+          pending_present={scene.texture,scene.fence,scene.value,
+                           scene.width,scene.height,scene.format};
+          shared_scene_sequence_=scene_sequence;
+          sequence=scene_sequence;
+          present_outside_lock=true;
+          presented=true;
+          shared_scene=true;
+        }
+      }
+    }
+    if(!shared_scene) {
+      if(!VisitNativePresentationFrame([&](auto& d,auto& c,auto& image,auto serial,auto,auto* gamma) {sequence=serial; render(d,c,&image,gamma);}))
+        VisitNativePresentationContext([&](auto& d,auto& c) {render(d,c,nullptr,nullptr);});
+    }
     // Outside the renderer's lock, so the draw thread is not held up by a
     // present it has no stake in. The fence the composite signalled is what
     // keeps the ordering; the lock was never what did.

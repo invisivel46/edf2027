@@ -34,12 +34,16 @@ class D3D12Buffer final : public NativeBackendBuffer {
       : tracked_(std::move(tracked)),bytes_(bytes),dynamic_(dynamic) {}
   size_t bytes() const override { return bytes_; }
   bool dynamic() const { return dynamic_; }
+  // A token that expires with this object, so a staged upload can tell whether
+  // the resource it was made for is still there.
+  std::shared_ptr<void> alive() const { return alive_; }
   TrackedResource& tracked() { return tracked_; }
   D3D12_GPU_VIRTUAL_ADDRESS address() const { return tracked_.resource->GetGPUVirtualAddress(); }
  private:
   TrackedResource tracked_;
   size_t bytes_;
   bool dynamic_=false;
+  std::shared_ptr<void> alive_=std::make_shared<char>();
 };
 
 class D3D12Texture final : public NativeBackendTexture {
@@ -59,12 +63,14 @@ class D3D12Texture final : public NativeBackendTexture {
   uint32_t height() const override { return height_; }
   TrackedResource& tracked() { return *tracked_; }
   const std::shared_ptr<TrackedResource>& shared() const { return tracked_; }
+  std::shared_ptr<void> alive() const { return alive_; }
   D3D12_CPU_DESCRIPTOR_HANDLE view() const { return view_; }
  private:
   std::shared_ptr<TrackedResource> tracked_;
   uint32_t width_,height_;
   D3D12_CPU_DESCRIPTOR_HANDLE view_;
   NativeD3D12CpuDescriptorHeap* heap_;
+  std::shared_ptr<void> alive_=std::make_shared<char>();
 };
 
 class D3D12RenderTarget final : public NativeBackendRenderTarget {
@@ -94,6 +100,36 @@ class D3D12RenderTarget final : public NativeBackendRenderTarget {
   bool depth_;
   D3D12_CPU_DESCRIPTOR_HANDLE view_;
   NativeD3D12CpuDescriptorHeap* heap_;
+};
+
+class D3D12SharedSurface final : public NativeBackendSharedSurface {
+ public:
+  D3D12SharedSurface(std::shared_ptr<TrackedResource> tracked, ComPtr<ID3D12Fence> fence,
+                     void* texture_handle, void* fence_handle,
+                     uint32_t width, uint32_t height, uint32_t format)
+      : tracked_(std::move(tracked)),fence_(std::move(fence)),
+        texture_handle_(texture_handle),fence_handle_(fence_handle),
+        width_(width),height_(height),format_(format) {}
+  ~D3D12SharedSurface() override {
+    if(texture_handle_) CloseHandle(texture_handle_);
+    if(fence_handle_) CloseHandle(fence_handle_);
+  }
+  void* texture_handle() const override { return texture_handle_; }
+  void* fence_handle() const override { return fence_handle_; }
+  uint32_t width() const override { return width_; }
+  uint32_t height() const override { return height_; }
+  uint32_t format() const override { return format_; }
+  uint64_t value() const override { return value_; }
+  TrackedResource& tracked() { return *tracked_; }
+  ID3D12Fence* fence() const { return fence_.Get(); }
+  uint64_t Advance() { return ++value_; }
+ private:
+  std::shared_ptr<TrackedResource> tracked_;
+  ComPtr<ID3D12Fence> fence_;
+  void* texture_handle_=nullptr;
+  void* fence_handle_=nullptr;
+  uint32_t width_,height_,format_;
+  uint64_t value_=0;
 };
 
 class D3D12Pipeline final : public NativeBackendPipeline {
@@ -403,6 +439,26 @@ class D3D12Recorder final : public NativeBackendRecorder {
     Transition(from.tracked(),D3D12_RESOURCE_STATE_COPY_SOURCE);
     Commands().CopyResource(to.tracked().resource.Get(),from.tracked().resource.Get());
   }
+  void CopyToShared(NativeBackendSharedSurface& destination,
+                    NativeBackendRenderTarget& source) override {
+    auto& to=static_cast<D3D12SharedSurface&>(destination);
+    auto& from=static_cast<D3D12RenderTarget&>(source);
+    const auto description=from.tracked().resource->GetDesc();
+    if(description.SampleDesc.Count>1) {
+      Transition(to.tracked(),D3D12_RESOURCE_STATE_RESOLVE_DEST);
+      Transition(from.tracked(),D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+      Commands().ResolveSubresource(to.tracked().resource.Get(),0,
+                                    from.tracked().resource.Get(),0,description.Format);
+    } else {
+      Transition(to.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
+      Transition(from.tracked(),D3D12_RESOURCE_STATE_COPY_SOURCE);
+      Commands().CopyResource(to.tracked().resource.Get(),from.tracked().resource.Get());
+    }
+    // Left readable by the other API. A shared surface has no state tracking
+    // on the consumer's side, so it has to be in a state that API can sample
+    // from before this command list ends.
+    Transition(to.tracked(),D3D12_RESOURCE_STATE_COMMON);
+  }
   void UpdateBuffer(NativeBackendBuffer& buffer, uint32_t offset, std::span<const uint8_t> bytes) override {
     auto& concrete=static_cast<D3D12Buffer&>(buffer);
     if(offset+bytes.size()>concrete.bytes())
@@ -612,7 +668,8 @@ class D3D12Backend final : public NativeRenderBackend {
     if(!initial.empty()) {
       if(initial.size()>desc.bytes)
         throw std::runtime_error("initial buffer contents are larger than the buffer");
-      pending_.push_back({buffer.get(),std::vector<uint8_t>(initial.begin(),initial.end())});
+      pending_.push_back({buffer->alive(),buffer.get(),
+                          std::vector<uint8_t>(initial.begin(),initial.end())});
     }
     return buffer;
   }
@@ -666,7 +723,8 @@ class D3D12Backend final : public NativeRenderBackend {
     // Staged on the next frame that opens, like buffer contents: there is no
     // command list to copy with until then.
     if(!initial.empty())
-      pending_textures_.push_back({texture.get(),std::vector<uint8_t>(initial.begin(),initial.end())});
+      pending_textures_.push_back({texture->alive(),texture.get(),
+                                   std::vector<uint8_t>(initial.begin(),initial.end())});
     return texture;
   }
 
@@ -863,9 +921,14 @@ class D3D12Backend final : public NativeRenderBackend {
     // Staged on recorder 0: these are one-off creation uploads, and putting
     // them anywhere else would make the frame's first list depend on which
     // thread happened to create a resource.
-    for(auto& upload:pending_) recorders_.front()->UpdateBuffer(*upload.buffer,0,upload.bytes);
+    // Skipped, not dropped silently in the dark: a resource destroyed before
+    // its contents were staged never had them, and uploading into freed memory
+    // is worse than an empty mesh.
+    for(auto& upload:pending_)
+      if(!upload.alive.expired()) recorders_.front()->UpdateBuffer(*upload.buffer,0,upload.bytes);
     pending_.clear();
-    for(auto& upload:pending_textures_) UploadTexture(*upload.texture,upload.bytes);
+    for(auto& upload:pending_textures_)
+      if(!upload.alive.expired()) UploadTexture(*upload.texture,upload.bytes);
     pending_textures_.clear();
   }
 
@@ -934,6 +997,52 @@ class D3D12Backend final : public NativeRenderBackend {
                                           texture_views_);
   }
 
+  std::unique_ptr<NativeBackendSharedSurface> CreateSharedSurface(
+      const NativeBackendTextureDesc& desc) override {
+    TrackedResource tracked;
+    // COMMON, because that is the state a shared resource has to be in for
+    // another API to pick it up, and where CopyToShared leaves it.
+    tracked.state=D3D12_RESOURCE_STATE_COMMON;
+    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                     D3D12_MEMORY_POOL_UNKNOWN,0,0};
+    D3D12_RESOURCE_DESC description{};
+    description.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width=desc.width;
+    description.Height=desc.height;
+    description.DepthOrArraySize=1;
+    description.MipLevels=1;
+    description.Format=static_cast<DXGI_FORMAT>(desc.format);
+    description.SampleDesc={1,0};
+    description.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if(FAILED(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_SHARED,&description,
+                                                     tracked.state,nullptr,
+                                                     IID_PPV_ARGS(&tracked.resource))))
+      return nullptr;
+    void* texture_handle=nullptr;
+    if(FAILED(gpu_.device()->CreateSharedHandle(tracked.resource.Get(),nullptr,GENERIC_ALL,
+                                                nullptr,&texture_handle)))
+      return nullptr;
+    ComPtr<ID3D12Fence> fence;
+    void* fence_handle=nullptr;
+    if(FAILED(gpu_.device()->CreateFence(0,D3D12_FENCE_FLAG_SHARED,IID_PPV_ARGS(&fence))) ||
+       FAILED(gpu_.device()->CreateSharedHandle(fence.Get(),nullptr,GENERIC_ALL,nullptr,&fence_handle))) {
+      CloseHandle(texture_handle);
+      return nullptr;
+    }
+    return std::make_unique<D3D12SharedSurface>(
+      std::make_shared<TrackedResource>(std::move(tracked)),std::move(fence),
+      texture_handle,fence_handle,desc.width,desc.height,desc.format);
+  }
+
+  uint64_t SignalShared(NativeBackendSharedSurface& surface) override {
+    auto& concrete=static_cast<D3D12SharedSurface&>(surface);
+    const auto value=concrete.Advance();
+    // A queue signal, so it lands after everything already submitted - which
+    // is why this has to be called after Submit and not inside the frame.
+    if(FAILED(gpu_.queue()->Signal(concrete.fence(),value))) return concrete.value();
+    return value;
+  }
+
   bool WaitSharedFence(void* handle, uint64_t value) override {
     if(!handle) return false;
     if(!shared_fence_ || shared_fence_handle_!=handle) {
@@ -996,10 +1105,27 @@ class D3D12Backend final : public NativeRenderBackend {
     return back_buffers_[swap_chain_->GetCurrentBackBufferIndex()].get();
   }
 
+  // Why the device went away, in words. DXGI_ERROR_DEVICE_REMOVED on its own
+  // says only that something the GPU was asked to do was fatal; the reason
+  // separates "this process did something invalid" from "the driver reset".
+  const char* RemovedReason() {
+    switch(gpu_.device()->GetDeviceRemovedReason()) {
+      case DXGI_ERROR_DEVICE_HUNG: return "the GPU hung on this device's own work";
+      case DXGI_ERROR_DEVICE_RESET: return "the device was reset, usually by another process hanging the GPU";
+      case DXGI_ERROR_DRIVER_INTERNAL_ERROR: return "the driver reported an internal error";
+      case DXGI_ERROR_INVALID_CALL: return "an invalid call was made on this device";
+      case DXGI_ERROR_DEVICE_REMOVED: return "the adapter was removed or its driver was updated";
+      case S_OK: return "the device reports no removal reason";
+      default: return "an unrecognised removal reason";
+    }
+  }
   void Present(bool vsync) override {
     if(!swap_chain_) throw std::runtime_error("Present with no window attached");
     if(open_) throw std::runtime_error("Present inside an open frame; submit it first");
-    Require(swap_chain_->Present(vsync?1:0,0),"present");
+    const auto result=swap_chain_->Present(vsync?1:0,0);
+    if(result==DXGI_ERROR_DEVICE_REMOVED || result==DXGI_ERROR_DEVICE_RESET)
+      throw std::runtime_error(std::string("D3D12 present failed: the device was removed - ")+RemovedReason());
+    Require(result,"present");
   }
 
   NativeD3D12Device& gpu() { return gpu_; }
@@ -1055,8 +1181,11 @@ class D3D12Backend final : public NativeRenderBackend {
     }
   }
 
-  struct PendingUpload { D3D12Buffer* buffer; std::vector<uint8_t> bytes; };
-  struct PendingTexture { D3D12Texture* texture; std::vector<uint8_t> bytes; };
+  // Weak, because the caller owns these and may destroy one before the next
+  // frame opens. A raw pointer here is read as a live object exactly once and
+  // hangs the GPU.
+  struct PendingUpload { std::weak_ptr<void> alive; D3D12Buffer* buffer; std::vector<uint8_t> bytes; };
+  struct PendingTexture { std::weak_ptr<void> alive; D3D12Texture* texture; std::vector<uint8_t> bytes; };
 
   NativeD3D12Device gpu_;
   ComPtr<ID3D12RootSignature> signature_;
