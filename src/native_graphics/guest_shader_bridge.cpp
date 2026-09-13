@@ -394,7 +394,12 @@ std::array<float,4> ResolveBlendFactorForDraw(uint32_t device,
     const NativeRenderStateSnapshots::BlendWords* live);
 template<class Reader>
 void BindGuestRenderState(const NativeRenderState& state,ID3D11DeviceContext& context,
-                          const Reader& reader,uint32_t device) {
+                          const Reader& reader,uint32_t device,uint64_t* generation=nullptr) {
+  // Every path that binds render state comes through here, so this is where a
+  // skip elsewhere has to be invalidated from. Same for BindActiveTarget.
+  // Passed in rather than fetched, because this is a template defined before
+  // the bridge state is.
+  if(generation) ++*generation;
   if(!state.requires_blend_factor) { state.Bind(context); return; }
   if(!REXCVAR_GET(edf_native_owned_render_state) && !REXCVAR_GET(edf_native_render_state_audit)) {
     state.Bind(context,ReadBlendFactor(reader,device)); return;
@@ -587,6 +592,15 @@ struct Bridge {
   // Run-length accounting for the XUI path, the same question the indexed
   // audit answered: how many consecutive draws differ only in things a batch
   // would carry per-item, and how many change state that a batch cannot.
+  // Bumped by every path that binds a target or render state, so the indexed
+  // path can tell whether anything has bound since it last did. Without this a
+  // skip would compare against its own cache and miss that another path had
+  // replaced the state underneath it.
+  uint64_t bind_generation=0,indexed_bind_generation=0;
+  edf::native::RenderStateWords indexed_bind_key{};
+  uint32_t indexed_bind_target=0,indexed_bind_scene=0,indexed_bind_output=0;
+  bool indexed_bind_valid=false;
+  uint64_t indexed_binds_skipped=0,indexed_binds_bound=0;
   uint64_t xui_batch_draws=0,xui_batch_runs=0,xui_batch_run=0,xui_batch_longest=0;
   uint64_t xui_batch_collapsible=0,xui_last_state=0,xui_last_constants=0;
   uint64_t xui_constants_differ=0;
@@ -1177,6 +1191,7 @@ void RegisterRenderTarget(const GuestReader& reader, uint32_t owner) {
   REXLOG_INFO("Native render target: owner={:#x}, texture={:#x}, surface={:#x}, {}x{}",owner,texture,surface,width,height);
 }
 void BindActiveTarget(Bridge& state) {
+  ++state.bind_generation;
   const auto found = state.render_targets.find(state.active_target);
   if (found == state.render_targets.end()) {
     const auto scene=state.scenes.find(state.active_scene);
@@ -4803,8 +4818,38 @@ REX_HOOK_RAW(sub_821FE358) {
           auto found=state.render_states.find(key);
           if (found==state.render_states.end()) found=state.render_states.emplace(key,
             edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
-          edf::native::BindActiveTarget(state);
-          edf::native::BindGuestRenderState(found->second,*state.context.Get(),reader,ctx.r3.u32);
+          // 77.4% of this game's indexed draws repeat the one before them in
+          // mesh, material and state, differing only in the constants an
+          // activation patches between them. The targets and render state do
+          // not change across such a run, so binding them again per draw is
+          // pure repetition - which is the batch, without needing the draws
+          // themselves to merge.
+          //
+          // Skipped only when nothing else has bound since we did: the
+          // generation catches another path replacing the state underneath us,
+          // which a comparison against our own cache never would. A state that
+          // needs a constant blend factor is never skipped, because the factor
+          // can change while the state words do not.
+          const bool same_binding=state.indexed_bind_valid &&
+            state.bind_generation==state.indexed_bind_generation &&
+            state.indexed_bind_key==key &&
+            state.indexed_bind_target==state.active_target &&
+            state.indexed_bind_scene==state.active_scene &&
+            state.indexed_bind_output==state.active_output &&
+            !found->second.requires_blend_factor;
+          if(same_binding) ++state.indexed_binds_skipped;
+          else {
+            edf::native::BindActiveTarget(state);
+            edf::native::BindGuestRenderState(found->second,*state.context.Get(),reader,ctx.r3.u32,
+                                             &state.bind_generation);
+            state.indexed_bind_valid=true;
+            state.indexed_bind_key=key;
+            state.indexed_bind_target=state.active_target;
+            state.indexed_bind_scene=state.active_scene;
+            state.indexed_bind_output=state.active_output;
+            state.indexed_bind_generation=state.bind_generation;
+            ++state.indexed_binds_bound;
+          }
           viewport.Bind(*state.context.Get());
           bindings.Bind(*state.context.Get());
           state.shaders.at(state.linked_pixel).bindings->Bind(*state.context.Get());
@@ -4884,6 +4929,11 @@ REX_HOOK_RAW(sub_821FE358) {
           // DrawIndexedInstanced replaces. Measure the run lengths before
           // building that: the mean run length is the draw-call reduction, and
           // a mean near 1 would mean there is nothing to collapse.
+          if(REXCVAR_GET(edf_native_batch_audit) && state.indexed_draws%1000000==0)
+            REXLOG_INFO("Native indexed binding reuse: bound={}, skipped={} ({:.1f}% of draws bound no target or render state, because the draw before them had already bound the same)",
+              state.indexed_binds_bound,state.indexed_binds_skipped,
+              (state.indexed_binds_bound+state.indexed_binds_skipped)
+                ?100.0*double(state.indexed_binds_skipped)/double(state.indexed_binds_bound+state.indexed_binds_skipped):0.0);
           if(REXCVAR_GET(edf_native_batch_audit)) {
             const std::array<uint32_t,12> batch_key{stream.resource,ib,decl,
               state.active_vertex,state.linked_pixel,ctx.r6.u32,ctx.r7.u32,uint32_t(ctx.r5.s32),
@@ -5376,7 +5426,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         auto render=state.render_states.find(key);
         if(render==state.render_states.end()) render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
         edf::native::BindActiveTarget(state);
-        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32); viewport.Bind(*state.context.Get());
+        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
         state.movie_vertex->Bind(*state.context.Get()); movie_pixel.Bind(*state.context.Get());
         state.movie_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,64),64});
         native_submitted=true;
@@ -5556,7 +5606,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         if(render==state.render_states.end())
           render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
         edf::native::BindActiveTarget(state);
-        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32); viewport.Bind(*state.context.Get());
+        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
         vertex.Bind(*state.context.Get()); pixel.Bind(*state.context.Get());
         xui_bind.Finish();
         edf::native::HookTiming xui_draw(edf::native::HookPhase::XuiDraw);
@@ -5652,7 +5702,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         if(render==state.render_states.end())
           render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
         edf::native::BindActiveTarget(state);
-        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32); viewport.Bind(*state.context.Get());
+        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
         state.font_vertex->Bind(*state.context.Get()); state.font_pixel->Bind(*state.context.Get());
         const size_t bytes=size_t(ctx.r5.u32)*16;
         state.font_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,bytes),bytes});
@@ -5740,7 +5790,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           if(render==state.render_states.end()) render=state.render_states.emplace(key,
             edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
           edf::native::BindActiveTarget(state);
-          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32); viewport.Bind(*state.context.Get());
+          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
           bindings.Bind(*state.context.Get()); ps.Bind(*state.context.Get());
           mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
           native_submitted=true; scene.frame_complete=false;
@@ -5820,7 +5870,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           if(render==state.render_states.end())
             render=state.render_states.emplace(snapshot.render,edf::native::CreateNativeRenderState(*state.device.Get(),snapshot.render)).first;
           edf::native::BindActiveTarget(state);
-          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32); viewport.Bind(*state.context.Get());
+          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
           bindings.Bind(*state.context.Get()); ps.Bind(*state.context.Get());
           if(lines) mesh.DrawLines(*state.context.Get(),0,uint32_t(indices.size()/2));
           else mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
@@ -5924,7 +5974,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           REXLOG_INFO("Native render state: cached={}, blend={:#x}, depth={:#x}, raster={:#x}, alpha={:#x}, write_mask={}, scissor={}",
                       state.render_states.size(),render_key[0],render_key[1],render_key[2],render_key[3],render_key[4],render_key[5]);
         }
-        edf::native::BindGuestRenderState(render_state->second,*state.context.Get(),reader,ctx.r3.u32);
+        edf::native::BindGuestRenderState(render_state->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation);
         const auto viewport=edf::native::ReadNativeDrawViewport(reader,ctx.r3.u32);
         if (state.immediate_draws<=15) {
           REXLOG_INFO("Native post pass: VS={}, PS={}, viewport={},{},{}x{}, depth={}..{}, reverse={}",
