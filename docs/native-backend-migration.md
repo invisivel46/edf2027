@@ -416,12 +416,13 @@ because each one is shared, safe, and verified by the tests that already exist:
 | mesh input layout | neutral, retained, owns its names, fingerprinted |
 | shader constants | `ConstantImages` - the bytes a draw carries itself |
 
-What remains is the thin half, and it is one connected change rather than five
-separable ones: vertex and index buffers become backend buffers, the draw site
-asks for a pipeline instead of binding a shader, textures and render targets
-become backend resources, and the compositor and presenter follow. It has to
-land together because a mesh drawn through a recorder needs a pipeline, which
-needs the layout and the render state, which needs the targets' formats.
+The thin half was expected to be one connected change rather than five
+separable ones - a mesh drawn through a recorder needs a pipeline, which needs
+the layout and the render state, which needs the targets' formats - and it
+mostly was. It landed in that order and each step was playable: buffers and
+textures, then targets and material bindings, then the frame lifecycle, then the
+draws. What did separate cleanly is the last piece, the compositor and the
+presenter, which are still D3D11 and are what "What is left" below describes.
 
 Doing it on the adopted D3D11 backend first means the game keeps working and
 any difference is a wiring mistake rather than a backend one - and the
