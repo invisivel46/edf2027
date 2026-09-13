@@ -12,6 +12,9 @@ if(WIN32)
     add_library(edf_native_d3d12 STATIC d3d12_device.cpp d3d12_descriptors.cpp d3d12_pipeline.cpp d3d12_backend.cpp)
     target_link_libraries(edf_native_d3d12 PUBLIC edf_native_effects d3d12 dxgi d3dcompiler)
 
+    add_executable(edf_native_backend_bench ../../tools/native_backend_bench.cpp)
+    target_link_libraries(edf_native_backend_bench PRIVATE edf_native_d3d12 d3d11 d3dcompiler)
+
     add_executable(edf_native_shader_check ../../tools/native_shader_check.cpp)
     target_link_libraries(edf_native_shader_check PRIVATE edf_native_d3d11)
     add_executable(edf_native_texture_check ../../tools/native_texture_check.cpp)

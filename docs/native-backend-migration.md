@@ -20,9 +20,11 @@ gameplay at 60 fps on a 20-core i7-14700:
 
 Two D3D11 properties cap what can be done about that:
 
-- **Per-draw driver cost.** Roughly 1-2 us per draw is spent inside the runtime
-  on validation, state resolution and hazard tracking. At 2,370 draws a frame
-  that is ~3 ms we cannot optimise away from the outside.
+- **Per-draw driver cost.** *This estimate was wrong; see "What the per-draw
+  cost actually is" below.* It originally read: roughly 1-2 us per draw is
+  spent inside the runtime on validation, state resolution and hazard
+  tracking, so at 2,370 draws a frame that is ~3 ms we cannot optimise away
+  from the outside. Measured, it is 0.30 us per draw and ~0.71 ms a frame.
 - **One immediate context.** Draws cannot be issued from more than one thread.
   Deferred contexts exist but are widely slower for many small draws, which is
   exactly this game's profile, so they are not a shortcut.
@@ -34,6 +36,41 @@ one of those 28 processors for submission.
 **Vulkan is the better second backend if only one is built.** The stated target
 is handheld PCs; handheld means Steam Deck means Linux, where D3D12 only runs
 through Proton.
+
+## What the per-draw cost actually is
+
+`edf_native_backend_bench` runs the same workload through both APIs: 2,370
+draws a frame, a material activation every 1.6 draws as measured, one texture
+per draw cycled through 64, a blend state change every 16 draws, and trivial
+geometry so the number is submission cost and not shading. Hardware, 300
+frames, after a discarded warm-up. Stable to about 2% across runs.
+
+| | per draw | per frame |
+|---|---|---|
+| D3D11 (dynamic constant buffer, WRITE_DISCARD) | 0.298 us | 0.71 ms |
+| D3D12 (root CBV from the upload ring) | 0.080 us | 0.19 ms |
+
+D3D12 is **3.7x cheaper per draw**, which is a real result and it holds when
+the workload changes state rather than repeating one bind.
+
+**But the frame-level claim above was wrong, and it was mine.** I estimated
+1-2 us of driver cost per draw and ~3 ms a frame. The measurement says 0.30 us
+and 0.71 ms, so moving to D3D12 saves about **0.52 ms of a 16.67 ms frame** -
+worth having, and nothing like the headline the "Why" section implied.
+
+Two consequences worth taking seriously:
+
+- The draw hook costs 1.83 us per draw in the game. If only 0.30 us of that is
+  the API, then **1.5 us is our own work** - guest reads, mesh lookup,
+  parameter decode - and that is where the larger prize is, not in the API.
+- Stage 0 makes this smaller still. Collapsing 77.4% of draws into instanced
+  ones cuts the API cost to roughly 0.16 ms a frame on D3D11 alone.
+
+What survives untouched is the argument that actually motivated the migration:
+**a single immediate context cannot submit from more than one thread.** 27 of
+28 logical processors are idle. That is a structural ceiling no amount of
+per-draw tuning reaches, and it needs stage 3. The per-draw saving is a bonus,
+not the reason.
 
 ## Measured surface to replace
 
