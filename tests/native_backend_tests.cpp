@@ -47,6 +47,9 @@ class StubBackend final : public edf::native::NativeRenderBackend {
   void AttachWindow(void*, uint32_t, uint32_t) override {}
   edf::native::NativeBackendRenderTarget* BackBuffer() override { return nullptr; }
   void Present(bool) override {}
+  std::unique_ptr<edf::native::NativeBackendTexture> OpenSharedTexture(
+      void*, const edf::native::NativeBackendTextureDesc&) override { return {}; }
+  bool WaitSharedFence(void*, uint64_t) override { return false; }
   void Submit() override {}
  private:
   std::string name_;
