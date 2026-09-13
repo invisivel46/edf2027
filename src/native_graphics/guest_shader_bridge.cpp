@@ -908,6 +908,11 @@ void ResolveScene(const GuestReader& reader,Bridge& state,uint32_t owner) {
     // and on the adopted D3D11 backend the recorder issues straight to the same
     // immediate context, so the ordering against the direct paths is exact.
     ResolveNativeRenderTarget(SceneRecorderLocked(state),scene.color);
+    // A converting resolve is a draw and binds its own targets, so whatever
+    // this code last bound - on the context or on the recorder - is no longer
+    // what is set.
+    ++state.bind_generation;
+    state.recorded={};
     state.textures.insert_or_assign(handle,scene.color.sampled);
     if (++state.scene_resolves<=5 || state.scene_resolves%1000==0)
       REXLOG_INFO("Native HDR scene resolve: count={}, texture={:#x}, initialized={}, frame_complete={}",
@@ -1558,6 +1563,11 @@ void EndRenderTarget(uint32_t owner) {
     // and on the adopted D3D11 backend the recorder issues straight to the same
     // immediate context, so the ordering against the direct paths is exact.
     ResolveNativeRenderTarget(SceneRecorderLocked(state),target.native);
+    // A converting resolve is a draw and binds its own targets, so whatever
+    // this code last bound - on the context or on the recorder - is no longer
+    // what is set.
+    ++state.bind_generation;
+    state.recorded={};
     state.textures.insert_or_assign(target.texture_handle,target.native.sampled);
     if (target.native.sampled.content_valid) ++state.target_resolves;
     else ++state.target_unwritten;
@@ -5973,7 +5983,11 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
             *state.movie_vertex,movie_pixel,viewport,key,
             edf::native::QuadStream::Layout(),edf::native::kNativeQuadLayoutId,
-            pair.vertex,pair.pixel,edf::native::NativeBackendTopology::TriangleList});
+            // The reversed-depth variant is a different compiled shader under the
+            // same guest handle, so it belongs in the identity: a cache keyed on
+            // the handle alone hands back the pipeline built from the other one.
+            (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),
+            pair.pixel,edf::native::NativeBackendTopology::TriangleList});
           state.movie_vertices->Draw(edf::native::EnsureSceneBackendLocked(state),recorder,
                                      {reader.Bytes(ctx.r6.u32,64),64});
         } else {
@@ -6169,7 +6183,11 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
             vertex,pixel,viewport,key,
             edf::native::PositionTriangleStream::Layout(),edf::native::kNativePositionLayoutId,
-            pair.vertex,pair.pixel,edf::native::NativeBackendTopology::TriangleList});
+            // The reversed-depth variant is a different compiled shader under the
+            // same guest handle, so it belongs in the identity: a cache keyed on
+            // the handle alone hands back the pipeline built from the other one.
+            (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),
+            pair.pixel,edf::native::NativeBackendTopology::TriangleList});
           state.xui_vertices->Draw(edf::native::EnsureSceneBackendLocked(state),recorder,
                                    {reader.Bytes(ctx.r6.u32,bytes),bytes});
         } else state.xui_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,bytes),bytes});
@@ -6265,7 +6283,11 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
             *state.font_vertex,*state.font_pixel,viewport,key,
             edf::native::QuadStream::Layout(),edf::native::kNativeQuadLayoutId,
-            pair.vertex,pair.pixel,edf::native::NativeBackendTopology::TriangleList});
+            // The reversed-depth variant is a different compiled shader under the
+            // same guest handle, so it belongs in the identity: a cache keyed on
+            // the handle alone hands back the pipeline built from the other one.
+            (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),
+            pair.pixel,edf::native::NativeBackendTopology::TriangleList});
           state.font_vertices->Draw(edf::native::EnsureSceneBackendLocked(state),recorder,
                                     {reader.Bytes(ctx.r6.u32,bytes),bytes});
         } else {
