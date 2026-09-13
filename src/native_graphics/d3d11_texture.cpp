@@ -75,11 +75,25 @@ NativeDepthTarget CreateNativeDepthTarget(NativeRenderBackend& backend,uint32_t 
   result.has_stencil=format!=DXGI_FORMAT_D32_FLOAT;
   return result;
 }
-void ClearNativeDepthTarget(ID3D11DeviceContext& context,NativeDepthTarget& target,
-                            bool depth,bool stencil,float value,uint8_t stencil_value) {
-  if (!target.target || (!depth && !stencil) || (stencil && !target.has_stencil) ||
+namespace {
+void ValidateDepthClear(const NativeDepthTarget& target,bool depth,bool stencil,float value) {
+  if ((!depth && !stencil) || (stencil && !target.has_stencil) ||
       (depth && (!std::isfinite(value) || value<0 || value>1)))
     throw std::runtime_error("invalid native depth/stencil clear");
+}
+}  // namespace
+void ClearNativeDepthTarget(NativeBackendRecorder& recorder,NativeDepthTarget& target,
+                            bool depth,bool stencil,float value,uint8_t stencil_value) {
+  if(!target.backend_target) throw std::runtime_error("invalid native depth/stencil clear");
+  ValidateDepthClear(target,depth,stencil,value);
+  recorder.ClearDepthStencil(*target.backend_target,depth,stencil,value,stencil_value);
+  if (depth) target.depth_valid=true;
+  if (stencil) target.stencil_valid=true;
+}
+void ClearNativeDepthTarget(ID3D11DeviceContext& context,NativeDepthTarget& target,
+                            bool depth,bool stencil,float value,uint8_t stencil_value) {
+  if (!target.target) throw std::runtime_error("invalid native depth/stencil clear");
+  ValidateDepthClear(target,depth,stencil,value);
   context.ClearDepthStencilView(target.target.Get(),(depth?D3D11_CLEAR_DEPTH:0)|(stencil?D3D11_CLEAR_STENCIL:0),value,stencil_value);
   if (depth) target.depth_valid=true;
   if (stencil) target.stencil_valid=true;
@@ -118,12 +132,32 @@ NativeRenderTarget CreateNativeRenderTarget(NativeRenderBackend& backend, uint32
   sampled.content_valid = false;
   return result;
 }
+namespace {
+// A triangle that covers the target, in clip space. Three vertices rather than
+// a quad's four: the extra area is clipped and it is one primitive instead of
+// two, which also removes the diagonal seam a quad can show.
+constexpr float kCoveringTriangle[]{-1.f,-1.f, 3.f,-1.f, -1.f,3.f};
+constexpr char kConvertVertexShader[]=R"(
+float4 VS(float2 position : POSITION) : SV_POSITION { return float4(position,0,1); }
+)";
+std::span<const uint8_t> BlobBytes(ID3DBlob& blob) {
+  return {static_cast<const uint8_t*>(blob.GetBufferPointer()),blob.GetBufferSize()};
+}
+Microsoft::WRL::ComPtr<ID3DBlob> CompileConvertShader(std::string_view source,const char* entry,
+                                                      const char* profile) {
+  Microsoft::WRL::ComPtr<ID3DBlob> code,errors;
+  if(FAILED(D3DCompile(source.data(),source.size(),"native-target-convert",nullptr,nullptr,entry,profile,
+                       D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors)))
+    throw std::runtime_error(std::string("native target conversion shader failed: ")+
+      (errors?static_cast<const char*>(errors->GetBufferPointer()):"unknown"));
+  return code;
+}
+}  // namespace
 static NativeRenderTarget CreateConvertedTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height,
   DXGI_FORMAT surface_format,DXGI_FORMAT sampled_format,std::string_view source,NativeRenderTarget::Conversion conversion) {
-  // The surface is read back by the conversion, so it is declared sampled. The
-  // converted result is written by a compute shader through a UAV, which is the
-  // one thing here the seam cannot express, and so the one thing still built
-  // from the device.
+  // Both halves are sampled render targets: the surface because the conversion
+  // reads it, and the converted result because the conversion draws into it and
+  // everything downstream samples it.
   NativeRenderTarget result;
   result.conversion=conversion;
   NativeBackendTextureDesc desc{};
@@ -133,42 +167,54 @@ static NativeRenderTarget CreateConvertedTarget(NativeRenderBackend& backend,uin
   if(!result.backend_surface) throw std::runtime_error("native converted render surface creation failed");
   AttachD3D11Handles(result);
   result.format=surface_format; result.samples=1;
-  auto* surface_texture=result.backend_surface->texture();
-  if(!surface_texture) throw std::runtime_error("a converted target surface cannot be sampled");
-  result.resolve_source=NativeD3D11TextureView(*surface_texture);
+  if(!result.backend_surface->texture())
+    throw std::runtime_error("a converted target surface cannot be sampled");
 
-  auto* device=NativeD3D11BackendDevice(backend);
-  if(!device)
-    throw std::runtime_error("a converting render target needs a compute pass, which the "+
-                             std::string(backend.name())+" backend cannot be given through the seam yet");
-  D3D11_TEXTURE2D_DESC sampled_desc{};
-  sampled_desc.Width=width; sampled_desc.Height=height;
-  sampled_desc.MipLevels=sampled_desc.ArraySize=1;
-  sampled_desc.SampleDesc={1,0};
-  sampled_desc.Format=sampled_format;
-  sampled_desc.Usage=D3D11_USAGE_DEFAULT;
-  sampled_desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
-  if (FAILED(device->CreateTexture2D(&sampled_desc,nullptr,&result.sampled.resource)) ||
-      FAILED(device->CreateShaderResourceView(result.sampled.resource.Get(),nullptr,&result.sampled.view)) ||
-      FAILED(device->CreateUnorderedAccessView(result.sampled.resource.Get(),nullptr,&result.resolve_destination)))
-    throw std::runtime_error("native converted sampled texture creation failed");
+  auto converted_desc=desc;
+  converted_desc.format=sampled_format;
+  result.converted_target=backend.CreateRenderTarget(converted_desc);
+  if(!result.converted_target) throw std::runtime_error("native converted sampled texture creation failed");
+  auto* converted_texture=result.converted_target->texture();
+  if(!converted_texture) throw std::runtime_error("a converted target result cannot be sampled");
+  result.sampled.backend=std::shared_ptr<NativeBackendTexture>(result.converted_target,converted_texture);
+  result.sampled.resource=NativeD3D11TextureResource(*converted_texture);
+  result.sampled.view=NativeD3D11TextureView(*converted_texture);
   result.sampled.width=width; result.sampled.height=height; result.sampled.mip_count=1;
   result.sampled.format=sampled_format;
   result.sampled.content_valid=false;
-  Microsoft::WRL::ComPtr<ID3DBlob> code,errors;
-  if (FAILED(D3DCompile(source.data(),source.size(),"native-target-resolve",nullptr,nullptr,"CS","cs_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors)) ||
-      FAILED(device->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&result.resolve_shader)))
-    throw std::runtime_error("native target resolve shader creation failed");
+
+  NativeBackendBufferDesc vertices{};
+  vertices.bytes=sizeof(kCoveringTriangle);
+  vertices.vertex=true;
+  result.convert_vertices=backend.CreateBuffer(vertices,
+    {reinterpret_cast<const uint8_t*>(kCoveringTriangle),sizeof(kCoveringTriangle)});
+  if(!result.convert_vertices) throw std::runtime_error("native conversion vertex buffer creation failed");
+
+  const auto vertex_code=CompileConvertShader(kConvertVertexShader,"VS","vs_5_0");
+  const auto pixel_code=CompileConvertShader(source,"PS","ps_5_0");
+  const NativeBackendInputElement layout[]{{"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,false,0}};
+  NativeBackendPipelineDesc pipeline{};
+  pipeline.vertex=BlobBytes(*vertex_code.Get());
+  pipeline.pixel=BlobBytes(*pixel_code.Get());
+  // One vertex shader and one pixel shader per conversion kind, so the ids are
+  // the kind itself rather than a guest handle.
+  pipeline.vertex_id=0x636f6e7600000001ull;
+  pipeline.pixel_id=0x636f6e7600000010ull+static_cast<uint64_t>(conversion);
+  pipeline.input_layout=layout;
+  pipeline.input_layout_id=0x636f6e7600000002ull;
+  pipeline.state=kNativeOpaqueCopyState;
+  pipeline.topology=NativeBackendTopology::TriangleList;
+  pipeline.render_targets=1;
+  pipeline.rtv_format[0]=sampled_format;
+  pipeline.sample_count=1;
+  result.convert_pipeline=&backend.CreatePipeline(pipeline);
   return result;
 }
 NativeRenderTarget CreateNativeLuminanceTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height) {
   return CreateConvertedTarget(backend,width,height,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R16G16B16A16_FLOAT,R"(
 Texture2D<float> Source : register(t0);
-RWTexture2D<float4> Destination : register(u0);
-[numthreads(8,8,1)] void CS(uint3 at:SV_DispatchThreadID) {
-  uint width,height; Destination.GetDimensions(width,height);
-  if (at.x<width && at.y<height) Destination[at.xy]=float4(Source.Load(int3(at.xy,0)),1,1,1);
+float4 PS(float4 position : SV_POSITION) : SV_TARGET {
+  return float4(Source.Load(int3(position.xy,0)),1,1,1);
 })",NativeRenderTarget::Conversion::luminance);
 }
 NativeRenderTarget CreateNativeBloomTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height) {
@@ -176,10 +222,8 @@ NativeRenderTarget CreateNativeBloomTarget(NativeRenderBackend& backend,uint32_t
   // back on sampling. Native RGBA storage directly represents logical color.
   return CreateConvertedTarget(backend,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R8G8B8A8_UNORM,R"(
 Texture2D<float4> Source : register(t0);
-RWTexture2D<float4> Destination : register(u0);
-[numthreads(8,8,1)] void CS(uint3 at:SV_DispatchThreadID) {
-  uint width,height; Destination.GetDimensions(width,height);
-  if (at.x<width && at.y<height) Destination[at.xy]=Source.Load(int3(at.xy,0));
+float4 PS(float4 position : SV_POSITION) : SV_TARGET {
+  return Source.Load(int3(position.xy,0));
 })",NativeRenderTarget::Conversion::rgba8);
 }
 NativeRenderTarget CreateNativeOpaqueFrameTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height) {
@@ -187,16 +231,14 @@ NativeRenderTarget CreateNativeOpaqueFrameTarget(NativeRenderBackend& backend,ui
   // channel-correct; no tone mapping or display gamma belongs in this resolve.
   return CreateConvertedTarget(backend,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R8G8B8A8_UNORM,R"(
 Texture2D<float4> Source : register(t0);
-RWTexture2D<float4> Destination : register(u0);
-[numthreads(8,8,1)] void CS(uint3 at:SV_DispatchThreadID) {
-  uint width,height; Destination.GetDimensions(width,height);
-  if (at.x<width && at.y<height) Destination[at.xy]=float4(Source.Load(int3(at.xy,0)).rgb,1);
+float4 PS(float4 position : SV_POSITION) : SV_TARGET {
+  return float4(Source.Load(int3(position.xy,0)).rgb,1);
 })",NativeRenderTarget::Conversion::rgba8);
 }
 bool ImportZeroLuminanceHistory(ID3D11DeviceContext& context,NativeRenderTarget& target,
                                 std::span<const uint8_t> initial_page) {
   if (target.sampled.width!=1 || target.sampled.height!=1 || target.conversion!=NativeRenderTarget::Conversion::luminance ||
-      !target.resolve_shader || !target.sampled.resource ||
+      !target.convert_pipeline || !target.sampled.resource ||
       target.content_valid || target.sampled.content_valid || initial_page.size()!=4096 ||
       !std::all_of(initial_page.begin(),initial_page.end(),[](uint8_t value) { return value==0; }))
     return false;
@@ -211,7 +253,7 @@ void ResolveNativeRgba8Frame(ID3D11DeviceContext& context,const NativeRenderTarg
   if(&source==&destination) throw std::runtime_error("direct frame resolve aliases source");
   destination.content_valid=destination.sampled.content_valid=false;
   if(!source.surface || !destination.surface ||
-     destination.conversion!=NativeRenderTarget::Conversion::rgba8 || !destination.resolve_shader)
+     destination.conversion!=NativeRenderTarget::Conversion::rgba8 || !destination.convert_pipeline)
     throw std::runtime_error("invalid direct frame conversion pair");
   D3D11_TEXTURE2D_DESC in{},out{};
   source.surface->GetDesc(&in); destination.surface->GetDesc(&out);
@@ -232,45 +274,49 @@ void ResolveNativeRgba8Frame(ID3D11DeviceContext& context,const NativeRenderTarg
   destination.content_valid=true;
   ResolveNativeRenderTarget(context,destination);
 }
+std::array<float,4> NativeClearColor(uint32_t argb) {
+  return {float((argb>>16)&255)/255.0f,float((argb>>8)&255)/255.0f,
+          float(argb&255)/255.0f,float(argb>>24)/255.0f};
+}
+void ClearNativeColorTarget(NativeBackendRecorder& recorder, NativeRenderTarget& target,
+                           uint32_t argb) {
+  if (!target.backend_surface) throw std::runtime_error("invalid native color clear target");
+  recorder.ClearColor(*target.backend_surface,NativeClearColor(argb));
+  target.content_valid=true;
+}
 void ClearNativeColorTarget(ID3D11DeviceContext& context, NativeRenderTarget& target,
                            uint32_t argb) {
   if (!target.target) throw std::runtime_error("invalid native color clear target");
-  const float color[]{float((argb>>16)&255)/255.0f,float((argb>>8)&255)/255.0f,
-                      float(argb&255)/255.0f,float(argb>>24)/255.0f};
-  context.ClearRenderTargetView(target.target.Get(),color);
+  const auto color=NativeClearColor(argb);
+  context.ClearRenderTargetView(target.target.Get(),color.data());
   target.content_valid=true;
+}
+// The conversion pass, recorded. Both overloads below end here for a
+// converting target; only the plain resolve differs between them.
+static void RecordConversion(NativeBackendRecorder& recorder, NativeRenderTarget& target) {
+  NativeBackendRenderTarget* colors[]{target.converted_target.get()};
+  recorder.SetRenderTargets(colors,nullptr);
+  recorder.SetViewport({0,0,float(target.sampled.width),float(target.sampled.height),0,1});
+  recorder.SetScissor({},false);
+  recorder.SetPipeline(*target.convert_pipeline);
+  recorder.SetTexture(NativeBackendStage::Pixel,0,target.backend_surface->texture());
+  recorder.SetVertexBuffer(0,*target.convert_vertices,8,0);
+  recorder.SetTopology(NativeBackendTopology::TriangleList);
+  recorder.Draw(3,0);
+}
+void ResolveNativeRenderTarget(NativeBackendRecorder& recorder, NativeRenderTarget& target) {
+  if (target.content_valid) {
+    if (target.convert_pipeline) RecordConversion(recorder,target);
+    else if (target.sampled.backend)
+      recorder.ResolveTarget(*target.sampled.backend,*target.backend_surface);
+  }
+  target.sampled.content_valid=target.content_valid;
 }
 void ResolveNativeRenderTarget(ID3D11DeviceContext& context, NativeRenderTarget& target) {
   // The caller unbinds sampled views before resolving. Multisampled color
   // resolves natively; single-sample surfaces retain the copy boundary.
-  if (target.content_valid && target.resolve_shader) {
-    // This native context does not use dynamic shader linkage. Preserve its
-    // compute slot0 and output-merger bindings across the conversion.
-    Microsoft::WRL::ComPtr<ID3D11ComputeShader> shader;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> input;
-    Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> output;
-    ID3D11RenderTargetView* targets[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT]{};
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth;
-    context.CSGetShader(&shader,nullptr,nullptr);
-    context.CSGetShaderResources(0,1,&input);
-    context.CSGetUnorderedAccessViews(0,1,&output);
-    context.OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,targets,&depth);
-    context.OMSetRenderTargets(0,nullptr,nullptr);
-    auto* source=target.resolve_source.Get(); auto* destination=target.resolve_destination.Get();
-    context.CSSetShader(target.resolve_shader.Get(),nullptr,0);
-    context.CSSetShaderResources(0,1,&source);
-    context.CSSetUnorderedAccessViews(0,1,&destination,nullptr);
-    context.Dispatch((target.sampled.width+7)/8,(target.sampled.height+7)/8,1);
-    ID3D11ShaderResourceView* no_input=nullptr;
-    ID3D11UnorderedAccessView* no_output=nullptr;
-    context.CSSetShaderResources(0,1,&no_input);
-    context.CSSetUnorderedAccessViews(0,1,&no_output,nullptr);
-    source=input.Get(); destination=output.Get();
-    context.CSSetShader(shader.Get(),nullptr,0);
-    context.CSSetShaderResources(0,1,&source);
-    context.CSSetUnorderedAccessViews(0,1,&destination,nullptr);
-    context.OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT,targets,depth.Get());
-    for (auto* view:targets) if (view) view->Release();
+  if (target.content_valid && target.convert_pipeline) {
+    throw std::runtime_error("a converting target's resolve is a draw and needs a recorder, not a context");
   } else if (target.content_valid) {
     D3D11_TEXTURE2D_DESC desc{}; target.surface->GetDesc(&desc);
     if(desc.SampleDesc.Count>1)

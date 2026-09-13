@@ -163,14 +163,19 @@ NativeIndexedMesh::NativeIndexedMesh(NativeRenderBackend& backend,const NativeSh
                         static_cast<DXGI_FORMAT>(element.format),element.slot,element.offset,
                         element.per_instance?D3D11_INPUT_PER_INSTANCE_DATA:D3D11_INPUT_PER_VERTEX_DATA,
                         element.step_rate});
-  // Still a D3D11 input layout, because the draw is still a D3D11 draw. On the
-  // seam this is part of the pipeline, and it goes when BindAndDraw does.
+  // A D3D11 input layout, for the direct draw. On a backend with no device to
+  // make one the layout travels in the pipeline instead, and a direct draw is
+  // already refused there for want of D3D11 buffers - so its absence is the
+  // normal state, not a failure.
+  //
+  // This is also the only place the layout is checked against the shader's
+  // input signature, which is why the error below is worth as much as it is.
+  // The other backends check the same thing when they build the pipeline.
   auto* d3d11_device=NativeD3D11BackendDevice(backend);
-  if(!d3d11_device)
-    throw std::runtime_error("a mesh cannot be built on the "+std::string(backend.name())+
-                             " backend yet: its draw path is still D3D11");
-  const auto layout_result=d3d11_device->CreateInputLayout(elements.data(),static_cast<UINT>(elements.size()),
-      shader.bytecode->GetBufferPointer(),shader.bytecode->GetBufferSize(),&layout_);
+  const auto layout_result=d3d11_device
+    ? d3d11_device->CreateInputLayout(elements.data(),static_cast<UINT>(elements.size()),
+        shader.bytecode->GetBufferPointer(),shader.bytecode->GetBufferSize(),&layout_)
+    : S_OK;
   if (FAILED(layout_result)) {
     std::ostringstream message;
     message << "native mesh shader input layout mismatch: entry=" << shader.entry.name
@@ -285,6 +290,19 @@ std::vector<uint8_t> NativeVertexBuffer::ConvertVertices(std::span<const uint8_t
 void NativeIndexedMesh::UpdateVertices(ID3D11DeviceContext& context,std::span<const uint8_t> vertices) {
   vertex_storage_->Update(context,vertices);
 }
+void NativeIndexedMesh::UpdateVertices(NativeBackendRecorder& recorder,std::span<const uint8_t> vertices) {
+  vertex_storage_->Update(recorder,vertices);
+}
+void NativeVertexBuffer::Update(NativeBackendRecorder& recorder,std::span<const uint8_t> vertices) {
+  if(!dynamic_vertices_) throw std::runtime_error("cannot update immutable native mesh");
+  auto snapshot=std::make_shared<const std::vector<uint8_t>>(vertices.begin(),vertices.end());
+  const auto converted=ConvertVertices(*snapshot);
+  // Whole-buffer, which is what a dynamic buffer takes: the backend renames the
+  // storage and the draws already recorded keep the vertices they were given.
+  recorder.UpdateBuffer(*storage_,0,converted);
+  source_=std::move(snapshot);
+  source_offset_=0; source_bytes_=vertices.size();
+}
 void NativeVertexBuffer::Update(ID3D11DeviceContext& context,std::span<const uint8_t> vertices) {
   if(!dynamic_vertices_) throw std::runtime_error("cannot update immutable native mesh");
   // Still the immediate context, not the recorder: the recorder needs an open
@@ -371,8 +389,8 @@ void NativeIndexedMesh::DrawLines(ID3D11DeviceContext& context,uint32_t first,ui
 }
 void NativeIndexedMesh::BindAndDraw(ID3D11DeviceContext& context,uint32_t first,uint32_t count,int32_t base,D3D11_PRIMITIVE_TOPOLOGY topology) const {
   auto* buffer=vertex_storage_->buffer_.Get(); const UINT offset=0;
-  if(!buffer || !index_storage_->buffer_)
-    throw std::runtime_error("this mesh's buffers are not on a D3D11 backend and cannot be drawn through a context");
+  if(!buffer || !index_storage_->buffer_ || !layout_)
+    throw std::runtime_error("this mesh is not on a D3D11 backend and cannot be drawn through a context");
   context.IASetInputLayout(layout_.Get());
   context.IASetVertexBuffers(0,1,&buffer,&stride_,&offset);
   context.IASetIndexBuffer(index_storage_->buffer_.Get(),index_storage_->format_,0);
@@ -458,7 +476,8 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
     std::shared_ptr<NativeVertexBuffer> vertex_storage,
     NativeSnapshotObserver before_snapshot,
     std::shared_ptr<const std::vector<uint8_t>> vertex_contents,size_t contents_offset,
-    std::shared_ptr<const std::vector<uint8_t>> index_contents) {
+    std::shared_ptr<const std::vector<uint8_t>> index_contents,
+    NativeBackendRecorder* recorder) {
   if(index_contents && (index_contents->size()!=indices.size() || index_contents->data()!=indices.data()))
     throw std::runtime_error("native index contents do not own supplied bytes");
   if(owned_indices && (index_bytes!=2 || owned_indices->bytes().data()!=indices.data() ||
@@ -519,12 +538,16 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
       if(dynamic_vertices_ && e.mesh->VertexStorage()->SourceBytes()==vertices.size()) {
         try {
           if(before_snapshot) before_snapshot();
-          // The update is still a D3D11 write; see NativeVertexBuffer::Update.
-          auto* update_device=NativeD3D11BackendDevice(backend);
-          if(!update_device) throw std::runtime_error("dynamic mesh vertices cannot be updated on the "+
-                                                      std::string(backend.name())+" backend yet");
-          Microsoft::WRL::ComPtr<ID3D11DeviceContext> context; update_device->GetImmediateContext(&context);
-          e.mesh->UpdateVertices(*context.Get(),vertices);
+          if(recorder) e.mesh->UpdateVertices(*recorder,vertices);
+          else {
+            // No recorder means the caller is still on the direct path, which
+            // writes through the immediate context.
+            auto* update_device=NativeD3D11BackendDevice(backend);
+            if(!update_device) throw std::runtime_error("dynamic mesh vertices on the "+
+              std::string(backend.name())+" backend need a recorder to update them");
+            Microsoft::WRL::ComPtr<ID3D11DeviceContext> context; update_device->GetImmediateContext(&context);
+            e.mesh->UpdateVertices(*context.Get(),vertices);
+          }
           e.used=tick_; ++updates_; return *e.mesh;
         } catch(...) { bytes_-=e.bytes; entries_.erase(found); throw; }
       }

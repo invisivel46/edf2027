@@ -137,6 +137,8 @@ REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
                      "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
 REXCVAR_DEFINE_STRING(edf_native_scene_backend, "d3d11", "EDF2027",
                      "Backend that owns the scene's own resources - its textures, meshes and targets - while the draw paths are being moved onto the backend interface one at a time. Must stay d3d11 until the last of them has moved: a ported path and an unported one have to share the same targets, and only the adopted d3d11 backend is this renderer's own device. Setting it to d3d12 before then gives the unported paths nothing to bind");
+REXCVAR_DEFINE_INT32(edf_native_upload_megabytes, 256, "EDF2027",
+                    "Upload-ring megabytes for a D3D12 backend. Every recorded draw stages its constants here and the ring is retired by fence, so it has to hold every frame still in flight. A frame that does not fit is refused with the high water it reached, which is what to set this from");
 REXCVAR_DEFINE_BOOL(edf_native_seam_draws, false, "EDF2027",
                    "Record the scene's draws through the backend interface instead of calling the D3D11 context directly. With --edf_native_scene_backend=d3d11 both draw the same thing on the same device, which is what makes this the A/B control for the port: a difference is a wiring mistake, because the backend underneath has not changed. It must be true before the scene backend can be anything else");
 REXCVAR_DEFINE_BOOL(edf_native_backend_present, true, "EDF2027",
@@ -631,6 +633,15 @@ struct Bridge {
     uint64_t bind_generation=0;
     uint64_t frame=0;
     const edf::native::NativeBackendPipeline* pipeline=nullptr;
+    // What that pipeline was built from. Compared here so a repeat draw does
+    // not go through the backend's cache at all: that lookup builds a string
+    // key per call, which is a heap allocation on a path that runs a million
+    // times a minute.
+    uint64_t vertex_id=0,pixel_id=0,layout_id=0;
+    edf::native::RenderStateWords state{};
+    edf::native::NativeBackendTopology topology=edf::native::NativeBackendTopology::TriangleList;
+    uint32_t render_targets=0,sample_count=0,dsv_format=0;
+    std::array<uint32_t,8> rtv_format{};
     std::array<edf::native::NativeBackendRenderTarget*,8> colors{};
     uint32_t color_count=0;
     edf::native::NativeBackendRenderTarget* depth=nullptr;
@@ -641,8 +652,12 @@ struct Bridge {
     uint64_t pixel_resources=0;
     bool blend_factor_needed=false;
     std::array<float,4> blend_factor{};
+    // The bytes last staged for each constant buffer, so an unchanged buffer
+    // is not copied into the upload ring again.
+    std::vector<std::vector<uint8_t>> vertex_constants,pixel_constants;
   } recorded;
   uint64_t recorded_draws=0,recorded_pipeline_skips=0,recorded_material_skips=0;
+  uint64_t recorded_constant_skips=0;
   // Declared after the backend so it is destroyed before it: the preview
   // thread uses the backend on every tick and must be stopped first.
   std::unique_ptr<edf::native::NativeD3D12Preview> backend_preview;
@@ -863,7 +878,10 @@ void ResolveScene(const GuestReader& reader,Bridge& state,uint32_t owner) {
     ID3D11ShaderResourceView* empty[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT]{};
     state.context->PSSetShaderResources(0,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,empty);
     state.context->VSSetShaderResources(0,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,empty);
-    ResolveNativeRenderTarget(*state.context.Get(),scene.color);
+    // Through the recorder, always: a converting target's resolve is a draw,
+    // and on the adopted D3D11 backend the recorder issues straight to the same
+    // immediate context, so the ordering against the direct paths is exact.
+    ResolveNativeRenderTarget(SceneRecorderLocked(state),scene.color);
     state.textures.insert_or_assign(handle,scene.color.sampled);
     if (++state.scene_resolves<=5 || state.scene_resolves%1000==0)
       REXLOG_INFO("Native HDR scene resolve: count={}, texture={:#x}, initialized={}, frame_complete={}",
@@ -1372,32 +1390,42 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
   // this renderer uses. A vertex shader that sampled something would have it
   // silently unbound, so it is refused instead: no backend root signature
   // declares vertex-stage textures, and this is where that would be noticed.
-  if(!draw.vertex.TextureImages().empty() || !draw.vertex.SamplerImages().empty())
+  if(draw.vertex.BindsResources())
     throw std::runtime_error("a vertex shader with textures or samplers cannot be recorded: "
                              "no backend root signature declares them");
-  edf::native::NativeBackendPipelineDesc desc{};
-  auto* vertex_code=draw.vertex.shader().bytecode.Get();
-  auto* pixel_code=draw.pixel.shader().bytecode.Get();
-  desc.vertex={static_cast<const uint8_t*>(vertex_code->GetBufferPointer()),vertex_code->GetBufferSize()};
-  desc.pixel={static_cast<const uint8_t*>(pixel_code->GetBufferPointer()),pixel_code->GetBufferSize()};
-  desc.vertex_id=draw.vertex_id;
-  desc.pixel_id=draw.pixel_id;
-  desc.input_layout=draw.layout;
-  desc.input_layout_id=draw.layout_id;
-  desc.state=draw.state;
-  desc.topology=draw.topology;
-  desc.render_targets=targets.count;
-  desc.rtv_format=targets.rtv_format;
-  desc.dsv_format=targets.dsv_format;
-  desc.sample_count=targets.samples;
-  auto& pipeline=backend.CreatePipeline(desc);
-  if(&pipeline!=last.pipeline || !same_frame) {
+  const bool same_pipeline=same_frame && last.pipeline &&
+    last.vertex_id==draw.vertex_id && last.pixel_id==draw.pixel_id &&
+    last.layout_id==draw.layout_id && last.state==draw.state && last.topology==draw.topology &&
+    last.render_targets==targets.count && last.sample_count==targets.samples &&
+    last.dsv_format==targets.dsv_format && last.rtv_format==targets.rtv_format;
+  if(same_pipeline) ++state.recorded_pipeline_skips;
+  else {
+    edf::native::NativeBackendPipelineDesc desc{};
+    auto* vertex_code=draw.vertex.shader().bytecode.Get();
+    auto* pixel_code=draw.pixel.shader().bytecode.Get();
+    desc.vertex={static_cast<const uint8_t*>(vertex_code->GetBufferPointer()),vertex_code->GetBufferSize()};
+    desc.pixel={static_cast<const uint8_t*>(pixel_code->GetBufferPointer()),pixel_code->GetBufferSize()};
+    desc.vertex_id=draw.vertex_id;
+    desc.pixel_id=draw.pixel_id;
+    desc.input_layout=draw.layout;
+    desc.input_layout_id=draw.layout_id;
+    desc.state=draw.state;
+    desc.topology=draw.topology;
+    desc.render_targets=targets.count;
+    desc.rtv_format=targets.rtv_format;
+    desc.dsv_format=targets.dsv_format;
+    desc.sample_count=targets.samples;
+    auto& pipeline=backend.CreatePipeline(desc);
     recorder.SetPipeline(pipeline);
     last.pipeline=&pipeline;
+    last.vertex_id=draw.vertex_id; last.pixel_id=draw.pixel_id; last.layout_id=draw.layout_id;
+    last.state=draw.state; last.topology=draw.topology;
+    last.render_targets=targets.count; last.sample_count=targets.samples;
+    last.dsv_format=targets.dsv_format; last.rtv_format=targets.rtv_format;
     // A blend factor belongs to the pipeline that was bound with it; a new
     // pipeline has not been given one.
     last.blend_factor_needed=false;
-  } else ++state.recorded_pipeline_skips;
+  }
   if(DecodeNativeRenderState(draw.state).requires_blend_factor) {
     const auto factor=GuestBlendFactorForDraw(reader,device);
     if(!last.blend_factor_needed || factor!=last.blend_factor) {
@@ -1405,12 +1433,29 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
       last.blend_factor=factor; last.blend_factor_needed=true;
     }
   }
-  // Constants are always re-sent: an activation patches them between draws,
-  // which is the whole reason a run of otherwise identical draws exists.
-  for(const auto& image:draw.vertex.ConstantImages())
-    recorder.SetConstants(edf::native::NativeBackendStage::Vertex,image.slot,image.bytes);
-  for(const auto& image:draw.pixel.ConstantImages())
-    recorder.SetConstants(edf::native::NativeBackendStage::Pixel,image.slot,image.bytes);
+  // Constants are re-sent when they differ. An activation patches the vertex
+  // constants between draws, which is the whole reason a run of otherwise
+  // identical draws exists - but the pixel constants usually do not move, and
+  // every re-send stages a copy in the backend's upload ring. Comparing the
+  // bytes costs a memcmp and saves that copy.
+  const auto send=[&](edf::native::NativeBackendStage stage,
+                      std::vector<std::vector<uint8_t>>& sent,
+                      const std::vector<edf::native::ShaderBindings::ConstantImage>& images) {
+    if(sent.size()<images.size()) sent.resize(images.size());
+    for(size_t index=0;index<images.size();++index) {
+      const auto& image=images[index];
+      auto& last_bytes=sent[index];
+      if(same_frame && last_bytes.size()==image.bytes.size() &&
+         std::equal(last_bytes.begin(),last_bytes.end(),image.bytes.begin())) {
+        ++state.recorded_constant_skips;
+        continue;
+      }
+      recorder.SetConstants(stage,image.slot,image.bytes);
+      last_bytes.assign(image.bytes.begin(),image.bytes.end());
+    }
+  };
+  send(edf::native::NativeBackendStage::Vertex,last.vertex_constants,draw.vertex.ConstantImages());
+  send(edf::native::NativeBackendStage::Pixel,last.pixel_constants,draw.pixel.ConstantImages());
   if(&draw.pixel!=last.pixel || draw.pixel.resource_generation()!=last.pixel_resources || !same_frame) {
     for(const auto& image:draw.pixel.TextureImages())
       recorder.SetTexture(edf::native::NativeBackendStage::Pixel,image.slot,image.texture);
@@ -1470,7 +1515,10 @@ void EndRenderTarget(uint32_t owner) {
     state.context->PSSetShaderResources(0,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,empty);
     state.context->VSSetShaderResources(0,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,empty);
     auto& target = found->second;
-    ResolveNativeRenderTarget(*state.context.Get(),target.native);
+    // Through the recorder, always: a converting target's resolve is a draw,
+    // and on the adopted D3D11 backend the recorder issues straight to the same
+    // immediate context, so the ordering against the direct paths is exact.
+    ResolveNativeRenderTarget(SceneRecorderLocked(state),target.native);
     state.textures.insert_or_assign(target.texture_handle,target.native.sampled);
     if (target.native.sampled.content_valid) ++state.target_resolves;
     else ++state.target_unwritten;
@@ -1772,6 +1820,9 @@ edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state) {
   if(name.empty()) throw std::runtime_error("the scene's resources were asked for but --edf_native_scene_backend is empty");
   if(!state.device) throw std::runtime_error("the scene's resources were asked for before the renderer had a device");
   edf::native::RegisterNativeD3D11Backend();
+  // Sized from a measured frame, not from a guess; see the cvar.
+  edf::native::SetNativeD3D12UploadMegabytes(
+    uint32_t((std::max)(16,REXCVAR_GET(edf_native_upload_megabytes))));
   edf::native::RegisterNativeD3D12Backend();
   state.scene_backend=name=="d3d11"
     ? edf::native::AdoptNativeD3D11Backend(*state.device.Get(),*state.context.Get())
@@ -4170,7 +4221,7 @@ REX_HOOK_RAW(sub_821340D0) {
                 surface,ctx.r5.u32,word(12384),word(12388),target.sampled.width,target.sampled.height);
             continue;
           }
-          edf::native::ClearNativeColorTarget(*state.context.Get(),target,ctx.r7.u32);
+          edf::native::ClearNativeColorTarget(edf::native::SceneRecorderLocked(state),target,ctx.r7.u32);
           if (++state.color_clears<=5)
             REXLOG_INFO("Native color clear: surface={:#x}, slot={}, ARGB={:#x}, initialized=true",surface,slot,ctx.r7.u32);
         }
@@ -4197,7 +4248,7 @@ REX_HOOK_RAW(sub_821340D0) {
           if (ctx.r6.u32&0x10) target.depth_valid=false;
           if (ctx.r6.u32&0x20) target.stencil_valid=false;
         } else {
-          edf::native::ClearNativeDepthTarget(*state.context.Get(),target,
+          edf::native::ClearNativeDepthTarget(edf::native::SceneRecorderLocked(state),target,
             (ctx.r6.u32&0x10)!=0,(ctx.r6.u32&0x20)!=0,float(ctx.f1.f64),uint8_t(ctx.r9.u32));
           ++state.depth_clears;
           if (state.depth_clears<=5 || state.depth_clears%1000==0)
@@ -4421,8 +4472,10 @@ REX_HOOK_RAW(sub_8219C7A8) {
       for (uint32_t i=0;i<4;++i) color[i]=std::bit_cast<float>(reader.Word(0x8257bfc0+i*4));
       {
         edf::native::HookTiming clear_timing(edf::native::HookPhase::SceneClear);
-        state.context->ClearRenderTargetView(scene.color.target.Get(),color);
-        edf::native::ClearNativeDepthTarget(*state.context.Get(),scene.depth,true,true,
+        auto& recorder=edf::native::SceneRecorderLocked(state);
+        recorder.ClearColor(*scene.color.backend_surface,{color[0],color[1],color[2],color[3]});
+        scene.color.content_valid=true;
+        edf::native::ClearNativeDepthTarget(recorder,scene.depth,true,true,
           std::bit_cast<float>(reader.Word(0x820009a4)),0);
       }
       // The whole surface now contains defined pixels. Native post-processing
@@ -6178,7 +6231,10 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
             edf::native::ImmediateStreamKey(vertices.size(),declaration,pair.vertex,ctx.r4.u32,viewport.reverse_depth),
             {elements,element_count*12},stride,
-            vertices,indices,2,owned_declaration,owned_indices);
+            vertices,indices,2,owned_declaration,owned_indices,{},{},{},{},0,{},
+            // Where this mesh's dynamic vertices are rewritten when the draw
+            // is recorded; the immediate context does it otherwise.
+            REXCVAR_GET(edf_native_seam_draws)?&edf::native::SceneRecorderLocked(state):nullptr);
           const auto key=edf::native::ReadAuditedRenderStateWords(reader,ctx.r3.u32);
           auto render=state.render_states.find(key);
           if(render==state.render_states.end()) render=state.render_states.emplace(key,
@@ -6268,7 +6324,10 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
             edf::native::ImmediateStreamKey(vertices.size(),declaration_handle,pair.vertex,ctx.r4.u32,viewport.reverse_depth),
             native_declaration->bytes(),stride,
-            vertices,indices,2,native_declaration,owned_indices);
+            vertices,indices,2,native_declaration,owned_indices,{},{},{},{},0,{},
+            // Where this mesh's dynamic vertices are rewritten when the draw
+            // is recorded; the immediate context does it otherwise.
+            REXCVAR_GET(edf_native_seam_draws)?&edf::native::SceneRecorderLocked(state):nullptr);
           auto render=state.render_states.find(snapshot.render);
           if(render==state.render_states.end())
             render=state.render_states.emplace(snapshot.render,edf::native::CreateNativeRenderState(*state.device.Get(),snapshot.render)).first;

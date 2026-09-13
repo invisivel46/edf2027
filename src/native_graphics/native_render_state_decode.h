@@ -53,4 +53,10 @@ struct NativeDecodedRenderState {
 // Throws std::runtime_error on state this renderer does not implement, which is
 // how an unsupported combination stays visible instead of being approximated.
 NativeDecodedRenderState DecodeNativeRenderState(const RenderStateWords& words);
+
+// Write every channel, blend nothing, test nothing: what a full-screen copy or
+// format conversion wants. Spelled as guest words rather than as a decoded
+// struct because a pipeline description takes the words, and because putting it
+// here means the copy passes and the game's own draws go through one decoder.
+inline constexpr RenderStateWords kNativeOpaqueCopyState{0x10001,0,0,0,15,0};
 }  // namespace edf::native

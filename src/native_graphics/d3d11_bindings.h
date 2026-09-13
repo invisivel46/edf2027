@@ -98,6 +98,10 @@ class ShaderBindings {
   // not moved; comparing the object's address would not catch an activation
   // re-pointing a texture inside it, which is the common case.
   uint64_t resource_generation() const { return resource_generation_; }
+  // Whether this shader binds any textures or samplers at all. Cheap on
+  // purpose: the recorded draw path asks this per draw, and the answer used to
+  // cost two vectors built and thrown away.
+  bool BindsResources() const { return !textures_.empty() || !samplers_.empty(); }
   bool HasAllTextureInputs() const;
   bool UsesTextureResource(ID3D11Resource& resource) const;
   bool UsesTexture(const NativeBackendTexture& texture) const;

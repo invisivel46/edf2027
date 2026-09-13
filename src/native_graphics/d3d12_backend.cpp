@@ -1084,11 +1084,26 @@ std::unique_ptr<NativeRenderBackend> CreateNativeD3D12Backend(const NativeD3D12O
   return std::make_unique<D3D12Backend>(options);
 }
 
+namespace {
+std::atomic<uint32_t>& UploadMegabytes() {
+  static std::atomic<uint32_t> megabytes{0};
+  return megabytes;
+}
+NativeD3D12Options RegistryOptions() {
+  NativeD3D12Options options;
+  if(const auto megabytes=UploadMegabytes().load(std::memory_order_relaxed))
+    options.upload_bytes=uint64_t(megabytes)<<20;
+  return options;
+}
+}  // namespace
+void SetNativeD3D12UploadMegabytes(uint32_t megabytes) {
+  UploadMegabytes().store(megabytes,std::memory_order_relaxed);
+}
 void RegisterNativeD3D12Backend() {
   static bool registered=false;
   if(registered) return;
   RegisterNativeRenderBackend("d3d12",[]() -> std::unique_ptr<NativeRenderBackend> {
-    return CreateNativeD3D12Backend();
+    return CreateNativeD3D12Backend(RegistryOptions());
   });
   // WARP as its own selectable backend, not a hidden fallback. It is how a
   // rendering difference gets attributed: if it reproduces on the software
@@ -1096,7 +1111,7 @@ void RegisterNativeD3D12Backend() {
   // lets the test suite drive the whole registry path on a machine with no
   // D3D12 hardware.
   RegisterNativeRenderBackend("d3d12-warp",[]() -> std::unique_ptr<NativeRenderBackend> {
-    NativeD3D12Options options;
+    auto options=RegistryOptions();
     options.prefer_warp=true;
     options.debug_layer=true;
     return CreateNativeD3D12Backend(options);

@@ -48,10 +48,14 @@ struct NativeRenderTarget {
   // will.
   uint32_t format = 0, samples = 1;
   bool content_valid = false;
-  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> resolve_source;
-  Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> resolve_destination;
-  Microsoft::WRL::ComPtr<ID3D11ComputeShader> resolve_shader;
   Conversion conversion=Conversion::none;
+  // A converting target's resolve is a full-screen draw that reads the surface
+  // and writes the converted result. It was a compute dispatch writing through
+  // an unordered-access view, which is the one thing in this renderer the seam
+  // cannot express - and a per-pixel copy is a draw on any API.
+  std::shared_ptr<NativeBackendRenderTarget> converted_target;
+  std::unique_ptr<NativeBackendBuffer> convert_vertices;
+  NativeBackendPipeline* convert_pipeline=nullptr;
 };
 struct NativeDepthTarget {
   std::shared_ptr<NativeBackendRenderTarget> backend_target;
@@ -68,14 +72,24 @@ NativeDepthTarget CreateNativeDepthTarget(NativeRenderBackend& backend,uint32_t 
                                           uint32_t height,DXGI_FORMAT format,uint32_t samples=1);
 void ClearNativeDepthTarget(ID3D11DeviceContext& context,NativeDepthTarget& target,
                             bool depth,bool stencil,float depth_value,uint8_t stencil_value);
+void ClearNativeDepthTarget(NativeBackendRecorder& recorder,NativeDepthTarget& target,
+                            bool depth,bool stencil,float depth_value,uint8_t stencil_value);
 NativeRenderTarget CreateNativeRenderTarget(NativeRenderBackend& backend, uint32_t width,
                                            uint32_t height, DXGI_FORMAT format,uint32_t samples=1);
 // Separate surface and sampled texture retain the guest's explicit resolve
 // boundary and permit a pass to sample the previous resolved contents.
 void ResolveNativeRenderTarget(ID3D11DeviceContext& context, NativeRenderTarget& target);
+// The same resolve recorded. Required for a converting target on a backend
+// that is not D3D11, because the conversion is a draw.
+void ResolveNativeRenderTarget(NativeBackendRecorder& recorder, NativeRenderTarget& target);
 // Full-surface packed ARGB clear. Does not implicitly resolve the sampled view.
 void ClearNativeColorTarget(ID3D11DeviceContext& context, NativeRenderTarget& target,
                            uint32_t argb);
+void ClearNativeColorTarget(NativeBackendRecorder& recorder, NativeRenderTarget& target,
+                           uint32_t argb);
+// The guest's packed ARGB clear colour, as the four floats a clear takes.
+// Shared so the two overloads cannot disagree about channel order.
+std::array<float,4> NativeClearColor(uint32_t argb);
 // Luminance pair: R32F surface -> half-precision R111 sampled values.
 // RGBA16F host storage represents the guest texture's fixed channel mapping.
 NativeRenderTarget CreateNativeLuminanceTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height);

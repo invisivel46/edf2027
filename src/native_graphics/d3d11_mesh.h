@@ -36,6 +36,7 @@ class NativeVertexBuffer {
     std::shared_ptr<const std::vector<uint8_t>> validated_snapshot={},size_t snapshot_offset=0);
   std::vector<uint8_t> ConvertVertices(std::span<const uint8_t> source) const;
   void Update(ID3D11DeviceContext& context,std::span<const uint8_t> source);
+  void Update(NativeBackendRecorder& recorder,std::span<const uint8_t> source);
   // The backend that made storage_, kept for the identity checks that used to
   // compare devices: sharing a converted buffer across backends would bind a
   // resource one of them has never seen.
@@ -89,6 +90,7 @@ class NativeIndexedMesh {
   // Same declaration/count only. WRITE_DISCARD preserves queued draws while
   // replacing changing immediate geometry without creating another GPU buffer.
   void UpdateVertices(ID3D11DeviceContext& context,std::span<const uint8_t> vertices);
+  void UpdateVertices(NativeBackendRecorder& recorder,std::span<const uint8_t> vertices);
   void Draw(ID3D11DeviceContext& context,uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
   // The same draw through a recorder. The pipeline carries the vertex layout
   // and the shaders, so the caller sets that; this sets the buffers and issues
@@ -162,7 +164,10 @@ class NativeMeshCache {
     // Must not mutate this cache or the supplied resource registry.
     NativeSnapshotObserver before_snapshot={},
     std::shared_ptr<const std::vector<uint8_t>> vertex_contents={},size_t contents_offset=0,
-    std::shared_ptr<const std::vector<uint8_t>> index_contents={});
+    std::shared_ptr<const std::vector<uint8_t>> index_contents={},
+    // Where a dynamic mesh's vertices are rewritten. Null means the caller is
+    // still on the direct path and the immediate context does it.
+    NativeBackendRecorder* recorder=nullptr);
   void Invalidate(uint32_t resource);
   void Clear();
   uint64_t hits() const { return hits_; }
