@@ -279,7 +279,7 @@ void NativeHostSurface::Paint() {
     if(ticker_) ticker_->Stop();
     if(window_) KillTimer(window_,reinterpret_cast<UINT_PTR>(this));
     else ReleaseResources();
-    REXLOG_ERROR("Native host surface stopped: {}",error.what());
+    REXLOG_ERROR("Native host surface stopped: {} (the producing device has signalled {} of {} asked for)",error.what(),shared_.completed(),shared_.value());
   }
 }
 LRESULT CALLBACK NativeHostSurface::WindowProcedure(HWND window,UINT message,WPARAM wparam,

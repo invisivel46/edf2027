@@ -33,6 +33,11 @@ class NativeSharedSurface {
   void* shared_texture() const { return shared_texture_; }
   void* shared_fence() const { return shared_fence_; }
   uint64_t value() const { return value_; }
+  // What the producing GPU has actually reached, as against the value signals
+  // have been *asked* for. A consumer stalled on a value this has not reached
+  // is waiting on work that was never dispatched, which is the one thing that
+  // cannot be told apart from any other hang after the fact.
+  uint64_t completed() const { return fence_?fence_->GetCompletedValue():0; }
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
   bool valid() const { return shared_texture_ && shared_fence_; }

@@ -24,8 +24,40 @@ void Require(HRESULT result, const char* what) {
 // some hardware and a validation error on the rest, so the state lives with
 // the resource and only the recorder is allowed to change it.
 struct TrackedResource {
+  // Constructed against the device it will be retired to. A resource whose
+  // last owner drops it is not necessarily one the GPU has finished with, and
+  // releasing it here rather than on the frame fence is a page fault waiting
+  // for the next draw that still names it; see NativeD3D12Device::Retire. The
+  // default constructor is for the resources the swap chain owns, which it
+  // reclaims on its own schedule and must not be held past.
+  TrackedResource()=default;
+  explicit TrackedResource(NativeD3D12Device& retire_to):retire_to_(&retire_to) {}
+  TrackedResource(TrackedResource&& other) noexcept
+      : resource(std::move(other.resource)),state(other.state),retire_to_(other.retire_to_) {
+    other.retire_to_=nullptr;
+  }
+  TrackedResource& operator=(TrackedResource&& other) noexcept {
+    if(this==&other) return *this;
+    Release();
+    resource=std::move(other.resource);
+    state=other.state;
+    retire_to_=other.retire_to_;
+    other.retire_to_=nullptr;
+    return *this;
+  }
+  TrackedResource(const TrackedResource&)=delete;
+  TrackedResource& operator=(const TrackedResource&)=delete;
+  ~TrackedResource() { Release(); }
+
   ComPtr<ID3D12Resource> resource;
   D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COMMON;
+
+ private:
+  void Release() {
+    if(retire_to_ && resource) retire_to_->Retire(std::move(resource));
+    resource.Reset();
+  }
+  NativeD3D12Device* retire_to_=nullptr;
 };
 
 class D3D12Buffer final : public NativeBackendBuffer {
@@ -667,7 +699,7 @@ class D3D12Backend final : public NativeRenderBackend {
   std::unique_ptr<NativeBackendBuffer> CreateBuffer(const NativeBackendBufferDesc& desc,
                                                     std::span<const uint8_t> initial) override {
     if(!desc.bytes) throw std::runtime_error("a zero-byte buffer cannot be created");
-    TrackedResource tracked;
+    TrackedResource tracked(gpu_);
     tracked.state=D3D12_RESOURCE_STATE_COMMON;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN,0,0};
@@ -700,7 +732,7 @@ class D3D12Backend final : public NativeRenderBackend {
 
   std::unique_ptr<NativeBackendTexture> CreateTexture(const NativeBackendTextureDesc& desc,
                                                       std::span<const uint8_t> initial) override {
-    TrackedResource tracked;
+    TrackedResource tracked(gpu_);
     tracked.state=D3D12_RESOURCE_STATE_COMMON;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN,0,0};
@@ -752,7 +784,7 @@ class D3D12Backend final : public NativeRenderBackend {
   }
 
   std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc) override {
-    TrackedResource tracked;
+    TrackedResource tracked(gpu_);
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN,0,0};
     if(desc.sampled && desc.samples>1)
@@ -994,7 +1026,7 @@ class D3D12Backend final : public NativeRenderBackend {
   std::unique_ptr<NativeBackendTexture> OpenSharedTexture(void* handle,
                                                           const NativeBackendTextureDesc& desc) override {
     if(!handle) return {};
-    TrackedResource tracked;
+    TrackedResource tracked(gpu_);
     // A surface another API owns and may still be writing. It arrives in
     // COMMON, which is the only state a shared resource can be handed over in.
     tracked.state=D3D12_RESOURCE_STATE_COMMON;
@@ -1012,7 +1044,7 @@ class D3D12Backend final : public NativeRenderBackend {
 
   std::unique_ptr<NativeBackendSharedSurface> CreateSharedSurface(
       const NativeBackendTextureDesc& desc) override {
-    TrackedResource tracked;
+    TrackedResource tracked(gpu_);
     // COMMON, because that is the state a shared resource has to be in for
     // another API to pick it up, and where CopyToShared leaves it.
     tracked.state=D3D12_RESOURCE_STATE_COMMON;
@@ -1069,7 +1101,10 @@ class D3D12Backend final : public NativeRenderBackend {
       shared_fence_handle_=handle;
     }
     // A queue-side wait, not a CPU one: the GPU stalls until the producer has
-    // signalled, and this thread carries on recording.
+    // signalled, and this thread carries on recording. Remembered because a
+    // wait that is never satisfied is indistinguishable from any other hang
+    // once the device is gone, and this is the one number that separates them.
+    shared_wait_value_=value;
     return SUCCEEDED(gpu_.queue()->Wait(shared_fence_.Get(),value));
   }
 
@@ -1136,6 +1171,15 @@ class D3D12Backend final : public NativeRenderBackend {
       throw std::runtime_error(std::string("D3D12 ")+what+" failed: the device was removed - "+RemovedReason());
     Require(result,what);
   }
+  // What the device was waiting for when it died, when it was waiting for a
+  // producer on another device. A completed value below the awaited one says
+  // the producer never signalled, which is a different bug from anything this
+  // device's own command lists did.
+  std::string SharedWaitState() {
+    if(!shared_fence_ || !shared_wait_value_) return {};
+    return ", awaiting shared fence "+std::to_string(shared_wait_value_)+
+           " which has reached "+std::to_string(shared_fence_->GetCompletedValue());
+  }
   const char* RemovedReason() {
     switch(gpu_.device()->GetDeviceRemovedReason()) {
       case DXGI_ERROR_DEVICE_HUNG: return "the GPU hung on this device's own work";
@@ -1152,7 +1196,8 @@ class D3D12Backend final : public NativeRenderBackend {
     if(open_) throw std::runtime_error("Present inside an open frame; submit it first");
     const auto result=swap_chain_->Present(vsync?1:0,0);
     if(result==DXGI_ERROR_DEVICE_REMOVED || result==DXGI_ERROR_DEVICE_RESET)
-      throw std::runtime_error(std::string("D3D12 present failed: the device was removed - ")+RemovedReason());
+      throw std::runtime_error(std::string("D3D12 present failed: the device was removed - ")+
+                               RemovedReason()+SharedWaitState());
     Require(result,"present");
   }
 
@@ -1226,6 +1271,7 @@ class D3D12Backend final : public NativeRenderBackend {
   // the display is still showing.
   static constexpr uint32_t kBackBuffers=3;
   ComPtr<ID3D12Fence> shared_fence_;
+  uint64_t shared_wait_value_=0;
   void* shared_fence_handle_=nullptr;
   ComPtr<IDXGISwapChain3> swap_chain_;
   std::vector<std::unique_ptr<D3D12RenderTarget>> back_buffers_;

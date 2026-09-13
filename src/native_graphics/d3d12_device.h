@@ -82,6 +82,20 @@ class NativeD3D12Device {
   // shutdown and for tests; never on a frame path.
   void WaitIdle();
 
+  // Keeps a resource alive until the GPU has certainly stopped reading it.
+  //
+  // D3D12 does not reference-count what a command list uses. A resource
+  // released the moment its owner drops it is still named by every list
+  // already submitted, and by every descriptor copied out of it into a frame's
+  // shader-visible table; freeing it there leaves the shader sampling whatever
+  // the allocator next puts at that address. That is not a validation error,
+  // it is a GPU page fault - the hang with the empty log. So the owner drops
+  // it here instead, and the frame fence decides when it actually goes.
+  void Retire(Microsoft::WRL::ComPtr<ID3D12Resource> resource);
+  // How many retired resources are still waiting on the GPU. A number that
+  // only grows means frames are not completing.
+  size_t retiring() const { return retiring_.size(); }
+
   // A slice of the upload ring, already mapped. The pointer is valid until the
   // frame that allocated it has completed on the GPU - which is the entire
   // contract, and why this returns a fence-bound view rather than a buffer.
@@ -138,6 +152,14 @@ class NativeD3D12Device {
   Microsoft::WRL::ComPtr<ID3D12InfoQueue> messages_;
   Microsoft::WRL::ComPtr<ID3D12Resource> upload_;
   std::vector<Frame> frames_;
+  // Dropped by their owners, still possibly on the GPU. Freed in BeginFrame,
+  // oldest first, once the fence proves the frame that could have named them
+  // is done.
+  struct Retiring {
+    uint64_t fence=0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+  };
+  std::vector<Retiring> retiring_;
   void* fence_event_=nullptr;
   uint8_t* upload_cpu_=nullptr;
   D3D12_GPU_VIRTUAL_ADDRESS upload_gpu_=0;

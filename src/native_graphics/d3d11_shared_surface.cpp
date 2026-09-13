@@ -50,5 +50,13 @@ void NativeSharedSurface::Signal(ID3D11DeviceContext& context) {
   Microsoft::WRL::ComPtr<ID3D11DeviceContext4> fenced;
   if(FAILED(context.QueryInterface(IID_PPV_ARGS(&fenced)))) return;
   fenced->Signal(fence_.Get(),++value_);
+  // Dispatched here rather than whenever the driver next feels like it. A
+  // signal on the immediate context is a command in a buffer, and the consumer
+  // is another device waiting on its queue for this exact value: a wait that
+  // cannot finish until the buffer is submitted. The renderer used to submit it
+  // incidentally, by being busy - which stopped being true the moment the scene
+  // moved to its own backend and left this context nearly idle, and the wait
+  // then ran until the GPU was reset out from under the window.
+  context.Flush();
 }
 }  // namespace edf::native

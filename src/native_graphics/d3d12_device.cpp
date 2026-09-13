@@ -4,6 +4,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 using Microsoft::WRL::ComPtr;
 
@@ -237,6 +238,10 @@ void NativeD3D12Device::BeginFrame() {
   // undefined, and it is the classic way a D3D12 port crashes only under load.
   WaitForFence(frame.fence);
   const uint64_t completed=fence_->GetCompletedValue();
+  // Anything whose last possible reader has finished. Erased here rather than
+  // at the drop, because here is the one place that knows what the GPU has
+  // actually got through.
+  std::erase_if(retiring_,[completed](const Retiring& held) { return held.fence<=completed; });
   // Every ring takes the frame's fence value: they are all freed by the same
   // signal because they are all read by the same submission.
   ++next_fence_;
@@ -249,6 +254,14 @@ void NativeD3D12Device::BeginFrame() {
     views_[index]->BeginFrame(next_fence_);
   }
   open_=true;
+}
+
+void NativeD3D12Device::Retire(ComPtr<ID3D12Resource> resource) {
+  if(!resource) return;
+  // The open frame's value, or the last one signalled when none is open.
+  // Either way it is the highest value any submitted or recording work can
+  // carry, which is exactly the wait this resource needs.
+  retiring_.push_back({next_fence_,std::move(resource)});
 }
 
 void NativeD3D12Device::EndFrame() {

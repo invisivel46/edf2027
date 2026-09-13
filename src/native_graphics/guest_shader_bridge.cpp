@@ -861,6 +861,8 @@ void CaptureScene(Bridge& state,uint32_t owner) {
   try {
     const auto path=std::filesystem::path(prefix+"."+std::to_string(number)+".bmp");
     if (std::filesystem::exists(path)) throw std::runtime_error("native capture path already exists");
+    if(!scene->second.color.surface)
+      throw std::runtime_error("a scene capture reads the surface through D3D11, which a scene on another backend has not got");
     const auto bmp=CaptureNativeHdrBmp(*state.context.Get(),*scene->second.color.surface.Get());
     std::ofstream output(path,std::ios::binary);
     output.write(reinterpret_cast<const char*>(bmp.data()),bmp.size());
@@ -868,7 +870,7 @@ void CaptureScene(Bridge& state,uint32_t owner) {
     if (!output) throw std::runtime_error("cannot write native scene capture");
     REXLOG_INFO("Native partial scene capture: {}, indexed_draws={}, initialized={}, frame_complete={}, linear RGB clamped; not final tone mapping",
       path.string(),state.indexed_submitted-state.scene_indexed_start,scene->second.color.content_valid,scene->second.frame_complete);
-    if(scene->second.samples==1) {
+    if(scene->second.samples==1 && scene->second.depth.surface) {
       const auto depth=InspectNativeDepth(*state.context.Get(),*scene->second.depth.surface.Get(),0);
       REXLOG_INFO("Native scene depth diagnostic: changed_pixels={}, top/middle/bottom={}/{}/{}, min={}, max={}, nonfinite={}",
         depth.changed_pixels,depth.vertical_bands[0],depth.vertical_bands[1],depth.vertical_bands[2],
@@ -4739,6 +4741,8 @@ REX_HOOK_RAW(sub_8219C840) {
           ++state.output_captures;
           const auto path=std::filesystem::path(prefix+".output."+std::to_string(state.indexed_output_frames)+".bmp");
           if (std::filesystem::exists(path)) throw std::runtime_error("native output capture already exists");
+          if(!scene.output.surface)
+            throw std::runtime_error("an output capture reads the surface through D3D11, which a scene on another backend has not got");
           const auto bmp=edf::native::CaptureNativeHdrBmp(*state.context.Get(),*scene.output.surface.Get());
           std::ofstream output(path,std::ios::binary);
           output.write(reinterpret_cast<const char*>(bmp.data()),bmp.size()); output.close();
@@ -4782,15 +4786,23 @@ REX_HOOK_RAW(sub_8219C840) {
            creation.format!=0x28280106)
           throw std::runtime_error("unsupported direct frame destination format/dimensions: "+std::to_string(creation.format));
         auto& direct=scene.direct_outputs[handle];
-        if(!direct.surface)
+        // Tested on the backend handle, not the D3D11 one: a target on the
+        // scene's own backend has no D3D11 surface, and this would build a new
+        // one every frame and hand the old one to the collector mid-flight.
+        if(!direct.backend_surface)
           direct=edf::native::CreateNativeOpaqueFrameTarget(EnsureSceneBackendLocked(state),creation.width,creation.height);
         edf::native::ResolveNativeRgba8Frame(edf::native::SceneRecorderLocked(state),scene.color,direct);
         state.textures.insert_or_assign(handle,direct.sampled);
         if(state.presentation_frames) {
           state.presentation_frames->Invalidate();
-          if(direct.sampled.content_valid)
-            state.presentation_frames->Publish(*direct.sampled.resource.Get(),edf::native::NativeFrameKind::PartialScene,
-              state.display_gamma?&*state.display_gamma:nullptr);
+          // Two ways to the window, chosen by what the frame was drawn on; see
+          // the ordinary output path, which makes the same choice.
+          if(direct.sampled.content_valid) {
+            if(direct.sampled.resource)
+              state.presentation_frames->Publish(*direct.sampled.resource.Get(),edf::native::NativeFrameKind::PartialScene,
+                state.display_gamma?&*state.display_gamma:nullptr);
+            else edf::native::PublishSceneSharedLocked(state,direct);
+          }
         }
       } catch(const std::exception& error) {
         static uint64_t failures=0;
@@ -5539,6 +5551,8 @@ REX_HOOK_RAW(sub_821FE358) {
               if(width<=0 || height<=0) throw std::runtime_error("invalid diagnostic region size");
               std::array<float,4> rgba{};
               const bool probe_negative=REXCVAR_GET(edf_native_probe_negative);
+              if(!scene.color.surface)
+                throw std::runtime_error("the colour probe reads the surface through D3D11, which a scene on another backend has not got");
               if((width==1 && height==1) || edf::native::FindNativeInvalidColorPixel(
                   *state.context.Get(),*scene.color.surface.Get(),sample_x,sample_y,
                   uint32_t(width),uint32_t(height),sample_x,sample_y,probe_negative))
@@ -6014,7 +6028,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           REXLOG_INFO("Native movie draw: submitted={}, PS={}, output_initialized={}, frame_complete=false",
             state.movie_draws,movie_pixel.shader().entry.name,scene.output.content_valid);
           const auto prefix=REXCVAR_GET(edf_native_scene_capture);
-          if(!prefix.empty() && scene.output.content_valid) {
+          if(!prefix.empty() && scene.output.content_valid && scene.output.surface) {
             const auto path=std::filesystem::path(prefix+".movie."+std::to_string(state.movie_draws)+".bmp");
             if(std::filesystem::exists(path)) throw std::runtime_error("native movie capture path already exists");
             const auto bytes=edf::native::CaptureNativeHdrBmp(*state.context.Get(),*scene.output.surface.Get());
@@ -6312,7 +6326,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           REXLOG_INFO("Native font draw: submitted={}, vertices={}, output_initialized={}",
             state.font_draws,ctx.r5.u32,scene.output.content_valid);
         const auto prefix=REXCVAR_GET(edf_native_scene_capture);
-        if(!prefix.empty() && scene.output.content_valid &&
+        if(!prefix.empty() && scene.output.content_valid && scene.output.surface &&
            (state.font_draws==1 || state.font_draws==100 || state.font_draws==1000)) {
           const auto path=std::filesystem::path(prefix+".font."+std::to_string(state.font_draws)+".bmp");
           if(std::filesystem::exists(path)) throw std::runtime_error("native font capture path already exists");
@@ -6484,11 +6498,24 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto render=state.render_states.find(snapshot.render);
           if(render==state.render_states.end())
             render=state.render_states.emplace(snapshot.render,edf::native::CreateNativeRenderState(*state.device.Get(),snapshot.render)).first;
-          edf::native::BindActiveTarget(state);
-          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
-          bindings.Bind(*state.context.Get()); ps.Bind(*state.context.Get());
-          if(lines) mesh.DrawLines(*state.context.Get(),0,uint32_t(indices.size()/2));
-          else mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
+          if(REXCVAR_GET(edf_native_seam_draws)) {
+            auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
+              bindings,ps,viewport,snapshot.render,
+              mesh.input_layout().elements(),mesh.input_layout().fingerprint(),
+              // The reversed-depth variant is a different compiled shader under
+              // the same guest handle, so it belongs in the identity.
+              (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),pair.pixel,
+              lines?edf::native::NativeBackendTopology::LineList
+                   :edf::native::NativeBackendTopology::TriangleList});
+            if(lines) mesh.DrawLines(recorder,0,uint32_t(indices.size()/2));
+            else mesh.Draw(recorder,0,uint32_t(indices.size()/2));
+          } else {
+            edf::native::BindActiveTarget(state);
+            edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
+            bindings.Bind(*state.context.Get()); ps.Bind(*state.context.Get());
+            if(lines) mesh.DrawLines(*state.context.Get(),0,uint32_t(indices.size()/2));
+            else mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
+          }
           native_submitted=true; scene.frame_complete=false;
           auto& variant_reported=state.utility_variants_reported[(textured?2:0)+(lines?1:0)];
           if(++state.utility_draws<=5 || !variant_reported)
