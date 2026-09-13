@@ -1,6 +1,8 @@
 #pragma once
 #include "d3d11_presenter.h"
 #include "d3d11_frame_compositor.h"
+#include "d3d11_shared_surface.h"
+#include "native_backend_present.h"
 #include <commctrl.h>
 #include <functional>
 #include <memory>
@@ -8,6 +10,15 @@
 #include "ui_ticker.h"
 
 namespace edf::native {
+// How this window finds a backend to present with.
+//
+// Injected rather than looked up, because the host surface is also built
+// standalone by its lifetime test, which has no bridge and no backend and
+// must keep using the D3D11 presenter exactly as before. An unset provider is
+// the normal state for that test, not an error.
+using NativeHostBackendProvider=std::function<NativeRenderBackend*()>;
+void SetNativeHostBackendProvider(NativeHostBackendProvider provider);
+
 // App-owned rendering on the SDK HWND when no GPU plugin owns its presenter.
 // Construct/destroy on that window's thread. Removing the subclass before
 // destruction makes already-queued timer messages harmless.
@@ -27,6 +38,14 @@ class NativeHostSurface : public std::enable_shared_from_this<NativeHostSurface>
   HWND window_;
   std::function<void(UINT,UINT)> overlays_;
   std::unique_ptr<NativeWindowPresenter> presenter_;
+  // The backend path: the frame is composited into a shared surface here and
+  // presented to the window by the backend. Null, or refusing, means the
+  // D3D11 presenter above stays in charge - a window that shows nothing would
+  // be a far worse outcome than one presented by the API it always used.
+  std::unique_ptr<NativeBackendWindowPresenter> backend_presenter_;
+  NativeSharedSurface shared_;
+  bool backend_present_failed_=false;
+  bool logged_backend_present_=false;
   std::unique_ptr<NativeFrameCompositor> compositor_;
   std::unique_ptr<NativeUiTicker> ticker_;
   uint64_t paints_=0;

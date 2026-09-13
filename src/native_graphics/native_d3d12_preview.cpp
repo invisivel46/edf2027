@@ -48,7 +48,12 @@ LRESULT CALLBACK NativeD3D12Preview::WindowProcedure(HWND window,UINT message,WP
   return DefWindowProcW(window,message,w,l);
 }
 
-NativeD3D12Preview::NativeD3D12Preview(NativeRenderBackend& backend) : backend_(&backend) {
+NativeD3D12Preview::NativeD3D12Preview(const std::string& backend_name) {
+  if(backend_name=="d3d11")
+    throw std::runtime_error("the backend preview cannot use the adopted d3d11 backend: it shares the "
+                             "renderer's immediate context, which only one thread may drive");
+  owned_backend_=CreateNativeRenderBackend(backend_name);
+  backend_=owned_backend_.get();
   thread_=std::thread([this] {
     try { Run(); }
     catch(const std::exception& error) {

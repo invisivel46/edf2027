@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <thread>
 
 namespace edf::native {
@@ -31,8 +32,15 @@ class NativeD3D12Preview {
   // thread-safe, and the alternative - ticking from the game's frame loop -
   // would need a per-frame hook the app does not have.
   //
-  // The caller keeps ownership of the backend and must outlive this.
-  explicit NativeD3D12Preview(NativeRenderBackend& backend);
+  // Owns its backend rather than sharing the renderer's. A backend has one
+  // command list and is not thread-safe, and this runs on its own thread: two
+  // windows driving one backend corrupted its command allocator after three
+  // frames, which is the kind of failure that looks random.
+  //
+  // Throws if the named backend cannot be created, or if it is the adopted
+  // D3D11 one - that shares the renderer's immediate context, so a second
+  // thread driving it has the same problem a step further along.
+  explicit NativeD3D12Preview(const std::string& backend_name);
   ~NativeD3D12Preview();
   NativeD3D12Preview(const NativeD3D12Preview&)=delete;
   NativeD3D12Preview& operator=(const NativeD3D12Preview&)=delete;
@@ -50,7 +58,8 @@ class NativeD3D12Preview {
   void Draw(const uint8_t* pixels, uint32_t width, uint32_t height, uint32_t format);
   void Composite(NativeBackendTexture& frame, uint32_t width, uint32_t height);
 
-  NativeRenderBackend* backend_;
+  std::unique_ptr<NativeRenderBackend> owned_backend_;
+  NativeRenderBackend* backend_=nullptr;
   HWND window_=nullptr;
   std::unique_ptr<NativeBackendBuffer> vertices_;
   std::unique_ptr<NativeBackendTexture> frame_;

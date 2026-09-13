@@ -20,6 +20,16 @@ REXCVAR_DEFINE_INT32(edf_native_host_capture_after_ms,0,"EDF2027",
 REXCVAR_DEFINE_BOOL(edf_native_host_capture_require_image,false,"EDF2027",
                    "Wait for a published game image before the one-time host GPU capture (development)");
 namespace edf::native {
+namespace {
+NativeHostBackendProvider& HostBackendProvider() {
+  static NativeHostBackendProvider provider;
+  return provider;
+}
+}  // namespace
+void SetNativeHostBackendProvider(NativeHostBackendProvider provider) {
+  HostBackendProvider()=std::move(provider);
+}
+
 std::shared_ptr<NativeHostSurface> NativeHostSurface::Create(HWND window,std::function<void(UINT,UINT)> overlays,
     NativeUiTicker::Dispatch dispatch) {
   auto host=std::shared_ptr<NativeHostSurface>(new NativeHostSurface(window,std::move(overlays)));
@@ -76,19 +86,34 @@ void NativeHostSurface::Paint() {
     uint64_t sequence=0;
     bool attempted_present=false;
     double acquire_ms=0,present_ms=0;
+    // Resolved before the visit below, never inside it: that callback runs
+    // with the bridge's lock held, and asking the bridge for a backend from
+    // there takes the same lock again and deadlocks. It did, once.
+    auto* backend=(backend_present_failed_||!HostBackendProvider())?nullptr:HostBackendProvider()();
     auto render=[&](ID3D11Device& device,ID3D11DeviceContext& context,ID3D11ShaderResourceView* frame,const NativeDisplayGamma* gamma) {
       // Includes bridge lock acquisition and context isolation, not pure lock time.
       if(timed) acquire_ms=milliseconds(Clock::now()-entered);
-      if(!presenter_) {
-        presenter_=std::make_unique<NativeWindowPresenter>(window_,device,context);
-        compositor_=std::make_unique<NativeFrameCompositor>(device);
+      // The backend presents the window when it can: the frame is composited
+      // into a surface it can sample, and it owns the swap chain. Everything
+      // between here and Present is unchanged either way, which is what keeps
+      // the two paths comparable.
+      bool through_backend=false;
+      if(backend && shared_.Resize(device,width,height)) {
+        if(!backend_presenter_)
+          backend_presenter_=std::make_unique<NativeBackendWindowPresenter>(*backend);
+        through_backend=!backend_presenter_->refused();
       }
-      if(!presenter_->BeginFrame(width,height)) return;
-      if(frame) compositor_->Draw(context,*frame,*presenter_->target(),true,gamma);
+      if(!through_backend && !presenter_) {
+        presenter_=std::make_unique<NativeWindowPresenter>(window_,device,context);
+      }
+      if(!compositor_) compositor_=std::make_unique<NativeFrameCompositor>(device);
+      if(!through_backend && !presenter_->BeginFrame(width,height)) return;
+      auto* surface=through_backend?shared_.target():presenter_->target();
+      if(frame) compositor_->Draw(context,*frame,*surface,true,gamma);
       else {
         context.ClearState();
-        const float black[]{0,0,0,1}; context.ClearRenderTargetView(presenter_->target(),black);
-        auto* target=presenter_->target(); context.OMSetRenderTargets(1,&target,nullptr);
+        const float black[]{0,0,0,1}; context.ClearRenderTargetView(surface,black);
+        context.OMSetRenderTargets(1,&surface,nullptr);
       }
       overlays_(width,height);
       // UI callbacks can close the window or drop the app's owning reference.
@@ -102,7 +127,7 @@ void NativeHostSurface::Paint() {
          elapsed>=REXCVAR_GET(edf_native_host_capture_after_ms) &&
          (frame || !REXCVAR_GET(edf_native_host_capture_require_image))) {
         if(std::filesystem::exists(capture)) throw std::runtime_error("native host capture path exists");
-        Microsoft::WRL::ComPtr<ID3D11Resource> resource; presenter_->target()->GetResource(&resource);
+        Microsoft::WRL::ComPtr<ID3D11Resource> resource; surface->GetResource(&resource);
         Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
         if(FAILED(resource.As(&texture))) throw std::runtime_error("native host capture target is not a texture");
         const auto bmp=CaptureNativeHdrBmp(context,*texture.Get());
@@ -115,7 +140,26 @@ void NativeHostSurface::Paint() {
       }
       const auto before_present=timed?Clock::now():Clock::time_point{};
       attempted_present=true;
-      presented=presenter_->Present(REXCVAR_GET(edf_native_vsync));
+      if(through_backend) {
+        // Signalled after the last draw of the frame, so the backend samples a
+        // finished surface rather than one still being written.
+        shared_.Signal(context);
+        NativeBackendWindowPresenter::SharedSource source{shared_.shared_texture(),shared_.shared_fence(),
+          shared_.value(),shared_.width(),shared_.height(),DXGI_FORMAT_R8G8B8A8_UNORM};
+        presented=backend_presenter_->Present(window_,width,height,source,REXCVAR_GET(edf_native_vsync));
+        if(!presented && backend_presenter_->refused()) {
+          // Fall back for good, and say so once. A window presented by the API
+          // it always used is a far better outcome than a blank one.
+          backend_present_failed_=true;
+          REXLOG_INFO("Native host surface: the backend could not present this window; falling back to D3D11 for the rest of the run");
+        } else if(!logged_backend_present_) {
+          logged_backend_present_=true;
+          REXLOG_INFO("Native host surface: this window is presented by the {} backend; the frame is composited into a shared surface it samples directly",
+            std::string(backend->name()));
+        }
+      } else {
+        presented=presenter_->Present(REXCVAR_GET(edf_native_vsync));
+      }
       if(timed) present_ms=milliseconds(Clock::now()-before_present);
       if(paints_<=3 || (frame && !logged_game_frame_))
         REXLOG_INFO("Native host frame: count={}, image={}, presented={}, Xenos_loaded={}",

@@ -6,6 +6,7 @@
 #include "d3d12_backend.h"
 #include "native_render_backend.h"
 #include "native_d3d12_preview.h"
+#include "native_host_surface.h"
 #include "guest_instance_parameters.h"
 #include "guest_parameter_records.h"
 #include "guest_draw_state.h"
@@ -1476,6 +1477,9 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
                               D3D11_SDK_VERSION, &state.device, nullptr, &state.context)))
     throw std::runtime_error("native shader bridge: D3D11 device creation failed");
   REXLOG_INFO("Native shader bridge: initialized hardware D3D11 device");
+  // The host window asks for a backend through this rather than calling into
+  // the bridge, so it can still be built standalone by its own test.
+  edf::native::SetNativeHostBackendProvider([]{ return edf::native::EnsureNativeRenderBackend(); });
   REXLOG_INFO("Native render backend: --edf_native_backend={}; built on first use, so selecting one costs nothing until something draws through it. The renderer's own draw path is still direct D3D11 and does not use it yet",
     REXCVAR_GET(edf_native_backend).empty()?std::string("none"):REXCVAR_GET(edf_native_backend));
   if(REXCVAR_GET(edf_native_backend_preview)) {
@@ -1484,12 +1488,22 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
     // Built here, under the lock already held, through the same creator the
     // lazy accessor uses - so there is one place that knows how to build the
     // selected backend rather than two that can drift.
+    edf::native::RegisterNativeD3D11Backend();
+    edf::native::RegisterNativeD3D12Backend();
     state.backend_preview=std::make_unique<edf::native::NativeD3D12Preview>(
-      EnsureBackendLocked(state));
+      REXCVAR_GET(edf_native_backend));
   }
   if(REXCVAR_GET(edf_native_publish_frames))
     state.presentation_frames=std::make_unique<NativeFrameHandoff>(*state.device.Get(),*state.context.Get());
 }
+NativeRenderBackend* EnsureNativeRenderBackend() {
+  auto& state=State();
+  std::lock_guard lock(state.mutex);
+  if(state.backend) return state.backend.get();
+  if(REXCVAR_GET(edf_native_backend).empty() || !state.device) return nullptr;
+  return &EnsureBackendLocked(state);
+}
+
 bool VisitNativePresentationSharedFrame(NativeFrameHandoff::SharedFrame& shared,uint64_t& sequence) {
   auto& state=State();
   std::lock_guard lock(state.mutex);
