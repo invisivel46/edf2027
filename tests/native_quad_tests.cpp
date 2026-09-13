@@ -2,6 +2,7 @@
 #include "native_graphics/d3d11_texture.h"
 #include "native_graphics/d3d11_render_state.h"
 #include "native_graphics/d3d11_mesh.h"
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/native_declarations.h"
 #include "native_graphics/native_generated_indices.h"
 #include "native_graphics/native_model_buffers.h"
@@ -36,6 +37,10 @@ int main() {
     ComPtr<ID3D11DeviceContext> context;
     Require(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
       D3D11_SDK_VERSION,&device,nullptr,&context)),"device creation");
+    // Mesh storage comes from the backend now; adopting this device keeps it
+    // usable by the direct D3D11 draws the rest of this test makes.
+    auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
+    Require(bool(backend),"adopted backend");
     Effect effect;
     effect.source = R"(
 struct Varying { float4 position : SV_POSITION; float2 coord : TEXCOORD0; };
@@ -276,15 +281,15 @@ float4 VS(float4 position:POSITION):SV_POSITION {
       indices16.push_back(uint8_t(index>>8)); indices16.push_back(uint8_t(index));
       const auto at=indices32.size(); indices32.resize(at+4); word(indices32,at,index);
     }
-    NativeIndexedMesh mesh16(*device.Get(),mesh_vs,declaration,40,mesh_vertices,indices16,2);
-    NativeIndexedMesh mesh32(*device.Get(),mesh_vs,declaration,40,mesh_vertices,indices32,4);
+    NativeIndexedMesh mesh16(*backend,mesh_vs,declaration,40,mesh_vertices,indices16,2);
+    NativeIndexedMesh mesh32(*backend,mesh_vs,declaration,40,mesh_vertices,indices32,4);
     const auto source_probe=mesh16.CaptureSourceFloat3(0,6,-1,4);
     Require(source_probe==mesh32.CaptureSourceFloat3(0,6,-1,4) &&
       source_probe[0]==std::array<float,3>{quad[0],quad[1],0} &&
       source_probe[5]==std::array<float,3>{quad[12],quad[13],0},
       "native float3 probe lost index width, signed base or attribute offset");
     auto probe_vertices=mesh_vertices,probe_indices=indices16;
-    NativeIndexedMesh probe_mesh(*device.Get(),mesh_vs,declaration,40,probe_vertices,probe_indices,2);
+    NativeIndexedMesh probe_mesh(*backend,mesh_vs,declaration,40,probe_vertices,probe_indices,2);
     std::fill(probe_vertices.begin(),probe_vertices.end(),0);
     std::fill(probe_indices.begin(),probe_indices.end(),255);
     Require(probe_mesh.CaptureSourceFloat3(0,6,-1,4)==source_probe,
@@ -294,7 +299,7 @@ float4 VS(float4 position:POSITION):SV_POSITION {
       "native attribute probe incorrectly required triangle-aligned samples");
     std::vector<uint8_t> many_indices(65538*2);
     for(size_t i=0;i<65538;++i) many_indices[i*2+1]=1;
-    NativeIndexedMesh large_probe(*device.Get(),mesh_vs,declaration,40,mesh_vertices,many_indices,2);
+    NativeIndexedMesh large_probe(*backend,mesh_vs,declaration,40,mesh_vertices,many_indices,2);
     const auto many_samples=large_probe.CaptureSourceFloat3(1,65536,-1,4);
     Require(many_samples.size()==65536 &&
       std::all_of(many_samples.begin(),many_samples.end(),[&](const auto& value) { return value==source_probe[0]; }),
@@ -305,7 +310,7 @@ float4 VS(float4 position:POSITION):SV_POSITION {
     Require(oversized_probe,"native attribute probe exceeded bounded sample budget");
     auto prefixed=std::make_shared<std::vector<uint8_t>>(40,0xcc);
     prefixed->insert(prefixed->end(),mesh_vertices.begin(),mesh_vertices.end());
-    NativeIndexedMesh offset_probe(*device.Get(),mesh_vs,declaration,40,std::span<const uint8_t>(*prefixed).subspan(40),
+    NativeIndexedMesh offset_probe(*backend,mesh_vs,declaration,40,std::span<const uint8_t>(*prefixed).subspan(40),
       indices16,2,false,{},{},NativeIndexedMesh::IndexReuse::RequireMatch,prefixed,40);
     Require(offset_probe.CaptureSourceFloat3(3,3,-1,4)==
       std::vector<std::array<float,3>>(source_probe.begin()+3,source_probe.end()),
@@ -338,7 +343,7 @@ float4 VS(float4 position:POSITION):SV_POSITION {
         }
       }
     auto partial_indices=indices32; word(partial_indices,20,UINT32_MAX);
-    NativeIndexedMesh partial_mesh(*device.Get(),mesh_vs,declaration,40,mesh_vertices,partial_indices,4);
+    NativeIndexedMesh partial_mesh(*backend,mesh_vs,declaration,40,mesh_vertices,partial_indices,4);
     partial_mesh.ValidateDraw(0,3,-1); // Invalid unused index must not reject this subset.
     bool rejected_partial=false;
     try {partial_mesh.ValidateDraw(3,3,-1);} catch(const std::runtime_error&) {rejected_partial=true;}
@@ -363,7 +368,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       auto tangent_vs=CompileNativeShader(*device.Get(),tangent_effect,{false,"VS","vs_5_0"},"tangent.fx");
       auto tangent_decl=declaration;
       if(supplied) tangent_decl[21]=6; // Existing finite (1,1,0) NORMAL0 bytes become TANGENT0.
-      NativeIndexedMesh tangent_mesh(*device.Get(),tangent_vs,tangent_decl,40,mesh_vertices,indices16,2);
+      NativeIndexedMesh tangent_mesh(*backend,tangent_vs,tangent_decl,40,mesh_vertices,indices16,2);
       context->VSSetShader(tangent_vs.vertex.Get(),nullptr,0);
       submit=[&]{tangent_mesh.Draw(*context.Get(),0,6,-1);}; verify(false);
     }
@@ -430,7 +435,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         "native declaration retained guest storage");
       NativeMeshCache owned_cache;
       auto acquire_owned=[&](auto identity)->NativeIndexedMesh& {
-        return owned_cache.Acquire(*device.Get(),mesh_vs,cache_key,identity->bytes(),40,mesh_vertices,indices16,2,identity);
+        return owned_cache.Acquire(*backend,mesh_vs,cache_key,identity->bytes(),40,mesh_vertices,indices16,2,identity);
       };
       acquire_owned(first);
       submit=[&] { acquire_owned(first).Draw(*context.Get(),0,6,-1); }; verify(false);
@@ -439,7 +444,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         owned_cache.source_checks().vertex_candidate_bytes==mesh_vertices.size() &&
         owned_cache.source_checks().index_candidate_bytes==indices16.size(),"source-check counters include construction or omit cache hit");
       bool rejected=false;
-      try { owned_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,first); }
+      try { owned_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,first); }
       catch(const std::runtime_error&) { rejected=true; }
       Require(rejected,"declaration token accepted unrelated storage");
       rejected=false;
@@ -459,7 +464,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       Require(owned_cache.builds()==3,"old owned generation lost independent lifetime");
     }
     auto acquire=[&](std::span<const uint8_t> data)->NativeIndexedMesh& {
-      return mesh_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,data,indices16,2);
+      return mesh_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,data,indices16,2);
     };
     acquire(mesh_vertices);
     submit=[&] { acquire(mesh_vertices).Draw(*context.Get(),0,6,-1); }; verify(false);
@@ -472,10 +477,10 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
     Require(mesh_cache.builds()==2,"updated vertices not rebuilt");
     {
       // Model-owned native index storage exists before any shader/mesh variant.
-      auto loaded=std::make_shared<const NativeIndexBuffer>(*device.Get(),indices16,2);
+      auto loaded=std::make_shared<const NativeIndexBuffer>(*backend,indices16,2);
       for(const uint32_t index_stride:{2u,4u}) {
         const auto& source=index_stride==2?indices16:indices32;
-        auto tracked_storage=std::make_shared<const NativeIndexBuffer>(*device.Get(),source,index_stride);
+        auto tracked_storage=std::make_shared<const NativeIndexBuffer>(*backend,source,index_stride);
         NativeBufferWrites writes;
         NativeModelBuffers tracked(&writes);
         tracked.Publish(1,NativeModelBuffers::Kind::Index,0xa0001000,index_stride,uint32_t(source.size()/index_stride),0x1000);
@@ -484,7 +489,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         writes.Record(0x1800,4,true); // Same page, outside index data.
         Require(tracked.CommitObservedIndex(1,generation,version,tracked_storage),"stable index snapshot rejected");
         NativeMeshCache tracked_cache;
-        auto& tracked_mesh=tracked_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,source,index_stride,{}, {},
+        auto& tracked_mesh=tracked_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,source,index_stride,{}, {},
           tracked.Find(1,NativeModelBuffers::Kind::Index)->index_storage);
         Require(tracked_mesh.IndexStorage()==tracked_storage,"registered index format was not reused by mesh");
         submit=[&] { tracked_mesh.Draw(*context.Get(),0,6,-1); }; verify(false);
@@ -499,7 +504,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       NativeModelBuffers owners;
       owners.Publish(cache_key[1],NativeModelBuffers::Kind::Index,0xa0001000,2,uint32_t(indices16.size()/2),0x1000,loaded);
       NativeMeshCache seeded_cache;
-      auto& seeded=seeded_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,{}, {},
+      auto& seeded=seeded_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,{}, {},
         owners.Find(cache_key[1],NativeModelBuffers::Kind::Index)->index_storage);
       Require(seeded.IndexStorage()==loaded,"load-time index storage was not consumed by first mesh");
       Require(seeded_cache.published_index_reuses()==1 && seeded_cache.published_index_rejections()==0,"published index reuse accounting");
@@ -525,7 +530,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         uint32_t snapshots=0;
         NativeSnapshotObserver observer{&snapshots,[](void* value) { ++*static_cast<uint32_t*>(value); }};
         auto acquire=[&](std::span<const uint8_t> vertices) -> NativeIndexedMesh& {
-          return observed_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,vertices,indices16,2,{}, {},{}, {},observer);
+          return observed_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,vertices,indices16,2,{}, {},{}, {},observer);
         };
         acquire(mesh_vertices);
         Require(snapshots==1,"first construction did not notify snapshot observer");
@@ -552,7 +557,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
           writes.Record(0x2000,uint32_t(source.size()),true);
         };
         NativeMeshCache observed_cache;
-        auto& mesh=observed_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,source,indices16,2,{}, {},{}, {},
+        auto& mesh=observed_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,source,indices16,2,{}, {},{}, {},
           {&producer,[](void* value) { (*static_cast<decltype(producer)*>(value))(); }});
         Require(mesh.VertexStorage()->MatchesSource(updated_vertices),"snapshot observer ran after construction read");
         Require(version && !tracked.CommitObservedVertex(2,generation,*version,mesh.VertexStorage()),"construction-time write escaped retention handshake");
@@ -562,11 +567,11 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       const auto vertex_generation=owners.Find(cache_key[0],NativeModelBuffers::Kind::Vertex)->generation;
       Require(owners.RetainVertexStorage(cache_key[0],vertex_generation,retained_vertices),"model did not retain first-use vertices");
       NativeMeshCache retained_cache;
-      Require(retained_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,{}, {},loaded,
+      Require(retained_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,{}, {},loaded,
         owners.Find(cache_key[0],NativeModelBuffers::Kind::Vertex)->vertex_storage).VertexStorage()==retained_vertices,
         "independent mesh cache did not reuse model vertex allocation");
       retained_cache.Clear();
-      Require(retained_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,updated_vertices,indices16,2,{}, {},loaded,
+      Require(retained_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,updated_vertices,indices16,2,{}, {},loaded,
         retained_vertices).VertexStorage()!=retained_vertices,"model vertex ownership bypassed source validation");
       Require(retained_vertices->MatchesSource(mesh_vertices),"vertex update mutated retained model generation");
       Require(retained_cache.retained_vertex_reuses()==1 && retained_cache.retained_vertex_replacements()==1,
@@ -577,20 +582,20 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       Require(!owners.RetainVertexStorage(cache_key[0],vertex_generation,retained_vertices),"reused owner accepted stale vertex generation");
       Require(!owners.RetainVertexStorage(cache_key[1],vertex_generation,retained_vertices),"index owner accepted vertex allocation");
       seeded_cache.Clear();
-      Require(seeded_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,{}, {},loaded).IndexStorage()==loaded,
+      Require(seeded_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,{}, {},loaded).IndexStorage()==loaded,
         "mesh cache clear discarded model-owned index storage");
       auto mutated_indices=indices16; std::swap(mutated_indices[1],mutated_indices[3]);
-      Require(seeded_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,mutated_indices,2,{}, {},loaded).IndexStorage()!=loaded,
+      Require(seeded_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,mutated_indices,2,{}, {},loaded).IndexStorage()!=loaded,
         "load-time index storage bypassed live source validation");
-      Require(loaded->Matches(*device.Get(),indices16,2),"source update mutated retained load-time generation");
+      Require(loaded->Matches(*backend,indices16,2),"source update mutated retained load-time generation");
       Require(seeded_cache.published_index_reuses()==2 && seeded_cache.published_index_rejections()==1,"published stale index accounting");
       owners.NotifyUpdate(cache_key[1]);
       Require(!owners.Find(cache_key[1],NativeModelBuffers::Kind::Index)->index_storage,"unlock retained old native index ownership");
       const auto index_generation=owners.Find(cache_key[1],NativeModelBuffers::Kind::Index)->generation;
-      const auto updated_index=seeded_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,mutated_indices,2).IndexStorage();
+      const auto updated_index=seeded_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,mutated_indices,2).IndexStorage();
       Require(owners.RetainIndexStorage(cache_key[1],index_generation,updated_index),"validated update was not retained by model index owner");
       seeded_cache.Clear();
-      Require(seeded_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,mutated_indices,2,{}, {},
+      Require(seeded_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,mutated_indices,2,{}, {},
         owners.Find(cache_key[1],NativeModelBuffers::Kind::Index)->index_storage).IndexStorage()==updated_index,
         "updated index allocation did not survive mesh-cache eviction");
       Require(!owners.RetainIndexStorage(cache_key[0],index_generation,updated_index),"vertex owner accepted index storage");
@@ -603,32 +608,32 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       Require(!owners.Find(cache_key[1],NativeModelBuffers::Kind::Index),"model retirement retained index owner");
       NativeMeshCache shared_cache;
       auto variant_key=cache_key; variant_key[4]=1;
-      const auto original=shared_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2).IndexStorage();
-      const auto original_vertices=shared_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2).VertexStorage();
-      const auto variant=shared_cache.Acquire(*device.Get(),mesh_vs,variant_key,declaration,40,mesh_vertices,indices16,2).IndexStorage();
+      const auto original=shared_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2).IndexStorage();
+      const auto original_vertices=shared_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2).VertexStorage();
+      const auto variant=shared_cache.Acquire(*backend,mesh_vs,variant_key,declaration,40,mesh_vertices,indices16,2).IndexStorage();
       Require(original==variant,"shader variant duplicated native index resource");
       Require(shared_cache.vertex_mismatches()==0 && shared_cache.index_mismatches()==0,
         "cold builds and cache hits counted as geometry mismatches");
-      Require(shared_cache.Acquire(*device.Get(),mesh_vs,variant_key,declaration,40,mesh_vertices,indices16,2).VertexStorage()==original_vertices,
+      Require(shared_cache.Acquire(*backend,mesh_vs,variant_key,declaration,40,mesh_vertices,indices16,2).VertexStorage()==original_vertices,
         "compatible variant duplicated native vertex storage");
-      const auto vertex_update=shared_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,updated_vertices,indices16,2).IndexStorage();
+      const auto vertex_update=shared_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,updated_vertices,indices16,2).IndexStorage();
       Require(original==vertex_update,"vertex update duplicated unchanged index storage");
       Require(shared_cache.vertex_mismatches()==1 && shared_cache.index_mismatches()==0,
         "vertex mismatch classification");
       Require(shared_cache.last_vertex_mismatch()==cache_key,
         "vertex mismatch lost resource/shader identity");
       Require(original_vertices->MatchesSource(mesh_vertices) &&
-        shared_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,updated_vertices,indices16,2).VertexStorage()!=original_vertices,
+        shared_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,updated_vertices,indices16,2).VertexStorage()!=original_vertices,
         "vertex replacement mutated an earlier generation");
-      const auto wider=shared_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices32,4).IndexStorage();
-      Require(wider!=original && wider->Matches(*device.Get(),indices32,4),"index format change reused old generation");
+      const auto wider=shared_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices32,4).IndexStorage();
+      Require(wider!=original && wider->Matches(*backend,indices32,4),"index format change reused old generation");
       Require(shared_cache.vertex_mismatches()==1 && shared_cache.index_mismatches()==0,
         "layout change counted as source mismatch");
-      Require(original->Matches(*device.Get(),indices16,2),"index replacement mutated an earlier generation");
+      Require(original->Matches(*backend,indices16,2),"index replacement mutated an earlier generation");
       // Earlier generation remains drawable after owner retirement; D3D draws
       // and native references retain its immutable storage independently.
       shared_cache.Invalidate(cache_key[1]);
-      NativeIndexedMesh retained(*device.Get(),mesh_vs,declaration,40,mesh_vertices,indices16,2,false,original,original_vertices);
+      NativeIndexedMesh retained(*backend,mesh_vs,declaration,40,mesh_vertices,indices16,2,false,original,original_vertices);
       Require(retained.VertexStorage()==original_vertices,"retained immutable vertex resource was duplicated");
       {
         NativeBufferWrites writes;
@@ -648,16 +653,16 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         registry.Publish(78,NativeModelBuffers::Kind::Index,0xa0008000,2,uint32_t(indices16.size()/2),0x8000);
         auto index_snapshot=writes.CopyObserved(78,0x8000,indices16);
         Require(index_snapshot.has_value(),"guarded index publication copy failed");
-        auto index_storage=std::make_shared<const NativeIndexBuffer>(*device.Get(),
+        auto index_storage=std::make_shared<const NativeIndexBuffer>(*backend,
           std::span<const uint8_t>(*index_snapshot->contents),2,index_snapshot->contents);
         Require(index_storage->SourceSnapshot()==index_snapshot->contents,
           "index publication duplicated immutable CPU contents");
         bool wrong_identity=false;
-        try { NativeIndexBuffer invalid(*device.Get(),indices16,2,index_snapshot->contents); }
+        try { NativeIndexBuffer invalid(*backend,indices16,2,index_snapshot->contents); }
         catch(const std::runtime_error&) { wrong_identity=true; }
         Require(wrong_identity,"index contents accepted unrelated source identity");
         Require(registry.CommitObservedIndex(78,registry.Find(78,NativeModelBuffers::Kind::Index)->generation,
-          index_snapshot->version,index_storage) && index_storage->Matches(*device.Get(),indices16,2),
+          index_snapshot->version,index_storage) && index_storage->Matches(*backend,indices16,2),
           "guarded index snapshot failed GPU creation/attachment");
         auto live_vertices=mesh_vertices,live_indices=indices16;
         const auto pair=writes.CopyObservedSet(std::array<NativeBufferWrites::SnapshotSource,2>{{
@@ -668,7 +673,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
           live_vertices[0]^=1; live_indices[0]^=1;
           writes.Record(0x2000,1); writes.Record(0x8000,1);
         }
-        NativeIndexedMesh paired(*device.Get(),mesh_vs,declaration,40,*(*pair)[0].contents,
+        NativeIndexedMesh paired(*backend,mesh_vs,declaration,40,*(*pair)[0].contents,
           *(*pair)[1].contents,2,false,index_storage,{},NativeIndexedMesh::IndexReuse::RequireMatch,
           (*pair)[0].contents);
         paired.ValidateDraw(0,3,0);
@@ -678,7 +683,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
           const NativeMeshCache::Key key{277,278,279,280,0};
           auto contents=std::make_shared<const std::vector<uint8_t>>(indices16);
           auto acquire=[&](std::span<const uint8_t> bytes) -> NativeIndexedMesh& {
-            return cpu_owned_cache.Acquire(*device.Get(),mesh_vs,key,declaration,40,
+            return cpu_owned_cache.Acquire(*backend,mesh_vs,key,declaration,40,
               mesh_vertices,bytes,2,{},{},{},{},{},{},0,contents);
           };
           auto first=acquire(*contents).IndexStorage();
@@ -703,9 +708,9 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         }
         const NativeMeshCache::Key snapshot_key{177,178,179,180,0};
         const auto index_contents=paired.IndexStorage()->SourceSnapshot();
-        auto& first_snapshot=snapshot_cache.Acquire(*device.Get(),mesh_vs,snapshot_key,declaration,40,
+        auto& first_snapshot=snapshot_cache.Acquire(*backend,mesh_vs,snapshot_key,declaration,40,
           *(*pair)[0].contents,*index_contents,2,{},{},paired.IndexStorage(),paired.VertexStorage());
-        auto& next_snapshot=snapshot_cache.Acquire(*device.Get(),mesh_vs,snapshot_key,declaration,40,
+        auto& next_snapshot=snapshot_cache.Acquire(*backend,mesh_vs,snapshot_key,declaration,40,
           *(*pair)[0].contents,*index_contents,2,{},{},paired.IndexStorage(),paired.VertexStorage());
         Require(&first_snapshot==&next_snapshot && snapshot_cache.source_checks().vertex_checks==0 &&
           snapshot_cache.source_checks().index_checks==0 && snapshot_cache.source_checks().vertex_identity_hits==1 &&
@@ -713,12 +718,12 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
           "native snapshot cache hit scanned owned geometry bytes");
         Require(!paired.VertexStorage()->OwnsSource(live_vertices) &&
           !paired.VertexStorage()->OwnsSource(std::span(*(*pair)[0].contents).subspan(1)) &&
-          !paired.IndexStorage()->OwnsSource(*device.Get(),*index_contents,4) &&
-          !paired.IndexStorage()->OwnsSource(*device.Get(),std::span(*index_contents).subspan(2),2),
+          !paired.IndexStorage()->OwnsSource(*backend,*index_contents,4) &&
+          !paired.IndexStorage()->OwnsSource(*backend,std::span(*index_contents).subspan(2),2),
           "owned geometry identity ignored pointer, extent or index width");
         Require(paired.VertexStorage()->SourceSnapshot()==(*pair)[0].contents &&
           paired.VertexStorage()->MatchesSource(mesh_vertices) &&
-          paired.IndexStorage()->Matches(*device.Get(),indices16,2),
+          paired.IndexStorage()->Matches(*backend,indices16,2),
           "GPU geometry construction reread changed pair sources");
         Require(!registry.CommitObservedIndex(78,registry.Find(78,NativeModelBuffers::Kind::Index)->generation,
           (*pair)[1].version,paired.IndexStorage()),"old draw pair attached after a later writer");
@@ -738,7 +743,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         const auto fresh=writes.CopyObservedSet(std::array<NativeBufferWrites::SnapshotSource,2>{{
           {77,0x2000,mesh_vertices},{78,0x8000,indices16}}});
         Require(fresh.has_value(),"fresh geometry attachment observation failed");
-        NativeIndexedMesh fresh_mesh(*device.Get(),mesh_vs,declaration,40,*(*fresh)[0].contents,
+        NativeIndexedMesh fresh_mesh(*backend,mesh_vs,declaration,40,*(*fresh)[0].contents,
           *(*fresh)[1].contents,2,false,{},{},NativeIndexedMesh::IndexReuse::RequireMatch,(*fresh)[0].contents);
         const NativeModelBuffers::GeometryOwner fresh_vb{77,generation,(*fresh)[0].version};
         const NativeModelBuffers::GeometryOwner fresh_ib{78,index_owner.generation,(*fresh)[1].version};
@@ -762,11 +767,11 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         registry.Retire(78);
         NativeMeshCache published_cache;
         const NativeMeshCache::Key key{77,78,79,80,0};
-        auto& published=published_cache.Acquire(*device.Get(),mesh_vs,key,declaration,40,mesh_vertices,indices16,2,
+        auto& published=published_cache.Acquire(*backend,mesh_vs,key,declaration,40,mesh_vertices,indices16,2,
           {},{},{},{},{},registry.Find(77,kind)->vertex_contents);
         Require(published.VertexStorage()->SourceSnapshot()==contents,"first GPU conversion did not consume published CPU contents");
         auto changed=mesh_vertices; changed[0]^=1;
-        NativeIndexedMesh stale(*device.Get(),mesh_vs,declaration,40,changed,indices16,2,false,{},{},
+        NativeIndexedMesh stale(*backend,mesh_vs,declaration,40,changed,indices16,2,false,{},{},
           NativeIndexedMesh::IndexReuse::RequireMatch,contents);
         Require(stale.VertexStorage()->SourceSnapshot()!=contents && stale.VertexStorage()->MatchesSource(changed),
           "unreported write reused stale publication contents");
@@ -796,40 +801,40 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       }
       auto shifted_declaration=declaration;
       word(shifted_declaration,0,0); // Different non-overlapping POSITION range, same source allocation.
-      NativeIndexedMesh shifted(*device.Get(),mesh_vs,shifted_declaration,40,mesh_vertices,indices16,2,false,original,original_vertices);
+      NativeIndexedMesh shifted(*backend,mesh_vs,shifted_declaration,40,mesh_vertices,indices16,2,false,original,original_vertices);
       Require(shifted.VertexStorage()!=original_vertices,"different layout reused converted GPU vertices");
       Require(shifted.VertexStorage()->SourceSnapshot()==original_vertices->SourceSnapshot(),
         "different layout duplicated validated immutable CPU vertex contents");
-      NativeIndexedMesh shifted_reference(*device.Get(),mesh_vs,shifted_declaration,40,mesh_vertices,indices16,2);
+      NativeIndexedMesh shifted_reference(*backend,mesh_vs,shifted_declaration,40,mesh_vertices,indices16,2);
       {
         std::vector<uint8_t> prefixed(40,0xff);
         prefixed.insert(prefixed.end(),mesh_vertices.begin(),mesh_vertices.end());
         const auto contents=std::make_shared<const std::vector<uint8_t>>(prefixed);
         NativeMeshCache ranged_cache;
         const NativeMeshCache::Key key{177,178,179,180,0};
-        auto& ranged=ranged_cache.Acquire(*device.Get(),mesh_vs,key,declaration,40,mesh_vertices,indices16,2,
+        auto& ranged=ranged_cache.Acquire(*backend,mesh_vs,key,declaration,40,mesh_vertices,indices16,2,
           {},{},{},{},{},contents,40);
         const auto storage=ranged.VertexStorage();
         Require(storage->SourceSnapshot()==contents && storage->SourceOffset()==40 &&
           storage->SourceBytes()==mesh_vertices.size() && storage->MatchesSource(mesh_vertices),
           "offset stream did not retain its range of publication contents");
-        NativeIndexedMesh reference(*device.Get(),mesh_vs,declaration,40,mesh_vertices,indices16,2);
+        NativeIndexedMesh reference(*backend,mesh_vs,declaration,40,mesh_vertices,indices16,2);
         Require(ranged.CaptureClipPositions(*context.Get(),mesh_vs,0,6,-1)==
           reference.CaptureClipPositions(*context.Get(),mesh_vs,0,6,-1),"offset snapshot converted prefix bytes");
         auto layout_key=key; ++layout_key[2];
-        auto& alternate=ranged_cache.Acquire(*device.Get(),mesh_vs,layout_key,shifted_declaration,40,mesh_vertices,indices16,2);
+        auto& alternate=ranged_cache.Acquire(*backend,mesh_vs,layout_key,shifted_declaration,40,mesh_vertices,indices16,2);
         Require(alternate.VertexStorage()!=storage && alternate.VertexStorage()->SourceSnapshot()==contents &&
           alternate.VertexStorage()->SourceOffset()==40,"layout conversion lost retained source offset");
         Require(alternate.CaptureClipPositions(*context.Get(),mesh_vs,0,6,-1)==
           shifted_reference.CaptureClipPositions(*context.Get(),mesh_vs,0,6,-1),"ranged layout conversion output differs");
-        Require(ranged_cache.Acquire(*device.Get(),mesh_vs,key,declaration,40,mesh_vertices,indices16,2,
+        Require(ranged_cache.Acquire(*backend,mesh_vs,key,declaration,40,mesh_vertices,indices16,2,
           {},{},{},{},{},contents,40).VertexStorage()==storage,"unchanged ranged cache hit rebuilt storage");
-        const auto changed=ranged_cache.Acquire(*device.Get(),mesh_vs,key,declaration,40,updated_vertices,indices16,2,
+        const auto changed=ranged_cache.Acquire(*backend,mesh_vs,key,declaration,40,updated_vertices,indices16,2,
           {},{},{},{},{},contents,40).VertexStorage();
         Require(changed->SourceSnapshot()!=contents && changed->SourceOffset()==0 && changed->MatchesSource(updated_vertices),
           "changed offset stream revived stale contents");
         for(const auto invalid_offset:{contents->size(),SIZE_MAX}) {
-          NativeIndexedMesh invalid(*device.Get(),mesh_vs,declaration,40,mesh_vertices,indices16,2,false,{},{},
+          NativeIndexedMesh invalid(*backend,mesh_vs,declaration,40,mesh_vertices,indices16,2,false,{},{},
             NativeIndexedMesh::IndexReuse::RequireMatch,contents,invalid_offset);
           Require(invalid.VertexStorage()->SourceSnapshot()!=contents && invalid.VertexStorage()->SourceOffset()==0 &&
             invalid.VertexStorage()->MatchesSource(mesh_vertices),"invalid snapshot range did not fall back to live contents");
@@ -840,16 +845,16 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       Require(shifted.CaptureClipPositions(*context.Get(),mesh_vs,0,6,-1)==
         shifted_reference.CaptureClipPositions(*context.Get(),mesh_vs,0,6,-1),
         "shared CPU snapshot used the old GPU conversion layout");
-      NativeIndexedMesh shifted_changed(*device.Get(),mesh_vs,shifted_declaration,40,updated_vertices,indices16,2,false,original,original_vertices);
+      NativeIndexedMesh shifted_changed(*backend,mesh_vs,shifted_declaration,40,updated_vertices,indices16,2,false,original,original_vertices);
       Require(shifted_changed.VertexStorage()->SourceSnapshot()!=original_vertices->SourceSnapshot() &&
         shifted_changed.VertexStorage()->MatchesSource(updated_vertices),
         "layout change bypassed live source validation");
       {
         NativeMeshCache layout_cache;
         auto layout_key=cache_key; layout_key[2]+=100;
-        const auto first_layout=layout_cache.Acquire(*device.Get(),mesh_vs,cache_key,
+        const auto first_layout=layout_cache.Acquire(*backend,mesh_vs,cache_key,
           declaration,40,mesh_vertices,indices16,2).VertexStorage();
-        auto& second_mesh=layout_cache.Acquire(*device.Get(),mesh_vs,layout_key,
+        auto& second_mesh=layout_cache.Acquire(*backend,mesh_vs,layout_key,
           shifted_declaration,40,mesh_vertices,indices16,2);
         const auto second_layout=second_mesh.VertexStorage();
         const auto shared_source=first_layout->SourceSnapshot();
@@ -858,27 +863,27 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
         Require(second_mesh.CaptureClipPositions(*context.Get(),mesh_vs,0,6,-1)==
           shifted_reference.CaptureClipPositions(*context.Get(),mesh_vs,0,6,-1),
           "cached source sharing changed converted clip positions");
-        const auto changed_layout=layout_cache.Acquire(*device.Get(),mesh_vs,layout_key,
+        const auto changed_layout=layout_cache.Acquire(*backend,mesh_vs,layout_key,
           shifted_declaration,40,updated_vertices,indices16,2).VertexStorage();
         Require(changed_layout->SourceSnapshot()!=shared_source && *shared_source==mesh_vertices &&
           changed_layout->MatchesSource(updated_vertices),"cache update mutated a shared CPU generation");
-        const auto first_updated=layout_cache.Acquire(*device.Get(),mesh_vs,cache_key,
+        const auto first_updated=layout_cache.Acquire(*backend,mesh_vs,cache_key,
           declaration,40,updated_vertices,indices16,2).VertexStorage();
         Require(first_updated!=first_layout && first_updated->MatchesSource(updated_vertices),
           "other cached layout missed changed source contents");
         layout_cache.Invalidate(cache_key[0]);
         Require(layout_cache.entries()==0,"vertex retirement retained a cached layout");
-        const auto after_retirement=layout_cache.Acquire(*device.Get(),mesh_vs,cache_key,
+        const auto after_retirement=layout_cache.Acquire(*backend,mesh_vs,cache_key,
           declaration,40,mesh_vertices,indices16,2).VertexStorage();
         Require(after_retirement->SourceSnapshot()!=shared_source &&
           *shared_source==mesh_vertices,"retirement revived or mutated an earlier source generation");
       }
       submit=[&] { retained.Draw(*context.Get(),0,6,-1); }; verify(false);
-      const auto recreated=shared_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2).IndexStorage();
+      const auto recreated=shared_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2).IndexStorage();
       Require(recreated!=original,"retired index owner reused prior native generation");
       auto changed=indices16; std::swap(changed[1],changed[3]);
-      const auto changed_generation=shared_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,changed,2).IndexStorage();
-      Require(changed_generation!=recreated && recreated->Matches(*device.Get(),indices16,2),"index byte mutation lost immutable generation");
+      const auto changed_generation=shared_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,changed,2).IndexStorage();
+      Require(changed_generation!=recreated && recreated->Matches(*backend,indices16,2),"index byte mutation lost immutable generation");
       Require(shared_cache.vertex_mismatches()==1 && shared_cache.index_mismatches()==1,
         "index mismatch classification");
       Require(shared_cache.last_index_mismatch()==cache_key && shared_cache.last_vertex_mismatch()==cache_key,
@@ -889,42 +894,42 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       NativeMeshCache rejection_cache;
       auto mutable_indices=indices16;
       auto mutable_vertices=mesh_vertices;
-      auto& first_rejection_mesh=rejection_cache.Acquire(*device.Get(),mesh_vs,cache_key,
+      auto& first_rejection_mesh=rejection_cache.Acquire(*backend,mesh_vs,cache_key,
         declaration,40,mutable_vertices,mutable_indices,2);
       const auto rejected_ib=first_rejection_mesh.IndexStorage();
       const auto rejected_vb=first_rejection_mesh.VertexStorage();
       mutable_indices=changed;
       auto restore_indices=[&] { std::copy(indices16.begin(),indices16.end(),mutable_indices.begin()); };
-      auto& after_index_rejection=rejection_cache.Acquire(*device.Get(),mesh_vs,cache_key,
+      auto& after_index_rejection=rejection_cache.Acquire(*backend,mesh_vs,cache_key,
         declaration,40,mutable_vertices,mutable_indices,2,{},{},rejected_ib,rejected_vb,
         {&restore_indices,[](void* p) { (*static_cast<decltype(restore_indices)*>(p))(); }});
       Require(after_index_rejection.IndexStorage()!=rejected_ib &&
-        after_index_rejection.IndexStorage()->Matches(*device.Get(),indices16,2),
+        after_index_rejection.IndexStorage()->Matches(*backend,indices16,2),
         "construction reconsidered rejected index storage or missed snapshot bytes");
       mutable_vertices=updated_vertices;
       auto restore_vertices=[&] { std::copy(mesh_vertices.begin(),mesh_vertices.end(),mutable_vertices.begin()); };
-      auto& after_vertex_rejection=rejection_cache.Acquire(*device.Get(),mesh_vs,cache_key,
+      auto& after_vertex_rejection=rejection_cache.Acquire(*backend,mesh_vs,cache_key,
         declaration,40,mutable_vertices,mutable_indices,2,{},{},{},rejected_vb,
         {&restore_vertices,[](void* p) { (*static_cast<decltype(restore_vertices)*>(p))(); }});
       Require(after_vertex_rejection.VertexStorage()!=rejected_vb &&
         after_vertex_rejection.VertexStorage()->MatchesSource(mesh_vertices),
         "construction reconsidered rejected vertex storage or missed snapshot bytes");
       bool rejected_generation=false;
-      try { NativeIndexedMesh invalid(*device.Get(),mesh_vs,declaration,40,mesh_vertices,changed,2,false,original); }
+      try { NativeIndexedMesh invalid(*backend,mesh_vs,declaration,40,mesh_vertices,changed,2,false,original); }
       catch(const std::runtime_error&) { rejected_generation=true; }
       Require(rejected_generation,"mesh accepted mismatched shared index generation");
-      NativeIndexedMesh replaced(*device.Get(),mesh_vs,declaration,40,mesh_vertices,changed,2,false,original,{},
+      NativeIndexedMesh replaced(*backend,mesh_vs,declaration,40,mesh_vertices,changed,2,false,original,{},
         NativeIndexedMesh::IndexReuse::ReplaceStale);
-      Require(replaced.IndexStorage()!=original && replaced.IndexStorage()->Matches(*device.Get(),changed,2) &&
-        original->Matches(*device.Get(),indices16,2),"single-validation replacement lost old/new index contents");
-      NativeIndexedMesh reused(*device.Get(),mesh_vs,declaration,40,mesh_vertices,indices16,2,false,original,{},
+      Require(replaced.IndexStorage()!=original && replaced.IndexStorage()->Matches(*backend,changed,2) &&
+        original->Matches(*backend,indices16,2),"single-validation replacement lost old/new index contents");
+      NativeIndexedMesh reused(*backend,mesh_vs,declaration,40,mesh_vertices,indices16,2,false,original,{},
         NativeIndexedMesh::IndexReuse::ReplaceStale);
       Require(reused.IndexStorage()==original,"single-validation path failed to retain matching index storage");
       shared_cache.Invalidate(cache_key[0]);
-      Require(shared_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2).VertexStorage()!=original_vertices,
+      Require(shared_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2).VertexStorage()!=original_vertices,
         "retired vertex owner reused prior generation");
-      NativeIndexedMesh dynamic_a(*device.Get(),mesh_vs,declaration,40,mesh_vertices,indices16,2,true,original,original_vertices);
-      NativeIndexedMesh dynamic_b(*device.Get(),mesh_vs,declaration,40,mesh_vertices,indices16,2,true,original,dynamic_a.VertexStorage());
+      NativeIndexedMesh dynamic_a(*backend,mesh_vs,declaration,40,mesh_vertices,indices16,2,true,original,original_vertices);
+      NativeIndexedMesh dynamic_b(*backend,mesh_vs,declaration,40,mesh_vertices,indices16,2,true,original,dynamic_a.VertexStorage());
       Require(dynamic_a.VertexStorage()!=original_vertices && dynamic_a.VertexStorage()!=dynamic_b.VertexStorage(),
         "dynamic vertex allocations shared mutable ownership");
       const auto previous_dynamic_source=dynamic_a.VertexStorage()->SourceSnapshot();
@@ -937,7 +942,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
     }
     NativeMeshCache streaming_cache(4*1024*1024,256,true);
     auto stream_acquire=[&](std::span<const uint8_t> data)->NativeIndexedMesh& {
-      return streaming_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,data,indices16,2);
+      return streaming_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,data,indices16,2);
     };
     // Updating after a queued draw must preserve its old vertices until the GPU
     // consumes them. Readback here tests DISCARD, not only the latest upload.
@@ -971,74 +976,74 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
     auto updated_indices=indices16; updated_indices[1]=100;
     bool rejected_cached_index=false;
     try {
-      mesh_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,updated_vertices,updated_indices,2)
+      mesh_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,updated_vertices,updated_indices,2)
         .ValidateDraw(0,6,-1);
     } catch (const std::runtime_error&) { rejected_cached_index=true; }
     Require(rejected_cached_index && mesh_cache.builds()==3,"updated indices reused stale cache");
     auto malformed_decl=declaration; word(malformed_decl,4,0xffffffff);
     bool rejected_cached_decl=false;
-    try { mesh_cache.Acquire(*device.Get(),mesh_vs,cache_key,malformed_decl,40,mesh_vertices,indices16,2); }
+    try { mesh_cache.Acquire(*backend,mesh_vs,cache_key,malformed_decl,40,mesh_vertices,indices16,2); }
     catch (const std::runtime_error&) { rejected_cached_decl=true; }
     Require(rejected_cached_decl && mesh_cache.bytes()==0,"failed declaration update retained cache entry");
     acquire(mesh_vertices);
     auto reloaded_vs=CompileNativeShader(*device.Get(),mesh_effect,{false,"VS","vs_5_0"},"mesh.fx");
     bool rejected_stream_decl=false;
-    try { streaming_cache.Acquire(*device.Get(),mesh_vs,cache_key,malformed_decl,40,mesh_vertices,indices16,2); }
+    try { streaming_cache.Acquire(*backend,mesh_vs,cache_key,malformed_decl,40,mesh_vertices,indices16,2); }
     catch(const std::runtime_error&) { rejected_stream_decl=true; }
     Require(rejected_stream_decl && streaming_cache.bytes()==0,"failed dynamic layout retained stale geometry");
     stream_acquire(mesh_vertices);
     const auto stream_builds=streaming_cache.builds();
-    streaming_cache.Acquire(*device.Get(),reloaded_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
+    streaming_cache.Acquire(*backend,reloaded_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
     Require(streaming_cache.builds()==stream_builds+1,"dynamic mesh ignored shader reload");
-    streaming_cache.Acquire(*device.Get(),reloaded_vs,cache_key,declaration,40,mesh_vertices,indices32,4);
+    streaming_cache.Acquire(*backend,reloaded_vs,cache_key,declaration,40,mesh_vertices,indices32,4);
     Require(streaming_cache.builds()==stream_builds+2,"dynamic mesh ignored changed index format");
     streaming_cache.Invalidate(102);
     Require(streaming_cache.bytes()==0,"dynamic resource invalidation retained geometry");
     const auto before_reload=mesh_cache.builds();
-    mesh_cache.Acquire(*device.Get(),reloaded_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
+    mesh_cache.Acquire(*backend,reloaded_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
     Require(mesh_cache.builds()==before_reload+1,"shader reload reused old layout");
     mesh_cache.Invalidate(102);
     Require(mesh_cache.bytes()==0,"destroyed index resource retained cache entry");
     // Embedded model owners can release/recreate without final COM destruction.
     // Identical bytes and handle values still belong to a new native lifetime.
     for (const auto resource : {cache_key[0],cache_key[1]}) {
-      mesh_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
+      mesh_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
       const auto before_reuse=mesh_cache.builds();
       mesh_cache.Invalidate(resource);
       Require(mesh_cache.entries()==0 && mesh_cache.bytes()==0,"model cleanup retained native mesh");
       mesh_cache.Invalidate(resource); // cleanup of an already empty owner
-      mesh_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
+      mesh_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
       Require(mesh_cache.builds()==before_reuse+1,"recreated model owner reused retired mesh");
     }
     NativeMeshCache bounded_cache(payload_bytes);
     auto second_key=cache_key; second_key[0]=201;
-    bounded_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
-    bounded_cache.Acquire(*device.Get(),mesh_vs,second_key,declaration,40,mesh_vertices,indices16,2);
-    bounded_cache.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
+    bounded_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
+    bounded_cache.Acquire(*backend,mesh_vs,second_key,declaration,40,mesh_vertices,indices16,2);
+    bounded_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
     Require(bounded_cache.builds()==3 && bounded_cache.bytes()==payload_bytes,"mesh cache budget eviction failed");
     Require(bounded_cache.budget_evictions()==2 && bounded_cache.entry_evictions()==0,
       "mesh budget eviction attribution");
     NativeMeshCache entry_bounded(payload_bytes*4,2);
     auto third_key=cache_key; third_key[0]=301;
     for(const auto& key:{cache_key,second_key,cache_key,third_key,cache_key})
-      entry_bounded.Acquire(*device.Get(),mesh_vs,key,declaration,40,mesh_vertices,indices16,2);
+      entry_bounded.Acquire(*backend,mesh_vs,key,declaration,40,mesh_vertices,indices16,2);
     Require(entry_bounded.builds()==3 && entry_bounded.hits()==2 && entry_bounded.entries()==2 &&
       entry_bounded.entry_evictions()==1 && entry_bounded.budget_evictions()==0,
       "mesh entry cap preserves recently used entry");
     NativeMeshCache more_entries(payload_bytes*300);
     for(uint32_t i=0;i<257;++i) {
       auto key=cache_key; key[0]=1000+i;
-      more_entries.Acquire(*device.Get(),mesh_vs,key,declaration,40,mesh_vertices,indices16,2);
+      more_entries.Acquire(*backend,mesh_vs,key,declaration,40,mesh_vertices,indices16,2);
     }
     auto first_key=cache_key; first_key[0]=1000;
-    more_entries.Acquire(*device.Get(),mesh_vs,first_key,declaration,40,mesh_vertices,indices16,2);
+    more_entries.Acquire(*backend,mesh_vs,first_key,declaration,40,mesh_vertices,indices16,2);
     Require(more_entries.builds()==257 && more_entries.hits()==1 && more_entries.entries()==257 &&
       more_entries.bytes()<=payload_bytes*300,"mesh cache still thrashes at former256 entry limit");
     NativeMeshCache zero_entries(payload_bytes,0);
-    zero_entries.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
+    zero_entries.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
     Require(zero_entries.entries()==0 && zero_entries.bytes()==0,"zero entry limit must not retain meshes");
     NativeMeshCache uncached(1);
-    for (int i=0;i<2;++i) uncached.Acquire(*device.Get(),mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
+    for (int i=0;i<2;++i) uncached.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2);
     Require(uncached.builds()==2 && uncached.bytes()==0,"oversized mesh retained in cache");
     // The farther mesh has inverted UVs. Its color must be rejected after a
     // nearer draw, but must appear when depth writes or depth testing are off.
@@ -1048,7 +1053,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       word(far_vertices,v*40+28,std::bit_cast<uint32_t>(1-quad[v*4+2]));
       word(far_vertices,v*40+32,std::bit_cast<uint32_t>(1-quad[v*4+3]));
     }
-    NativeIndexedMesh far_mesh(*device.Get(),mesh_vs,declaration,40,far_vertices,indices16,2);
+    NativeIndexedMesh far_mesh(*backend,mesh_vs,declaration,40,far_vertices,indices16,2);
     for (auto format : {DXGI_FORMAT_D24_UNORM_S8_UINT,DXGI_FORMAT_D32_FLOAT,DXGI_FORMAT_D32_FLOAT_S8X24_UINT}) {
       auto depth=CreateNativeDepthTarget(*device.Get(),4,2,format);
       Require(!depth.depth_valid && !depth.stencil_valid,"new depth storage marked valid");
@@ -1106,7 +1111,7 @@ Varying VS(float3 position : POSITION0,float3 normal : NORMAL0,float2 uv : TEXCO
       word(packed_vertices,v*48+40,0x04030201); // UBYTE4 -> 1,2,3,4, not normalized.
       word(packed_vertices,v*48+44,0xffff0000); // ARGB -> red, alpha one.
     }
-    NativeIndexedMesh packed_mesh(*device.Get(),packed_vs,packed_decl,48,packed_vertices,indices16,2);
+    NativeIndexedMesh packed_mesh(*backend,packed_vs,packed_decl,48,packed_vertices,indices16,2);
     unclipped_state.Bind(*context.Get());
     context->VSSetShader(packed_vs.vertex.Get(),nullptr,0);
     submit=[&] { packed_mesh.Draw(*context.Get(),0,6,-1); }; verify(false);
@@ -1150,7 +1155,7 @@ Varying VS(float3 position : POSITION0,float3 normal : NORMAL0,float2 uv : TEXCO
       const auto palette_bytes=Guest(palette);
       skin_vs.PatchGuestFloatRegisters("bones",6,
         std::span<const uint8_t>(palette_bytes).subspan(6*16,3*16));
-      NativeIndexedMesh skin_mesh(*device.Get(),skin_vs.shader(),skin_decl,64,skin_vertices,indices16,2);
+      NativeIndexedMesh skin_mesh(*backend,skin_vs.shader(),skin_decl,64,skin_vertices,indices16,2);
       skin_vs.Bind(*context.Get());
       submit=[&] { skin_mesh.Draw(*context.Get(),0,6,-1); }; verify(false);
     }
@@ -1162,7 +1167,7 @@ Varying VS(float3 position : POSITION0,float3 normal : NORMAL0,float2 uv : TEXCO
     Require(rejected_index,"out-of-range mesh index span accepted");
     auto invalid_decl=declaration; word(invalid_decl,4,0xffffffff);
     bool rejected_format=false;
-    try { NativeIndexedMesh invalid(*device.Get(),mesh_vs,invalid_decl,40,mesh_vertices,indices16,2); }
+    try { NativeIndexedMesh invalid(*backend,mesh_vs,invalid_decl,40,mesh_vertices,indices16,2); }
     catch (const std::runtime_error&) { rejected_format=true; }
     Require(rejected_format,"unsupported packed mesh attribute accepted");
     std::shared_ptr<NativeVertexBuffer> previous_defaults;
@@ -1180,7 +1185,7 @@ Varying VS(float3 position : POSITION0,float3 normal : NORMAL0,float2 uv : TEXCO
 )";
       for (bool reversed : {false,true}) {
         auto defaults_vs=CompileNativeShader(*device.Get(),defaults,{false,"VS","vs_5_0"},"defaults.fx",reversed);
-        NativeIndexedMesh defaults_mesh(*device.Get(),defaults_vs,declaration,40,mesh_vertices,indices16,2,false,{},previous_defaults);
+        NativeIndexedMesh defaults_mesh(*backend,defaults_vs,declaration,40,mesh_vertices,indices16,2,false,{},previous_defaults);
         const bool integer=std::string_view(component_type)!="float4";
         if(previous_defaults) Require((defaults_mesh.VertexStorage()==previous_defaults)==(integer==previous_integer),
           "vertex resource sharing ignored default-component conversion contract");
@@ -1378,7 +1383,7 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
       source_declaration.reset();
       NativeMeshCache utility_cache;
       auto acquire_utility=[&]()->NativeIndexedMesh& {
-        return utility_cache.Acquire(*device.Get(),utility_vs.shader(),{51,52,53,54,0},
+        return utility_cache.Acquire(*backend,utility_vs.shader(),{51,52,53,54,0},
           converted_declaration->bytes(),uint32_t(stride),utility_vertices,generated_quad->bytes(),2,converted_declaration,generated_quad);
       };
       acquire_utility();
@@ -1390,7 +1395,7 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
         "native generated indices were counted as guest source checks");
       for(uint32_t width:{2u,4u}) {
         bool rejected=false;
-        try { utility_cache.Acquire(*device.Get(),utility_vs.shader(),{51,52,53,54,0},
+        try { utility_cache.Acquire(*backend,utility_vs.shader(),{51,52,53,54,0},
           converted_declaration->bytes(),uint32_t(stride),utility_vertices,utility_indices,width,converted_declaration,generated_quad); }
         catch(const std::runtime_error&) { rejected=true; }
         Require(rejected,"generated index identity accepted foreign bytes/width");
@@ -1426,7 +1431,7 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
           {false,textured?"VS_2DTex":"VS_2D","vs_5_0"},"utility_contract.fx",reversed));
         scene_vs.SetGuestFloatRegisters("_g_DX2DScale",Guest(std::array<float,4>{.5f,-1,0,0}));
         scene_vs.SetGuestFloatRegisters("_g_DX2DOffset",Guest(std::array<float,4>{-1,1,0,0}));
-        NativeIndexedMesh scene_mesh(*device.Get(),scene_vs.shader(),native_utility_decl,
+        NativeIndexedMesh scene_mesh(*backend,scene_vs.shader(),native_utility_decl,
           uint32_t(stride),utility_vertices,utility_indices,2);
         auto scene_depth=CreateNativeDepthTarget(*device.Get(),4,2,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
         context->OMSetRenderTargets(1,&rtv,scene_depth.target.Get());
@@ -1463,7 +1468,7 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
           strip_vertices.begin()+destination*stride);
       }
       const auto strip_indices=TriangleStripIndices16(4);
-      NativeIndexedMesh strip_mesh(*device.Get(),utility_vs.shader(),native_utility_decl,uint32_t(stride),strip_vertices,strip_indices,2);
+      NativeIndexedMesh strip_mesh(*backend,utility_vs.shader(),native_utility_decl,uint32_t(stride),strip_vertices,strip_indices,2);
       ClearNativeColorTarget(*context.Get(),target,0xff000000);
       strip_mesh.Draw(*context.Get(),0,6);
       for(uint32_t y=0;y<2;++y) for(uint32_t x=0;x<4;++x) {
@@ -1556,16 +1561,16 @@ float4 Ps_ZParticle(P i):SV_TARGET {
       Require(ImmediateMeshKey(changed_vertices,2,3,strip?6:13,reversed)!=content_key &&
         ImmediateMeshKey(scene_vertices,2,3,strip?6:13,!reversed)!=content_key,
         "immediate key ignores contents/depth variant");
-      immediate_cache.Acquire(*device.Get(),particle_vs.shader(),immediate_key,scene_decl,billboard?44:36,
+      immediate_cache.Acquire(*backend,particle_vs.shader(),immediate_key,scene_decl,billboard?44:36,
         scene_vertices,scene_indices,2);
-      auto& particle_mesh=immediate_cache.Acquire(*device.Get(),particle_vs.shader(),immediate_key,
+      auto& particle_mesh=immediate_cache.Acquire(*backend,particle_vs.shader(),immediate_key,
         scene_decl,billboard?44:36,scene_vertices,scene_indices,2);
       Require(immediate_cache.builds()==1 && immediate_cache.hits()==1,"immediate mesh exact-byte reuse");
       // A/B/A changes reuse one layout and buffer, uploading both mutations.
       const auto alternate_key=ImmediateStreamKey(changed_vertices.size(),2,3,strip?6:13,reversed);
-      immediate_cache.Acquire(*device.Get(),particle_vs.shader(),alternate_key,scene_decl,billboard?44:36,
+      immediate_cache.Acquire(*backend,particle_vs.shader(),alternate_key,scene_decl,billboard?44:36,
         changed_vertices,scene_indices,2);
-      auto& restored_mesh=immediate_cache.Acquire(*device.Get(),particle_vs.shader(),immediate_key,
+      auto& restored_mesh=immediate_cache.Acquire(*backend,particle_vs.shader(),immediate_key,
         scene_decl,billboard?44:36,scene_vertices,scene_indices,2);
       Require(&restored_mesh==&particle_mesh && immediate_cache.builds()==1 && immediate_cache.hits()==1 &&
         immediate_cache.updates()==2 && immediate_cache.entries()==1,"alternating dynamic contents rebuilt geometry");

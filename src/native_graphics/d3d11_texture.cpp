@@ -1,5 +1,6 @@
 #include "d3d11_texture.h"
 #include "native_dds_decode.h"
+#include "d3d11_backend.h"
 #include <d3dcompiler.h>
 #include <string>
 #include <string_view>
@@ -252,10 +253,12 @@ void ResolveNativeRenderTarget(ID3D11DeviceContext& context, NativeRenderTarget&
   }
   target.sampled.content_valid = target.content_valid;
 }
-NativeTexture CreateNativeDdsTexture(ID3D11Device& device, std::span<const uint8_t> data) {
+NativeTexture CreateNativeDdsTexture(NativeRenderBackend& backend, std::span<const uint8_t> data) {
   // Everything about what the file contains is decided by the shared decoder,
   // so a second backend creating the same texture cannot reach a different
-  // answer. Only the creation below is D3D11's.
+  // answer. Nothing below is D3D11's any more either: the creation goes
+  // through the seam, and the D3D11 handles kept at the end are the same
+  // objects, for the paths that still sample them directly.
   const auto decoded = DecodeNativeDdsTexture(data);
   NativeTexture result;
   result.width = decoded.width;
@@ -263,22 +266,33 @@ NativeTexture CreateNativeDdsTexture(ID3D11Device& device, std::span<const uint8
   result.mip_count = decoded.mip_count;
   result.cube = decoded.cube;
 
-  std::vector<D3D11_SUBRESOURCE_DATA> subresources(decoded.levels.size());
-  for (size_t index = 0; index < decoded.levels.size(); ++index) {
-    const auto& level = decoded.levels[index];
-    subresources[index] = {level.bytes.data(), level.pitch,
-                           static_cast<UINT>(level.bytes.size())};
-  }
-  D3D11_TEXTURE2D_DESC desc{};
-  desc.Width = decoded.width; desc.Height = decoded.height; desc.MipLevels = decoded.mip_count;
-  desc.ArraySize = decoded.faces; desc.Format = static_cast<DXGI_FORMAT>(decoded.format);
-  desc.SampleDesc.Count = 1;
-  desc.Usage = D3D11_USAGE_IMMUTABLE; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  desc.MiscFlags = decoded.cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
-  if (FAILED(device.CreateTexture2D(&desc, subresources.data(), &result.resource)))
-    throw std::runtime_error("native DDS texture creation failed");
-  if (FAILED(device.CreateShaderResourceView(result.resource.Get(), nullptr, &result.view)))
-    throw std::runtime_error("native DDS view creation failed");
+  // The seam takes one tightly packed block in subresource order - every
+  // level of face 0, then face 1 - which is the order the decode produces, so
+  // the levels are simply concatenated. A block-compressed level points into
+  // the source file and a converted one into the decode's own storage; both
+  // outlive this copy.
+  size_t total = 0;
+  for (const auto& level : decoded.levels) total += level.bytes.size();
+  std::vector<uint8_t> contents;
+  contents.reserve(total);
+  for (const auto& level : decoded.levels)
+    contents.insert(contents.end(), level.bytes.begin(), level.bytes.end());
+
+  NativeBackendTextureDesc desc{};
+  desc.width = decoded.width;
+  desc.height = decoded.height;
+  desc.levels = decoded.mip_count;
+  desc.array_size = decoded.faces;
+  desc.cube = decoded.cube;
+  desc.format = decoded.format;
+  result.backend = backend.CreateTexture(desc, contents);
+  if (!result.backend) throw std::runtime_error("native DDS texture creation failed");
+  // The same objects, for the paths that still sample through D3D11. Null on a
+  // backend that is not D3D11, which is not an error here - it is an error only
+  // for a caller that then tries to bind the view, and those callers are what
+  // the rest of this port removes.
+  result.resource = NativeD3D11TextureResource(*result.backend);
+  result.view = NativeD3D11TextureView(*result.backend);
   return result;
 }
 NativeHdrRange InspectNativeHdrColor(ID3D11DeviceContext& context,ID3D11Texture2D& surface) {

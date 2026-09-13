@@ -1,4 +1,5 @@
 #include "native_graphics/d3d11_texture.h"
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d11_bindings.h"
 #include "native_graphics/d3d11_render_state.h"
 #include <cmath>
@@ -23,9 +24,9 @@ std::vector<uint8_t> Header(uint32_t width, uint32_t height, uint32_t mips) {
   Word(bytes,12,height); Word(bytes,16,width); Word(bytes,28,mips);
   return bytes;
 }
-void Reject(ID3D11Device& device, const std::vector<uint8_t>& bytes) {
+void Reject(NativeRenderBackend& backend, const std::vector<uint8_t>& bytes) {
   bool rejected = false;
-  try { CreateNativeDdsTexture(device, bytes); }
+  try { CreateNativeDdsTexture(backend, bytes); }
   catch (const std::runtime_error&) { rejected = true; }
   Require(rejected, "invalid DDS accepted");
 }
@@ -49,6 +50,11 @@ int main() {
     ComPtr<ID3D11DeviceContext> context;
     Require(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
       D3D11_SDK_VERSION,&device,nullptr,&context)), "device creation");
+    // Through the backend, on this device, so the readbacks below check what
+    // the seam actually created - including face-major subresource order,
+    // which a texture interface describing one 2D slice could not express.
+    auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
+    Require(bool(backend),"adopted backend");
     // Read each compressed subresource back byte-for-byte. Unique face/mip
     // values detect truncated chains, incorrect block rounding and face order.
     for (uint32_t fourcc : {0x31545844u,0x33545844u,0x35545844u}) {
@@ -58,7 +64,7 @@ int main() {
       for (unsigned face = 0; face < 6; ++face)
         for (unsigned mip = 0; mip < 4; ++mip)
           bytes.insert(bytes.end(), (mip == 0 ? 4 : 1)*block, uint8_t(face*4+mip+1));
-      auto native = CreateNativeDdsTexture(*device.Get(),bytes);
+      auto native = CreateNativeDdsTexture(*backend,bytes);
       Require(native.cube && native.mip_count == 4, "cube metadata");
       D3D11_SHADER_RESOURCE_VIEW_DESC view{};
       native.view->GetDesc(&view);
@@ -82,8 +88,8 @@ int main() {
         context->Unmap(staging.Get(),index);
         Require(correct,"compressed face/mip payload changed");
       }
-      bytes.pop_back(); Reject(*device.Get(),bytes);
-      Word(bytes,112,0x600); Reject(*device.Get(),bytes);
+      bytes.pop_back(); Reject(*backend,bytes);
+      Word(bytes,112,0x600); Reject(*backend,bytes);
     }
     // Map shadow textures are alpha-only A8. Check all channels, padded top
     // rows and the tightly packed next mip so alpha cannot turn into red.
@@ -91,7 +97,7 @@ int main() {
     Word(alpha,80,2); Word(alpha,88,8); Word(alpha,104,255);
     Word(alpha,8,8); Word(alpha,20,4);
     alpha.insert(alpha.end(),{0,85,0xee,0xee,170,255,0xee,0xee,123});
-    auto alpha_texture=CreateNativeDdsTexture(*device.Get(),alpha);
+    auto alpha_texture=CreateNativeDdsTexture(*backend,alpha);
     D3D11_TEXTURE2D_DESC alpha_desc{}; alpha_texture.resource->GetDesc(&alpha_desc);
     Require(alpha_desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM,"A8 expanded format");
     alpha_desc.Usage=D3D11_USAGE_STAGING; alpha_desc.BindFlags=0;
@@ -111,14 +117,14 @@ int main() {
       context->Unmap(alpha_readback.Get(),mip);
       Require(correct,"A8 shadow channel/pitch/mip conversion");
     }
-    auto bad_alpha=alpha; bad_alpha.pop_back(); Reject(*device.Get(),bad_alpha);
-    bad_alpha=alpha; Word(bad_alpha,104,0); Reject(*device.Get(),bad_alpha);
-    bad_alpha=alpha; Word(bad_alpha,92,255); Reject(*device.Get(),bad_alpha);
+    auto bad_alpha=alpha; bad_alpha.pop_back(); Reject(*backend,bad_alpha);
+    bad_alpha=alpha; Word(bad_alpha,104,0); Reject(*backend,bad_alpha);
+    bad_alpha=alpha; Word(bad_alpha,92,255); Reject(*backend,bad_alpha);
     auto invalid = Header(4,4,4); // Four levels cannot fit a 4x4 image.
-    Reject(*device.Get(),invalid);
-    invalid = Header(0,4,1); Reject(*device.Get(),invalid);
+    Reject(*backend,invalid);
+    invalid = Header(0,4,1); Reject(*backend,invalid);
     invalid = Header(4,4,1); Word(invalid,80,4); Word(invalid,84,0x30315844);
-    Reject(*device.Get(),invalid); // DX10 is deliberately not silently misread.
+    Reject(*backend,invalid); // DX10 is deliberately not silently misread.
     auto capture_target=CreateNativeRenderTarget(*device.Get(),3,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     const std::array<uint16_t,24> capture_pixels{
       0x3c00,0,0,0x3c00, 0,0x3800,0,0x3c00, 0,0,0x4000,0x3c00,

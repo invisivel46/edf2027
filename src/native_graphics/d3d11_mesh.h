@@ -2,6 +2,7 @@
 #include "native_input_layout.h"
 #include "mesh_key.h"
 #include "d3d11_effect.h"
+#include "native_render_backend.h"
 #include <array>
 #include <map>
 #include <memory>
@@ -30,12 +31,18 @@ class NativeVertexBuffer {
   size_t StorageBytes() const { return source_->size()+size_t(stride_)*vertex_count_+attributes_.size()*sizeof(NativeVertexAttribute); }
  private:
   friend class NativeIndexedMesh;
-  NativeVertexBuffer(ID3D11Device& device,std::vector<NativeVertexAttribute> attributes,
+  NativeVertexBuffer(NativeRenderBackend& backend,std::vector<NativeVertexAttribute> attributes,
     uint32_t guest_stride,uint32_t native_stride,std::span<const uint8_t> source,bool dynamic,
     std::shared_ptr<const std::vector<uint8_t>> validated_snapshot={},size_t snapshot_offset=0);
   std::vector<uint8_t> ConvertVertices(std::span<const uint8_t> source) const;
   void Update(ID3D11DeviceContext& context,std::span<const uint8_t> source);
-  Microsoft::WRL::ComPtr<ID3D11Device> device_;
+  // The backend that made storage_, kept for the identity checks that used to
+  // compare devices: sharing a converted buffer across backends would bind a
+  // resource one of them has never seen.
+  NativeRenderBackend* backend_=nullptr;
+  std::unique_ptr<NativeBackendBuffer> storage_;
+  // The same buffer, for the draw and the update - both still D3D11. They go
+  // when the draw path itself moves onto a recorder.
   Microsoft::WRL::ComPtr<ID3D11Buffer> buffer_;
   std::vector<NativeVertexAttribute> attributes_;
   std::shared_ptr<const std::vector<uint8_t>> source_;
@@ -47,17 +54,18 @@ class NativeVertexBuffer {
 // share it; replacement never mutates storage referenced by earlier draws.
 class NativeIndexBuffer {
  public:
-  NativeIndexBuffer(ID3D11Device& device,std::span<const uint8_t> bytes,uint32_t width,
+  NativeIndexBuffer(NativeRenderBackend& backend,std::span<const uint8_t> bytes,uint32_t width,
     std::shared_ptr<const std::vector<uint8_t>> contents={});
-  bool Matches(ID3D11Device& device,std::span<const uint8_t> bytes,uint32_t width) const;
-  bool OwnsSource(ID3D11Device& device,std::span<const uint8_t> bytes,uint32_t width) const {
-    return device_.Get()==&device && width_==width && bytes.size()==source_->size() && bytes.data()==source_->data();
+  bool Matches(NativeRenderBackend& backend,std::span<const uint8_t> bytes,uint32_t width) const;
+  bool OwnsSource(NativeRenderBackend& backend,std::span<const uint8_t> bytes,uint32_t width) const {
+    return backend_==&backend && width_==width && bytes.size()==source_->size() && bytes.data()==source_->data();
   }
   const std::shared_ptr<const std::vector<uint8_t>>& SourceSnapshot() const { return source_; }
   size_t StorageBytes() const { return source_->size()*2+values_.size()*sizeof(uint32_t); }
  private:
   friend class NativeIndexedMesh;
-  Microsoft::WRL::ComPtr<ID3D11Device> device_;
+  NativeRenderBackend* backend_=nullptr;
+  std::unique_ptr<NativeBackendBuffer> storage_;
   Microsoft::WRL::ComPtr<ID3D11Buffer> buffer_;
   std::shared_ptr<const std::vector<uint8_t>> source_;
   std::vector<uint32_t> values_;
@@ -71,7 +79,7 @@ class NativeIndexBuffer {
 class NativeIndexedMesh {
  public:
   enum class IndexReuse { RequireMatch, ReplaceStale };
-  NativeIndexedMesh(ID3D11Device& device,const NativeShader& vertex_shader,
+  NativeIndexedMesh(NativeRenderBackend& backend,const NativeShader& vertex_shader,
     std::span<const uint8_t> guest_declaration,uint32_t stride,
     std::span<const uint8_t> guest_vertices,std::span<const uint8_t> guest_indices,
     uint32_t index_bytes,bool dynamic_vertices=false,std::shared_ptr<const NativeIndexBuffer> index_storage={},
@@ -132,7 +140,7 @@ class NativeMeshCache {
   using Key=std::array<uint32_t,5>;
   explicit NativeMeshCache(size_t budget=64*1024*1024,size_t entry_limit=1024,bool dynamic_vertices=false)
       : budget_(budget),entry_limit_(entry_limit),dynamic_vertices_(dynamic_vertices) {}
-  NativeIndexedMesh& Acquire(ID3D11Device& device,const NativeShader& shader,const Key& key,
+  NativeIndexedMesh& Acquire(NativeRenderBackend& backend,const NativeShader& shader,const Key& key,
     std::span<const uint8_t> declaration,uint32_t stride,std::span<const uint8_t> vertices,
     std::span<const uint8_t> indices,uint32_t index_bytes,
     std::shared_ptr<const NativeDeclaration> owned_declaration={},
@@ -186,7 +194,7 @@ class NativeMeshCache {
   std::map<uint32_t,std::weak_ptr<const NativeIndexBuffer>> index_resources_;
   std::map<uint32_t,std::weak_ptr<NativeVertexBuffer>> vertex_resources_;
   std::unique_ptr<NativeIndexedMesh> transient_;
-  Microsoft::WRL::ComPtr<ID3D11Device> device_;
+  NativeRenderBackend* backend_=nullptr;
   size_t budget_,entry_limit_,bytes_=0;
   bool dynamic_vertices_=false;
   uint64_t updates_=0;

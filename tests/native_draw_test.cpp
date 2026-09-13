@@ -2,6 +2,7 @@
 // uses hardware. Neither path loads ReXGlue or emulates Xbox GPU commands.
 #include "native_graphics/d3d11_bindings.h"
 #include "native_graphics/d3d11_texture.h"
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d11_sampler.h"
 #include "native_graphics/d3d11_render_state.h"
 #include "native_graphics/d3d11_completion.h"
@@ -44,6 +45,10 @@ int main() {
     const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
     Require(SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &level, 1,
                                        D3D11_SDK_VERSION, &device, nullptr, &context)), "device creation");
+    // Textures are created through the backend now; adopting this device keeps
+    // them usable by the direct D3D11 draws the rest of this test makes.
+    auto backend = AdoptNativeD3D11Backend(*device.Get(), *context.Get());
+    Require(bool(backend), "adopted backend");
     Effect effect;
     effect.source = R"(
 cbuffer VertexData : register(b7) { float2 offset; };
@@ -158,10 +163,10 @@ float4 PackingPS() : SV_TARGET {
     DdsWord(dds,76,32); DdsWord(dds,80,0x41); DdsWord(dds,88,32);
     DdsWord(dds,92,0xff); DdsWord(dds,96,0xff00); DdsWord(dds,100,0xff0000); DdsWord(dds,104,0xff000000);
     std::copy(texel.begin(), texel.end(), dds.begin()+128);
-    auto texture = CreateNativeDdsTexture(*device.Get(), dds);
+    auto texture = CreateNativeDdsTexture(*backend, dds);
     auto view = texture.view;
     rejected = false;
-    try { CreateNativeDdsTexture(*device.Get(), std::span(dds).first(131)); }
+    try { CreateNativeDdsTexture(*backend, std::span(dds).first(131)); }
     catch (const std::runtime_error&) { rejected = true; }
     Require(rejected, "truncated DDS payload accepted");
     const uint32_t clamp = (2u<<10)|(2u<<13)|(2u<<16);
@@ -527,7 +532,7 @@ float4 WhitePS():SV_TARGET { return 1; }
     const std::array<uint8_t,20> mip_pixels{
       255,0,0,255, 0,255,0,255, 255,0,0,255, 0,255,0,255, 0,0,255,255};
     std::copy(mip_pixels.begin(),mip_pixels.end(),mip_dds.begin()+128);
-    auto mip_texture = CreateNativeDdsTexture(*device.Get(),mip_dds);
+    auto mip_texture = CreateNativeDdsTexture(*backend,mip_dds);
     ShaderBindings probe_shader(*device.Get(),CompileNativeShader(*device.Get(),effect,{true,"SamplerPS","ps_5_0"},"test.fx"));
     probe_shader.SetTexture("mipImage",mip_texture.view.Get());
     auto sample = [&](uint32_t address, uint32_t filter, uint32_t lod_range,

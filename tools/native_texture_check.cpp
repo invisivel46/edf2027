@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "native_graphics/d3d11_texture.h"
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/effect.h"
 #include <algorithm>
 #include <cctype>
@@ -11,9 +12,11 @@
 int main(int argc,char** argv) {
   if (argc!=2) { std::cerr << "usage: edf_native_texture_check <game directory>\n"; return 2; }
   try {
-    Microsoft::WRL::ComPtr<ID3D11Device> device;
-    if (FAILED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
-        D3D11_SDK_VERSION,&device,nullptr,nullptr))) throw std::runtime_error("D3D11 device creation failed");
+    // WARP through the backend interface: this checks the disc's assets
+    // against the same creation path the game uses, which is now the seam.
+    edf::native::RegisterNativeD3D11Backend();
+    auto backend=edf::native::CreateNativeRenderBackend("d3d11-warp");
+    if(!backend) throw std::runtime_error("D3D11 WARP backend creation failed");
     std::vector<std::filesystem::path> paths;
     for (const auto& file : std::filesystem::recursive_directory_iterator(argv[1])) {
       if (!file.is_regular_file()) continue;
@@ -27,7 +30,7 @@ int main(int argc,char** argv) {
     for (const auto& path : paths) {
       try {
         const auto bytes=edf::native::ReadSourceAsset(path);
-        auto texture=edf::native::CreateNativeDdsTexture(*device.Get(),bytes);
+        auto texture=edf::native::CreateNativeDdsTexture(*backend,bytes);
       } catch (const std::exception& error) {
         ++failures;
         std::cerr << path.string() << ": " << error.what() << '\n';

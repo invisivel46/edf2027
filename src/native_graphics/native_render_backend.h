@@ -190,10 +190,25 @@ struct NativeBackendPipelineDesc {
 struct NativeBackendBufferDesc {
   size_t bytes=0;
   bool vertex=false,index=false,constant=false;
-  bool dynamic=false; // Rewritten per frame; the backend decides how to stage it.
+  // Rewritten whole, repeatedly, while earlier draws that read the old
+  // contents may still be queued. The backend decides how to stage that; what
+  // it must guarantee is that those earlier draws keep the contents they were
+  // recorded with. Only a whole-buffer update at offset 0 is allowed on one,
+  // because that is the only shape both target APIs can honour without
+  // stalling for the GPU.
+  bool dynamic=false;
 };
 struct NativeBackendTextureDesc {
   uint32_t width=0,height=0,levels=1;
+  // Array slices, and whether they are the six faces of a cube. The game's
+  // DDS assets include cube maps, so a texture interface that only describes
+  // a single 2D slice cannot create what this renderer actually loads.
+  //
+  // Initial contents for these are face-major - every level of face 0, then
+  // face 1 - which is the order both APIs want subresources in and the order
+  // the DDS decode produces.
+  uint32_t array_size=1;
+  bool cube=false;
   uint32_t format=0;  // Backend-specific format code; see the backend's mapping.
   // Multisampling, which this renderer does use: 2x and 4x targets that are
   // resolved before anything samples them. A pipeline drawing into one must

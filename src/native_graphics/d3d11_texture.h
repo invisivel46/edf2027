@@ -1,4 +1,5 @@
 #pragma once
+#include "native_render_backend.h"
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <span>
@@ -17,6 +18,10 @@ inline uint32_t NativeSceneSamples(uint32_t guest_mode, int32_t override_samples
   throw std::runtime_error("native MSAA must be 0 (game default), 1 (off), 2 or 4");
 }
 struct NativeTexture {
+  // Created through the backend. The D3D11 handles below name the same
+  // objects, and are kept only while the paths that sample this texture are
+  // still D3D11; they go when those paths move onto the seam.
+  std::shared_ptr<NativeBackendTexture> backend;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> resource;
   Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
   uint32_t width = 0, height = 0, mip_count = 0;
@@ -75,7 +80,10 @@ bool ImportZeroLuminanceHistory(ID3D11DeviceContext& context,NativeRenderTarget&
 // Native DDS upload: retains BC1/BC2/BC3 compression and all authored mip/face
 // data. RGB mask formats and alpha-only A8 are converted to RGBA8. No Xbox texture descriptors,
 // tiled GPU memory, or GPU command processing is involved.
-NativeTexture CreateNativeDdsTexture(ID3D11Device& device, std::span<const uint8_t> dds);
+// Creates through the backend rather than a device. The decode above is
+// already shared, so this is the whole of what was API-specific about loading
+// the game's textures.
+NativeTexture CreateNativeDdsTexture(NativeRenderBackend& backend, std::span<const uint8_t> dds);
 // Diagnostic only: clamp linear HDR RGB to [0,1], or retain RGBA8 output bytes,
 // in a top-down 24-bit BMP.
 // Nonfinite RGB becomes magenta. This is not the game's tone mapping, and

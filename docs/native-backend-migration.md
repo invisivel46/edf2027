@@ -494,9 +494,14 @@ Hz pacing sleep, 2.35 ms waiting for the GPU, and about 1.5 ms of our CPU work
 across the immediate and XUI paths. The game is at its frame cap.
 
 That is a UI-heavy scene, though - the run recorded no indexed draws at all,
-so the geometry path and the two binding optimisations built for it are still
-unmeasured. The combat script runs to 775 seconds and the run was cut off at
-420, which is the whole reason: it measured the menu.
+so the geometry path and the two binding optimisations built for it were
+unmeasured here. The combat script runs to 775 seconds and the run was cut off
+at 420, which is the whole reason: it measured the menu. The mission itself
+begins at 507 seconds; runs that reach it are recorded under "the scene's own
+resources" below, where `indexed.native` measures 1.6-1.7 us per call across
+roughly 740,000 indexed draws per sampling window and `immediate.context_wait`
+stays at 0.019-0.020 us - the lock fix above still holding under a million
+draws a minute.
 
 ## Threading: three designs, and why only one of them can work
 
@@ -608,6 +613,92 @@ Helpers to move, roughly in dependency order: `d3d11_render_state` (already
 decoded through the shared path, so only the objects remain),
 `d3d11_bindings`, `d3d11_mesh`, `d3d11_texture`, `d3d11_quads`, then the
 effect paths (`d3d11_ui`, font, movie, XUI) and the presenter.
+
+### Step 2, started: the scene's own resources
+
+The scene's textures and its meshes are created through the seam now. Nothing
+about how they are drawn has changed yet; what has changed is who owns the
+storage, and that is the half that decides whether a second backend can hold
+the game's resources at all.
+
+**A second cvar, because the two questions are different.**
+`--edf_native_backend` is what the player selected. `--edf_native_scene_backend`
+is what the half-ported scene can share targets with, and it must stay `d3d11`
+until the last draw path has moved: a texture created on a second device cannot
+be sampled by a draw that is still direct D3D11. Collapsing them into one would
+have made selecting d3d12 mean "load the game's textures somewhere the renderer
+cannot read them", which looks like a black screen, not like a half-finished
+port.
+
+**What each piece needed from the seam.**
+
+| | what was missing | why it was not optional |
+|---|---|---|
+| textures | array slices and cube faces | the game ships cube maps; a texture desc describing one 2D slice cannot create what the renderer loads |
+| textures | uploads covering every subresource | the first version filled face 0 and left the other five undefined |
+| meshes | a dynamic buffer that means something | `dynamic` was declared and ignored, so every immediate-geometry rewrite would have gone through `UpdateSubresource` |
+
+The dynamic-buffer gap is the one worth recording. `NativeBackendBufferDesc`
+had a `dynamic` flag from the start and the D3D11 backend ignored it entirely:
+every buffer was `USAGE_DEFAULT` and every update an `UpdateSubresource`. Both
+are correctly ordered against queued draws, so nothing would have rendered
+wrongly - it would simply have made the driver wait, on the path the renderer
+rewrites every frame. The flag now creates `USAGE_DYNAMIC` and updates rename
+with `WRITE_DISCARD`, and both backends refuse a *partial* update of one,
+because the untouched bytes of a renamed buffer are undefined and a caller that
+got away with it on D3D12 would have found that out on D3D11.
+
+**What the tests had to become.** Each test that covered this already existed
+and was passing; each was checking the old path.
+
+* The cube DDS test now creates through the seam and reads back all 24
+  subresources. Swapping the upload loop to level-major fails it on
+  "compressed face/mip payload changed".
+* The conformance test draws twice from one dynamic vertex buffer, rewriting it
+  between the draws, into two targets. Changing `WRITE_DISCARD` to
+  `WRITE_NO_OVERWRITE` fails it on "the draws either side of the dynamic
+  rewrite overlap on 2016 pixels, so the rewrite reached the first one" - which
+  is the actual defect, named.
+* `edf_native_texture_check` validates all 83 disc DDS assets through the
+  backend rather than a device; still 0 failures.
+
+**In the game.** Two scripted combat runs, one per half, each reaching the
+mission rather than stopping in the menus the way every earlier measurement in
+this document did.
+
+| | textures loaded | indexed draws | mesh builds | mesh bytes | errors |
+|---|---|---|---|---|---|
+| textures on the seam | 176 | 1,203,000 | 308 | 32,725,928 | 0 |
+| meshes on the seam too | 176 | 1,184,000 | 308 | 32,725,928 | 0 |
+
+The second row is the one that says the mesh change did nothing but move the
+storage: same 308 builds, the same 32,725,928 bytes of converted geometry, and
+zero vertex or index mismatches, against a cache-hit rate of 99.97%. Per-draw
+cost across the two runs' sampling windows: `indexed.native` 1.699 us (741,005
+calls) before the mesh change and 1.603 us (735,043 calls) after. These are
+separate windows in separate runs, not a controlled A/B, so read them as "no
+regression", not as an improvement. Offline,
+`edf_native_geometry_check` builds a real mesh for all 858 (declaration, vertex
+entry) pairs through a WARP *backend* now - 858 constructed, no declaration
+left unbindable.
+
+**One difference that was not free.** Immutable vertex and index buffers were
+`D3D11_USAGE_IMMUTABLE` and are now `USAGE_DEFAULT`, because the seam has no
+immutable flag and inventing one without a measurement to justify it would be
+guessing. And the DDS path now concatenates the decoded levels into one block
+before handing them over, where D3D11 took the level pointers directly - one
+extra copy of each texture, at load, bounded by the asset's own size. Both are
+recorded here rather than hidden: neither has been measured, and a later run
+that finds load time worse should look here first.
+
+**What is still D3D11 inside these two files.** The draw itself
+(`IASetInputLayout` / `IASetVertexBuffers` / `DrawIndexed`), the dynamic vertex
+write, the D3D11 input layout, and the stream-output clip-position capture. Each
+reaches its resource through an unwrap helper - `NativeD3D11Buffer`,
+`NativeD3D11TextureView`, `NativeD3D11BackendDevice` - which returns null on a
+backend that is not D3D11 and is checked, so selecting d3d12 for the scene
+fails with a sentence rather than binding nothing. Those helpers are the
+remaining port, and they disappear with it.
 
 ## What this replaces
 

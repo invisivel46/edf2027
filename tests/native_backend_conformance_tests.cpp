@@ -47,7 +47,10 @@ constexpr uint32_t kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 struct Rendered {
   std::vector<uint8_t> flat, textured, instanced, mipped, resolved, compressed, blended;
   std::vector<uint8_t> depth_tested, target0, target1;
+  // Two targets drawn from one dynamic vertex buffer, rewritten between them.
+  std::vector<uint8_t> dynamic_before, dynamic_after;
   bool refused_missing_blend_factor=false;
+  bool refused_partial_dynamic_update=false;
   uint64_t query_samples = 0;
   std::vector<std::string> validation;
 };
@@ -166,6 +169,56 @@ Rendered Render(NativeRenderBackend& backend) {
 
   std::span<uint8_t> into{reinterpret_cast<uint8_t*>(&out.query_samples), sizeof(out.query_samples)};
   for (uint32_t attempt = 0; attempt < 10000 && !backend.ReadQuery(*query, into); ++attempt) {}
+
+  // A dynamic vertex buffer rewritten between two draws in one frame.
+  //
+  // This is the one thing a dynamic buffer has to promise: the draw recorded
+  // before the rewrite keeps the vertices it was recorded with. A backend that
+  // overwrote the storage in place would show the second triangle on both
+  // targets, and would do so only under load, in a frame with enough draws
+  // queued for the write to land first.
+  const float upper[] = {1.0f, 1.0f, 0.0f, -1.0f, 1.0f, 0.0f, 1.0f, -1.0f, 0.0f};
+  NativeBackendBufferDesc dynamic_desc{};
+  dynamic_desc.bytes = sizeof(upper);
+  dynamic_desc.vertex = true;
+  dynamic_desc.dynamic = true;
+  const auto dynamic_buffer =
+      backend.CreateBuffer(dynamic_desc, {reinterpret_cast<const uint8_t*>(upper), sizeof(upper)});
+  const auto before_target = backend.CreateRenderTarget(target_desc);
+  const auto after_target = backend.CreateRenderTarget(target_desc);
+  NativeBackendRenderTarget* before_colors[] = {before_target.get()};
+  NativeBackendRenderTarget* after_colors[] = {after_target.get()};
+  backend.BeginFrame();
+  {
+    auto& recorder = backend.Recorder();
+    recorder.SetViewport({0, 0, kSize, kSize, 0, 1});
+    recorder.SetPipeline(flat_pipeline);
+    recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                          {reinterpret_cast<const uint8_t*>(green.data()), sizeof(float) * 4});
+    recorder.SetRenderTargets(before_colors, nullptr);
+    recorder.ClearColor(*before_target, {1.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetVertexBuffer(0, *dynamic_buffer, sizeof(float) * 3, 0);
+    recorder.Draw(3, 0);
+
+    recorder.UpdateBuffer(*dynamic_buffer, 0,
+                          {reinterpret_cast<const uint8_t*>(half), sizeof(half)});
+
+    recorder.SetRenderTargets(after_colors, nullptr);
+    recorder.ClearColor(*after_target, {1.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetVertexBuffer(0, *dynamic_buffer, sizeof(float) * 3, 0);
+    recorder.Draw(3, 0);
+
+    // Whole or nothing: the untouched part of a renamed buffer is undefined,
+    // so a partial update must be refused rather than quietly returning
+    // whatever the driver handed back.
+    try {
+      recorder.UpdateBuffer(*dynamic_buffer, 12,
+                            {reinterpret_cast<const uint8_t*>(half), sizeof(float) * 3});
+    } catch (const std::runtime_error&) { out.refused_partial_dynamic_update = true; }
+  }
+  backend.Submit();
+  out.dynamic_before = backend.ReadRenderTarget(*before_target);
+  out.dynamic_after = backend.ReadRenderTarget(*after_target);
 
   // Textured, with a 2x2 texture whose four texels differ, so a flipped or
   // row-swapped upload cannot match the other backend by accident.
@@ -538,13 +591,16 @@ int main() {
           {"instanced", &rendered.instanced}, {"mipped", &rendered.mipped},
           {"compressed", &rendered.compressed}, {"blended", &rendered.blended},
           {"depth", &rendered.depth_tested}, {"target0", &rendered.target0},
-          {"target1", &rendered.target1}};
+          {"target1", &rendered.target1},
+          {"dynamic-before", &rendered.dynamic_before},
+          {"dynamic-after", &rendered.dynamic_after}};
       const std::vector<uint8_t>* references[] = {&reference.flat, &reference.textured,
                                                   &reference.instanced, &reference.mipped,
                                                   &reference.compressed, &reference.blended,
                                                   &reference.depth_tested, &reference.target0,
-                                                  &reference.target1};
-      for (size_t index = 0; index < 9; ++index) {
+                                                  &reference.target1, &reference.dynamic_before,
+                                                  &reference.dynamic_after};
+      for (size_t index = 0; index < 11; ++index) {
         const auto difference = Compare(*references[index], *surfaces[index].second);
         Check(difference.pixels == 0,
               std::string(name) + " differs from d3d11-warp on the " + surfaces[index].first +
@@ -579,6 +635,31 @@ int main() {
           if (at(rendered.flat, x, y, 1) > 200) ++covered;
       Check(covered > kSize * kSize * 4 / 10 && covered < kSize * kSize * 6 / 10,
             name + " covered " + std::to_string(covered) + " pixels with a half-covering triangle");
+      // The dynamic buffer's second draw used the same triangle the flat
+      // surface did, so that surface is the reference for it - exactly, not
+      // approximately. The first draw used the complementary triangle and must
+      // still show it: if the rewrite reached the storage those vertices were
+      // already recorded against, this is where it shows.
+      Check(Compare(rendered.dynamic_after, rendered.flat).pixels == 0,
+            name + ": the draw after the dynamic rewrite did not use the new vertices");
+      uint32_t before_covered = 0, both_green = 0;
+      for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+          const bool before = at(rendered.dynamic_before, x, y, 1) > 200;
+          if (before) ++before_covered;
+          if (before && at(rendered.flat, x, y, 1) > 200) ++both_green;
+        }
+      Check(before_covered > kSize * kSize * 4 / 10 && before_covered < kSize * kSize * 6 / 10,
+            name + ": the draw before the dynamic rewrite covered " + std::to_string(before_covered) +
+                " pixels, which is not a half-covering triangle");
+      // The two triangles are complementary, so they may share only the
+      // diagonal. Substantial overlap means the first draw got the second
+      // draw's vertices.
+      Check(both_green < kSize * 2,
+            name + ": the draws either side of the dynamic rewrite overlap on " +
+                std::to_string(both_green) + " pixels, so the rewrite reached the first one");
+      Check(rendered.refused_partial_dynamic_update,
+            name + " accepted a partial update of a dynamic buffer, whose untouched bytes are undefined");
       Check(rendered.query_samples == covered,
             name + " counted " + std::to_string(rendered.query_samples) +
                 " occlusion samples for a draw covering " + std::to_string(covered) + " pixels");

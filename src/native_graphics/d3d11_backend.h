@@ -51,6 +51,22 @@ std::unique_ptr<NativeRenderBackend> CreateNativeD3D11Backend(const NativeD3D11B
 // must not hold the wrapper across a resize that replaces it.
 std::unique_ptr<NativeBackendTexture> AdoptNativeD3D11Texture(
     NativeRenderBackend& backend, ID3D11ShaderResourceView& view, uint32_t width, uint32_t height);
+// The D3D11 objects behind a resource this backend created, for consumers that
+// have not moved onto the seam yet.
+//
+// The mirror image of adoption: adoption wraps a D3D11 resource so a ported
+// path can use it, this unwraps a seam resource so an unported path can. Both
+// exist only while the port is half done, and both disappear with it. Each
+// returns null if the resource did not come from a D3D11 backend, which is a
+// real case - the player can select d3d12 - and so is checked, not assumed.
+ID3D11Buffer* NativeD3D11Buffer(NativeBackendBuffer& buffer);
+ID3D11ShaderResourceView* NativeD3D11TextureView(NativeBackendTexture& texture);
+ID3D11Texture2D* NativeD3D11TextureResource(NativeBackendTexture& texture);
+// The device itself, for the few things that still create D3D11 objects of
+// their own: an input layout to bind, a stream-output replay to diagnose with.
+// Null if this is not a D3D11 backend.
+ID3D11Device* NativeD3D11BackendDevice(NativeRenderBackend& backend);
+
 std::unique_ptr<NativeBackendRenderTarget> AdoptNativeD3D11RenderTarget(
     NativeRenderBackend& backend, ID3D11RenderTargetView* colour, ID3D11DepthStencilView* depth,
     uint32_t width, uint32_t height);

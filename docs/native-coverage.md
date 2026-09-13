@@ -48,7 +48,7 @@ running, which is what makes offline CI coverage possible at all:
 | Axis | Source on disc | Checker | Status |
 |---|---|---|---|
 | Shaders | 44 `.dxsl` | `edf_native_shader_check` | all effects, variants and linked passes compile |
-| Textures | 83 `.dds` | `edf_native_texture_check` | every DDS asset on the disc |
+| Textures | 83 `.dds` | `edf_native_texture_check` | every DDS asset on the disc, created through the render-backend seam |
 | Geometry | 263 `.sgo` + 68 `.dxm` | `edf_native_geometry_check` | **not statically recoverable — see below** |
 | Render state | technique pass blocks in the 44 `.dxsl` | none yet | outstanding |
 
@@ -75,8 +75,10 @@ submitted indexed 0000000000000000 0000000000000000 1111111111111111 4 52 2 5
 
 `edf_native_geometry_check <game directory> <catalog>` then constructs a real
 `NativeIndexedMesh` for every captured declaration against **every vertex entry
-the disc can supply**, on WARP, with no display and no GPU clocks. One capture
-run makes that layout checkable in CI forever.
+the disc can supply**, on a WARP *backend*, with no display and no GPU clocks.
+The backend matters: meshes are built through the render-backend seam now, so
+checking them against a bare device would stop checking the path the game
+takes. One capture run makes that layout checkable in CI forever.
 
 A declaration most entries reject is ordinary — an entry that does not consume
 those semantics has no business binding it. A declaration *no* entry accepts is

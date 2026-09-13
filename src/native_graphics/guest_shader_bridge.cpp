@@ -135,6 +135,8 @@ REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
 REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
                      "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
+REXCVAR_DEFINE_STRING(edf_native_scene_backend, "d3d11", "EDF2027",
+                     "Backend that owns the scene's own resources - its textures, meshes and targets - while the draw paths are being moved onto the backend interface one at a time. Must stay d3d11 until the last of them has moved: a ported path and an unported one have to share the same targets, and only the adopted d3d11 backend is this renderer's own device. Setting it to d3d12 before then gives the unported paths nothing to bind");
 REXCVAR_DEFINE_BOOL(edf_native_backend_present, true, "EDF2027",
                    "Let the selected backend present the game's window from its own device. False keeps the D3D11 presenter, which is the control for measuring what the backend path costs or saves");
 REXCVAR_DEFINE_BOOL(edf_native_reuse_material, true, "EDF2027",
@@ -590,6 +592,11 @@ struct Bridge {
   // and reported inside the real process, which is where device creation
   // actually fails, and so paths can be moved onto it one at a time.
   std::unique_ptr<edf::native::NativeRenderBackend> backend;
+  // The scene's resources, separate from the selection above because the two
+  // answer different questions while the port is under way: --edf_native_backend
+  // is what the player picked, --edf_native_scene_backend is what the half-ported
+  // scene can actually share targets with. See the cvar.
+  std::unique_ptr<edf::native::NativeRenderBackend> scene_backend;
   // Declared after the backend so it is destroyed before it: the preview
   // thread uses the backend on every tick and must be stopped first.
   std::unique_ptr<edf::native::NativeD3D12Preview> backend_preview;
@@ -708,6 +715,9 @@ struct Bridge {
   uint64_t activations = 0, misses = 0, parameter_uploads = 0, optimized_out = 0, parameter_errors = 0;
 };
 Bridge& State() { static Bridge state; return state; }
+// Defined below, next to the selection it mirrors; declared here because
+// the texture hook, further up, is the first thing to create a scene resource.
+edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state);
 // Called under the registry lock at consumption, never from a writer callback.
 void AuditGeneratedWrites(Bridge& state,const NativeBufferWrites::Batch& batch) {
   for(size_t i=0;i<batch.writer_hit_count;++i) {
@@ -866,7 +876,7 @@ void ImportTexture(PPCContext& ctx, uint8_t* base, Original original) {
     state.textures.erase(handle);
     if (!state.device) throw std::runtime_error("native texture bridge not initialized");
     HookTiming create_timing(HookPhase::TextureCreate);
-    auto native = CreateNativeDdsTexture(*state.device.Get(), image);
+    auto native = CreateNativeDdsTexture(EnsureSceneBackendLocked(state), image);
     create_timing.Finish();
     ++state.texture_loads;
     REXLOG_INFO("Native texture bridge: handle={:#x}, {}x{}, mips={}, cube={}, loads={}",
@@ -1532,6 +1542,30 @@ edf::native::NativeRenderBackend& EnsureBackendLocked(Bridge& state) {
   for(const auto& message:state.backend->DrainValidationMessages())
     REXLOG_WARN("Native render backend validation: {}",message);
   return *state.backend;
+}
+// The backend the scene's own resources are created on.
+//
+// Separate from EnsureBackendLocked because during the port these are not the
+// same backend: a texture created on a second device cannot be sampled by the
+// draw paths that are still direct D3D11, so the scene's resources stay on the
+// adopted backend - this renderer's own device - until the last path has moved.
+edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state) {
+  if(state.scene_backend) return *state.scene_backend;
+  const std::string name=REXCVAR_GET(edf_native_scene_backend);
+  if(name.empty()) throw std::runtime_error("the scene's resources were asked for but --edf_native_scene_backend is empty");
+  if(!state.device) throw std::runtime_error("the scene's resources were asked for before the renderer had a device");
+  edf::native::RegisterNativeD3D11Backend();
+  edf::native::RegisterNativeD3D12Backend();
+  state.scene_backend=name=="d3d11"
+    ? edf::native::AdoptNativeD3D11Backend(*state.device.Get(),*state.context.Get())
+    : edf::native::CreateNativeRenderBackend(name);
+  REXLOG_INFO("Native scene backend ready: name={}; selected by --edf_native_scene_backend={}. {}",
+    std::string(state.scene_backend->name()),name,
+    name=="d3d11"?"This renderer's own device, so ported and unported draw paths share the same resources."
+                 :"A separate device: every draw path that samples a scene resource must already be ported, or it will have nothing to bind.");
+  for(const auto& message:state.scene_backend->DrainValidationMessages())
+    REXLOG_WARN("Native scene backend validation: {}",message);
+  return *state.scene_backend;
 }
 }  // namespace
 
@@ -3452,7 +3486,7 @@ void PublishNativeModelBuffer(uint8_t* base,uint32_t owner,edf::native::NativeMo
       if(contents && version) state.model_buffers.RetainIndexContents(owner,generation,contents,*version);
       // GPU construction is outside the queue lock and reads the owned copy for
       // physical buffers. Later writes can still reject registry attachment.
-      auto index_storage=std::make_shared<const edf::native::NativeIndexBuffer>(*state.device.Get(),
+      auto index_storage=std::make_shared<const edf::native::NativeIndexBuffer>(EnsureSceneBackendLocked(state),
         contents?std::span<const uint8_t>(*contents):source,stride,contents);
       if(version) state.model_buffers.CommitObservedIndex(owner,generation,*version,std::move(index_storage));
       else state.model_buffers.RetainIndexStorage(owner,generation,std::move(index_storage));
@@ -4779,7 +4813,7 @@ REX_HOOK_RAW(sub_821FE358) {
           if(native_vb && native_vb->physical) vertex_version=edf::native::BufferWrites().Version(stream.resource);
           if(native_ib && native_ib->physical) index_version=edf::native::BufferWrites().Version(ib);
         };
-        auto& mesh=state.meshes.Acquire(*state.device.Get(),bindings.shader(),
+        auto& mesh=state.meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
           {stream.resource,ib,decl,state.active_vertex,uint32_t(viewport.reverse_depth)},
           declaration_bytes,stream.stride,vertices_bytes,indices_bytes,index_width,native_declaration,{},
           native_ib?native_ib->index_storage:nullptr,native_vb?native_vb->vertex_storage:nullptr,
@@ -5830,7 +5864,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           const auto indices=owned_indices->bytes();
           const size_t bytes=size_t(ctx.r5.u32)*stride;
           const std::span<const uint8_t> vertices{reader.Bytes(ctx.r6.u32,bytes),bytes};
-          auto& mesh=state.immediate_meshes.Acquire(*state.device.Get(),bindings.shader(),
+          auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
             edf::native::ImmediateStreamKey(vertices.size(),declaration,pair.vertex,ctx.r4.u32,viewport.reverse_depth),
             {elements,element_count*12},stride,
             vertices,indices,2,owned_declaration,owned_indices);
@@ -5911,7 +5945,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           const auto indices=owned_indices->bytes();
           const size_t bytes=size_t(ctx.r5.u32)*stride;
           const std::span<const uint8_t> vertices{reader.Bytes(ctx.r6.u32,bytes),bytes};
-          auto& mesh=state.immediate_meshes.Acquire(*state.device.Get(),bindings.shader(),
+          auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
             edf::native::ImmediateStreamKey(vertices.size(),declaration_handle,pair.vertex,ctx.r4.u32,viewport.reverse_depth),
             native_declaration->bytes(),stride,
             vertices,indices,2,native_declaration,owned_indices);

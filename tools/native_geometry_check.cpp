@@ -16,6 +16,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "native_graphics/d3d11_mesh.h"
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d11_effect.h"
 #include "native_graphics/effect.h"
 #include "native_graphics/native_contract_ledger.h"
@@ -148,11 +149,17 @@ int main(int argc, char** argv) {
       std::cout << "contract catalog holds no declarations; nothing to check\n";
       return 0;
     }
-    ComPtr<ID3D11Device> device;
-    const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
-    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &level, 1,
-                                 D3D11_SDK_VERSION, &device, nullptr, nullptr)))
-      throw std::runtime_error("D3D11 WARP device creation failed");
+    // WARP through the backend interface: meshes are built on a backend now,
+    // so checking them against a device would no longer be checking the path
+    // the game takes.
+    edf::native::RegisterNativeD3D11Backend();
+    auto backend = edf::native::CreateNativeRenderBackend("d3d11-warp");
+    if (!backend) throw std::runtime_error("D3D11 WARP backend creation failed");
+    // Shader compilation has not moved onto the seam, so it still wants the
+    // device - the backend's own, not a second one, or the meshes below would
+    // be built against shaders from a different device.
+    auto* device = edf::native::NativeD3D11BackendDevice(*backend);
+    if (!device) throw std::runtime_error("the WARP backend is not a D3D11 backend");
 
     const fs::path shaders = fs::path(argv[1]) / "Shader";
     std::vector<fs::path> effects;
@@ -171,7 +178,7 @@ int main(int argc, char** argv) {
         if (entry.pixel || !seen.insert(entry.name).second) continue;
         try {
           vertex_shaders.push_back({path.filename().string(), entry.name,
-                                    edf::native::CompileNativeShader(*device.Get(), effect, entry,
+                                    edf::native::CompileNativeShader(*device, effect, entry,
                                                                      shaders / "guest.fx")});
         } catch (const std::exception& error) {
           ++compile_failures;
@@ -200,7 +207,7 @@ int main(int argc, char** argv) {
         for (const auto& candidate : vertex_shaders) {
           ++pairs;
           try {
-            edf::native::NativeIndexedMesh mesh(*device.Get(), candidate.shader, declaration, stride,
+            edf::native::NativeIndexedMesh mesh(*backend, candidate.shader, declaration, stride,
                                                 vertices, indices, index_width);
             ++constructed;
             ++accepted[hash];

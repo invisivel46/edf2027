@@ -24,12 +24,15 @@ void Require(HRESULT result, const char* what) {
 
 class D3D11Buffer final : public NativeBackendBuffer {
  public:
-  D3D11Buffer(ComPtr<ID3D11Buffer> buffer, size_t bytes) : buffer_(std::move(buffer)),bytes_(bytes) {}
+  D3D11Buffer(ComPtr<ID3D11Buffer> buffer, size_t bytes, bool dynamic)
+      : buffer_(std::move(buffer)),bytes_(bytes),dynamic_(dynamic) {}
   size_t bytes() const override { return bytes_; }
   ID3D11Buffer* buffer() const { return buffer_.Get(); }
+  bool dynamic() const { return dynamic_; }
  private:
   ComPtr<ID3D11Buffer> buffer_;
   size_t bytes_;
+  bool dynamic_;
 };
 
 class D3D11Texture final : public NativeBackendTexture {
@@ -288,6 +291,25 @@ class D3D11Recorder final : public NativeBackendRecorder {
   }
   void UpdateBuffer(NativeBackendBuffer& buffer, uint32_t offset, std::span<const uint8_t> bytes) override {
     auto& concrete=static_cast<D3D11Buffer&>(buffer);
+    if(offset+bytes.size()>concrete.bytes())
+      throw std::runtime_error("a buffer update of "+std::to_string(bytes.size())+
+                               " bytes at "+std::to_string(offset)+" runs past its "+
+                               std::to_string(concrete.bytes())+" bytes");
+    if(concrete.dynamic()) {
+      // WRITE_DISCARD: the driver hands back fresh storage and leaves the old
+      // contents to the draws already recorded against them. A partial update
+      // cannot do that - the untouched part would come back undefined - so it
+      // is refused rather than silently returning garbage.
+      if(offset || bytes.size()!=concrete.bytes())
+        throw std::runtime_error("a dynamic buffer is updated whole or not at all; this update covers "+
+                                 std::to_string(bytes.size())+" of "+std::to_string(concrete.bytes())+
+                                 " bytes at offset "+std::to_string(offset));
+      D3D11_MAPPED_SUBRESOURCE mapped{};
+      Require(context_->Map(concrete.buffer(),0,D3D11_MAP_WRITE_DISCARD,0,&mapped),"dynamic buffer map");
+      std::memcpy(mapped.pData,bytes.data(),bytes.size());
+      context_->Unmap(concrete.buffer(),0);
+      return;
+    }
     const D3D11_BOX box{offset,0,0,static_cast<UINT>(offset+bytes.size()),1,1};
     context_->UpdateSubresource(concrete.buffer(),0,&box,bytes.data(),0,0);
   }
@@ -413,13 +435,18 @@ class D3D11Backend final : public NativeRenderBackend {
     if(desc.vertex) bind|=D3D11_BIND_VERTEX_BUFFER;
     if(desc.index) bind|=D3D11_BIND_INDEX_BUFFER;
     if(desc.constant) bind|=D3D11_BIND_CONSTANT_BUFFER;
-    const D3D11_BUFFER_DESC description{static_cast<UINT>(desc.bytes),D3D11_USAGE_DEFAULT,bind,0,0,0};
+    // DYNAMIC, so UpdateBuffer below can rename rather than overwrite. Both
+    // are correctly ordered against queued draws; renaming is the one that
+    // does not make the driver wait for them.
+    const D3D11_BUFFER_DESC description{static_cast<UINT>(desc.bytes),
+      desc.dynamic?D3D11_USAGE_DYNAMIC:D3D11_USAGE_DEFAULT,bind,
+      desc.dynamic?UINT(D3D11_CPU_ACCESS_WRITE):0u,0,0};
     const D3D11_SUBRESOURCE_DATA data{initial.data(),0,0};
     if(!initial.empty() && initial.size()>desc.bytes)
       throw std::runtime_error("initial buffer contents are larger than the buffer");
     ComPtr<ID3D11Buffer> buffer;
     Require(device_->CreateBuffer(&description,initial.empty()?nullptr:&data,&buffer),"buffer creation");
-    return std::make_unique<D3D11Buffer>(std::move(buffer),desc.bytes);
+    return std::make_unique<D3D11Buffer>(std::move(buffer),desc.bytes,desc.dynamic);
   }
 
   std::unique_ptr<NativeBackendTexture> CreateTexture(const NativeBackendTextureDesc& desc,
@@ -428,30 +455,35 @@ class D3D11Backend final : public NativeRenderBackend {
     description.Width=desc.width;
     description.Height=desc.height;
     description.MipLevels=desc.levels?desc.levels:1;
-    description.ArraySize=1;
+    description.ArraySize=desc.cube?6:(desc.array_size?desc.array_size:1);
     description.Format=static_cast<DXGI_FORMAT>(desc.format);
     description.SampleDesc={1,0};
     description.Usage=D3D11_USAGE_DEFAULT;
     description.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    description.MiscFlags=desc.cube?D3D11_RESOURCE_MISC_TEXTURECUBE:0u;
 
-    // The seam's initial contents are tightly packed, smallest stride, level
-    // after level - the same layout the D3D12 backend expects, so a caller
-    // does not have to know which backend it is talking to.
+    // The seam's initial contents are tightly packed, smallest stride, in
+    // subresource order - the same layout the D3D12 backend expects, so a
+    // caller does not have to know which backend it is talking to.
     std::vector<D3D11_SUBRESOURCE_DATA> levels;
     size_t offset=0;
     const auto info=DescribeNativeDxgiFormat(description.Format);
-    for(UINT level=0;level<description.MipLevels && !initial.empty();++level) {
-      const uint32_t width=(std::max)(1u,desc.width>>level),height=(std::max)(1u,desc.height>>level);
-      // Blocks, not texels: a 2x2 level of a BC format still costs a whole
-      // 4x4 block, and width x bytes would under-count it.
-      const size_t pitch=static_cast<size_t>(NativeDxgiRowPitch(info,width));
-      const size_t level_bytes=static_cast<size_t>(NativeDxgiLevelBytes(info,width,height));
-      if(offset+level_bytes>initial.size())
-        throw std::runtime_error("initial texture contents are "+std::to_string(initial.size())+
-                                 " bytes, too few for "+std::to_string(description.MipLevels)+" levels");
-      levels.push_back({initial.data()+offset,static_cast<UINT>(pitch),0});
-      offset+=level_bytes;
-    }
+    // Face-major, matching the order D3D11 wants subresources in and the order
+    // the DDS decode produces.
+    for(UINT slice=0;slice<description.ArraySize && !initial.empty();++slice)
+      for(UINT level=0;level<description.MipLevels;++level) {
+        const uint32_t width=(std::max)(1u,desc.width>>level),height=(std::max)(1u,desc.height>>level);
+        // Blocks, not texels: a 2x2 level of a BC format still costs a whole
+        // 4x4 block, and width x bytes would under-count it.
+        const size_t pitch=static_cast<size_t>(NativeDxgiRowPitch(info,width));
+        const size_t level_bytes=static_cast<size_t>(NativeDxgiLevelBytes(info,width,height));
+        if(offset+level_bytes>initial.size())
+          throw std::runtime_error("initial texture contents are "+std::to_string(initial.size())+
+                                   " bytes, too few for "+std::to_string(description.ArraySize)+
+                                   " slices of "+std::to_string(description.MipLevels)+" levels");
+        levels.push_back({initial.data()+offset,static_cast<UINT>(pitch),0});
+        offset+=level_bytes;
+      }
     ComPtr<ID3D11Texture2D> texture;
     Require(device_->CreateTexture2D(&description,levels.empty()?nullptr:levels.data(),&texture),
             "texture creation");
@@ -604,6 +636,8 @@ class D3D11Backend final : public NativeRenderBackend {
     auto& stored=pipelines_.emplace(std::move(key),std::move(pipeline)).first->second;
     return *stored;
   }
+
+  ID3D11Device* device() const { return device_.Get(); }
 
   NativeBackendRecorder& Recorder(uint32_t index) override {
     if(!open_) throw std::runtime_error("the D3D11 backend has no frame open; call BeginFrame first");
@@ -775,6 +809,26 @@ class D3D11Backend final : public NativeRenderBackend {
   bool open_=false,debug_layer_refused_=false,owns_device_=true;
 };
 }  // namespace
+
+// Null, not undefined behaviour, for a texture from another backend: these
+// are called by paths that are still D3D11 while the renderer is mid-port, and
+// the selected backend is whatever the player chose.
+ID3D11Device* NativeD3D11BackendDevice(NativeRenderBackend& backend) {
+  auto* d3d11=dynamic_cast<D3D11Backend*>(&backend);
+  return d3d11?d3d11->device():nullptr;
+}
+ID3D11Buffer* NativeD3D11Buffer(NativeBackendBuffer& buffer) {
+  auto* d3d11=dynamic_cast<D3D11Buffer*>(&buffer);
+  return d3d11?d3d11->buffer():nullptr;
+}
+ID3D11ShaderResourceView* NativeD3D11TextureView(NativeBackendTexture& texture) {
+  auto* d3d11=dynamic_cast<D3D11Texture*>(&texture);
+  return d3d11?d3d11->view():nullptr;
+}
+ID3D11Texture2D* NativeD3D11TextureResource(NativeBackendTexture& texture) {
+  auto* d3d11=dynamic_cast<D3D11Texture*>(&texture);
+  return d3d11?d3d11->texture():nullptr;
+}
 
 std::unique_ptr<NativeBackendTexture> AdoptNativeD3D11Texture(
     NativeRenderBackend& backend, ID3D11ShaderResourceView& view, uint32_t width, uint32_t height) {

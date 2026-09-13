@@ -1,4 +1,5 @@
 #include "d3d11_mesh.h"
+#include "d3d11_backend.h"
 #include "native_input_layout.h"
 #include "native_declarations.h"
 #include "native_generated_indices.h"
@@ -30,9 +31,9 @@ const char* Semantic(uint8_t usage) {
   }
 }
 }
-NativeIndexBuffer::NativeIndexBuffer(ID3D11Device& device,std::span<const uint8_t> bytes,uint32_t width,
+NativeIndexBuffer::NativeIndexBuffer(NativeRenderBackend& backend,std::span<const uint8_t> bytes,uint32_t width,
     std::shared_ptr<const std::vector<uint8_t>> contents)
-    : device_(&device),width_(width),format_(width==2?DXGI_FORMAT_R16_UINT:DXGI_FORMAT_R32_UINT) {
+    : backend_(&backend),width_(width),format_(width==2?DXGI_FORMAT_R16_UINT:DXGI_FORMAT_R32_UINT) {
   if ((width!=2 && width!=4) || bytes.empty() || bytes.size()%width || bytes.size()>128*1024*1024)
     throw std::runtime_error("invalid native index resource");
   if(contents && (contents->size()!=bytes.size() || contents->data()!=bytes.data()))
@@ -50,17 +51,20 @@ NativeIndexBuffer::NativeIndexBuffer(ID3D11Device& device,std::span<const uint8_
     values_.push_back(value);
     minimum_=(std::min)(minimum_,value); maximum_=(std::max)(maximum_,value);
   }
-  D3D11_BUFFER_DESC desc{};
-  desc.ByteWidth=static_cast<UINT>(converted.size());
-  desc.Usage=D3D11_USAGE_IMMUTABLE; desc.BindFlags=D3D11_BIND_INDEX_BUFFER;
-  const D3D11_SUBRESOURCE_DATA data{converted.data(),0,0};
-  if(FAILED(device.CreateBuffer(&desc,&data,&buffer_))) throw std::runtime_error("native index buffer creation failed");
+  NativeBackendBufferDesc desc{};
+  desc.bytes=converted.size();
+  desc.index=true;
+  storage_=backend.CreateBuffer(desc,converted);
+  if(!storage_) throw std::runtime_error("native index buffer creation failed");
+  // The same buffer, for the draw, which is still D3D11. Null on a backend
+  // that is not, which BindAndDraw refuses rather than binding nothing.
+  buffer_=NativeD3D11Buffer(*storage_);
 }
-bool NativeIndexBuffer::Matches(ID3D11Device& device,std::span<const uint8_t> bytes,uint32_t width) const {
-  return OwnsSource(device,bytes,width) || (device_.Get()==&device && width_==width && source_->size()==bytes.size() &&
+bool NativeIndexBuffer::Matches(NativeRenderBackend& backend,std::span<const uint8_t> bytes,uint32_t width) const {
+  return OwnsSource(backend,bytes,width) || (backend_==&backend && width_==width && source_->size()==bytes.size() &&
     std::equal(source_->begin(),source_->end(),bytes.begin()));
 }
-NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& shader,
+NativeIndexedMesh::NativeIndexedMesh(NativeRenderBackend& backend,const NativeShader& shader,
   std::span<const uint8_t> declaration,uint32_t stride,std::span<const uint8_t> vertices,
   std::span<const uint8_t> indices,uint32_t index_bytes,bool dynamic_vertices,std::shared_ptr<const NativeIndexBuffer> index_storage,
   std::shared_ptr<NativeVertexBuffer> vertex_storage,IndexReuse index_reuse,
@@ -159,7 +163,13 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
                         static_cast<DXGI_FORMAT>(element.format),element.slot,element.offset,
                         element.per_instance?D3D11_INPUT_PER_INSTANCE_DATA:D3D11_INPUT_PER_VERTEX_DATA,
                         element.step_rate});
-  const auto layout_result=device.CreateInputLayout(elements.data(),static_cast<UINT>(elements.size()),
+  // Still a D3D11 input layout, because the draw is still a D3D11 draw. On the
+  // seam this is part of the pipeline, and it goes when BindAndDraw does.
+  auto* d3d11_device=NativeD3D11BackendDevice(backend);
+  if(!d3d11_device)
+    throw std::runtime_error("a mesh cannot be built on the "+std::string(backend.name())+
+                             " backend yet: its draw path is still D3D11");
+  const auto layout_result=d3d11_device->CreateInputLayout(elements.data(),static_cast<UINT>(elements.size()),
       shader.bytecode->GetBufferPointer(),shader.bytecode->GetBufferSize(),&layout_);
   if (FAILED(layout_result)) {
     std::ostringstream message;
@@ -187,12 +197,12 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
   input_layout_=std::move(layout);
   vertex_count_=static_cast<uint32_t>(vertices.size()/stride);
   stride_=native_stride;
-  if(index_storage && !index_storage->Matches(device,indices,index_bytes)) {
+  if(index_storage && !index_storage->Matches(backend,indices,index_bytes)) {
     if(index_reuse==IndexReuse::RequireMatch)
       throw std::runtime_error("native index resource generation mismatch");
     index_storage.reset();
   }
-  index_storage_=index_storage?std::move(index_storage):std::make_shared<NativeIndexBuffer>(device,indices,index_bytes,std::move(index_contents));
+  index_storage_=index_storage?std::move(index_storage):std::make_shared<NativeIndexBuffer>(backend,indices,index_bytes,std::move(index_contents));
   // Sharing is allowed only for exactly the same conversion contract and bytes.
   // In particular integer blend indices and default semantics affect packing.
   std::shared_ptr<const std::vector<uint8_t>> source_snapshot;
@@ -205,7 +215,7 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
       source_snapshot=vertex_storage->SourceSnapshot();
       snapshot_offset=vertex_storage->SourceOffset();
     }
-    if(!source_snapshot || vertex_storage->device_.Get()!=&device ||
+    if(!source_snapshot || vertex_storage->backend_!=&backend ||
        vertex_storage->guest_stride_!=stride || vertex_storage->stride_!=native_stride ||
        vertex_storage->attributes_!=attributes) vertex_storage.reset();
   }
@@ -218,12 +228,12 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
     snapshot_offset=contents_offset;
   }
   vertex_storage_=vertex_storage?std::move(vertex_storage):std::shared_ptr<NativeVertexBuffer>(
-    new NativeVertexBuffer(device,std::move(attributes),stride,native_stride,vertices,dynamic_vertices,std::move(source_snapshot),snapshot_offset));
+    new NativeVertexBuffer(backend,std::move(attributes),stride,native_stride,vertices,dynamic_vertices,std::move(source_snapshot),snapshot_offset));
 }
-NativeVertexBuffer::NativeVertexBuffer(ID3D11Device& device,std::vector<NativeVertexAttribute> attributes,
+NativeVertexBuffer::NativeVertexBuffer(NativeRenderBackend& backend,std::vector<NativeVertexAttribute> attributes,
     uint32_t guest_stride,uint32_t native_stride,std::span<const uint8_t> source,bool dynamic,
     std::shared_ptr<const std::vector<uint8_t>> validated_snapshot,size_t snapshot_offset)
-    : device_(&device),attributes_(std::move(attributes)),source_(validated_snapshot?std::move(validated_snapshot):
+    : backend_(&backend),attributes_(std::move(attributes)),source_(validated_snapshot?std::move(validated_snapshot):
         std::make_shared<const std::vector<uint8_t>>(source.begin(),source.end())),
       source_offset_(snapshot_offset),source_bytes_(source.size()),
       guest_stride_(guest_stride),stride_(native_stride),vertex_count_(static_cast<uint32_t>(source.size()/guest_stride)),
@@ -231,11 +241,16 @@ NativeVertexBuffer::NativeVertexBuffer(ID3D11Device& device,std::vector<NativeVe
   if(source_offset_>source_->size() || source_bytes_>source_->size()-source_offset_)
     throw std::runtime_error("invalid native vertex snapshot range");
   const auto converted=ConvertVertices(std::span<const uint8_t>(*source_).subspan(source_offset_,source_bytes_));
-  D3D11_BUFFER_DESC desc{}; desc.ByteWidth=static_cast<UINT>(converted.size());
-  desc.Usage=dynamic?D3D11_USAGE_DYNAMIC:D3D11_USAGE_IMMUTABLE;
-  desc.BindFlags=D3D11_BIND_VERTEX_BUFFER; desc.CPUAccessFlags=dynamic?D3D11_CPU_ACCESS_WRITE:0;
-  const D3D11_SUBRESOURCE_DATA data{converted.data(),0,0};
-  if(FAILED(device.CreateBuffer(&desc,&data,&buffer_))) throw std::runtime_error("native vertex buffer creation failed");
+  NativeBackendBufferDesc desc{};
+  desc.bytes=converted.size();
+  desc.vertex=true;
+  // Immediate geometry is rewritten whole every frame while earlier draws are
+  // still queued against it, which is exactly what the seam's dynamic flag
+  // means; the backend decides how to stage that.
+  desc.dynamic=dynamic;
+  storage_=backend.CreateBuffer(desc,converted);
+  if(!storage_) throw std::runtime_error("native vertex buffer creation failed");
+  buffer_=NativeD3D11Buffer(*storage_);
 }
 bool NativeVertexBuffer::MatchesSource(std::span<const uint8_t> bytes) const {
   return OwnsSource(bytes) || (source_bytes_==bytes.size() &&
@@ -272,6 +287,10 @@ void NativeIndexedMesh::UpdateVertices(ID3D11DeviceContext& context,std::span<co
 }
 void NativeVertexBuffer::Update(ID3D11DeviceContext& context,std::span<const uint8_t> vertices) {
   if(!dynamic_vertices_) throw std::runtime_error("cannot update immutable native mesh");
+  // Still the immediate context, not the recorder: the recorder needs an open
+  // frame, and the scene backend does not drive frames yet. The storage is the
+  // seam's; only the write is D3D11's.
+  if(!buffer_) throw std::runtime_error("this mesh's vertices are not on a D3D11 backend and cannot be updated through a context");
   Microsoft::WRL::ComPtr<ID3D11Device> buffer_device,context_device;
   buffer_->GetDevice(&buffer_device); context.GetDevice(&context_device);
   if(buffer_device.Get()!=context_device.Get() || context.GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)
@@ -336,6 +355,8 @@ void NativeIndexedMesh::DrawLines(ID3D11DeviceContext& context,uint32_t first,ui
 }
 void NativeIndexedMesh::BindAndDraw(ID3D11DeviceContext& context,uint32_t first,uint32_t count,int32_t base,D3D11_PRIMITIVE_TOPOLOGY topology) const {
   auto* buffer=vertex_storage_->buffer_.Get(); const UINT offset=0;
+  if(!buffer || !index_storage_->buffer_)
+    throw std::runtime_error("this mesh's buffers are not on a D3D11 backend and cannot be drawn through a context");
   context.IASetInputLayout(layout_.Get());
   context.IASetVertexBuffers(0,1,&buffer,&stride_,&offset);
   context.IASetIndexBuffer(index_storage_->buffer_.Get(),index_storage_->format_,0);
@@ -412,7 +433,7 @@ void NativeMeshCache::Invalidate(uint32_t resource) {
   }
   transient_.reset();
 }
-NativeIndexedMesh& NativeMeshCache::Acquire(ID3D11Device& device,const NativeShader& shader,const Key& key,
+NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const NativeShader& shader,const Key& key,
     std::span<const uint8_t> declaration,uint32_t stride,std::span<const uint8_t> vertices,
     std::span<const uint8_t> indices,uint32_t index_bytes,
     std::shared_ptr<const NativeDeclaration> owned_declaration,
@@ -432,7 +453,10 @@ NativeIndexedMesh& NativeMeshCache::Acquire(ID3D11Device& device,const NativeSha
     throw std::runtime_error("native declaration identity does not own supplied bytes");
   if (shader.entry.pixel || !shader.vertex || !shader.bytecode || !shader.reflection)
     throw std::runtime_error("invalid cached mesh shader");
-  if (device_.Get()!=&device) { Clear(); device_=&device; }
+  // A different backend means different resources; nothing cached here can be
+  // bound by it, so the cache starts again rather than handing back a buffer
+  // the new backend has never seen.
+  if (backend_!=&backend) { Clear(); backend_=&backend; }
   transient_.reset();
   ++tick_;
   auto equal=[](const std::vector<uint8_t>& owned,std::span<const uint8_t> guest) {
@@ -454,12 +478,12 @@ NativeIndexedMesh& NativeMeshCache::Acquire(ID3D11Device& device,const NativeSha
     if(layout_matches) {
       if(owned_indices) indices_match=e.owned_indices==owned_indices;
       else {
-        if(e.mesh->IndexStorage()->OwnsSource(device,indices,index_bytes)) ++source_checks_.index_identity_hits;
+        if(e.mesh->IndexStorage()->OwnsSource(backend,indices,index_bytes)) ++source_checks_.index_identity_hits;
         else {
           ++source_checks_.index_checks;
           source_checks_.index_candidate_bytes+=indices.size();
         }
-        indices_match=e.mesh->IndexStorage()->Matches(device,indices,index_bytes);
+        indices_match=e.mesh->IndexStorage()->Matches(backend,indices,index_bytes);
       }
     }
     if(layout_matches && !indices_match && !owned_indices) {
@@ -479,7 +503,11 @@ NativeIndexedMesh& NativeMeshCache::Acquire(ID3D11Device& device,const NativeSha
       if(dynamic_vertices_ && e.mesh->VertexStorage()->SourceBytes()==vertices.size()) {
         try {
           if(before_snapshot) before_snapshot();
-          Microsoft::WRL::ComPtr<ID3D11DeviceContext> context; device.GetImmediateContext(&context);
+          // The update is still a D3D11 write; see NativeVertexBuffer::Update.
+          auto* update_device=NativeD3D11BackendDevice(backend);
+          if(!update_device) throw std::runtime_error("dynamic mesh vertices cannot be updated on the "+
+                                                      std::string(backend.name())+" backend yet");
+          Microsoft::WRL::ComPtr<ID3D11DeviceContext> context; update_device->GetImmediateContext(&context);
           e.mesh->UpdateVertices(*context.Get(),vertices);
           e.used=tick_; ++updates_; return *e.mesh;
         } catch(...) { bytes_-=e.bytes; entries_.erase(found); throw; }
@@ -507,7 +535,7 @@ NativeIndexedMesh& NativeMeshCache::Acquire(ID3D11Device& device,const NativeSha
   // Construction validates the candidate's device, format and live source once.
   // Do not repeat that full guest-memory scan here immediately beforehand.
   if(before_snapshot) before_snapshot();
-  auto mesh=std::make_unique<NativeIndexedMesh>(device,shader,declaration,stride,vertices,indices,index_bytes,dynamic_vertices_,index_storage,vertex_storage,
+  auto mesh=std::make_unique<NativeIndexedMesh>(backend,shader,declaration,stride,vertices,indices,index_bytes,dynamic_vertices_,index_storage,vertex_storage,
     NativeIndexedMesh::IndexReuse::ReplaceStale,std::move(vertex_contents),contents_offset,std::move(index_contents));
   if(published_index) {
     if(mesh->IndexStorage()==index_storage) ++published_index_reuses_;

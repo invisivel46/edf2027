@@ -29,13 +29,16 @@ struct TrackedResource {
 
 class D3D12Buffer final : public NativeBackendBuffer {
  public:
-  D3D12Buffer(TrackedResource tracked, size_t bytes) : tracked_(std::move(tracked)),bytes_(bytes) {}
+  D3D12Buffer(TrackedResource tracked, size_t bytes, bool dynamic)
+      : tracked_(std::move(tracked)),bytes_(bytes),dynamic_(dynamic) {}
   size_t bytes() const override { return bytes_; }
+  bool dynamic() const { return dynamic_; }
   TrackedResource& tracked() { return tracked_; }
   D3D12_GPU_VIRTUAL_ADDRESS address() const { return tracked_.resource->GetGPUVirtualAddress(); }
  private:
   TrackedResource tracked_;
   size_t bytes_;
+  bool dynamic_=false;
 };
 
 class D3D12Texture final : public NativeBackendTexture {
@@ -361,6 +364,18 @@ class D3D12Recorder final : public NativeBackendRecorder {
   }
   void UpdateBuffer(NativeBackendBuffer& buffer, uint32_t offset, std::span<const uint8_t> bytes) override {
     auto& concrete=static_cast<D3D12Buffer&>(buffer);
+    if(offset+bytes.size()>concrete.bytes())
+      throw std::runtime_error("a buffer update of "+std::to_string(bytes.size())+
+                               " bytes at "+std::to_string(offset)+" runs past its "+
+                               std::to_string(concrete.bytes())+" bytes");
+    // The same whole-or-nothing rule the D3D11 backend enforces, so a caller
+    // cannot write a partial dynamic update that happens to work here and
+    // returns undefined bytes there. The copy below is recorded in order, so
+    // draws already in this list keep the contents they were recorded with.
+    if(concrete.dynamic() && (offset || bytes.size()!=concrete.bytes()))
+      throw std::runtime_error("a dynamic buffer is updated whole or not at all; this update covers "+
+                               std::to_string(bytes.size())+" of "+std::to_string(concrete.bytes())+
+                               " bytes at offset "+std::to_string(offset));
     const auto upload=gpu_->Allocate(bytes.size(),16,index_);
     std::memcpy(upload.cpu,bytes.data(),bytes.size());
     Transition(concrete.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
@@ -552,7 +567,7 @@ class D3D12Backend final : public NativeRenderBackend {
     Require(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
                                                    tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
             "buffer creation");
-    auto buffer=std::make_unique<D3D12Buffer>(std::move(tracked),desc.bytes);
+    auto buffer=std::make_unique<D3D12Buffer>(std::move(tracked),desc.bytes,desc.dynamic);
     if(!initial.empty()) {
       if(initial.size()>desc.bytes)
         throw std::runtime_error("initial buffer contents are larger than the buffer");
@@ -582,7 +597,7 @@ class D3D12Backend final : public NativeRenderBackend {
     description.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     description.Width=desc.width;
     description.Height=desc.height;
-    description.DepthOrArraySize=1;
+    description.DepthOrArraySize=static_cast<UINT16>(desc.cube?6:(desc.array_size?desc.array_size:1));
     description.MipLevels=static_cast<UINT16>(desc.levels?desc.levels:1);
     description.Format=static_cast<DXGI_FORMAT>(desc.format);
     description.SampleDesc={1,0};
@@ -592,9 +607,18 @@ class D3D12Backend final : public NativeRenderBackend {
     const auto view=texture_views_.Allocate();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format=description.Format;
-    srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
     srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    srv.Texture2D.MipLevels=description.MipLevels;
+    if(desc.cube) {
+      srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURECUBE;
+      srv.TextureCube.MipLevels=description.MipLevels;
+    } else if(description.DepthOrArraySize>1) {
+      srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      srv.Texture2DArray.MipLevels=description.MipLevels;
+      srv.Texture2DArray.ArraySize=description.DepthOrArraySize;
+    } else {
+      srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Texture2D.MipLevels=description.MipLevels;
+    }
     gpu_.device()->CreateShaderResourceView(tracked.resource.Get(),&srv,view);
     auto texture=std::make_unique<D3D12Texture>(std::move(tracked),desc.width,desc.height,view,
                                                 texture_views_);
@@ -914,35 +938,39 @@ class D3D12Backend final : public NativeRenderBackend {
   // A texture upload is not a buffer copy: rows land on a 256-byte pitch that
   // has nothing to do with the source's packed rows, so each level's copy is
   // described by a footprint the device computes and its rows are written one
-  // at a time. The source is expected tightly packed, smallest stride, level
-  // after level, which is how every mipped asset in this game arrives.
+  // at a time. The source is expected tightly packed, smallest stride, in
+  // subresource order, which is how every mipped and cube asset in this game
+  // arrives from the shared DDS decode.
   void UploadTexture(D3D12Texture& texture, const std::vector<uint8_t>& bytes) {
     const auto description=texture.tracked().resource->GetDesc();
+    // Every subresource, not only the first face's mip chain: a cube map is
+    // six of them and uploading one would leave five undefined.
     const UINT levels=description.MipLevels?description.MipLevels:1;
-    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(levels);
-    std::vector<UINT64> row_bytes(levels);
-    std::vector<UINT> rows(levels);
+    const UINT subresources=levels*(description.DepthOrArraySize?description.DepthOrArraySize:1);
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(subresources);
+    std::vector<UINT64> row_bytes(subresources);
+    std::vector<UINT> rows(subresources);
     UINT64 total=0;
-    gpu_.device()->GetCopyableFootprints(&description,0,levels,0,footprints.data(),rows.data(),
+    gpu_.device()->GetCopyableFootprints(&description,0,subresources,0,footprints.data(),rows.data(),
                                          row_bytes.data(),&total);
     size_t needed=0;
-    for(UINT level=0;level<levels;++level)
-      needed+=static_cast<size_t>(row_bytes[level])*rows[level];
+    for(UINT index=0;index<subresources;++index)
+      needed+=static_cast<size_t>(row_bytes[index])*rows[index];
     if(bytes.size()<needed)
       throw std::runtime_error("initial texture contents are "+std::to_string(bytes.size())+
-                               " bytes but its "+std::to_string(levels)+" levels need "+
-                               std::to_string(needed));
+                               " bytes but its "+std::to_string(subresources)+
+                               " subresources need "+std::to_string(needed));
 
     const auto upload=gpu_.Allocate(total,D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
     recorders_.front()->Transition(texture.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
     size_t source=0;
-    for(UINT level=0;level<levels;++level) {
-      auto& footprint=footprints[level];
-      for(UINT row=0;row<rows[level];++row)
+    for(UINT index=0;index<subresources;++index) {
+      auto& footprint=footprints[index];
+      for(UINT row=0;row<rows[index];++row)
         std::memcpy(upload.cpu+footprint.Offset+static_cast<size_t>(row)*footprint.Footprint.RowPitch,
-                    bytes.data()+source+static_cast<size_t>(row)*row_bytes[level],
-                    static_cast<size_t>(row_bytes[level]));
-      source+=static_cast<size_t>(row_bytes[level])*rows[level];
+                    bytes.data()+source+static_cast<size_t>(row)*row_bytes[index],
+                    static_cast<size_t>(row_bytes[index]));
+      source+=static_cast<size_t>(row_bytes[index])*rows[index];
       // GetCopyableFootprints laid the levels out from offset zero; the ring
       // put the block somewhere else, so every level's offset moves with it.
       footprint.Offset+=upload.offset;
@@ -951,7 +979,7 @@ class D3D12Backend final : public NativeRenderBackend {
       D3D12_TEXTURE_COPY_LOCATION to{};
       to.pResource=texture.tracked().resource.Get();
       to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-      to.SubresourceIndex=level;
+      to.SubresourceIndex=index;
       gpu_.commands()->CopyTextureRegion(&to,0,0,0,&from,nullptr);
     }
   }
