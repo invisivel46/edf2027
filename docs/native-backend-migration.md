@@ -666,10 +666,17 @@ and was passing; each was checking the old path.
 mission rather than stopping in the menus the way every earlier measurement in
 this document did.
 
+Compared at the same point in the script - 1.2 million indexed draws in, so
+the same content has been drawn - rather than at whatever each run happened to
+reach:
+
 | | textures loaded | indexed draws | mesh builds | mesh bytes | errors |
 |---|---|---|---|---|---|
 | textures on the seam | 176 | 1,203,000 | 308 | 32,725,928 | 0 |
 | meshes on the seam too | 176 | 1,184,000 | 308 | 32,725,928 | 0 |
+
+The second run was stopped at 7,072,000 indexed draws, still 0 errors and 0
+mismatches, 717 mesh builds against 7,071,283 cache hits.
 
 The second row is the one that says the mesh change did nothing but move the
 storage: same 308 builds, the same 32,725,928 bytes of converted geometry, and
