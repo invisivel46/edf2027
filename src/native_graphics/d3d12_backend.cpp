@@ -820,6 +820,37 @@ class D3D12Backend final : public NativeRenderBackend {
     return pixels;
   }
 
+  std::unique_ptr<NativeBackendTexture> OpenSharedTexture(void* handle,
+                                                          const NativeBackendTextureDesc& desc) override {
+    if(!handle) return {};
+    TrackedResource tracked;
+    // A surface another API owns and may still be writing. It arrives in
+    // COMMON, which is the only state a shared resource can be handed over in.
+    tracked.state=D3D12_RESOURCE_STATE_COMMON;
+    if(FAILED(gpu_.device()->OpenSharedHandle(handle,IID_PPV_ARGS(&tracked.resource)))) return {};
+    const auto view=texture_views_.Allocate();
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+    srv.Format=static_cast<DXGI_FORMAT>(desc.format);
+    srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srv.Texture2D.MipLevels=1;
+    gpu_.device()->CreateShaderResourceView(tracked.resource.Get(),&srv,view);
+    return std::make_unique<D3D12Texture>(std::move(tracked),desc.width,desc.height,view,
+                                          texture_views_);
+  }
+
+  bool WaitSharedFence(void* handle, uint64_t value) override {
+    if(!handle) return false;
+    if(!shared_fence_ || shared_fence_handle_!=handle) {
+      shared_fence_.Reset();
+      if(FAILED(gpu_.device()->OpenSharedHandle(handle,IID_PPV_ARGS(&shared_fence_)))) return false;
+      shared_fence_handle_=handle;
+    }
+    // A queue-side wait, not a CPU one: the GPU stalls until the producer has
+    // signalled, and this thread carries on recording.
+    return SUCCEEDED(gpu_.queue()->Wait(shared_fence_.Get(),value));
+  }
+
   std::vector<std::string> DrainValidationMessages() override { return gpu_.DrainValidationErrors(); }
 
   void AttachWindow(void* window, uint32_t width, uint32_t height) override {
@@ -938,6 +969,8 @@ class D3D12Backend final : public NativeRenderBackend {
   // slot until its fence has passed, which is also what keeps us off a buffer
   // the display is still showing.
   static constexpr uint32_t kBackBuffers=3;
+  ComPtr<ID3D12Fence> shared_fence_;
+  void* shared_fence_handle_=nullptr;
   ComPtr<IDXGISwapChain3> swap_chain_;
   std::vector<std::unique_ptr<D3D12RenderTarget>> back_buffers_;
   std::vector<PendingUpload> pending_;

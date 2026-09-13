@@ -1,6 +1,6 @@
 #include "d3d11_backend.h"
 #include "native_dxgi_format.h"
-#include <d3d11_1.h>
+#include <d3d11_4.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -659,6 +659,33 @@ class D3D11Backend final : public NativeRenderBackend {
     return pixels;
   }
 
+  std::unique_ptr<NativeBackendTexture> OpenSharedTexture(void* handle,
+                                                          const NativeBackendTextureDesc& desc) override {
+    if(!handle) return {};
+    ComPtr<ID3D11Device1> extended;
+    if(FAILED(device_.As(&extended))) return {};
+    ComPtr<ID3D11Texture2D> texture;
+    if(FAILED(extended->OpenSharedResource1(handle,IID_PPV_ARGS(&texture)))) return {};
+    ComPtr<ID3D11ShaderResourceView> view;
+    if(FAILED(device_->CreateShaderResourceView(texture.Get(),nullptr,&view))) return {};
+    return std::make_unique<D3D11Texture>(std::move(texture),std::move(view),desc.width,desc.height);
+  }
+
+  bool WaitSharedFence(void* handle, uint64_t value) override {
+    if(!handle) return false;
+    if(!shared_fence_ || shared_fence_handle_!=handle) {
+      shared_fence_.Reset();
+      ComPtr<ID3D11Device5> fencing;
+      if(FAILED(device_.As(&fencing))) return false;
+      if(FAILED(fencing->OpenSharedFence(handle,IID_PPV_ARGS(&shared_fence_)))) return false;
+      shared_fence_handle_=handle;
+    }
+    ComPtr<ID3D11DeviceContext4> fenced;
+    if(FAILED(context_.As(&fenced))) return false;
+    fenced->Wait(shared_fence_.Get(),value);
+    return true;
+  }
+
   std::vector<std::string> DrainValidationMessages() override {
     std::vector<std::string> found;
     if(debug_layer_refused_)
@@ -733,6 +760,8 @@ class D3D11Backend final : public NativeRenderBackend {
   ComPtr<ID3D11Device> device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<ID3D11InfoQueue> messages_;
+  ComPtr<ID3D11Fence> shared_fence_;
+  void* shared_fence_handle_=nullptr;
   ComPtr<IDXGISwapChain1> swap_chain_;
   std::unique_ptr<D3D11Recorder> recorder_;
   std::unique_ptr<D3D11RenderTarget> back_buffer_;

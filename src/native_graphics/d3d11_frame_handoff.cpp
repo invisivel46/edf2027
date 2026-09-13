@@ -1,4 +1,5 @@
 #include "d3d11_frame_handoff.h"
+#include <dxgi1_2.h>
 #include <stdexcept>
 
 namespace edf::native {
@@ -25,19 +26,46 @@ void NativeFrameHandoff::Publish(ID3D11Texture2D& source,NativeFrameKind kind,co
     throw std::runtime_error("native frame publication requires same-device single-level RGBA8 surface");
   if(!snapshot_ || width_!=desc.Width || height_!=desc.Height) {
     desc.Usage=D3D11_USAGE_DEFAULT; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-    desc.CPUAccessFlags=0; desc.MiscFlags=0;
+    desc.CPUAccessFlags=0;
+    // Shareable so another API can sample this surface directly. Costs nothing
+    // when nobody opens it, and saves a full frame through system memory when
+    // somebody does.
+    desc.MiscFlags=D3D11_RESOURCE_MISC_SHARED_NTHANDLE|D3D11_RESOURCE_MISC_SHARED;
     Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
     Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
     if(FAILED(device_->CreateTexture2D(&desc,nullptr,&texture)) ||
        FAILED(device_->CreateShaderResourceView(texture.Get(),nullptr,&view)))
       throw std::runtime_error("native frame snapshot allocation failed");
+    if(shared_texture_) { CloseHandle(shared_texture_); shared_texture_=nullptr; }
+    Microsoft::WRL::ComPtr<IDXGIResource1> shareable;
+    if(SUCCEEDED(texture.As(&shareable)))
+      shareable->CreateSharedHandle(nullptr,DXGI_SHARED_RESOURCE_READ|DXGI_SHARED_RESOURCE_WRITE,
+                                    nullptr,&shared_texture_);
     snapshot_=std::move(texture); view_=std::move(view);
     width_=desc.Width; height_=desc.Height;
   }
+  // Created once, on first publication, because a device that never publishes
+  // should not pay for a fence nobody waits on.
+  if(!fence_ && shared_texture_) {
+    Microsoft::WRL::ComPtr<ID3D11Device5> fencing;
+    if(SUCCEEDED(device_.As(&fencing)) &&
+       SUCCEEDED(fencing->CreateFence(0,D3D11_FENCE_FLAG_SHARED,IID_PPV_ARGS(&fence_)))) {
+      if(FAILED(fence_->CreateSharedHandle(nullptr,GENERIC_ALL,nullptr,&shared_fence_))) fence_.Reset();
+      if(FAILED(context_.As(&fenced_context_))) fence_.Reset();
+    }
+  }
   context_->CopyResource(snapshot_.Get(),&source);
+  // Signalled after the copy, so a consumer that waits for this value is
+  // guaranteed a finished surface rather than one still being written.
+  if(fence_ && fenced_context_) fenced_context_->Signal(fence_.Get(),++fence_value_);
   if(gamma) gamma_=*gamma;
   ++sequence_; kind_=kind; valid_=true;
 }
+NativeFrameHandoff::SharedFrame NativeFrameHandoff::Shared() const {
+  if(!valid_ || !shared_texture_ || !shared_fence_) return {};
+  return {shared_texture_,shared_fence_,fence_value_,width_,height_,DXGI_FORMAT_R8G8B8A8_UNORM};
+}
+
 bool NativeFrameHandoff::Visit(const Consumer& consumer) {
   if(!valid_) return false;
   if(!consumer) throw std::runtime_error("native frame consumer is empty");

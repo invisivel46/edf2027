@@ -138,6 +138,17 @@ void NativeD3D12Preview::Draw(const uint8_t* pixels,uint32_t width,uint32_t heig
     frame_height_=height;
     frame_format_=format;
   }
+  {
+    // The copy path's own upload. Kept out of Composite so the shared path
+    // does not pay for a texture it never writes.
+    backend_->BeginFrame();
+    backend_->Recorder().UpdateTexture(*frame_,{pixels,static_cast<size_t>(width)*height*4});
+    backend_->Submit();
+  }
+  Composite(*frame_,width,height);
+}
+
+void NativeD3D12Preview::Composite(NativeBackendTexture& frame,uint32_t width,uint32_t height) {
   auto* back=backend_->BackBuffer();
   if(!back) return;
   NativeBackendRenderTarget* colors[]={back};
@@ -153,7 +164,6 @@ void NativeD3D12Preview::Draw(const uint8_t* pixels,uint32_t width,uint32_t heig
 
   backend_->BeginFrame();
   auto& recorder=backend_->Recorder();
-  recorder.UpdateTexture(*frame_,{pixels,static_cast<size_t>(width)*height*4});
   recorder.SetRenderTargets(colors,nullptr);
   recorder.SetViewport({0,0,float(window_width_),float(window_height_),0,1});
   recorder.ClearColor(*back,{0,0,0,1});
@@ -161,12 +171,56 @@ void NativeD3D12Preview::Draw(const uint8_t* pixels,uint32_t width,uint32_t heig
   recorder.SetVertexBuffer(0,*vertices_,sizeof(float)*3,0);
   recorder.SetConstants(NativeBackendStage::Vertex,0,
                         {reinterpret_cast<const uint8_t*>(fit),sizeof(fit)});
-  recorder.SetTexture(NativeBackendStage::Pixel,0,frame_.get());
+  recorder.SetTexture(NativeBackendStage::Pixel,0,&frame);
   recorder.SetSampler(NativeBackendStage::Pixel,0,sampler_);
   recorder.Draw(3,0);
   backend_->Submit();
   backend_->Present(false);
   presented_.fetch_add(1,std::memory_order_relaxed);
+}
+
+bool NativeD3D12Preview::DrawShared() {
+  if(shared_refused_) return false;
+  NativeFrameHandoff::SharedFrame shared;
+  uint64_t sequence=0;
+  if(!VisitNativePresentationSharedFrame(shared,sequence) || !shared) return false;
+  if(sequence==last_sequence_) return true;  // Nothing new; not a failure.
+
+  if(!shared_frame_ || shared_handle_!=shared.texture) {
+    NativeBackendTextureDesc desc{};
+    desc.width=shared.width;
+    desc.height=shared.height;
+    desc.levels=1;
+    desc.format=shared.format;
+    shared_frame_=backend_->OpenSharedTexture(shared.texture,desc);
+    if(!shared_frame_) {
+      // Said once. A backend that cannot import handles is a fact about the
+      // backend, not a per-frame event worth repeating 60 times a second.
+      REXLOG_INFO("D3D12 preview: the {} backend cannot open a shared surface; using the copy path",
+        std::string(backend_->name()));
+      shared_refused_=true;
+      return false;
+    }
+    shared_handle_=shared.texture;
+    frame_width_=shared.width;
+    frame_height_=shared.height;
+  }
+  // Wait for the publication to finish on the producing GPU before sampling
+  // it. Without this the surface is read mid-copy.
+  if(!backend_->WaitSharedFence(shared.fence,shared.value)) {
+    REXLOG_INFO("D3D12 preview: the {} backend cannot wait on the shared fence; using the copy path",
+      std::string(backend_->name()));
+    shared_refused_=true;
+    shared_frame_.reset();
+    return false;
+  }
+  Composite(*shared_frame_,shared.width,shared.height);
+  last_sequence_=sequence;
+  if(presented_.load(std::memory_order_relaxed)%120==1)
+    REXLOG_INFO("D3D12 preview: shared surface, no copy; frame={}x{} format={}, window={}x{}, sequence={}; drawn and presented by the {} backend",
+      shared.width,shared.height,shared.format,window_width_,window_height_,sequence,
+      std::string(backend_->name()));
+  return true;
 }
 
 bool NativeD3D12Preview::Tick() {
@@ -185,6 +239,10 @@ bool NativeD3D12Preview::Tick() {
     window_height_=height;
     attached_=true;
   }
+
+  // The shared surface first; the copy below is only for backends that cannot
+  // import one.
+  if(DrawShared()) return true;
 
   // Readback of the published snapshot. The renderer's own context mutex is
   // held for the duration by VisitNativePresentationFrame, which is why the

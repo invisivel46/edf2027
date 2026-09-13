@@ -275,6 +275,22 @@ class NativeRenderBackend {
   // buffer, and holding the old one writes to something being displayed.
   virtual NativeBackendRenderTarget* BackBuffer()=0;
   virtual void Present(bool vsync)=0;
+
+  // Cross-API sharing, for the stretch of the migration where one API produces
+  // a surface another consumes. Without it the only way across is a copy
+  // through system memory, which costs a whole frame of bandwidth every frame.
+  //
+  // Returns null when the backend cannot import the handle, which callers must
+  // handle rather than assume - the copy path has to stay until nothing needs
+  // it. The handle stays owned by the producer.
+  virtual std::unique_ptr<NativeBackendTexture> OpenSharedTexture(
+      void* handle, const NativeBackendTextureDesc& desc)=0;
+  // Makes everything submitted afterwards wait until the producing API has
+  // signalled `value` on the shared fence. Sampling a surface without this
+  // reads it mid-write, which looks like tearing or stale frames rather than
+  // like a missing synchronisation. Returns false if the fence cannot be
+  // opened, in which case the caller must not use the shared surface.
+  virtual bool WaitSharedFence(void* handle, uint64_t value)=0;
 };
 
 // Backends register here; selection is by name so a run can A/B them without a

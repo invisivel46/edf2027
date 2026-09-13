@@ -1490,6 +1490,15 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
   if(REXCVAR_GET(edf_native_publish_frames))
     state.presentation_frames=std::make_unique<NativeFrameHandoff>(*state.device.Get(),*state.context.Get());
 }
+bool VisitNativePresentationSharedFrame(NativeFrameHandoff::SharedFrame& shared,uint64_t& sequence) {
+  auto& state=State();
+  std::lock_guard lock(state.mutex);
+  if(!state.presentation_frames) return false;
+  shared=state.presentation_frames->Shared();
+  sequence=state.presentation_frames->SharedSequence();
+  return bool(shared);
+}
+
 bool VisitNativePresentationFrame(const NativeFrameHandoff::Consumer& consumer) {
   auto& state=State();
   HookTiming wait(HookPhase::PresentationContextWait);

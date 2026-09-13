@@ -17,12 +17,13 @@ namespace edf::native {
 // name at startup, compositing and presenting real game frames inside the
 // running game.
 //
-// Frames arrive by CPU readback of the published snapshot and are uploaded
-// again on the backend side. That is a staging step and is stated as one: it
-// costs a round trip per frame and exists because it needs no cross-API
-// sharing, so the thing being proved here is the backend drawing and
-// presenting, not a shared-surface path that would have to be debugged at the
-// same time. A real port shares the surface instead.
+// Frames arrive by shared surface where the backend can open one: the
+// renderer publishes into a shareable texture and signals a shared fence, and
+// this samples it where it lies. Nothing crosses system memory.
+//
+// The copy path is kept for backends that cannot import a handle, because
+// "shared or nothing" would mean a preview that silently shows nothing rather
+// than one that is merely slower. Which path a run took is in the log.
 class NativeD3D12Preview {
  public:
   // Runs on its own thread, which owns the window and is the only thread that
@@ -43,12 +44,19 @@ class NativeD3D12Preview {
   void Run();
   void CreateResources();
   bool Tick();
+  // Returns false when no shared surface is available and the copy path has
+  // to be used instead.
+  bool DrawShared();
   void Draw(const uint8_t* pixels, uint32_t width, uint32_t height, uint32_t format);
+  void Composite(NativeBackendTexture& frame, uint32_t width, uint32_t height);
 
   NativeRenderBackend* backend_;
   HWND window_=nullptr;
   std::unique_ptr<NativeBackendBuffer> vertices_;
   std::unique_ptr<NativeBackendTexture> frame_;
+  std::unique_ptr<NativeBackendTexture> shared_frame_;
+  void* shared_handle_=nullptr;
+  bool shared_refused_=false;
   NativeBackendPipeline* pipeline_=nullptr;
   NativeBackendSampler* sampler_=nullptr;
   uint32_t frame_width_=0,frame_height_=0,frame_format_=0,window_width_=0,window_height_=0;
