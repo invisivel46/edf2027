@@ -181,6 +181,8 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        IndexedMesh, IndexedBindings, MeshRanges, MeshAcquire, MeshDrawRange,
                        IndexedSubmissionWait, IndexedContextWait, ImmediateSubmissionWait,
                        ImmediateContextWait, PresentationContextWait,
+                       ActivationLock, ActivationResolve, ActivationVertexParams, ActivationPixelParams,
+                       ActivationTextures, ActivationBind,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
@@ -210,6 +212,8 @@ class HookTiming {
       "indexed.mesh","indexed.bindings","mesh.ranges","mesh.acquire","mesh.draw_range",
       "indexed.submission_wait","indexed.context_wait","immediate.submission_wait",
       "immediate.context_wait","presentation.context_wait",
+      "activation.lock","activation.resolve","activation.params_vs","activation.params_ps",
+      "activation.textures","activation.bind",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
       "load.shader.registration","load.shader.lock","load.shader.entry",
       "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
@@ -554,6 +558,8 @@ struct Bridge {
   uint64_t vertex_center_word=UINT64_MAX;
   uint64_t shared_constant_activations=0,shared_constant_unsupplied=0,shared_constant_split_storage=0;
   uint64_t shared_constant_both_supplied=0;
+  uint32_t last_activation_instance=0,last_activation_vertex=0,last_activation_pixel=0;
+  uint64_t repeat_activations=0;
   std::set<std::array<uint32_t,2>> shared_constant_pairs;
   std::set<std::array<uint32_t,3>> shared_constant_storage_reported;
   std::set<std::array<uint32_t,3>> shared_constant_reported;
@@ -935,13 +941,20 @@ void UploadParameters(const Reader& reader, uint32_t instance, uint32_t stage_of
     const size_t group=(stage_offset?2:0)+(global?1:0);
     const auto& resolved=shader.ResolveParameters(owned,group,false);
     const auto* alternate_resolved=alternate?&shader.ResolveParameters(owned,group,true):nullptr;
+    // One validated read covers every record in this group, so the per-record
+    // reads inside it cost pointer arithmetic instead of a heap lookup each.
+    // Payload pointers still fall through to the backing reader's validation:
+    // they are scattered, and that check belongs exactly where it is.
+    const auto record_base=owned->record_base[group];
+    const auto record_bytes=owned->record_bytes[group];
+    const auto upload=[&](const auto& source) {
     size_t parameter_index=0;
     for(const auto& parameter:(*owned)[group]) {
       const std::array<const ShaderBindings::FloatRegisterBinding*,2> targets{
         &resolved[parameter_index].binding,alternate_resolved?&(*alternate_resolved)[parameter_index].binding:nullptr};
       const bool canvas_xy=resolved[parameter_index].canvas_xy;
       ++parameter_index;
-      const auto value=parameter.ReadValue(reader,global);
+      const auto value=parameter.ReadValue(source,global);
       const auto& name=parameter.name;
       const auto registers=parameter.registers;
       std::array<ShaderBindings*,2> destinations{&bindings,alternate};
@@ -966,7 +979,7 @@ void UploadParameters(const Reader& reader, uint32_t instance, uint32_t stage_of
         maximum=(std::max)(maximum,bytes);
       }
       if(!destinations[0] && !destinations[1]) continue;
-      const auto* data=reader.Bytes(value.data,maximum);
+      const auto* data=source.Bytes(value.data,maximum);
       std::array<uint8_t,16> canvas_data{};
       if(canvas_xy && NativeRenderDimensions()[0]>0 && maximum==16) {
         canvas_data=ScaleNativeCanvasXY({data,16},float(NativeRenderDimensions()[0])/1280.0f,
@@ -978,6 +991,10 @@ void UploadParameters(const Reader& reader, uint32_t instance, uint32_t stage_of
         else ++state.optimized_out;
       }
     }
+    };
+    if(record_base && record_bytes)
+      upload(edf::native::GuestReadWindow(reader,record_base,record_bytes));
+    else upload(reader);
   }
 }
 template<class Reader>
@@ -1137,9 +1154,24 @@ void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t d
   const auto vertex = reader.Word(reader.Word(pass));
   const auto pixel = reader.Word(reader.Add(reader.Word(reader.Add(pass, 4)), 4));
   auto& state = State();
+  // Sub-phases: activation is the most expensive per-call hook in gameplay and
+  // nobody has measured which part of it that is. Lock wait is separated from
+  // work because both scale differently with thread contention.
+  edf::native::HookTiming lock_timing(edf::native::HookPhase::ActivationLock);
   std::lock_guard submission(state.submissions);
   std::lock_guard lock(state.mutex);
+  lock_timing.Finish();
+  edf::native::HookTiming resolve_timing(edf::native::HookPhase::ActivationResolve);
   ++state.activations;
+  // Repeat activations of one material with unchanged shaders are the cheapest
+  // thing to skip if they dominate, so count them before optimising anything.
+  if(instance==state.last_activation_instance && vertex==state.last_activation_vertex &&
+     pixel==state.last_activation_pixel) ++state.repeat_activations;
+  state.last_activation_instance=instance;
+  state.last_activation_vertex=vertex; state.last_activation_pixel=pixel;
+  if(state.activations%250000==0)
+    REXLOG_INFO("Native activation repeats: activations={}, repeats_of_previous={} ({:.1f}% identical instance and shader pair as the immediately preceding activation)",
+      state.activations,state.repeat_activations,100.0*double(state.repeat_activations)/double(state.activations));
   const bool found = state.shaders.contains(vertex) && state.shaders.contains(pixel);
   state.active_vertex = 0;
   state.active_vertex_parameters.reset();
@@ -1233,8 +1265,12 @@ void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t d
             seen,state.shared_constant_unsupplied,state.shared_constant_reported.size(),
             state.shared_constant_both_supplied,state.shared_constant_split_storage);
       }
-      UploadParameters(reader, instance, 0, vs, state, &reversed);
-      UploadParameters(reader, instance, 36, ps, state);
+      resolve_timing.Finish();
+      { edf::native::HookTiming vertex_params(edf::native::HookPhase::ActivationVertexParams);
+        UploadParameters(reader, instance, 0, vs, state, &reversed); }
+      { edf::native::HookTiming pixel_params(edf::native::HookPhase::ActivationPixelParams);
+        UploadParameters(reader, instance, 36, ps, state); }
+      edf::native::HookTiming texture_timing(edf::native::HookPhase::ActivationTextures);
       try { UploadTextures(reader, instance, device, ps, state); }
       catch (const std::exception& error) {
         ++state.texture_binding_errors;
@@ -1243,8 +1279,10 @@ void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t d
         ps.ClearTextures();
         ps.ClearSamplers();
       }
-      vs.Bind(*state.context.Get());
-      ps.Bind(*state.context.Get());
+      texture_timing.Finish();
+      { edf::native::HookTiming bind_timing(edf::native::HookPhase::ActivationBind);
+        vs.Bind(*state.context.Get());
+        ps.Bind(*state.context.Get()); }
       state.active_vertex_parameters=vertex_ranges;
       state.active_vertex = vertex;
     } catch (const std::exception& error) {

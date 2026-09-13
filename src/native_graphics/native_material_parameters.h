@@ -36,6 +36,12 @@ class NativeMaterialParameters {
  public:
   struct Groups : std::array<std::vector<NativeMaterialParameter>,4> {
     std::array<std::vector<NativeMaterialTexture>,2> textures;
+    // Each group's records are one contiguous guest array. Retaining its bounds
+    // lets an upload validate the whole array once instead of once per
+    // parameter, which at tens of thousands of activations a second is a heap
+    // lookup each. Only the bounds are cached: the records themselves stay live,
+    // because their data pointers change between activations.
+    std::array<uint32_t,4> record_base{},record_bytes{};
   };
   template<class Reader> void Publish(const Reader& reader,uint32_t instance) {
     if(!instance) throw std::runtime_error("null native material owner");
@@ -47,6 +53,8 @@ class NativeMaterialParameters {
       if(!count) continue;
       const auto* records=reader.Bytes(address,size_t(count)*16);
       auto& group=(*fresh)[stage*2+global]; group.reserve(count);
+      fresh->record_base[stage*2+global]=address;
+      fresh->record_bytes[stage*2+global]=count*16;
       for(uint32_t i=0;i<count;++i) {
         const auto* record=records+size_t(i)*16;
         const auto registers=GuestBlockWord(record+8);
