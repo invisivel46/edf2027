@@ -145,6 +145,58 @@ management, upload ring, barriers.
 **Stage 3 - multithreaded recording.** The actual payoff, and only reachable
 from stage 2.
 
+## Where the D3D12 backend actually is
+
+Built and tested on WARP, so the suite runs on a machine with no D3D12
+hardware. Selected by name through the registry (`d3d12`, or `d3d12-warp` to
+force the software rasteriser), which is how a rendering difference gets
+attributed: reproduces on WARP, the bug is ours; does not, it is the driver's.
+
+Working, each verified by reading pixels back rather than by inspection:
+
+- Device, queue, per-frame command allocators, fences. 32 frames through 3
+  slots, readback matching the frame that wrote it.
+- Fenced upload ring, shared by constants, buffer and texture staging.
+- Root signature sized from the shader measurement; constant buffers as root
+  CBVs, so a material activation costs no descriptor work at all.
+- Pipeline cache on the fused description, with scissor deliberately excluded.
+- Every shader validated against the root signature by reflection before it
+  can reach a pipeline.
+- View descriptor ring, sampler tables cached by combination.
+- Flat triangle: 2,016 of 4,096 pixels where half is expected.
+- Textured draw: a 2x2 texture uploaded and sampled, all four quadrants
+  checked so a flip or row swap cannot pass.
+- Indexed instanced draw with a per-instance input element: four instances,
+  one per quadrant, nothing in the centre. This is the stage-0 primitive.
+
+Not done, and loud rather than silent about it:
+
+- **No presentation.** Frames render to a texture; nothing reaches a window.
+- No vertex-stage textures or samplers (no disc shader uses any).
+- No MSAA resolve, no query readback, no mipped texture upload.
+- `SupportsParallelRecording()` returns false, because it is stage 3.
+- **The bridge still calls D3D11 directly.** This backend is not wired to the
+  game; that is the 13 touchpoints and it is the largest remaining piece.
+
+### Consequence 5 is no longer a prediction
+
+Twice now, disabling resource barriers produced **pixel-identical, fully
+passing output** - the same 2,016 covered pixels, every colour check green -
+and only the drained validation messages caught it. That is why validation
+draining is on the seam rather than in one backend, and why the tests read it
+instead of leaving it in the debugger where an automated run never looks.
+
+### Seam gaps found by building against it
+
+The interface was written before any backend existed, and four things in it
+were wrong. Each is now fixed rather than worked around:
+
+- It required pipelines everywhere and created them nowhere.
+- It had `Submit` but no `BeginFrame`. D3D11 needed none; everything else does.
+- It declared a sampler type with no way to create one.
+- It could not read its own output, so a backend could not be compared against
+  the one it replaces.
+
 ## What this replaces
 
 A renderer that currently works: 60 fps held, 18.9M indexed draws submitted with
