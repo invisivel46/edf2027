@@ -1261,16 +1261,17 @@ float4 PS():SV_TARGET {return float4(tex2D_DXT5N_xGxR(NormalSampler,float2(.5,.5
       D3D11_SAMPLER_DESC desc{}; desc.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
       desc.AddressU=desc.AddressV=desc.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
       desc.MaxLOD=D3D11_FLOAT32_MAX;
-      ComPtr<ID3D11SamplerState> normal_sampler;
-      Require(SUCCEEDED(device->CreateSamplerState(&desc,&normal_sampler)),"normal decoder sampler");
-      normal_ps.SetSampler("NormalSampler",normal_sampler.Get());
+      NativeBackendSamplerDesc normal_desc{};
+      normal_desc.min=normal_desc.mag=normal_desc.mip=NativeBackendFilter::Point;
+      normal_desc.u=normal_desc.v=normal_desc.w=NativeBackendAddress::Clamp;
+      normal_ps.SetSampler("NormalSampler",&backend->CreateSampler(normal_desc));
       for(const auto xy:std::array<std::array<float,2>,6>{{{.5f,.5f},{.75f,.5f},{1,1},{0,0},{1,128.f/255},{.5f,nan}}}) {
         const float encoded[]{0,xy[1],0,xy[0]};
         context->ClearRenderTargetView(normal_texture.target.Get(),encoded);
         normal_texture.content_valid=true;
         normal_ps.ClearTextures(); normal_ps.Bind(*context.Get());
         ResolveNativeRenderTarget(*context.Get(),normal_texture);
-        normal_ps.SetTexture("NormalSampler",normal_texture.sampled.view.Get());
+        normal_ps.SetTexture("NormalSampler",normal_texture.sampled.backend);
         normal_ps.Bind(*context.Get()); stream.Draw(*context.Get(),bytes);
         const auto actual=ReadNativeColorPixel(*context.Get(),*target.surface.Get(),1,1);
         if(std::isnan(xy[1])) {
@@ -1307,10 +1308,18 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
     ComPtr<ID3D11Texture2D> utility_texture; ComPtr<ID3D11ShaderResourceView> utility_view;
     Require(SUCCEEDED(device->CreateTexture2D(&utility_desc,&utility_data,&utility_texture)),"Utility texture");
     Require(SUCCEEDED(device->CreateShaderResourceView(utility_texture.Get(),nullptr,&utility_view)),"Utility texture view");
-    D3D11_SAMPLER_DESC utility_sampler_desc{}; utility_sampler_desc.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
-    utility_sampler_desc.AddressU=utility_sampler_desc.AddressV=utility_sampler_desc.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
-    ComPtr<ID3D11SamplerState> utility_sampler;
-    Require(SUCCEEDED(device->CreateSamplerState(&utility_sampler_desc,&utility_sampler)),"Utility sampler");
+    // The same texture and sampler as backend handles, which is what a
+    // material binding holds; the D3D11 views above stay for the direct calls.
+    NativeBackendTextureDesc utility_backend_desc{};
+    utility_backend_desc.width=2; utility_backend_desc.height=1; utility_backend_desc.levels=1;
+    utility_backend_desc.format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    std::shared_ptr<NativeBackendTexture> utility_backend=
+      backend->CreateTexture(utility_backend_desc,utility_pixels);
+    Require(bool(utility_backend),"Utility backend texture");
+    NativeBackendSamplerDesc utility_sampler_desc{};
+    utility_sampler_desc.min=utility_sampler_desc.mag=utility_sampler_desc.mip=NativeBackendFilter::Point;
+    utility_sampler_desc.u=utility_sampler_desc.v=utility_sampler_desc.w=NativeBackendAddress::Clamp;
+    auto* utility_sampler=&backend->CreateSampler(utility_sampler_desc);
     context->OMSetRenderTargets(1,&rtv,nullptr); context->OMSetBlendState(nullptr,nullptr,UINT32_MAX);
     context->OMSetDepthStencilState(nullptr,0); context->RSSetState(raster_state.Get()); context->RSSetViewports(1,&viewport);
     const std::array<uint8_t,12> utility_indices{0,0,0,1,0,2,0,0,0,2,0,3};
@@ -1348,8 +1357,10 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
       ValidateNativeShaderLink(utility_vs.shader(),utility_ps.shader());
       utility_vs.SetGuestFloatRegisters("_g_DX2DScale",Guest(std::array<float,4>{.5f,-1,0,0}));
       utility_vs.SetGuestFloatRegisters("_g_DX2DOffset",Guest(std::array<float,4>{-1,1,0,0}));
-      if(textured) { utility_ps.SetTexture("m_Texture",utility_view.Get()); utility_ps.SetSampler("m_Sampler",utility_sampler.Get()); }
-      Require(utility_ps.UsesTextureResource(*utility_texture.Get())==textured &&
+      if(textured) { utility_ps.SetTexture("m_Texture",utility_backend); utility_ps.SetSampler("m_Sampler",utility_sampler); }
+      // Asked of the backend handle the binding actually holds. It used to be
+      // asked of a D3D11 resource, which is no longer what is bound.
+      Require(utility_ps.UsesTexture(*utility_backend)==textured &&
         !utility_ps.UsesTextureResource(*target.surface.Get()),"Utility texture resource identity");
       const size_t stride=textured?20:12;
       std::vector<uint8_t> utility_decl(textured?36:24),utility_vertices(stride*4);
@@ -1508,6 +1519,9 @@ float4 Ps_ZParticle(P i):SV_TARGET {
     ComPtr<ID3D11Texture2D> particle_texture; ComPtr<ID3D11ShaderResourceView> particle_view;
     Require(SUCCEEDED(device->CreateTexture2D(&utility_desc,&particle_data,&particle_texture)),"particle texture");
     Require(SUCCEEDED(device->CreateShaderResourceView(particle_texture.Get(),nullptr,&particle_view)),"particle texture view");
+    std::shared_ptr<NativeBackendTexture> particle_backend=
+      backend->CreateTexture(utility_backend_desc,particle_pixels);
+    Require(bool(particle_backend),"particle backend texture");
     std::vector<uint8_t> particle_decl(48);
     for(size_t e=0;e<4;++e) {
       constexpr uint32_t offsets[]{0,12,20,28},types[]{0x2a23b9,0x2c23a5,0x2c23a5,0x1a23a6},semantics[]{0,0x50000,0x50100,0xa0000};
@@ -1586,7 +1600,7 @@ float4 Ps_ZParticle(P i):SV_TARGET {
       for(bool clipped:{false,true}) {
         ShaderBindings particle_ps(*device.Get(),CompileNativeShader(*device.Get(),particle,
           {true,clipped?"Ps_ZParticle":"Ps_Particle","ps_5_0"},"particle_contract.fx"));
-        particle_ps.SetTexture("m_Texture",particle_view.Get()); particle_ps.SetSampler("m_Sampler",utility_sampler.Get());
+        particle_ps.SetTexture("m_Texture",particle_backend); particle_ps.SetSampler("m_Sampler",utility_sampler);
         context->OMSetRenderTargets(1,&rtv,nullptr); context->OMSetBlendState(nullptr,nullptr,UINT32_MAX);
         context->OMSetDepthStencilState(nullptr,0); context->RSSetState(raster_state.Get()); context->RSSetViewports(1,&viewport);
         const float clear[]{-2,-2,-2,-2}; context->ClearRenderTargetView(rtv,clear);

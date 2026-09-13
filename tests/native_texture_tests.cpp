@@ -55,6 +55,11 @@ int main() {
     // which a texture interface describing one 2D slice could not express.
     auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
     Require(bool(backend),"adopted backend");
+    // A frame stays open for the rest of this test. On the adopted D3D11
+    // backend the recorder issues straight to the immediate context, so an
+    // open frame is bookkeeping and the ordering against the direct calls
+    // below is unchanged.
+    backend->BeginFrame();
     // Read each compressed subresource back byte-for-byte. Unique face/mip
     // values detect truncated chains, incorrect block rounding and face order.
     for (uint32_t fourcc : {0x31545844u,0x33545844u,0x35545844u}) {
@@ -162,12 +167,12 @@ int main() {
       msaa.sampled.resource->GetDesc(&sample_desc);
       Require(color_desc.SampleDesc.Count==samples && depth_desc.SampleDesc.Count==samples &&
         sample_desc.SampleDesc.Count==1,"MSAA storage/resolve sample counts");
-      ResolveNativeRenderTarget(*context.Get(),msaa);
+      ResolveNativeRenderTarget(backend->Recorder(),msaa);
       Require(!msaa.sampled.content_valid,"unwritten MSAA resolve marked valid");
       ClearNativeDepthTarget(*context.Get(),depth,true,true,.25f,7);
       Require(depth.depth_valid && depth.stencil_valid,"MSAA depth/stencil clear validity");
       const float hdr[]{2,.5f,-1,1}; context->ClearRenderTargetView(msaa.target.Get(),hdr);
-      msaa.content_valid=true; ResolveNativeRenderTarget(*context.Get(),msaa);
+      msaa.content_valid=true; ResolveNativeRenderTarget(backend->Recorder(),msaa);
       Require(msaa.sampled.content_valid,"MSAA resolve missing validity");
       for(uint32_t y=0;y<2;++y) for(uint32_t x=0;x<4;++x)
         Require(ReadNativeColorPixel(*context.Get(),*msaa.sampled.resource.Get(),x,y)==
@@ -196,7 +201,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       const float blue[]{0,0,1,0}; context->ClearRenderTargetView(rtv,blue);
       sample_vs.Bind(*context.Get()); sample_ps.Bind(*context.Get()); context->Draw(3,0);
       context->OMSetRenderTargets(0,nullptr,nullptr); context->OMSetBlendState(nullptr,nullptr,UINT32_MAX);
-      ResolveNativeRenderTarget(*context.Get(),msaa);
+      ResolveNativeRenderTarget(backend->Recorder(),msaa);
       const float fraction=1.f/samples;
       Require(CaptureNativeHdrBmp(*context.Get(),*msaa.surface.Get())==
         CaptureNativeHdrBmp(*context.Get(),*msaa.sampled.resource.Get()),"MSAA diagnostic capture differs from explicit resolve");
@@ -220,7 +225,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       context->OMSetBlendState(nullptr,nullptr,UINT32_MAX);
       context->Draw(3,0);
       context->OMSetRenderTargets(0,nullptr,nullptr);
-      ResolveNativeRenderTarget(*context.Get(),msaa);
+      ResolveNativeRenderTarget(backend->Recorder(),msaa);
       for(uint32_t y=0;y<2;++y) for(uint32_t x=0;x<4;++x) {
         const auto pixel=ReadNativeColorPixel(*context.Get(),*msaa.sampled.resource.Get(),x,y);
         Require(std::abs(pixel[0]-(1-fraction))<.001f && pixel[1]==0 &&
@@ -239,12 +244,12 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
     }
     auto target = CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     Require(!target.content_valid && !target.sampled.content_valid,"allocated target marked initialized");
-    ResolveNativeRenderTarget(*context.Get(),target);
+    ResolveNativeRenderTarget(backend->Recorder(),target);
     Require(!target.sampled.content_valid,"unwritten resolve marked initialized");
     const float first[]{2,.5f,-1,1}, second[]{.25f,4,0,1};
     context->ClearRenderTargetView(target.target.Get(),first);
     target.content_valid = true;
-    ResolveNativeRenderTarget(*context.Get(),target);
+    ResolveNativeRenderTarget(backend->Recorder(),target);
     Require(target.sampled.content_valid,"written resolve not initialized");
     D3D11_TEXTURE2D_DESC readback_desc{};
     target.sampled.resource->GetDesc(&readback_desc);
@@ -268,15 +273,15 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
     verify_resolved({0x4000,0x3800,0xbc00,0x3c00});
     context->ClearRenderTargetView(target.target.Get(),second);
     verify_resolved({0x4000,0x3800,0xbc00,0x3c00}); // No implicit resolve.
-    ResolveNativeRenderTarget(*context.Get(),target);
+    ResolveNativeRenderTarget(backend->Recorder(),target);
     verify_resolved({0x3400,0x4400,0,0x3c00});
     ClearNativeColorTarget(*context.Get(),target,0x00ff00ff);
     Require(target.content_valid,"color clear did not initialize surface");
     verify_resolved({0x3400,0x4400,0,0x3c00}); // Clear is not a resolve.
-    ResolveNativeRenderTarget(*context.Get(),target);
+    ResolveNativeRenderTarget(backend->Recorder(),target);
     verify_resolved({0x3c00,0,0x3c00,0}); // ARGB -> RGBA, including zero alpha.
     ClearNativeColorTarget(*context.Get(),target,0xff008000);
-    ResolveNativeRenderTarget(*context.Get(),target);
+    ResolveNativeRenderTarget(backend->Recorder(),target);
     verify_resolved({0,0x3804,0,0x3c00}); // 128/255, not 128/256.
     // Sampling the last resolve while rendering the next frame must not make
     // D3D11 silently null an SRV. Exercise both binding orders repeatedly.
@@ -302,7 +307,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       srv=nullptr;
       context->PSSetShaderResources(3,1,&srv);
       context->VSSetShaderResources(5,1,&srv);
-      ResolveNativeRenderTarget(*context.Get(),target);
+      ResolveNativeRenderTarget(backend->Recorder(),target);
       if(frame&1) verify_resolved({0x4000,0x3800,0xbc00,0x3c00});
       else verify_resolved({0x3400,0x4400,0,0x3c00});
       context->OMSetRenderTargets(0,nullptr,nullptr);
@@ -342,7 +347,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       Require(!ImportZeroLuminanceHistory(*context.Get(),invalid_history,initial_page),"non-1x1 history accepted");
       auto luminance=CreateNativeLuminanceTarget(*backend,9,3);
       Require(!luminance.content_valid && !luminance.sampled.content_valid,"luminance allocation initialized");
-      ResolveNativeRenderTarget(*context.Get(),luminance);
+      ResolveNativeRenderTarget(backend->Recorder(),luminance);
       Require(!luminance.sampled.content_valid,"unwritten luminance resolve initialized");
       D3D11_TEXTURE2D_DESC surface_desc{}; luminance.surface->GetDesc(&surface_desc);
       Require(surface_desc.Format==DXGI_FORMAT_R32_FLOAT,"luminance surface lost float32 precision");
@@ -354,11 +359,16 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       luminance.content_valid=true;
       auto* luminance_rtv=luminance.target.Get();
       context->OMSetRenderTargets(1,&luminance_rtv,nullptr);
-      ResolveNativeRenderTarget(*context.Get(),luminance);
+      ResolveNativeRenderTarget(backend->Recorder(),luminance);
       Require(luminance.sampled.content_valid,"luminance conversion not published");
-      ComPtr<ID3D11RenderTargetView> restored;
-      context->OMGetRenderTargets(1,&restored,nullptr);
-      Require(restored.Get()==luminance_rtv,"conversion lost render target binding");
+      // The conversion is a draw now, so it leaves its own target bound. That
+      // is the contract - a recorder has no getters to restore from - and the
+      // check is that it really did change, so a caller cannot go on assuming
+      // otherwise the way the compute pass let it.
+      ComPtr<ID3D11RenderTargetView> after;
+      context->OMGetRenderTargets(1,&after,nullptr);
+      Require(after.Get()!=luminance_rtv,"conversion did not bind its own target");
+      context->OMSetRenderTargets(1,&luminance_rtv,nullptr);
       D3D11_TEXTURE2D_DESC sample_desc{}; luminance.sampled.resource->GetDesc(&sample_desc);
       sample_desc.Usage=D3D11_USAGE_STAGING; sample_desc.BindFlags=0; sample_desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
       ComPtr<ID3D11Texture2D> converted;
@@ -388,7 +398,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       for (size_t i=0;i<pixels.size();++i) pixels[i]=hdr[i%4];
       context->UpdateSubresource(bloom.surface.Get(),0,nullptr,pixels.data(),9*8,0);
       bloom.content_valid=true;
-      ResolveNativeRenderTarget(*context.Get(),bloom);
+      ResolveNativeRenderTarget(backend->Recorder(),bloom);
       Require(bloom.sampled.content_valid,"bloom conversion not initialized");
       D3D11_TEXTURE2D_DESC desc{}; bloom.sampled.resource->GetDesc(&desc);
       Require(desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM,"bloom format not quantized RGBA8");
@@ -413,16 +423,16 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
         const float clear[]{-1,.5f,2,.25f};
         context->ClearRenderTargetView(direct.target.Get(),clear);
         direct.content_valid=true;
-        ResolveNativeRgba8Frame(*context.Get(),direct,bloom);
+        ResolveNativeRgba8Frame(backend->Recorder(),direct,bloom);
         Require(bloom.sampled.content_valid,"direct frame resolve not valid");
         verify_bloom();
         direct.content_valid=false;
-        ResolveNativeRgba8Frame(*context.Get(),direct,bloom);
+        ResolveNativeRgba8Frame(backend->Recorder(),direct,bloom);
         Require(!bloom.sampled.content_valid,"unwritten direct frame published");
         verify_bloom(); // Invalidating must not overwrite old sampled bytes.
         direct.content_valid=true;
         auto opaque=CreateNativeOpaqueFrameTarget(*backend,9,3);
-        ResolveNativeRgba8Frame(*context.Get(),direct,opaque);
+        ResolveNativeRgba8Frame(backend->Recorder(),direct,opaque);
         Require(opaque.sampled.content_valid,"opaque direct resolve not initialized");
         for(uint32_t y=0;y<3;++y) for(uint32_t x=0;x<9;++x) {
           const auto pixel=ReadNativeColorPixel(*context.Get(),*opaque.sampled.resource.Get(),x,y);
@@ -433,11 +443,11 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       {
         auto wrong=CreateNativeRenderTarget(*backend,8,3,DXGI_FORMAT_R16G16B16A16_FLOAT);
         bool rejected=false;
-        try { ResolveNativeRgba8Frame(*context.Get(),wrong,bloom); }
+        try { ResolveNativeRgba8Frame(backend->Recorder(),wrong,bloom); }
         catch(const std::exception&) { rejected=true; }
         Require(rejected && !bloom.sampled.content_valid,"mismatched direct frame accepted");
         rejected=false;
-        try { ResolveNativeRgba8Frame(*context.Get(),bloom,bloom); }
+        try { ResolveNativeRgba8Frame(backend->Recorder(),bloom,bloom); }
         catch(const std::exception&) { rejected=true; }
         Require(rejected,"aliased direct frame accepted");
       }

@@ -50,6 +50,11 @@ class StubBackend final : public edf::native::NativeRenderBackend {
   std::unique_ptr<edf::native::NativeBackendTexture> OpenSharedTexture(
       void*, const edf::native::NativeBackendTextureDesc&) override { return {}; }
   bool WaitSharedFence(void*, uint64_t) override { return false; }
+  // A backend that cannot share says so, which is what a caller has to handle.
+  std::unique_ptr<edf::native::NativeBackendSharedSurface> CreateSharedSurface(
+      const edf::native::NativeBackendTextureDesc&) override { return {}; }
+  uint64_t SignalShared(edf::native::NativeBackendSharedSurface&) override { return 0; }
+  bool SupportsSamples(uint32_t, uint32_t samples) override { return samples==1; }
   void Submit() override {}
  private:
   std::string name_;

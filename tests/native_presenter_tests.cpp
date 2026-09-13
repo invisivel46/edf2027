@@ -1,3 +1,4 @@
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d11_presenter.h"
 #include "native_graphics/d3d11_frame_compositor.h"
 #include "native_graphics/d3d11_frame_handoff.h"
@@ -59,6 +60,10 @@ void CheckBuffer(ID3D11Device& device,ID3D11DeviceContext& context,
 }
 void CheckComposition(ID3D11Device& device,ID3D11DeviceContext& context,
                       NativeWindowPresenter& presenter) {
+  // Render targets come from the backend now; adopting this device keeps them
+  // usable by the direct D3D11 calls this check makes.
+  auto backend=AdoptNativeD3D11Backend(device,context);
+  Require(bool(backend),"adopted backend");
   NativeFrameCompositor compositor(device);
   auto source=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R8G8B8A8_UNORM);
   ClearNativeColorTarget(context,source,0xff4080bfu);
@@ -143,6 +148,10 @@ void CheckComposition(ID3D11Device& device,ID3D11DeviceContext& context,
   presenter.Present(false);
 }
 void CheckDisplayGamma(ID3D11Device& device,ID3D11DeviceContext& context) {
+  // Render targets come from the backend now; adopting this device keeps them
+  // usable by the direct D3D11 calls this check makes.
+  auto backend=AdoptNativeD3D11Backend(device,context);
+  Require(bool(backend),"adopted backend");
   NativeFrameCompositor compositor(device);
   auto source=CreateNativeRenderTarget(*backend,256,1,DXGI_FORMAT_R8G8B8A8_UNORM);
   auto target=CreateNativeRenderTarget(*backend,256,1,DXGI_FORMAT_R8G8B8A8_UNORM);
@@ -192,6 +201,10 @@ void CheckDisplayGamma(ID3D11Device& device,ID3D11DeviceContext& context) {
 }
 void CheckHandoff(ID3D11Device& device,ID3D11DeviceContext& context,
                   NativeWindowPresenter& presenter) {
+  // Render targets come from the backend now; adopting this device keeps them
+  // usable by the direct D3D11 calls this check makes.
+  auto backend=AdoptNativeD3D11Backend(device,context);
+  Require(bool(backend),"adopted backend");
   NativeFrameHandoff handoff(device,context);
   static_assert(!std::is_copy_constructible_v<NativeFrameHandoff>);
   Require(!handoff.Visit({}),"empty handoff visited");

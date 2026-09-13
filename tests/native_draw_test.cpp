@@ -631,8 +631,8 @@ float4 LegacyPS(float2 uv : TEXCOORD0) : COLOR0 {
     }
     Require(has_texture && has_sampler, "legacy combined resource names");
     const auto combined_resource=combined.ResolveResource("combined");
-    Require(combined.TrySetTexture(combined_resource,view.Get()), "resolved legacy texture lookup");
-    Require(combined.TrySetSampler(combined_resource,sampler.Get()),"resolved legacy sampler lookup");
+    Require(combined.TrySetTexture(combined_resource,texture.backend), "resolved legacy texture lookup");
+    Require(combined.TrySetSampler(combined_resource,sampler),"resolved legacy sampler lookup");
     combined.Bind(*context.Get());
     const auto absent_resource=combined.ResolveResource("unusedShadow");
     Require(!combined.TrySetTexture(absent_resource,nullptr) && !combined.TrySetSampler(absent_resource,nullptr),
@@ -642,7 +642,8 @@ float4 LegacyPS(float2 uv : TEXCOORD0) : COLOR0 {
     combined.Bind(*context.Get()); // Skipping dead records must retain live bindings.
     context->PSGetShaderResources(reflected_texture.BindPoint,1,bound_texture.ReleaseAndGetAddressOf());
     context->PSGetSamplers(reflected_sampler.BindPoint,1,bound_sampler.ReleaseAndGetAddressOf());
-    Require(bound_texture.Get() == view.Get() && bound_sampler.Get() == sampler.Get(), "legacy native binding slots");
+    Require(bound_texture.Get() == NativeD3D11TextureView(*texture.backend) &&
+            bound_sampler.Get() == NativeD3D11SamplerState(*sampler), "legacy native binding slots");
     // A defined HDR scene can feed native post-processing without implying
     // complete gameplay coverage. Preserve the explicit resolve boundary.
     Effect scene_effect;
@@ -656,14 +657,14 @@ float4 ScenePS() : SV_TARGET { return sceneImage.Sample(sceneFilter,float2(.5,.5
     const float scene_first[]{.25f,.5f,.75f,1},scene_next[]{.75f,.25f,.5f,1};
     context->ClearRenderTargetView(scene.target.Get(),scene_first); scene.content_valid=true;
     ResolveNativeRenderTarget(*context.Get(),scene);
-    scene_ps.SetTexture("sceneImage",scene.sampled.view.Get());
-    scene_ps.SetSampler("sceneFilter",sampler.Get());
+    scene_ps.SetTexture("sceneImage",scene.sampled.backend);
+    scene_ps.SetSampler("sceneFilter",sampler);
     draw(scene_ps,{64,128,191,255});
     context->ClearRenderTargetView(scene.target.Get(),scene_next);
     draw(scene_ps,{64,128,191,255}); // No resolve: previous sampled contents.
     scene_ps.ClearTextures(); scene_ps.Bind(*context.Get());
     ResolveNativeRenderTarget(*context.Get(),scene);
-    scene_ps.SetTexture("sceneImage",scene.sampled.view.Get());
+    scene_ps.SetTexture("sceneImage",scene.sampled.backend);
     draw(scene_ps,{191,64,128,255});
     NativeCompletionQueue completion(*device.Get(),*context.Get(),2);
     Require(!completion.Poll() && !completion.pending(),"empty completion queue published a value");

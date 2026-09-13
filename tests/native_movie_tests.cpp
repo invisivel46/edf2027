@@ -27,6 +27,11 @@ int main() {
     // keeps them usable by the direct D3D11 calls the rest of this test makes.
     auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
     Require(bool(backend),"adopted backend");
+    // A frame stays open for the rest of this test. On the adopted D3D11
+    // backend the recorder issues straight to the immediate context, so an
+    // open frame is bookkeeping and the ordering against the direct calls
+    // below is unchanged.
+    backend->BeginFrame();
     const auto effect=MakeNativeMovieEffect();
     ShaderBindings vs(*device.Get(),CompileNativeShader(*device.Get(),effect,effect.entries[0],"movie.fx"));
     ShaderBindings ps(*device.Get(),CompileNativeShader(*device.Get(),effect,effect.entries[pixel_entry],"movie.fx"));
@@ -49,20 +54,19 @@ int main() {
       plan.SetConstants(vs,ps,registers,color);
     };
     update_constants();
-    std::array<ComPtr<ID3D11Texture2D>,3> planes;
-    std::array<ComPtr<ID3D11ShaderResourceView>,3> views;
-    D3D11_TEXTURE2D_DESC plane_desc{};
-    plane_desc.Width=plane_desc.Height=plane_desc.MipLevels=plane_desc.ArraySize=plane_desc.SampleDesc.Count=1;
-    plane_desc.Format=DXGI_FORMAT_R32_FLOAT; plane_desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    std::array<std::shared_ptr<NativeBackendTexture>,3> views;
+    NativeBackendTextureDesc plane_desc{};
+    plane_desc.width=plane_desc.height=plane_desc.levels=1;
+    plane_desc.format=DXGI_FORMAT_R32_FLOAT;
     for (size_t i=0;i<3;++i) {
-      Require(SUCCEEDED(device->CreateTexture2D(&plane_desc,nullptr,&planes[i])) &&
-              SUCCEEDED(device->CreateShaderResourceView(planes[i].Get(),nullptr,&views[i])),"movie plane creation");
+      views[i]=backend->CreateTexture(plane_desc,{});
+      Require(bool(views[i]),"movie plane creation");
     }
-    D3D11_SAMPLER_DESC sampler_desc{}; sampler_desc.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
-    sampler_desc.AddressU=sampler_desc.AddressV=sampler_desc.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
-    ComPtr<ID3D11SamplerState> sampler;
-    Require(SUCCEEDED(device->CreateSamplerState(&sampler_desc,&sampler)),"movie sampler creation");
-    for (size_t i=0;i<3;++i) { plan.SetTexture(ps,i,views[i].Get()); plan.SetSampler(ps,i,sampler.Get()); }
+    NativeBackendSamplerDesc sampler_desc{};
+    sampler_desc.min=sampler_desc.mag=sampler_desc.mip=NativeBackendFilter::Point;
+    sampler_desc.u=sampler_desc.v=sampler_desc.w=NativeBackendAddress::Clamp;
+    auto* sampler=&backend->CreateSampler(sampler_desc);
+    for (size_t i=0;i<3;++i) { plan.SetTexture(ps,i,views[i]); plan.SetSampler(ps,i,sampler); }
     auto target=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     auto* rtv=target.target.Get(); context->OMSetRenderTargets(1,&rtv,nullptr);
     CreateNativeRenderState(*device.Get(),{0x10001,0,0,0,15,0}).Bind(*context.Get());
@@ -73,7 +77,11 @@ int main() {
     std::vector<uint8_t> guest;
     for (float value:fan) { const auto word=std::bit_cast<uint32_t>(value); for(int b=24;b>=0;b-=8) guest.push_back(uint8_t(word>>b)); }
     auto draw=[&](std::array<float,3> yuv) {
-      for(size_t i=0;i<3;++i) context->UpdateSubresource(planes[i].Get(),0,nullptr,&yuv[i],4,0);
+      // Through the backend, whose UpdateTexture takes the whole top level -
+      // which for a 1x1 plane is this one value.
+      for(size_t i=0;i<3;++i)
+        backend->Recorder().UpdateTexture(*views[i],
+          {reinterpret_cast<const uint8_t*>(&yuv[i]),sizeof(float)});
       vs.Bind(*context.Get()); ps.Bind(*context.Get()); vertices.Draw(*context.Get(),guest);
       return ReadNativeColorPixel(*context.Get(),*target.surface.Get(),3,0);
     };
@@ -95,20 +103,18 @@ int main() {
     // interpolation that constant 1x1 inputs cannot expose.
     transform[3]=0; update_constants();
     ps.ClearTextures();
-    plane_desc.Width=4; plane_desc.Height=2;
+    plane_desc.width=4; plane_desc.height=2;
     const std::array<std::array<float,8>,3> pattern{{
       {.0625f,.25f,.5f,.75f, .875f,.625f,.375f,.125f},
       {.5f,.375f,.625f,.25f, .75f,.5f,.375f,.625f},
       {.5f,.625f,.375f,.75f, .25f,.375f,.625f,.5f}
     }};
     for(size_t i=0;i<3;++i) {
-      views[i].Reset(); planes[i].Reset();
-      D3D11_SUBRESOURCE_DATA initial{};
-      initial.pSysMem=pattern[i].data(); initial.SysMemPitch=4*sizeof(float);
-      Require(SUCCEEDED(device->CreateTexture2D(&plane_desc,&initial,&planes[i])) &&
-              SUCCEEDED(device->CreateShaderResourceView(planes[i].Get(),nullptr,&views[i])),"patterned movie plane creation");
-      plan.SetTexture(ps,i,views[i].Get());
-      plan.SetSampler(ps,i,sampler.Get());
+      views[i]=backend->CreateTexture(plane_desc,
+        {reinterpret_cast<const uint8_t*>(pattern[i].data()),pattern[i].size()*sizeof(float)});
+      Require(bool(views[i]),"patterned movie plane creation");
+      plan.SetTexture(ps,i,views[i]);
+      plan.SetSampler(ps,i,sampler);
     }
     vs.Bind(*context.Get()); ps.Bind(*context.Get());
     vertices.Draw(*context.Get(),guest);
@@ -134,10 +140,10 @@ int main() {
     registers[128]=0x3f;
     reject([&]{plan.SetConstants(vs,foreign_ps,registers,color);});
     Require(vs.ReadFloatVector("Params")==before,"invalid movie binding mutated vertex constants");
-    reject([&]{plan.SetTexture(ps,3,views[0].Get());});
-    reject([&]{plan.SetSampler(ps,SIZE_MAX,sampler.Get());});
-    reject([&]{plan.SetTexture(foreign_ps,0,views[0].Get());});
-    reject([&]{plan.SetSampler(foreign_ps,0,sampler.Get());});
+    reject([&]{plan.SetTexture(ps,3,views[0]);});
+    reject([&]{plan.SetSampler(ps,SIZE_MAX,sampler);});
+    reject([&]{plan.SetTexture(foreign_ps,0,views[0]);});
+    reject([&]{plan.SetSampler(foreign_ps,0,sampler);});
     std::cout<<"Native recovered XUI movie "<<(pixel_entry==1 ? "HD" : "SD")
              <<" transform, YUV planes, tint and alpha passed\n";
     }

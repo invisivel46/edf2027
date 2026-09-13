@@ -1,5 +1,6 @@
 #include "native_graphics/native_immediate_drawer.h"
 #include "native_graphics/d3d11_texture.h"
+#include "native_graphics/d3d11_backend.h"
 #include <array>
 #include <iostream>
 #include <stdexcept>
@@ -20,7 +21,11 @@ int main() {
     Require(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
       D3D11_SDK_VERSION,&device,nullptr,&context)),"SDK UI WARP device");
     NativeImmediateDrawer drawer(*device.Get(),*context.Get());
-    auto target=CreateNativeRenderTarget(*device.Get(),4,4,DXGI_FORMAT_R8G8B8A8_UNORM);
+    // Render targets come from the backend now; adopting this device keeps the
+    // target usable by the direct D3D11 calls this test makes.
+    auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
+    Require(bool(backend),"SDK UI adopted backend");
+    auto target=CreateNativeRenderTarget(*backend,4,4,DXGI_FORMAT_R8G8B8A8_UNORM);
     AppUIDrawContext ui_context(4,4);
     Reject([&]{drawer.Begin(ui_context,2,2);},"SDK UI accepted absent target");
     auto* rtv=target.target.Get(); context->OMSetRenderTargets(1,&rtv,nullptr);

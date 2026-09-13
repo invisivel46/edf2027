@@ -22,6 +22,10 @@ void Paint(HWND window,const edf::native::NativeHostSurface* host) {
 // recursive context access: closing during overlays must not reacquire it.
 namespace edf::native {
 bool VisitNativePresentationFrame(const NativeFrameHandoff::Consumer&) {return false;}
+// No bridge here, so no scene and no scene-shared frame. The host surface
+// must still work: this is the standalone-lifetime case the surface exists
+// to be testable in.
+bool VisitNativeSceneSharedFrame(NativeFrameHandoff::SharedFrame&,uint64_t&) {return false;}
 bool VisitNativePresentationContext(const std::function<void(ID3D11Device&,ID3D11DeviceContext&)>& visitor) {
   Require(context_depth==0,"reentrant presentation context access");
   ++context_depth;

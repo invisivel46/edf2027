@@ -60,18 +60,19 @@ int main() {
     vs.SetConstant("TextureOffset",Bytes(std::array<float,4>{0,0,0,0}));
     ps.SetConstant("ColorFactor",Bytes(std::array<float,4>{.5f,.25f,.75f,.5f}));
     const std::array<float,16> pixels{1,0,0,1, 0,1,0,.5f, 0,0,1,.25f, 1,1,1,0};
-    D3D11_TEXTURE2D_DESC desc{}; desc.Width=desc.Height=2;
-    desc.MipLevels=desc.ArraySize=desc.SampleDesc.Count=1;
-    desc.Format=DXGI_FORMAT_R32G32B32A32_FLOAT; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA initial{pixels.data(),32,0};
-    ComPtr<ID3D11Texture2D> texture; ComPtr<ID3D11ShaderResourceView> view;
-    Require(SUCCEEDED(device->CreateTexture2D(&desc,&initial,&texture)),"XUI texture");
-    Require(SUCCEEDED(device->CreateShaderResourceView(texture.Get(),nullptr,&view)),"XUI texture view");
-    D3D11_SAMPLER_DESC sd{}; sd.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
-    sd.AddressU=sd.AddressV=sd.AddressW=D3D11_TEXTURE_ADDRESS_WRAP;
-    ComPtr<ID3D11SamplerState> sampler;
-    Require(SUCCEEDED(device->CreateSamplerState(&sd,&sampler)),"XUI sampler");
-    ps.SetTexture("BrushTexture",view.Get()); ps.SetSampler("BrushSampler",sampler.Get());
+    // Through the backend, because that is what a material binding holds now.
+    NativeBackendTextureDesc texture_desc{};
+    texture_desc.width=texture_desc.height=2;
+    texture_desc.levels=1;
+    texture_desc.format=DXGI_FORMAT_R32G32B32A32_FLOAT;
+    std::shared_ptr<NativeBackendTexture> view=backend->CreateTexture(texture_desc,
+      {reinterpret_cast<const uint8_t*>(pixels.data()),pixels.size()*sizeof(pixels[0])});
+    Require(bool(view),"XUI texture");
+    NativeBackendSamplerDesc sampler_desc{};
+    sampler_desc.min=sampler_desc.mag=sampler_desc.mip=NativeBackendFilter::Point;
+    sampler_desc.u=sampler_desc.v=sampler_desc.w=NativeBackendAddress::Wrap;
+    auto* sampler=&backend->CreateSampler(sampler_desc);
+    ps.SetTexture("BrushTexture",view); ps.SetSampler("BrushSampler",sampler);
     auto target=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     auto* rtv=target.target.Get(); context->OMSetRenderTargets(1,&rtv,nullptr);
     const D3D11_VIEWPORT viewport{0,0,4,2,0,1}; context->RSSetViewports(1,&viewport);
@@ -204,12 +205,12 @@ int main() {
       Require(variant.ReadFloatVector("ColorFactor")==prior_factor,"rejected XUI pixel plan mutated constants");
       if(entry==2) {
         reject([&]{pixel_plan.SetConstants(variant,factor);});
-        reject([&]{pixel_plan.SetTexture(variant,view.Get());});
-        reject([&]{pixel_plan.SetSampler(variant,sampler.Get());});
+        reject([&]{pixel_plan.SetTexture(variant,view);});
+        reject([&]{pixel_plan.SetSampler(variant,sampler);});
       } else {
-        pixel_plan.SetTexture(variant,view.Get()); pixel_plan.SetSampler(variant,sampler.Get());
-        reject([&]{pixel_plan.SetTexture(ps,view.Get());});
-        reject([&]{pixel_plan.SetSampler(ps,sampler.Get());});
+        pixel_plan.SetTexture(variant,view); pixel_plan.SetSampler(variant,sampler);
+        reject([&]{pixel_plan.SetTexture(ps,view);});
+        reject([&]{pixel_plan.SetSampler(ps,sampler);});
       }
       context->ClearRenderTargetView(rtv,clear);
       vs.Bind(*context.Get()); variant.Bind(*context.Get()); vertices.Draw(*context.Get(),guest);
@@ -243,7 +244,7 @@ int main() {
     upload_font_register(font_vertex_registers,3,{.5f,-1,123,456});
     upload_font_register(font_vertex_registers,2,{-1,1,789,123});
     upload_font_register(font_vertex_registers,1,{.5f,.5f,456,789});
-    font_plan.SetTexture(font_ps,view.Get()); font_plan.SetSampler(font_ps,sampler.Get());
+    font_plan.SetTexture(font_ps,view); font_plan.SetSampler(font_ps,sampler);
     std::vector<uint8_t> glyph_data;
     for(float f:std::array<float,16>{0,0,0,0,4,0,2,0,4,2,2,2,0,2,0,2}) {
       const auto word=std::bit_cast<uint32_t>(f);
