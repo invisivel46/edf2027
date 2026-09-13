@@ -53,6 +53,41 @@ Of the 47 context methods, about ten are **getters** (`VSGetShader`,
 save and restore state around foreign work. See the state-ownership consequence
 below: they have no equivalent to port.
 
+## What the shaders actually bind
+
+`edf_native_shader_check <game> --slots` reports the widest slot any disc
+shader uses, across 44 effects / 130 shader entries. A D3D12 root signature is
+fixed at creation, so it has to be sized from this rather than from the API
+maximum:
+
+| | used | D3D11 maximum |
+|---|---|---|
+| PS constant buffers | 1 | 14 |
+| PS textures | 7 | 128 |
+| PS samplers | 7 | 16 |
+| VS constant buffers | 2 | 14 |
+| VS textures / samplers | none | - |
+| widest constant buffer | 3,824 bytes (`m_Water01_DNDNAC.dxsl:PS_Main`) | - |
+| vertex input elements | 9 (`c_Mech01.dxsl:VS_Blend`) | 32 |
+
+This is small enough to change the design rather than merely inform it. The
+three constant buffers can be **root CBVs** - a GPU virtual address written
+straight into the root arguments, with no descriptor heap traffic at all. At
+44,917 activations a second that removes the single highest-frequency piece of
+descriptor work in the frame, which is the opposite of what consequence 4
+assumed when it said this path was the most likely place to get lifetime wrong.
+The lifetime problem stays (the memory is still fenced ring memory); the
+descriptor problem disappears.
+
+Textures still need a descriptor table, because a root SRV can only address a
+buffer. Seven per draw, from a per-frame descriptor ring.
+
+Caveat on record: these are the **disc** shaders. The renderer also compiles
+its own HLSL for UI, font, movie and post, which this tool does not enumerate.
+The root signature is therefore sized from evidence but **verified against
+reflection at pipeline creation**, so a shader that needs more fails loudly
+instead of silently losing a binding.
+
 ## Five consequences that decide the design
 
 **1. There is no device state to query, so we must own it.**
