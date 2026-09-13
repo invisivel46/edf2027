@@ -74,6 +74,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     fsr_sharp_ = static_cast<float>(GetDouble("present_fsr_sharpness_reduction", 0.2));
     fsr_passes_ = FsrPassesValue(GetInt("present_fsr_max_upsampling_passes", 4));
     dither_ = GetBool("present_dither", false);
+    backend_index_ = BackendIndex(GetStr("edf_native_backend", ""));
+    backend_preview_ = backend_index_ > 0 && GetBool("edf_native_backend_preview", false);
     async_shaders_ = GetBool("async_shader_compilation", true);
     int refresh = static_cast<int>(GetDouble("video_mode_refresh_rate", 60));
     for (int i = 0; i < 4; ++i) if (refresh == kRefresh[i]) refresh_index_ = i;
@@ -118,6 +120,39 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     std::string labels; for (auto& p : kPresets) { labels += p.name; labels.push_back('\0'); }
     if (ImGui::Combo("Window size *", &res_index_, labels.c_str())) restart_ = true;
     if (res_index_ == (int)kPresets.size() - 1) { ImGui::InputInt("Width", &custom_w_); ImGui::InputInt("Height", &custom_h_); }
+    if (ImGui::Combo("Graphics backend *", &backend_index_,
+                     "Direct3D 11 (default)\0" "Direct3D 11 backend\0" "Direct3D 12 backend\0")) {
+      rex::cvar::SetFlagByName("edf_native_backend", std::string(BackendValue(backend_index_)));
+      if (backend_index_ == 0) {
+        // The preview window has nothing to draw it without a backend, and
+        // leaving the flag set would refuse to start next time.
+        backend_preview_ = false;
+        rex::cvar::SetFlagByName("edf_native_backend_preview", "false");
+      }
+      restart_ = true;
+    }
+    ImGui::SameLine(); HelpMarker(
+      "The renderer is being moved onto a backend interface so a second one can be used. "
+      "Direct3D 11 (default) is the renderer as it has always been. The two backend options "
+      "create that backend at startup and report it in the log. The game's own window is still "
+      "drawn by the direct Direct3D 11 path either way - selecting Direct3D 12 does not move it "
+      "yet. Save and restart to apply.");
+    if (backend_index_ > 0) {
+      if (ImGui::Checkbox("Backend preview window *", &backend_preview_)) {
+        rex::cvar::SetFlagByName("edf_native_backend_preview", backend_preview_ ? "true" : "false");
+        // The preview draws the frames the renderer publishes, so it cannot
+        // work without them. Turning it on here rather than refusing to start
+        // later is the only version of this that is not a trap.
+        if (backend_preview_) rex::cvar::SetFlagByName("edf_native_publish_frames", "true");
+        restart_ = true;
+      }
+      ImGui::SameLine(); HelpMarker(
+        "Opens a second window whose every pixel is drawn and presented by the selected backend, "
+        "showing the frames the renderer publishes. It is how the backend can be seen working "
+        "before the game's own window moves onto it. Costs a copy of each frame through system "
+        "memory, so it is slower than the game's own window and is not meant to replace it. "
+        "Also enables frame publishing.");
+    }
     ImGui::TextDisabled("Renderer: native Direct3D 11");
     std::string render_labels; for(const auto& p:kRenderPresets) { render_labels+=p.name; render_labels.push_back('\0'); }
     if(ImGui::Combo("Render resolution *",&render_index_,render_labels.c_str())) {
@@ -421,6 +456,18 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
 
   std::filesystem::path config_path_; std::string pad_name_; std::function<void()> on_close_;
   std::function<bool()> on_restart_;
+  static std::string_view BackendValue(int index) {
+    return index == 1 ? "d3d11" : index == 2 ? "d3d12" : "";
+  }
+  static int BackendIndex(const std::string& value) {
+    // Unknown values read as the default rather than being invented into a
+    // menu position, so a hand-edited config cannot make the menu lie about
+    // what the game will start with.
+    return value == "d3d11" ? 1 : value == "d3d12" ? 2 : 0;
+  }
+
+  int backend_index_ = 0;
+  bool backend_preview_ = false;
   int display_mode_ = 0, res_index_ = 0, custom_w_ = 1280, custom_h_ = 720, fps_cap_index_ = 0;
   int render_index_=0,render_w_=0,render_h_=0;
   bool vsync_ = true, mute_ = false, mnk_ = false, mnk_mouse_ = true, rumble_ = true;
