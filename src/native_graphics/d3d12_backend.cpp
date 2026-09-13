@@ -699,9 +699,9 @@ class D3D12Backend final : public NativeRenderBackend {
     description.MipLevels=static_cast<UINT16>(desc.levels?desc.levels:1);
     description.Format=static_cast<DXGI_FORMAT>(desc.format);
     description.SampleDesc={1,0};
-    Require(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
-                                                   tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
-            "texture creation");
+    RequireDevice(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
+                                                        tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
+                  "texture creation");
     const auto view=texture_views_.Allocate();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
     srv.Format=description.Format;
@@ -1113,6 +1113,16 @@ class D3D12Backend final : public NativeRenderBackend {
   // Why the device went away, in words. DXGI_ERROR_DEVICE_REMOVED on its own
   // says only that something the GPU was asked to do was fatal; the reason
   // separates "this process did something invalid" from "the driver reset".
+  // Like Require, but says why the device went away when that is what
+  // happened. A bare 0x887a0005 on a resource creation tells you the device is
+  // gone and nothing about what killed it, which is the wrong end of a hang to
+  // start from.
+  void RequireDevice(HRESULT result, const char* what) {
+    if(SUCCEEDED(result)) return;
+    if(result==DXGI_ERROR_DEVICE_REMOVED || result==DXGI_ERROR_DEVICE_RESET)
+      throw std::runtime_error(std::string("D3D12 ")+what+" failed: the device was removed - "+RemovedReason());
+    Require(result,what);
+  }
   const char* RemovedReason() {
     switch(gpu_.device()->GetDeviceRemovedReason()) {
       case DXGI_ERROR_DEVICE_HUNG: return "the GPU hung on this device's own work";

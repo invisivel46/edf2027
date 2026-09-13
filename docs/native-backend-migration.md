@@ -768,22 +768,43 @@ the seam cannot express, and one it never needed: the kernel read its source at
 the dispatch coordinate and wrote the result, which is a full-screen draw
 reading its own pixel coordinate. The arithmetic is unchanged.
 
+### Presentation, and a misattribution worth recording
+
+The scene's finished frame used to reach the window only as an
+`ID3D11Texture2D` handed to `NativeFrameHandoff`. The seam could *consume* a
+shared surface - `OpenSharedTexture` and `WaitSharedFence` are how the D3D12
+preview samples a D3D11 frame - but not produce one, so a scene on one backend
+could not reach a window on another. `CreateSharedSurface`, `CopyToShared` and
+`SignalShared` are the mirror image, on both backends, and the bridge now
+publishes by whichever route the scene can take. That route gives up the
+compositor's display gamma, which is a visible difference rather than an
+oversight.
+
+**The stall was not presentation.** It was recorded here as "no frame is ever
+published, probably", and that was wrong twice over. The first wrong turn was
+blaming the presenting device: the removal reason, once it was printed in words
+instead of as `0x887a0005`, said *the GPU hung on this device's own work*, and
+the device it said it about was the scene's. The second was measuring with
+`--edf_native_backend_present=false` to "isolate" the renderer - which is the
+1.2 fps path this document already measured a hundred pages up. Every isolation
+run was crippled by the flag chosen to isolate it, and the 1 fps that seemed to
+indict D3D12 reproduced exactly on D3D11.
+
+**One real cause found and fixed.** A D3D12 resource created with initial
+contents is staged until the next frame opens, because there is no command list
+to copy with before then - and the staging list held a raw pointer to a resource
+the *caller* owns. This renderer destroys textures during loading every time the
+guest reuses a handle. The next frame then read a freed object and copied its
+contents into the command list: not a crash, a GPU hang, seconds later, with
+nothing pointing back at it.
+
 ### What is left
 
-**Presentation.** The scene's finished frame reaches the window as an
-`ID3D11Texture2D` handed to `NativeFrameHandoff`, which is D3D11 throughout. A
-D3D12 scene has no such texture, so nothing reaches the screen. The observed
-behaviour is that the run then reaches about 1.5 fps and stops advancing; the
-stall has not been attributed yet, and "no frame is ever published" is the
-obvious suspect rather than a finding.
-
-The mechanism to fix the handoff already exists and is already proven -
-`OpenSharedTexture` and `WaitSharedFence` on the seam, which is how the D3D12
-preview window samples a D3D11 frame today - but the handoff itself has to be
-written against the seam rather than against a device.
-
-That is the last structural piece. Until it lands, `--edf_native_scene_backend`
-stays `d3d11`, which is what the cvar has said since it was added.
+The scene's D3D12 device still hangs during loading. It is now a named failure
+on a known device rather than a hex code from an unknown one, and one of its
+causes is gone, but it is not the only one. Until that is found,
+`--edf_native_scene_backend` stays `d3d11`, which is what the cvar has said
+since it was added.
 
 **Diagnostics that are D3D11 by nature** - the HDR range and BMP captures, the
 depth inspection, the stream-output clip-position replay, the occlusion
