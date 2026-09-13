@@ -1,0 +1,213 @@
+#include "d3d12_device.h"
+#include <windows.h>
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+
+using Microsoft::WRL::ComPtr;
+
+namespace edf::native {
+namespace {
+void Require(HRESULT result, const char* what) {
+  if(SUCCEEDED(result)) return;
+  char code[16];
+  std::snprintf(code,sizeof(code),"0x%08lx",static_cast<unsigned long>(result));
+  throw std::runtime_error(std::string("D3D12 ")+what+" failed: "+code);
+}
+std::string Narrow(const wchar_t* wide) {
+  if(!wide) return {};
+  const int bytes=WideCharToMultiByte(CP_UTF8,0,wide,-1,nullptr,0,nullptr,nullptr);
+  if(bytes<=1) return {};
+  std::string narrow(static_cast<size_t>(bytes-1),'\0');
+  WideCharToMultiByte(CP_UTF8,0,wide,-1,narrow.data(),bytes,nullptr,nullptr);
+  return narrow;
+}
+}  // namespace
+
+NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options)
+    : ring_(options.upload_bytes) {
+  if(!options.frames_in_flight)
+    throw std::runtime_error("D3D12 needs at least one frame in flight");
+
+  // The debug layer has to be enabled before the device exists, and it is the
+  // only thing that will tell us about a missing barrier - the failure mode
+  // this migration is most exposed to, because it is silent on the hardware
+  // that happens to tolerate it.
+  if(options.debug_layer) {
+    ComPtr<ID3D12Debug> debug;
+    if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
+      debug->EnableDebugLayer();
+      debug_layer_active_=true;
+    }
+  }
+
+  UINT factory_flags=0;
+  if(options.debug_layer) factory_flags|=DXGI_CREATE_FACTORY_DEBUG;
+  Require(CreateDXGIFactory2(factory_flags,IID_PPV_ARGS(&factory_)),"factory creation");
+
+  ComPtr<IDXGIAdapter1> adapter;
+  if(options.prefer_warp) {
+    Require(factory_->EnumWarpAdapter(IID_PPV_ARGS(&adapter)),"WARP adapter enumeration");
+    Require(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device_)),
+            "WARP device creation");
+    is_warp_=true;
+  } else {
+    // Take the first adapter that actually creates a device rather than the
+    // first that enumerates: a machine can list an adapter whose driver cannot
+    // serve D3D12, and silently landing on WARP would look like a catastrophic
+    // performance regression with no explanation.
+    for(UINT index=0;factory_->EnumAdapters1(index,adapter.ReleaseAndGetAddressOf())!=DXGI_ERROR_NOT_FOUND;++index) {
+      DXGI_ADAPTER_DESC1 description{};
+      if(FAILED(adapter->GetDesc1(&description))) continue;
+      if(description.Flags&DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+      if(SUCCEEDED(D3D12CreateDevice(adapter.Get(),D3D_FEATURE_LEVEL_11_0,IID_PPV_ARGS(&device_)))) break;
+      device_.Reset();
+    }
+    if(!device_) throw std::runtime_error("no D3D12 adapter could create a feature level 11_0 device");
+  }
+  if(adapter) {
+    DXGI_ADAPTER_DESC1 description{};
+    if(SUCCEEDED(adapter->GetDesc1(&description))) adapter_name_=Narrow(description.Description);
+  }
+
+  // Only errors and corruption. Warnings on WARP are noisy about things that
+  // are not defects, and a check nobody trusts is a check nobody reads.
+  if(debug_layer_active_ && SUCCEEDED(device_.As(&messages_))) {
+    D3D12_MESSAGE_SEVERITY severities[]={D3D12_MESSAGE_SEVERITY_CORRUPTION,D3D12_MESSAGE_SEVERITY_ERROR};
+    D3D12_INFO_QUEUE_FILTER filter{};
+    filter.AllowList.NumSeverities=2;
+    filter.AllowList.pSeverityList=severities;
+    messages_->PushRetrievalFilter(&filter);
+  }
+
+  const D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT,0,
+                                            D3D12_COMMAND_QUEUE_FLAG_NONE,0};
+  Require(device_->CreateCommandQueue(&queue_desc,IID_PPV_ARGS(&queue_)),"command queue creation");
+  Require(device_->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&fence_)),"fence creation");
+  fence_event_=CreateEventW(nullptr,FALSE,FALSE,nullptr);
+  if(!fence_event_) throw std::runtime_error("D3D12 fence event creation failed");
+
+  frames_.resize(options.frames_in_flight);
+  for(auto& frame:frames_)
+    Require(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&frame.allocator)),
+            "command allocator creation");
+  Require(device_->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,frames_.front().allocator.Get(),
+                                     nullptr,IID_PPV_ARGS(&commands_)),"command list creation");
+  // Created open; every frame opens it itself.
+  Require(commands_->Close(),"command list close");
+
+  const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                   D3D12_MEMORY_POOL_UNKNOWN,0,0};
+  const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER,0,options.upload_bytes,1,1,1,
+                                 DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                 D3D12_RESOURCE_FLAG_NONE};
+  Require(device_->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
+                                           D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,
+                                           IID_PPV_ARGS(&upload_)),"upload buffer creation");
+  // Mapped once for the life of the device. Mapping per use would cost more
+  // than the copy at this traffic, and an upload heap is CPU-visible anyway.
+  const D3D12_RANGE no_read{0,0};
+  void* mapped=nullptr;
+  Require(upload_->Map(0,&no_read,&mapped),"upload buffer map");
+  upload_cpu_=static_cast<uint8_t*>(mapped);
+  upload_gpu_=upload_->GetGPUVirtualAddress();
+}
+
+NativeD3D12Device::~NativeD3D12Device() {
+  // The GPU must not be reading memory we are about to unmap and free. A
+  // destructor is the one place this is easy to forget and impossible to debug.
+  try { WaitIdle(); } catch(...) {}
+  if(upload_) { const D3D12_RANGE none{0,0}; upload_->Unmap(0,&none); }
+  if(fence_event_) CloseHandle(fence_event_);
+}
+
+void NativeD3D12Device::WaitForFence(uint64_t value) {
+  if(!value || fence_->GetCompletedValue()>=value) return;
+  Require(fence_->SetEventOnCompletion(value,fence_event_),"fence event registration");
+  WaitForSingleObject(fence_event_,INFINITE);
+}
+
+ID3D12GraphicsCommandList* NativeD3D12Device::BeginFrame() {
+  if(open_) throw std::runtime_error("D3D12 frame already open");
+  open_frame_=static_cast<uint32_t>(frame_counter_%frames_.size());
+  auto& frame=frames_[open_frame_];
+  // This slot's previous frame must be off the GPU before its allocator is
+  // reset: resetting an allocator whose commands are still executing is
+  // undefined, and it is the classic way a D3D12 port crashes only under load.
+  WaitForFence(frame.fence);
+  ring_.Retire(fence_->GetCompletedValue());
+  Require(frame.allocator->Reset(),"command allocator reset");
+  Require(commands_->Reset(frame.allocator.Get(),nullptr),"command list reset");
+  ring_.BeginFrame(++next_fence_);
+  open_=true;
+  return commands_.Get();
+}
+
+void NativeD3D12Device::EndFrame() {
+  if(!open_) throw std::runtime_error("D3D12 has no open frame");
+  Require(commands_->Close(),"command list close");
+  ID3D12CommandList* lists[]={commands_.Get()};
+  queue_->ExecuteCommandLists(1,lists);
+  // The fence value the ring already recorded for this frame, so the memory it
+  // handed out is freed by exactly the signal that proves the GPU is done.
+  Require(queue_->Signal(fence_.Get(),next_fence_),"queue signal");
+  frames_[open_frame_].fence=next_fence_;
+  ring_.EndFrame();
+  ++frame_counter_;
+  open_=false;
+}
+
+void NativeD3D12Device::WaitIdle() {
+  if(!queue_||!fence_) return;
+  Require(queue_->Signal(fence_.Get(),++next_fence_),"queue signal");
+  WaitForFence(next_fence_);
+  ring_.Retire(fence_->GetCompletedValue());
+}
+
+std::vector<std::string> NativeD3D12Device::DrainValidationErrors() {
+  std::vector<std::string> found;
+  if(!messages_) return found;
+  const UINT64 count=messages_->GetNumStoredMessagesAllowedByRetrievalFilter();
+  for(UINT64 index=0;index<count;++index) {
+    SIZE_T bytes=0;
+    if(FAILED(messages_->GetMessage(index,nullptr,&bytes))||!bytes) continue;
+    std::vector<uint8_t> storage(bytes);
+    auto* message=reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+    if(FAILED(messages_->GetMessage(index,message,&bytes))) continue;
+    found.emplace_back(message->pDescription,message->DescriptionByteLength?message->DescriptionByteLength-1:0);
+  }
+  messages_->ClearStoredMessages();
+  return found;
+}
+
+NativeD3D12Device::Upload NativeD3D12Device::Allocate(uint64_t bytes, uint64_t alignment) {
+  auto allocation=ring_.Allocate(bytes,alignment);
+  if(allocation.status==NativeUploadRing::Status::Full) {
+    // Give the GPU a chance to release a frame, then try again. Waiting on the
+    // oldest in-flight frame is the smallest wait that can possibly help.
+    ++upload_stalls_;
+    uint64_t oldest=0;
+    for(const auto& frame:frames_)
+      if(frame.fence && (!oldest||frame.fence<oldest) && frame.fence>fence_->GetCompletedValue())
+        oldest=frame.fence;
+    if(oldest) {
+      WaitForFence(oldest);
+      ring_.Retire(fence_->GetCompletedValue());
+      allocation=ring_.Allocate(bytes,alignment);
+    }
+  }
+  if(allocation.status==NativeUploadRing::Status::TooLarge)
+    throw std::runtime_error("D3D12 upload of "+std::to_string(bytes)+
+                             " bytes exceeds the whole upload ring of "+
+                             std::to_string(ring_.capacity())+" bytes");
+  if(allocation.status!=NativeUploadRing::Status::Ok)
+    // Every frame in flight has been waited on and it still does not fit, so a
+    // single frame needs more upload memory than the ring holds. Say that,
+    // rather than stalling forever on a fence that cannot help.
+    throw std::runtime_error("D3D12 upload ring of "+std::to_string(ring_.capacity())+
+                             " bytes cannot satisfy one frame; high water "+
+                             std::to_string(ring_.high_water())+" bytes");
+  const uint64_t offset=allocation.offset%ring_.capacity();
+  return {upload_cpu_+offset,upload_gpu_+offset,upload_.Get(),offset};
+}
+}  // namespace edf::native
