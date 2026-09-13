@@ -798,11 +798,37 @@ guest reuses a handle. The next frame then read a freed object and copied its
 contents into the command list: not a crash, a GPU hang, seconds later, with
 nothing pointing back at it.
 
+### Three hangs, and how each was found
+
+None of them were found by reading the code, and all three were the same shape:
+a D3D12 object holding something it did not own, or being handed something that
+was not there yet.
+
+| what held what | how it presented | what found it |
+|---|---|---|
+| the staged-upload list kept a raw pointer to a resource the caller owns, and this renderer destroys textures whenever the guest reuses a handle | `DEVICE_HUNG`, seconds later, nothing in the log | printing the removal reason in words instead of `0x887a0005`, which said *which device* |
+| the recorder kept a raw pointer to every bound texture, across draws, and only rewrote the table when something marked it dirty | the same | a bisect: the same 75 textures with `--edf_native_seam_draws=false` do not remove the device, so it was the draws and not the uploads |
+| the window took the *composited* frame for the scene's own, presented it directly, and never ran the composite that fills it | the presenting device hung on the **default** path | a bisect after a run meant only to confirm the default path failed: clean at the commit before, failing at the commit after, still failing after a full clean rebuild |
+
+The third was mine, introduced while fixing the first two, and it broke the
+configuration everybody actually uses. It is also the one I had already
+declared safe.
+
+What made the first two findable at all was giving the failures something to
+say. A hung GPU used to present as a frozen process: the fence wait was
+`INFINITE`, so the process stopped with no message and no clue which of a
+hundred changes did it. It has a ten-second deadline now and reports the
+device's removal reason, and the debug layer - with GPU-based validation, which
+is the half that catches what a *shader* did rather than what the API was
+asked - can be turned on for the hardware device instead of only for WARP.
+
 ### What is left
 
-The scene's D3D12 device still hangs during loading. It is now a named failure
-on a known device rather than a hex code from an unknown one, and one of its
-causes is gone, but it is not the only one. Until that is found,
+The scene on D3D12 hangs the GPU at the first recorded XUI draw, reproducibly,
+at the same texture load every run. The same draw path on the adopted D3D11
+backend runs a full mission, so it is not the wiring: it is something
+D3D12-specific in that draw. That is one defect, precisely located, and it is
+all that stands between here and the flip. Until it is found,
 `--edf_native_scene_backend` stays `d3d11`, which is what the cvar has said
 since it was added.
 
