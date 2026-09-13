@@ -1,4 +1,5 @@
 #include "d3d11_quads.h"
+#include "native_dxgi_format.h"
 #include "native_guest_vertex_stream.h"
 #include <cstring>
 #include <bit>
@@ -45,6 +46,34 @@ void PositionTriangleStream::Draw(ID3D11DeviceContext& context,std::span<const u
   context.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   context.Draw(bytes/8,0);
 }
+std::span<const NativeBackendInputElement> PositionTriangleStream::Layout() {
+  static const NativeBackendInputElement elements[]{
+    {"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,false,0}};
+  return elements;
+}
+void PositionTriangleStream::Upload(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
+                                    std::span<const uint8_t> host) {
+  if(host.size()>capacity_ || !backend_vertices_) {
+    NativeBackendBufferDesc desc{};
+    desc.bytes=host.size(); desc.vertex=true; desc.dynamic=true;
+    backend_vertices_=backend.CreateBuffer(desc,host);
+    if(!backend_vertices_) throw std::runtime_error("position triangle buffer creation failed");
+    capacity_=static_cast<UINT>(host.size());
+    staging_.assign(host.begin(),host.end());
+    return;
+  }
+  staging_.assign(capacity_,0);
+  std::memcpy(staging_.data(),host.data(),host.size());
+  recorder.UpdateBuffer(*backend_vertices_,0,staging_);
+}
+void PositionTriangleStream::Draw(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
+                                  std::span<const uint8_t> guest) {
+  const auto host=ConvertGuestPositionTriangles(guest);
+  Upload(backend,recorder,host);
+  recorder.SetVertexBuffer(0,*backend_vertices_,8,0);
+  recorder.SetTopology(NativeBackendTopology::TriangleList);
+  recorder.Draw(static_cast<uint32_t>(host.size()/8),0);
+}
 bool CanInitializeReductionTarget(const NativeShader& vertex,const NativeShader& pixel,
   std::span<const uint8_t> guest,const NativeViewportState& viewport,
   const RenderStateWords& state,uint32_t width,uint32_t height,bool inputs_bound) {
@@ -90,6 +119,43 @@ void QuadStream::Draw(ID3D11DeviceContext& context, std::span<const uint8_t> gue
 }
 void QuadStream::DrawTriangleStrip(ID3D11DeviceContext& context,std::span<const uint8_t> guest) {
   DrawStream(context,guest,true);
+}
+std::span<const NativeBackendInputElement> QuadStream::Layout() {
+  static const NativeBackendInputElement elements[]{
+    {"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,false,0},
+    {"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,8,false,0}};
+  return elements;
+}
+void QuadStream::Upload(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
+                        std::span<const uint8_t> host) {
+  if(host.size()>capacity_ || !backend_vertices_) {
+    NativeBackendBufferDesc desc{};
+    desc.bytes=host.size(); desc.vertex=true; desc.dynamic=true;
+    backend_vertices_=backend.CreateBuffer(desc,host);
+    if(!backend_vertices_) throw std::runtime_error("native quad vertex buffer creation failed");
+    capacity_=static_cast<UINT>(host.size());
+    staging_.assign(host.begin(),host.end());
+    return;
+  }
+  staging_.assign(capacity_,0);
+  std::memcpy(staging_.data(),host.data(),host.size());
+  recorder.UpdateBuffer(*backend_vertices_,0,staging_);
+}
+void QuadStream::Draw(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
+                      std::span<const uint8_t> guest) {
+  DrawStream(backend,recorder,guest,false);
+}
+void QuadStream::DrawTriangleStrip(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
+                                   std::span<const uint8_t> guest) {
+  DrawStream(backend,recorder,guest,true);
+}
+void QuadStream::DrawStream(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
+                            std::span<const uint8_t> guest,bool strip) {
+  const auto host=ConvertGuestQuads(guest,strip);
+  Upload(backend,recorder,host);
+  recorder.SetVertexBuffer(0,*backend_vertices_,16,0);
+  recorder.SetTopology(strip?NativeBackendTopology::TriangleStrip:NativeBackendTopology::TriangleList);
+  recorder.Draw(static_cast<uint32_t>(host.size()/16),0);
 }
 void QuadStream::DrawStream(ID3D11DeviceContext& context,std::span<const uint8_t> guest,bool strip) {
   const auto host = ConvertGuestQuads(guest,strip);

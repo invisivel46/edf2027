@@ -1286,6 +1286,74 @@ ActiveTargets ActiveTargetsLocked(Bridge& state) {
   result.width=target.sampled.width; result.height=target.sampled.height;
   return result;
 }
+// Everything a recorded draw needs before its geometry.
+//
+// The D3D11 paths spell this out as four separate bindings - target, render
+// state, viewport, shader pair - because D3D11 keeps those apart. One pipeline
+// carries most of it here, and the rest is recorder state, so every draw path
+// that used those four calls uses this one instead. Written once because five
+// paths need it and five copies would drift.
+struct RecordedDraw {
+  ShaderBindings& vertex;
+  ShaderBindings& pixel;
+  const NativeViewportState& viewport;
+  const RenderStateWords& state;
+  std::span<const edf::native::NativeBackendInputElement> layout;
+  uint64_t layout_id=0;
+  // The guest handles, plus whatever else makes two compiled shaders under one
+  // handle different - the reversed-depth variant being the one that does.
+  uint64_t vertex_id=0,pixel_id=0;
+  edf::native::NativeBackendTopology topology=edf::native::NativeBackendTopology::TriangleList;
+};
+template <typename Reader>
+edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& reader,
+                                                    uint32_t device,const RecordedDraw& draw) {
+  auto& backend=EnsureSceneBackendLocked(state);
+  auto& recorder=SceneRecorderLocked(state);
+  const auto targets=ActiveTargetsLocked(state);
+  if(!targets.count) throw std::runtime_error("a recorded draw has no colour target to record into");
+  recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
+  recorder.SetViewport({draw.viewport.viewport.TopLeftX,draw.viewport.viewport.TopLeftY,
+                        draw.viewport.viewport.Width,draw.viewport.viewport.Height,
+                        draw.viewport.viewport.MinDepth,draw.viewport.viewport.MaxDepth});
+  recorder.SetScissor({draw.viewport.scissor.left,draw.viewport.scissor.top,
+                       draw.viewport.scissor.right,draw.viewport.scissor.bottom},draw.state[5]!=0);
+  // Pixel-stage resources only, which is what every shader in this game and
+  // this renderer uses. A vertex shader that sampled something would have it
+  // silently unbound, so it is refused instead: no backend root signature
+  // declares vertex-stage textures, and this is where that would be noticed.
+  if(!draw.vertex.TextureImages().empty() || !draw.vertex.SamplerImages().empty())
+    throw std::runtime_error("a vertex shader with textures or samplers cannot be recorded: "
+                             "no backend root signature declares them");
+  edf::native::NativeBackendPipelineDesc desc{};
+  auto* vertex_code=draw.vertex.shader().bytecode.Get();
+  auto* pixel_code=draw.pixel.shader().bytecode.Get();
+  desc.vertex={static_cast<const uint8_t*>(vertex_code->GetBufferPointer()),vertex_code->GetBufferSize()};
+  desc.pixel={static_cast<const uint8_t*>(pixel_code->GetBufferPointer()),pixel_code->GetBufferSize()};
+  desc.vertex_id=draw.vertex_id;
+  desc.pixel_id=draw.pixel_id;
+  desc.input_layout=draw.layout;
+  desc.input_layout_id=draw.layout_id;
+  desc.state=draw.state;
+  desc.topology=draw.topology;
+  desc.render_targets=targets.count;
+  desc.rtv_format=targets.rtv_format;
+  desc.dsv_format=targets.dsv_format;
+  desc.sample_count=targets.samples;
+  auto& pipeline=backend.CreatePipeline(desc);
+  recorder.SetPipeline(pipeline);
+  if(DecodeNativeRenderState(draw.state).requires_blend_factor)
+    recorder.SetBlendFactor(GuestBlendFactorForDraw(reader,device));
+  for(const auto& image:draw.vertex.ConstantImages())
+    recorder.SetConstants(edf::native::NativeBackendStage::Vertex,image.slot,image.bytes);
+  for(const auto& image:draw.pixel.ConstantImages())
+    recorder.SetConstants(edf::native::NativeBackendStage::Pixel,image.slot,image.bytes);
+  for(const auto& image:draw.pixel.TextureImages())
+    recorder.SetTexture(edf::native::NativeBackendStage::Pixel,image.slot,image.texture);
+  for(const auto& image:draw.pixel.SamplerImages())
+    recorder.SetSampler(edf::native::NativeBackendStage::Pixel,image.slot,image.sampler);
+  return recorder;
+}
 void BindActiveTarget(Bridge& state) {
   ++state.bind_generation;
   const auto found = state.render_targets.find(state.active_target);
@@ -5173,54 +5241,11 @@ REX_HOOK_RAW(sub_821FE358) {
           }
           try {
             if(seam_draws) {
-              auto& recorder=edf::native::SceneRecorderLocked(state);
-              const auto targets=edf::native::ActiveTargetsLocked(state);
-              if(!targets.count)
-                throw std::runtime_error("an indexed draw has no colour target to record into");
-              recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
-              recorder.SetViewport({viewport.viewport.TopLeftX,viewport.viewport.TopLeftY,
-                                    viewport.viewport.Width,viewport.viewport.Height,
-                                    viewport.viewport.MinDepth,viewport.viewport.MaxDepth});
-              recorder.SetScissor({viewport.scissor.left,viewport.scissor.top,
-                                   viewport.scissor.right,viewport.scissor.bottom},key[5]!=0);
-              auto& ps=*state.shaders.at(state.linked_pixel).bindings;
-              edf::native::NativeBackendPipelineDesc desc{};
-              auto* vs_code=bindings.shader().bytecode.Get();
-              auto* ps_code=ps.shader().bytecode.Get();
-              desc.vertex={static_cast<const uint8_t*>(vs_code->GetBufferPointer()),vs_code->GetBufferSize()};
-              desc.pixel={static_cast<const uint8_t*>(ps_code->GetBufferPointer()),ps_code->GetBufferSize()};
-              // The reversed-depth variant is a different compiled shader under
-              // the same guest handle, so it has to be part of the identity or
-              // the cache hands back the wrong one.
-              desc.vertex_id=(uint64_t(state.active_vertex)<<1)|uint64_t(viewport.reverse_depth?1:0);
-              desc.pixel_id=state.linked_pixel;
-              desc.input_layout=mesh.input_layout().elements();
-              desc.input_layout_id=mesh.input_layout().fingerprint();
-              desc.state=key;
-              desc.topology=edf::native::NativeBackendTopology::TriangleList;
-              desc.render_targets=targets.count;
-              desc.rtv_format=targets.rtv_format;
-              desc.dsv_format=targets.dsv_format;
-              desc.sample_count=targets.samples;
-              recorder.SetPipeline(edf::native::EnsureSceneBackendLocked(state).CreatePipeline(desc));
-              if(found->second.requires_blend_factor)
-                recorder.SetBlendFactor(edf::native::GuestBlendFactorForDraw(reader,ctx.r3.u32));
-              for(const auto& image:bindings.ConstantImages())
-                recorder.SetConstants(edf::native::NativeBackendStage::Vertex,image.slot,image.bytes);
-              for(const auto& image:ps.ConstantImages())
-                recorder.SetConstants(edf::native::NativeBackendStage::Pixel,image.slot,image.bytes);
-              // Pixel-stage only, which is what every shader in this game and
-              // this renderer uses. A vertex shader that sampled something
-              // would have it silently unbound here, so say so instead: the
-              // backends refuse vertex-stage textures outright and this is
-              // where that would first be noticed.
-              if(!bindings.TextureImages().empty() || !bindings.SamplerImages().empty())
-                throw std::runtime_error("a vertex shader with textures or samplers cannot be recorded: "
-                                         "no backend's root signature declares them");
-              for(const auto& image:ps.TextureImages())
-                recorder.SetTexture(edf::native::NativeBackendStage::Pixel,image.slot,image.texture);
-              for(const auto& image:ps.SamplerImages())
-                recorder.SetSampler(edf::native::NativeBackendStage::Pixel,image.slot,image.sampler);
+              auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
+                bindings,*state.shaders.at(state.linked_pixel).bindings,viewport,key,
+                mesh.input_layout().elements(),mesh.input_layout().fingerprint(),
+                (uint64_t(state.active_vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),
+                state.linked_pixel,edf::native::NativeBackendTopology::TriangleList});
               mesh.Draw(recorder,ctx.r6.u32,ctx.r7.u32,ctx.r5.s32);
             } else mesh.Draw(*state.context.Get(),ctx.r6.u32,ctx.r7.u32,ctx.r5.s32);
           }
@@ -5690,10 +5715,19 @@ REX_HOOK_RAW(sub_821FD8F8) {
         if ((key[1]&3)!=0) throw std::runtime_error("movie requires an unbound depth/stencil surface");
         auto render=state.render_states.find(key);
         if(render==state.render_states.end()) render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
-        edf::native::BindActiveTarget(state);
-        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
-        state.movie_vertex->Bind(*state.context.Get()); movie_pixel.Bind(*state.context.Get());
-        state.movie_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,64),64});
+        if(REXCVAR_GET(edf_native_seam_draws)) {
+          auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
+            *state.movie_vertex,movie_pixel,viewport,key,
+            edf::native::QuadStream::Layout(),edf::native::kNativeQuadLayoutId,
+            pair.vertex,pair.pixel,edf::native::NativeBackendTopology::TriangleList});
+          state.movie_vertices->Draw(edf::native::EnsureSceneBackendLocked(state),recorder,
+                                     {reader.Bytes(ctx.r6.u32,64),64});
+        } else {
+          edf::native::BindActiveTarget(state);
+          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
+          state.movie_vertex->Bind(*state.context.Get()); movie_pixel.Bind(*state.context.Get());
+          state.movie_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,64),64});
+        }
         native_submitted=true;
         scene.frame_complete=false;
         ++state.movie_draws;
@@ -5868,13 +5902,23 @@ REX_HOOK_RAW(sub_821FD8F8) {
         auto render=state.render_states.find(key);
         if(render==state.render_states.end())
           render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
-        edf::native::BindActiveTarget(state);
-        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
-        vertex.Bind(*state.context.Get()); pixel.Bind(*state.context.Get());
+        const bool xui_seam=REXCVAR_GET(edf_native_seam_draws);
+        if(!xui_seam) {
+          edf::native::BindActiveTarget(state);
+          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
+          vertex.Bind(*state.context.Get()); pixel.Bind(*state.context.Get());
+        }
         xui_bind.Finish();
         edf::native::HookTiming xui_draw(edf::native::HookPhase::XuiDraw);
         const size_t bytes=size_t(ctx.r5.u32)*8;
-        state.xui_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,bytes),bytes});
+        if(xui_seam) {
+          auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
+            vertex,pixel,viewport,key,
+            edf::native::PositionTriangleStream::Layout(),edf::native::kNativePositionLayoutId,
+            pair.vertex,pair.pixel,edf::native::NativeBackendTopology::TriangleList});
+          state.xui_vertices->Draw(edf::native::EnsureSceneBackendLocked(state),recorder,
+                                   {reader.Bytes(ctx.r6.u32,bytes),bytes});
+        } else state.xui_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,bytes),bytes});
         xui_draw.Finish();
         native_submitted=true;
         // Partial alpha geometry cannot establish initialized full-frame pixels.
@@ -5962,11 +6006,20 @@ REX_HOOK_RAW(sub_821FD8F8) {
         auto render=state.render_states.find(key);
         if(render==state.render_states.end())
           render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
-        edf::native::BindActiveTarget(state);
-        edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
-        state.font_vertex->Bind(*state.context.Get()); state.font_pixel->Bind(*state.context.Get());
         const size_t bytes=size_t(ctx.r5.u32)*16;
-        state.font_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,bytes),bytes});
+        if(REXCVAR_GET(edf_native_seam_draws)) {
+          auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
+            *state.font_vertex,*state.font_pixel,viewport,key,
+            edf::native::QuadStream::Layout(),edf::native::kNativeQuadLayoutId,
+            pair.vertex,pair.pixel,edf::native::NativeBackendTopology::TriangleList});
+          state.font_vertices->Draw(edf::native::EnsureSceneBackendLocked(state),recorder,
+                                    {reader.Bytes(ctx.r6.u32,bytes),bytes});
+        } else {
+          edf::native::BindActiveTarget(state);
+          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
+          state.font_vertex->Bind(*state.context.Get()); state.font_pixel->Bind(*state.context.Get());
+          state.font_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,bytes),bytes});
+        }
         native_submitted=true;
         scene.frame_complete=false;
         if(++state.font_draws<=5 || state.font_draws%10000==0)
@@ -6050,10 +6103,19 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto render=state.render_states.find(key);
           if(render==state.render_states.end()) render=state.render_states.emplace(key,
             edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
-          edf::native::BindActiveTarget(state);
-          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
-          bindings.Bind(*state.context.Get()); ps.Bind(*state.context.Get());
-          mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
+          if(REXCVAR_GET(edf_native_seam_draws)) {
+            auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
+              bindings,ps,viewport,key,
+              mesh.input_layout().elements(),mesh.input_layout().fingerprint(),
+              (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),pair.pixel,
+              edf::native::NativeBackendTopology::TriangleList});
+            mesh.Draw(recorder,0,uint32_t(indices.size()/2));
+          } else {
+            edf::native::BindActiveTarget(state);
+            edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
+            bindings.Bind(*state.context.Get()); ps.Bind(*state.context.Get());
+            mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
+          }
           native_submitted=true; scene.frame_complete=false;
           auto& reported=state.scene_immediate_variants_reported[solid?0:textured?(strip?1:2):ps.shader().entry.name=="Ps_ZParticle"?4:3];
           if(++state.utility_3d_draws<=5 || !reported || state.utility_3d_draws%10000==0)
@@ -6235,7 +6297,9 @@ REX_HOOK_RAW(sub_821FD8F8) {
           REXLOG_INFO("Native render state: cached={}, blend={:#x}, depth={:#x}, raster={:#x}, alpha={:#x}, write_mask={}, scissor={}",
                       state.render_states.size(),render_key[0],render_key[1],render_key[2],render_key[3],render_key[4],render_key[5]);
         }
-        edf::native::BindGuestRenderState(render_state->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation);
+        const bool post_seam=REXCVAR_GET(edf_native_seam_draws);
+        if(!post_seam)
+          edf::native::BindGuestRenderState(render_state->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation);
         const auto viewport=edf::native::ReadNativeDrawViewport(reader,ctx.r3.u32);
         if (state.immediate_draws<=15) {
           REXLOG_INFO("Native post pass: VS={}, PS={}, viewport={},{},{}x{}, depth={}..{}, reverse={}",
@@ -6249,14 +6313,13 @@ REX_HOOK_RAW(sub_821FD8F8) {
               std::bit_cast<float>(reader.Word(reader.Add(vertex,8))),std::bit_cast<float>(reader.Word(reader.Add(vertex,12))));
           }
         }
-        viewport.Bind(*state.context.Get());
+        if(!post_seam) viewport.Bind(*state.context.Get());
         auto& bindings=viewport.reverse_depth ? *shader.reversed_bindings : *shader.bindings;
         auto& quads=viewport.reverse_depth ? shader.reversed_quads : shader.quads;
         if (!quads) quads=std::make_unique<edf::native::QuadStream>(*state.device.Get(),bindings.shader());
-        bindings.Bind(*state.context.Get());
         const std::span<const uint8_t> vertices{reader.Bytes(ctx.r6.u32,bytes),bytes};
         auto& pixel=*state.shaders.at(state.linked_pixel).bindings;
-        pixel.Bind(*state.context.Get());
+        if(!post_seam) { bindings.Bind(*state.context.Get()); pixel.Bind(*state.context.Get()); }
         auto& target=output_draw ? state.scenes.at(state.active_output).output : state.render_targets.at(state.active_target).native;
         // Read the actual post-pass views before drawing, not a guessed target
         // from the resource registry after later passes may have changed it.
@@ -6355,14 +6418,28 @@ REX_HOOK_RAW(sub_821FD8F8) {
         const float center_offset=REXCVAR_GET(edf_native_pixel_centers)
           ? edf::native::GuestPixelCenterOffset(centers_word) : 0.f;
         const bool shift_centers=initialized && center_offset!=0.f;
-        if(shift_centers) {
-          auto shifted=viewport.viewport;
-          shifted.TopLeftX+=center_offset; shifted.TopLeftY+=center_offset;
-          state.context->RSSetViewports(1,&shifted);
+        if(post_seam) {
+          auto shifted=viewport;
+          if(shift_centers) {
+            shifted.viewport.TopLeftX+=center_offset;
+            shifted.viewport.TopLeftY+=center_offset;
+          }
+          auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
+            bindings,pixel,shifted,render_key,
+            edf::native::QuadStream::Layout(),edf::native::kNativeQuadLayoutId,
+            (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),pair.pixel,
+            edf::native::NativeBackendTopology::TriangleList});
+          quads->Draw(edf::native::EnsureSceneBackendLocked(state),recorder,vertices);
+        } else {
+          if(shift_centers) {
+            auto shifted=viewport.viewport;
+            shifted.TopLeftX+=center_offset; shifted.TopLeftY+=center_offset;
+            state.context->RSSetViewports(1,&shifted);
+          }
+          try { quads->Draw(*state.context.Get(),vertices); }
+          catch(...) { if(shift_centers) viewport.Bind(*state.context.Get()); throw; }
+          if(shift_centers) viewport.Bind(*state.context.Get());
         }
-        try { quads->Draw(*state.context.Get(),vertices); }
-        catch(...) { if(shift_centers) viewport.Bind(*state.context.Get()); throw; }
-        if(shift_centers) viewport.Bind(*state.context.Get());
         if(output_draw && state.scene_gpu_timer && state.scene_gpu_timer_resolved &&
            state.scene_gpu_timer_owner==state.active_output) {
           try { state.scene_gpu_timer->End(); }
