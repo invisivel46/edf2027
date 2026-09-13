@@ -24,10 +24,10 @@ std::string Narrow(const wchar_t* wide) {
 }
 }  // namespace
 
-NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options)
-    : ring_(options.upload_bytes) {
+NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options) {
   if(!options.frames_in_flight)
     throw std::runtime_error("D3D12 needs at least one frame in flight");
+  if(!options.recorders) throw std::runtime_error("D3D12 needs at least one recorder");
 
   // The debug layer has to be enabled before the device exists, and it is the
   // only thing that will tell us about a missing barrier - the failure mode
@@ -88,17 +88,33 @@ NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options)
   if(!fence_event_) throw std::runtime_error("D3D12 fence event creation failed");
 
   frames_.resize(options.frames_in_flight);
-  for(auto& frame:frames_)
-    Require(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&frame.allocator)),
-            "command allocator creation");
-  Require(device_->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,frames_.front().allocator.Get(),
-                                     nullptr,IID_PPV_ARGS(&commands_)),"command list creation");
-  // Created open; every frame opens it itself.
-  Require(commands_->Close(),"command list close");
+  for(auto& frame:frames_) {
+    frame.allocators.resize(options.recorders);
+    for(auto& allocator:frame.allocators)
+      Require(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),
+              "command allocator creation");
+  }
+  lists_.resize(options.recorders);
+  for(uint32_t index=0;index<options.recorders;++index) {
+    Require(device_->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                       frames_.front().allocators[index].Get(),nullptr,
+                                       IID_PPV_ARGS(&lists_[index])),"command list creation");
+    // Created open; every frame opens them itself.
+    Require(lists_[index]->Close(),"command list close");
+  }
 
   const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_UPLOAD,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                    D3D12_MEMORY_POOL_UNKNOWN,0,0};
-  const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER,0,options.upload_bytes,1,1,1,
+  // The upload buffer is one allocation split evenly between recorders, so no
+  // thread's allocations can touch another one's bytes.
+  const uint64_t per_recorder=(options.upload_bytes/options.recorders)&~uint64_t(255);
+  if(!per_recorder) throw std::runtime_error("upload_bytes is too small to split between recorders");
+  const uint64_t upload_bytes=per_recorder*options.recorders;
+  for(uint32_t index=0;index<options.recorders;++index) {
+    rings_.emplace_back(per_recorder);
+    ring_bases_.push_back(per_recorder*index);
+  }
+  const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER,0,upload_bytes,1,1,1,
                                  DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                                  D3D12_RESOURCE_FLAG_NONE};
   Require(device_->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,
@@ -112,8 +128,18 @@ NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options)
   upload_cpu_=static_cast<uint8_t*>(mapped);
   upload_gpu_=upload_->GetGPUVirtualAddress();
 
-  views_=std::make_unique<NativeD3D12DescriptorRing>(*device_.Get(),
-      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,options.view_descriptors);
+  // One heap, sliced. Each command list binds the same heap, so switching
+  // recorders costs nothing, and each allocates only inside its own slice.
+  const uint32_t per_recorder_views=options.view_descriptors/options.recorders;
+  if(!per_recorder_views) throw std::runtime_error("view_descriptors is too small to split between recorders");
+  const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                                             per_recorder_views*options.recorders,
+                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,0};
+  Require(device_->CreateDescriptorHeap(&heap_desc,IID_PPV_ARGS(&view_heap_)),"view heap creation");
+  for(uint32_t index=0;index<options.recorders;++index)
+    views_.push_back(std::make_unique<NativeD3D12DescriptorRing>(
+        *device_.Get(),*view_heap_.Get(),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        per_recorder_views*index,per_recorder_views));
   samplers_=std::make_unique<NativeD3D12SamplerCache>(*device_.Get(),options.sampler_slots,
                                                       options.sampler_tables);
 }
@@ -126,8 +152,10 @@ bool NativeD3D12Device::WaitForOldestFrame() {
   if(!oldest) return false;
   WaitForFence(oldest);
   const uint64_t now=fence_->GetCompletedValue();
-  ring_.Retire(now);
-  views_->Retire(now);
+  for(uint32_t index=0;index<rings_.size();++index) {
+    rings_[index].Retire(now);
+    views_[index]->Retire(now);
+  }
   return true;
 }
 
@@ -145,7 +173,7 @@ void NativeD3D12Device::WaitForFence(uint64_t value) {
   WaitForSingleObject(fence_event_,INFINITE);
 }
 
-ID3D12GraphicsCommandList* NativeD3D12Device::BeginFrame() {
+void NativeD3D12Device::BeginFrame() {
   if(open_) throw std::runtime_error("D3D12 frame already open");
   open_frame_=static_cast<uint32_t>(frame_counter_%frames_.size());
   auto& frame=frames_[open_frame_];
@@ -154,30 +182,39 @@ ID3D12GraphicsCommandList* NativeD3D12Device::BeginFrame() {
   // undefined, and it is the classic way a D3D12 port crashes only under load.
   WaitForFence(frame.fence);
   const uint64_t completed=fence_->GetCompletedValue();
-  ring_.Retire(completed);
-  views_->Retire(completed);
-  Require(frame.allocator->Reset(),"command allocator reset");
-  Require(commands_->Reset(frame.allocator.Get(),nullptr),"command list reset");
-  // Both rings share the frame's fence value: they are freed by the same
-  // signal because they are read by the same submission.
+  // Every ring takes the frame's fence value: they are all freed by the same
+  // signal because they are all read by the same submission.
   ++next_fence_;
-  ring_.BeginFrame(next_fence_);
-  views_->BeginFrame(next_fence_);
+  for(uint32_t index=0;index<lists_.size();++index) {
+    rings_[index].Retire(completed);
+    views_[index]->Retire(completed);
+    Require(frame.allocators[index]->Reset(),"command allocator reset");
+    Require(lists_[index]->Reset(frame.allocators[index].Get(),nullptr),"command list reset");
+    rings_[index].BeginFrame(next_fence_);
+    views_[index]->BeginFrame(next_fence_);
+  }
   open_=true;
-  return commands_.Get();
 }
 
 void NativeD3D12Device::EndFrame() {
   if(!open_) throw std::runtime_error("D3D12 has no open frame");
-  Require(commands_->Close(),"command list close");
-  ID3D12CommandList* lists[]={commands_.Get()};
-  queue_->ExecuteCommandLists(1,lists);
+  std::vector<ID3D12CommandList*> lists;
+  lists.reserve(lists_.size());
+  for(auto& list:lists_) {
+    Require(list->Close(),"command list close");
+    lists.push_back(list.Get());
+  }
+  // Submitted together and in recorder order, so work recorded in parallel
+  // still executes in a defined order on the queue.
+  queue_->ExecuteCommandLists(static_cast<UINT>(lists.size()),lists.data());
   // The fence value the ring already recorded for this frame, so the memory it
   // handed out is freed by exactly the signal that proves the GPU is done.
   Require(queue_->Signal(fence_.Get(),next_fence_),"queue signal");
   frames_[open_frame_].fence=next_fence_;
-  ring_.EndFrame();
-  views_->EndFrame();
+  for(uint32_t index=0;index<lists_.size();++index) {
+    rings_[index].EndFrame();
+    views_[index]->EndFrame();
+  }
   ++frame_counter_;
   open_=false;
 }
@@ -187,8 +224,8 @@ void NativeD3D12Device::WaitIdle() {
   Require(queue_->Signal(fence_.Get(),++next_fence_),"queue signal");
   WaitForFence(next_fence_);
   const uint64_t completed=fence_->GetCompletedValue();
-  ring_.Retire(completed);
-  if(views_) views_->Retire(completed);
+  for(auto& ring:rings_) ring.Retire(completed);
+  for(auto& views:views_) views->Retire(completed);
 }
 
 std::vector<std::string> NativeD3D12Device::DrainValidationErrors() {
@@ -207,44 +244,49 @@ std::vector<std::string> NativeD3D12Device::DrainValidationErrors() {
   return found;
 }
 
-NativeD3D12Device::Upload NativeD3D12Device::Allocate(uint64_t bytes, uint64_t alignment) {
-  auto allocation=ring_.Allocate(bytes,alignment);
+NativeD3D12Device::Upload NativeD3D12Device::Allocate(uint64_t bytes, uint64_t alignment,
+                                                     uint32_t recorder) {
+  auto& ring=rings_.at(recorder);
+  auto allocation=ring.Allocate(bytes,alignment);
   if(allocation.status==NativeUploadRing::Status::Full) {
     // Give the GPU a chance to release a frame, then try again. Waiting on the
-    // oldest in-flight frame is the smallest wait that can possibly help.
+    // oldest in-flight frame is the smallest wait that can possibly help. It
+    // is only safe from one thread, so with several recorders a stall here is
+    // a sizing failure and the messages below say which ring ran out.
     ++upload_stalls_;
     while(allocation.status==NativeUploadRing::Status::Full && WaitForOldestFrame())
-      allocation=ring_.Allocate(bytes,alignment);
+      allocation=ring.Allocate(bytes,alignment);
   }
   if(allocation.status==NativeUploadRing::Status::TooLarge)
     throw std::runtime_error("D3D12 upload of "+std::to_string(bytes)+
-                             " bytes exceeds the whole upload ring of "+
-                             std::to_string(ring_.capacity())+" bytes");
+                             " bytes exceeds this recorder's upload ring of "+
+                             std::to_string(ring.capacity())+" bytes");
   if(allocation.status!=NativeUploadRing::Status::Ok)
     // Every frame in flight has been waited on and it still does not fit, so a
     // single frame needs more upload memory than the ring holds. Say that,
     // rather than stalling forever on a fence that cannot help.
-    throw std::runtime_error("D3D12 upload ring of "+std::to_string(ring_.capacity())+
+    throw std::runtime_error("D3D12 upload ring of "+std::to_string(ring.capacity())+
                              " bytes cannot satisfy one frame; high water "+
-                             std::to_string(ring_.high_water())+" bytes");
-  const uint64_t offset=allocation.offset%ring_.capacity();
+                             std::to_string(ring.high_water())+" bytes");
+  const uint64_t offset=ring_bases_.at(recorder)+allocation.offset%ring.capacity();
   return {upload_cpu_+offset,upload_gpu_+offset,upload_.Get(),offset};
 }
-NativeD3D12DescriptorRing::Table NativeD3D12Device::AllocateViews(uint32_t count) {
-  auto result=views_->TryAllocate(count);
+NativeD3D12DescriptorRing::Table NativeD3D12Device::AllocateViews(uint32_t count, uint32_t recorder) {
+  auto& views=*views_.at(recorder);
+  auto result=views.TryAllocate(count);
   if(result.status==NativeUploadRing::Status::Full) {
     ++descriptor_stalls_;
     while(result.status==NativeUploadRing::Status::Full && WaitForOldestFrame())
-      result=views_->TryAllocate(count);
+      result=views.TryAllocate(count);
   }
   if(result.status!=NativeUploadRing::Status::Ok)
     // Either the table is wider than the whole heap or one frame needs more
     // descriptors than the heap holds. Both are a sizing mistake, and saying
     // so beats binding a table that overlaps a draw still in flight.
-    throw std::runtime_error("D3D12 view descriptor heap of "+
-                             std::to_string(views_->ring().capacity())+
+    throw std::runtime_error("D3D12 view descriptor heap slice of "+
+                             std::to_string(views.ring().capacity())+
                              " cannot satisfy a run of "+std::to_string(count)+
-                             "; high water "+std::to_string(views_->ring().high_water()));
+                             "; high water "+std::to_string(views.ring().high_water()));
   return result.table;
 }
 }  // namespace edf::native

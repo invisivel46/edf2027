@@ -72,6 +72,59 @@ What survives untouched is the argument that actually motivated the migration:
 per-draw tuning reaches, and it needs stage 3. The per-draw saving is a bonus,
 not the reason.
 
+## Does multithreaded recording actually pay?
+
+This is the argument the per-draw correction left standing, so it was measured
+too, with `--threads=N --bridge-us=1.5`. The simulated 1.5 us of non-API work
+per draw is the difference between the game's measured 1.83 us draw hook and
+the 0.30 us of API cost above: guest reads, parameter decode, mesh lookup.
+2,370 draws a frame, 120 frames, hardware.
+
+| | ms/frame | vs one thread |
+|---|---|---|
+| D3D11, one thread (today) | 3.77 | - |
+| D3D12, one thread | 3.75 | 1.00x |
+| D3D11, 4-thread decode, serial submit | 2.02 | 1.87x |
+| D3D12, 4 recorders | 1.05 | 3.59x |
+| D3D12, 8 recorders | 0.73 | 5.13x |
+
+Three things fall out, and the third is the one that matters.
+
+**Threading the API calls alone buys nothing.** With no simulated work, going
+from 1 to 4 recorders moved 0.197 ms to 0.133 ms. There is not enough
+submission work to be worth splitting - the per-frame barrier costs about as
+much as it saves.
+
+**The win is in threading our own work, not the API.** Put the 1.5 us back and
+four threads take 3.77 ms to 1.05 ms. That is the whole prize, and almost none
+of it is the graphics API.
+
+**But D3D11 cannot collect it.** The honest control is D3D11 with the same
+decode split across four threads and submission left serial, which is allowed:
+2.02 ms, only 1.87x. It stalls on the one thing D3D11 cannot parallelise. At
+eight threads it is 1.81 ms and barely moving, while D3D12 reaches 0.73 ms.
+
+So **D3D12 is worth about 0.97 ms a frame beyond what restructuring alone can
+get** - 48% of the restructured frame. Not the headline the original "Why"
+section implied, and not nothing either.
+
+### What this says about the order of work
+
+Restructuring the bridge to do its per-draw work off the submit thread is the
+prerequisite for both, and it pays 1.87x on D3D11 as it stands, with no
+backend migration at all. It should come first. D3D12 then removes the ceiling
+that restructuring runs into.
+
+### Caveat that could overturn this
+
+The simulated work is perfectly parallel: no shared state, no locks, no guest
+memory. The real work reads guest memory through the write-ownership registry
+and the parameter decode paths, and how much of that can run concurrently is
+not known yet. If it turns out to be mostly serialised, the 3.59x is an upper
+bound nothing reaches, and the honest answer would be that neither the
+restructuring nor the migration pays. That is the next thing to measure, and
+it should be measured before either is built.
+
 ## Measured surface to replace
 
 ```

@@ -26,6 +26,18 @@ NativeD3D12DescriptorRing::NativeD3D12DescriptorRing(ID3D12Device& device,
   gpu_start_=heap_->GetGPUDescriptorHandleForHeapStart();
 }
 
+NativeD3D12DescriptorRing::NativeD3D12DescriptorRing(ID3D12Device& device,
+                                                     ID3D12DescriptorHeap& heap,
+                                                     D3D12_DESCRIPTOR_HEAP_TYPE type,
+                                                     uint32_t first, uint32_t count)
+    : heap_(&heap),ring_(count),capacity_(count),first_(first) {
+  increment_=device.GetDescriptorHandleIncrementSize(type);
+  cpu_start_=heap.GetCPUDescriptorHandleForHeapStart();
+  gpu_start_=heap.GetGPUDescriptorHandleForHeapStart();
+  cpu_start_.ptr+=static_cast<SIZE_T>(first)*increment_;
+  gpu_start_.ptr+=static_cast<UINT64>(first)*increment_;
+}
+
 NativeD3D12DescriptorRing::Result NativeD3D12DescriptorRing::TryAllocate(uint32_t count) {
   // Alignment of 1: descriptors have no alignment rule beyond being adjacent,
   // and the ring's straddle handling already guarantees the run is contiguous.

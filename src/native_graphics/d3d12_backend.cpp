@@ -160,12 +160,12 @@ D3D12_PRIMITIVE_TOPOLOGY Topology(NativeBackendTopology topology) {
 
 class D3D12Recorder final : public NativeBackendRecorder {
  public:
-  D3D12Recorder(NativeD3D12Device& gpu, ID3D12RootSignature& signature)
-      : gpu_(&gpu),signature_(&signature) {}
+  D3D12Recorder(NativeD3D12Device& gpu, ID3D12RootSignature& signature, uint32_t index)
+      : gpu_(&gpu),signature_(&signature),index_(index) {}
 
   void Begin(ID3D12GraphicsCommandList& commands) {
     commands_=&commands;
-    ID3D12DescriptorHeap* heaps[]={gpu_->views().heap(),gpu_->samplers().heap()};
+    ID3D12DescriptorHeap* heaps[]={gpu_->view_heap(),gpu_->samplers().heap()};
     commands_->SetDescriptorHeaps(2,heaps);
     commands_->SetGraphicsRootSignature(signature_);
     bound_={};
@@ -219,7 +219,8 @@ class D3D12Recorder final : public NativeBackendRecorder {
     // Straight into the upload ring and then into a root descriptor: no
     // constant buffer object, no descriptor, no map. This is the path the slot
     // measurement bought - it is why the constant buffers are root CBVs.
-    const auto upload=gpu_->Allocate(bytes.size());
+    const auto upload=gpu_->Allocate(bytes.size(),
+                                     D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,index_);
     std::memcpy(upload.cpu,bytes.data(),bytes.size());
     Commands().SetGraphicsRootConstantBufferView(RootConstantSlot(stage,slot),upload.gpu);
   }
@@ -333,7 +334,7 @@ class D3D12Recorder final : public NativeBackendRecorder {
   }
   void UpdateBuffer(NativeBackendBuffer& buffer, uint32_t offset, std::span<const uint8_t> bytes) override {
     auto& concrete=static_cast<D3D12Buffer&>(buffer);
-    const auto upload=gpu_->Allocate(bytes.size(),16);
+    const auto upload=gpu_->Allocate(bytes.size(),16,index_);
     std::memcpy(upload.cpu,bytes.data(),bytes.size());
     Transition(concrete.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
     Commands().CopyBufferRegion(concrete.tracked().resource.Get(),offset,upload.resource,
@@ -410,8 +411,8 @@ class D3D12Recorder final : public NativeBackendRecorder {
   }
   void FlushTextures() {
     if(!bound_.textures_dirty) return;
-    const auto table=gpu_->AllocateViews(NativeD3D12RootLayout::kPixelTextures);
-    const auto increment=gpu_->views().increment();
+    const auto table=gpu_->AllocateViews(NativeD3D12RootLayout::kPixelTextures,index_);
+    const auto increment=gpu_->views(index_).increment();
     for(uint32_t slot=0;slot<NativeD3D12RootLayout::kPixelTextures;++slot) {
       const D3D12_CPU_DESCRIPTOR_HANDLE at{table.cpu.ptr+static_cast<SIZE_T>(slot)*increment};
       auto* texture=bound_.textures[slot];
@@ -441,6 +442,7 @@ class D3D12Recorder final : public NativeBackendRecorder {
 
   NativeD3D12Device* gpu_;
   ID3D12RootSignature* signature_;
+  uint32_t index_=0;
   ID3D12GraphicsCommandList* commands_=nullptr;
   Bound bound_;
   std::vector<Bound> stack_;
@@ -457,8 +459,9 @@ class D3D12Backend final : public NativeRenderBackend {
         pipelines_(*gpu_.device(),*signature_.Get()),
         texture_views_(*gpu_.device(),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,4096),
         render_target_views_(*gpu_.device(),D3D12_DESCRIPTOR_HEAP_TYPE_RTV,256),
-        depth_views_(*gpu_.device(),D3D12_DESCRIPTOR_HEAP_TYPE_DSV,64),
-        recorder_(gpu_,*signature_.Get()) {
+        depth_views_(*gpu_.device(),D3D12_DESCRIPTOR_HEAP_TYPE_DSV,64) {
+    for(uint32_t index=0;index<gpu_.recorders();++index)
+      recorders_.push_back(std::make_unique<D3D12Recorder>(gpu_,*signature_.Get(),index));
     // One null descriptor, written once, for every texture slot a draw leaves
     // unbound. Creating it per draw would be pure waste on the hottest path.
     null_texture_=texture_views_.Allocate();
@@ -468,7 +471,7 @@ class D3D12Backend final : public NativeRenderBackend {
     null.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     null.Texture2D.MipLevels=1;
     gpu_.device()->CreateShaderResourceView(nullptr,&null,null_texture_);
-    recorder_.null_texture_view_=null_texture_;
+    for(auto& recorder:recorders_) recorder->null_texture_view_=null_texture_;
   }
 
   ~D3D12Backend() override {
@@ -647,14 +650,18 @@ class D3D12Backend final : public NativeRenderBackend {
     return *found->second;
   }
 
-  NativeBackendRecorder& Recorder() override {
-    if(!open_) throw std::runtime_error("the D3D12 backend has no frame open; call Submit's counterpart first");
-    return recorder_;
+  NativeBackendRecorder& Recorder(uint32_t index) override {
+    if(!open_) throw std::runtime_error("the D3D12 backend has no frame open; call BeginFrame first");
+    if(index>=recorders_.size())
+      throw std::runtime_error("recorder "+std::to_string(index)+" does not exist; this backend has "+
+                               std::to_string(recorders_.size()));
+    return *recorders_[index];
   }
-  // One immediate recorder for now. Parallel recording is stage 3 and needs a
-  // command list per thread; claiming it here would be a lie the caller would
-  // act on by spawning threads that then serialise.
-  bool SupportsParallelRecording() const override { return false; }
+  uint32_t RecorderCount() const override { return static_cast<uint32_t>(recorders_.size()); }
+  // True only when there is genuinely more than one command list. A backend
+  // that claimed this with one recorder would have callers spawn threads that
+  // then serialise on it, which is slower than not threading at all.
+  bool SupportsParallelRecording() const override { return recorders_.size()>1; }
 
   void Submit() override {
     if(!open_) throw std::runtime_error("Submit with no frame open");
@@ -664,21 +671,25 @@ class D3D12Backend final : public NativeRenderBackend {
     // buffer rather than the current one costs nothing: Transition is a no-op
     // for a buffer already in that state.
     for(auto& buffer:back_buffers_)
-      recorder_.Transition(buffer->tracked(),D3D12_RESOURCE_STATE_PRESENT);
-    recorder_.End();
+      recorders_.front()->Transition(buffer->tracked(),D3D12_RESOURCE_STATE_PRESENT);
+    for(auto& recorder:recorders_) recorder->End();
     gpu_.EndFrame();
     open_=false;
   }
 
   void BeginFrame() override {
     if(open_) throw std::runtime_error("a D3D12 frame is already open");
-    auto* commands=gpu_.BeginFrame();
-    recorder_.Begin(*commands);
+    gpu_.BeginFrame();
+    for(uint32_t index=0;index<recorders_.size();++index)
+      recorders_[index]->Begin(*gpu_.commands(index));
     open_=true;
     // Buffer contents supplied at creation are staged on the first frame that
     // opens: there is no command list to copy them with until then, and a
     // backend that quietly dropped them would produce an empty mesh.
-    for(auto& upload:pending_) recorder_.UpdateBuffer(*upload.buffer,0,upload.bytes);
+    // Staged on recorder 0: these are one-off creation uploads, and putting
+    // them anywhere else would make the frame's first list depend on which
+    // thread happened to create a resource.
+    for(auto& upload:pending_) recorders_.front()->UpdateBuffer(*upload.buffer,0,upload.bytes);
     pending_.clear();
     for(auto& upload:pending_textures_) UploadTexture(*upload.texture,upload.bytes);
     pending_textures_.clear();
@@ -704,7 +715,7 @@ class D3D12Backend final : public NativeRenderBackend {
                                                    IID_PPV_ARGS(&readback)),"readback buffer creation");
 
     BeginFrame();
-    recorder_.Transition(concrete.tracked(),D3D12_RESOURCE_STATE_COPY_SOURCE);
+    recorders_.front()->Transition(concrete.tracked(),D3D12_RESOURCE_STATE_COPY_SOURCE);
     const D3D12_TEXTURE_COPY_LOCATION to{readback.Get(),
                                          D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{footprint}};
     D3D12_TEXTURE_COPY_LOCATION from{};
@@ -809,7 +820,7 @@ class D3D12Backend final : public NativeRenderBackend {
     // The footprint's offset is relative to the resource it is copied from, so
     // it has to name where in the ring the bytes actually landed.
     footprint.Offset=upload.offset;
-    recorder_.Transition(texture.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
+    recorders_.front()->Transition(texture.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
     const D3D12_TEXTURE_COPY_LOCATION from{upload.resource,
                                            D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{footprint}};
     D3D12_TEXTURE_COPY_LOCATION to{};
@@ -826,7 +837,7 @@ class D3D12Backend final : public NativeRenderBackend {
   ComPtr<ID3D12RootSignature> signature_;
   NativeD3D12PipelineCache pipelines_;
   NativeD3D12CpuDescriptorHeap texture_views_,render_target_views_,depth_views_;
-  D3D12Recorder recorder_;
+  std::vector<std::unique_ptr<D3D12Recorder>> recorders_;
   std::map<std::string,std::unique_ptr<D3D12Pipeline>> wrappers_;
   // Three, to match the frames in flight: the device will not reuse a frame
   // slot until its fence has passed, which is also what keeps us off a buffer

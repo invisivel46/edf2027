@@ -211,7 +211,12 @@ class NativeRenderBackend {
   // One recorder per thread that submits work. D3D11 returns the same immediate
   // recorder every time and rejects a second thread; a second backend hands out
   // independent ones, which is what unlocks parallel submission.
-  virtual NativeBackendRecorder& Recorder()=0;
+  // Recorders are addressed by index, one per thread that submits work. Index
+  // 0 always exists. A backend with one recorder is not a broken backend; it
+  // is D3D11, and callers must ask rather than assume.
+  virtual NativeBackendRecorder& Recorder(uint32_t index)=0;
+  NativeBackendRecorder& Recorder() { return Recorder(0); }
+  virtual uint32_t RecorderCount() const=0;
   virtual bool SupportsParallelRecording() const=0;
 
   // Open a frame. D3D11 needed no such call, which is why the first draft of

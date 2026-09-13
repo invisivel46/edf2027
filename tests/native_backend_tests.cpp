@@ -35,9 +35,10 @@ class StubBackend final : public edf::native::NativeRenderBackend {
       const edf::native::NativeBackendPipelineDesc&) override {
     throw std::runtime_error("stub backend builds no pipelines");
   }
-  edf::native::NativeBackendRecorder& Recorder() override {
+  edf::native::NativeBackendRecorder& Recorder(uint32_t) override {
     throw std::runtime_error("stub backend records nothing");
   }
+  uint32_t RecorderCount() const override { return 1; }
   bool SupportsParallelRecording() const override { return parallel_; }
   void BeginFrame() override {}
   std::vector<uint8_t> ReadRenderTarget(edf::native::NativeBackendRenderTarget&) override { return {}; }

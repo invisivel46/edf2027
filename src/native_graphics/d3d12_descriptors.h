@@ -24,6 +24,12 @@ namespace edf::native {
 class NativeD3D12DescriptorRing {
  public:
   NativeD3D12DescriptorRing(ID3D12Device& device, D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t descriptors);
+  // A window onto an existing heap, so several recorders can each own a slice
+  // of one heap and allocate from it without a lock. Sharing a heap matters:
+  // a command list binds whole heaps, and one per recorder would mean every
+  // list re-binding them.
+  NativeD3D12DescriptorRing(ID3D12Device& device, ID3D12DescriptorHeap& heap,
+                            D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t first, uint32_t count);
 
   struct Table {
     D3D12_CPU_DESCRIPTOR_HANDLE cpu{};  // Where to write the descriptors.
@@ -48,7 +54,7 @@ class NativeD3D12DescriptorRing {
   NativeUploadRing ring_;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_start_{};
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_start_{};
-  uint32_t increment_=0,capacity_=0;
+  uint32_t increment_=0,capacity_=0,first_=0;
 };
 
 // CPU-side descriptors that live as long as the resource they describe. Every

@@ -39,6 +39,11 @@ struct NativeD3D12Options {
   // combinations the cache may hold. 8 x 192 = 1,536 of the 2,048 descriptors
   // a shader-visible sampler heap is allowed.
   uint32_t sampler_slots=8,sampler_tables=192;
+  // How many threads may record at once. One is D3D11's shape and the default;
+  // more is the entire reason this backend exists, and each recorder gets its
+  // own command allocator, its own slice of the upload ring and its own slice
+  // of the descriptor heap, so recording needs no lock.
+  uint32_t recorders=1;
 };
 
 class NativeD3D12Device {
@@ -52,7 +57,8 @@ class NativeD3D12Device {
   ID3D12CommandQueue* queue() const { return queue_.Get(); }
   IDXGIFactory4* factory() const { return factory_.Get(); }
   // Valid only between BeginFrame and EndFrame.
-  ID3D12GraphicsCommandList* commands() const { return commands_.Get(); }
+  ID3D12GraphicsCommandList* commands(uint32_t recorder=0) const { return lists_.at(recorder).Get(); }
+  uint32_t recorders() const { return static_cast<uint32_t>(lists_.size()); }
   const std::string& adapter_name() const { return adapter_name_; }
   bool is_warp() const { return is_warp_; }
   // Whether the debug layer is actually validating. Asking for it and not
@@ -69,7 +75,7 @@ class NativeD3D12Device {
 
   // Waits until the frame slot this frame will reuse is finished on the GPU,
   // recycles its allocator, and frees the upload memory it was holding.
-  ID3D12GraphicsCommandList* BeginFrame();
+  void BeginFrame();
   // Closes and submits the list, then signals the fence this frame owns.
   void EndFrame();
   // Blocks until the GPU has finished everything submitted so far. For
@@ -87,15 +93,17 @@ class NativeD3D12Device {
   };
   // Throws rather than returning a null slice: every caller would have to
   // handle the failure identically and none could continue meaningfully.
-  Upload Allocate(uint64_t bytes, uint64_t alignment=D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+  Upload Allocate(uint64_t bytes, uint64_t alignment=D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+                  uint32_t recorder=0);
 
   // A contiguous run of shader-visible view descriptors for this frame, on the
   // same fenced rule and with the same stall-and-retry as upload memory.
-  NativeD3D12DescriptorRing::Table AllocateViews(uint32_t count);
-  NativeD3D12DescriptorRing& views() { return *views_; }
+  NativeD3D12DescriptorRing::Table AllocateViews(uint32_t count, uint32_t recorder=0);
+  NativeD3D12DescriptorRing& views(uint32_t recorder=0) { return *views_.at(recorder); }
+  ID3D12DescriptorHeap* view_heap() const { return view_heap_.Get(); }
   NativeD3D12SamplerCache& samplers() { return *samplers_; }
 
-  const NativeUploadRing& upload_ring() const { return ring_; }
+  const NativeUploadRing& upload_ring(uint32_t recorder=0) const { return rings_.at(recorder); }
   uint64_t frames_submitted() const { return frame_counter_; }
   // How many times a frame had to stall waiting for upload memory. Zero is the
   // expected reading; anything else means upload_bytes is too small, and it
@@ -110,14 +118,17 @@ class NativeD3D12Device {
   bool WaitForOldestFrame();
 
   struct Frame {
-    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    // One allocator per recorder: two threads writing one allocator is
+    // undefined, and it is the first thing that breaks when recording is
+    // parallelised.
+    std::vector<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>> allocators;
     uint64_t fence=0;  // Value signalled after this frame's work; 0 = never used.
   };
 
   Microsoft::WRL::ComPtr<IDXGIFactory4> factory_;
   Microsoft::WRL::ComPtr<ID3D12Device> device_;
   Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
-  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commands_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>> lists_;
   Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
   Microsoft::WRL::ComPtr<ID3D12InfoQueue> messages_;
   Microsoft::WRL::ComPtr<ID3D12Resource> upload_;
@@ -125,8 +136,12 @@ class NativeD3D12Device {
   void* fence_event_=nullptr;
   uint8_t* upload_cpu_=nullptr;
   D3D12_GPU_VIRTUAL_ADDRESS upload_gpu_=0;
-  NativeUploadRing ring_;
-  std::unique_ptr<NativeD3D12DescriptorRing> views_;
+  // One ring per recorder over its own region of one upload buffer, so no two
+  // threads touch the same allocator state.
+  std::vector<NativeUploadRing> rings_;
+  std::vector<uint64_t> ring_bases_;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> view_heap_;
+  std::vector<std::unique_ptr<NativeD3D12DescriptorRing>> views_;
   std::unique_ptr<NativeD3D12SamplerCache> samplers_;
   std::string adapter_name_;
   uint64_t next_fence_=0,frame_counter_=0,upload_stalls_=0,descriptor_stalls_=0;

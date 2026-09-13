@@ -86,7 +86,8 @@ int main() {
     // recycled many times over rather than each being used once.
     constexpr uint32_t kFrames = 32;
     for (uint32_t frame = 1; frame <= kFrames; ++frame) {
-      auto* commands = gpu.BeginFrame();
+      gpu.BeginFrame();
+      auto* commands = gpu.commands();
       // Several allocations per frame, as a real frame's constants would be,
       // so the ring is exercised rather than just touched.
       std::vector<NativeD3D12Device::Upload> slices;
