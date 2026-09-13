@@ -46,6 +46,7 @@ constexpr uint32_t kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 // What one backend produced. Compared against every other backend's.
 struct Rendered {
   std::vector<uint8_t> flat, textured, instanced, mipped, resolved, compressed, blended;
+  std::vector<uint8_t> depth_tested, target0, target1;
   bool refused_missing_blend_factor=false;
   uint64_t query_samples = 0;
   std::vector<std::string> validation;
@@ -79,6 +80,25 @@ Varying VS(float3 position : POSITION) {
   return output;
 }
 float4 PS(Varying input) : SV_TARGET { return image.SampleLevel(filtering, input.uv, 1); }
+)";
+// Depth comes from a vertex constant so one vertex buffer can be drawn at
+// several depths; the guest supplies depth the same way, through constants.
+const char* kDepth = R"(
+cbuffer VertexData : register(b0) { float4 depth; };
+cbuffer PixelData : register(b0) { float4 tint; };
+float4 VS(float3 position : POSITION) : SV_POSITION { return float4(position.xy, depth.x, 1); }
+float4 PS(float4 position : SV_POSITION) : SV_TARGET { return tint; }
+)";
+// Two outputs, which the seam allows and nothing had ever asked for.
+const char* kTwoTargets = R"(
+struct Outputs { float4 first : SV_TARGET0; float4 second : SV_TARGET1; };
+float4 VS(float3 position : POSITION) : SV_POSITION { return float4(position, 1); }
+Outputs PS(float4 position : SV_POSITION) {
+  Outputs outputs;
+  outputs.first = float4(1, 0, 0, 1);
+  outputs.second = float4(0, 0, 1, 1);
+  return outputs;
+}
 )";
 const char* kInstanced = R"(
 cbuffer PixelData : register(b0) { float4 tint; };
@@ -259,6 +279,86 @@ Rendered Render(NativeRenderBackend& backend) {
   backend.Submit();
   out.blended = backend.ReadRenderTarget(*target);
 
+  // Depth testing. Three full-screen draws at different depths with LESS:
+  // the middle one must be rejected and the nearest must win, so the result
+  // is the third colour rather than the last one drawn. A depth buffer that
+  // was never bound, never cleared, or never written shows a different colour
+  // here, and each of those is a distinct way for the port to go wrong.
+  NativeBackendTextureDesc depth_desc{};
+  depth_desc.width = depth_desc.height = kSize;
+  depth_desc.levels = 1;
+  depth_desc.format = 40;  // DXGI_FORMAT_D32_FLOAT
+  depth_desc.depth = true;
+  depth_desc.render_target = true;
+  const auto depth_target = backend.CreateRenderTarget(depth_desc);
+
+  const auto depth_vs = Compile(kDepth, "VS", "vs_5_0");
+  const auto depth_ps = Compile(kDepth, "PS", "ps_5_0");
+  NativeBackendPipelineDesc depth_pipeline_desc = flat_desc;
+  depth_pipeline_desc.vertex = Bytes(*depth_vs.Get());
+  depth_pipeline_desc.pixel = Bytes(*depth_ps.Get());
+  depth_pipeline_desc.vertex_id = 15;
+  depth_pipeline_desc.pixel_id = 16;
+  // depth enable | depth write | func LESS, in the guest encoding.
+  depth_pipeline_desc.state = {0x10001, 0x16, 0, 0, 15, 0};
+  depth_pipeline_desc.dsv_format = 40;
+  auto& depth_pipeline = backend.CreatePipeline(depth_pipeline_desc);
+
+  const std::array<float, 4> depth_red{1, 0, 0, 1}, depth_green{0, 1, 0, 1}, depth_blue{0, 0, 1, 1};
+  const std::array<float, 4> near_z{0.2f, 0, 0, 0}, mid_z{0.5f, 0, 0, 0}, far_z{0.8f, 0, 0, 0};
+  backend.BeginFrame();
+  {
+    auto& recorder = backend.Recorder();
+    recorder.SetRenderTargets(colors, depth_target.get());
+    recorder.SetViewport({0, 0, kSize, kSize, 0, 1});
+    recorder.ClearColor(*target, {0.0f, 0.0f, 0.0f, 1.0f});
+    recorder.ClearDepthStencil(*depth_target, true, false, 1.0f, 0);
+    recorder.SetPipeline(depth_pipeline);
+    recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+    const auto draw_at = [&](const std::array<float, 4>& z, const std::array<float, 4>& tint) {
+      recorder.SetConstants(NativeBackendStage::Vertex, 0,
+                            {reinterpret_cast<const uint8_t*>(z.data()), sizeof(float) * 4});
+      recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                            {reinterpret_cast<const uint8_t*>(tint.data()), sizeof(float) * 4});
+      recorder.Draw(3, 0);
+    };
+    draw_at(mid_z, depth_red);     // passes against the cleared depth
+    draw_at(far_z, depth_green);   // must be rejected
+    draw_at(near_z, depth_blue);   // must win
+  }
+  backend.Submit();
+  out.depth_tested = backend.ReadRenderTarget(*target);
+
+  // Two render targets at once, written by one draw.
+  const auto second_target = backend.CreateRenderTarget(target_desc);
+  const auto two_vs = Compile(kTwoTargets, "VS", "vs_5_0");
+  const auto two_ps = Compile(kTwoTargets, "PS", "ps_5_0");
+  NativeBackendPipelineDesc two_desc = flat_desc;
+  two_desc.vertex = Bytes(*two_vs.Get());
+  two_desc.pixel = Bytes(*two_ps.Get());
+  two_desc.vertex_id = 17;
+  two_desc.pixel_id = 18;
+  two_desc.render_targets = 2;
+  two_desc.rtv_format[0] = kFormat;
+  two_desc.rtv_format[1] = kFormat;
+  auto& two_pipeline = backend.CreatePipeline(two_desc);
+  NativeBackendRenderTarget* both[] = {target.get(), second_target.get()};
+
+  backend.BeginFrame();
+  {
+    auto& recorder = backend.Recorder();
+    recorder.SetRenderTargets(both, nullptr);
+    recorder.SetViewport({0, 0, kSize, kSize, 0, 1});
+    recorder.ClearColor(*target, {0.0f, 0.0f, 0.0f, 1.0f});
+    recorder.ClearColor(*second_target, {0.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetPipeline(two_pipeline);
+    recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+    recorder.Draw(3, 0);
+  }
+  backend.Submit();
+  out.target0 = backend.ReadRenderTarget(*target);
+  out.target1 = backend.ReadRenderTarget(*second_target);
+
   // Block-compressed, which is what the game's textures actually are. A BC1
   // block is two RGB565 endpoints and four bytes of 2-bit indices; setting
   // both endpoints to the same colour and all indices to zero gives a solid
@@ -436,11 +536,15 @@ int main() {
       const std::pair<const char*, const std::vector<uint8_t>*> surfaces[] = {
           {"flat", &rendered.flat}, {"textured", &rendered.textured},
           {"instanced", &rendered.instanced}, {"mipped", &rendered.mipped},
-          {"compressed", &rendered.compressed}, {"blended", &rendered.blended}};
+          {"compressed", &rendered.compressed}, {"blended", &rendered.blended},
+          {"depth", &rendered.depth_tested}, {"target0", &rendered.target0},
+          {"target1", &rendered.target1}};
       const std::vector<uint8_t>* references[] = {&reference.flat, &reference.textured,
                                                   &reference.instanced, &reference.mipped,
-                                                  &reference.compressed, &reference.blended};
-      for (size_t index = 0; index < 6; ++index) {
+                                                  &reference.compressed, &reference.blended,
+                                                  &reference.depth_tested, &reference.target0,
+                                                  &reference.target1};
+      for (size_t index = 0; index < 9; ++index) {
         const auto difference = Compare(*references[index], *surfaces[index].second);
         Check(difference.pixels == 0,
               std::string(name) + " differs from d3d11-warp on the " + surfaces[index].first +
@@ -459,7 +563,7 @@ int main() {
             std::string(name) + " counted " + std::to_string(rendered.query_samples) +
                 " occlusion samples where d3d11-warp counted " +
                 std::to_string(reference.query_samples));
-      std::cout << name << " vs d3d11-warp: identical on flat/textured/instanced/mipped/compressed/blended, resolve "
+      std::cout << name << " vs d3d11-warp: identical on every surface including depth and MRT, resolve "
                 << "differs by at most " << resolve.worst << " on " << resolve.pixels << " pixels\n";
     }
 
@@ -499,6 +603,18 @@ int main() {
       Check(at(rendered.compressed, kSize * 3 / 4, kSize * 3 / 4, 0) > 200 &&
                 at(rendered.compressed, kSize * 3 / 4, kSize * 3 / 4, 1) > 200,
             name + ": BC1 bottom-right block is not yellow");
+      // Blue is the nearest draw; red would mean the nearest was rejected and
+      // green would mean depth testing did nothing at all.
+      Check(at(rendered.depth_tested, kSize / 2, kSize / 2, 2) > 200 &&
+                at(rendered.depth_tested, kSize / 2, kSize / 2, 1) < 60 &&
+                at(rendered.depth_tested, kSize / 2, kSize / 2, 0) < 60,
+            name + ": depth testing did not keep the nearest draw");
+      Check(at(rendered.target0, kSize / 2, kSize / 2, 0) > 200 &&
+                at(rendered.target0, kSize / 2, kSize / 2, 2) < 60,
+            name + ": the first of two render targets is not red");
+      Check(at(rendered.target1, kSize / 2, kSize / 2, 2) > 200 &&
+                at(rendered.target1, kSize / 2, kSize / 2, 0) < 60,
+            name + ": the second of two render targets is not blue");
       Check(rendered.refused_missing_blend_factor,
             name + ": a draw needing a constant blend factor was allowed without one");
       // source x factor, within the rounding of an 8-bit target.
