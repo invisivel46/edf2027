@@ -142,6 +142,96 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET { return tint; }
               " pixels, which is not the half it should");
     std::cout << "triangle covered " << drawn << " of " << total << " pixels\n";
 
+    {
+      // A textured draw: upload a 2x2 texture, sample it with point filtering
+      // and clamping, and read the quadrants back. This is the path every real
+      // material takes, and none of it exists in a triangle of flat colour.
+      const uint8_t texels[] = {
+          255, 0,   0,   255,   0,   255, 0,   255,     // top row:    red,  green
+          0,   0,   255, 255,   255, 255, 0,   255};    // bottom row: blue, yellow
+      NativeBackendTextureDesc texture_desc{};
+      texture_desc.width = texture_desc.height = 2;
+      texture_desc.levels = 1;
+      texture_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      const auto texture = backend->CreateTexture(texture_desc, texels);
+
+      NativeBackendSamplerDesc sampler_desc{};
+      sampler_desc.min = sampler_desc.mag = sampler_desc.mip = NativeBackendFilter::Point;
+      sampler_desc.u = sampler_desc.v = sampler_desc.w = NativeBackendAddress::Clamp;
+      auto& sampler = backend->CreateSampler(sampler_desc);
+      Check(&sampler == &backend->CreateSampler(sampler_desc),
+            "an identical sampler description produced a second sampler");
+
+      const char* kTextured = R"(
+Texture2D image : register(t0);
+SamplerState filtering : register(s0);
+struct Varying { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
+Varying VS(float3 position : POSITION) {
+  Varying output;
+  output.position = float4(position, 1);
+  output.uv = position.xy * 0.5 + 0.5;
+  return output;
+}
+float4 PS(Varying input) : SV_TARGET { return image.Sample(filtering, input.uv); }
+)";
+      const auto textured_vs = Compile(kTextured, "VS", "vs_5_0");
+      const auto textured_ps = Compile(kTextured, "PS", "ps_5_0");
+
+      // A full-screen covering triangle is right here: every pixel should come
+      // from the texture, so there is nothing for it to hide.
+      const float cover[] = {-1.0f, -1.0f, 0.0f, 3.0f, -1.0f, 0.0f, -1.0f, 3.0f, 0.0f};
+      NativeBackendBufferDesc cover_desc{};
+      cover_desc.bytes = sizeof(cover);
+      cover_desc.vertex = true;
+      const auto cover_buffer = backend->CreateBuffer(
+          cover_desc, {reinterpret_cast<const uint8_t*>(cover), sizeof(cover)});
+
+      NativeBackendPipelineDesc textured{};
+      textured.vertex = Bytes(*textured_vs.Get());
+      textured.pixel = Bytes(*textured_ps.Get());
+      textured.vertex_id = 0x44;
+      textured.pixel_id = 0x55;
+      textured.input_layout = layout;
+      textured.input_layout_id = 0x33;
+      textured.state = {0x10001, 0, 0, 0, 15, 0};
+      textured.topology = NativeBackendTopology::TriangleList;
+      textured.render_targets = 1;
+      textured.rtv_format[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+      auto& textured_pipeline = backend->CreatePipeline(textured);
+
+      backend->BeginFrame();
+      auto& textured_recorder = backend->Recorder();
+      textured_recorder.SetRenderTargets(colors, nullptr);
+      textured_recorder.SetViewport({0, 0, static_cast<float>(kSize), static_cast<float>(kSize), 0, 1});
+      textured_recorder.ClearColor(*target, {0.0f, 0.0f, 0.0f, 1.0f});
+      textured_recorder.SetPipeline(textured_pipeline);
+      textured_recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+      textured_recorder.SetTexture(NativeBackendStage::Pixel, 0, texture.get());
+      textured_recorder.SetSampler(NativeBackendStage::Pixel, 0, &sampler);
+      textured_recorder.Draw(3, 0);
+      backend->Submit();
+
+      const auto sampled = backend->ReadRenderTarget(*target);
+      const auto texel = [&](uint32_t x, uint32_t y) {
+        const size_t index = (static_cast<size_t>(y) * kSize + x) * 4;
+        return std::array<uint8_t, 4>{sampled[index], sampled[index + 1], sampled[index + 2]};
+      };
+      // uv maps NDC to [0,1] with v increasing upward, so the target's top rows
+      // hold the texture's bottom row. Checking all four quadrants catches a
+      // flip or a swapped row, which a single sample would not.
+      const auto top_left = texel(kSize / 4, kSize / 4), top_right = texel(kSize * 3 / 4, kSize / 4);
+      const auto bottom_left = texel(kSize / 4, kSize * 3 / 4),
+                 bottom_right = texel(kSize * 3 / 4, kSize * 3 / 4);
+      Check(top_left[2] > 200 && top_left[0] < 60, "top-left quadrant is not the texture's blue texel");
+      Check(top_right[0] > 200 && top_right[1] > 200,
+            "top-right quadrant is not the texture's yellow texel");
+      Check(bottom_left[0] > 200 && bottom_left[1] < 60,
+            "bottom-left quadrant is not the texture's red texel");
+      Check(bottom_right[1] > 200 && bottom_right[0] < 60,
+            "bottom-right quadrant is not the texture's green texel");
+      std::cout << "textured draw: four quadrants sampled\n";
+    }
+
     // A missing barrier would not change a single pixel above; only the API's
     // own validation sees it, so it is read rather than left in the debugger.
     for (const auto& message : backend->DrainValidationMessages())

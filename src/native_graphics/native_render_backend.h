@@ -132,6 +132,21 @@ class NativeBackendRecorder {
   virtual void PopState()=0;
 };
 
+// Sampler state, neutral because D3D12 packs the three filters into one
+// encoded value and Vulkan does not. A backend encodes it however its API
+// wants; callers describe what they mean.
+enum class NativeBackendFilter : uint32_t { Point, Linear, Anisotropic };
+enum class NativeBackendAddress : uint32_t { Wrap, Mirror, Clamp, Border };
+struct NativeBackendSamplerDesc {
+  NativeBackendFilter min=NativeBackendFilter::Linear,mag=NativeBackendFilter::Linear,
+                      mip=NativeBackendFilter::Linear;
+  NativeBackendAddress u=NativeBackendAddress::Wrap,v=NativeBackendAddress::Wrap,
+                       w=NativeBackendAddress::Wrap;
+  float mip_lod_bias=0,min_lod=0,max_lod=3.402823466e+38f;
+  uint32_t max_anisotropy=1;
+  std::array<float,4> border{};
+};
+
 // One vertex attribute. Neutral so a second backend is not handed D3D12's
 // struct; `format` is a backend-specific format code, like the texture descs.
 struct NativeBackendInputElement {
@@ -188,6 +203,10 @@ class NativeRenderBackend {
   // descriptor set declares, rather than building something that draws with a
   // binding pointing nowhere.
   virtual NativeBackendPipeline& CreatePipeline(const NativeBackendPipelineDesc& desc)=0;
+  // Samplers are described, not built: on D3D12 a sampler only becomes a real
+  // descriptor when it lands in a table, and the backend caches those by
+  // combination because the shader-visible sampler heap holds only 2,048.
+  virtual NativeBackendSampler& CreateSampler(const NativeBackendSamplerDesc& desc)=0;
 
   // One recorder per thread that submits work. D3D11 returns the same immediate
   // recorder every time and rejects a second thread; a second backend hands out

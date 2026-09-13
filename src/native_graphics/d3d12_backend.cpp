@@ -86,6 +86,14 @@ class D3D12Pipeline final : public NativeBackendPipeline {
   D3D12_PRIMITIVE_TOPOLOGY topology_;
 };
 
+class D3D12Sampler final : public NativeBackendSampler {
+ public:
+  explicit D3D12Sampler(const D3D12_SAMPLER_DESC& desc) : desc_(desc) {}
+  const D3D12_SAMPLER_DESC& desc() const { return desc_; }
+ private:
+  D3D12_SAMPLER_DESC desc_;
+};
+
 class D3D12Query final : public NativeBackendQuery {
  public:
   D3D12Query(ComPtr<ID3D12QueryHeap> heap, NativeBackendQueryKind kind) : heap_(std::move(heap)),kind_(kind) {}
@@ -95,6 +103,41 @@ class D3D12Query final : public NativeBackendQuery {
   ComPtr<ID3D12QueryHeap> heap_;
   NativeBackendQueryKind kind_;
 };
+
+D3D12_FILTER_TYPE FilterType(NativeBackendFilter filter) {
+  return filter==NativeBackendFilter::Point?D3D12_FILTER_TYPE_POINT:D3D12_FILTER_TYPE_LINEAR;
+}
+D3D12_TEXTURE_ADDRESS_MODE AddressMode(NativeBackendAddress address) {
+  switch(address) {
+    case NativeBackendAddress::Wrap: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+    case NativeBackendAddress::Mirror: return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+    case NativeBackendAddress::Clamp: return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    case NativeBackendAddress::Border: return D3D12_TEXTURE_ADDRESS_MODE_BORDER;
+  }
+  throw std::runtime_error("unknown backend address mode");
+}
+D3D12_SAMPLER_DESC SamplerDesc(const NativeBackendSamplerDesc& desc) {
+  D3D12_SAMPLER_DESC native{};
+  // Anisotropic is a whole-filter mode in D3D12, not a per-axis one, so asking
+  // for it on any axis means asking for it.
+  const bool anisotropic=desc.min==NativeBackendFilter::Anisotropic||
+                         desc.mag==NativeBackendFilter::Anisotropic||
+                         desc.mip==NativeBackendFilter::Anisotropic;
+  native.Filter=anisotropic?D3D12_FILTER_ANISOTROPIC
+                           :D3D12_ENCODE_BASIC_FILTER(FilterType(desc.min),FilterType(desc.mag),
+                                                      FilterType(desc.mip),
+                                                      D3D12_FILTER_REDUCTION_TYPE_STANDARD);
+  native.AddressU=AddressMode(desc.u);
+  native.AddressV=AddressMode(desc.v);
+  native.AddressW=AddressMode(desc.w);
+  native.MipLODBias=desc.mip_lod_bias;
+  native.MaxAnisotropy=anisotropic?(desc.max_anisotropy?desc.max_anisotropy:16):1;
+  native.ComparisonFunc=D3D12_COMPARISON_FUNC_NEVER;
+  for(size_t index=0;index<4;++index) native.BorderColor[index]=desc.border[index];
+  native.MinLOD=desc.min_lod;
+  native.MaxLOD=desc.max_lod;
+  return native;
+}
 
 D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyType(NativeBackendTopology topology) {
   switch(topology) {
@@ -189,11 +232,12 @@ class D3D12Recorder final : public NativeBackendRecorder {
     bound_.textures_dirty=true;
   }
   void SetSampler(NativeBackendStage stage, uint32_t slot, NativeBackendSampler* sampler) override {
-    // Samplers reach this backend through the pipeline's sampler table, which
-    // is cached by combination; a per-slot sampler object has no equivalent
-    // here and pretending otherwise would bind nothing.
-    (void)stage; (void)slot; (void)sampler;
-    throw std::runtime_error("the D3D12 backend binds samplers as a cached table, not per slot");
+    if(stage!=NativeBackendStage::Pixel)
+      throw std::runtime_error("this root signature declares no vertex-stage samplers");
+    if(slot>=NativeD3D12RootLayout::kPixelSamplers)
+      throw std::runtime_error("sampler slot "+std::to_string(slot)+" is outside the root signature");
+    bound_.samplers[slot]=static_cast<D3D12Sampler*>(sampler);
+    bound_.samplers_dirty=true;
   }
 
   void SetRenderTargets(std::span<NativeBackendRenderTarget* const> colors,
@@ -252,15 +296,18 @@ class D3D12Recorder final : public NativeBackendRecorder {
 
   void Draw(uint32_t vertices, uint32_t first_vertex) override {
     FlushTextures();
+    FlushSamplers();
     Commands().DrawInstanced(vertices,1,first_vertex,0);
   }
   void DrawIndexed(uint32_t indices, uint32_t first_index, int32_t base_vertex) override {
     FlushTextures();
+    FlushSamplers();
     Commands().DrawIndexedInstanced(indices,1,first_index,base_vertex,0);
   }
   void DrawIndexedInstanced(uint32_t indices, uint32_t instances, uint32_t first_index,
                             int32_t base_vertex, uint32_t first_instance) override {
     FlushTextures();
+    FlushSamplers();
     Commands().DrawIndexedInstanced(indices,instances,first_index,base_vertex,first_instance);
   }
 
@@ -315,6 +362,7 @@ class D3D12Recorder final : public NativeBackendRecorder {
     stack_.pop_back();
     if(bound_.pipeline) SetPipeline(*bound_.pipeline);
     bound_.textures_dirty=true;
+    bound_.samplers_dirty=true;
   }
 
  private:
@@ -339,6 +387,27 @@ class D3D12Recorder final : public NativeBackendRecorder {
   // Textures are gathered as they are set and written into one table just
   // before the draw that reads them. Copying eight descriptors per SetTexture
   // would write the table up to eight times for one draw.
+  // The whole table is resolved at once from the cache, because that is the
+  // only shape the 2,048-descriptor sampler heap allows. Slots left unbound get
+  // a defined sampler rather than whatever the last combination had there.
+  void FlushSamplers() {
+    if(!bound_.samplers_dirty) return;
+    std::array<D3D12_SAMPLER_DESC,NativeD3D12RootLayout::kPixelSamplers> descs{};
+    for(uint32_t slot=0;slot<descs.size();++slot)
+      descs[slot]=bound_.samplers[slot]?bound_.samplers[slot]->desc():DefaultSampler();
+    const auto table=gpu_->samplers().Table(descs);
+    Commands().SetGraphicsRootDescriptorTable(NativeD3D12RootLayout::kPixelSamplerTable,table);
+    bound_.samplers_dirty=false;
+  }
+  static D3D12_SAMPLER_DESC DefaultSampler() {
+    D3D12_SAMPLER_DESC sampler{};
+    sampler.Filter=D3D12_FILTER_MIN_MAG_MIP_POINT;
+    sampler.AddressU=sampler.AddressV=sampler.AddressW=D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc=D3D12_COMPARISON_FUNC_NEVER;
+    sampler.MaxAnisotropy=1;
+    sampler.MaxLOD=D3D12_FLOAT32_MAX;
+    return sampler;
+  }
   void FlushTextures() {
     if(!bound_.textures_dirty) return;
     const auto table=gpu_->AllocateViews(NativeD3D12RootLayout::kPixelTextures);
@@ -365,8 +434,9 @@ class D3D12Recorder final : public NativeBackendRecorder {
   struct Bound {
     D3D12Pipeline* pipeline=nullptr;
     D3D12Texture* textures[NativeD3D12RootLayout::kPixelTextures]{};
+    D3D12Sampler* samplers[NativeD3D12RootLayout::kPixelSamplers]{};
     uint32_t render_targets=0;
-    bool textures_dirty=false;
+    bool textures_dirty=false,samplers_dirty=false;
   };
 
   NativeD3D12Device* gpu_;
@@ -425,12 +495,19 @@ class D3D12Backend final : public NativeRenderBackend {
     return buffer;
   }
 
+  NativeBackendSampler& CreateSampler(const NativeBackendSamplerDesc& desc) override {
+    const auto native=SamplerDesc(desc);
+    // Deduplicated on the description, so a caller that describes the same
+    // sampler for every material does not fill the cache with copies of it.
+    std::string key(reinterpret_cast<const char*>(&native),sizeof(native));
+    auto found=samplers_.find(key);
+    if(found==samplers_.end())
+      found=samplers_.emplace(std::move(key),std::make_unique<D3D12Sampler>(native)).first;
+    return *found->second;
+  }
+
   std::unique_ptr<NativeBackendTexture> CreateTexture(const NativeBackendTextureDesc& desc,
                                                       std::span<const uint8_t> initial) override {
-    if(!initial.empty())
-      // Uploading pixels needs a footprint-aware staged copy; leaving it
-      // unimplemented and loud beats accepting the bytes and dropping them.
-      throw std::runtime_error("initial texture contents are not implemented in the D3D12 backend");
     TrackedResource tracked;
     tracked.state=D3D12_RESOURCE_STATE_COMMON;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
@@ -453,7 +530,19 @@ class D3D12Backend final : public NativeRenderBackend {
     srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     srv.Texture2D.MipLevels=description.MipLevels;
     gpu_.device()->CreateShaderResourceView(tracked.resource.Get(),&srv,view);
-    return std::make_unique<D3D12Texture>(std::move(tracked),desc.width,desc.height,view,texture_views_);
+    auto texture=std::make_unique<D3D12Texture>(std::move(tracked),desc.width,desc.height,view,
+                                                texture_views_);
+    if(!initial.empty()) {
+      // Staged on the next frame that opens, like buffer contents: there is no
+      // command list to copy with until then. Only level 0 - the disc textures
+      // arrive with their own mips through a path that does not exist yet, and
+      // quietly leaving the other levels undefined would show as the wrong
+      // texture at distance rather than as a missing feature.
+      if(description.MipLevels!=1)
+        throw std::runtime_error("initial contents for a mipped texture are not implemented");
+      pending_textures_.push_back({texture.get(),std::vector<uint8_t>(initial.begin(),initial.end())});
+    }
+    return texture;
   }
 
   std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc) override {
@@ -576,6 +665,8 @@ class D3D12Backend final : public NativeRenderBackend {
     // backend that quietly dropped them would produce an empty mesh.
     for(auto& upload:pending_) recorder_.UpdateBuffer(*upload.buffer,0,upload.bytes);
     pending_.clear();
+    for(auto& upload:pending_textures_) UploadTexture(*upload.texture,upload.bytes);
+    pending_textures_.clear();
   }
 
   std::vector<uint8_t> ReadRenderTarget(NativeBackendRenderTarget& target) override {
@@ -630,7 +721,37 @@ class D3D12Backend final : public NativeRenderBackend {
   const NativeD3D12PipelineCache& pipelines() const { return pipelines_; }
 
  private:
+  // A texture upload is not a buffer copy: rows land on a 256-byte pitch that
+  // has nothing to do with the source's packed rows, so the copy is described
+  // by a footprint the device computes and the rows are written one at a time.
+  void UploadTexture(D3D12Texture& texture, const std::vector<uint8_t>& bytes) {
+    const auto description=texture.tracked().resource->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total=0,row_bytes=0;
+    UINT rows=0;
+    gpu_.device()->GetCopyableFootprints(&description,0,1,0,&footprint,&rows,&row_bytes,&total);
+    if(bytes.size()<static_cast<size_t>(row_bytes)*rows)
+      throw std::runtime_error("initial texture contents are "+std::to_string(bytes.size())+
+                               " bytes but the texture needs "+std::to_string(row_bytes*rows));
+    const auto upload=gpu_.Allocate(total,D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+    for(UINT row=0;row<rows;++row)
+      std::memcpy(upload.cpu+static_cast<size_t>(row)*footprint.Footprint.RowPitch,
+                  bytes.data()+static_cast<size_t>(row)*row_bytes,static_cast<size_t>(row_bytes));
+    // The footprint's offset is relative to the resource it is copied from, so
+    // it has to name where in the ring the bytes actually landed.
+    footprint.Offset=upload.offset;
+    recorder_.Transition(texture.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_TEXTURE_COPY_LOCATION from{upload.resource,
+                                           D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{footprint}};
+    D3D12_TEXTURE_COPY_LOCATION to{};
+    to.pResource=texture.tracked().resource.Get();
+    to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.SubresourceIndex=0;
+    gpu_.commands()->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+  }
+
   struct PendingUpload { D3D12Buffer* buffer; std::vector<uint8_t> bytes; };
+  struct PendingTexture { D3D12Texture* texture; std::vector<uint8_t> bytes; };
 
   NativeD3D12Device gpu_;
   ComPtr<ID3D12RootSignature> signature_;
@@ -639,6 +760,8 @@ class D3D12Backend final : public NativeRenderBackend {
   D3D12Recorder recorder_;
   std::map<std::string,std::unique_ptr<D3D12Pipeline>> wrappers_;
   std::vector<PendingUpload> pending_;
+  std::vector<PendingTexture> pending_textures_;
+  std::map<std::string,std::unique_ptr<D3D12Sampler>> samplers_;
   D3D12_CPU_DESCRIPTOR_HANDLE null_texture_{};
   bool open_=false;
 };

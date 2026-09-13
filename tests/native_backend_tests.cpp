@@ -27,6 +27,10 @@ class StubBackend final : public edf::native::NativeRenderBackend {
       const edf::native::NativeBackendTextureDesc&) override { return {}; }
   std::unique_ptr<edf::native::NativeBackendQuery> CreateQuery(
       edf::native::NativeBackendQueryKind) override { return {}; }
+  edf::native::NativeBackendSampler& CreateSampler(
+      const edf::native::NativeBackendSamplerDesc&) override {
+    throw std::runtime_error("stub backend builds no samplers");
+  }
   edf::native::NativeBackendPipeline& CreatePipeline(
       const edf::native::NativeBackendPipelineDesc&) override {
     throw std::runtime_error("stub backend builds no pipelines");
