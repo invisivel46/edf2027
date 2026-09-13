@@ -10,6 +10,7 @@
 #include "native_graphics/triangle_strip.h"
 #include "native_graphics/guest_fence.h"
 #include "native_graphics/native_constant_ownership.h"
+#include "native_graphics/native_contract_ledger.h"
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
@@ -802,6 +803,51 @@ int main() {
   Reject([&] { ParseEffect(invalid); }, "invalid stage accepted");
   invalid = data; Word(invalid, 48, 134);
   Reject([&] { ParseEffect(invalid); }, "unresolved shader entry accepted");
+  {
+    using namespace edf::native;
+    // Coverage identity is the contract, not the caller: a hundred draws of one
+    // unsupported layout is one gap, and two layouts from one caller is two.
+    NativeContractLedger ledger(3);
+    NativeContract mesh;
+    mesh.path=NativeContractPath::Indexed; mesh.vertex_source=1; mesh.pixel_source=2;
+    const std::vector<uint8_t> declaration_bytes{1,2,3};
+    mesh.declaration=HashNativeDeclaration(declaration_bytes); mesh.topology=4;
+    const auto other_caller=mesh; // Callers are not part of identity at all.
+    Check(ledger.RecordRejected(mesh,"unsupported semantic"),"first rejection was not distinct");
+    Check(!ledger.RecordRejected(other_caller,"unsupported semantic"),
+      "the same contract from another draw counted as a new gap");
+    auto other_layout=mesh;
+    const std::vector<uint8_t> other_bytes{9};
+    other_layout.declaration=HashNativeDeclaration(other_bytes);
+    Check(ledger.RecordRejected(other_layout,"unsupported stride"),"a different declaration was folded away");
+    Check(ledger.counters().rejected==3 && ledger.counters().distinct_rejected==2,
+      "rejected draw and distinct contract counts were not separated");
+    Check(ledger.counters().rejected_by_path[size_t(NativeContractPath::Indexed)]==3,
+      "rejections were not attributed to their draw path");
+    Check(!ledger.clean(),"a ledger holding rejections reported clean coverage");
+    const auto rejections=ledger.Rejections();
+    Check(rejections.size()==2 && rejections[0].draws+rejections[1].draws==3,
+      "retained rejections lost their draw counts");
+    // Reaching the limit must be reported, never silently dropped.
+    auto third=mesh; third.topology=7;
+    Check(ledger.RecordRejected(third,"third"),"limit rejected a contract that still fits");
+    auto fourth=mesh; fourth.topology=8;
+    Check(!ledger.RecordRejected(fourth,"fourth") && ledger.counters().omitted_rejected==1,
+      "a contract past the limit was dropped without being counted");
+    Check(ledger.distinct_rejected()==3,"limit did not bound retained contracts");
+    NativeContractLedger submitted(2);
+    NativeContract drawn; drawn.vertex_source=5;
+    Check(submitted.RecordSubmitted(drawn) && !submitted.RecordSubmitted(drawn) &&
+      submitted.counters().submitted==2 && submitted.counters().distinct_submitted==1,
+      "submitted contracts were not deduplicated");
+    Check(submitted.clean(),"a ledger with no rejections reported unclean coverage");
+    const std::vector<uint8_t> forward{1,2},reversed{2,1};
+    Check(HashNativeDeclaration({})!=0,"empty declaration hash collided with unresolved");
+    Check(HashNativeDeclaration(forward)!=HashNativeDeclaration(reversed),
+      "declaration hash ignored byte order");
+    Check(NativeContractPathName(NativeContractPath::Immediate)=="immediate" &&
+      NativeContractPathName(NativeContractPath::Output)=="output","contract path names");
+  }
   std::cout << "native effect tests: " << failures << " failures\n";
   return failures ? 1 : 0;
 }

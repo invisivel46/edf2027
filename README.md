@@ -39,6 +39,14 @@ full-screen post-processing passes, which is what its downsample chain's
 half-texel sampling offsets assume. `--edf_native_pixel_centers=false` restores
 the unshifted viewport for regression diagnosis.
 
+Rendering coverage is accounted for rather than assumed: every draw the native
+renderer cannot handle is recorded as a distinct *contract* (shaders,
+declaration, topology, stride) instead of being silently dropped from the frame,
+and reaching the retention limit is counted rather than hiding the rest.
+`--edf_native_contract_export=<path>` writes the observed declarations to a
+catalog that `edf_native_geometry_check` replays offline against every vertex
+shader on the disc. See [docs/native-coverage.md](docs/native-coverage.md).
+
 From a Visual Studio developer shell, `cmake --build <build-dir> --target
 audit_native_dependencies` checks the game's transitive non-system PE imports
 and rejects Xenos DLLs or dependencies resolved outside the executable folder.

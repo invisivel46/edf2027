@@ -25,6 +25,7 @@
 #include "native_movie_bindings.h"
 #include "native_generated_indices.h"
 #include "native_physical_write_notify.h"
+#include "native_contract_ledger.h"
 #include "utility_layout.h"
 #include "triangle_strip.h"
 #include "guest_fence.h"
@@ -125,6 +126,12 @@ REXCVAR_DEFINE_INT32(edf_native_probe_height, 1, "EDF2027", "Invalid-RGB diagnos
 REXCVAR_DEFINE_INT32(edf_native_probe_draw_limit, 4096, "EDF2027", "Maximum invalid-RGB diagnostic draws, capped at 65536");
 REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
+REXCVAR_DEFINE_INT32(edf_native_contract_limit, 4096, "EDF2027",
+                    "Distinct draw contracts the coverage ledger retains (1..1048576); reaching it is counted, never silently dropped");
+REXCVAR_DEFINE_STRING(edf_native_contract_export, "", "EDF2027",
+                     "Write the captured draw-contract catalog to this path; the offline geometry check replays it");
+REXCVAR_DEFINE_BOOL(edf_native_contract_coverage, false, "EDF2027",
+                   "Also record every submitted draw contract, so a run can enumerate what the content exercises; costs a set lookup per draw");
 REXCVAR_DEFINE_INT32(edf_native_shared_constant_audit, 0, "EDF2027",
                     "Audit Common.fx globals a stage's native shader consumes but the material never lists for that stage, for this many activations; 0 disables (development)");
 REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
@@ -622,6 +629,8 @@ struct Bridge {
   uint64_t indexed_ownership_attempts=0,indexed_physical_pairs=0;
   uint64_t indexed_empty_requests=0,indexed_nonempty_submitted=0,indexed_unsubmitted_requests=0;
   std::set<std::array<uint32_t,5>> indexed_unsubmitted_paths;
+  // Identity is the contract, not the caller: see native_contract_ledger.h.
+  edf::native::NativeContractLedger contracts;
   std::chrono::steady_clock::time_point indexed_coverage_reported{};
   uint64_t indexed_outside_scene = 0;
   uint64_t sampler_bindings = 0;
@@ -880,6 +889,37 @@ void RegisterShaders(const GuestReader& reader, uint32_t owner, const Effect& ef
   for (auto& [handle, shader] : fresh) state.shaders.insert_or_assign(handle, std::move(shader));
   REXLOG_INFO("Native shader bridge: owner={:#x}, {} guest shaders registered, {} resident",
               owner, count, state.shaders.size());
+}
+namespace {
+// Fill in only what is resolved: a rejection before shader or declaration
+// lookup still names a real contract, just a coarser one.
+edf::native::NativeContract MakeNativeContract(Bridge& state,edf::native::NativeContractPath path,
+    uint32_t vertex,uint32_t pixel,uint32_t declaration,uint32_t topology,
+    uint32_t stride=0,uint32_t index_width=0) {
+  edf::native::NativeContract contract;
+  contract.path=path; contract.topology=topology;
+  contract.stride=stride; contract.index_width=index_width;
+  if(const auto found=state.shaders.find(vertex);found!=state.shaders.end() && found->second.bindings)
+    contract.vertex_source=found->second.bindings->shader().source_fingerprint;
+  if(const auto found=state.shaders.find(pixel);found!=state.shaders.end() && found->second.bindings)
+    contract.pixel_source=found->second.bindings->shader().source_fingerprint;
+  if(declaration) try {
+    const auto owned=state.declarations.Get(declaration);
+    contract.declaration=edf::native::HashNativeDeclaration(owned->bytes());
+    contract.elements=owned->count();
+    // Keep the bytes, not only the identity: the disc cannot supply them.
+    state.contracts.RetainDeclaration(contract.declaration,owned->bytes());
+  } catch(const std::exception&) { /* Unpublished declaration stays unresolved. */ }
+  return contract;
+}
+void ReportNativeContractRejection(Bridge& state,const edf::native::NativeContract& contract,
+    std::string_view reason) {
+  state.contracts.set_limit(size_t(std::clamp(REXCVAR_GET(edf_native_contract_limit),1,1<<20)));
+  if(!state.contracts.RecordRejected(contract,reason)) return;
+  REXLOG_WARN("Native contract rejected: path={}, VS_source={:#x}, PS_source={:#x}, declaration={:#x}, elements={}, topology={}, stride={}, index_width={}, reason={} (this draw is missing from the frame)",
+    edf::native::NativeContractPathName(contract.path),contract.vertex_source,contract.pixel_source,
+    contract.declaration,contract.elements,contract.topology,contract.stride,contract.index_width,reason);
+}
 }
 template<class Reader>
 void UploadParameters(const Reader& reader, uint32_t instance, uint32_t stage_offset,
@@ -4747,9 +4787,30 @@ REX_HOOK_RAW(sub_821FE358) {
       }
     }
     if(!ctx.r7.u32) ++state.indexed_empty_requests;
-    else if(native_submitted) ++state.indexed_nonempty_submitted;
+    else if(native_submitted) {
+      ++state.indexed_nonempty_submitted;
+      // Opt-in: enumerating what the content exercises costs a set lookup on
+      // every draw, and gameplay submits over a hundred thousand a second.
+      if(REXCVAR_GET(edf_native_contract_coverage)) try {
+        const edf::native::GuestReader reader(base);
+        state.contracts.RecordSubmitted(edf::native::MakeNativeContract(state,
+          edf::native::NativeContractPath::Indexed,state.active_vertex,state.linked_pixel,
+          reader.Word(reader.Add(ctx.r3.u32,11536)),ctx.r4.u32));
+      } catch(const std::exception&) { /* Accounting must never fail a drawn frame. */ }
+    }
     else {
       ++state.indexed_unsubmitted_requests;
+      try {
+        const edf::native::GuestReader reader(base);
+        const auto declaration=reader.Word(reader.Add(ctx.r3.u32,11536));
+        edf::native::ReportNativeContractRejection(state,edf::native::MakeNativeContract(state,
+          edf::native::NativeContractPath::Indexed,state.active_vertex,state.linked_pixel,
+          declaration,ctx.r4.u32),"indexed draw not submitted natively");
+      } catch(const std::exception&) {
+        edf::native::ReportNativeContractRejection(state,edf::native::MakeNativeContract(state,
+          edf::native::NativeContractPath::Indexed,state.active_vertex,state.linked_pixel,
+          0,ctx.r4.u32),"indexed draw not submitted natively; device unreadable");
+      }
       const std::array<uint32_t,5> signature{uint32_t(ctx.lr),ctx.r4.u32,state.active_vertex,state.linked_pixel,state.active_target};
       if(state.indexed_unsubmitted_paths.size()<64 && state.indexed_unsubmitted_paths.insert(signature).second) {
         REXLOG_INFO("Native indexed unsubmitted path: caller={:#x}, primitive={}, count={}, scene={:#x}, target={:#x}, active_VS={:#x}, active_PS={:#x}",
@@ -4771,6 +4832,25 @@ REX_HOOK_RAW(sub_821FE358) {
       REXLOG_INFO("Native indexed coverage: requests={}, empty={}, submitted={}, unsubmitted={}, sampled_paths={} (64-path cap; not visual completeness)",
         state.indexed_draws,state.indexed_empty_requests,state.indexed_nonempty_submitted,
         state.indexed_unsubmitted_requests,state.indexed_unsubmitted_paths.size());
+      const auto& coverage=state.contracts.counters();
+      REXLOG_INFO("Native contract coverage: rejected_draws={}, distinct_rejected={}, omitted={}, errors={}, clean={}, submitted_contracts={} (clean requires zero rejected and zero omitted)",
+        coverage.rejected,coverage.distinct_rejected,coverage.omitted_rejected,
+        state.indexed_errors,state.contracts.clean(),coverage.distinct_submitted);
+      if(const auto path=REXCVAR_GET(edf_native_contract_export);!path.empty()) {
+        // Rewritten whole each time: a partial capture from a killed run is
+        // still a valid catalog of everything seen up to that point.
+        std::ofstream file(path,std::ios::binary|std::ios::trunc);
+        const auto text=state.contracts.Export();
+        file.write(text.data(),std::streamsize(text.size()));
+        if(!file) REXLOG_ERROR("Native contract export failed: {}",path);
+        else REXLOG_INFO("Native contract export: {}, declarations={}, bytes={}",
+          path,state.contracts.declarations().size(),text.size());
+      }
+      for(const auto& rejection:state.contracts.Rejections())
+        REXLOG_INFO("Native contract gap: path={}, VS_source={:#x}, PS_source={:#x}, declaration={:#x}, elements={}, topology={}, draws={}, reason={}",
+          edf::native::NativeContractPathName(rejection.contract.path),rejection.contract.vertex_source,
+          rejection.contract.pixel_source,rejection.contract.declaration,rejection.contract.elements,
+          rejection.contract.topology,rejection.draws,rejection.reason);
     }
   }
   native_timing.Finish();
@@ -5429,6 +5509,9 @@ REX_HOOK_RAW(sub_821FD8F8) {
        state.scenes.contains(state.active_output) && state.unsupported_output_pairs.size()<64) try {
       const auto& pair=bound_shaders();
       const std::array<uint32_t,4> key{pair.vertex,pair.pixel,ctx.r4.u32,ctx.r7.u32};
+      edf::native::ReportNativeContractRejection(state,edf::native::MakeNativeContract(state,
+        edf::native::NativeContractPath::Output,pair.vertex,pair.pixel,0,ctx.r4.u32,ctx.r7.u32),
+        "no native implementation for this output shader pair");
       if(state.unsupported_output_pairs.insert(key).second) {
         REXLOG_INFO("Native unsupported output shader pair: caller={:#x}, VS={:#x}, PS={:#x}, primitive={}, stride={}, vertices={}",
           uint32_t(ctx.lr),pair.vertex,pair.pixel,ctx.r4.u32,ctx.r7.u32,ctx.r5.u32);
@@ -5662,6 +5745,17 @@ REX_HOOK_RAW(sub_821FD8F8) {
     else if(native_submitted) ++state.immediate_submitted;
     else {
       ++state.immediate_unsubmitted;
+      try {
+        const edf::native::GuestReader reader(base);
+        edf::native::ReportNativeContractRejection(state,edf::native::MakeNativeContract(state,
+          edf::native::NativeContractPath::Immediate,state.active_vertex,state.linked_pixel,
+          reader.Word(reader.Add(ctx.r3.u32,11536)),ctx.r4.u32,ctx.r7.u32),
+          "immediate draw not submitted natively");
+      } catch(const std::exception&) {
+        edf::native::ReportNativeContractRejection(state,edf::native::MakeNativeContract(state,
+          edf::native::NativeContractPath::Immediate,state.active_vertex,state.linked_pixel,
+          0,ctx.r4.u32,ctx.r7.u32),"immediate draw not submitted natively; device unreadable");
+      }
       // This is evidence of routing coverage, not automatically a pixel bug:
       // the guest may issue draws outside a valid target or during teardown.
       if(state.immediate_unsubmitted_paths.size()<64) {
