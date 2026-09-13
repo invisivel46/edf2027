@@ -325,6 +325,10 @@ class D3D11Recorder final : public NativeBackendRecorder {
 
 class D3D11Backend final : public NativeRenderBackend {
  public:
+  D3D11Backend(ID3D11Device& device, ID3D11DeviceContext& context)
+      : device_(&device),context_(&context),owns_device_(false) {
+    recorder_=std::make_unique<D3D11Recorder>(*device_.Get(),*context_.Get());
+  }
   explicit D3D11Backend(const NativeD3D11BackendOptions& options) {
     UINT flags=0;
     if(options.debug_layer) flags|=D3D11_CREATE_DEVICE_DEBUG;
@@ -345,7 +349,12 @@ class D3D11Backend final : public NativeRenderBackend {
     Require(created,"device creation");
     recorder_=std::make_unique<D3D11Recorder>(*device_.Get(),*context_.Get());
   }
-  ~D3D11Backend() override { if(context_) context_->ClearState(); }
+  ~D3D11Backend() override {
+    // Only when the device is ours. Clearing a context the caller still uses
+    // would unbind everything the unported paths had set, and the symptom
+    // would be a frame going blank at shutdown for no visible reason.
+    if(owns_device_ && context_) context_->ClearState();
+  }
 
   std::string_view name() const override { return "d3d11"; }
 
@@ -695,9 +704,14 @@ class D3D11Backend final : public NativeRenderBackend {
   std::unique_ptr<D3D11RenderTarget> back_buffer_;
   std::map<std::string,std::unique_ptr<D3D11Sampler>> samplers_;
   std::map<std::string,std::unique_ptr<D3D11Pipeline>> pipelines_;
-  bool open_=false,debug_layer_refused_=false;
+  bool open_=false,debug_layer_refused_=false,owns_device_=true;
 };
 }  // namespace
+
+std::unique_ptr<NativeRenderBackend> AdoptNativeD3D11Backend(ID3D11Device& device,
+                                                             ID3D11DeviceContext& context) {
+  return std::make_unique<D3D11Backend>(device,context);
+}
 
 std::unique_ptr<NativeRenderBackend> CreateNativeD3D11Backend(const NativeD3D11BackendOptions& options) {
   return std::make_unique<D3D11Backend>(options);

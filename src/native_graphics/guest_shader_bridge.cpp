@@ -1438,7 +1438,13 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
     // reason nowhere in the log, which is failing silently with extra steps;
     // the reason goes in first, then the throw stands.
     try {
-      state.backend=edf::native::CreateNativeRenderBackend(name);
+      // "d3d11" means the device this renderer already has, not a second one.
+      // A separate device could not share a texture or a target with the
+      // paths that have not been ported yet, which is the whole reason the
+      // port can proceed one path at a time.
+      state.backend=name=="d3d11"
+        ? edf::native::AdoptNativeD3D11Backend(*state.device.Get(),*state.context.Get())
+        : edf::native::CreateNativeRenderBackend(name);
     } catch(const std::exception& error) {
       std::string known;
       for(const auto& candidate:edf::native::NativeRenderBackendNames())
@@ -1447,9 +1453,11 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
         name,error.what(),known.empty()?std::string("none"):known);
       throw;
     }
-    REXLOG_INFO("Native render backend: name={}, recorders={}, parallel_recording={}; selected by --edf_native_backend={}. The renderer still draws through its direct D3D11 path; this backend is created, not yet drawing",
+    REXLOG_INFO("Native render backend: name={}, recorders={}, parallel_recording={}; selected by --edf_native_backend={}. {} The renderer still draws through its direct D3D11 path; this backend is created, not yet drawing",
       std::string(state.backend->name()),state.backend->RecorderCount(),
-      state.backend->SupportsParallelRecording(),name);
+      state.backend->SupportsParallelRecording(),name,
+      name=="d3d11"?"Sharing this renderer's own device, so ported and unported paths can draw into the same targets.":
+                    "On its own device, so it cannot share targets with the unported paths yet.");
     for(const auto& message:state.backend->DrainValidationMessages())
       REXLOG_WARN("Native render backend validation: {}",message);
   }
