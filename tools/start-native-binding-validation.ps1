@@ -15,7 +15,11 @@ param(
   [ValidateRange(480,4095)][int]$RenderHeight = 720,
   [switch]$NativeRenderSize,
   [ValidateSet(0,1,2,4)][int]$Msaa = 0,
-  [ValidateRange(-1,5)][int]$AnisotropicFiltering = -1
+  [ValidateRange(-1,5)][int]$AnisotropicFiltering = -1,
+  # Anything else this run needs, passed through verbatim. The options above
+  # are the ones every run chooses between; this is for a flag that exists to
+  # answer one question, such as a port's A/B control.
+  [string[]]$ExtraArgs = @()
 )
 $ErrorActionPreference = 'Stop'
 $workspace = Split-Path $PSScriptRoot -Parent
@@ -68,6 +72,7 @@ if ($PSBoundParameters.ContainsKey('OwnedRenderState')) {
 if ($PSBoundParameters.ContainsKey('UntiledScene')) {
   $arguments += '--edf_native_untiled_scene=' + $UntiledScene.IsPresent.ToString().ToLowerInvariant()
 }
+$arguments += $ExtraArgs
 $arguments += if ($NativeRenderSize) {
   @(('--edf_native_render_width=' + $RenderWidth), ('--edf_native_render_height=' + $RenderHeight))
 } else { @() }

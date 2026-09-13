@@ -107,6 +107,12 @@ class NativeBackendRecorder {
   // A draw whose pipeline blends against this and has not been given one is
   // refused. The renderer it replaces refuses it too, and the alternative is a
   // material drawn in the wrong colour with nothing to say why.
+  //
+  // The factor is given as the guest wrote it. Some blend states use the
+  // factor's alpha in all four channels, and the backend replicates it because
+  // it knows that from the pipeline's own state - a caller doing it would be
+  // re-deriving decoded state it was never given, and forgetting it would show
+  // as a material tinted by its own alpha.
   virtual void SetBlendFactor(const std::array<float,4>& factor)=0;
 
   // Constants are handed over as bytes rather than as a mapped buffer: at the

@@ -137,6 +137,8 @@ REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
                      "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
 REXCVAR_DEFINE_STRING(edf_native_scene_backend, "d3d11", "EDF2027",
                      "Backend that owns the scene's own resources - its textures, meshes and targets - while the draw paths are being moved onto the backend interface one at a time. Must stay d3d11 until the last of them has moved: a ported path and an unported one have to share the same targets, and only the adopted d3d11 backend is this renderer's own device. Setting it to d3d12 before then gives the unported paths nothing to bind");
+REXCVAR_DEFINE_BOOL(edf_native_seam_draws, false, "EDF2027",
+                   "Record the scene's draws through the backend interface instead of calling the D3D11 context directly. With --edf_native_scene_backend=d3d11 both draw the same thing on the same device, which is what makes this the A/B control for the port: a difference is a wiring mistake, because the backend underneath has not changed. It must be true before the scene backend can be anything else");
 REXCVAR_DEFINE_BOOL(edf_native_backend_present, true, "EDF2027",
                    "Let the selected backend present the game's window from its own device. False keeps the D3D11 presenter, which is the control for measuring what the backend path costs or saves");
 REXCVAR_DEFINE_BOOL(edf_native_reuse_material, true, "EDF2027",
@@ -414,6 +416,15 @@ void BindGuestRenderState(const NativeRenderState& state,ID3D11DeviceContext& co
   const bool audit=REXCVAR_GET(edf_native_render_state_audit);
   if(audit) live=ReadGuestWords<4>(reader,reader.Add(device,10336));
   state.Bind(context,ResolveBlendFactorForDraw(device,audit?&live:nullptr));
+}
+template <typename Reader>
+std::array<float,4> GuestBlendFactorForDraw(const Reader& reader,uint32_t device) {
+  if(!REXCVAR_GET(edf_native_owned_render_state) && !REXCVAR_GET(edf_native_render_state_audit))
+    return ReadBlendFactor(reader,device);
+  NativeRenderStateSnapshots::BlendWords live{};
+  const bool audit=REXCVAR_GET(edf_native_render_state_audit);
+  if(audit) live=ReadGuestWords<4>(reader,reader.Add(device,10336));
+  return ResolveBlendFactorForDraw(device,audit?&live:nullptr);
 }
 struct VertexParameterRange {
   std::string name;
@@ -1224,6 +1235,56 @@ void RegisterRenderTarget(const GuestReader& reader, uint32_t owner) {
   state.textures.insert_or_assign(texture,native.sampled);
   state.render_targets.insert_or_assign(owner,RegisteredTarget{texture,surface,std::move(native)});
   REXLOG_INFO("Native render target: owner={:#x}, texture={:#x}, surface={:#x}, {}x{}",owner,texture,surface,width,height);
+}
+// The targets a draw goes into, as backend handles, plus the formats a
+// pipeline has to declare to match them.
+//
+// Mirrors BindActiveTarget below, which answers the same question for the
+// context. The two must agree: a pipeline built for one set of formats and
+// bound while another is set does not draw, it fails to create or draws
+// nothing, and neither says why.
+struct ActiveTargets {
+  std::array<edf::native::NativeBackendRenderTarget*,8> colors{};
+  uint32_t count=0;
+  edf::native::NativeBackendRenderTarget* depth=nullptr;
+  std::array<uint32_t,8> rtv_format{};
+  uint32_t dsv_format=0,samples=1;
+  uint32_t width=0,height=0;
+};
+ActiveTargets ActiveTargetsLocked(Bridge& state) {
+  ActiveTargets result;
+  const auto found=state.render_targets.find(state.active_target);
+  if(found==state.render_targets.end()) {
+    const auto scene=state.scenes.find(state.active_scene);
+    if(!state.active_target && scene!=state.scenes.end()) {
+      auto& colour=scene->second.color;
+      auto& depth=scene->second.depth;
+      result.colors[result.count]=colour.backend_surface.get();
+      result.rtv_format[result.count]=colour.format;
+      ++result.count;
+      result.depth=depth.backend_target.get();
+      result.dsv_format=depth.format;
+      result.samples=colour.samples;
+      result.width=colour.sampled.width; result.height=colour.sampled.height;
+      return result;
+    }
+    if(!state.active_target && !state.active_scene && state.scenes.contains(state.active_output)) {
+      auto& output=state.scenes.at(state.active_output).output;
+      result.colors[result.count]=output.backend_surface.get();
+      result.rtv_format[result.count]=output.format;
+      ++result.count;
+      result.samples=output.samples;
+      result.width=output.sampled.width; result.height=output.sampled.height;
+    }
+    return result;
+  }
+  auto& target=found->second.native;
+  result.colors[result.count]=target.backend_surface.get();
+  result.rtv_format[result.count]=target.format;
+  ++result.count;
+  result.samples=target.samples;
+  result.width=target.sampled.width; result.height=target.sampled.height;
+  return result;
 }
 void BindActiveTarget(Bridge& state) {
   ++state.bind_generation;
@@ -4954,7 +5015,12 @@ REX_HOOK_RAW(sub_821FE358) {
             state.indexed_bind_vertex==state.active_vertex &&
             state.indexed_bind_pixel==state.linked_pixel &&
             state.indexed_bind_reversed==viewport.reverse_depth;
-          if(same_binding) ++state.indexed_binds_skipped;
+          // Recorded draws set all of this per draw through the pipeline and
+          // the recorder, so the context bindings below are not merely
+          // redundant, they describe a draw that is not going to happen.
+          const bool seam_draws=REXCVAR_GET(edf_native_seam_draws);
+          if(seam_draws) { /* bound per draw below */ }
+          else if(same_binding) ++state.indexed_binds_skipped;
           else {
             edf::native::BindActiveTarget(state);
             edf::native::BindGuestRenderState(found->second,*state.context.Get(),reader,ctx.r3.u32,
@@ -4967,17 +5033,19 @@ REX_HOOK_RAW(sub_821FE358) {
             state.indexed_bind_generation=state.bind_generation;
             ++state.indexed_binds_bound;
           }
-          viewport.Bind(*state.context.Get());
-          if(same_material) {
-            bindings.BindConstants(*state.context.Get());
-            state.shaders.at(state.linked_pixel).bindings->BindConstants(*state.context.Get());
-            ++state.indexed_materials_reused;
-          } else {
-            bindings.Bind(*state.context.Get());
-            state.shaders.at(state.linked_pixel).bindings->Bind(*state.context.Get());
-            state.indexed_bind_vertex=state.active_vertex;
-            state.indexed_bind_pixel=state.linked_pixel;
-            state.indexed_bind_reversed=viewport.reverse_depth;
+          if(!seam_draws) {
+            viewport.Bind(*state.context.Get());
+            if(same_material) {
+              bindings.BindConstants(*state.context.Get());
+              state.shaders.at(state.linked_pixel).bindings->BindConstants(*state.context.Get());
+              ++state.indexed_materials_reused;
+            } else {
+              bindings.Bind(*state.context.Get());
+              state.shaders.at(state.linked_pixel).bindings->Bind(*state.context.Get());
+              state.indexed_bind_vertex=state.active_vertex;
+              state.indexed_bind_pixel=state.linked_pixel;
+              state.indexed_bind_reversed=viewport.reverse_depth;
+            }
           }
           binding_timing.Finish();
           if(REXCVAR_GET(edf_native_capture_indexed_state) &&
@@ -5006,7 +5074,11 @@ REX_HOOK_RAW(sub_821FE358) {
             }
           }
           const std::array<uint32_t,4> probe_key{state.active_vertex,state.linked_pixel,key[2],key[1]};
-          if (!REXCVAR_GET(edf_native_scene_capture).empty() && state.clip_probes.size()<24 &&
+          // The clip probe replays the draw with a stream-output geometry
+          // shader and requires this VS already bound on the context. A
+          // recorded draw binds nothing there, so the replay would refuse -
+          // correctly, but once per draw and in the log. Skip it instead.
+          if (!seam_draws && !REXCVAR_GET(edf_native_scene_capture).empty() && state.clip_probes.size()<24 &&
               state.clip_probes.insert(probe_key).second) {
             try {
               const auto positions=mesh.CaptureClipPositions(*state.context.Get(),bindings.shader(),
@@ -5045,7 +5117,13 @@ REX_HOOK_RAW(sub_821FE358) {
             } catch(const std::exception& error) { REXLOG_ERROR("Native clip probe: {}",error.what()); }
           }
           Microsoft::WRL::ComPtr<ID3D11Query> visibility;
-          if (!REXCVAR_GET(edf_native_scene_capture).empty() && state.scene_captures<3 && state.visibility.size()<2048) {
+          // A context query cannot count a draw that was recorded rather than
+          // issued on that context: it would return zero for every draw and
+          // read as "nothing was visible". The visibility diagnostic is a
+          // capture-time tool, so it is simply not taken on the recorded path
+          // rather than reporting a number that means nothing.
+          if (!seam_draws && !REXCVAR_GET(edf_native_scene_capture).empty() &&
+              state.scene_captures<3 && state.visibility.size()<2048) {
             const D3D11_QUERY_DESC query_desc{D3D11_QUERY_OCCLUSION,0};
             if (SUCCEEDED(state.device->CreateQuery(&query_desc,&visibility))) state.context->Begin(visibility.Get());
           }
@@ -5093,7 +5171,59 @@ REX_HOOK_RAW(sub_821FE358) {
                 state.batch_collapsible?100.0*double(state.batch_shape_breaks)/double(state.batch_collapsible):0.0);
             }
           }
-          try { mesh.Draw(*state.context.Get(),ctx.r6.u32,ctx.r7.u32,ctx.r5.s32); }
+          try {
+            if(seam_draws) {
+              auto& recorder=edf::native::SceneRecorderLocked(state);
+              const auto targets=edf::native::ActiveTargetsLocked(state);
+              if(!targets.count)
+                throw std::runtime_error("an indexed draw has no colour target to record into");
+              recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
+              recorder.SetViewport({viewport.viewport.TopLeftX,viewport.viewport.TopLeftY,
+                                    viewport.viewport.Width,viewport.viewport.Height,
+                                    viewport.viewport.MinDepth,viewport.viewport.MaxDepth});
+              recorder.SetScissor({viewport.scissor.left,viewport.scissor.top,
+                                   viewport.scissor.right,viewport.scissor.bottom},key[5]!=0);
+              auto& ps=*state.shaders.at(state.linked_pixel).bindings;
+              edf::native::NativeBackendPipelineDesc desc{};
+              auto* vs_code=bindings.shader().bytecode.Get();
+              auto* ps_code=ps.shader().bytecode.Get();
+              desc.vertex={static_cast<const uint8_t*>(vs_code->GetBufferPointer()),vs_code->GetBufferSize()};
+              desc.pixel={static_cast<const uint8_t*>(ps_code->GetBufferPointer()),ps_code->GetBufferSize()};
+              // The reversed-depth variant is a different compiled shader under
+              // the same guest handle, so it has to be part of the identity or
+              // the cache hands back the wrong one.
+              desc.vertex_id=(uint64_t(state.active_vertex)<<1)|uint64_t(viewport.reverse_depth?1:0);
+              desc.pixel_id=state.linked_pixel;
+              desc.input_layout=mesh.input_layout().elements();
+              desc.input_layout_id=mesh.input_layout().fingerprint();
+              desc.state=key;
+              desc.topology=edf::native::NativeBackendTopology::TriangleList;
+              desc.render_targets=targets.count;
+              desc.rtv_format=targets.rtv_format;
+              desc.dsv_format=targets.dsv_format;
+              desc.sample_count=targets.samples;
+              recorder.SetPipeline(edf::native::EnsureSceneBackendLocked(state).CreatePipeline(desc));
+              if(found->second.requires_blend_factor)
+                recorder.SetBlendFactor(edf::native::GuestBlendFactorForDraw(reader,ctx.r3.u32));
+              for(const auto& image:bindings.ConstantImages())
+                recorder.SetConstants(edf::native::NativeBackendStage::Vertex,image.slot,image.bytes);
+              for(const auto& image:ps.ConstantImages())
+                recorder.SetConstants(edf::native::NativeBackendStage::Pixel,image.slot,image.bytes);
+              // Pixel-stage only, which is what every shader in this game and
+              // this renderer uses. A vertex shader that sampled something
+              // would have it silently unbound here, so say so instead: the
+              // backends refuse vertex-stage textures outright and this is
+              // where that would first be noticed.
+              if(!bindings.TextureImages().empty() || !bindings.SamplerImages().empty())
+                throw std::runtime_error("a vertex shader with textures or samplers cannot be recorded: "
+                                         "no backend's root signature declares them");
+              for(const auto& image:ps.TextureImages())
+                recorder.SetTexture(edf::native::NativeBackendStage::Pixel,image.slot,image.texture);
+              for(const auto& image:ps.SamplerImages())
+                recorder.SetSampler(edf::native::NativeBackendStage::Pixel,image.slot,image.sampler);
+              mesh.Draw(recorder,ctx.r6.u32,ctx.r7.u32,ctx.r5.s32);
+            } else mesh.Draw(*state.context.Get(),ctx.r6.u32,ctx.r7.u32,ctx.r5.s32);
+          }
           catch (...) { if (visibility) state.context->End(visibility.Get()); throw; }
           if (visibility) {
             state.context->End(visibility.Get());
@@ -5143,6 +5273,12 @@ REX_HOOK_RAW(sub_821FE358) {
                 // interpolation extrapolate the colour varyings far outside the
                 // range the vertex shader can emit.
                 try {
+                  // Same reason as the clip probe above: the replay needs this
+                  // VS bound on the context, and a recorded draw binds nothing
+                  // there.
+                  if(seam_draws) throw std::runtime_error(
+                    "clip positions cannot be replayed for a draw recorded through the backend; "
+                    "run with --edf_native_seam_draws=false to diagnose this");
                   const auto clip=mesh.CaptureClipPositions(*state.context.Get(),bindings.shader(),
                     ctx.r6.u32,(std::min)(ctx.r7.u32,24u),ctx.r5.s32);
                   float min_w=std::numeric_limits<float>::infinity(),max_w=-min_w;

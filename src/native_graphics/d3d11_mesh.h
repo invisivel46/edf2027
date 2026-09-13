@@ -90,6 +90,11 @@ class NativeIndexedMesh {
   // replacing changing immediate geometry without creating another GPU buffer.
   void UpdateVertices(ID3D11DeviceContext& context,std::span<const uint8_t> vertices);
   void Draw(ID3D11DeviceContext& context,uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
+  // The same draw through a recorder. The pipeline carries the vertex layout
+  // and the shaders, so the caller sets that; this sets the buffers and issues
+  // the draw, which is all that is per-mesh about it.
+  void Draw(NativeBackendRecorder& recorder,uint32_t first_index,uint32_t index_count,
+            int32_t base_vertex=0) const;
   void ValidateDraw(uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
   // Diagnostic float3 input from the exact CPU generations used by this mesh.
   // Attribute offset is relative to the guest stride; no guest memory is read.
@@ -97,6 +102,10 @@ class NativeIndexedMesh {
   std::vector<std::array<float,3>> CaptureSourceFloat3(uint32_t first_index,
     uint32_t index_count,int32_t base_vertex,uint32_t attribute_offset) const;
   void DrawLines(ID3D11DeviceContext& context,uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
+  void DrawLines(NativeBackendRecorder& recorder,uint32_t first_index,uint32_t index_count,
+                 int32_t base_vertex=0) const;
+  // Vertex stride and index width, for a caller building the draw itself.
+  uint32_t stride() const { return stride_; }
   void ValidateLineDraw(uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
   // Diagnostic replay only: capture SV_POSITION before rasterization. Requires
   // this VS already bound, no GS or SO targets, and at most 96 triangle vertices.
@@ -116,6 +125,8 @@ class NativeIndexedMesh {
   NativeOwnedInputLayout input_layout_;
   void ValidateRange(uint32_t first,uint32_t count,int32_t base,uint32_t primitive_width) const;
   void BindAndDraw(ID3D11DeviceContext& context,uint32_t first,uint32_t count,int32_t base,D3D11_PRIMITIVE_TOPOLOGY topology) const;
+  void BindAndDraw(NativeBackendRecorder& recorder,uint32_t first,uint32_t count,int32_t base,
+                   NativeBackendTopology topology) const;
   std::shared_ptr<NativeVertexBuffer> vertex_storage_;
   Microsoft::WRL::ComPtr<ID3D11InputLayout> layout_;
   std::shared_ptr<const NativeIndexBuffer> index_storage_;

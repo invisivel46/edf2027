@@ -25,6 +25,7 @@ struct NativeTexture {
   Microsoft::WRL::ComPtr<ID3D11Texture2D> resource;
   Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
   uint32_t width = 0, height = 0, mip_count = 0;
+  uint32_t format = 0;
   bool cube = false;
   // Describes initialized pixel data, not complete game-frame fidelity.
   // DDS imports are initialized. Render-target textures become valid only
@@ -42,6 +43,10 @@ struct NativeRenderTarget {
   Microsoft::WRL::ComPtr<ID3D11Texture2D> surface;
   Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
   NativeTexture sampled;
+  // What a pipeline drawing into this has to declare. Remembered rather than
+  // asked for: D3D11 would answer from the resource, and neither target API
+  // will.
+  uint32_t format = 0, samples = 1;
   bool content_valid = false;
   Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> resolve_source;
   Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> resolve_destination;
@@ -53,6 +58,7 @@ struct NativeDepthTarget {
   Microsoft::WRL::ComPtr<ID3D11Texture2D> surface;
   Microsoft::WRL::ComPtr<ID3D11DepthStencilView> target;
   uint32_t width = 0, height = 0;
+  uint32_t format = 0, samples = 1;
   bool has_stencil = false;
   bool depth_valid = false, stencil_valid = false;
 };

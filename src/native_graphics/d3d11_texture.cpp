@@ -71,6 +71,7 @@ NativeDepthTarget CreateNativeDepthTarget(NativeRenderBackend& backend,uint32_t 
   result.surface=NativeD3D11RenderTargetResource(*result.backend_target);
   result.target=NativeD3D11DepthStencilView(*result.backend_target);
   result.width=width; result.height=height;
+  result.format=format; result.samples=samples;
   result.has_stencil=format!=DXGI_FORMAT_D32_FLOAT;
   return result;
 }
@@ -102,6 +103,7 @@ NativeRenderTarget CreateNativeRenderTarget(NativeRenderBackend& backend, uint32
   result.backend_surface=backend.CreateRenderTarget(desc);
   if(!result.backend_surface) throw std::runtime_error("native render surface creation failed");
   AttachD3D11Handles(result);
+  result.format=format; result.samples=samples;
   // Shaders sample the explicit single-sample resolve, never the surface.
   NativeBackendTextureDesc sampled_desc{};
   sampled_desc.width=width; sampled_desc.height=height; sampled_desc.levels=1;
@@ -112,6 +114,7 @@ NativeRenderTarget CreateNativeRenderTarget(NativeRenderBackend& backend, uint32
   sampled.resource=NativeD3D11TextureResource(*sampled.backend);
   sampled.view=NativeD3D11TextureView(*sampled.backend);
   sampled.width = width; sampled.height = height; sampled.mip_count = 1;
+  sampled.format = format;
   sampled.content_valid = false;
   return result;
 }
@@ -129,6 +132,7 @@ static NativeRenderTarget CreateConvertedTarget(NativeRenderBackend& backend,uin
   result.backend_surface=backend.CreateRenderTarget(desc);
   if(!result.backend_surface) throw std::runtime_error("native converted render surface creation failed");
   AttachD3D11Handles(result);
+  result.format=surface_format; result.samples=1;
   auto* surface_texture=result.backend_surface->texture();
   if(!surface_texture) throw std::runtime_error("a converted target surface cannot be sampled");
   result.resolve_source=NativeD3D11TextureView(*surface_texture);
@@ -149,6 +153,7 @@ static NativeRenderTarget CreateConvertedTarget(NativeRenderBackend& backend,uin
       FAILED(device->CreateUnorderedAccessView(result.sampled.resource.Get(),nullptr,&result.resolve_destination)))
     throw std::runtime_error("native converted sampled texture creation failed");
   result.sampled.width=width; result.sampled.height=height; result.sampled.mip_count=1;
+  result.sampled.format=sampled_format;
   result.sampled.content_valid=false;
   Microsoft::WRL::ComPtr<ID3DBlob> code,errors;
   if (FAILED(D3DCompile(source.data(),source.size(),"native-target-resolve",nullptr,nullptr,"CS","cs_5_0",
@@ -285,6 +290,7 @@ NativeTexture CreateNativeDdsTexture(NativeRenderBackend& backend, std::span<con
   result.width = decoded.width;
   result.height = decoded.height;
   result.mip_count = decoded.mip_count;
+  result.format = decoded.format;
   result.cube = decoded.cube;
 
   // The seam takes one tightly packed block in subresource order - every

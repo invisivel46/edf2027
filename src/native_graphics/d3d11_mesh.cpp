@@ -349,6 +349,22 @@ void NativeIndexedMesh::Draw(ID3D11DeviceContext& context,uint32_t first,uint32_
   ValidateDraw(first,count,base);
   BindAndDraw(context,first,count,base,D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 }
+void NativeIndexedMesh::Draw(NativeBackendRecorder& recorder,uint32_t first,uint32_t count,int32_t base) const {
+  ValidateDraw(first,count,base);
+  BindAndDraw(recorder,first,count,base,NativeBackendTopology::TriangleList);
+}
+void NativeIndexedMesh::DrawLines(NativeBackendRecorder& recorder,uint32_t first,uint32_t count,int32_t base) const {
+  ValidateLineDraw(first,count,base);
+  BindAndDraw(recorder,first,count,base,NativeBackendTopology::LineList);
+}
+void NativeIndexedMesh::BindAndDraw(NativeBackendRecorder& recorder,uint32_t first,uint32_t count,
+                                    int32_t base,NativeBackendTopology topology) const {
+  recorder.SetVertexBuffer(0,*vertex_storage_->storage_,stride_,0);
+  recorder.SetIndexBuffer(*index_storage_->storage_,
+    index_storage_->width_==2?NativeBackendIndexFormat::Uint16:NativeBackendIndexFormat::Uint32,0);
+  recorder.SetTopology(topology);
+  recorder.DrawIndexed(count,first,base);
+}
 void NativeIndexedMesh::DrawLines(ID3D11DeviceContext& context,uint32_t first,uint32_t count,int32_t base) const {
   ValidateLineDraw(first,count,base);
   BindAndDraw(context,first,count,base,D3D11_PRIMITIVE_TOPOLOGY_LINELIST);

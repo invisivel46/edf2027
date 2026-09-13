@@ -4,6 +4,7 @@
 #include <dxgi1_2.h>
 #include <wrl/client.h>
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -96,7 +97,18 @@ class D3D11Pipeline final : public NativeBackendPipeline {
   ComPtr<ID3D11RasterizerState> raster;
   D3D11_PRIMITIVE_TOPOLOGY topology=D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
   bool requires_blend_factor=false;
+  bool replicate_blend_alpha=false;
 };
+// The factor this pipeline actually wants, from the factor the guest wrote.
+inline std::array<float,4> ResolvedBlendFactor(bool requires_factor,bool replicate,
+                                               const std::array<float,4>& factor) {
+  if(!requires_factor) return factor;
+  for(float value:factor)
+    if(!std::isfinite(value) || value<0 || value>1)
+      throw std::runtime_error("a constant blend factor outside [0,1] cannot be bound");
+  if(replicate) return {factor[3],factor[3],factor[3],factor[3]};
+  return factor;
+}
 
 class D3D11Query final : public NativeBackendQuery {
  public:
@@ -184,7 +196,9 @@ class D3D11Recorder final : public NativeBackendRecorder {
     // D3D11 carries the factor on the blend state, so it is re-sent with the
     // state rather than on its own.
     if(bound_.pipeline)
-      context_->OMSetBlendState(bound_.pipeline->blend.Get(),factor.data(),0xffffffff);
+      context_->OMSetBlendState(bound_.pipeline->blend.Get(),
+        ResolvedBlendFactor(bound_.pipeline->requires_blend_factor,
+                            bound_.pipeline->replicate_blend_alpha,factor).data(),0xffffffff);
   }
 
   void SetConstants(NativeBackendStage stage, uint32_t slot, std::span<const uint8_t> bytes) override {
@@ -652,6 +666,7 @@ class D3D11Backend final : public NativeRenderBackend {
     Require(device_->CreateRasterizerState(&raster,&pipeline->raster),"raster state creation");
     pipeline->topology=Topology(desc.topology);
     pipeline->requires_blend_factor=decoded.requires_blend_factor;
+    pipeline->replicate_blend_alpha=decoded.replicate_blend_alpha;
 
     auto& stored=pipelines_.emplace(std::move(key),std::move(pipeline)).first->second;
     return *stored;

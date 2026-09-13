@@ -1,6 +1,7 @@
 #include "d3d12_backend.h"
 #include "d3d12_pipeline.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <stdexcept>
@@ -97,16 +98,33 @@ class D3D12RenderTarget final : public NativeBackendRenderTarget {
 
 class D3D12Pipeline final : public NativeBackendPipeline {
  public:
-  D3D12Pipeline(ID3D12PipelineState& state, D3D12_PRIMITIVE_TOPOLOGY topology, bool requires_blend_factor)
-      : state_(&state),topology_(topology),requires_blend_factor_(requires_blend_factor) {}
+  D3D12Pipeline(ID3D12PipelineState& state, D3D12_PRIMITIVE_TOPOLOGY topology,
+                bool requires_blend_factor, bool replicate_blend_alpha)
+      : state_(&state),topology_(topology),requires_blend_factor_(requires_blend_factor),
+        replicate_blend_alpha_(replicate_blend_alpha) {}
   ID3D12PipelineState& state() const { return *state_; }
   D3D12_PRIMITIVE_TOPOLOGY topology() const { return topology_; }
   bool requires_blend_factor() const { return requires_blend_factor_; }
+  bool replicate_blend_alpha() const { return replicate_blend_alpha_; }
  private:
   ID3D12PipelineState* state_;
   D3D12_PRIMITIVE_TOPOLOGY topology_;
   bool requires_blend_factor_;
+  bool replicate_blend_alpha_=false;
 };
+// The factor this pipeline actually wants, from the factor the guest wrote.
+// Duplicated deliberately in both backends rather than shared: it is three
+// lines, and a helper that only one of them called would be the thing that
+// drifts.
+inline std::array<float,4> ResolvedBlendFactor(bool requires_factor,bool replicate,
+                                               const std::array<float,4>& factor) {
+  if(!requires_factor) return factor;
+  for(float value:factor)
+    if(!std::isfinite(value) || value<0 || value>1)
+      throw std::runtime_error("a constant blend factor outside [0,1] cannot be bound");
+  if(replicate) return {factor[3],factor[3],factor[3],factor[3]};
+  return factor;
+}
 
 class D3D12Sampler final : public NativeBackendSampler {
  public:
@@ -249,7 +267,13 @@ class D3D12Recorder final : public NativeBackendRecorder {
     Commands().IASetPrimitiveTopology(Topology(topology));
   }
   void SetBlendFactor(const std::array<float,4>& factor) override {
-    Commands().OMSetBlendFactor(factor.data());
+    // Needs the pipeline, because whether the alpha is replicated is part of
+    // the blend state it was built from.
+    if(!bound_.pipeline)
+      throw std::runtime_error("a blend factor was set before the pipeline it belongs to");
+    Commands().OMSetBlendFactor(ResolvedBlendFactor(bound_.pipeline->requires_blend_factor(),
+                                                    bound_.pipeline->replicate_blend_alpha(),
+                                                    factor).data());
     bound_.blend_factor_set=true;
   }
 
@@ -750,6 +774,10 @@ class D3D12Backend final : public NativeRenderBackend {
   }
 
   NativeBackendPipeline& CreatePipeline(const NativeBackendPipelineDesc& desc) override {
+    // Decoded once here rather than twice: the pipeline cache builds its own
+    // state from these words, and the wrapper below needs the two blend-factor
+    // answers out of the same decode.
+    const auto decoded=DecodeNativeRenderState(desc.state);
     ValidateAgainstRootLayout(desc.vertex,false,"vertex shader "+std::to_string(desc.vertex_id));
     ValidateAgainstRootLayout(desc.pixel,true,"pixel shader "+std::to_string(desc.pixel_id));
 
@@ -791,8 +819,8 @@ class D3D12Backend final : public NativeRenderBackend {
     if(found==wrappers_.end())
       found=wrappers_.emplace(std::move(key),
                               std::make_unique<D3D12Pipeline>(state,Topology(desc.topology),
-                                                              DecodeNativeRenderState(desc.state)
-                                                                .requires_blend_factor)).first;
+                                                              decoded.requires_blend_factor,
+                                                              decoded.replicate_blend_alpha)).first;
     return *found->second;
   }
 
