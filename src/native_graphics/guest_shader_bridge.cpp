@@ -4346,6 +4346,10 @@ REX_EXTERN(__imp__edf_native_indexed_cpu_tail);
 REX_HOOK_RAW(sub_821FE358) {
   bool native_submitted=false;
   bool native_geometry_rejected=false;
+  // The stride and index width belong to the draw, not the declaration, and the
+  // coverage catalog needs both to replay a layout at the size it was actually
+  // drawn with. Resolved inside the draw, reported after it.
+  uint32_t drawn_stride=0,drawn_index_width=0;
   edf::native::HookTiming native_timing(edf::native::HookPhase::IndexedNative);
   if (REXCVAR_GET(edf_native_shader_bridge)) {
     auto& state=edf::native::State();
@@ -4415,6 +4419,7 @@ REX_HOOK_RAW(sub_821FE358) {
           const auto header=edf::native::ReadGuestWords<8>(reader,ib);
           index_address=header[6]; index_bytes=header[7]; index_width=(header[0]&0x80000000u)?4:2;
         }
+        drawn_stride=stream.stride; drawn_index_width=index_width;
         if (state.indexed_draws<=20) REXLOG_INFO("Native indexed input: draw={}, primitive={}, base={}, first={}, count={}, stride={}, vertex_bytes={}, index_bytes={}, index_width={}, elements={}, target={:#x}, native_vb={}, native_ib={}",
           state.indexed_draws,ctx.r4.u32,ctx.r5.s32,ctx.r6.u32,ctx.r7.u32,stream.stride,
           vertex_bytes,index_bytes,index_width,elements,state.active_target,native_vb!=nullptr,native_ib!=nullptr);
@@ -4795,7 +4800,7 @@ REX_HOOK_RAW(sub_821FE358) {
         const edf::native::GuestReader reader(base);
         state.contracts.RecordSubmitted(edf::native::MakeNativeContract(state,
           edf::native::NativeContractPath::Indexed,state.active_vertex,state.linked_pixel,
-          reader.Word(reader.Add(ctx.r3.u32,11536)),ctx.r4.u32));
+          reader.Word(reader.Add(ctx.r3.u32,11536)),ctx.r4.u32,drawn_stride,drawn_index_width));
       } catch(const std::exception&) { /* Accounting must never fail a drawn frame. */ }
     }
     else {

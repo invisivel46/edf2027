@@ -120,3 +120,33 @@ fail-closed accounting plus content coverage.
   per-run, and a run reports only newly seen contracts.
 - Immediate, font, movie, XUI and utility paths record rejections but have no
   offline replay equivalent yet.
+
+## First real capture (2026-09-12)
+
+A user gameplay session on a healthy host exported
+`tests/fixtures/geometry-contract-mission1.txt`: **13 distinct vertex
+declarations and 28 draw contracts, with zero rejections**
+(`rejected_draws=0, distinct_rejected=0, omitted=0, errors=0, clean=true`).
+Replaying it offline builds **858 of 858 (declaration, vertex entry) pairs**
+against the disc's 44 effects and 66 distinct vertex entries, with no
+declaration that no entry can bind.
+
+The same session confirmed the sampled geometry comparison on content nobody
+scripted: compared 40,979 against trusted 4,169,237, `unreported_changes=0`,
+`revoked=false`. Frame rate held 50-60 during play.
+
+Two limitations this capture exposed, one fixed:
+
+- **Fixed.** Submitted contracts recorded `stride=0` and `index_width=0`,
+  because the indexed hook resolves both inside the draw while the accounting
+  runs after it. The checker fell back to the minimum stride the elements imply,
+  which is a lower bound rather than the size the game actually drew - a padded
+  layout was being tested at the wrong width. Both are now hoisted and captured.
+- **Open.** The run's log stopped at 22:12:45 while the catalog kept updating to
+  22:14:33, so the final in-log counters are missing and the export is the only
+  complete record. The catalog is rewritten whole each time and is therefore
+  still authoritative, but the log truncation is worth understanding before
+  relying on log-side coverage numbers for a long session.
+
+13 declarations is a small slice: one session, early content. The number is
+expected to grow with maps, weapons and menus until it stops.
