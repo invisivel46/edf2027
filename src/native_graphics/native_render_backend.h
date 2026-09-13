@@ -62,6 +62,14 @@ class NativeBackendRenderTarget {
   virtual ~NativeBackendRenderTarget()=default;
   virtual uint32_t width() const=0;
   virtual uint32_t height() const=0;
+  // The same surface as a sampleable texture, for a target declared `sampled`.
+  // Null otherwise, which is the normal case: a multisampled scene target is
+  // resolved into a separate texture and is not sampled directly.
+  //
+  // It has to be the same object rather than a copy, because on a backend with
+  // explicit barriers the two views share one resource state and a second
+  // wrapper would transition it behind the first one's back.
+  virtual NativeBackendTexture* texture() { return nullptr; }
 };
 enum class NativeBackendQueryKind : uint32_t { Occlusion, Timestamp, TimestampDisjoint };
 class NativeBackendQuery {
@@ -215,6 +223,11 @@ struct NativeBackendTextureDesc {
   // declare the same count, or it will not bind.
   uint32_t samples=1;
   bool render_target=false,depth=false;
+  // Drawn into and sampled, without a resolve between. The post chain's
+  // conversion passes need exactly this: read the surface, write the
+  // converted result. Refused together with multisampling, which would need a
+  // resolve and so a second resource - say what you mean instead.
+  bool sampled=false;
 };
 
 class NativeRenderBackend {

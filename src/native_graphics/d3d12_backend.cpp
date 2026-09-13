@@ -43,16 +43,24 @@ class D3D12Buffer final : public NativeBackendBuffer {
 
 class D3D12Texture final : public NativeBackendTexture {
  public:
-  D3D12Texture(TrackedResource tracked, uint32_t width, uint32_t height,
+  // The tracked resource is shared, not owned, because a sampled render target
+  // is one resource behind two handles and both must transition the same
+  // state. Two copies would each believe the resource was in the state they
+  // last put it in, and the barrier that mattered would be skipped.
+  D3D12Texture(std::shared_ptr<TrackedResource> tracked, uint32_t width, uint32_t height,
                D3D12_CPU_DESCRIPTOR_HANDLE view, NativeD3D12CpuDescriptorHeap& heap)
       : tracked_(std::move(tracked)),width_(width),height_(height),view_(view),heap_(&heap) {}
+  D3D12Texture(TrackedResource tracked, uint32_t width, uint32_t height,
+               D3D12_CPU_DESCRIPTOR_HANDLE view, NativeD3D12CpuDescriptorHeap& heap)
+      : D3D12Texture(std::make_shared<TrackedResource>(std::move(tracked)),width,height,view,heap) {}
   ~D3D12Texture() override { if(heap_) heap_->Free(view_); }
   uint32_t width() const override { return width_; }
   uint32_t height() const override { return height_; }
-  TrackedResource& tracked() { return tracked_; }
+  TrackedResource& tracked() { return *tracked_; }
+  const std::shared_ptr<TrackedResource>& shared() const { return tracked_; }
   D3D12_CPU_DESCRIPTOR_HANDLE view() const { return view_; }
  private:
-  TrackedResource tracked_;
+  std::shared_ptr<TrackedResource> tracked_;
   uint32_t width_,height_;
   D3D12_CPU_DESCRIPTOR_HANDLE view_;
   NativeD3D12CpuDescriptorHeap* heap_;
@@ -60,18 +68,27 @@ class D3D12Texture final : public NativeBackendTexture {
 
 class D3D12RenderTarget final : public NativeBackendRenderTarget {
  public:
+  D3D12RenderTarget(std::shared_ptr<TrackedResource> tracked, uint32_t width, uint32_t height,
+                    bool depth, D3D12_CPU_DESCRIPTOR_HANDLE view, NativeD3D12CpuDescriptorHeap& heap,
+                    std::unique_ptr<D3D12Texture> sampled={})
+      : tracked_(std::move(tracked)),sampled_(std::move(sampled)),width_(width),height_(height),
+        depth_(depth),view_(view),heap_(&heap) {}
   D3D12RenderTarget(TrackedResource tracked, uint32_t width, uint32_t height, bool depth,
                     D3D12_CPU_DESCRIPTOR_HANDLE view, NativeD3D12CpuDescriptorHeap& heap)
-      : tracked_(std::move(tracked)),width_(width),height_(height),depth_(depth),
-        view_(view),heap_(&heap) {}
+      : D3D12RenderTarget(std::make_shared<TrackedResource>(std::move(tracked)),width,height,depth,
+                          view,heap) {}
   ~D3D12RenderTarget() override { if(heap_) heap_->Free(view_); }
   uint32_t width() const override { return width_; }
   uint32_t height() const override { return height_; }
+  NativeBackendTexture* texture() override { return sampled_.get(); }
   bool depth() const { return depth_; }
-  TrackedResource& tracked() { return tracked_; }
+  TrackedResource& tracked() { return *tracked_; }
+  const std::shared_ptr<TrackedResource>& shared() const { return tracked_; }
   D3D12_CPU_DESCRIPTOR_HANDLE view() const { return view_; }
  private:
-  TrackedResource tracked_;
+  std::shared_ptr<TrackedResource> tracked_;
+  // The same resource behind a texture handle, sharing the state above.
+  std::unique_ptr<D3D12Texture> sampled_;
   uint32_t width_,height_;
   bool depth_;
   D3D12_CPU_DESCRIPTOR_HANDLE view_;
@@ -633,6 +650,8 @@ class D3D12Backend final : public NativeRenderBackend {
     TrackedResource tracked;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN,0,0};
+    if(desc.sampled && desc.samples>1)
+      throw std::runtime_error("a multisampled target cannot be sampled directly; resolve it into a texture");
     D3D12_RESOURCE_DESC description{};
     description.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     description.Width=desc.width;
@@ -652,6 +671,7 @@ class D3D12Backend final : public NativeRenderBackend {
     Require(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
                                                    tracked.state,&clear,IID_PPV_ARGS(&tracked.resource)),
             "render target creation");
+    auto shared=std::make_shared<TrackedResource>(std::move(tracked));
     auto& pool=desc.depth?depth_views_:render_target_views_;
     const auto view=pool.Allocate();
     const bool multisampled=description.SampleDesc.Count>1;
@@ -659,15 +679,28 @@ class D3D12Backend final : public NativeRenderBackend {
       D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
       dsv.Format=description.Format;
       dsv.ViewDimension=multisampled?D3D12_DSV_DIMENSION_TEXTURE2DMS:D3D12_DSV_DIMENSION_TEXTURE2D;
-      gpu_.device()->CreateDepthStencilView(tracked.resource.Get(),&dsv,view);
+      gpu_.device()->CreateDepthStencilView(shared->resource.Get(),&dsv,view);
     } else {
       D3D12_RENDER_TARGET_VIEW_DESC rtv{};
       rtv.Format=description.Format;
       rtv.ViewDimension=multisampled?D3D12_RTV_DIMENSION_TEXTURE2DMS:D3D12_RTV_DIMENSION_TEXTURE2D;
-      gpu_.device()->CreateRenderTargetView(tracked.resource.Get(),&rtv,view);
+      gpu_.device()->CreateRenderTargetView(shared->resource.Get(),&rtv,view);
     }
-    return std::make_unique<D3D12RenderTarget>(std::move(tracked),desc.width,desc.height,desc.depth,
-                                               view,pool);
+    std::unique_ptr<D3D12Texture> sampled;
+    if(desc.sampled) {
+      const auto srv_handle=texture_views_.Allocate();
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format=description.Format;
+      srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Texture2D.MipLevels=1;
+      gpu_.device()->CreateShaderResourceView(shared->resource.Get(),&srv,srv_handle);
+      // The same shared state, so a draw that samples this and a draw that
+      // writes it transition one resource, in order.
+      sampled=std::make_unique<D3D12Texture>(shared,desc.width,desc.height,srv_handle,texture_views_);
+    }
+    return std::make_unique<D3D12RenderTarget>(std::move(shared),desc.width,desc.height,desc.depth,
+                                               view,pool,std::move(sampled));
   }
 
   std::unique_ptr<NativeBackendQuery> CreateQuery(NativeBackendQueryKind kind) override {

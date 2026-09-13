@@ -597,6 +597,13 @@ struct Bridge {
   // is what the player picked, --edf_native_scene_backend is what the half-ported
   // scene can actually share targets with. See the cvar.
   std::unique_ptr<edf::native::NativeRenderBackend> scene_backend;
+  // Whether the scene backend has a frame open. Opened lazily by the first
+  // thing that records into it and closed at the guest's swap barrier, which
+  // is the only point in the frame where the renderer already knows the frame
+  // is over. A backend that records has to be told where a frame ends: D3D11
+  // did not, which is why nothing needed this until now.
+  bool scene_frame_open=false;
+  uint64_t scene_frames=0;
   // Declared after the backend so it is destroyed before it: the preview
   // thread uses the backend on every tick and must be stopped first.
   std::unique_ptr<edf::native::NativeD3D12Preview> backend_preview;
@@ -718,6 +725,10 @@ Bridge& State() { static Bridge state; return state; }
 // Defined below, next to the selection it mirrors; declared here because
 // the texture hook, further up, is the first thing to create a scene resource.
 edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state);
+// The scene backend's recorder, with a frame open.
+edf::native::NativeBackendRecorder& SceneRecorderLocked(Bridge& state);
+// Closes the frame if one is open. Safe to call when none is.
+void SubmitSceneFrameLocked(Bridge& state);
 // Called under the registry lock at consumption, never from a writer callback.
 void AuditGeneratedWrites(Bridge& state,const NativeBufferWrites::Batch& batch) {
   for(size_t i=0;i<batch.writer_hit_count;++i) {
@@ -1567,6 +1578,31 @@ edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state) {
     REXLOG_WARN("Native scene backend validation: {}",message);
   return *state.scene_backend;
 }
+edf::native::NativeBackendRecorder& SceneRecorderLocked(Bridge& state) {
+  auto& backend=EnsureSceneBackendLocked(state);
+  if(!state.scene_frame_open) {
+    backend.BeginFrame();
+    state.scene_frame_open=true;
+    ++state.scene_frames;
+  }
+  // Recorder 0: this renderer records the scene from one thread. Parallel
+  // recording is a later question and a different one - it needs the draws to
+  // be independent first, which is what moving them here is for.
+  return backend.Recorder(0);
+}
+void SubmitSceneFrameLocked(Bridge& state) {
+  if(!state.scene_frame_open) return;
+  state.scene_frame_open=false;
+  try {
+    state.scene_backend->Submit();
+  } catch(const std::exception& error) {
+    // A frame that cannot be submitted is lost either way; what must not
+    // happen is the next frame finding one still open and refusing to start.
+    REXLOG_ERROR("Native scene frame submit: {} (frame {})",error.what(),state.scene_frames);
+  }
+  for(const auto& message:state.scene_backend->DrainValidationMessages())
+    REXLOG_WARN("Native scene backend validation: {}",message);
+}
 }  // namespace
 
 void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
@@ -2191,6 +2227,10 @@ REX_EXTERN(edf_native_swap_wait) {
     throw std::runtime_error("native swap requires an initialized native device");
   if(reader.Word(reader.Add(device,15120)))
     throw std::runtime_error("native swap has an unaudited vblank callback");
+  // Everything this frame recorded into the scene backend goes now, before the
+  // barrier below waits for the GPU: submitting after the wait would put this
+  // frame's work behind the wait that was meant to cover it.
+  SubmitSceneFrameLocked(state);
   auto [it,inserted]=state.swap_clocks.try_emplace(device);
   auto& timing=it->second;
   if(inserted) timing.clock.Reset(NativePacingClock::Clock::now(),0);

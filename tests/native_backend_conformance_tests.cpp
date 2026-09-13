@@ -49,6 +49,9 @@ struct Rendered {
   std::vector<uint8_t> depth_tested, target0, target1;
   // Two targets drawn from one dynamic vertex buffer, rewritten between them.
   std::vector<uint8_t> dynamic_before, dynamic_after;
+  // A target drawn into and then sampled, in one frame, without a resolve.
+  // Twice, because one round trip does not diverge a per-view state tracker.
+  std::vector<uint8_t> sampled_target, sampled_target_again;
   bool refused_missing_blend_factor=false;
   bool refused_partial_dynamic_update=false;
   uint64_t query_samples = 0;
@@ -264,6 +267,71 @@ Rendered Render(NativeRenderBackend& backend) {
   }
   backend.Submit();
   out.textured = backend.ReadRenderTarget(*target);
+
+  // A render target sampled in the same frame it was drawn into.
+  //
+  // One resource behind two views. On a backend with explicit barriers the two
+  // have to agree about the state it is in: if the sampled handle carried its
+  // own copy of that state, the transition from "being written" to "being
+  // read" would be skipped and this would read a target the GPU has not
+  // finished writing. The post chain's conversion passes are exactly this
+  // shape, which is why it is checked rather than assumed.
+  NativeBackendTextureDesc sampled_desc = target_desc;
+  sampled_desc.sampled = true;
+  const auto sampled = backend.CreateRenderTarget(sampled_desc);
+  Check(sampled->texture() != nullptr, std::string(backend.name()) +
+        ": a target declared sampled has no texture handle");
+  const auto second = backend.CreateRenderTarget(target_desc);
+  const auto third = backend.CreateRenderTarget(target_desc);
+  NativeBackendRenderTarget* sampled_colors[] = {sampled.get()};
+  NativeBackendRenderTarget* second_colors[] = {second.get()};
+  NativeBackendRenderTarget* third_colors[] = {third.get()};
+  backend.BeginFrame();
+  {
+    auto& recorder = backend.Recorder();
+    recorder.SetViewport({0, 0, kSize, kSize, 0, 1});
+    // Write it: a flat green half-triangle over a red clear.
+    recorder.SetRenderTargets(sampled_colors, nullptr);
+    recorder.ClearColor(*sampled, {1.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetPipeline(flat_pipeline);
+    recorder.SetVertexBuffer(0, *half_buffer, sizeof(float) * 3, 0);
+    recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                          {reinterpret_cast<const uint8_t*>(green.data()), sizeof(float) * 4});
+    recorder.Draw(3, 0);
+    // Read it, in the same frame, into a different target, covering all of it.
+    recorder.SetRenderTargets(second_colors, nullptr);
+    recorder.ClearColor(*second, {0.0f, 0.0f, 1.0f, 1.0f});
+    recorder.SetPipeline(textured_pipeline);
+    recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+    recorder.SetTexture(NativeBackendStage::Pixel, 0, sampled->texture());
+    recorder.SetSampler(NativeBackendStage::Pixel, 0, &sampler);
+    recorder.Draw(3, 0);
+
+    // Round two, which is the one that matters. After the read above, the
+    // resource is in a read state. Writing it again has to transition it back,
+    // and a backend holding one state per *view* rather than per resource now
+    // believes it is still writable and emits no barrier at all - which the
+    // pixels may survive on a software rasteriser but the debug layer will
+    // not, and real hardware will not either.
+    recorder.SetRenderTargets(sampled_colors, nullptr);
+    recorder.SetPipeline(flat_pipeline);
+    recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+    const std::array<float, 4> white{1.0f, 1.0f, 1.0f, 1.0f};
+    recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                          {reinterpret_cast<const uint8_t*>(white.data()), sizeof(float) * 4});
+    recorder.Draw(3, 0);
+
+    recorder.SetRenderTargets(third_colors, nullptr);
+    recorder.ClearColor(*third, {0.0f, 0.0f, 1.0f, 1.0f});
+    recorder.SetPipeline(textured_pipeline);
+    recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+    recorder.SetTexture(NativeBackendStage::Pixel, 0, sampled->texture());
+    recorder.SetSampler(NativeBackendStage::Pixel, 0, &sampler);
+    recorder.Draw(3, 0);
+  }
+  backend.Submit();
+  out.sampled_target = backend.ReadRenderTarget(*second);
+  out.sampled_target_again = backend.ReadRenderTarget(*third);
 
   // Mipped: level 0 red, level 1 blue, and the shader samples level 1, so a
   // backend that uploaded only the top level renders something else.
@@ -593,14 +661,17 @@ int main() {
           {"depth", &rendered.depth_tested}, {"target0", &rendered.target0},
           {"target1", &rendered.target1},
           {"dynamic-before", &rendered.dynamic_before},
-          {"dynamic-after", &rendered.dynamic_after}};
+          {"dynamic-after", &rendered.dynamic_after},
+          {"sampled-target", &rendered.sampled_target},
+          {"sampled-target-again", &rendered.sampled_target_again}};
       const std::vector<uint8_t>* references[] = {&reference.flat, &reference.textured,
                                                   &reference.instanced, &reference.mipped,
                                                   &reference.compressed, &reference.blended,
                                                   &reference.depth_tested, &reference.target0,
                                                   &reference.target1, &reference.dynamic_before,
-                                                  &reference.dynamic_after};
-      for (size_t index = 0; index < 11; ++index) {
+                                                  &reference.dynamic_after, &reference.sampled_target,
+                                                  &reference.sampled_target_again};
+      for (size_t index = 0; index < 13; ++index) {
         const auto difference = Compare(*references[index], *surfaces[index].second);
         Check(difference.pixels == 0,
               std::string(name) + " differs from d3d11-warp on the " + surfaces[index].first +
@@ -658,6 +729,35 @@ int main() {
       Check(both_green < kSize * 2,
             name + ": the draws either side of the dynamic rewrite overlap on " +
                 std::to_string(both_green) + " pixels, so the rewrite reached the first one");
+      // Sampling the target that was just drawn into reproduces it: the same
+      // half-covering green triangle, over red rather than the blue clear the
+      // second target started with. Blue anywhere means the sample read the
+      // clear instead of the draw.
+      uint32_t sampled_green = 0, sampled_red = 0, sampled_blue = 0;
+      for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+          if (at(rendered.sampled_target, x, y, 1) > 200) ++sampled_green;
+          else if (at(rendered.sampled_target, x, y, 0) > 200) ++sampled_red;
+          if (at(rendered.sampled_target, x, y, 2) > 200 &&
+              at(rendered.sampled_target, x, y, 0) < 60) ++sampled_blue;
+        }
+      Check(sampled_blue == 0,
+            name + ": " + std::to_string(sampled_blue) + " pixels of the second target were never " +
+                "written, so sampling a target drawn in the same frame did not happen");
+      Check(sampled_green == covered && sampled_red == kSize * kSize - covered,
+            name + ": sampling a target drawn in the same frame gave " + std::to_string(sampled_green) +
+                " green and " + std::to_string(sampled_red) + " red pixels, not " +
+                std::to_string(covered) + " and " + std::to_string(kSize * kSize - covered));
+      // The second round trip covered the whole target in white.
+      uint32_t sampled_white = 0;
+      for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x)
+          if (at(rendered.sampled_target_again, x, y, 0) > 200 &&
+              at(rendered.sampled_target_again, x, y, 1) > 200 &&
+              at(rendered.sampled_target_again, x, y, 2) > 200) ++sampled_white;
+      Check(sampled_white == kSize * kSize,
+            name + ": the second write-then-sample round trip left " + std::to_string(sampled_white) +
+                " of " + std::to_string(kSize * kSize) + " pixels white");
       Check(rendered.refused_partial_dynamic_update,
             name + " accepted a partial update of a dynamic buffer, whose untouched bytes are undefined");
       Check(rendered.query_samples == covered,

@@ -55,18 +55,22 @@ class D3D11Texture final : public NativeBackendTexture {
 class D3D11RenderTarget final : public NativeBackendRenderTarget {
  public:
   D3D11RenderTarget(ComPtr<ID3D11Texture2D> texture, ComPtr<ID3D11RenderTargetView> colour,
-                    ComPtr<ID3D11DepthStencilView> depth, uint32_t width, uint32_t height)
+                    ComPtr<ID3D11DepthStencilView> depth, uint32_t width, uint32_t height,
+                    std::unique_ptr<D3D11Texture> sampled={})
       : texture_(std::move(texture)),colour_(std::move(colour)),depth_(std::move(depth)),
-        width_(width),height_(height) {}
+        sampled_(std::move(sampled)),width_(width),height_(height) {}
   uint32_t width() const override { return width_; }
   uint32_t height() const override { return height_; }
-  ID3D11Texture2D* texture() const { return texture_.Get(); }
+  NativeBackendTexture* texture() override { return sampled_.get(); }
+  ID3D11Texture2D* resource() const { return texture_.Get(); }
   ID3D11RenderTargetView* colour() const { return colour_.Get(); }
   ID3D11DepthStencilView* depth() const { return depth_.Get(); }
  private:
   ComPtr<ID3D11Texture2D> texture_;
   ComPtr<ID3D11RenderTargetView> colour_;
   ComPtr<ID3D11DepthStencilView> depth_;
+  // The same ID3D11Texture2D behind a texture handle, for a sampled target.
+  std::unique_ptr<D3D11Texture> sampled_;
   uint32_t width_,height_;
 };
 
@@ -284,10 +288,10 @@ class D3D11Recorder final : public NativeBackendRecorder {
     auto& to=static_cast<D3D11Texture&>(destination);
     auto& from=static_cast<D3D11RenderTarget&>(source);
     D3D11_TEXTURE2D_DESC description{};
-    from.texture()->GetDesc(&description);
+    from.resource()->GetDesc(&description);
     if(description.SampleDesc.Count>1)
-      context_->ResolveSubresource(to.texture(),0,from.texture(),0,description.Format);
-    else context_->CopyResource(to.texture(),from.texture());
+      context_->ResolveSubresource(to.texture(),0,from.resource(),0,description.Format);
+    else context_->CopyResource(to.texture(),from.resource());
   }
   void UpdateBuffer(NativeBackendBuffer& buffer, uint32_t offset, std::span<const uint8_t> bytes) override {
     auto& concrete=static_cast<D3D11Buffer&>(buffer);
@@ -493,6 +497,8 @@ class D3D11Backend final : public NativeRenderBackend {
   }
 
   std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc) override {
+    if(desc.sampled && desc.samples>1)
+      throw std::runtime_error("a multisampled target cannot be sampled directly; resolve it into a texture");
     D3D11_TEXTURE2D_DESC description{};
     description.Width=desc.width;
     description.Height=desc.height;
@@ -502,14 +508,21 @@ class D3D11Backend final : public NativeRenderBackend {
     description.SampleDesc={desc.samples?desc.samples:1,0};
     description.Usage=D3D11_USAGE_DEFAULT;
     description.BindFlags=desc.depth?D3D11_BIND_DEPTH_STENCIL:D3D11_BIND_RENDER_TARGET;
+    if(desc.sampled) description.BindFlags|=D3D11_BIND_SHADER_RESOURCE;
     ComPtr<ID3D11Texture2D> texture;
     Require(device_->CreateTexture2D(&description,nullptr,&texture),"render target creation");
     ComPtr<ID3D11RenderTargetView> colour;
     ComPtr<ID3D11DepthStencilView> depth;
     if(desc.depth) Require(device_->CreateDepthStencilView(texture.Get(),nullptr,&depth),"depth view creation");
     else Require(device_->CreateRenderTargetView(texture.Get(),nullptr,&colour),"render target view creation");
+    std::unique_ptr<D3D11Texture> sampled;
+    if(desc.sampled) {
+      ComPtr<ID3D11ShaderResourceView> view;
+      Require(device_->CreateShaderResourceView(texture.Get(),nullptr,&view),"sampled target view creation");
+      sampled=std::make_unique<D3D11Texture>(texture,std::move(view),desc.width,desc.height);
+    }
     return std::make_unique<D3D11RenderTarget>(std::move(texture),std::move(colour),std::move(depth),
-                                               desc.width,desc.height);
+                                               desc.width,desc.height,std::move(sampled));
   }
 
   std::unique_ptr<NativeBackendQuery> CreateQuery(NativeBackendQueryKind kind) override {
@@ -661,9 +674,9 @@ class D3D11Backend final : public NativeRenderBackend {
     if(open_) throw std::runtime_error("ReadRenderTarget cannot run inside an open frame");
     auto& concrete=static_cast<D3D11RenderTarget&>(target);
     D3D11_TEXTURE2D_DESC description{};
-    concrete.texture()->GetDesc(&description);
+    concrete.resource()->GetDesc(&description);
 
-    ComPtr<ID3D11Texture2D> source=concrete.texture();
+    ComPtr<ID3D11Texture2D> source=concrete.resource();
     if(description.SampleDesc.Count>1) {
       // A multisampled surface cannot be mapped, so it is resolved first.
       auto resolved_desc=description;
@@ -671,7 +684,7 @@ class D3D11Backend final : public NativeRenderBackend {
       resolved_desc.BindFlags=0;
       ComPtr<ID3D11Texture2D> resolved;
       Require(device_->CreateTexture2D(&resolved_desc,nullptr,&resolved),"resolve texture creation");
-      context_->ResolveSubresource(resolved.Get(),0,concrete.texture(),0,description.Format);
+      context_->ResolveSubresource(resolved.Get(),0,concrete.resource(),0,description.Format);
       source=resolved;
     }
     auto staging_desc=description;
