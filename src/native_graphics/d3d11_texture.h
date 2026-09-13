@@ -81,6 +81,13 @@ NativeRenderTarget CreateNativeRenderTarget(NativeRenderBackend& backend, uint32
 void ResolveNativeRenderTarget(ID3D11DeviceContext& context, NativeRenderTarget& target);
 // The same resolve recorded. Required for a converting target on a backend
 // that is not D3D11, because the conversion is a draw.
+//
+// A converting target's resolve therefore leaves the recorder's render targets,
+// viewport, scissor and pipeline set to the conversion's own. It cannot put
+// them back: a recorder has no getters, deliberately, because neither target
+// API keeps state to read. Callers that cache what they last bound must treat
+// this as having bound something else. The compute pass this replaces did
+// restore them, which is exactly the assumption that has to go.
 void ResolveNativeRenderTarget(NativeBackendRecorder& recorder, NativeRenderTarget& target);
 // Full-surface packed ARGB clear. Does not implicitly resolve the sampled view.
 void ClearNativeColorTarget(ID3D11DeviceContext& context, NativeRenderTarget& target,

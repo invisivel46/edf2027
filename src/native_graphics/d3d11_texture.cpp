@@ -154,7 +154,8 @@ Microsoft::WRL::ComPtr<ID3DBlob> CompileConvertShader(std::string_view source,co
 }
 }  // namespace
 static NativeRenderTarget CreateConvertedTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height,
-  DXGI_FORMAT surface_format,DXGI_FORMAT sampled_format,std::string_view source,NativeRenderTarget::Conversion conversion) {
+  DXGI_FORMAT surface_format,DXGI_FORMAT sampled_format,std::string_view source,
+  NativeRenderTarget::Conversion conversion,uint64_t shader_id) {
   // Both halves are sampled render targets: the surface because the conversion
   // reads it, and the converted result because the conversion draws into it and
   // everything downstream samples it.
@@ -196,10 +197,13 @@ static NativeRenderTarget CreateConvertedTarget(NativeRenderBackend& backend,uin
   NativeBackendPipelineDesc pipeline{};
   pipeline.vertex=BlobBytes(*vertex_code.Get());
   pipeline.pixel=BlobBytes(*pixel_code.Get());
-  // One vertex shader and one pixel shader per conversion kind, so the ids are
-  // the kind itself rather than a guest handle.
+  // One vertex shader for every conversion, and one pixel shader per source
+  // here, so the ids are constants rather than guest handles. The pixel id is
+  // per shader and not per Conversion: two kinds share Conversion::rgba8 and
+  // differ only in the shader, and keying the cache on the kind would hand one
+  // of them the other's pipeline.
   pipeline.vertex_id=0x636f6e7600000001ull;
-  pipeline.pixel_id=0x636f6e7600000010ull+static_cast<uint64_t>(conversion);
+  pipeline.pixel_id=0x636f6e7600000010ull+shader_id;
   pipeline.input_layout=layout;
   pipeline.input_layout_id=0x636f6e7600000002ull;
   pipeline.state=kNativeOpaqueCopyState;
@@ -215,7 +219,7 @@ NativeRenderTarget CreateNativeLuminanceTarget(NativeRenderBackend& backend,uint
 Texture2D<float> Source : register(t0);
 float4 PS(float4 position : SV_POSITION) : SV_TARGET {
   return float4(Source.Load(int3(position.xy,0)),1,1,1);
-})",NativeRenderTarget::Conversion::luminance);
+})",NativeRenderTarget::Conversion::luminance,0);
 }
 NativeRenderTarget CreateNativeBloomTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height) {
   // The guest swaps red/blue on resolve for the BGRA texture and swaps them
@@ -224,7 +228,7 @@ NativeRenderTarget CreateNativeBloomTarget(NativeRenderBackend& backend,uint32_t
 Texture2D<float4> Source : register(t0);
 float4 PS(float4 position : SV_POSITION) : SV_TARGET {
   return Source.Load(int3(position.xy,0));
-})",NativeRenderTarget::Conversion::rgba8);
+})",NativeRenderTarget::Conversion::rgba8,1);
 }
 NativeRenderTarget CreateNativeOpaqueFrameTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height) {
   // XRGB backbuffers have constant-one sampled alpha. Logical RGB is already
@@ -233,7 +237,7 @@ NativeRenderTarget CreateNativeOpaqueFrameTarget(NativeRenderBackend& backend,ui
 Texture2D<float4> Source : register(t0);
 float4 PS(float4 position : SV_POSITION) : SV_TARGET {
   return float4(Source.Load(int3(position.xy,0)).rgb,1);
-})",NativeRenderTarget::Conversion::rgba8);
+})",NativeRenderTarget::Conversion::rgba8,2);
 }
 bool ImportZeroLuminanceHistory(ID3D11DeviceContext& context,NativeRenderTarget& target,
                                 std::span<const uint8_t> initial_page) {
