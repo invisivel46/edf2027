@@ -615,6 +615,34 @@ struct Bridge {
   // did not, which is why nothing needed this until now.
   bool scene_frame_open=false;
   uint64_t scene_frames=0;
+  // What the last recorded draw left the recorder holding.
+  //
+  // The same reasoning the direct path already uses: 77.4% of this game's
+  // draws repeat the one before them in everything but the constants an
+  // activation patched between them, so re-sending the pipeline, the targets,
+  // the viewport and the material is the same calls with the same arguments.
+  // The direct path skips those and this has to as well, or recording is
+  // slower than the thing it replaces for no reason anyone would accept.
+  struct RecordedBindings {
+    bool valid=false;
+    // Bumped by anything that binds the context directly. On the adopted D3D11
+    // backend the recorder and the direct paths share one context, so a direct
+    // bind invalidates what the recorder believes is still set.
+    uint64_t bind_generation=0;
+    uint64_t frame=0;
+    const edf::native::NativeBackendPipeline* pipeline=nullptr;
+    std::array<edf::native::NativeBackendRenderTarget*,8> colors{};
+    uint32_t color_count=0;
+    edf::native::NativeBackendRenderTarget* depth=nullptr;
+    D3D11_VIEWPORT viewport{};
+    D3D11_RECT scissor{};
+    bool scissor_enabled=false;
+    const edf::native::ShaderBindings* pixel=nullptr;
+    uint64_t pixel_resources=0;
+    bool blend_factor_needed=false;
+    std::array<float,4> blend_factor{};
+  } recorded;
+  uint64_t recorded_draws=0,recorded_pipeline_skips=0,recorded_material_skips=0;
   // Declared after the backend so it is destroyed before it: the preview
   // thread uses the backend on every tick and must be stopped first.
   std::unique_ptr<edf::native::NativeD3D12Preview> backend_preview;
@@ -1312,12 +1340,34 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
   auto& recorder=SceneRecorderLocked(state);
   const auto targets=ActiveTargetsLocked(state);
   if(!targets.count) throw std::runtime_error("a recorded draw has no colour target to record into");
-  recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
-  recorder.SetViewport({draw.viewport.viewport.TopLeftX,draw.viewport.viewport.TopLeftY,
-                        draw.viewport.viewport.Width,draw.viewport.viewport.Height,
-                        draw.viewport.viewport.MinDepth,draw.viewport.viewport.MaxDepth});
-  recorder.SetScissor({draw.viewport.scissor.left,draw.viewport.scissor.top,
-                       draw.viewport.scissor.right,draw.viewport.scissor.bottom},draw.state[5]!=0);
+  ++state.recorded_draws;
+  auto& last=state.recorded;
+  // Nothing the recorder already holds is re-sent. The comparison is against
+  // what this code last sent, not against device state, because neither target
+  // API has device state to ask - which is also why a direct bind on the shared
+  // context has to invalidate it explicitly.
+  const bool same_frame=last.valid && last.frame==state.scene_frames &&
+                        last.bind_generation==state.bind_generation;
+  bool same_targets=same_frame && last.color_count==targets.count && last.depth==targets.depth;
+  for(uint32_t index=0;same_targets && index<targets.count;++index)
+    same_targets=last.colors[index]==targets.colors[index];
+  if(!same_targets) {
+    recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
+    last.color_count=targets.count; last.colors=targets.colors; last.depth=targets.depth;
+  }
+  const auto& view=draw.viewport.viewport;
+  const auto& scissor=draw.viewport.scissor;
+  const bool scissor_enabled=draw.state[5]!=0;
+  if(!same_frame || std::memcmp(&last.viewport,&view,sizeof(view))!=0) {
+    recorder.SetViewport({view.TopLeftX,view.TopLeftY,view.Width,view.Height,
+                          view.MinDepth,view.MaxDepth});
+    last.viewport=view;
+  }
+  if(!same_frame || last.scissor_enabled!=scissor_enabled ||
+     std::memcmp(&last.scissor,&scissor,sizeof(scissor))!=0) {
+    recorder.SetScissor({scissor.left,scissor.top,scissor.right,scissor.bottom},scissor_enabled);
+    last.scissor=scissor; last.scissor_enabled=scissor_enabled;
+  }
   // Pixel-stage resources only, which is what every shader in this game and
   // this renderer uses. A vertex shader that sampled something would have it
   // silently unbound, so it is refused instead: no backend root signature
@@ -1341,17 +1391,37 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
   desc.dsv_format=targets.dsv_format;
   desc.sample_count=targets.samples;
   auto& pipeline=backend.CreatePipeline(desc);
-  recorder.SetPipeline(pipeline);
-  if(DecodeNativeRenderState(draw.state).requires_blend_factor)
-    recorder.SetBlendFactor(GuestBlendFactorForDraw(reader,device));
+  if(&pipeline!=last.pipeline || !same_frame) {
+    recorder.SetPipeline(pipeline);
+    last.pipeline=&pipeline;
+    // A blend factor belongs to the pipeline that was bound with it; a new
+    // pipeline has not been given one.
+    last.blend_factor_needed=false;
+  } else ++state.recorded_pipeline_skips;
+  if(DecodeNativeRenderState(draw.state).requires_blend_factor) {
+    const auto factor=GuestBlendFactorForDraw(reader,device);
+    if(!last.blend_factor_needed || factor!=last.blend_factor) {
+      recorder.SetBlendFactor(factor);
+      last.blend_factor=factor; last.blend_factor_needed=true;
+    }
+  }
+  // Constants are always re-sent: an activation patches them between draws,
+  // which is the whole reason a run of otherwise identical draws exists.
   for(const auto& image:draw.vertex.ConstantImages())
     recorder.SetConstants(edf::native::NativeBackendStage::Vertex,image.slot,image.bytes);
   for(const auto& image:draw.pixel.ConstantImages())
     recorder.SetConstants(edf::native::NativeBackendStage::Pixel,image.slot,image.bytes);
-  for(const auto& image:draw.pixel.TextureImages())
-    recorder.SetTexture(edf::native::NativeBackendStage::Pixel,image.slot,image.texture);
-  for(const auto& image:draw.pixel.SamplerImages())
-    recorder.SetSampler(edf::native::NativeBackendStage::Pixel,image.slot,image.sampler);
+  if(&draw.pixel!=last.pixel || draw.pixel.resource_generation()!=last.pixel_resources || !same_frame) {
+    for(const auto& image:draw.pixel.TextureImages())
+      recorder.SetTexture(edf::native::NativeBackendStage::Pixel,image.slot,image.texture);
+    for(const auto& image:draw.pixel.SamplerImages())
+      recorder.SetSampler(edf::native::NativeBackendStage::Pixel,image.slot,image.sampler);
+    last.pixel=&draw.pixel;
+    last.pixel_resources=draw.pixel.resource_generation();
+  } else ++state.recorded_material_skips;
+  last.valid=true;
+  last.frame=state.scene_frames;
+  last.bind_generation=state.bind_generation;
   return recorder;
 }
 void BindActiveTarget(Bridge& state) {
@@ -1729,6 +1799,10 @@ edf::native::NativeBackendRecorder& SceneRecorderLocked(Bridge& state) {
 void SubmitSceneFrameLocked(Bridge& state) {
   if(!state.scene_frame_open) return;
   state.scene_frame_open=false;
+  // Nothing survives a frame boundary: the recorder's own tracked state is
+  // reset when the next frame opens, so what this believed was still bound is
+  // no longer true.
+  state.recorded={};
   try {
     state.scene_backend->Submit();
   } catch(const std::exception& error) {
@@ -5201,6 +5275,12 @@ REX_HOOK_RAW(sub_821FE358) {
           // DrawIndexedInstanced replaces. Measure the run lengths before
           // building that: the mean run length is the draw-call reduction, and
           // a mean near 1 would mean there is nothing to collapse.
+          if(state.recorded_draws && state.recorded_draws%1000000==0)
+            REXLOG_INFO("Native recorded binding reuse: draws={}, pipeline_skips={} ({:.1f}%), material_skips={} ({:.1f}%) (a skip is a draw whose pipeline or material the recorder already held)",
+              state.recorded_draws,state.recorded_pipeline_skips,
+              100.0*double(state.recorded_pipeline_skips)/double(state.recorded_draws),
+              state.recorded_material_skips,
+              100.0*double(state.recorded_material_skips)/double(state.recorded_draws));
           if(REXCVAR_GET(edf_native_batch_audit) && state.indexed_draws%1000000==0)
             REXLOG_INFO("Native indexed binding reuse: bound={}, skipped={} ({:.1f}% of draws bound no target or render state, because the draw before them had already bound the same)",
               state.indexed_binds_bound,state.indexed_binds_skipped,

@@ -192,10 +192,12 @@ bool ShaderBindings::TrySetTexture(const std::string& name, std::shared_ptr<Nati
   if (found == textures_.end()) return false;
   texture_slots_.at(found->second)=texture?NativeD3D11TextureView(*texture):nullptr;
   texture_values_.at(found->second) = std::move(texture);
+  ++resource_generation_;
   return true;
 }
 void ShaderBindings::ClearTextures() {
   for (auto& [slot, texture] : texture_values_) { texture.reset(); texture_slots_[slot]=nullptr; }
+  ++resource_generation_;
 }
 NativeBackendTexture* ShaderBindings::ReadTexture(const std::string& name) const {
   const auto found=textures_.find(name);
@@ -216,6 +218,7 @@ bool ShaderBindings::TrySetTexture(const ResourceBinding& binding,std::shared_pt
   if(!binding.texture_) return false;
   texture_slots_.at(*binding.texture_)=texture?NativeD3D11TextureView(*texture):nullptr;
   texture_values_.at(*binding.texture_)=std::move(texture);
+  ++resource_generation_;
   return true;
 }
 bool ShaderBindings::TrySetSampler(const ResourceBinding& binding,NativeBackendSampler* sampler) {
@@ -223,10 +226,12 @@ bool ShaderBindings::TrySetSampler(const ResourceBinding& binding,NativeBackendS
   if(!binding.sampler_) return false;
   sampler_values_.at(*binding.sampler_)=sampler;
   sampler_slots_.at(*binding.sampler_)=sampler?NativeD3D11SamplerState(*sampler):nullptr;
+  ++resource_generation_;
   return true;
 }
 void ShaderBindings::ClearSamplers() {
   for (auto& [slot, sampler] : sampler_values_) { sampler=nullptr; sampler_slots_[slot]=nullptr; }
+  ++resource_generation_;
 }
 void ShaderBindings::SetSampler(const std::string& name, NativeBackendSampler* sampler) {
   if (!TrySetSampler(name,sampler)) throw std::runtime_error("unknown sampler: " + name);
@@ -236,6 +241,7 @@ bool ShaderBindings::TrySetSampler(const std::string& name, NativeBackendSampler
   if (found == samplers_.end()) return false;
   sampler_values_.at(found->second) = sampler;
   sampler_slots_.at(found->second)=sampler?NativeD3D11SamplerState(*sampler):nullptr;
+  ++resource_generation_;
   return true;
 }
 bool ShaderBindings::HasAllTextureInputs() const {

@@ -93,6 +93,11 @@ class ShaderBindings {
   struct SamplerImage { UINT slot; NativeBackendSampler* sampler; };
   std::vector<TextureImage> TextureImages() const;
   std::vector<SamplerImage> SamplerImages() const;
+  // Bumped by every texture and sampler change. A caller that re-sent this
+  // material's resources last draw can skip them this draw only if this has
+  // not moved; comparing the object's address would not catch an activation
+  // re-pointing a texture inside it, which is the common case.
+  uint64_t resource_generation() const { return resource_generation_; }
   bool HasAllTextureInputs() const;
   bool UsesTextureResource(ID3D11Resource& resource) const;
   bool UsesTexture(const NativeBackendTexture& texture) const;
@@ -122,6 +127,7 @@ class ShaderBindings {
   std::map<std::string, UINT> textures_, samplers_;
   std::map<UINT, std::shared_ptr<NativeBackendTexture>> texture_values_;
   std::map<UINT, NativeBackendSampler*> sampler_values_;
+  uint64_t resource_generation_=1;
   // Immutable reflected runs, with live pointers backed by the owning maps.
   // These cache binding data, never D3D context state: Bind always re-emits it.
   std::vector<std::pair<UINT,UINT>> texture_runs_,sampler_runs_;
