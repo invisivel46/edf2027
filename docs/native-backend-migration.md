@@ -713,7 +713,7 @@ remaining port, and they disappear with it.
 
 ### Step 2, finished: every scene draw records through the seam
 
-`--edf_native_seam_draws` makes all five draw paths - indexed geometry, scene
+`--edf_native_seam_draws` makes every scene draw path - indexed geometry, scene
 immediate geometry, XUI, font, movie and the post chain's full-screen quads -
 build a pipeline and record into a recorder instead of binding four D3D11
 objects and calling the context. With `--edf_native_scene_backend=d3d11` both
@@ -725,12 +725,15 @@ In the game: 466,000 indexed draws, zero errors, and the same 294 mesh builds
 and 31,944,056 bytes of converted geometry as the direct path reached at the
 same point in the same script.
 
-**What recording cost, and what got it back.** Recorded draws started at 2.60 us
-each against 1.62 us direct, over 510,278 and 771,082 draws. The difference was
+**What recording cost.** Recorded draws started at 2.60 us each against 1.62 us
+direct, over 510,278 and 771,082 draws of the same script. The difference was
 not the backend: the direct path skips 98% of its binding work when the draw
 before it bound the same things, and the recorded path was doing all of it every
-draw. Teaching it the same skip - and not re-staging constants whose bytes have
-not changed - is what closes that gap. Two things make the skip trustworthy:
+draw. Teaching it the same skip took that to 2.33 us over 680,547 draws. Not
+rebuilding the pipeline description per draw, and not re-staging constants whose
+bytes have not changed, came after that and are **not yet measured** - the run
+that would have measured them was spent on the D3D12 selection instead. Two
+things make the skip trustworthy:
 
 * a material's resources change *inside* one bindings object when an activation
   re-points a texture, so the comparison is against a counter the bindings keep,
