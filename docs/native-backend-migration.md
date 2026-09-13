@@ -766,12 +766,15 @@ reading its own pixel coordinate. The arithmetic is unchanged.
 
 **Presentation.** The scene's finished frame reaches the window as an
 `ID3D11Texture2D` handed to `NativeFrameHandoff`, which is D3D11 throughout. A
-D3D12 scene has no such texture, so nothing reaches the screen and the run
-stalls behind a presenter waiting for a frame that will never be published. The
-mechanism to fix it already exists and is already proven - `OpenSharedTexture`
-and `WaitSharedFence` on the seam, which is how the D3D12 preview window samples
-a D3D11 frame today - but the handoff itself has to be written against the seam
-rather than against a device.
+D3D12 scene has no such texture, so nothing reaches the screen. The observed
+behaviour is that the run then reaches about 1.5 fps and stops advancing; the
+stall has not been attributed yet, and "no frame is ever published" is the
+obvious suspect rather than a finding.
+
+The mechanism to fix the handoff already exists and is already proven -
+`OpenSharedTexture` and `WaitSharedFence` on the seam, which is how the D3D12
+preview window samples a D3D11 frame today - but the handoff itself has to be
+written against the seam rather than against a device.
 
 That is the last structural piece. Until it lands, `--edf_native_scene_backend`
 stays `d3d11`, which is what the cvar has said since it was added.
