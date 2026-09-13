@@ -37,4 +37,21 @@ void RegisterNativeD3D11Backend();
 std::unique_ptr<NativeRenderBackend> AdoptNativeD3D11Backend(ID3D11Device& device,
                                                              ID3D11DeviceContext& context);
 std::unique_ptr<NativeRenderBackend> CreateNativeD3D11Backend(const NativeD3D11BackendOptions& options={});
+
+// Wrap resources the renderer already owns so a path can be ported before the
+// paths that create its inputs are.
+//
+// This is the other half of adoption, and the reason the port can go one path
+// at a time: a ported draw needs a render target and textures, and until the
+// code that creates those has moved, they are D3D11 objects. Both throw if the
+// backend is not an adopting D3D11 backend, because doing this across devices
+// would silently produce a resource the target device cannot use.
+//
+// Neither takes ownership. The caller must keep the underlying view alive, and
+// must not hold the wrapper across a resize that replaces it.
+std::unique_ptr<NativeBackendTexture> AdoptNativeD3D11Texture(
+    NativeRenderBackend& backend, ID3D11ShaderResourceView& view, uint32_t width, uint32_t height);
+std::unique_ptr<NativeBackendRenderTarget> AdoptNativeD3D11RenderTarget(
+    NativeRenderBackend& backend, ID3D11RenderTargetView* colour, ID3D11DepthStencilView* depth,
+    uint32_t width, uint32_t height);
 }  // namespace edf::native

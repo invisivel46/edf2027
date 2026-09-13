@@ -34,6 +34,8 @@ class D3D11Buffer final : public NativeBackendBuffer {
 
 class D3D11Texture final : public NativeBackendTexture {
  public:
+  // An adopted view has no texture of its own; nothing here needs one except
+  // CopyTexture, which refuses rather than dereferencing null.
   D3D11Texture(ComPtr<ID3D11Texture2D> texture, ComPtr<ID3D11ShaderResourceView> view,
                uint32_t width, uint32_t height)
       : texture_(std::move(texture)),view_(std::move(view)),width_(width),height_(height) {}
@@ -269,8 +271,11 @@ class D3D11Recorder final : public NativeBackendRecorder {
   }
 
   void CopyTexture(NativeBackendTexture& destination, NativeBackendTexture& source) override {
-    context_->CopyResource(static_cast<D3D11Texture&>(destination).texture(),
-                           static_cast<D3D11Texture&>(source).texture());
+    auto& to=static_cast<D3D11Texture&>(destination);
+    auto& from=static_cast<D3D11Texture&>(source);
+    if(!to.texture() || !from.texture())
+      throw std::runtime_error("an adopted texture was copied; adoption wraps a view, not a resource");
+    context_->CopyResource(to.texture(),from.texture());
   }
   void ResolveTarget(NativeBackendTexture& destination, NativeBackendRenderTarget& source) override {
     auto& to=static_cast<D3D11Texture&>(destination);
@@ -770,6 +775,24 @@ class D3D11Backend final : public NativeRenderBackend {
   bool open_=false,debug_layer_refused_=false,owns_device_=true;
 };
 }  // namespace
+
+std::unique_ptr<NativeBackendTexture> AdoptNativeD3D11Texture(
+    NativeRenderBackend& backend, ID3D11ShaderResourceView& view, uint32_t width, uint32_t height) {
+  if(backend.name()!="d3d11")
+    throw std::runtime_error("a D3D11 texture can only be adopted by a D3D11 backend; "
+                             "this one is "+std::string(backend.name()));
+  return std::make_unique<D3D11Texture>(nullptr,&view,width,height);
+}
+
+std::unique_ptr<NativeBackendRenderTarget> AdoptNativeD3D11RenderTarget(
+    NativeRenderBackend& backend, ID3D11RenderTargetView* colour, ID3D11DepthStencilView* depth,
+    uint32_t width, uint32_t height) {
+  if(backend.name()!="d3d11")
+    throw std::runtime_error("a D3D11 render target can only be adopted by a D3D11 backend; "
+                             "this one is "+std::string(backend.name()));
+  if(!colour && !depth) throw std::runtime_error("adopting a render target needs a view");
+  return std::make_unique<D3D11RenderTarget>(nullptr,colour,depth,width,height);
+}
 
 std::unique_ptr<NativeRenderBackend> AdoptNativeD3D11Backend(ID3D11Device& device,
                                                              ID3D11DeviceContext& context) {
