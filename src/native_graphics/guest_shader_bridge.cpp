@@ -135,6 +135,8 @@ REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
 REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
                      "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
+REXCVAR_DEFINE_BOOL(edf_native_backend_present, true, "EDF2027",
+                   "Let the selected backend present the game's window from its own device. False keeps the D3D11 presenter, which is the control for measuring what the backend path costs or saves");
 REXCVAR_DEFINE_BOOL(edf_native_reuse_material, true, "EDF2027",
                    "Skip re-binding the shader pair, textures and samplers when the previous indexed draw already bound the same ones and nothing has bound since. Set false if repeated objects ever show another material's textures; that is what a wrong guard here looks like");
 REXCVAR_DEFINE_INT32(edf_native_shader_workers, -1, "EDF2027",
@@ -1558,7 +1560,12 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
   REXLOG_INFO("Native shader bridge: initialized hardware D3D11 device");
   // The host window asks for a backend through this rather than calling into
   // the bridge, so it can still be built standalone by its own test.
-  edf::native::SetNativeHostBackendProvider([]{ return edf::native::EnsureNativeRenderBackend(); });
+  // The flag is read here rather than in the host surface, which is also
+  // built standalone by its own test and cannot see the bridge's cvars.
+  edf::native::SetNativeHostBackendProvider([]() -> edf::native::NativeRenderBackend* {
+    if(!REXCVAR_GET(edf_native_backend_present)) return nullptr;
+    return edf::native::EnsureNativeRenderBackend();
+  });
   REXLOG_INFO("Native render backend: --edf_native_backend={}; built on first use, so selecting one costs nothing until something draws through it. The renderer's own draw path is still direct D3D11 and does not use it yet",
     REXCVAR_GET(edf_native_backend).empty()?std::string("none"):REXCVAR_GET(edf_native_backend));
   if(REXCVAR_GET(edf_native_backend_preview)) {
