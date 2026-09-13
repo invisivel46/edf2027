@@ -122,8 +122,6 @@ class NativeBackendRecorder {
 
   virtual void BeginQuery(NativeBackendQuery& query)=0;
   virtual void EndQuery(NativeBackendQuery& query)=0;
-  // False when the result is not ready; never blocks.
-  virtual bool ReadQuery(NativeBackendQuery& query,std::span<uint8_t> result)=0;
 
   // State ownership, replacing the D3D11 getters. A caller that needs to run
   // foreign work and restore afterwards asks the recorder, because on a second
@@ -196,6 +194,11 @@ class NativeRenderBackend {
                                                               std::span<const uint8_t> initial)=0;
   virtual std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc)=0;
   virtual std::unique_ptr<NativeBackendQuery> CreateQuery(NativeBackendQueryKind kind)=0;
+  // False when the result is not ready; never blocks. On the backend rather
+  // than the recorder, where it started: reading a result is not a recorded
+  // command, and a caller polling for one has no frame open and so no recorder
+  // to ask.
+  virtual bool ReadQuery(NativeBackendQuery& query, std::span<uint8_t> result)=0;
   // Expensive on both target APIs, and cached by the backend on the whole
   // description - so calling this every frame with the same description is
   // cheap, while a combination first seen mid-gameplay is a visible hitch.

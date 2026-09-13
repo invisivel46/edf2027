@@ -105,6 +105,11 @@ class NativeD3D12Device {
 
   const NativeUploadRing& upload_ring(uint32_t recorder=0) const { return rings_.at(recorder); }
   uint64_t frames_submitted() const { return frame_counter_; }
+  // The fence value the open frame will signal, and the one the GPU has
+  // actually reached. A caller that wants to know whether its work is done -
+  // a query result, say - compares the two rather than blocking.
+  uint64_t pending_fence() const { return next_fence_; }
+  uint64_t completed_fence() const { return fence_?fence_->GetCompletedValue():0; }
   // How many times a frame had to stall waiting for upload memory. Zero is the
   // expected reading; anything else means upload_bytes is too small, and it
   // should be visible as a number rather than as an unexplained stutter.

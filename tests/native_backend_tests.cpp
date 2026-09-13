@@ -39,6 +39,7 @@ class StubBackend final : public edf::native::NativeRenderBackend {
     throw std::runtime_error("stub backend records nothing");
   }
   uint32_t RecorderCount() const override { return 1; }
+  bool ReadQuery(edf::native::NativeBackendQuery&, std::span<uint8_t>) override { return false; }
   bool SupportsParallelRecording() const override { return parallel_; }
   void BeginFrame() override {}
   std::vector<uint8_t> ReadRenderTarget(edf::native::NativeBackendRenderTarget&) override { return {}; }

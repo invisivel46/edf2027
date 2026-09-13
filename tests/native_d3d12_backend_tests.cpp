@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <chrono>
 #include <thread>
 #include <vector>
 
@@ -465,6 +466,109 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET { return tint; }
         Check(false, "D3D12 validation error while recording in parallel: " + message);
       std::cout << "parallel recording: " << green_left << " px from recorder 0, " << blue_right
                 << " px from recorder 1\n";
+    }
+
+    {
+      // An occlusion query around a draw whose coverage is already known from
+      // the first test: 2,016 pixels. A query that returns a plausible-looking
+      // number is not enough - it has to return that one.
+      const auto query = backend->CreateQuery(NativeBackendQueryKind::Occlusion);
+      Check(query != nullptr, "the occlusion query was not created");
+
+      uint64_t samples = 0;
+      std::span<uint8_t> into{reinterpret_cast<uint8_t*>(&samples), sizeof(samples)};
+      backend->BeginFrame();
+      auto& counted = backend->Recorder();
+      counted.SetRenderTargets(colors, nullptr);
+      counted.SetViewport({0, 0, static_cast<float>(kSize), static_cast<float>(kSize), 0, 1});
+      counted.ClearColor(*target, {0.0f, 0.0f, 0.0f, 1.0f});
+      counted.SetPipeline(pipeline);
+      counted.SetVertexBuffer(0, *vertex_buffer, sizeof(float) * 3, 0);
+      counted.SetConstants(NativeBackendStage::Pixel, 0,
+                           {reinterpret_cast<const uint8_t*>(tint.data()), sizeof(float) * 4});
+      counted.BeginQuery(*query);
+      counted.Draw(3, 0);
+      counted.EndQuery(*query);
+      backend->Submit();
+
+      // Never blocks, so the caller polls. Reading it before the GPU has
+      // reached the resolve must say "not ready", not hand back stale bytes.
+      uint32_t attempts = 0;
+      while (!backend->ReadQuery(*query, into) && attempts < 10000) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        ++attempts;
+      }
+      Check(attempts < 10000, "the occlusion query never became readable");
+      Check(samples == 2016, "the occlusion query counted " + std::to_string(samples) +
+                                 " samples, not the 2016 pixels that draw covers");
+      std::cout << "occlusion query: " << samples << " samples after " << attempts << " polls\n";
+    }
+    {
+      // A mipped texture, uploaded level by level. Level 1 is a different
+      // colour from level 0, and the draw samples level 1 explicitly - so if
+      // only the top level were uploaded, this reads back whatever level 1
+      // happened to contain, which is not the colour asked for.
+      NativeBackendTextureDesc mipped_desc{};
+      mipped_desc.width = mipped_desc.height = 2;
+      mipped_desc.levels = 2;
+      mipped_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      // Level 0 is 2x2 red, level 1 is 1x1 blue, packed tightly one after the
+      // other, which is how the disc assets arrive.
+      const uint8_t mip_bytes[] = {255, 0, 0, 255,  255, 0, 0, 255,
+                                   255, 0, 0, 255,  255, 0, 0, 255,
+                                   0,   0, 255, 255};
+      const auto mipped = backend->CreateTexture(mipped_desc, mip_bytes);
+
+      NativeBackendSamplerDesc mip_sampler_desc{};
+      mip_sampler_desc.min = mip_sampler_desc.mag = mip_sampler_desc.mip = NativeBackendFilter::Point;
+      mip_sampler_desc.u = mip_sampler_desc.v = mip_sampler_desc.w = NativeBackendAddress::Clamp;
+      auto& mip_sampler = backend->CreateSampler(mip_sampler_desc);
+
+      const char* kMipped = R"(
+Texture2D image : register(t0);
+SamplerState filtering : register(s0);
+struct Varying { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
+Varying VS(float3 position : POSITION) {
+  Varying output;
+  output.position = float4(position, 1);
+  output.uv = position.xy * 0.5 + 0.5;
+  return output;
+}
+float4 PS(Varying input) : SV_TARGET { return image.SampleLevel(filtering, input.uv, 1); }
+)";
+      const auto mip_vs = Compile(kMipped, "VS", "vs_5_0");
+      const auto mip_ps = Compile(kMipped, "PS", "ps_5_0");
+      const float cover[] = {-1.0f, -1.0f, 0.0f, 3.0f, -1.0f, 0.0f, -1.0f, 3.0f, 0.0f};
+      NativeBackendBufferDesc cover_desc{};
+      cover_desc.bytes = sizeof(cover);
+      cover_desc.vertex = true;
+      const auto cover_buffer = backend->CreateBuffer(
+          cover_desc, {reinterpret_cast<const uint8_t*>(cover), sizeof(cover)});
+
+      NativeBackendPipelineDesc mip_pipeline_desc = pipeline_desc;
+      mip_pipeline_desc.vertex = Bytes(*mip_vs.Get());
+      mip_pipeline_desc.pixel = Bytes(*mip_ps.Get());
+      mip_pipeline_desc.vertex_id = 0x99;
+      mip_pipeline_desc.pixel_id = 0xAA;
+      auto& mip_pipeline = backend->CreatePipeline(mip_pipeline_desc);
+
+      backend->BeginFrame();
+      auto& mip_recorder = backend->Recorder();
+      mip_recorder.SetRenderTargets(colors, nullptr);
+      mip_recorder.SetViewport({0, 0, static_cast<float>(kSize), static_cast<float>(kSize), 0, 1});
+      mip_recorder.ClearColor(*target, {0.0f, 0.0f, 0.0f, 1.0f});
+      mip_recorder.SetPipeline(mip_pipeline);
+      mip_recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+      mip_recorder.SetTexture(NativeBackendStage::Pixel, 0, mipped.get());
+      mip_recorder.SetSampler(NativeBackendStage::Pixel, 0, &mip_sampler);
+      mip_recorder.Draw(3, 0);
+      backend->Submit();
+
+      const auto sampled_mip = backend->ReadRenderTarget(*target);
+      const size_t middle = (static_cast<size_t>(kSize / 2) * kSize + kSize / 2) * 4;
+      Check(sampled_mip[middle + 2] > 200 && sampled_mip[middle] < 60,
+            "level 1 of the mipped texture is not the colour it was uploaded with");
+      std::cout << "mipped upload: level 1 sampled correctly\n";
     }
 
     // A missing barrier would not change a single pixel above; only the API's

@@ -94,14 +94,24 @@ class D3D12Sampler final : public NativeBackendSampler {
   D3D12_SAMPLER_DESC desc_;
 };
 
+// A D3D12 query is not readable where it is written. The result has to be
+// resolved into a buffer on the command list, and that buffer is only valid
+// once the GPU has passed the fence for the frame that resolved it - which is
+// why the query remembers a fence value rather than a flag.
 class D3D12Query final : public NativeBackendQuery {
  public:
-  D3D12Query(ComPtr<ID3D12QueryHeap> heap, NativeBackendQueryKind kind) : heap_(std::move(heap)),kind_(kind) {}
+  D3D12Query(ComPtr<ID3D12QueryHeap> heap, ComPtr<ID3D12Resource> readback, NativeBackendQueryKind kind)
+      : heap_(std::move(heap)),readback_(std::move(readback)),kind_(kind) {}
   ID3D12QueryHeap* heap() const { return heap_.Get(); }
+  ID3D12Resource* readback() const { return readback_.Get(); }
   NativeBackendQueryKind kind() const { return kind_; }
+  void Resolved(uint64_t fence) { fence_=fence; }
+  uint64_t fence() const { return fence_; }
  private:
   ComPtr<ID3D12QueryHeap> heap_;
+  ComPtr<ID3D12Resource> readback_;
   NativeBackendQueryKind kind_;
+  uint64_t fence_=0;  // 0 = never resolved.
 };
 
 D3D12_FILTER_TYPE FilterType(NativeBackendFilter filter) {
@@ -348,14 +358,13 @@ class D3D12Recorder final : public NativeBackendRecorder {
   void EndQuery(NativeBackendQuery& query) override {
     auto& concrete=static_cast<D3D12Query&>(query);
     Commands().EndQuery(concrete.heap(),D3D12_QUERY_TYPE_OCCLUSION,0);
+    // Resolved straight away rather than on a later frame: the result is only
+    // readable out of a buffer, and deferring the resolve would mean tracking
+    // which frame each unresolved query belonged to.
+    Commands().ResolveQueryData(concrete.heap(),D3D12_QUERY_TYPE_OCCLUSION,0,1,
+                                concrete.readback(),0);
+    concrete.Resolved(gpu_->pending_fence());
   }
-  bool ReadQuery(NativeBackendQuery&, std::span<uint8_t>) override {
-    // Resolving a query needs a readback buffer and a fence the caller can
-    // poll. Returning false says "not ready" forever, which reads as a stall
-    // rather than a missing feature, so this is refused instead.
-    throw std::runtime_error("query readback is not implemented in the D3D12 backend");
-  }
-
   void PushState() override { stack_.push_back(bound_); }
   void PopState() override {
     if(stack_.empty()) throw std::runtime_error("PopState with nothing pushed");
@@ -543,16 +552,10 @@ class D3D12Backend final : public NativeRenderBackend {
     gpu_.device()->CreateShaderResourceView(tracked.resource.Get(),&srv,view);
     auto texture=std::make_unique<D3D12Texture>(std::move(tracked),desc.width,desc.height,view,
                                                 texture_views_);
-    if(!initial.empty()) {
-      // Staged on the next frame that opens, like buffer contents: there is no
-      // command list to copy with until then. Only level 0 - the disc textures
-      // arrive with their own mips through a path that does not exist yet, and
-      // quietly leaving the other levels undefined would show as the wrong
-      // texture at distance rather than as a missing feature.
-      if(description.MipLevels!=1)
-        throw std::runtime_error("initial contents for a mipped texture are not implemented");
+    // Staged on the next frame that opens, like buffer contents: there is no
+    // command list to copy with until then.
+    if(!initial.empty())
       pending_textures_.push_back({texture.get(),std::vector<uint8_t>(initial.begin(),initial.end())});
-    }
     return texture;
   }
 
@@ -602,7 +605,34 @@ class D3D12Backend final : public NativeRenderBackend {
     const D3D12_QUERY_HEAP_DESC desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION,1,0};
     ComPtr<ID3D12QueryHeap> heap;
     Require(gpu_.device()->CreateQueryHeap(&desc,IID_PPV_ARGS(&heap)),"query heap creation");
-    return std::make_unique<D3D12Query>(std::move(heap),kind);
+    // Its own readback buffer, created in COPY_DEST because that is the state
+    // ResolveQueryData requires and a readback heap can never leave it.
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                              D3D12_MEMORY_POOL_UNKNOWN,0,0};
+    const D3D12_RESOURCE_DESC readback_desc{D3D12_RESOURCE_DIMENSION_BUFFER,0,sizeof(uint64_t),1,1,1,
+                                            DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                            D3D12_RESOURCE_FLAG_NONE};
+    ComPtr<ID3D12Resource> readback;
+    Require(gpu_.device()->CreateCommittedResource(&readback_heap,D3D12_HEAP_FLAG_NONE,&readback_desc,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST,nullptr,
+                                                   IID_PPV_ARGS(&readback)),"query readback creation");
+    return std::make_unique<D3D12Query>(std::move(heap),std::move(readback),kind);
+  }
+
+  bool ReadQuery(NativeBackendQuery& query, std::span<uint8_t> result) override {
+    auto& concrete=static_cast<D3D12Query&>(query);
+    if(result.size()<sizeof(uint64_t))
+      throw std::runtime_error("an occlusion query result needs 8 bytes");
+    // Never blocks, as the interface promises. Not yet resolved, or resolved
+    // by a frame the GPU has not reached, both mean "ask again later".
+    if(!concrete.fence()||gpu_.completed_fence()<concrete.fence()) return false;
+    void* mapped=nullptr;
+    const D3D12_RANGE whole{0,sizeof(uint64_t)};
+    if(FAILED(concrete.readback()->Map(0,&whole,&mapped))) return false;
+    std::memcpy(result.data(),mapped,sizeof(uint64_t));
+    const D3D12_RANGE none{0,0};
+    concrete.readback()->Unmap(0,&none);
+    return true;
   }
 
   NativeBackendPipeline& CreatePipeline(const NativeBackendPipelineDesc& desc) override {
@@ -802,32 +832,48 @@ class D3D12Backend final : public NativeRenderBackend {
 
  private:
   // A texture upload is not a buffer copy: rows land on a 256-byte pitch that
-  // has nothing to do with the source's packed rows, so the copy is described
-  // by a footprint the device computes and the rows are written one at a time.
+  // has nothing to do with the source's packed rows, so each level's copy is
+  // described by a footprint the device computes and its rows are written one
+  // at a time. The source is expected tightly packed, smallest stride, level
+  // after level, which is how every mipped asset in this game arrives.
   void UploadTexture(D3D12Texture& texture, const std::vector<uint8_t>& bytes) {
     const auto description=texture.tracked().resource->GetDesc();
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT64 total=0,row_bytes=0;
-    UINT rows=0;
-    gpu_.device()->GetCopyableFootprints(&description,0,1,0,&footprint,&rows,&row_bytes,&total);
-    if(bytes.size()<static_cast<size_t>(row_bytes)*rows)
+    const UINT levels=description.MipLevels?description.MipLevels:1;
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(levels);
+    std::vector<UINT64> row_bytes(levels);
+    std::vector<UINT> rows(levels);
+    UINT64 total=0;
+    gpu_.device()->GetCopyableFootprints(&description,0,levels,0,footprints.data(),rows.data(),
+                                         row_bytes.data(),&total);
+    size_t needed=0;
+    for(UINT level=0;level<levels;++level)
+      needed+=static_cast<size_t>(row_bytes[level])*rows[level];
+    if(bytes.size()<needed)
       throw std::runtime_error("initial texture contents are "+std::to_string(bytes.size())+
-                               " bytes but the texture needs "+std::to_string(row_bytes*rows));
+                               " bytes but its "+std::to_string(levels)+" levels need "+
+                               std::to_string(needed));
+
     const auto upload=gpu_.Allocate(total,D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-    for(UINT row=0;row<rows;++row)
-      std::memcpy(upload.cpu+static_cast<size_t>(row)*footprint.Footprint.RowPitch,
-                  bytes.data()+static_cast<size_t>(row)*row_bytes,static_cast<size_t>(row_bytes));
-    // The footprint's offset is relative to the resource it is copied from, so
-    // it has to name where in the ring the bytes actually landed.
-    footprint.Offset=upload.offset;
     recorders_.front()->Transition(texture.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
-    const D3D12_TEXTURE_COPY_LOCATION from{upload.resource,
-                                           D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{footprint}};
-    D3D12_TEXTURE_COPY_LOCATION to{};
-    to.pResource=texture.tracked().resource.Get();
-    to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    to.SubresourceIndex=0;
-    gpu_.commands()->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+    size_t source=0;
+    for(UINT level=0;level<levels;++level) {
+      auto& footprint=footprints[level];
+      for(UINT row=0;row<rows[level];++row)
+        std::memcpy(upload.cpu+footprint.Offset+static_cast<size_t>(row)*footprint.Footprint.RowPitch,
+                    bytes.data()+source+static_cast<size_t>(row)*row_bytes[level],
+                    static_cast<size_t>(row_bytes[level]));
+      source+=static_cast<size_t>(row_bytes[level])*rows[level];
+      // GetCopyableFootprints laid the levels out from offset zero; the ring
+      // put the block somewhere else, so every level's offset moves with it.
+      footprint.Offset+=upload.offset;
+      const D3D12_TEXTURE_COPY_LOCATION from{upload.resource,
+                                             D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{footprint}};
+      D3D12_TEXTURE_COPY_LOCATION to{};
+      to.pResource=texture.tracked().resource.Get();
+      to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      to.SubresourceIndex=level;
+      gpu_.commands()->CopyTextureRegion(&to,0,0,0,&from,nullptr);
+    }
   }
 
   struct PendingUpload { D3D12Buffer* buffer; std::vector<uint8_t> bytes; };
