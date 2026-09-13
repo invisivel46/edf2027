@@ -398,6 +398,34 @@ default would mean a device that costs memory and start-up time and renders
 nothing. The default stays D3D11 until the port lands; the flip itself is one
 line and the conformance test is what says it was clean.
 
+### Port progress
+
+The files above are mostly guest logic wrapped in a thin D3D11 shell - the DDS
+loader was 96 lines of which ten were D3D11 - so the port is much less new code
+than the line counts suggest. The guest halves are being lifted out first,
+because each one is shared, safe, and verified by the tests that already exist:
+
+| done | what moved out |
+|---|---|
+| render state decode | guest blend / depth / raster words |
+| guest vertex streams | validation, endian swap, quad-to-triangle expansion |
+| DDS decode | header, formats, channel masks, cube faces, mip chains |
+| mesh input layout | neutral, retained, owns its names, fingerprinted |
+| shader constants | `ConstantImages` - the bytes a draw carries itself |
+
+What remains is the thin half, and it is one connected change rather than five
+separable ones: vertex and index buffers become backend buffers, the draw site
+asks for a pipeline instead of binding a shader, textures and render targets
+become backend resources, and the compositor and presenter follow. It has to
+land together because a mesh drawn through a recorder needs a pipeline, which
+needs the layout and the render state, which needs the targets' formats.
+
+Doing it on the adopted D3D11 backend first means the game keeps working and
+any difference is a wiring mistake rather than a backend one - and the
+conformance test already says the two backends agree on everything the
+renderer does.
+
+
 ## How the port actually has to happen
 
 Two facts decide this, and neither was obvious before a backend existed.
