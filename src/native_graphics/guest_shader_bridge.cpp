@@ -861,9 +861,17 @@ void CaptureScene(Bridge& state,uint32_t owner) {
   try {
     const auto path=std::filesystem::path(prefix+"."+std::to_string(number)+".bmp");
     if (std::filesystem::exists(path)) throw std::runtime_error("native capture path already exists");
-    if(!scene->second.color.surface)
-      throw std::runtime_error("a scene capture reads the surface through D3D11, which a scene on another backend has not got");
-    const auto bmp=CaptureNativeHdrBmp(*state.context.Get(),*scene->second.color.surface.Get());
+    // The resolved scene rather than the multisampled surface when the fetch
+    // goes through the seam: a multisampled resource cannot be read back on
+    // either API, and this is the same picture one step later.
+    std::vector<uint8_t> bmp;
+    if(scene->second.color.surface)
+      bmp=CaptureNativeHdrBmp(*state.context.Get(),*scene->second.color.surface.Get());
+    else if(scene->second.color.sampled.backend && scene->second.color.sampled.content_valid) {
+      SubmitSceneFrameLocked(state);
+      bmp=CaptureNativeBmp(EnsureSceneBackendLocked(state),*scene->second.color.sampled.backend,
+                           scene->second.color.sampled.format);
+    } else throw std::runtime_error("this scene has neither a D3D11 surface nor a resolved texture to capture");
     std::ofstream output(path,std::ios::binary);
     output.write(reinterpret_cast<const char*>(bmp.data()),bmp.size());
     output.close();

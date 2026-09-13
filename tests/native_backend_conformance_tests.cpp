@@ -46,6 +46,10 @@ constexpr uint32_t kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 // What one backend produced. Compared against every other backend's.
 struct Rendered {
   std::vector<uint8_t> flat, textured, instanced, mipped, resolved, compressed, blended;
+  // The uploaded texture read straight back, with no draw in between: it
+  // separates "the upload is wrong" from "the sampling is wrong", which a
+  // rendered surface alone cannot.
+  std::vector<uint8_t> uploaded;
   std::vector<uint8_t> depth_tested, target0, target1;
   // Two targets drawn from one dynamic vertex buffer, rewritten between them.
   std::vector<uint8_t> dynamic_before, dynamic_after;
@@ -267,6 +271,7 @@ Rendered Render(NativeRenderBackend& backend) {
   }
   backend.Submit();
   out.textured = backend.ReadRenderTarget(*target);
+  out.uploaded = backend.ReadTexture(*texture);
 
   // A render target sampled in the same frame it was drawn into.
   //
@@ -663,15 +668,17 @@ int main() {
           {"dynamic-before", &rendered.dynamic_before},
           {"dynamic-after", &rendered.dynamic_after},
           {"sampled-target", &rendered.sampled_target},
-          {"sampled-target-again", &rendered.sampled_target_again}};
+          {"sampled-target-again", &rendered.sampled_target_again},
+          {"uploaded", &rendered.uploaded}};
       const std::vector<uint8_t>* references[] = {&reference.flat, &reference.textured,
                                                   &reference.instanced, &reference.mipped,
                                                   &reference.compressed, &reference.blended,
                                                   &reference.depth_tested, &reference.target0,
                                                   &reference.target1, &reference.dynamic_before,
                                                   &reference.dynamic_after, &reference.sampled_target,
-                                                  &reference.sampled_target_again};
-      for (size_t index = 0; index < 13; ++index) {
+                                                  &reference.sampled_target_again,
+                                                  &reference.uploaded};
+      for (size_t index = 0; index < 14; ++index) {
         const auto difference = Compare(*references[index], *surfaces[index].second);
         Check(difference.pixels == 0,
               std::string(name) + " differs from d3d11-warp on the " + surfaces[index].first +

@@ -554,6 +554,10 @@ std::vector<uint8_t> CaptureNativeBmp(NativeRenderBackend& backend,NativeBackend
                                       uint32_t format) {
   return EncodeNativeBmp(backend.ReadRenderTarget(target),target.width(),target.height(),format);
 }
+std::vector<uint8_t> CaptureNativeBmp(NativeRenderBackend& backend,NativeBackendTexture& texture,
+                                      uint32_t format) {
+  return EncodeNativeBmp(backend.ReadTexture(texture),texture.width(),texture.height(),format);
+}
 std::vector<uint8_t> CaptureNativeHdrBmp(ID3D11DeviceContext& context,ID3D11Texture2D& surface) {
   if(auto resolved=ResolveDiagnosticColor(context,surface))
     return CaptureNativeHdrBmp(context,*resolved.Get());

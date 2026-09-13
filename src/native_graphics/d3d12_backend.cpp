@@ -980,10 +980,21 @@ class D3D12Backend final : public NativeRenderBackend {
     pending_textures_.clear();
   }
 
+  std::vector<uint8_t> ReadTexture(NativeBackendTexture& texture) override {
+    if(open_) throw std::runtime_error("ReadTexture cannot run inside an open frame");
+    auto& concrete=static_cast<D3D12Texture&>(texture);
+    return ReadTracked(concrete.tracked());
+  }
   std::vector<uint8_t> ReadRenderTarget(NativeBackendRenderTarget& target) override {
     if(open_) throw std::runtime_error("ReadRenderTarget cannot run inside an open frame");
     auto& concrete=static_cast<D3D12RenderTarget&>(target);
-    const auto description=concrete.tracked().resource->GetDesc();
+    return ReadTracked(concrete.tracked());
+  }
+  // The top level of subresource 0, copied into a readback buffer and waited
+  // for. One body for both handles: which wrapper names the resource makes no
+  // difference to how it is read.
+  std::vector<uint8_t> ReadTracked(TrackedResource& tracked) {
+    const auto description=tracked.resource->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT64 total=0,row_bytes=0;
     UINT rows=0;
@@ -1000,11 +1011,11 @@ class D3D12Backend final : public NativeRenderBackend {
                                                    IID_PPV_ARGS(&readback)),"readback buffer creation");
 
     BeginFrame();
-    recorders_.front()->Transition(concrete.tracked(),D3D12_RESOURCE_STATE_COPY_SOURCE);
+    recorders_.front()->Transition(tracked,D3D12_RESOURCE_STATE_COPY_SOURCE);
     const D3D12_TEXTURE_COPY_LOCATION to{readback.Get(),
                                          D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{footprint}};
     D3D12_TEXTURE_COPY_LOCATION from{};
-    from.pResource=concrete.tracked().resource.Get();
+    from.pResource=tracked.resource.Get();
     from.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     from.SubresourceIndex=0;
     gpu_.commands()->CopyTextureRegion(&to,0,0,0,&from,nullptr);

@@ -133,6 +133,10 @@ std::vector<uint8_t> EncodeNativeBmp(std::span<const uint8_t> pixels,uint32_t wi
 // never inside an open frame - submit first.
 std::vector<uint8_t> CaptureNativeBmp(NativeRenderBackend& backend,NativeBackendRenderTarget& target,
                                       uint32_t format);
+// A resolved scene is a texture rather than a target, and it is the picture
+// worth looking at.
+std::vector<uint8_t> CaptureNativeBmp(NativeRenderBackend& backend,NativeBackendTexture& texture,
+                                      uint32_t format);
 // Diagnostic one-pixel readback, without quantizing HDR or changing validity.
 std::array<float,4> ReadNativeColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,uint32_t x,uint32_t y);
 // Diagnostic region scan. Returns the first nonfinite RGB pixel in row order;

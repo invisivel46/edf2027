@@ -72,7 +72,15 @@ if ($PSBoundParameters.ContainsKey('OwnedRenderState')) {
 if ($PSBoundParameters.ContainsKey('UntiledScene')) {
   $arguments += '--edf_native_untiled_scene=' + $UntiledScene.IsPresent.ToString().ToLowerInvariant()
 }
-$arguments += $ExtraArgs
+# Passing a flag twice does not mean "the last one wins": the parser mis-reads
+# the options that follow the duplicate, and the run silently uses a default
+# for something the caller asked for by name. So an -ExtraArgs entry replaces
+# the base entry for the same option rather than being appended after it.
+foreach ($extra in $ExtraArgs) {
+  $name = ($extra -split '=', 2)[0]
+  $arguments = @($arguments | Where-Object { (($_ -split '=', 2)[0]) -ne $name })
+  $arguments += $extra
+}
 $arguments += if ($NativeRenderSize) {
   @(('--edf_native_render_width=' + $RenderWidth), ('--edf_native_render_height=' + $RenderHeight))
 } else { @() }

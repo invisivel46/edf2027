@@ -323,6 +323,10 @@ class NativeRenderBackend {
   // replaces, and "looks right to me" is not how this renderer has been
   // verified so far.
   virtual std::vector<uint8_t> ReadRenderTarget(NativeBackendRenderTarget& target)=0;
+  // The same for a sampled texture, on the same blocking terms. Separate
+  // because a resolved scene is a texture and not a target, and a backend that
+  // can only be read where it draws can only be checked where it draws.
+  virtual std::vector<uint8_t> ReadTexture(NativeBackendTexture& texture)=0;
 
   // Whatever the API's own validation has complained about since the last
   // call, and clears it. On the seam rather than on one backend because the

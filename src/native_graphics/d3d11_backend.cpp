@@ -732,6 +732,38 @@ class D3D11Backend final : public NativeRenderBackend {
     open_=false;
   }
 
+  std::vector<uint8_t> ReadTexture(NativeBackendTexture& texture) override {
+    if(open_) throw std::runtime_error("ReadTexture cannot run inside an open frame");
+    auto& concrete=static_cast<D3D11Texture&>(texture);
+    D3D11_TEXTURE2D_DESC description{};
+    concrete.texture()->GetDesc(&description);
+    if(description.SampleDesc.Count>1)
+      throw std::runtime_error("a multisampled texture cannot be read back; resolve it first");
+    auto staging_desc=description;
+    staging_desc.MipLevels=1;
+    staging_desc.ArraySize=1;
+    staging_desc.Usage=D3D11_USAGE_STAGING;
+    staging_desc.BindFlags=0;
+    staging_desc.MiscFlags=0;
+    staging_desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> staging;
+    Require(device_->CreateTexture2D(&staging_desc,nullptr,&staging),"staging texture creation");
+    // The top level of the first slice, which is what every caller of this
+    // wants and the only one a single-level staging texture can hold.
+    context_->CopySubresourceRegion(staging.Get(),0,0,0,0,concrete.texture(),0,nullptr);
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    Require(context_->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"staging map");
+    const auto info=DescribeNativeDxgiFormat(description.Format);
+    const size_t pitch=static_cast<size_t>(NativeDxgiRowPitch(info,description.Width));
+    const size_t rows=NativeDxgiRowCount(info,description.Height);
+    std::vector<uint8_t> pixels(pitch*rows);
+    for(size_t row=0;row<rows;++row)
+      std::memcpy(pixels.data()+row*pitch,
+                  static_cast<const uint8_t*>(mapped.pData)+row*mapped.RowPitch,pitch);
+    context_->Unmap(staging.Get(),0);
+    return pixels;
+  }
   std::vector<uint8_t> ReadRenderTarget(NativeBackendRenderTarget& target) override {
     if(open_) throw std::runtime_error("ReadRenderTarget cannot run inside an open frame");
     auto& concrete=static_cast<D3D11RenderTarget&>(target);
