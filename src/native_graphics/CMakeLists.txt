@@ -9,7 +9,7 @@ if(WIN32)
     target_sources(edf_native_d3d11 PRIVATE d3d11_signals.cpp)
     target_sources(edf_native_d3d11 PRIVATE d3d11_gpu_timer.cpp)
     target_sources(edf_native_d3d11 PRIVATE d3d11_ui.cpp)
-    add_library(edf_native_d3d12 STATIC d3d12_device.cpp)
+    add_library(edf_native_d3d12 STATIC d3d12_device.cpp d3d12_descriptors.cpp)
     target_link_libraries(edf_native_d3d12 PUBLIC edf_native_effects d3d12 dxgi)
 
     add_executable(edf_native_shader_check ../../tools/native_shader_check.cpp)

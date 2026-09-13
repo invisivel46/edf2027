@@ -123,6 +123,51 @@ int main() {
     std::cout << "upload ring high water " << gpu.upload_ring().high_water() << " of "
               << options.upload_bytes << ", " << gpu.upload_stalls() << " stalls\n";
 
+    {
+      // Views are ring-allocated per frame; the same combination of samplers
+      // must come back as the same table, because the sampler heap is far too
+      // small to hand out a fresh one per draw.
+      auto describe = [](float lod) {
+        D3D12_SAMPLER_DESC sampler{};
+        sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        sampler.MaxLOD = lod;
+        return sampler;
+      };
+      const D3D12_SAMPLER_DESC one[] = {describe(1.0f), describe(2.0f)};
+      const D3D12_SAMPLER_DESC two[] = {describe(1.0f), describe(3.0f)};
+      const auto first = gpu.samplers().Table(one);
+      const auto again = gpu.samplers().Table(one);
+      const auto other = gpu.samplers().Table(two);
+      Check(first.ptr == again.ptr, "the sampler cache did not reuse an identical combination");
+      Check(first.ptr != other.ptr, "two different sampler combinations shared one table");
+      Check(gpu.samplers().hits() == 1 && gpu.samplers().misses() == 2,
+            "the sampler cache did not account for its hits and misses");
+
+      gpu.BeginFrame();
+      const auto views = gpu.AllocateViews(7);
+      const auto next = gpu.AllocateViews(7);
+      Check(views.cpu.ptr != 0 && views.gpu.ptr != 0, "a view table came back null");
+      Check(next.cpu.ptr - views.cpu.ptr == 7ull * gpu.views().increment(),
+            "consecutive view tables were not laid out contiguously");
+      gpu.EndFrame();
+      gpu.WaitIdle();
+    }
+    {
+      // A table wider than the root signature's sampler width has to be
+      // refused, and a heap over the hardware limit has to be refused at
+      // construction rather than at the first draw that overflows it.
+      bool refused = false;
+      try {
+        NativeD3D12Options narrow = options;
+        narrow.sampler_slots = 8;
+        narrow.sampler_tables = 4096;  // 32,768 descriptors; the limit is 2,048.
+        NativeD3D12Device impossible(narrow);
+      } catch (const std::runtime_error&) { refused = true; }
+      Check(refused, "a sampler heap larger than the hardware limit was accepted");
+    }
+
+
     // Lifecycle misuse must be loud, not merely wrong.
     bool caught = false;
     try { gpu.EndFrame(); } catch (const std::runtime_error&) { caught = true; }

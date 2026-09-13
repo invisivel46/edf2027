@@ -1,10 +1,12 @@
 #pragma once
+#include "d3d12_descriptors.h"
 #include "native_upload_ring.h"
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -30,6 +32,13 @@ struct NativeD3D12Options {
   // frame; the ring reports its high water so this can be set from evidence
   // rather than from this guess.
   uint64_t upload_bytes=16u<<20;
+  // ~2,370 draws a frame at 7 textures each is ~16,600 view descriptors per
+  // frame; three frames in flight and headroom for the UI and post passes.
+  uint32_t view_descriptors=65536;
+  // The root signature's sampler table width, and how many distinct
+  // combinations the cache may hold. 8 x 192 = 1,536 of the 2,048 descriptors
+  // a shader-visible sampler heap is allowed.
+  uint32_t sampler_slots=8,sampler_tables=192;
 };
 
 class NativeD3D12Device {
@@ -79,15 +88,25 @@ class NativeD3D12Device {
   // handle the failure identically and none could continue meaningfully.
   Upload Allocate(uint64_t bytes, uint64_t alignment=D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
+  // A contiguous run of shader-visible view descriptors for this frame, on the
+  // same fenced rule and with the same stall-and-retry as upload memory.
+  NativeD3D12DescriptorRing::Table AllocateViews(uint32_t count);
+  NativeD3D12DescriptorRing& views() { return *views_; }
+  NativeD3D12SamplerCache& samplers() { return *samplers_; }
+
   const NativeUploadRing& upload_ring() const { return ring_; }
   uint64_t frames_submitted() const { return frame_counter_; }
   // How many times a frame had to stall waiting for upload memory. Zero is the
   // expected reading; anything else means upload_bytes is too small, and it
   // should be visible as a number rather than as an unexplained stutter.
   uint64_t upload_stalls() const { return upload_stalls_; }
+  uint64_t descriptor_stalls() const { return descriptor_stalls_; }
 
  private:
   void WaitForFence(uint64_t value);
+  // Waits for the oldest frame still on the GPU. Returns false when nothing is
+  // in flight, which is how a caller knows waiting again cannot help.
+  bool WaitForOldestFrame();
 
   struct Frame {
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
@@ -106,8 +125,10 @@ class NativeD3D12Device {
   uint8_t* upload_cpu_=nullptr;
   D3D12_GPU_VIRTUAL_ADDRESS upload_gpu_=0;
   NativeUploadRing ring_;
+  std::unique_ptr<NativeD3D12DescriptorRing> views_;
+  std::unique_ptr<NativeD3D12SamplerCache> samplers_;
   std::string adapter_name_;
-  uint64_t next_fence_=0,frame_counter_=0,upload_stalls_=0;
+  uint64_t next_fence_=0,frame_counter_=0,upload_stalls_=0,descriptor_stalls_=0;
   uint32_t open_frame_=0;
   bool open_=false,is_warp_=false,debug_layer_active_=false;
 };

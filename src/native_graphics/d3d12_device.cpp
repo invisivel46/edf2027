@@ -111,6 +111,24 @@ NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options)
   Require(upload_->Map(0,&no_read,&mapped),"upload buffer map");
   upload_cpu_=static_cast<uint8_t*>(mapped);
   upload_gpu_=upload_->GetGPUVirtualAddress();
+
+  views_=std::make_unique<NativeD3D12DescriptorRing>(*device_.Get(),
+      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,options.view_descriptors);
+  samplers_=std::make_unique<NativeD3D12SamplerCache>(*device_.Get(),options.sampler_slots,
+                                                      options.sampler_tables);
+}
+
+bool NativeD3D12Device::WaitForOldestFrame() {
+  const uint64_t completed=fence_->GetCompletedValue();
+  uint64_t oldest=0;
+  for(const auto& frame:frames_)
+    if(frame.fence>completed && (!oldest||frame.fence<oldest)) oldest=frame.fence;
+  if(!oldest) return false;
+  WaitForFence(oldest);
+  const uint64_t now=fence_->GetCompletedValue();
+  ring_.Retire(now);
+  views_->Retire(now);
+  return true;
 }
 
 NativeD3D12Device::~NativeD3D12Device() {
@@ -135,10 +153,16 @@ ID3D12GraphicsCommandList* NativeD3D12Device::BeginFrame() {
   // reset: resetting an allocator whose commands are still executing is
   // undefined, and it is the classic way a D3D12 port crashes only under load.
   WaitForFence(frame.fence);
-  ring_.Retire(fence_->GetCompletedValue());
+  const uint64_t completed=fence_->GetCompletedValue();
+  ring_.Retire(completed);
+  views_->Retire(completed);
   Require(frame.allocator->Reset(),"command allocator reset");
   Require(commands_->Reset(frame.allocator.Get(),nullptr),"command list reset");
-  ring_.BeginFrame(++next_fence_);
+  // Both rings share the frame's fence value: they are freed by the same
+  // signal because they are read by the same submission.
+  ++next_fence_;
+  ring_.BeginFrame(next_fence_);
+  views_->BeginFrame(next_fence_);
   open_=true;
   return commands_.Get();
 }
@@ -153,6 +177,7 @@ void NativeD3D12Device::EndFrame() {
   Require(queue_->Signal(fence_.Get(),next_fence_),"queue signal");
   frames_[open_frame_].fence=next_fence_;
   ring_.EndFrame();
+  views_->EndFrame();
   ++frame_counter_;
   open_=false;
 }
@@ -161,7 +186,9 @@ void NativeD3D12Device::WaitIdle() {
   if(!queue_||!fence_) return;
   Require(queue_->Signal(fence_.Get(),++next_fence_),"queue signal");
   WaitForFence(next_fence_);
-  ring_.Retire(fence_->GetCompletedValue());
+  const uint64_t completed=fence_->GetCompletedValue();
+  ring_.Retire(completed);
+  if(views_) views_->Retire(completed);
 }
 
 std::vector<std::string> NativeD3D12Device::DrainValidationErrors() {
@@ -186,15 +213,8 @@ NativeD3D12Device::Upload NativeD3D12Device::Allocate(uint64_t bytes, uint64_t a
     // Give the GPU a chance to release a frame, then try again. Waiting on the
     // oldest in-flight frame is the smallest wait that can possibly help.
     ++upload_stalls_;
-    uint64_t oldest=0;
-    for(const auto& frame:frames_)
-      if(frame.fence && (!oldest||frame.fence<oldest) && frame.fence>fence_->GetCompletedValue())
-        oldest=frame.fence;
-    if(oldest) {
-      WaitForFence(oldest);
-      ring_.Retire(fence_->GetCompletedValue());
+    while(allocation.status==NativeUploadRing::Status::Full && WaitForOldestFrame())
       allocation=ring_.Allocate(bytes,alignment);
-    }
   }
   if(allocation.status==NativeUploadRing::Status::TooLarge)
     throw std::runtime_error("D3D12 upload of "+std::to_string(bytes)+
@@ -209,5 +229,22 @@ NativeD3D12Device::Upload NativeD3D12Device::Allocate(uint64_t bytes, uint64_t a
                              std::to_string(ring_.high_water())+" bytes");
   const uint64_t offset=allocation.offset%ring_.capacity();
   return {upload_cpu_+offset,upload_gpu_+offset,upload_.Get(),offset};
+}
+NativeD3D12DescriptorRing::Table NativeD3D12Device::AllocateViews(uint32_t count) {
+  auto result=views_->TryAllocate(count);
+  if(result.status==NativeUploadRing::Status::Full) {
+    ++descriptor_stalls_;
+    while(result.status==NativeUploadRing::Status::Full && WaitForOldestFrame())
+      result=views_->TryAllocate(count);
+  }
+  if(result.status!=NativeUploadRing::Status::Ok)
+    // Either the table is wider than the whole heap or one frame needs more
+    // descriptors than the heap holds. Both are a sizing mistake, and saying
+    // so beats binding a table that overlaps a draw still in flight.
+    throw std::runtime_error("D3D12 view descriptor heap of "+
+                             std::to_string(views_->ring().capacity())+
+                             " cannot satisfy a run of "+std::to_string(count)+
+                             "; high water "+std::to_string(views_->ring().high_water()));
+  return result.table;
 }
 }  // namespace edf::native
