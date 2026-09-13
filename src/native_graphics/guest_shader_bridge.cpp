@@ -126,7 +126,7 @@ REXCVAR_DEFINE_INT32(edf_native_probe_draw_limit, 4096, "EDF2027", "Maximum inva
 REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
 REXCVAR_DEFINE_INT32(edf_native_shared_constant_audit, 0, "EDF2027",
-                    "Compare Common.fx globals between the bound vertex and pixel stage for this many indexed draws; 0 disables (development)");
+                    "Audit Common.fx globals a stage's native shader consumes but the material never lists for that stage, for this many activations; 0 disables (development)");
 REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
                    "Log inclusive CPU wall times for native/original graphics hook phases (development)");
 REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
@@ -544,7 +544,10 @@ struct Bridge {
   uint64_t output_unhandled=0;
   // Sentinel distinguishes "not observed" from a real zero register word.
   uint64_t vertex_center_word=UINT64_MAX;
-  uint64_t shared_constant_draws=0,shared_constant_mismatches=0;
+  uint64_t shared_constant_activations=0,shared_constant_unsupplied=0,shared_constant_split_storage=0;
+  uint64_t shared_constant_both_supplied=0;
+  std::set<std::array<uint32_t,2>> shared_constant_pairs;
+  std::set<std::array<uint32_t,3>> shared_constant_storage_reported;
   std::set<std::array<uint32_t,3>> shared_constant_reported;
   uint64_t movie_uploads=0, movie_upload_errors=0;
   uint64_t movie_draws=0, movie_draw_errors=0;
@@ -1111,6 +1114,81 @@ void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t d
         state.linked_vertex = vertex; state.linked_pixel = pixel;
       }
       const auto vertex_ranges=state.shaders.at(vertex).ResolveVertexRanges(state.material_parameters.Get(instance));
+      // A stage whose native shader consumes a Common.fx global that this
+      // material never lists for that stage keeps the value our own HLSL
+      // compilation baked in. Distinguish that from an upload the bridge drops:
+      // the guest's own records decide a stage's parameter list.
+      // Audit the first activation of each distinct shader pair only. The
+      // per-stage parameter list belongs to the material's shaders, not to the
+      // draw, so one sample per pair is complete, and gameplay activates
+      // hundreds of thousands of times a second.
+      if(const auto audit=REXCVAR_GET(edf_native_shared_constant_audit);
+         audit>0 && state.shared_constant_pairs.size()<uint64_t(audit) &&
+         state.shared_constant_pairs.insert({vertex,pixel}).second) {
+        ++state.shared_constant_activations;
+        const auto owned=state.material_parameters.Get(instance);
+        const auto supplied=[&](size_t stage,const std::string& name) {
+          for(size_t group=stage*2;group<stage*2+2;++group)
+            for(const auto& parameter:(*owned)[group]) if(parameter.name==name) return true;
+          return false;
+        };
+        // Where both stages are supplied, compare the storage each one names.
+        // Identical source bytes with different shader values would be an
+        // upload defect; different source addresses are the guest's own layout.
+        const auto global_source=[&](size_t stage,const std::string& name)
+            ->std::optional<std::array<uint32_t,3>> {
+          for(const auto& parameter:(*owned)[stage*2+1]) {
+            if(parameter.name!=name) continue;
+            const auto node=GuestBlockWord(reader.Bytes(parameter.record,4));
+            const auto value=parameter.ReadValue(reader,true);
+            return std::array<uint32_t,3>{parameter.record,node,value.data};
+          }
+          return std::nullopt;
+        };
+        for(const auto* name:{"g_LightVector","g_LightDiffuse","g_HemiSphereVector",
+            "g_HemiSphereColor1","g_HemiSphereColor2","g_FogParam","g_FogColor"}) {
+          const bool vertex_used=vs.ResolveFloatRegisters(name).bytes()!=0;
+          const bool pixel_used=ps.ResolveFloatRegisters(name).bytes()!=0;
+          const bool vertex_supplied=supplied(0,name),pixel_supplied=supplied(1,name);
+          if(vertex_supplied || pixel_supplied) {
+            const auto vertex_source=global_source(0,name),pixel_source=global_source(1,name);
+            if(vertex_used && pixel_used && vertex_supplied && pixel_supplied)
+              ++state.shared_constant_both_supplied;
+            if(vertex_source || pixel_source) {
+              const std::array<uint32_t,3> storage_identity{vertex,pixel,uint32_t(name[2])*7+uint32_t(name[3])};
+              if(state.shared_constant_storage_reported.size()<64 &&
+                 state.shared_constant_storage_reported.insert(storage_identity).second) {
+                const auto first=[&](uint32_t data)->float {
+                  return data ? std::bit_cast<float>(GuestBlockWord(reader.Bytes(data,4))) : 0.f;
+                };
+                const auto vertex_data=vertex_source?(*vertex_source)[2]:0u;
+                const auto pixel_data=pixel_source?(*pixel_source)[2]:0u;
+                REXLOG_INFO("Native shared constant storage: name={}, VS={:#x} {} uses={} data={:#x} first={}, PS={:#x} {} uses={} data={:#x} first={}, same_data={}",
+                  name,vertex,vs.shader().entry.name,vertex_used,vertex_data,first(vertex_data),
+                  pixel,ps.shader().entry.name,pixel_used,pixel_data,first(pixel_data),
+                  vertex_data && pixel_data && vertex_data==pixel_data);
+              }
+              if(vertex_source && pixel_source && (*vertex_source)[2]!=(*pixel_source)[2])
+                ++state.shared_constant_split_storage;
+            }
+          }
+          if((vertex_used && !vertex_supplied)||(pixel_used && !pixel_supplied)) {
+            ++state.shared_constant_unsupplied;
+            const std::array<uint32_t,3> identity{vertex,pixel,uint32_t(std::string_view(name).size()*131+name[2])};
+            if(state.shared_constant_reported.size()<64 &&
+               state.shared_constant_reported.insert(identity).second)
+              REXLOG_WARN("Native shared constant unsupplied: name={}, VS={:#x} {} uses={} supplied={}, PS={:#x} {} uses={} supplied={}, source={:#x} (an unsupplied stage keeps the compiled source default)",
+                name,vertex,vs.shader().entry.name,vertex_used,vertex_supplied,
+                pixel,ps.shader().entry.name,pixel_used,pixel_supplied,
+                vs.shader().source_fingerprint);
+          }
+        }
+        const auto seen=state.shared_constant_activations;
+        if(seen<=4 || (seen&(seen-1))==0)
+          REXLOG_INFO("Native shared constant audit: pairs={}, unsupplied_uses={}, distinct_unsupplied={}, both_supplied={}, split_storage={} (one sample per distinct shader pair; split_storage counts pairs whose two stages name different guest value storage)",
+            seen,state.shared_constant_unsupplied,state.shared_constant_reported.size(),
+            state.shared_constant_both_supplied,state.shared_constant_split_storage);
+      }
       UploadParameters(reader, instance, 0, vs, state, &reversed);
       UploadParameters(reader, instance, 36, ps, state);
       try { UploadTextures(reader, instance, device, ps, state); }
@@ -4461,44 +4539,6 @@ REX_HOOK_RAW(sub_821FE358) {
         mesh_timing.Finish();
         ++state.indexed_uploads;
         if (scene_draw) {
-          // Common.fx declares these once and the engine sets them per scene, so
-          // a bound vertex/pixel pair compiled from one source must see the same
-          // values. A stage still holding its authored default has not received
-          // the scene's upload; report the pair once per shader/name.
-          if(const auto audit_draws=REXCVAR_GET(edf_native_shared_constant_audit);
-             audit_draws>0 && state.shared_constant_draws<uint64_t(audit_draws)) {
-            ++state.shared_constant_draws;
-            try {
-              const auto& vertex_stage=bindings;
-              const auto& pixel_stage=*state.shaders.at(state.linked_pixel).bindings;
-              if(vertex_stage.shader().source_fingerprint==pixel_stage.shader().source_fingerprint) {
-                uint32_t name_index=0;
-                for(const auto* name:{"g_LightVector","g_LightDiffuse","g_HemiSphereVector",
-                    "g_HemiSphereColor1","g_HemiSphereColor2","g_FogParam","g_FogColor"}) {
-                  const auto in_vertex=vertex_stage.ReadFloatVector(name);
-                  const auto in_pixel=pixel_stage.ReadFloatVector(name);
-                  ++name_index;
-                  if(in_vertex.empty() || in_pixel.empty() || in_vertex==in_pixel) continue;
-                  ++state.shared_constant_mismatches;
-                  const std::array<uint32_t,3> identity{state.active_vertex,state.linked_pixel,name_index};
-                  if(!state.shared_constant_reported.insert(identity).second ||
-                     state.shared_constant_reported.size()>64) continue;
-                  std::string vertex_text,pixel_text;
-                  for(const auto value:in_vertex) vertex_text+=(vertex_text.empty()?"":",")+std::format("{}",value);
-                  for(const auto value:in_pixel) pixel_text+=(pixel_text.empty()?"":",")+std::format("{}",value);
-                  REXLOG_WARN("Native shared constant divergence: name={}, VS={:#x} {}, PS={:#x} {}, vertex=[{}], pixel=[{}], source={:#x} (one Common.fx global, two values in one draw)",
-                    name,state.active_vertex,vertex_stage.shader().entry.name,state.linked_pixel,
-                    pixel_stage.shader().entry.name,vertex_text,pixel_text,
-                    vertex_stage.shader().source_fingerprint);
-                }
-              }
-              if(state.shared_constant_draws==uint64_t(audit_draws))
-                REXLOG_INFO("Native shared constant audit: draws={}, mismatching_reads={}, distinct_pairs={} (same-source vertex/pixel pairs only)",
-                  state.shared_constant_draws,state.shared_constant_mismatches,state.shared_constant_reported.size());
-            } catch(const std::exception& error) {
-              REXLOG_ERROR("Native shared constant audit: {}",error.what());
-            }
-          }
           edf::native::HookTiming binding_timing(edf::native::HookPhase::IndexedBindings);
           const auto key=edf::native::ReadAuditedRenderStateWords(reader,ctx.r3.u32);
           auto found=state.render_states.find(key);

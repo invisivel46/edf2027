@@ -449,3 +449,68 @@ Next: resolve where the native parameter path decides a stage's destination for
 a non-material global, and check it against the guest setter for both register
 files. Do not "fix" this by copying one stage's values to the other before that
 is established - the two register files are genuinely separate on this hardware.
+
+## Parameter-supply audit built; conclusion blocked by the host (2026-09-12)
+
+`--edf_native_shared_constant_audit=N` now samples the first N distinct
+vertex/pixel shader pairs at material activation and reports, per Common.fx
+global, whether each stage's native shader *consumes* it
+(`ShaderBindings::ResolveFloatRegisters(name).bytes()`) and whether this
+material *supplies* it for that stage (the name appears in the guest's own
+`stage*2+global` parameter group). Where both stages are supplied it also
+compares the guest value storage each one names, so identical source bytes with
+different shader values would separate an upload defect from the guest's layout.
+
+### What the healthy runs already establish
+
+- The divergence is real and systemic in gameplay: 117,342 mismatching reads
+  over 20,000 indexed draws, 112 distinct (vertex, pixel, parameter)
+  combinations, 7 effect sources
+  (`out/native-bridge-run/shared-constants-20260912-195014`).
+- **The bridge drops nothing.** `optimized_out=0` across 7,150,000 activations
+  and 114,349,004 uploads, with `parameter_errors=0`
+  (`out/native-bridge-run/negative-probe-20260912-194418`). Every parameter the
+  guest lists for a stage reaches that stage's native constant buffer.
+- The losing stage holds *exactly* the Common.fx authored defaults for all six
+  globals at once, which is what an absent upload looks like.
+
+Together these narrow the cause to the guest's own per-stage parameter list
+rather than the bridge's routing. That is a narrowing, not the answer: the
+supply audit that would confirm it has not yet run under valid conditions.
+
+### Why the audit's own numbers must not be used yet
+
+Every run after roughly 20:00 local is invalid. `IDXGISwapChain::Present`
+returns in ~253 ms on this host, so the game runs at 1.5-1.9 FPS while the GPU
+sits at 1-2% utilization and P8/210 MHz. The scripted input schedule is
+wall-clock based, so at that rate its inputs fire long before the game is ready
+and the run never reaches a mission. The audits therefore only ever saw startup
+and menu materials, and their `both_supplied=0` / `split_storage=0` results say
+nothing about world materials.
+
+This is a host condition, not a regression. Controls, same flags and same
+hidden-window style throughout:
+
+| Binary | Time | FPS | present_avg_ms |
+|---|---|---|---|
+| tonight's build, sampled geometry | 17:37 | 60.0 | - |
+| tonight's build, audit enabled | 21:11 | 1.5 | 254.9 |
+| tonight's build, audit disabled | 21:17 | 1.9 | - |
+| **September 11 `edf2027-native-scene-only.exe`** | 21:25 | 1.7 | 252.7 |
+
+The September 11 binary predates every change in this session and is equally
+slow, so the throttle belongs to the session, not the code. `SetThreadExecutionState`
+with `ES_DISPLAY_REQUIRED` did not clear it, which points at swapchain-level
+occlusion/composition throttling rather than display power.
+
+### Next
+
+Re-run `--edf_native_shared_constant_audit=512` on a host whose Present cadence
+is healthy, confirm it reaches mission materials (`pairs` well above the four
+startup pairs), and read `unsupplied_uses`. Only then choose between the two
+remaining explanations: the guest never lists the global for that stage (in
+which case our from-source shader consumes a constant the original microcode
+did not, and the fix belongs in compilation or in how a stage's defaults are
+seeded), or it lists it and something upstream of `UploadParameters` loses it.
+Do not copy one stage's values to the other before that is settled: the two
+constant register files are genuinely separate on this hardware.
