@@ -42,6 +42,9 @@ class StubBackend final : public edf::native::NativeRenderBackend {
   void BeginFrame() override {}
   std::vector<uint8_t> ReadRenderTarget(edf::native::NativeBackendRenderTarget&) override { return {}; }
   std::vector<std::string> DrainValidationMessages() override { return {}; }
+  void AttachWindow(void*, uint32_t, uint32_t) override {}
+  edf::native::NativeBackendRenderTarget* BackBuffer() override { return nullptr; }
+  void Present(bool) override {}
   void Submit() override {}
  private:
   std::string name_;

@@ -237,6 +237,16 @@ class NativeRenderBackend {
   // exists on every explicit API. A backend without validation returns
   // nothing, which is honest; it never invents a clean bill of health.
   virtual std::vector<std::string> DrainValidationMessages()=0;
+
+  // Presentation. Optional by design: with no window attached a backend
+  // renders to textures only, which is what the offline checkers and the test
+  // suite do, and what lets the whole renderer be verified without a display.
+  virtual void AttachWindow(void* window, uint32_t width, uint32_t height)=0;
+  // Null until a window is attached. The returned target is only valid for the
+  // frame it was asked in: after Present the swap chain hands out a different
+  // buffer, and holding the old one writes to something being displayed.
+  virtual NativeBackendRenderTarget* BackBuffer()=0;
+  virtual void Present(bool vsync)=0;
 };
 
 // Backends register here; selection is by name so a run can A/B them without a

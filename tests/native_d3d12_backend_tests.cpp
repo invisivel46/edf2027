@@ -3,6 +3,7 @@
 // real backend can be built behind rather than a shape that merely compiles.
 #include "native_graphics/d3d12_backend.h"
 #include "native_graphics/native_render_backend.h"
+#include <windows.h>
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cstring>
@@ -35,6 +36,11 @@ std::span<const uint8_t> Bytes(ID3DBlob& blob) {
 }  // namespace
 
 int main() {
+  // Unbuffered: if a later stage kills the process, the output that says how
+  // far it got must not die in the buffer with it.
+  std::cout << std::unitbuf;
+  HWND present_window = nullptr;
+  WNDCLASSEXW present_class{};
   try {
     RegisterNativeD3D12Backend();
     const auto& names = NativeRenderBackendNames();
@@ -49,7 +55,7 @@ int main() {
     // Selected by name through the registry, so the whole path the game will
     // use is what gets exercised - not a direct constructor call the shipping
     // code never makes.
-    const auto backend = CreateNativeRenderBackend("d3d12-warp");
+    auto backend = CreateNativeRenderBackend("d3d12-warp");
     Check(backend != nullptr, "the registry did not produce a backend");
     Check(backend->name() == "d3d12", "the backend reported the wrong name");
     Check(!backend->SupportsParallelRecording(),
@@ -320,6 +326,65 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET { return tint; }
       std::cout << "instanced draw: 4 instances, " << area << " pixels\n";
     }
 
+    {
+      // Presentation, against a real but never-shown window. A swap chain is
+      // the one part that cannot be checked by rendering to a texture, and its
+      // characteristic failure - a back buffer presented in the wrong resource
+      // state - is exactly what validation exists to catch.
+      Check(backend->BackBuffer() == nullptr, "a back buffer existed before a window was attached");
+      bool refused = false;
+      try { backend->Present(false); } catch (const std::runtime_error&) { refused = true; }
+      Check(refused, "Present with no window attached was accepted");
+
+      // Declared outside the block that uses it: the window must outlive the
+      // backend, because the swap chain holds it, and a window destroyed from
+      // under a live swap chain is a crash rather than an error.
+      WNDCLASSEXW window_class{};
+      window_class.cbSize = sizeof(window_class);
+      window_class.lpfnWndProc = DefWindowProcW;
+      window_class.hInstance = GetModuleHandleW(nullptr);
+      window_class.lpszClassName = L"EdfD3D12PresentTest";
+      RegisterClassExW(&window_class);
+      HWND window = CreateWindowExW(0, window_class.lpszClassName, L"", WS_POPUP, 0, 0, kSize, kSize,
+                                    nullptr, nullptr, window_class.hInstance, nullptr);
+      Check(window != nullptr, "the test could not create a window to present to");
+      if (window) {
+        backend->AttachWindow(window, kSize, kSize);
+        auto* back = backend->BackBuffer();
+        Check(back != nullptr, "no back buffer after attaching a window");
+        Check(back->width() == kSize && back->height() == kSize,
+              "the back buffer is not the size the window was attached at");
+
+        // More frames than there are buffers, so the chain rotates and each
+        // buffer is rendered into, presented, and come back to.
+        for (uint32_t frame = 0; frame < 8; ++frame) {
+          auto* buffer = backend->BackBuffer();
+          NativeBackendRenderTarget* chain[] = {buffer};
+          backend->BeginFrame();
+          auto& present_recorder = backend->Recorder();
+          present_recorder.SetRenderTargets(chain, nullptr);
+          present_recorder.SetViewport({0, 0, static_cast<float>(kSize), static_cast<float>(kSize), 0, 1});
+          present_recorder.ClearColor(*buffer, {0.0f, 0.0f, 1.0f, 1.0f});
+          backend->Submit();
+          backend->Present(false);
+        }
+        for (const auto& message : backend->DrainValidationMessages())
+          Check(false, "D3D12 validation error while presenting: " + message);
+
+        // The buffer handed out must rotate; always returning the same one
+        // would mean writing to a buffer the display is still showing.
+        auto* first = backend->BackBuffer();
+        backend->BeginFrame();
+        backend->Submit();
+        backend->Present(false);
+        Check(first != backend->BackBuffer(), "the swap chain handed out the same buffer twice running");
+
+        std::cout << "presented 9 frames across " << 3 << " buffers\n";
+        DestroyWindow(window);
+      }
+      UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
+    }
+
     // A missing barrier would not change a single pixel above; only the API's
     // own validation sees it, so it is read rather than left in the debugger.
     for (const auto& message : backend->DrainValidationMessages())
@@ -332,6 +397,9 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET { return tint; }
     caught = false;
     try { backend->Submit(); } catch (const std::runtime_error&) { caught = true; }
     Check(caught, "Submit outside a frame was accepted");
+
+    // The backend goes first, then the window it was presenting to.
+    backend.reset();
   } catch (const std::exception& error) {
     std::cerr << "unexpected: " << error.what() << '\n';
     return 1;

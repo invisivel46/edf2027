@@ -471,6 +471,14 @@ class D3D12Backend final : public NativeRenderBackend {
     recorder_.null_texture_view_=null_texture_;
   }
 
+  ~D3D12Backend() override {
+    // The swap chain and its buffers are released before this object's own
+    // device member is destroyed, so nothing here waits for the GPU on our
+    // behalf. Presenting work may still be in flight, and releasing a back
+    // buffer it is reading takes the process down.
+    try { gpu_.WaitIdle(); } catch(...) {}
+  }
+
   std::string_view name() const override { return "d3d12"; }
 
   std::unique_ptr<NativeBackendBuffer> CreateBuffer(const NativeBackendBufferDesc& desc,
@@ -650,6 +658,13 @@ class D3D12Backend final : public NativeRenderBackend {
 
   void Submit() override {
     if(!open_) throw std::runtime_error("Submit with no frame open");
+    // A flip-model back buffer must be in PRESENT state when it is presented,
+    // and only the open command list can put it there. Doing it here rather
+    // than in Present keeps it off a second submission, and doing it for every
+    // buffer rather than the current one costs nothing: Transition is a no-op
+    // for a buffer already in that state.
+    for(auto& buffer:back_buffers_)
+      recorder_.Transition(buffer->tracked(),D3D12_RESOURCE_STATE_PRESENT);
     recorder_.End();
     gpu_.EndFrame();
     open_=false;
@@ -717,6 +732,60 @@ class D3D12Backend final : public NativeRenderBackend {
 
   std::vector<std::string> DrainValidationMessages() override { return gpu_.DrainValidationErrors(); }
 
+  void AttachWindow(void* window, uint32_t width, uint32_t height) override {
+    if(open_) throw std::runtime_error("a window cannot be attached inside an open frame");
+    if(!window) throw std::runtime_error("AttachWindow needs a window");
+    // Anything already submitted may still be reading a buffer we are about to
+    // release, so the queue has to drain before the old chain goes.
+    gpu_.WaitIdle();
+    back_buffers_.clear();
+    swap_chain_.Reset();
+
+    DXGI_SWAP_CHAIN_DESC1 desc{};
+    desc.Width=width;
+    desc.Height=height;
+    desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc={1,0};
+    desc.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    // Flip-discard is the only model worth having: the older ones copy the
+    // back buffer through the desktop compositor every frame.
+    desc.SwapEffect=DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    desc.BufferCount=kBackBuffers;
+    desc.Scaling=DXGI_SCALING_STRETCH;
+    desc.AlphaMode=DXGI_ALPHA_MODE_UNSPECIFIED;
+
+    ComPtr<IDXGISwapChain1> chain;
+    Require(gpu_.factory()->CreateSwapChainForHwnd(gpu_.queue(),static_cast<HWND>(window),&desc,
+                                                   nullptr,nullptr,&chain),"swap chain creation");
+    // Alt+Enter belongs to the game's own display handling, not to DXGI.
+    gpu_.factory()->MakeWindowAssociation(static_cast<HWND>(window),DXGI_MWA_NO_ALT_ENTER);
+    Require(chain.As(&swap_chain_),"swap chain interface");
+
+    for(uint32_t index=0;index<kBackBuffers;++index) {
+      TrackedResource tracked;
+      tracked.state=D3D12_RESOURCE_STATE_PRESENT;
+      Require(swap_chain_->GetBuffer(index,IID_PPV_ARGS(&tracked.resource)),"swap chain buffer");
+      const auto view=render_target_views_.Allocate();
+      D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+      rtv.Format=desc.Format;
+      rtv.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+      gpu_.device()->CreateRenderTargetView(tracked.resource.Get(),&rtv,view);
+      back_buffers_.push_back(std::make_unique<D3D12RenderTarget>(std::move(tracked),width,height,
+                                                                  false,view,render_target_views_));
+    }
+  }
+
+  NativeBackendRenderTarget* BackBuffer() override {
+    if(!swap_chain_) return nullptr;
+    return back_buffers_[swap_chain_->GetCurrentBackBufferIndex()].get();
+  }
+
+  void Present(bool vsync) override {
+    if(!swap_chain_) throw std::runtime_error("Present with no window attached");
+    if(open_) throw std::runtime_error("Present inside an open frame; submit it first");
+    Require(swap_chain_->Present(vsync?1:0,0),"present");
+  }
+
   NativeD3D12Device& gpu() { return gpu_; }
   const NativeD3D12PipelineCache& pipelines() const { return pipelines_; }
 
@@ -759,6 +828,12 @@ class D3D12Backend final : public NativeRenderBackend {
   NativeD3D12CpuDescriptorHeap texture_views_,render_target_views_,depth_views_;
   D3D12Recorder recorder_;
   std::map<std::string,std::unique_ptr<D3D12Pipeline>> wrappers_;
+  // Three, to match the frames in flight: the device will not reuse a frame
+  // slot until its fence has passed, which is also what keeps us off a buffer
+  // the display is still showing.
+  static constexpr uint32_t kBackBuffers=3;
+  ComPtr<IDXGISwapChain3> swap_chain_;
+  std::vector<std::unique_ptr<D3D12RenderTarget>> back_buffers_;
   std::vector<PendingUpload> pending_;
   std::vector<PendingTexture> pending_textures_;
   std::map<std::string,std::unique_ptr<D3D12Sampler>> samplers_;

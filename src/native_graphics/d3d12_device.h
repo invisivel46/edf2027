@@ -50,6 +50,7 @@ class NativeD3D12Device {
 
   ID3D12Device* device() const { return device_.Get(); }
   ID3D12CommandQueue* queue() const { return queue_.Get(); }
+  IDXGIFactory4* factory() const { return factory_.Get(); }
   // Valid only between BeginFrame and EndFrame.
   ID3D12GraphicsCommandList* commands() const { return commands_.Get(); }
   const std::string& adapter_name() const { return adapter_name_; }
