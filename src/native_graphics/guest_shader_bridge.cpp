@@ -4741,9 +4741,17 @@ REX_HOOK_RAW(sub_8219C840) {
           ++state.output_captures;
           const auto path=std::filesystem::path(prefix+".output."+std::to_string(state.indexed_output_frames)+".bmp");
           if (std::filesystem::exists(path)) throw std::runtime_error("native output capture already exists");
-          if(!scene.output.surface)
-            throw std::runtime_error("an output capture reads the surface through D3D11, which a scene on another backend has not got");
-          const auto bmp=edf::native::CaptureNativeHdrBmp(*state.context.Get(),*scene.output.surface.Get());
+          // Whichever fetch this scene's backend allows. The seam route has
+          // to close the open frame first: the readback waits for the GPU, and
+          // waiting on work that has not been submitted never returns.
+          std::vector<uint8_t> bmp;
+          if(scene.output.surface)
+            bmp=edf::native::CaptureNativeHdrBmp(*state.context.Get(),*scene.output.surface.Get());
+          else {
+            SubmitSceneFrameLocked(state);
+            bmp=edf::native::CaptureNativeBmp(EnsureSceneBackendLocked(state),
+              *scene.output.backend_surface,scene.output.format);
+          }
           std::ofstream output(path,std::ios::binary);
           output.write(reinterpret_cast<const char*>(bmp.data()),bmp.size()); output.close();
           if (!output) throw std::runtime_error("native output capture write failed");

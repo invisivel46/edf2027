@@ -93,18 +93,36 @@ NativeD3D12SamplerCache::NativeD3D12SamplerCache(ID3D12Device& device, uint32_t 
   gpu_start_=heap_->GetGPUDescriptorHandleForHeapStart();
 }
 
-D3D12_GPU_DESCRIPTOR_HANDLE NativeD3D12SamplerCache::Table(std::span<const D3D12_SAMPLER_DESC> samplers) {
+D3D12_GPU_DESCRIPTOR_HANDLE NativeD3D12SamplerCache::Table(std::span<const D3D12_SAMPLER_DESC> samplers,
+                                                          uint64_t used,uint64_t completed) {
   if(samplers.size()>slots_per_table_)
     throw std::runtime_error("a shader asked for "+std::to_string(samplers.size())+
                              " samplers but the root signature has "+std::to_string(slots_per_table_));
   std::string key(reinterpret_cast<const char*>(samplers.data()),
                   samplers.size()*sizeof(D3D12_SAMPLER_DESC));
-  if(const auto found=tables_.find(key);found!=tables_.end()) { ++hits_; return found->second; }
-  if(tables_.size()>=max_tables_)
-    throw std::runtime_error("sampler cache is full at "+std::to_string(max_tables_)+
-                             " distinct combinations; the shader-visible sampler heap holds at most "+
-                             std::to_string(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE)+" descriptors");
-  const uint32_t index=static_cast<uint32_t>(tables_.size())*slots_per_table_;
+  if(const auto found=tables_.find(key);found!=tables_.end()) {
+    ++hits_;
+    found->second.used=used;
+    return found->second.table;
+  }
+  uint32_t index=static_cast<uint32_t>(tables_.size())*slots_per_table_;
+  if(tables_.size()>=max_tables_) {
+    // The least recently used table the GPU has certainly finished reading.
+    // Scanned rather than kept in order because this only runs on a miss into
+    // a full heap, and the alternative is a second index to keep correct.
+    auto oldest=tables_.end();
+    for(auto entry=tables_.begin();entry!=tables_.end();++entry)
+      if(entry->second.used<=completed && (oldest==tables_.end() || entry->second.used<oldest->second.used))
+        oldest=entry;
+    if(oldest==tables_.end())
+      throw std::runtime_error("sampler cache is full at "+std::to_string(max_tables_)+
+                               " distinct combinations and every one is still in flight; the "
+                               "shader-visible sampler heap holds at most "+
+                               std::to_string(D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE)+" descriptors");
+    index=oldest->second.index;
+    tables_.erase(oldest);
+    ++evictions_;
+  }
   for(size_t slot=0;slot<samplers.size();++slot) {
     const D3D12_CPU_DESCRIPTOR_HANDLE at{cpu_start_.ptr+(index+slot)*increment_};
     device_->CreateSampler(&samplers[slot],at);
@@ -122,7 +140,7 @@ D3D12_GPU_DESCRIPTOR_HANDLE NativeD3D12SamplerCache::Table(std::span<const D3D12
     device_->CreateSampler(&fallback,at);
   }
   const D3D12_GPU_DESCRIPTOR_HANDLE table{gpu_start_.ptr+index*increment_};
-  tables_.emplace(std::move(key),table);
+  tables_.emplace(std::move(key),Entry{table,index,used});
   ++misses_;
   return table;
 }

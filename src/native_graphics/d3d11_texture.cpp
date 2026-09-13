@@ -1,4 +1,5 @@
 #include "d3d11_texture.h"
+#include <cstring>
 #include "native_dds_decode.h"
 #include "d3d11_backend.h"
 #include <d3dcompiler.h>
@@ -502,6 +503,57 @@ bool FindNativeInvalidColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& s
   context.Unmap(staging.Get(),0);
   return found;
 }
+// Packed pixels to a 24-bit BMP. Split out from the D3D11 capture because the
+// encoding has nothing to do with how the bytes were fetched, and a scene drawn
+// on another backend can only be fetched through the seam.
+//
+// Non-finite HDR is written as magenta rather than clamped: a NaN that comes
+// out black looks like geometry that did not draw.
+std::vector<uint8_t> EncodeNativeBmp(std::span<const uint8_t> pixels,uint32_t width,uint32_t height,
+                                     uint32_t format) {
+  if((format!=DXGI_FORMAT_R16G16B16A16_FLOAT && format!=DXGI_FORMAT_R8G8B8A8_UNORM) ||
+     !width || !height || width>4096 || height>4096)
+    throw std::runtime_error("unsupported native diagnostic format");
+  const size_t source_pitch=size_t(width)*(format==DXGI_FORMAT_R8G8B8A8_UNORM?4:8);
+  if(pixels.size()<source_pitch*height) throw std::runtime_error("short native diagnostic readback");
+  const uint32_t pitch=(width*3+3)&~3u;
+  std::vector<uint8_t> bmp(54+size_t(pitch)*height,0);
+  auto word=[&](size_t at,uint32_t value) {
+    for (unsigned b=0;b<4;++b) bmp[at+b]=uint8_t(value>>(8*b));
+  };
+  bmp[0]='B'; bmp[1]='M'; word(2,static_cast<uint32_t>(bmp.size())); word(10,54); word(14,40);
+  word(18,width); word(22,0u-height); bmp[26]=1; bmp[28]=24; word(34,pitch*height);
+  auto half=[](uint16_t bits) {
+    const int exponent=(bits>>10)&31,mantissa=bits&1023;
+    if (exponent==31) return std::numeric_limits<float>::quiet_NaN();
+    const float value=exponent ? std::ldexp(float(1024+mantissa),exponent-25) : std::ldexp(float(mantissa),-24);
+    return bits&0x8000?-value:value;
+  };
+  for (uint32_t y=0;y<height;++y) {
+    const auto* source=pixels.data()+size_t(y)*source_pitch;
+    for (uint32_t x=0;x<width;++x) {
+      auto* bgr=bmp.data()+54+size_t(y)*pitch+size_t(x)*3;
+      if (format==DXGI_FORMAT_R8G8B8A8_UNORM) {
+        const auto* rgba=source+size_t(x)*4;
+        bgr[0]=rgba[2]; bgr[1]=rgba[1]; bgr[2]=rgba[0];
+        continue;
+      }
+      const auto* row=reinterpret_cast<const uint16_t*>(source);
+      const float r=half(row[x*4]),g=half(row[x*4+1]),b=half(row[x*4+2]);
+      if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) { bgr[0]=255; bgr[1]=0; bgr[2]=255; }
+      else {
+        bgr[0]=uint8_t(std::clamp(b,0.0f,1.0f)*255+.5f);
+        bgr[1]=uint8_t(std::clamp(g,0.0f,1.0f)*255+.5f);
+        bgr[2]=uint8_t(std::clamp(r,0.0f,1.0f)*255+.5f);
+      }
+    }
+  }
+  return bmp;
+}
+std::vector<uint8_t> CaptureNativeBmp(NativeRenderBackend& backend,NativeBackendRenderTarget& target,
+                                      uint32_t format) {
+  return EncodeNativeBmp(backend.ReadRenderTarget(target),target.width(),target.height(),format);
+}
 std::vector<uint8_t> CaptureNativeHdrBmp(ID3D11DeviceContext& context,ID3D11Texture2D& surface) {
   if(auto resolved=ResolveDiagnosticColor(context,surface))
     return CaptureNativeHdrBmp(context,*resolved.Get());
@@ -509,13 +561,9 @@ std::vector<uint8_t> CaptureNativeHdrBmp(ID3D11DeviceContext& context,ID3D11Text
   if ((desc.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM) || desc.SampleDesc.Count!=1 ||
       desc.ArraySize!=1 || desc.MipLevels!=1 || !desc.Width || !desc.Height ||
       desc.Width>4096 || desc.Height>4096) throw std::runtime_error("unsupported native diagnostic surface");
-  const uint32_t pitch=(desc.Width*3+3)&~3u;
-  std::vector<uint8_t> bmp(54+size_t(pitch)*desc.Height,0);
-  auto word=[&](size_t at,uint32_t value) {
-    for (unsigned b=0;b<4;++b) bmp[at+b]=uint8_t(value>>(8*b));
-  };
-  bmp[0]='B'; bmp[1]='M'; word(2,static_cast<uint32_t>(bmp.size())); word(10,54); word(14,40);
-  word(18,desc.Width); word(22,0u-desc.Height); bmp[26]=1; bmp[28]=24; word(34,pitch*desc.Height);
+  // Read here, encoded by the shared encoder: the fetch is what differs
+  // between the two captures, not the picture.
+  const size_t row_bytes=size_t(desc.Width)*(desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM?4:8);
   desc.Usage=D3D11_USAGE_STAGING; desc.BindFlags=desc.MiscFlags=0; desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
   Microsoft::WRL::ComPtr<ID3D11Device> device; context.GetDevice(&device);
   Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
@@ -523,33 +571,12 @@ std::vector<uint8_t> CaptureNativeHdrBmp(ID3D11DeviceContext& context,ID3D11Text
   context.CopyResource(staging.Get(),&surface);
   D3D11_MAPPED_SUBRESOURCE mapped{};
   if (FAILED(context.Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped))) throw std::runtime_error("native capture mapping failed");
-  auto half=[](uint16_t bits) {
-    const int exponent=(bits>>10)&31,mantissa=bits&1023;
-    if (exponent==31) return std::numeric_limits<float>::quiet_NaN();
-    const float value=exponent ? std::ldexp(float(1024+mantissa),exponent-25) : std::ldexp(float(mantissa),-24);
-    return bits&0x8000?-value:value;
-  };
-  for (UINT y=0;y<desc.Height;++y) {
-    const auto* row=reinterpret_cast<const uint16_t*>(static_cast<const uint8_t*>(mapped.pData)+y*mapped.RowPitch);
-    for (UINT x=0;x<desc.Width;++x) {
-      if (desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM) {
-        const auto* rgba=static_cast<const uint8_t*>(mapped.pData)+size_t(y)*mapped.RowPitch+x*4;
-        auto* bgr=bmp.data()+54+size_t(y)*pitch+x*3;
-        bgr[0]=rgba[2]; bgr[1]=rgba[1]; bgr[2]=rgba[0];
-        continue;
-      }
-      const float r=half(row[x*4]),g=half(row[x*4+1]),b=half(row[x*4+2]);
-      auto* pixel=bmp.data()+54+size_t(y)*pitch+x*3;
-      if (!std::isfinite(r) || !std::isfinite(g) || !std::isfinite(b)) { pixel[0]=255; pixel[1]=0; pixel[2]=255; }
-      else {
-        pixel[0]=uint8_t(std::clamp(b,0.0f,1.0f)*255+.5f);
-        pixel[1]=uint8_t(std::clamp(g,0.0f,1.0f)*255+.5f);
-        pixel[2]=uint8_t(std::clamp(r,0.0f,1.0f)*255+.5f);
-      }
-    }
-  }
+  std::vector<uint8_t> pixels(row_bytes*desc.Height);
+  for (UINT y=0;y<desc.Height;++y)
+    std::memcpy(pixels.data()+size_t(y)*row_bytes,
+                static_cast<const uint8_t*>(mapped.pData)+size_t(y)*mapped.RowPitch,row_bytes);
   context.Unmap(staging.Get(),0);
-  return bmp;
+  return EncodeNativeBmp(pixels,desc.Width,desc.Height,desc.Format);
 }
 NativeDepthCoverage InspectNativeDepth(ID3D11DeviceContext& context,ID3D11Texture2D& surface,float clear_depth) {
   D3D11_TEXTURE2D_DESC desc{}; surface.GetDesc(&desc);

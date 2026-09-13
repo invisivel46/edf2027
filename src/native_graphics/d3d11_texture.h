@@ -123,6 +123,16 @@ NativeTexture CreateNativeDdsTexture(NativeRenderBackend& backend, std::span<con
 // Nonfinite RGB becomes magenta. This is not the game's tone mapping, and
 // reading a partial target does not mark its contents valid for presentation.
 std::vector<uint8_t> CaptureNativeHdrBmp(ID3D11DeviceContext& context,ID3D11Texture2D& surface);
+// Packed pixels to a 24-bit BMP, and the same capture taken through the seam.
+// The D3D11 one above reads an ID3D11Texture2D, which a scene drawn on another
+// backend has not got - and a port whose output cannot be looked at is a port
+// nobody can say is working.
+std::vector<uint8_t> EncodeNativeBmp(std::span<const uint8_t> pixels,uint32_t width,uint32_t height,
+                                     uint32_t format);
+// Blocking: it waits for the GPU. Diagnostics only, never on a frame path, and
+// never inside an open frame - submit first.
+std::vector<uint8_t> CaptureNativeBmp(NativeRenderBackend& backend,NativeBackendRenderTarget& target,
+                                      uint32_t format);
 // Diagnostic one-pixel readback, without quantizing HDR or changing validity.
 std::array<float,4> ReadNativeColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,uint32_t x,uint32_t y);
 // Diagnostic region scan. Returns the first nonfinite RGB pixel in row order;

@@ -151,13 +151,41 @@ int main() {
       };
       const D3D12_SAMPLER_DESC one[] = {describe(1.0f), describe(2.0f)};
       const D3D12_SAMPLER_DESC two[] = {describe(1.0f), describe(3.0f)};
-      const auto first = gpu.samplers().Table(one);
-      const auto again = gpu.samplers().Table(one);
-      const auto other = gpu.samplers().Table(two);
+      const auto first = gpu.samplers().Table(one, 1, 0);
+      const auto again = gpu.samplers().Table(one, 1, 0);
+      const auto other = gpu.samplers().Table(two, 1, 0);
       Check(first.ptr == again.ptr, "the sampler cache did not reuse an identical combination");
       Check(first.ptr != other.ptr, "two different sampler combinations shared one table");
       Check(gpu.samplers().hits() == 1 && gpu.samplers().misses() == 2,
             "the sampler cache did not account for its hits and misses");
+
+      // A mission uses more sampler combinations over its life than the heap
+      // can hold at once - 2,048 descriptors is all D3D12 allows - so a full
+      // heap has to give up a table the GPU has finished with. Filling it here
+      // rather than trusting the arithmetic: the failure this replaces was a
+      // hard stop part way through a level.
+      const auto capacity = gpu.samplers().capacity();
+      for (uint32_t index = 0; gpu.samplers().tables() < capacity; ++index) {
+        const D3D12_SAMPLER_DESC filler[] = {describe(float(index) + 16.0f)};
+        gpu.samplers().Table(filler, 1, 0);
+      }
+      Check(gpu.samplers().tables() == capacity, "the sampler cache did not fill to its capacity");
+      Check(gpu.samplers().evictions() == 0, "the sampler cache evicted before it was full");
+      // Nothing has retired: every table is stamped with frame 1 and the GPU
+      // has reached 0, so there is nothing safe to take.
+      bool refused = false;
+      const D3D12_SAMPLER_DESC overflow[] = {describe(4096.0f)};
+      try { gpu.samplers().Table(overflow, 1, 0); }
+      catch (const std::exception&) { refused = true; }
+      Check(refused, "a full sampler cache handed out a table still in flight");
+      // Frame 1 is done, so the oldest table's slots are free to reuse.
+      const auto recycled = gpu.samplers().Table(overflow, 2, 1);
+      Check(recycled.ptr != 0 && gpu.samplers().evictions() == 1,
+            "a full sampler cache did not reuse a table the GPU had finished with");
+      Check(gpu.samplers().tables() == capacity, "an eviction changed the cache's capacity");
+      // And the evicted combination is genuinely gone rather than aliased.
+      Check(gpu.samplers().Table(overflow, 2, 1).ptr == recycled.ptr,
+            "the recycled table did not come back for its own combination");
 
       gpu.BeginFrame();
       const auto views = gpu.AllocateViews(7);

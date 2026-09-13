@@ -38,7 +38,9 @@ struct NativeD3D12Options {
   // The root signature's sampler table width, and how many distinct
   // combinations the cache may hold. 8 x 192 = 1,536 of the 2,048 descriptors
   // a shader-visible sampler heap is allowed.
-  uint32_t sampler_slots=8,sampler_tables=192;
+  // 256 eight-slot tables is the whole 2,048-descriptor shader-visible
+  // sampler heap D3D12 permits - the ceiling, not a budget.
+  uint32_t sampler_slots=8,sampler_tables=256;
   // How many threads may record at once. One is D3D11's shape and the default;
   // more is the entire reason this backend exists, and each recorder gets its
   // own command allocator, its own slice of the upload ring and its own slice

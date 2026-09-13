@@ -89,26 +89,48 @@ class NativeD3D12SamplerCache {
   // width is reserved per combination so the table can be bound as one handle.
   NativeD3D12SamplerCache(ID3D12Device& device, uint32_t slots_per_table, uint32_t max_tables);
 
-  // Throws when the heap is exhausted, naming how many combinations fit. A
-  // silent fallback would bind the wrong filtering rather than report a limit,
-  // and the symptom - one surface filtered wrongly - is nearly unfindable.
-  D3D12_GPU_DESCRIPTOR_HANDLE Table(std::span<const D3D12_SAMPLER_DESC> samplers);
+  // A table for this combination, reusing one the GPU has finished with when
+  // the heap is full.
+  //
+  // The heap cannot simply be made bigger: 2,048 descriptors is the whole
+  // shader-visible sampler heap D3D12 allows, which at eight slots a table is
+  // 256 combinations, and a mission uses more than that over its lifetime
+  // while using very few at once. So a combination not seen since a frame the
+  // GPU has finished gives up its slots. `used` is the frame value to stamp
+  // this table with and `completed` what the GPU has reached; a table stamped
+  // above `completed` is still being read and is never taken.
+  //
+  // Throws only when every table is in flight, which is a real shape problem
+  // and not a busy moment. A silent fallback would bind the wrong filtering
+  // rather than report a limit, and the symptom - one surface filtered wrongly
+  // - is nearly unfindable.
+  D3D12_GPU_DESCRIPTOR_HANDLE Table(std::span<const D3D12_SAMPLER_DESC> samplers,
+                                    uint64_t used,uint64_t completed);
 
   ID3D12DescriptorHeap* heap() const { return heap_.Get(); }
   uint32_t tables() const { return static_cast<uint32_t>(tables_.size()); }
   uint32_t capacity() const { return max_tables_; }
   uint64_t hits() const { return hits_; }
   uint64_t misses() const { return misses_; }
+  // Tables taken back from a combination the GPU had finished with. A number
+  // that climbs every frame means the working set really is over capacity and
+  // the cache is thrashing, which is worth seeing rather than inferring.
+  uint64_t evictions() const { return evictions_; }
 
  private:
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
   ID3D12Device* device_=nullptr;
   // Keyed on the raw descriptor bytes: two sampler descriptions that compare
   // equal byte for byte are the same sampler, and nothing else is.
-  std::map<std::string,D3D12_GPU_DESCRIPTOR_HANDLE> tables_;
+  struct Entry {
+    D3D12_GPU_DESCRIPTOR_HANDLE table{};
+    uint32_t index=0;      // First slot, so an evicted table's slots can be reused.
+    uint64_t used=0;       // Frame this was last handed out for.
+  };
+  std::map<std::string,Entry> tables_;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_start_{};
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_start_{};
   uint32_t increment_=0,slots_per_table_=0,max_tables_=0;
-  uint64_t hits_=0,misses_=0;
+  uint64_t hits_=0,misses_=0,evictions_=0;
 };
 }  // namespace edf::native

@@ -595,7 +595,10 @@ class D3D12Recorder final : public NativeBackendRecorder {
     std::array<D3D12_SAMPLER_DESC,NativeD3D12RootLayout::kPixelSamplers> descs{};
     for(uint32_t slot=0;slot<descs.size();++slot)
       descs[slot]=bound_.samplers[slot]?bound_.samplers[slot]->desc():DefaultSampler();
-    const auto table=gpu_->samplers().Table(descs);
+    // Stamped with the frame being recorded and told what the GPU has passed,
+    // so a combination this frame needs can take the slots of one no frame is
+    // still reading.
+    const auto table=gpu_->samplers().Table(descs,gpu_->pending_fence(),gpu_->completed_fence());
     Commands().SetGraphicsRootDescriptorTable(NativeD3D12RootLayout::kPixelSamplerTable,table);
     bound_.samplers_dirty=false;
   }
