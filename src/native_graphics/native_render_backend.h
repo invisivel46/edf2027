@@ -179,6 +179,10 @@ struct NativeBackendBufferDesc {
 struct NativeBackendTextureDesc {
   uint32_t width=0,height=0,levels=1;
   uint32_t format=0;  // Backend-specific format code; see the backend's mapping.
+  // Multisampling, which this renderer does use: 2x and 4x targets that are
+  // resolved before anything samples them. A pipeline drawing into one must
+  // declare the same count, or it will not bind.
+  uint32_t samples=1;
   bool render_target=false,depth=false;
 };
 

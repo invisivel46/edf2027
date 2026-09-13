@@ -332,14 +332,20 @@ class D3D12Recorder final : public NativeBackendRecorder {
   void ResolveTarget(NativeBackendTexture& destination, NativeBackendRenderTarget& source) override {
     auto& to=static_cast<D3D12Texture&>(destination);
     auto& from=static_cast<D3D12RenderTarget&>(source);
+    const auto description=from.tracked().resource->GetDesc();
+    if(description.SampleDesc.Count>1) {
+      // A real resolve. The states are their own pair, not the copy ones, and
+      // using COPY_SOURCE here is the mistake validation would catch.
+      Transition(to.tracked(),D3D12_RESOURCE_STATE_RESOLVE_DEST);
+      Transition(from.tracked(),D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+      Commands().ResolveSubresource(to.tracked().resource.Get(),0,
+                                    from.tracked().resource.Get(),0,description.Format);
+      return;
+    }
+    // Resolving a single-sampled target is a copy, and callers do it rather
+    // than branching on the sample count themselves.
     Transition(to.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(from.tracked(),D3D12_RESOURCE_STATE_COPY_SOURCE);
-    // Single-sampled targets are the common case here and a resolve of one is
-    // a copy; a genuine MSAA resolve needs the sample count, which this seam
-    // does not yet carry, so it is refused rather than silently downgraded.
-    const auto description=from.tracked().resource->GetDesc();
-    if(description.SampleDesc.Count>1)
-      throw std::runtime_error("multisample resolve is not implemented in the D3D12 backend");
     Commands().CopyResource(to.tracked().resource.Get(),from.tracked().resource.Get());
   }
   void UpdateBuffer(NativeBackendBuffer& buffer, uint32_t offset, std::span<const uint8_t> bytes) override {
@@ -570,7 +576,7 @@ class D3D12Backend final : public NativeRenderBackend {
     description.DepthOrArraySize=1;
     description.MipLevels=1;
     description.Format=static_cast<DXGI_FORMAT>(desc.format);
-    description.SampleDesc={1,0};
+    description.SampleDesc={desc.samples?desc.samples:1,0};
     description.Flags=desc.depth?D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
                                 :D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     tracked.state=desc.depth?D3D12_RESOURCE_STATE_DEPTH_WRITE:D3D12_RESOURCE_STATE_RENDER_TARGET;
@@ -584,15 +590,16 @@ class D3D12Backend final : public NativeRenderBackend {
             "render target creation");
     auto& pool=desc.depth?depth_views_:render_target_views_;
     const auto view=pool.Allocate();
+    const bool multisampled=description.SampleDesc.Count>1;
     if(desc.depth) {
       D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
       dsv.Format=description.Format;
-      dsv.ViewDimension=D3D12_DSV_DIMENSION_TEXTURE2D;
+      dsv.ViewDimension=multisampled?D3D12_DSV_DIMENSION_TEXTURE2DMS:D3D12_DSV_DIMENSION_TEXTURE2D;
       gpu_.device()->CreateDepthStencilView(tracked.resource.Get(),&dsv,view);
     } else {
       D3D12_RENDER_TARGET_VIEW_DESC rtv{};
       rtv.Format=description.Format;
-      rtv.ViewDimension=D3D12_RTV_DIMENSION_TEXTURE2D;
+      rtv.ViewDimension=multisampled?D3D12_RTV_DIMENSION_TEXTURE2DMS:D3D12_RTV_DIMENSION_TEXTURE2D;
       gpu_.device()->CreateRenderTargetView(tracked.resource.Get(),&rtv,view);
     }
     return std::make_unique<D3D12RenderTarget>(std::move(tracked),desc.width,desc.height,desc.depth,

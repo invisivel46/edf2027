@@ -300,12 +300,16 @@ Working, each verified by reading pixels back rather than by inspection:
 - Occlusion query returning 2,016 samples, matching the pixel count the flat
   triangle test measures independently.
 - Mipped texture upload, checked by sampling level 1 explicitly.
+- 4x multisampled target, resolved and sampled: 2,016 fully covered pixels
+  matching the single-sample count, plus 64 partially covered ones - exactly
+  the length of the diagonal, and values single-sample rasterisation cannot
+  produce.
 
 Not done, and loud rather than silent about it:
 
 - **The bridge still calls D3D11 directly.** Not wired to the game.
-- No vertex-stage textures or samplers (no disc shader uses any).
-- No MSAA resolve.
+- No vertex-stage textures or samplers (no disc shader uses any, so this is a
+  declared limit rather than a missing feature).
 - Wiring is the 13 touchpoints and is the largest remaining piece, and it
   cannot be a translation: see the constant-buffer finding below.
 

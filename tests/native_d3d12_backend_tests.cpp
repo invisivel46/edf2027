@@ -571,6 +571,111 @@ float4 PS(Varying input) : SV_TARGET { return image.SampleLevel(filtering, input
       std::cout << "mipped upload: level 1 sampled correctly\n";
     }
 
+    {
+      // A 4x multisampled target, resolved and then sampled. The renderer does
+      // use 2x and 4x targets, so this is not a hypothetical path.
+      //
+      // Checked by looking for partially covered pixels along the diagonal.
+      // Single-sample rasterisation can only produce the triangle colour or
+      // the clear colour; intermediate values exist only if four samples were
+      // taken and averaged. A resolve that silently degraded to a copy would
+      // produce none, and would pass any check that only looked at corners.
+      NativeBackendTextureDesc msaa_desc{};
+      msaa_desc.width = msaa_desc.height = kSize;
+      msaa_desc.levels = 1;
+      msaa_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      msaa_desc.samples = 4;
+      msaa_desc.render_target = true;
+      const auto msaa_target = backend->CreateRenderTarget(msaa_desc);
+
+      NativeBackendTextureDesc resolved_desc{};
+      resolved_desc.width = resolved_desc.height = kSize;
+      resolved_desc.levels = 1;
+      resolved_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      const auto resolved = backend->CreateTexture(resolved_desc, {});
+
+      NativeBackendPipelineDesc msaa_pipeline_desc = pipeline_desc;
+      msaa_pipeline_desc.sample_count = 4;
+      msaa_pipeline_desc.vertex_id = 0xB1;
+      msaa_pipeline_desc.pixel_id = 0xB2;
+      auto& msaa_pipeline = backend->CreatePipeline(msaa_pipeline_desc);
+
+      NativeBackendRenderTarget* msaa_colors[] = {msaa_target.get()};
+      backend->BeginFrame();
+      auto& msaa_recorder = backend->Recorder();
+      msaa_recorder.SetRenderTargets(msaa_colors, nullptr);
+      msaa_recorder.SetViewport({0, 0, static_cast<float>(kSize), static_cast<float>(kSize), 0, 1});
+      msaa_recorder.ClearColor(*msaa_target, {0.0f, 0.0f, 0.0f, 1.0f});
+      msaa_recorder.SetPipeline(msaa_pipeline);
+      msaa_recorder.SetVertexBuffer(0, *vertex_buffer, sizeof(float) * 3, 0);
+      msaa_recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                                 {reinterpret_cast<const uint8_t*>(tint.data()), sizeof(float) * 4});
+      msaa_recorder.Draw(3, 0);
+      msaa_recorder.ResolveTarget(*resolved, *msaa_target);
+      backend->Submit();
+
+      // Sampled through the normal single-sample target, which is the only
+      // surface this seam can read back.
+      const char* kBlit = R"(
+Texture2D image : register(t0);
+SamplerState filtering : register(s0);
+struct Varying { float4 position : SV_POSITION; float2 uv : TEXCOORD0; };
+Varying VS(float3 position : POSITION) {
+  Varying output;
+  output.position = float4(position, 1);
+  output.uv = float2(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5);
+  return output;
+}
+float4 PS(Varying input) : SV_TARGET { return image.SampleLevel(filtering, input.uv, 0); }
+)";
+      const auto blit_vs = Compile(kBlit, "VS", "vs_5_0");
+      const auto blit_ps = Compile(kBlit, "PS", "ps_5_0");
+      const float cover[] = {-1.0f, -1.0f, 0.0f, 3.0f, -1.0f, 0.0f, -1.0f, 3.0f, 0.0f};
+      NativeBackendBufferDesc cover_desc{};
+      cover_desc.bytes = sizeof(cover);
+      cover_desc.vertex = true;
+      const auto cover_buffer = backend->CreateBuffer(
+          cover_desc, {reinterpret_cast<const uint8_t*>(cover), sizeof(cover)});
+      NativeBackendSamplerDesc point_desc{};
+      point_desc.min = point_desc.mag = point_desc.mip = NativeBackendFilter::Point;
+      point_desc.u = point_desc.v = point_desc.w = NativeBackendAddress::Clamp;
+      auto& point_sampler = backend->CreateSampler(point_desc);
+
+      NativeBackendPipelineDesc blit_desc = pipeline_desc;
+      blit_desc.vertex = Bytes(*blit_vs.Get());
+      blit_desc.pixel = Bytes(*blit_ps.Get());
+      blit_desc.vertex_id = 0xB3;
+      blit_desc.pixel_id = 0xB4;
+      auto& blit_pipeline = backend->CreatePipeline(blit_desc);
+
+      backend->BeginFrame();
+      auto& blit_recorder = backend->Recorder();
+      blit_recorder.SetRenderTargets(colors, nullptr);
+      blit_recorder.SetViewport({0, 0, static_cast<float>(kSize), static_cast<float>(kSize), 0, 1});
+      blit_recorder.ClearColor(*target, {0.0f, 0.0f, 0.0f, 1.0f});
+      blit_recorder.SetPipeline(blit_pipeline);
+      blit_recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+      blit_recorder.SetTexture(NativeBackendStage::Pixel, 0, resolved.get());
+      blit_recorder.SetSampler(NativeBackendStage::Pixel, 0, &point_sampler);
+      blit_recorder.Draw(3, 0);
+      backend->Submit();
+
+      const auto edges = backend->ReadRenderTarget(*target);
+      uint32_t partial = 0, full = 0;
+      for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+          const uint8_t green = edges[(static_cast<size_t>(y) * kSize + x) * 4 + 1];
+          if (green > 200) ++full;
+          else if (green > 20) ++partial;
+        }
+      Check(full > 1500, "the multisampled draw did not cover the target");
+      Check(partial > 20, "no partially covered pixels survived the resolve: " +
+                              std::to_string(partial) + ", so nothing was multisampled");
+      for (const auto& message : backend->DrainValidationMessages())
+        Check(false, "D3D12 validation error around the resolve: " + message);
+      std::cout << "4x resolve: " << full << " covered, " << partial << " edge pixels\n";
+    }
+
     // A missing barrier would not change a single pixel above; only the API's
     // own validation sees it, so it is read rather than left in the debugger.
     for (const auto& message : backend->DrainValidationMessages())
