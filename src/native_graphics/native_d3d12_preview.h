@@ -43,7 +43,7 @@ class NativeD3D12Preview {
   void Run();
   void CreateResources();
   bool Tick();
-  void Draw(const uint8_t* pixels, uint32_t width, uint32_t height);
+  void Draw(const uint8_t* pixels, uint32_t width, uint32_t height, uint32_t format);
 
   NativeRenderBackend* backend_;
   HWND window_=nullptr;
@@ -51,7 +51,7 @@ class NativeD3D12Preview {
   std::unique_ptr<NativeBackendTexture> frame_;
   NativeBackendPipeline* pipeline_=nullptr;
   NativeBackendSampler* sampler_=nullptr;
-  uint32_t frame_width_=0,frame_height_=0,window_width_=0,window_height_=0;
+  uint32_t frame_width_=0,frame_height_=0,frame_format_=0,window_width_=0,window_height_=0;
   uint64_t last_sequence_=0;
   std::atomic<uint64_t> presented_{0};
   std::atomic<bool> stop_{false};

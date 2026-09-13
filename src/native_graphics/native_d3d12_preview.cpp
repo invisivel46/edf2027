@@ -13,8 +13,6 @@ using Microsoft::WRL::ComPtr;
 
 namespace edf::native {
 namespace {
-constexpr uint32_t kFormat=87;  // DXGI_FORMAT_B8G8R8A8_UNORM, matching the snapshot.
-
 // Compiled here rather than loaded from the disc: this composite is the
 // renderer's own, not the game's, exactly like the D3D11 compositor it mirrors.
 const char* kComposite=R"(
@@ -124,16 +122,21 @@ void NativeD3D12Preview::CreateResources() {
   sampler_=&backend_->CreateSampler(sampler_desc);
 }
 
-void NativeD3D12Preview::Draw(const uint8_t* pixels,uint32_t width,uint32_t height) {
-  if(frame_width_!=width || frame_height_!=height) {
+void NativeD3D12Preview::Draw(const uint8_t* pixels,uint32_t width,uint32_t height,uint32_t format) {
+  if(frame_width_!=width || frame_height_!=height || frame_format_!=format) {
     NativeBackendTextureDesc desc{};
     desc.width=width;
     desc.height=height;
     desc.levels=1;
-    desc.format=kFormat;
+    // Taken from the frame that was actually published, never assumed. It was
+    // assumed once, as BGRA against an RGBA source, and the whole window came
+    // out with red and blue swapped - which looks like a colour-grading bug
+    // rather than a one-word mistake.
+    desc.format=format;
     frame_=backend_->CreateTexture(desc,{});
     frame_width_=width;
     frame_height_=height;
+    frame_format_=format;
   }
   auto* back=backend_->BackBuffer();
   if(!back) return;
@@ -187,7 +190,7 @@ bool NativeD3D12Preview::Tick() {
   // held for the duration by VisitNativePresentationFrame, which is why the
   // copy out is kept to exactly the staging map and nothing else happens here.
   std::vector<uint8_t> pixels;
-  uint32_t frame_width=0,frame_height=0;
+  uint32_t frame_width=0,frame_height=0,frame_format=0;
   const bool drew=VisitNativePresentationFrame(
     [&](ID3D11Device& device,ID3D11DeviceContext& context,ID3D11ShaderResourceView& view,
         uint64_t sequence,NativeFrameKind,const NativeDisplayGamma*) {
@@ -217,6 +220,7 @@ bool NativeD3D12Preview::Tick() {
       context.Unmap(copy.Get(),0);
       frame_width=description.Width;
       frame_height=description.Height;
+      frame_format=description.Format;
       last_sequence_=sequence;
     });
   if(!drew || pixels.empty()) return true;
@@ -228,11 +232,11 @@ bool NativeD3D12Preview::Tick() {
     total+=1;
     if(pixels[at]>8||pixels[at+1]>8||pixels[at+2]>8) ++lit;
   }
-  Draw(pixels.data(),frame_width,frame_height);
+  Draw(pixels.data(),frame_width,frame_height,frame_format);
   const uint64_t count=presented_.load(std::memory_order_relaxed);
   if(count==1 || count%120==0)
-    REXLOG_INFO("D3D12 preview: presented={}, frame={}x{}, window={}x{}, sequence={}, non_black={}/{} sampled source pixels; every pixel in this window was drawn and presented by the {} backend",
-      count,frame_width,frame_height,window_width_,window_height_,last_sequence_,lit,total,
+    REXLOG_INFO("D3D12 preview: presented={}, frame={}x{} format={}, window={}x{}, sequence={}, non_black={}/{} sampled source pixels; every pixel in this window was drawn and presented by the {} backend",
+      count,frame_width,frame_height,frame_format,window_width_,window_height_,last_sequence_,lit,total,
       std::string(backend_->name()));
   return true;
 }
