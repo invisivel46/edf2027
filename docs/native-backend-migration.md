@@ -460,6 +460,33 @@ workload that matters, even when a representative one is inconvenient to
 produce.** `EDF_INPUT_SCRIPT=tools/native-combat-input.txt` drives it without
 a human at the controls, and it cost seven minutes.
 
+### What the binding work is actually worth, measured in combat
+
+A run that reached mission geometry - 10.5 million indexed draws - says both
+optimisations land on nearly everything:
+
+  binding reuse    bound 684,912   skipped 35,315,088   98.1%
+  material reuse   36,000,000 draws, 32,164,091 constants-only   89.3%
+
+Higher than the 77.4% the batch audit predicted, because that figure counted
+draws matching on a full twelve-word key including index ranges, while these
+only need the target, render state and material to be unchanged.
+
+`indexed.native` costs 1.65 us per draw in that run, against the 1.83 us
+measured before this work.
+
+### A measurement trap worth knowing about
+
+Frame counts here come from summing `calls=` across `swap.refresh_wait`
+reports, and a phase only reports once per 5 seconds. If a run stops early -
+one did, hanging after 79 seconds of an 800-second script - the log still
+looks complete and the arithmetic silently divides real frames by an assumed
+duration. That produced a "5.6 fps in combat" figure that was wrong by a
+factor of ten; the run was at 56.3 fps and had simply stopped.
+
+Always check the span between the first and last log timestamp against the
+intended run length before dividing by it.
+
 ### Where the frame goes now
 
 At 58.4 fps, per frame: 8.6 ms waiting for vsync, 3.1 ms in the game's own 60
