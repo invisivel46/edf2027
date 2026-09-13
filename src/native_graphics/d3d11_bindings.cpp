@@ -37,7 +37,7 @@ ShaderBindings::ShaderBindings(ID3D11Device& device, NativeShader shader)
           throw std::runtime_error("invalid reflected constant extent");
         if (variable.DefaultValue)
           std::memcpy(buffer.bytes.data() + variable.StartOffset, variable.DefaultValue, variable.Size);
-        if (!variables_.emplace(variable.Name, Variable{buffers_.size(), variable.StartOffset, variable.Size, type}).second)
+        if (!variables_.emplace(variable.Name, Variable{buffers_.size(), variable.StartOffset, variable.Size, type, (variable.uFlags & D3D_SVF_USED) != 0}).second)
           throw std::runtime_error("ambiguous shader constant name");
       }
       buffers_.push_back(std::move(buffer));
@@ -254,6 +254,10 @@ std::vector<float> ShaderBindings::ReadFloatVector(const std::string& name) cons
   if (values.size()*sizeof(float)!=v.size) throw std::runtime_error("diagnostic float vector size mismatch");
   std::memcpy(values.data(),buffers_.at(v.buffer).bytes.data()+v.offset,v.size);
   return values;
+}
+bool ShaderBindings::ConsumesConstant(const std::string& name) const {
+  const auto found=variables_.find(name);
+  return found!=variables_.end() && found->second.used;
 }
 std::vector<float> ShaderBindings::ReadFloatArray(const std::string& name) const {
   const auto found=variables_.find(name);

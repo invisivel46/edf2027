@@ -1187,8 +1187,11 @@ void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t d
         };
         for(const auto* name:{"g_LightVector","g_LightDiffuse","g_HemiSphereVector",
             "g_HemiSphereColor1","g_HemiSphereColor2","g_FogParam","g_FogColor"}) {
-          const bool vertex_used=vs.ResolveFloatRegisters(name).bytes()!=0;
-          const bool pixel_used=ps.ResolveFloatRegisters(name).bytes()!=0;
+          // Declaring a constant is not reading it: the reflection lists every
+          // Common.fx global in the buffer, so a binding's existence says
+          // nothing about whether this stage's pixels depend on the value.
+          const bool vertex_used=vs.ConsumesConstant(name);
+          const bool pixel_used=ps.ConsumesConstant(name);
           const bool vertex_supplied=supplied(0,name),pixel_supplied=supplied(1,name);
           if(vertex_supplied || pixel_supplied) {
             const auto vertex_source=global_source(0,name),pixel_source=global_source(1,name);

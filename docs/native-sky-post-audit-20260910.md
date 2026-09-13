@@ -514,3 +514,58 @@ did not, and the fix belongs in compilation or in how a stage's defaults are
 seeded), or it lists it and something upstream of `UploadParameters` loses it.
 Do not copy one stage's values to the other before that is settled: the two
 constant register files are genuinely separate on this hardware.
+
+## Shared-constant divergence retracted: it cannot reach a pixel (2026-09-12)
+
+The "Common.fx globals reach only one shader stage" finding was wrong, and the
+error was in the instrument, not the game.
+
+`ShaderBindings` builds `variables_` from constant-buffer reflection and was
+discarding `D3D11_SHADER_VARIABLE_DESC::uFlags`. A constant buffer reflects
+every constant the source *declares*, including ones the compiler proved the
+shader never reads, so both the original divergence audit
+(`ReadFloatVector` on each stage) and the follow-up supply audit
+(`ResolveFloatRegisters(name).bytes()!=0`) treated "has a binding" as "consumes
+the value". Both therefore counted constants no pixel depends on.
+
+`ShaderBindings::ConsumesConstant` now gates on the real `D3D_SVF_USED` bit.
+Re-run on a healthy host at a steady 60 FPS, reaching gameplay with 13,427,512
+indexed draws all submitted:
+
+| audit | `unsupplied_uses` | `distinct_unsupplied` | `both_supplied` |
+|---|---|---|---|
+| binding-existence test (wrong) | 182 over 32 pairs | 64 | 0 |
+| `D3D_SVF_USED` test (correct) | **0** | **0** | **0** |
+
+**Every stage that actually reads a Common.fx global is supplied that global.**
+`both_supplied=0` alongside it is the structural explanation rather than a
+second symptom: no bound pair ever has *both* stages reading the same global, so
+there is no case where two stages could read one constant and disagree. Lighting
+is done in one stage per effect and the engine supplies that stage. That is
+correct behaviour, not a port defect.
+
+This also retracts the specific `g_FogParam`-on-the-vertex-stage argument, which
+was presented as the strongest case: `VS_Blend` does reference `FogParam(P)`, and
+the corrected audit shows the stage reading it is supplied it.
+
+The 117,342 mismatching reads were real value differences, but in constants the
+losing stage declares and never reads, so they cannot affect an image. Nothing
+in the parameter path needs changing, and the earlier warning against copying one
+stage's values to the other now has a stronger reason behind it: there is nothing
+to copy.
+
+### Where the brightness defect stands after this
+
+Two candidates are now eliminated rather than one. The post chain is faithful to
+the retail source, and the constant routing is correct. What remains:
+
+- **Negative radiance in the scene target**, min (-24.70, -24.20, -18.64) against
+  max (2.98, 2.93, 3.17). The tone curve turns a large negative into saturated
+  white. Producer draw identified (`VS_Blend`/`PS_Main`, source
+  `0x91d077f54e255d81`); the suspected mechanism, `lerp` extrapolating when
+  `m_RefrectionRate*Pr.z` exceeds 1, is still unmeasured.
+- The scene's own HDR range, max ~3.0 against mean ~0.44, has never been compared
+  against a reference.
+
+Next: measure `m_RefrectionRate` and the `Pr.z` texel at the identified pixel,
+which is a bounded readback at a known draw, not another search.

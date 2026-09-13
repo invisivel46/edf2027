@@ -10,7 +10,11 @@ namespace edf::native {
 // thread. The guest adapter converts endianness and serializes matrices/arrays
 // to the reflected layout before passing bytes here.
 class ShaderBindings {
-  struct Variable { size_t buffer; UINT offset, size; D3D11_SHADER_TYPE_DESC type; };
+  // `used` is the reflection's D3D_SVF_USED bit. A constant buffer reflects
+  // every constant the source declares, including ones the compiler proved the
+  // shader never reads, so "has a binding" is not "consumes". Coverage work that
+  // conflates the two reports gaps that cannot affect a pixel.
+  struct Variable { size_t buffer; UINT offset, size; D3D11_SHADER_TYPE_DESC type; bool used; };
  public:
   class FloatRegisterBinding {
    public:
@@ -64,6 +68,9 @@ class ShaderBindings {
   // constant-buffer padding. Missing/optimized-out names return an empty span;
   // a non-array or non-float name is rejected rather than reinterpreted.
   std::vector<float> ReadFloatArray(const std::string& name) const;
+  // Whether the compiled shader actually reads this constant, as opposed to
+  // merely declaring it. False for an absent name.
+  bool ConsumesConstant(const std::string& name) const;
   // Logical row-major values, independent of the reflected storage layout.
   // Missing/optimized-out names return nullopt; other types are rejected.
   std::optional<std::array<float,16>> ReadFloat4x4(const std::string& name) const;
