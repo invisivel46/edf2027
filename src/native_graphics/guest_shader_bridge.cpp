@@ -1,4 +1,4 @@
-#ifndef NOMINMAX
+﻿#ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include "guest_shader_bridge.h"
@@ -4663,7 +4663,7 @@ REX_HOOK_RAW(sub_8219C840) {
         auto& direct=scene.direct_outputs[handle];
         if(!direct.surface)
           direct=edf::native::CreateNativeOpaqueFrameTarget(EnsureSceneBackendLocked(state),creation.width,creation.height);
-        edf::native::ResolveNativeRgba8Frame(*state.context.Get(),scene.color,direct);
+        edf::native::ResolveNativeRgba8Frame(edf::native::SceneRecorderLocked(state),scene.color,direct);
         state.textures.insert_or_assign(handle,direct.sampled);
         if(state.presentation_frames) {
           state.presentation_frames->Invalidate();

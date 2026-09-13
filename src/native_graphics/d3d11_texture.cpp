@@ -248,31 +248,30 @@ bool ImportZeroLuminanceHistory(ID3D11DeviceContext& context,NativeRenderTarget&
   // This is the initial sampled allocation, not a clear of the R32F surface.
   return true;
 }
-void ResolveNativeRgba8Frame(ID3D11DeviceContext& context,const NativeRenderTarget& source,
+// The scene's HDR surface, resolved and converted into an RGBA8 frame.
+//
+// Both halves are recorded: the multisample resolve into the destination's own
+// surface, then the conversion draw that writes the RGBA8 result. It used to be
+// a ResolveSubresource plus a compute dispatch, and the destination's device
+// had to match the context's - a check that has no meaning once both come from
+// one backend, which is the only way they can be used together at all.
+void ResolveNativeRgba8Frame(NativeBackendRecorder& recorder,const NativeRenderTarget& source,
                              NativeRenderTarget& destination) {
   if(&source==&destination) throw std::runtime_error("direct frame resolve aliases source");
   destination.content_valid=destination.sampled.content_valid=false;
-  if(!source.surface || !destination.surface ||
+  if(!source.backend_surface || !destination.backend_surface ||
      destination.conversion!=NativeRenderTarget::Conversion::rgba8 || !destination.convert_pipeline)
     throw std::runtime_error("invalid direct frame conversion pair");
-  D3D11_TEXTURE2D_DESC in{},out{};
-  source.surface->GetDesc(&in); destination.surface->GetDesc(&out);
-  if(source.surface.Get()==destination.surface.Get() || in.Width!=out.Width || in.Height!=out.Height ||
-     in.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT || out.Format!=in.Format ||
-     in.MipLevels!=1 || in.ArraySize!=1 || out.SampleDesc.Count!=1 ||
-     (in.SampleDesc.Count!=1 && in.SampleDesc.Count!=2 && in.SampleDesc.Count!=4))
+  auto* into=destination.backend_surface->texture();
+  if(!into) throw std::runtime_error("a direct frame destination surface cannot be written");
+  if(source.backend_surface->width()!=destination.backend_surface->width() ||
+     source.backend_surface->height()!=destination.backend_surface->height() ||
+     source.format!=DXGI_FORMAT_R16G16B16A16_FLOAT || destination.format!=source.format)
     throw std::runtime_error("unsupported direct frame resolve source");
-  Microsoft::WRL::ComPtr<ID3D11Device> device,source_device,destination_device;
-  context.GetDevice(&device); source.surface->GetDevice(&source_device);
-  destination.surface->GetDevice(&destination_device);
-  if(device.Get()!=source_device.Get() || device.Get()!=destination_device.Get())
-    throw std::runtime_error("direct frame resolve device mismatch");
   if(!source.content_valid) return;
-  if(in.SampleDesc.Count>1)
-    context.ResolveSubresource(destination.surface.Get(),0,source.surface.Get(),0,in.Format);
-  else context.CopyResource(destination.surface.Get(),source.surface.Get());
+  recorder.ResolveTarget(*into,*source.backend_surface);
   destination.content_valid=true;
-  ResolveNativeRenderTarget(context,destination);
+  ResolveNativeRenderTarget(recorder,destination);
 }
 std::array<float,4> NativeClearColor(uint32_t argb) {
   return {float((argb>>16)&255)/255.0f,float((argb>>8)&255)/255.0f,

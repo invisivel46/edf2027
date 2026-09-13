@@ -98,7 +98,7 @@ NativeRenderTarget CreateNativeBloomTarget(NativeRenderBackend& backend,uint32_t
 NativeRenderTarget CreateNativeOpaqueFrameTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height);
 // Direct color resolve to RGBA8, without exposure, bloom or gamma. Destination
 // is a dedicated bloom/opaque-frame conversion pair, never the HDR history.
-void ResolveNativeRgba8Frame(ID3D11DeviceContext& context,const NativeRenderTarget& source,
+void ResolveNativeRgba8Frame(NativeBackendRecorder& recorder,const NativeRenderTarget& source,
                              NativeRenderTarget& destination);
 // Initial upload only: a 1x1 R16F texture fits in its first 4KiB backing page.
 // Uniform zero bytes have the same value for any tiling/endian layout.

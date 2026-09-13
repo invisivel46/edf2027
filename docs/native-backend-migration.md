@@ -398,6 +398,9 @@ default would mean a device that costs memory and start-up time and renders
 nothing. The default stays D3D11 until the port lands; the flip itself is one
 line and the conformance test is what says it was clean.
 
+*(That table is the state before the port started. What has actually moved is
+recorded under "Step 2" below; what has not is presentation.)*
+
 ### Port progress
 
 The files above are mostly guest logic wrapped in a thin D3D11 shell - the DDS
@@ -706,6 +709,77 @@ reaches its resource through an unwrap helper - `NativeD3D11Buffer`,
 backend that is not D3D11 and is checked, so selecting d3d12 for the scene
 fails with a sentence rather than binding nothing. Those helpers are the
 remaining port, and they disappear with it.
+
+### Step 2, finished: every scene draw records through the seam
+
+`--edf_native_seam_draws` makes all five draw paths - indexed geometry, scene
+immediate geometry, XUI, font, movie and the post chain's full-screen quads -
+build a pipeline and record into a recorder instead of binding four D3D11
+objects and calling the context. With `--edf_native_scene_backend=d3d11` both
+draw the same thing on the same device, which is what makes it the A/B control:
+a difference is a wiring mistake, because the backend underneath has not
+changed.
+
+In the game: 466,000 indexed draws, zero errors, and the same 294 mesh builds
+and 31,944,056 bytes of converted geometry as the direct path reached at the
+same point in the same script.
+
+**What recording cost, and what got it back.** Recorded draws started at 2.60 us
+each against 1.62 us direct, over 510,278 and 771,082 draws. The difference was
+not the backend: the direct path skips 98% of its binding work when the draw
+before it bound the same things, and the recorded path was doing all of it every
+draw. Teaching it the same skip - and not re-staging constants whose bytes have
+not changed - is what closes that gap. Two things make the skip trustworthy:
+
+* a material's resources change *inside* one bindings object when an activation
+  re-points a texture, so the comparison is against a counter the bindings keep,
+  not against the object's address;
+* on the adopted D3D11 backend the recorder and the direct paths share one
+  context, so a direct bind invalidates what the recorder believes is set - the
+  existing bind generation already tracks exactly that.
+
+### What selecting d3d12 for the scene found
+
+`--edf_native_scene_backend=d3d12` now creates every scene resource, compiles
+every pipeline and records every draw. Getting there turned up four defects that
+only exist on a backend with no D3D11 handles, and every one of them was a
+question asked of a null pointer:
+
+| what asked | what it did on D3D12 |
+|---|---|
+| "does this shader sample the target it draws into" | compared null to null, answered yes, refused every draw - and dereferenced that null to ask |
+| "does this brush have a native texture" | looked for a D3D11 view, found none, refused |
+| the XUI batch audit's shape hash | hashed the same null for every texture |
+| frame publication and the HDR captures | dereferenced a null texture |
+
+Two guesses in the D3D12 backend also became measurements. The upload ring was
+16 MB with a comment saying so; a real recorded frame wants more, and it is a
+setting now, set from the high-water figure the ring reports when a frame does
+not fit. And the post chain's three converting targets resolved through a
+compute shader and an unordered-access view - the one operation in this renderer
+the seam cannot express, and one it never needed: the kernel read its source at
+the dispatch coordinate and wrote the result, which is a full-screen draw
+reading its own pixel coordinate. The arithmetic is unchanged.
+
+### What is left
+
+**Presentation.** The scene's finished frame reaches the window as an
+`ID3D11Texture2D` handed to `NativeFrameHandoff`, which is D3D11 throughout. A
+D3D12 scene has no such texture, so nothing reaches the screen and the run
+stalls behind a presenter waiting for a frame that will never be published. The
+mechanism to fix it already exists and is already proven - `OpenSharedTexture`
+and `WaitSharedFence` on the seam, which is how the D3D12 preview window samples
+a D3D11 frame today - but the handoff itself has to be written against the seam
+rather than against a device.
+
+That is the last structural piece. Until it lands, `--edf_native_scene_backend`
+stays `d3d11`, which is what the cvar has said since it was added.
+
+**Diagnostics that are D3D11 by nature** - the HDR range and BMP captures, the
+depth inspection, the stream-output clip-position replay, the occlusion
+visibility query - refuse with a reason on a recorded or non-D3D11 path rather
+than reporting a number that means nothing. They are capture-time tools and are
+not on the path to the flip.
 
 ## What this replaces
 
