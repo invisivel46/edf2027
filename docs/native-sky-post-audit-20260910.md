@@ -569,3 +569,55 @@ the retail source, and the constant routing is correct. What remains:
 
 Next: measure `m_RefrectionRate` and the `Pr.z` texel at the identified pixel,
 which is a bounded readback at a known draw, not another search.
+
+## Negative radiance: five causes eliminated, and an attribution hole (2026-09-12)
+
+Measured on a healthy host at 60 FPS, probing the scene target after every
+indexed draw and stopping at the first channel at or below -1.
+
+The blamed draw is `VS_Blend`/`PS_Main` of source `0x91d077f54e255d81`, which is
+**`m_tD_trans.dxsl`** - not `c_Mech01.dxsl` as an earlier note assumed. That
+earlier `m_RefrectionRate * Pr.z` lerp hypothesis was read off the wrong
+shader's source and is withdrawn; `m_tD_trans` has no such constant, which is
+why the probe's constant dump never printed one.
+
+`m_tD_trans` is short enough to reason about completely:
+
+```hlsl
+// VS: LC = Lighting(N, g_LightVector, EV, m_MaterialDiffuse, power)
+//     Out.Color = LC;  Out.Specular = m_MaterialSpecularColor * LC.w
+// PS: Color = (Dtex * In.Color) + In.Specular;  return FogApply(Color, 1, In.Fog)
+```
+
+Every term is provably non-negative, and each candidate was measured rather
+than argued:
+
+| Candidate | Measurement | Result |
+|---|---|---|
+| Blend operation | decoded `D3D11_BLEND_DESC` at the hit | `SRC_ALPHA`/`INV_SRC_ALPHA`, op `ADD` - exactly what the technique declares |
+| Diffuse texture | bound view format at the hit | `BC1_UNORM` (71), 1024x1024 - cannot be negative |
+| Lighting inputs | full constant dump | diffuse 1, specular 0.1, power 16, light 1.7, hemisphere (0.41,0.44,0.5)/(0.188,0.17,0.17), all in range |
+| Zero-normalize override | source review | correct; `|N|` is 0 or 1, so the hemisphere lerp factor stays in [0,1] |
+| Clip-space extrapolation | `CaptureClipPositions` for the draw | 24 vertices, `w` 49.09..49.16, no non-positive, no non-finite |
+
+`lit()` clamps both its diffuse and specular terms, HLSL `smoothstep` saturates,
+and both `FogApply` lerps take a factor in [0,1]. With these inputs the shader
+**cannot** emit (-1.37, -1.25, -1.15).
+
+### The attribution hole
+
+The probe scans only **after indexed draws**. `scans=30..37` means that many
+indexed draws were scanned clean first, which is why the attribution looked
+solid - but nothing scans after an immediate draw, a font, movie or XUI draw, a
+post pass, or a partial clear. A negative written by any of those would first be
+seen by the next indexed draw's scan and blamed on it.
+
+That now looks like the likely explanation, because it is the only one
+consistent with a shader that provably cannot produce the value. Note also that
+ordinary alpha blending *preserves* an existing negative
+(`dst' = src*a + dst*(1-a)`), so a negative introduced once persists through
+later blended draws.
+
+Next: extend the probe to scan after the immediate draw path as well, and
+after scene clears, so the first writer is attributed to the path that actually
+produced it. Do not treat `m_tD_trans` as the producer until then.

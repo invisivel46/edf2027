@@ -67,6 +67,7 @@
 #include <rex/thread/mutex.h>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <bit>
 #include <atomic>
 #include <mutex>
@@ -4696,13 +4697,73 @@ REX_HOOK_RAW(sub_821FE358) {
                 (rgba[0]<=-1.f || rgba[1]<=-1.f || rgba[2]<=-1.f);
               if(nonfinite || negative) {
                 state.color_probe_done=true;
-                REXLOG_INFO("Native invalid RGB frame: next_output_candidate={}, kind={}",
-                  state.indexed_output_frames+1,nonfinite?"nonfinite":"negative");
+                // Scans since the probe window opened. A hit on the first scan
+                // means the pixel was already bad before the blamed draw ran,
+                // so the draw is only "the first one scanned", not the producer.
+                REXLOG_INFO("Native invalid RGB frame: next_output_candidate={}, kind={}, scans={} (scans==1 means the value predates this draw)",
+                  state.indexed_output_frames+1,nonfinite?"nonfinite":"negative",state.color_probe_draws);
                 REXLOG_INFO("Native invalid RGB origin: pixel={},{} draw={} VS={:#x} {} source={:#x} PS={:#x} {} source={:#x} rgba={},{},{},{}",
                   sample_x,sample_y,state.indexed_submitted,state.active_vertex,bindings.shader().entry.name,
                   state.shaders.at(state.active_vertex).source_fingerprint,state.linked_pixel,
                   state.shaders.at(state.linked_pixel).bindings->shader().entry.name,
                   state.shaders.at(state.linked_pixel).source_fingerprint,rgba[0],rgba[1],rgba[2],rgba[3]);
+                // m_tD_trans is alpha blended and its lighting cannot go
+                // negative, so the decoded blend operation is the first thing
+                // to rule out: a SUBTRACT or REV_SUBTRACT where the guest asked
+                // for ADD drives the target below zero from positive inputs.
+                // Everything inside the shader is provably non-negative for the
+                // logged constants, so the remaining candidate is the geometry
+                // reaching the rasteriser. A vertex at w<=0, or a triangle
+                // spanning the eye plane, makes perspective-correct
+                // interpolation extrapolate the colour varyings far outside the
+                // range the vertex shader can emit.
+                try {
+                  const auto clip=mesh.CaptureClipPositions(*state.context.Get(),bindings.shader(),
+                    ctx.r6.u32,(std::min)(ctx.r7.u32,24u),ctx.r5.s32);
+                  float min_w=std::numeric_limits<float>::infinity(),max_w=-min_w;
+                  size_t nonpositive=0,nonfinite_w=0;
+                  for(const auto& position:clip) {
+                    if(!std::isfinite(position[3])) { ++nonfinite_w; continue; }
+                    min_w=(std::min)(min_w,position[3]); max_w=(std::max)(max_w,position[3]);
+                    if(position[3]<=0) ++nonpositive;
+                  }
+                  REXLOG_INFO("Native invalid RGB clip: sampled={}, min_w={}, max_w={}, nonpositive_w={}, nonfinite_w={} (mixed-sign or near-zero w extrapolates interpolated colour)",
+                    clip.size(),min_w,max_w,nonpositive,nonfinite_w);
+                  for(size_t i=0;i<clip.size() && i<8;++i)
+                    REXLOG_INFO("Native invalid RGB clip vertex: index={}, xyzw={},{},{},{}",
+                      i,clip[i][0],clip[i][1],clip[i][2],clip[i][3]);
+                } catch(const std::exception& error) {
+                  REXLOG_INFO("Native invalid RGB clip capture: {}",error.what());
+                }
+                // Color = Dtex * In.Color + In.Specular, and the lighting terms
+                // are provably non-negative for the logged constants, so the
+                // sampled texel is the remaining candidate. A UNORM/BC format
+                // cannot be negative; a signed or float one can.
+                for(const auto* name:{"m_DiffuseTexture0_Sampler","m_ParameterTexture0_Sampler",
+                    "m_NormalTexture0_Sampler","m_CubeTexture0_Sampler"}) {
+                  const auto view=state.shaders.at(state.linked_pixel).bindings->ReadTexture(name);
+                  if(!view) continue;
+                  D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{}; view->GetDesc(&view_desc);
+                  Microsoft::WRL::ComPtr<ID3D11Resource> resource; view->GetResource(&resource);
+                  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
+                  D3D11_TEXTURE2D_DESC desc{};
+                  if(SUCCEEDED(resource.As(&texture))) texture->GetDesc(&desc);
+                  REXLOG_INFO("Native invalid RGB texture: name={}, view_format={}, resource_format={}, {}x{}, mips={}",
+                    name,uint32_t(view_desc.Format),uint32_t(desc.Format),desc.Width,desc.Height,desc.MipLevels);
+                }
+                REXLOG_INFO("Native invalid RGB state: blend={:#x}, depth={:#x}, raster={:#x}, alpha={:#x}, write_mask={}, scissor={}",
+                  key[0],key[1],key[2],key[3],key[4],key[5]);
+                if(const auto found=state.render_states.find(key);
+                   found!=state.render_states.end() && found->second.blend) {
+                  D3D11_BLEND_DESC blend{};
+                  found->second.blend->GetDesc(&blend);
+                  const auto& target=blend.RenderTarget[0];
+                  REXLOG_INFO("Native invalid RGB blend: enabled={}, src={}, dest={}, op={}, src_alpha={}, dest_alpha={}, alpha_op={}, mask={}, needs_factor={}, replicate_alpha={} (D3D11_BLEND_OP: 1=ADD 2=SUBTRACT 3=REV_SUBTRACT 4=MIN 5=MAX)",
+                    target.BlendEnable!=FALSE,uint32_t(target.SrcBlend),uint32_t(target.DestBlend),
+                    uint32_t(target.BlendOp),uint32_t(target.SrcBlendAlpha),uint32_t(target.DestBlendAlpha),
+                    uint32_t(target.BlendOpAlpha),uint32_t(target.RenderTargetWriteMask),
+                    found->second.requires_blend_factor,found->second.replicate_blend_alpha);
+                }
                 for(const auto* stage:{&bindings,state.shaders.at(state.linked_pixel).bindings.get()}) {
                   const auto* stage_name=stage->shader().entry.pixel?"PS":"VS";
                   for(const auto* name:{"m_MaterialDiffuse","m_MaterialSpecularColor","m_MaterialSpecularPower",
