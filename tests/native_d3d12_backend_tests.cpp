@@ -1,0 +1,163 @@
+// A triangle drawn through the backend seam by the D3D12 backend, on WARP, and
+// read back pixel by pixel. This is the check that the seam is an interface a
+// real backend can be built behind rather than a shape that merely compiles.
+#include "native_graphics/d3d12_backend.h"
+#include "native_graphics/native_render_backend.h"
+#include <d3dcompiler.h>
+#include <algorithm>
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+using Microsoft::WRL::ComPtr;
+using namespace edf::native;
+
+namespace {
+int failures = 0;
+void Check(bool ok, const std::string& message) {
+  if (ok) return;
+  ++failures;
+  std::cerr << "FAIL: " << message << '\n';
+}
+ComPtr<ID3DBlob> Compile(const char* source, const char* entry, const char* profile) {
+  ComPtr<ID3DBlob> code, errors;
+  if (FAILED(D3DCompile(source, std::strlen(source), nullptr, nullptr, nullptr, entry, profile, 0, 0,
+                        &code, &errors)))
+    throw std::runtime_error(std::string("shader compile failed: ") +
+                             (errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no detail"));
+  return code;
+}
+std::span<const uint8_t> Bytes(ID3DBlob& blob) {
+  return {static_cast<const uint8_t*>(blob.GetBufferPointer()), blob.GetBufferSize()};
+}
+}  // namespace
+
+int main() {
+  try {
+    RegisterNativeD3D12Backend();
+    const auto& names = NativeRenderBackendNames();
+    Check(std::find(names.begin(), names.end(), "d3d12") != names.end(),
+          "the D3D12 backend did not register itself");
+    Check(std::find(names.begin(), names.end(), "d3d12-warp") != names.end(),
+          "the WARP backend name is missing, so a driver bug cannot be attributed");
+    // Registering twice must not throw: the entry point is callable from more
+    // than one place and a duplicate registration would otherwise be fatal.
+    RegisterNativeD3D12Backend();
+
+    // Selected by name through the registry, so the whole path the game will
+    // use is what gets exercised - not a direct constructor call the shipping
+    // code never makes.
+    const auto backend = CreateNativeRenderBackend("d3d12-warp");
+    Check(backend != nullptr, "the registry did not produce a backend");
+    Check(backend->name() == "d3d12", "the backend reported the wrong name");
+    Check(!backend->SupportsParallelRecording(),
+          "the backend claims parallel recording it does not yet have");
+
+    constexpr uint32_t kSize = 64;
+    NativeBackendTextureDesc target_desc{};
+    target_desc.width = target_desc.height = kSize;
+    target_desc.levels = 1;
+    target_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target_desc.render_target = true;
+    const auto target = backend->CreateRenderTarget(target_desc);
+    Check(target && target->width() == kSize, "the render target was not created at the size asked for");
+
+    // A triangle covering exactly the lower-left half of the target, so the
+    // readback can tell "drawn" from "cleared" by position and by area. Not the
+    // usual (-1,-1)(3,-1)(-1,3) full-screen triangle: that covers everything,
+    // which would make a completely wrong viewport look like a pass.
+    const float vertices[] = {-1.0f, -1.0f, 0.0f, 1.0f, -1.0f, 0.0f, -1.0f, 1.0f, 0.0f};
+    NativeBackendBufferDesc buffer_desc{};
+    buffer_desc.bytes = sizeof(vertices);
+    buffer_desc.vertex = true;
+    const auto vertex_buffer = backend->CreateBuffer(
+        buffer_desc, {reinterpret_cast<const uint8_t*>(vertices), sizeof(vertices)});
+
+    const char* kSource = R"(
+cbuffer PixelData : register(b0) { float4 tint; };
+float4 VS(float3 position : POSITION) : SV_POSITION { return float4(position, 1); }
+float4 PS(float4 position : SV_POSITION) : SV_TARGET { return tint; }
+)";
+    const auto vertex = Compile(kSource, "VS", "vs_5_0");
+    const auto pixel = Compile(kSource, "PS", "ps_5_0");
+
+    const NativeBackendInputElement layout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, false, 0}};
+    NativeBackendPipelineDesc pipeline_desc{};
+    pipeline_desc.vertex = Bytes(*vertex.Get());
+    pipeline_desc.pixel = Bytes(*pixel.Get());
+    pipeline_desc.vertex_id = 0x11;
+    pipeline_desc.pixel_id = 0x22;
+    pipeline_desc.input_layout = layout;
+    pipeline_desc.input_layout_id = 0x33;
+    pipeline_desc.state = {0x10001, 0, 0, 0, 15, 0};  // No blending, no depth, solid, all channels.
+    pipeline_desc.topology = NativeBackendTopology::TriangleList;
+    pipeline_desc.render_targets = 1;
+    pipeline_desc.rtv_format[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    auto& pipeline = backend->CreatePipeline(pipeline_desc);
+    Check(&pipeline == &backend->CreatePipeline(pipeline_desc),
+          "an identical pipeline description produced a second pipeline object");
+
+    const std::array<float, 4> tint{0.0f, 1.0f, 0.0f, 1.0f};
+    NativeBackendRenderTarget* colors[] = {target.get()};
+
+    backend->BeginFrame();
+    auto& recorder = backend->Recorder();
+    recorder.SetRenderTargets(colors, nullptr);
+    recorder.SetViewport({0, 0, static_cast<float>(kSize), static_cast<float>(kSize), 0, 1});
+    recorder.ClearColor(*target, {1.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetPipeline(pipeline);
+    recorder.SetVertexBuffer(0, *vertex_buffer, sizeof(float) * 3, 0);
+    recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                          {reinterpret_cast<const uint8_t*>(tint.data()), sizeof(float) * 4});
+    recorder.Draw(3, 0);
+    backend->Submit();
+
+    const auto pixels = backend->ReadRenderTarget(*target);
+    Check(pixels.size() == static_cast<size_t>(kSize) * kSize * 4,
+          "the readback was not tightly packed: " + std::to_string(pixels.size()) + " bytes");
+    const auto at = [&](uint32_t x, uint32_t y) {
+      const size_t index = (static_cast<size_t>(y) * kSize + x) * 4;
+      return std::array<uint8_t, 4>{pixels[index], pixels[index + 1], pixels[index + 2], pixels[index + 3]};
+    };
+    // The triangle covers the lower-left; the opposite corner stays cleared.
+    const auto inside = at(2, kSize - 3), outside = at(kSize - 2, 1);
+    Check(inside[1] > 200 && inside[0] < 60,
+          "the triangle did not draw: covered pixel is not the tint colour");
+    Check(outside[0] > 200 && outside[1] < 60,
+          "the clear did not happen: uncovered pixel is not the clear colour");
+
+    uint32_t drawn = 0;
+    for (uint32_t y = 0; y < kSize; ++y)
+      for (uint32_t x = 0; x < kSize; ++x)
+        if (at(x, y)[1] > 200) ++drawn;
+    // Half the surface, give or take the diagonal. A wildly different number
+    // means the viewport or the vertex buffer went somewhere unintended, which
+    // a two-pixel spot check would not notice.
+    const uint32_t total = kSize * kSize;
+    Check(drawn > total * 4 / 10 && drawn < total * 6 / 10,
+          "the triangle covered " + std::to_string(drawn) + " of " + std::to_string(total) +
+              " pixels, which is not the half it should");
+    std::cout << "triangle covered " << drawn << " of " << total << " pixels\n";
+
+    // A missing barrier would not change a single pixel above; only the API's
+    // own validation sees it, so it is read rather than left in the debugger.
+    for (const auto& message : backend->DrainValidationMessages())
+      Check(false, "D3D12 validation error: " + message);
+
+    // Misuse of the frame lifecycle must be loud.
+    bool caught = false;
+    try { backend->Recorder(); } catch (const std::runtime_error&) { caught = true; }
+    Check(caught, "the recorder was handed out with no frame open");
+    caught = false;
+    try { backend->Submit(); } catch (const std::runtime_error&) { caught = true; }
+    Check(caught, "Submit outside a frame was accepted");
+  } catch (const std::exception& error) {
+    std::cerr << "unexpected: " << error.what() << '\n';
+    return 1;
+  }
+  std::cout << "native d3d12 backend tests: " << failures << " failures\n";
+  return failures ? 1 : 0;
+}

@@ -1,4 +1,5 @@
 #pragma once
+#include "native_render_state_decode.h"
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -131,6 +132,32 @@ class NativeBackendRecorder {
   virtual void PopState()=0;
 };
 
+// One vertex attribute. Neutral so a second backend is not handed D3D12's
+// struct; `format` is a backend-specific format code, like the texture descs.
+struct NativeBackendInputElement {
+  const char* semantic=nullptr;
+  uint32_t semantic_index=0,format=0,slot=0,offset=0;
+  bool per_instance=false;
+  uint32_t step_rate=0;
+};
+
+// Everything fused into one pipeline. The shader ids are the caller's stable
+// identity for the two shaders - a fingerprint, not a pointer - because the
+// backend caches on this description and a pointer that gets reused after a
+// free would silently return the wrong pipeline.
+struct NativeBackendPipelineDesc {
+  std::span<const uint8_t> vertex,pixel;
+  uint64_t vertex_id=0,pixel_id=0;
+  std::span<const NativeBackendInputElement> input_layout;
+  uint64_t input_layout_id=0;
+  RenderStateWords state{};
+  NativeBackendTopology topology=NativeBackendTopology::TriangleList;
+  uint32_t render_targets=0;
+  std::array<uint32_t,8> rtv_format{};
+  uint32_t dsv_format=0;
+  uint32_t sample_count=1;
+};
+
 struct NativeBackendBufferDesc {
   size_t bytes=0;
   bool vertex=false,index=false,constant=false;
@@ -154,6 +181,13 @@ class NativeRenderBackend {
                                                               std::span<const uint8_t> initial)=0;
   virtual std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc)=0;
   virtual std::unique_ptr<NativeBackendQuery> CreateQuery(NativeBackendQueryKind kind)=0;
+  // Expensive on both target APIs, and cached by the backend on the whole
+  // description - so calling this every frame with the same description is
+  // cheap, while a combination first seen mid-gameplay is a visible hitch.
+  // Throws if the shaders bind outside what the backend's root signature or
+  // descriptor set declares, rather than building something that draws with a
+  // binding pointing nowhere.
+  virtual NativeBackendPipeline& CreatePipeline(const NativeBackendPipelineDesc& desc)=0;
 
   // One recorder per thread that submits work. D3D11 returns the same immediate
   // recorder every time and rejects a second thread; a second backend hands out
@@ -161,9 +195,29 @@ class NativeRenderBackend {
   virtual NativeBackendRecorder& Recorder()=0;
   virtual bool SupportsParallelRecording() const=0;
 
+  // Open a frame. D3D11 needed no such call, which is why the first draft of
+  // this interface had only Submit; every other backend has per-frame state to
+  // recycle (command allocators, upload memory, descriptors) and needs to know
+  // when the GPU has finished with the frame it is about to reuse.
+  virtual void BeginFrame()=0;
   // Hand everything recorded so far to the GPU. Ordering between recorders is
   // the backend's responsibility.
   virtual void Submit()=0;
+
+  // Tightly packed RGBA bytes of a render target, for diagnostics, screenshots
+  // and tests. Blocking by construction: it waits for the GPU, so it must
+  // never appear on a frame path. It is on the interface because a backend
+  // whose output cannot be read back cannot be checked against the one it
+  // replaces, and "looks right to me" is not how this renderer has been
+  // verified so far.
+  virtual std::vector<uint8_t> ReadRenderTarget(NativeBackendRenderTarget& target)=0;
+
+  // Whatever the API's own validation has complained about since the last
+  // call, and clears it. On the seam rather than on one backend because the
+  // failure it catches - a missing barrier - is invisible in the output and
+  // exists on every explicit API. A backend without validation returns
+  // nothing, which is honest; it never invents a clean bill of health.
+  virtual std::vector<std::string> DrainValidationMessages()=0;
 };
 
 // Backends register here; selection is by name so a run can A/B them without a

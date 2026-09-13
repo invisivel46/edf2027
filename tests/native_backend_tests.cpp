@@ -27,10 +27,17 @@ class StubBackend final : public edf::native::NativeRenderBackend {
       const edf::native::NativeBackendTextureDesc&) override { return {}; }
   std::unique_ptr<edf::native::NativeBackendQuery> CreateQuery(
       edf::native::NativeBackendQueryKind) override { return {}; }
+  edf::native::NativeBackendPipeline& CreatePipeline(
+      const edf::native::NativeBackendPipelineDesc&) override {
+    throw std::runtime_error("stub backend builds no pipelines");
+  }
   edf::native::NativeBackendRecorder& Recorder() override {
     throw std::runtime_error("stub backend records nothing");
   }
   bool SupportsParallelRecording() const override { return parallel_; }
+  void BeginFrame() override {}
+  std::vector<uint8_t> ReadRenderTarget(edf::native::NativeBackendRenderTarget&) override { return {}; }
+  std::vector<std::string> DrainValidationMessages() override { return {}; }
   void Submit() override {}
  private:
   std::string name_;

@@ -51,6 +51,28 @@ class NativeD3D12DescriptorRing {
   uint32_t increment_=0,capacity_=0;
 };
 
+// CPU-side descriptors that live as long as the resource they describe. Every
+// texture needs one, because a shader-visible table is filled by copying from
+// somewhere, and D3D11's "the view is the object" model has no equivalent.
+// Freed slots are reused, so a run that creates and destroys textures does not
+// grow the heap forever.
+class NativeD3D12CpuDescriptorHeap {
+ public:
+  NativeD3D12CpuDescriptorHeap(ID3D12Device& device, D3D12_DESCRIPTOR_HEAP_TYPE type, uint32_t descriptors);
+  // Throws when exhausted, naming the capacity; silently handing back a slot
+  // already in use would make two textures alias.
+  D3D12_CPU_DESCRIPTOR_HANDLE Allocate();
+  void Free(D3D12_CPU_DESCRIPTOR_HANDLE handle);
+  uint32_t live() const { return live_; }
+  uint32_t capacity() const { return capacity_; }
+
+ private:
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap_;
+  std::vector<uint32_t> free_;
+  D3D12_CPU_DESCRIPTOR_HANDLE start_{};
+  uint32_t increment_=0,capacity_=0,next_=0,live_=0;
+};
+
 // One contiguous run of sampler descriptors per distinct combination a shader
 // asks for, kept for the life of the run. The hit path is a map lookup, which
 // is far cheaper than writing seven descriptors per draw would have been, and

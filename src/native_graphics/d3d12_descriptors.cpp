@@ -36,6 +36,34 @@ NativeD3D12DescriptorRing::Result NativeD3D12DescriptorRing::TryAllocate(uint32_
   return {NativeUploadRing::Status::Ok,table};
 }
 
+NativeD3D12CpuDescriptorHeap::NativeD3D12CpuDescriptorHeap(ID3D12Device& device,
+                                                           D3D12_DESCRIPTOR_HEAP_TYPE type,
+                                                           uint32_t descriptors)
+    : capacity_(descriptors) {
+  const D3D12_DESCRIPTOR_HEAP_DESC desc{type,descriptors,D3D12_DESCRIPTOR_HEAP_FLAG_NONE,0};
+  Require(device.CreateDescriptorHeap(&desc,IID_PPV_ARGS(&heap_)),"CPU descriptor heap creation");
+  increment_=device.GetDescriptorHandleIncrementSize(type);
+  start_=heap_->GetCPUDescriptorHandleForHeapStart();
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE NativeD3D12CpuDescriptorHeap::Allocate() {
+  uint32_t index=0;
+  if(!free_.empty()) { index=free_.back(); free_.pop_back(); }
+  else if(next_<capacity_) index=next_++;
+  else throw std::runtime_error("CPU descriptor heap exhausted at "+std::to_string(capacity_)+
+                                " descriptors");
+  ++live_;
+  return {start_.ptr+static_cast<SIZE_T>(index)*increment_};
+}
+
+void NativeD3D12CpuDescriptorHeap::Free(D3D12_CPU_DESCRIPTOR_HANDLE handle) {
+  if(!handle.ptr||handle.ptr<start_.ptr) return;
+  const auto index=static_cast<uint32_t>((handle.ptr-start_.ptr)/increment_);
+  if(index>=capacity_) return;
+  free_.push_back(index);
+  --live_;
+}
+
 NativeD3D12SamplerCache::NativeD3D12SamplerCache(ID3D12Device& device, uint32_t slots_per_table,
                                                  uint32_t max_tables)
     : device_(&device),slots_per_table_(slots_per_table),max_tables_(max_tables) {
