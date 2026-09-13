@@ -108,6 +108,10 @@ struct NativeBackendStatistics {
   uint64_t sampler_tables=0,sampler_hits=0,sampler_misses=0,sampler_evictions=0;
   // Resources dropped by their owner that the GPU may still be reading.
   uint64_t retiring=0;
+  // Time spent blocked waiting for a frame slot the GPU had not finished with.
+  // This is the number that separates "the CPU cannot keep up" from "the CPU is
+  // waiting for the GPU", which no amount of CPU profiling can tell apart.
+  uint64_t frame_waits=0,frame_wait_ns=0;
 };
 
 enum class NativeBackendQueryKind : uint32_t { Occlusion, Timestamp, TimestampDisjoint };

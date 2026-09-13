@@ -1,6 +1,7 @@
 #include "d3d12_device.h"
 #include <windows.h>
 #include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -236,7 +237,13 @@ void NativeD3D12Device::BeginFrame() {
   // This slot's previous frame must be off the GPU before its allocator is
   // reset: resetting an allocator whose commands are still executing is
   // undefined, and it is the classic way a D3D12 port crashes only under load.
-  WaitForFence(frame.fence);
+  if(frame.fence && fence_->GetCompletedValue()<frame.fence) {
+    const auto started=std::chrono::steady_clock::now();
+    WaitForFence(frame.fence);
+    ++frame_waits_;
+    frame_wait_ns_+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now()-started).count());
+  }
   const uint64_t completed=fence_->GetCompletedValue();
   // Anything whose last possible reader has finished. Erased here rather than
   // at the drop, because here is the one place that knows what the GPU has

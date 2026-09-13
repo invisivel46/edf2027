@@ -689,7 +689,13 @@ class D3D12Backend final : public NativeRenderBackend {
     for(auto& recorder:recorders_) recorder->null_texture_view_=null_texture_;
   }
 
+  void ReleaseFrameLatency() {
+    if(!frame_latency_) return;
+    CloseHandle(frame_latency_);
+    frame_latency_=nullptr;
+  }
   ~D3D12Backend() override {
+    ReleaseFrameLatency();
     // The swap chain and its buffers are released before this object's own
     // device member is destroyed, so nothing here waits for the GPU on our
     // behalf. Presenting work may still be in flight, and releasing a back
@@ -959,6 +965,12 @@ class D3D12Backend final : public NativeRenderBackend {
 
   void BeginFrame() override {
     if(open_) throw std::runtime_error("a D3D12 frame is already open");
+    // The swap chain's own throttle, taken here rather than inside Present.
+    // Only a backend with a window has one; the scene's backend never does,
+    // and never waits. Deadlined for the same reason every other wait in this
+    // file is: a window that stops being presented must not freeze the game.
+    if(frame_latency_ && WaitForSingleObject(frame_latency_,1000)==WAIT_TIMEOUT)
+      ++present_waits_timed_out_;
     gpu_.BeginFrame();
     for(uint32_t index=0;index<recorders_.size();++index)
       recorders_[index]->Begin(*gpu_.commands(index));
@@ -1137,6 +1149,8 @@ class D3D12Backend final : public NativeRenderBackend {
     out.sampler_misses=gpu_.samplers().misses();
     out.sampler_evictions=gpu_.samplers().evictions();
     out.retiring=gpu_.retiring();
+    out.frame_waits=gpu_.frame_waits();
+    out.frame_wait_ns=gpu_.frame_wait_ns();
     return out;
   }
 
@@ -1147,6 +1161,7 @@ class D3D12Backend final : public NativeRenderBackend {
     // release, so the queue has to drain before the old chain goes.
     gpu_.WaitIdle();
     back_buffers_.clear();
+    ReleaseFrameLatency();
     swap_chain_.Reset();
 
     DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -1161,6 +1176,13 @@ class D3D12Backend final : public NativeRenderBackend {
     desc.BufferCount=kBackBuffers;
     desc.Scaling=DXGI_SCALING_STRETCH;
     desc.AlphaMode=DXGI_ALPHA_MODE_UNSPECIFIED;
+    // Waitable, so vsync throttles by making this thread sleep on an event
+    // rather than by blocking inside Present. A blocking Present holds the
+    // queue, and this process has a second D3D12 device drawing the scene on
+    // the same adapter: throttling the window that way throttled the game with
+    // it, to a sixth of its frame rate. The wait belongs before the frame, on
+    // a handle, which is what this flag buys.
+    desc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
     ComPtr<IDXGISwapChain1> chain;
     Require(gpu_.factory()->CreateSwapChainForHwnd(gpu_.queue(),static_cast<HWND>(window),&desc,
@@ -1168,6 +1190,12 @@ class D3D12Backend final : public NativeRenderBackend {
     // Alt+Enter belongs to the game's own display handling, not to DXGI.
     gpu_.factory()->MakeWindowAssociation(static_cast<HWND>(window),DXGI_MWA_NO_ALT_ENTER);
     Require(chain.As(&swap_chain_),"swap chain interface");
+    ReleaseFrameLatency();
+    // One frame of latency: the shallowest queue that still keeps the GPU fed,
+    // and the one that keeps the window's present from running ahead of the
+    // scene it is showing.
+    swap_chain_->SetMaximumFrameLatency(1);
+    frame_latency_=swap_chain_->GetFrameLatencyWaitableObject();
 
     for(uint32_t index=0;index<kBackBuffers;++index) {
       TrackedResource tracked;
@@ -1224,6 +1252,8 @@ class D3D12Backend final : public NativeRenderBackend {
   void Present(bool vsync) override {
     if(!swap_chain_) throw std::runtime_error("Present with no window attached");
     if(open_) throw std::runtime_error("Present inside an open frame; submit it first");
+    // Never DXGI_PRESENT_ALLOW_TEARING here: without it a zero interval still
+    // queues rather than tears, which is the behaviour the caller asked for.
     const auto result=swap_chain_->Present(vsync?1:0,0);
     if(result==DXGI_ERROR_DEVICE_REMOVED || result==DXGI_ERROR_DEVICE_RESET)
       throw std::runtime_error(std::string("D3D12 present failed: the device was removed - ")+
@@ -1302,6 +1332,10 @@ class D3D12Backend final : public NativeRenderBackend {
   static constexpr uint32_t kBackBuffers=3;
   ComPtr<ID3D12Fence> shared_fence_;
   uint64_t shared_wait_value_=0;
+  // Signalled when the swap chain is ready for another frame. Waited on before
+  // recording rather than inside Present; see AttachWindow.
+  HANDLE frame_latency_=nullptr;
+  uint64_t present_waits_timed_out_=0;
   void* shared_fence_handle_=nullptr;
   ComPtr<IDXGISwapChain3> swap_chain_;
   std::vector<std::unique_ptr<D3D12RenderTarget>> back_buffers_;

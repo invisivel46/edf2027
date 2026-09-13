@@ -1,4 +1,5 @@
 #include "d3d11_mesh.h"
+#include <chrono>
 #include "d3d11_backend.h"
 #include "native_input_layout.h"
 #include "native_declarations.h"
@@ -491,9 +492,20 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
   // A different backend means different resources; nothing cached here can be
   // bound by it, so the cache starts again rather than handing back a buffer
   // the new backend has never seen.
+  const auto spend_start=std::chrono::steady_clock::now();
+  ++spend_.calls;
   if (backend_!=&backend) { Clear(); backend_=&backend; }
   transient_.reset();
   ++tick_;
+  const auto after_prologue=std::chrono::steady_clock::now();
+  spend_.prologue_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    after_prologue-spend_start).count());
+  // Charged to the lookup until something takes the tail; every return below
+  // the hit either goes through the tail marker or is the hit itself.
+  auto charge_lookup=[&] {
+    spend_.lookup_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now()-after_prologue).count());
+  };
   auto equal=[](const std::vector<uint8_t>& owned,std::span<const uint8_t> guest) {
     return owned.size()==guest.size() && std::equal(owned.begin(),owned.end(),guest.begin());
   };
@@ -531,7 +543,9 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
         ++source_checks_.vertex_checks;
         source_checks_.vertex_candidate_bytes+=vertices.size();
       }
-      if(e.mesh->VertexStorage()->MatchesSource(vertices)) { e.used=tick_; ++hits_; return *e.mesh; }
+      if(e.mesh->VertexStorage()->MatchesSource(vertices)) {
+        e.used=tick_; ++hits_; charge_lookup(); return *e.mesh;
+      }
       ++vertex_mismatches_;
       last_vertex_mismatch_=key;
       rejected_vertex=e.mesh->VertexStorage();
@@ -557,6 +571,16 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
     if(!vertex_storage) vertex_storage=e.mesh->VertexStorage();
     bytes_-=e.bytes; entries_.erase(found);
   }
+  charge_lookup();
+  const auto tail_start=std::chrono::steady_clock::now();
+  struct TailCharge {
+    NativeMeshCache::Spend* spend;
+    std::chrono::steady_clock::time_point start;
+    ~TailCharge() {
+      spend->tail_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now()-start).count());
+    }
+  } tail_charge{&spend_,tail_start};
   // Only live meshes own these generations. Pruning weak entries keeps resource
   // address churn bounded independently of mesh eviction and transient uploads.
   std::erase_if(index_resources_,[](const auto& item) { return item.second.expired(); });

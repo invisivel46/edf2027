@@ -184,6 +184,14 @@ class NativeMeshCache {
     uint64_t vertex_checks=0,index_checks=0,vertex_candidate_bytes=0,index_candidate_bytes=0;
     uint64_t vertex_identity_hits=0,index_identity_hits=0;
   };
+  // Where Acquire's time goes, in nanoseconds, split the three ways it can be
+  // spent. A cache hit ought to be a map lookup and two pointer comparisons;
+  // when it measures twenty microseconds instead, the only way to say which
+  // part is lying is to time them separately.
+  struct Spend {
+    uint64_t prologue_ns=0,lookup_ns=0,tail_ns=0,calls=0;
+  };
+  const Spend& spend() const { return spend_; }
   // Cache-hit validation only; excludes construction/update copies. Candidate
   // lengths are not actual memory traffic: mismatches may short-circuit.
   const SourceChecks& source_checks() const { return source_checks_; }
@@ -218,6 +226,7 @@ class NativeMeshCache {
   uint64_t published_index_reuses_=0,published_index_rejections_=0;
   uint64_t retained_vertex_reuses_=0,retained_vertex_replacements_=0;
   SourceChecks source_checks_;
+  Spend spend_;
   Key last_vertex_mismatch_{},last_index_mismatch_{};
   uint64_t entry_evictions_=0,budget_evictions_=0;
   uint64_t tick_=0,hits_=0,builds_=0;

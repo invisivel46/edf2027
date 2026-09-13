@@ -131,6 +131,11 @@ class NativeD3D12Device {
   // expected reading; anything else means upload_bytes is too small, and it
   // should be visible as a number rather than as an unexplained stutter.
   uint64_t upload_stalls() const { return upload_stalls_; }
+  // How long BeginFrame spent blocked on the frame slot it is about to reuse.
+  // With three frames in flight this should be near zero; anything else means
+  // the GPU is the limit and the CPU is watching it work.
+  uint64_t frame_waits() const { return frame_waits_; }
+  uint64_t frame_wait_ns() const { return frame_wait_ns_; }
   uint64_t descriptor_stalls() const { return descriptor_stalls_; }
 
  private:
@@ -175,6 +180,7 @@ class NativeD3D12Device {
   std::unique_ptr<NativeD3D12SamplerCache> samplers_;
   std::string adapter_name_;
   uint64_t next_fence_=0,frame_counter_=0,upload_stalls_=0,descriptor_stalls_=0;
+  uint64_t frame_waits_=0,frame_wait_ns_=0;
   uint32_t open_frame_=0;
   bool open_=false,is_warp_=false,debug_layer_active_=false;
   // Things worth telling the caller that the info queue cannot hold, because

@@ -207,6 +207,7 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        ColorTarget, DepthTarget, ViewportHook, ViewportLock,
                        ViewportRead, ViewportWrite, ViewportGuest,
                        IndexedMesh, IndexedBindings, MeshRanges, MeshAcquire, MeshDrawRange,
+                       MeshObserve, MeshLookup, MeshCommit,
                        IndexedSubmissionWait, IndexedContextWait, ImmediateSubmissionWait,
                        ImmediateContextWait, PresentationContextWait,
                        ActivationLock, ActivationResolve, ActivationVertexParams, ActivationPixelParams,
@@ -239,6 +240,7 @@ class HookTiming {
       "scene.setup.lock","scene.clear","target.color","target.depth","viewport.hook",
       "viewport.lock","viewport.read","viewport.write","viewport.original",
       "indexed.mesh","indexed.bindings","mesh.ranges","mesh.acquire","mesh.draw_range",
+      "mesh.observe","mesh.lookup","mesh.commit",
       "indexed.submission_wait","indexed.context_wait","immediate.submission_wait",
       "immediate.context_wait","presentation.context_wait",
       "activation.lock","activation.resolve","activation.params_vs","activation.params_ps",
@@ -1993,11 +1995,13 @@ void SubmitSceneFrameLocked(Bridge& state) {
     const auto counts=state.scene_backend->Statistics();
     REXLOG_INFO("Native scene backend spend: frames={}, splits={}, operations_last_frame={}, "
       "upload_stalls={}, descriptor_stalls={}, pipelines={} (hits={}, misses={}), "
-      "sampler_tables={} (hits={}, misses={}, evictions={}), retiring={}",
+      "sampler_tables={} (hits={}, misses={}, evictions={}), retiring={}, "
+      "frame_waits={} averaging {}us",
       state.scene_frames,state.scene_frame_splits,operations,
       counts.upload_stalls,counts.descriptor_stalls,counts.pipelines,counts.pipeline_hits,
       counts.pipeline_misses,counts.sampler_tables,counts.sampler_hits,counts.sampler_misses,
-      counts.sampler_evictions,counts.retiring);
+      counts.sampler_evictions,counts.retiring,counts.frame_waits,
+      counts.frame_waits?counts.frame_wait_ns/counts.frame_waits/1000:0);
   }
 }
 }  // namespace
@@ -5205,6 +5209,7 @@ REX_HOOK_RAW(sub_821FE358) {
         ranges_timing.Finish();
         auto mesh_watch_audit=state.mesh_watch_audit.lock();
         edf::native::HookTiming acquire_timing(edf::native::HookPhase::MeshAcquire);
+        edf::native::HookTiming observe_timing(edf::native::HookPhase::MeshObserve);
         std::optional<edf::native::NativeBufferWrites::ObservedVersion> vertex_version,index_version;
         using GeometrySnapshots=std::array<edf::native::NativeBufferWrites::ObservedSnapshot,2>;
         std::optional<GeometrySnapshots> observed_geometry;
@@ -5297,6 +5302,8 @@ REX_HOOK_RAW(sub_821FE358) {
           if(native_vb && native_vb->physical) vertex_version=edf::native::BufferWrites().Version(stream.resource);
           if(native_ib && native_ib->physical) index_version=edf::native::BufferWrites().Version(ib);
         };
+        observe_timing.Finish();
+        edf::native::HookTiming lookup_timing(edf::native::HookPhase::MeshLookup);
         auto& mesh=state.meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
           {stream.resource,ib,decl,state.active_vertex,uint32_t(viewport.reverse_depth)},
           declaration_bytes,stream.stride,vertices_bytes,indices_bytes,index_width,native_declaration,{},
@@ -5304,6 +5311,8 @@ REX_HOOK_RAW(sub_821FE358) {
           {&before_snapshot,[](void* context) {
             (*static_cast<decltype(before_snapshot)*>(context))();
           }},vertex_contents,stream.offset,observed_geometry?(*observed_geometry)[1].contents:nullptr);
+        lookup_timing.Finish();
+        edf::native::HookTiming commit_timing(edf::native::HookPhase::MeshCommit);
         // The registry lock protects lifetimes; the queue handshake additionally
         // rejects completed notified writes during construction. Unnotified raw
         // writes still require the existing live source comparisons.
@@ -5345,6 +5354,7 @@ REX_HOOK_RAW(sub_821FE358) {
             else if(!native_ib->physical) state.model_buffers.RetainIndexStorage(ib,native_ib->generation,mesh.IndexStorage());
           }
         }
+        commit_timing.Finish();
         acquire_timing.Finish();
         edf::native::HookTiming draw_range_timing(edf::native::HookPhase::MeshDrawRange);
         mesh.ValidateDraw(ctx.r6.u32,ctx.r7.u32,ctx.r5.s32);
@@ -5735,6 +5745,10 @@ REX_HOOK_RAW(sub_821FE358) {
             const auto& checks=state.meshes.source_checks();
             REXLOG_INFO("Native mesh source checks: vertex_checks={}, index_checks={}, vertex_candidate_bytes={}, index_candidate_bytes={} (cache-hit checks; not measured memory traffic)",
               checks.vertex_checks,checks.index_checks,checks.vertex_candidate_bytes,checks.index_candidate_bytes);
+            const auto& spend=state.meshes.spend();
+            REXLOG_INFO("Native mesh acquire spend: calls={}, prologue_ns_avg={}, lookup_ns_avg={}, tail_ns_avg={} (a cache hit is prologue+lookup; the tail is construction)",
+              spend.calls,spend.calls?spend.prologue_ns/spend.calls:0,
+              spend.calls?spend.lookup_ns/spend.calls:0,spend.calls?spend.tail_ns/spend.calls:0);
             REXLOG_INFO("Native published index consumption: reused_builds={}, rejected_generations={} (mesh hits excluded)",
               state.meshes.published_index_reuses(),state.meshes.published_index_rejections());
             size_t vertices=0,vertex_bytes=0,indices=0,index_bytes=0;
