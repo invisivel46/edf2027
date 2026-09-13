@@ -2,6 +2,8 @@
 // a machine with no usable GPU exactly as the D3D11 tests already do. Nothing
 // here loads ReXGlue or emulates Xbox GPU commands.
 #include "native_graphics/d3d12_device.h"
+#include "native_graphics/d3d12_pipeline.h"
+#include <d3dcompiler.h>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -42,6 +44,18 @@ void Transition(ID3D12GraphicsCommandList& commands, ID3D12Resource& resource,
   barrier.Transition.StateBefore = from;
   barrier.Transition.StateAfter = to;
   commands.ResourceBarrier(1, &barrier);
+}
+ComPtr<ID3DBlob> Compile(const char* source, const char* entry, const char* profile) {
+  ComPtr<ID3DBlob> code, errors;
+  const HRESULT result = D3DCompile(source, std::strlen(source), nullptr, nullptr, nullptr, entry,
+                                    profile, 0, 0, &code, &errors);
+  if (FAILED(result))
+    throw std::runtime_error(std::string("shader compile failed: ") +
+                             (errors ? static_cast<const char*>(errors->GetBufferPointer()) : "no detail"));
+  return code;
+}
+std::span<const uint8_t> Bytes(ID3DBlob& blob) {
+  return {static_cast<const uint8_t*>(blob.GetBufferPointer()), blob.GetBufferSize()};
 }
 }  // namespace
 
@@ -152,6 +166,88 @@ int main() {
             "consecutive view tables were not laid out contiguously");
       gpu.EndFrame();
       gpu.WaitIdle();
+    }
+
+    {
+      // Consequence 3: blend, depth, raster, input layout and the shader pair
+      // stop being independent objects and fuse into one pipeline.
+      const char* kSource = R"(
+cbuffer VertexData : register(b0) { float4 offset; };
+cbuffer PixelData : register(b0) { float4 tint; };
+Texture2D image : register(t0);
+SamplerState filtering : register(s0);
+float4 VS(float3 position : POSITION) : SV_POSITION { return float4(position, 1) + offset; }
+float4 PS(float4 position : SV_POSITION) : SV_TARGET { return image.Sample(filtering, position.xy) * tint; }
+)";
+      const auto vertex = Compile(kSource, "VS", "vs_5_0");
+      const auto pixel = Compile(kSource, "PS", "ps_5_0");
+      ValidateAgainstRootLayout(Bytes(*vertex.Get()), false, "VS");
+      ValidateAgainstRootLayout(Bytes(*pixel.Get()), true, "PS");
+
+      // A shader outside the measured shape must be refused by name and slot,
+      // not quietly built into a pipeline whose binding goes nowhere. The disc
+      // shaders were measured; the renderer's own HLSL was not.
+      const char* kTooWide = R"(
+Texture2D spare : register(t8);
+SamplerState filtering : register(s0);
+float4 PS(float4 position : SV_POSITION) : SV_TARGET { return spare.Sample(filtering, position.xy); }
+)";
+      bool refused = false;
+      std::string complaint;
+      try { ValidateAgainstRootLayout(Bytes(*Compile(kTooWide, "PS", "ps_5_0").Get()), true, "TooWide"); }
+      catch (const std::runtime_error& error) { refused = true; complaint = error.what(); }
+      Check(refused, "a shader binding beyond the root signature was accepted");
+      Check(complaint.find("texture slot 8") != std::string::npos,
+            "the refusal did not name the offending slot: " + complaint);
+
+      const char* kSecondPixelBuffer = R"(
+cbuffer A : register(b0) { float4 a; };
+cbuffer B : register(b1) { float4 b; };
+float4 PS(float4 position : SV_POSITION) : SV_TARGET { return a + b; }
+)";
+      refused = false;
+      try { ValidateAgainstRootLayout(Bytes(*Compile(kSecondPixelBuffer, "PS", "ps_5_0").Get()), true, "TwoBuffers"); }
+      catch (const std::runtime_error&) { refused = true; }
+      Check(refused, "a pixel shader using two constant buffers was accepted by a one-buffer signature");
+
+      const auto signature = CreateNativeD3D12RootSignature(*gpu.device());
+      Check(signature != nullptr, "the root signature was not created");
+      NativeD3D12PipelineCache cache(*gpu.device(), *signature.Get());
+
+      const D3D12_INPUT_ELEMENT_DESC layout[] = {
+          {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0}};
+      NativeD3D12PipelineCache::Request request{};
+      request.key.vertex_shader = 1;
+      request.key.pixel_shader = 2;
+      request.key.input_layout = 3;
+      request.key.blend = 0x10001;
+      request.key.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+      request.key.render_targets = 1;
+      request.key.rtv_format[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+      request.vertex = {vertex->GetBufferPointer(), vertex->GetBufferSize()};
+      request.pixel = {pixel->GetBufferPointer(), pixel->GetBufferSize()};
+      request.input_layout = layout;
+      request.state = {0x10001, 0, 0, 0, 15, 0};
+
+      auto& built = cache.Get(request);
+      auto& reused = cache.Get(request);
+      Check(&built == &reused, "the pipeline cache rebuilt an identical pipeline");
+      Check(cache.misses() == 1 && cache.hits() == 1, "the pipeline cache did not account for its lookups");
+
+      // Scissoring is a command in D3D12, not pipeline state. Two draws that
+      // differ only in it must share one pipeline rather than double the cache.
+      request.state[5] = 1;
+      auto& scissored = cache.Get(request);
+      Check(&scissored == &built, "enabling scissoring built a second pipeline for the same state");
+
+      // A different blend word is genuinely different state and must not.
+      request.key.blend = 0x10005;
+      request.state = {0x10005, 0, 0, 0, 15, 0};
+      auto& blended = cache.Get(request);
+      Check(&blended != &built, "two different blend states shared one pipeline");
+      Check(cache.size() == 2, "the pipeline cache holds the wrong number of pipelines");
+      std::cout << "pipeline cache: " << cache.size() << " pipelines, " << cache.hits() << " hits, "
+                << cache.misses() << " misses\n";
     }
     {
       // A table wider than the root signature's sampler width has to be
