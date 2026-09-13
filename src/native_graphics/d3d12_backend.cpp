@@ -592,6 +592,18 @@ class D3D12Recorder final : public NativeBackendRecorder {
   }
   void FlushSamplers() {
     if(!bound_.samplers_dirty) return;
+    // The same combination as the last draw, which is the usual case: a run of
+    // draws shares its material. Comparing eight pointers is cheaper than
+    // rebuilding eight descriptions and looking them up by their bytes. Keyed
+    // on the frame's fence value, because a table from an earlier frame may
+    // have been recycled since.
+    if(sampler_memo_frame_==gpu_->pending_fence() &&
+       std::equal(std::begin(bound_.samplers),std::end(bound_.samplers),std::begin(sampler_memo_))) {
+      Commands().SetGraphicsRootDescriptorTable(NativeD3D12RootLayout::kPixelSamplerTable,
+                                                sampler_memo_table_);
+      bound_.samplers_dirty=false;
+      return;
+    }
     std::array<D3D12_SAMPLER_DESC,NativeD3D12RootLayout::kPixelSamplers> descs{};
     for(uint32_t slot=0;slot<descs.size();++slot)
       descs[slot]=bound_.samplers[slot]?bound_.samplers[slot]->desc():DefaultSampler();
@@ -600,6 +612,9 @@ class D3D12Recorder final : public NativeBackendRecorder {
     // still reading.
     const auto table=gpu_->samplers().Table(descs,gpu_->pending_fence(),gpu_->completed_fence());
     Commands().SetGraphicsRootDescriptorTable(NativeD3D12RootLayout::kPixelSamplerTable,table);
+    std::copy(std::begin(bound_.samplers),std::end(bound_.samplers),std::begin(sampler_memo_));
+    sampler_memo_table_=table;
+    sampler_memo_frame_=gpu_->pending_fence();
     bound_.samplers_dirty=false;
   }
   static D3D12_SAMPLER_DESC DefaultSampler() {
@@ -613,13 +628,30 @@ class D3D12Recorder final : public NativeBackendRecorder {
   }
   void FlushTextures() {
     if(!bound_.textures_dirty) return;
+    // The barriers are not part of the memo, and finding that out cost a
+    // conformance failure: a sampled render target can be written again
+    // between two draws that bind it, so every draw has to say what state it
+    // needs even when the descriptors have not moved. Transition first,
+    // unconditionally; only the table is reused.
+    for(uint32_t slot=0;slot<NativeD3D12RootLayout::kPixelTextures;++slot)
+      if(auto* texture=bound_.textures[slot].get())
+        Transition(texture->tracked(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    // The same eight textures need the same table, and a ring-allocated table
+    // stays valid for the frame that allocated it. Without this every draw
+    // allocated a fresh table and copied eight descriptors into it to say what
+    // the last one already said.
+    if(texture_memo_frame_==gpu_->pending_fence() && SameBoundTextures()) {
+      Commands().SetGraphicsRootDescriptorTable(NativeD3D12RootLayout::kPixelTextureTable,
+                                                texture_memo_table_);
+      bound_.textures_dirty=false;
+      return;
+    }
     const auto table=gpu_->AllocateViews(NativeD3D12RootLayout::kPixelTextures,index_);
     const auto increment=gpu_->views(index_).increment();
     for(uint32_t slot=0;slot<NativeD3D12RootLayout::kPixelTextures;++slot) {
       const D3D12_CPU_DESCRIPTOR_HANDLE at{table.cpu.ptr+static_cast<SIZE_T>(slot)*increment};
       auto* texture=bound_.textures[slot].get();
       if(texture) {
-        Transition(texture->tracked(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         gpu_->device()->CopyDescriptorsSimple(1,at,texture->view(),
                                               D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
       } else {
@@ -631,7 +663,18 @@ class D3D12Recorder final : public NativeBackendRecorder {
       }
     }
     Commands().SetGraphicsRootDescriptorTable(NativeD3D12RootLayout::kPixelTextureTable,table.gpu);
+    for(uint32_t slot=0;slot<NativeD3D12RootLayout::kPixelTextures;++slot)
+      texture_memo_[slot]=bound_.textures[slot].get();
+    texture_memo_table_=table.gpu;
+    texture_memo_frame_=gpu_->pending_fence();
     bound_.textures_dirty=false;
+  }
+  // Compared through get(), so a texture destroyed since the memo was taken
+  // reads as a different slot rather than as a match on a dead pointer.
+  bool SameBoundTextures() const {
+    for(uint32_t slot=0;slot<NativeD3D12RootLayout::kPixelTextures;++slot)
+      if(texture_memo_[slot]!=bound_.textures[slot].get()) return false;
+    return true;
   }
 
   // A bound texture, held weakly. Expired means the caller destroyed it while
@@ -654,6 +697,14 @@ class D3D12Recorder final : public NativeBackendRecorder {
     uint32_t render_targets=0;
     bool textures_dirty=false,samplers_dirty=false,blend_factor_set=false;
   };
+
+  // One-frame memos of the last table bound; see FlushSamplers.
+  D3D12Sampler* sampler_memo_[NativeD3D12RootLayout::kPixelSamplers]{};
+  D3D12_GPU_DESCRIPTOR_HANDLE sampler_memo_table_{};
+  uint64_t sampler_memo_frame_=0;
+  D3D12Texture* texture_memo_[NativeD3D12RootLayout::kPixelTextures]{};
+  D3D12_GPU_DESCRIPTOR_HANDLE texture_memo_table_{};
+  uint64_t texture_memo_frame_=0;
 
   NativeD3D12Device* gpu_;
   ID3D12RootSignature* signature_;
