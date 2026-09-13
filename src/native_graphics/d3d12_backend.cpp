@@ -1124,6 +1124,22 @@ class D3D12Backend final : public NativeRenderBackend {
 
   std::vector<std::string> DrainValidationMessages() override { return gpu_.DrainValidationErrors(); }
 
+  NativeBackendStatistics Statistics() const override {
+    NativeBackendStatistics out;
+    out.frames=gpu_.frames_submitted();
+    out.upload_stalls=gpu_.upload_stalls();
+    out.descriptor_stalls=gpu_.descriptor_stalls();
+    out.pipelines=pipelines_.size();
+    out.pipeline_hits=pipelines_.hits();
+    out.pipeline_misses=pipelines_.misses();
+    out.sampler_tables=gpu_.samplers().tables();
+    out.sampler_hits=gpu_.samplers().hits();
+    out.sampler_misses=gpu_.samplers().misses();
+    out.sampler_evictions=gpu_.samplers().evictions();
+    out.retiring=gpu_.retiring();
+    return out;
+  }
+
   void AttachWindow(void* window, uint32_t width, uint32_t height) override {
     if(open_) throw std::runtime_error("a window cannot be attached inside an open frame");
     if(!window) throw std::runtime_error("AttachWindow needs a window");

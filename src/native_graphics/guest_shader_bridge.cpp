@@ -1957,6 +1957,7 @@ void PublishSceneSharedLocked(Bridge& state,const NativeRenderTarget& output) {
 }
 void SubmitSceneFrameLocked(Bridge& state) {
   if(!state.scene_frame_open) return;
+  const auto operations=state.scene_frame_operations;
   state.scene_frame_open=false;
   // Nothing survives a frame boundary: the recorder's own tracked state is
   // reset when the next frame opens, so what this believed was still bound is
@@ -1983,6 +1984,21 @@ void SubmitSceneFrameLocked(Bridge& state) {
   }
   for(const auto& message:state.scene_backend->DrainValidationMessages())
     REXLOG_WARN("Native scene backend validation: {}",message);
+  // Periodically, what the frame actually cost the backend. A frame time has
+  // to be attributable to something: a stall for upload memory, a pipeline
+  // built during gameplay, a sampler cache thrashing, a frame split into more
+  // command lists than it should need. Without these the only thing that can
+  // be said about a slow frame is that it was slow.
+  if(state.scene_frames<=3 || state.scene_frames%600==0) {
+    const auto counts=state.scene_backend->Statistics();
+    REXLOG_INFO("Native scene backend spend: frames={}, splits={}, operations_last_frame={}, "
+      "upload_stalls={}, descriptor_stalls={}, pipelines={} (hits={}, misses={}), "
+      "sampler_tables={} (hits={}, misses={}, evictions={}), retiring={}",
+      state.scene_frames,state.scene_frame_splits,operations,
+      counts.upload_stalls,counts.descriptor_stalls,counts.pipelines,counts.pipeline_hits,
+      counts.pipeline_misses,counts.sampler_tables,counts.sampler_hits,counts.sampler_misses,
+      counts.sampler_evictions,counts.retiring);
+  }
 }
 }  // namespace
 
@@ -5493,7 +5509,10 @@ REX_HOOK_RAW(sub_821FE358) {
           // DrawIndexedInstanced replaces. Measure the run lengths before
           // building that: the mean run length is the draw-call reduction, and
           // a mean near 1 would mean there is nothing to collapse.
-          if(state.recorded_draws && state.recorded_draws%1000000==0)
+          // Every hundred thousand rather than every million: a run slow enough
+          // to need this explanation never reaches a million draws, which made
+          // the one counter that could explain it unreachable.
+          if(state.recorded_draws && state.recorded_draws%100000==0)
             REXLOG_INFO("Native recorded binding reuse: draws={}, pipeline_skips={} ({:.1f}%), material_skips={} ({:.1f}%), constant_buffer_skips={} ({:.2f} per draw) (a skip is something the recorder already held, so the draw did not re-send it)",
               state.recorded_draws,state.recorded_pipeline_skips,
               100.0*double(state.recorded_pipeline_skips)/double(state.recorded_draws),

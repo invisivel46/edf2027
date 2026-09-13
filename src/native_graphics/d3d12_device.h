@@ -118,6 +118,7 @@ class NativeD3D12Device {
   NativeD3D12DescriptorRing& views(uint32_t recorder=0) { return *views_.at(recorder); }
   ID3D12DescriptorHeap* view_heap() const { return view_heap_.Get(); }
   NativeD3D12SamplerCache& samplers() { return *samplers_; }
+  const NativeD3D12SamplerCache& samplers() const { return *samplers_; }
 
   const NativeUploadRing& upload_ring(uint32_t recorder=0) const { return rings_.at(recorder); }
   uint64_t frames_submitted() const { return frame_counter_; }

@@ -92,6 +92,24 @@ class NativeBackendSharedSurface {
   virtual uint64_t value() const=0;
 };
 
+// What a backend is spending, for a caller that has to explain a frame time.
+//
+// Every field is a count a backend either keeps or does not have a concept of,
+// and the default is zero rather than an error: this exists so a slow frame can
+// be attributed instead of guessed at, and a backend that cannot answer should
+// not stop the caller asking.
+struct NativeBackendStatistics {
+  uint64_t frames=0;
+  // Times a frame had to wait for the GPU to give back upload memory or
+  // shader-visible descriptors. Anything but zero is a budget that is too small
+  // and shows to a player as a stutter with no other explanation.
+  uint64_t upload_stalls=0,descriptor_stalls=0;
+  uint64_t pipelines=0,pipeline_hits=0,pipeline_misses=0;
+  uint64_t sampler_tables=0,sampler_hits=0,sampler_misses=0,sampler_evictions=0;
+  // Resources dropped by their owner that the GPU may still be reading.
+  uint64_t retiring=0;
+};
+
 enum class NativeBackendQueryKind : uint32_t { Occlusion, Timestamp, TimestampDisjoint };
 class NativeBackendQuery {
  public:
@@ -323,6 +341,9 @@ class NativeRenderBackend {
   // replaces, and "looks right to me" is not how this renderer has been
   // verified so far.
   virtual std::vector<uint8_t> ReadRenderTarget(NativeBackendRenderTarget& target)=0;
+  // Not pure: a backend with none of these concepts answers zeroes rather than
+  // being forced to invent them.
+  virtual NativeBackendStatistics Statistics() const { return {}; }
   // The same for a sampled texture, on the same blocking terms. Separate
   // because a resolved scene is a texture and not a target, and a backend that
   // can only be read where it draws can only be checked where it draws.
