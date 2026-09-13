@@ -327,7 +327,7 @@ class D3D12Recorder final : public NativeBackendRecorder {
       throw std::runtime_error("this root signature declares no vertex-stage textures");
     if(slot>=NativeD3D12RootLayout::kPixelTextures)
       throw std::runtime_error("texture slot "+std::to_string(slot)+" is outside the root signature");
-    bound_.textures[slot]=static_cast<D3D12Texture*>(texture);
+    bound_.textures[slot].set(static_cast<D3D12Texture*>(texture));
     bound_.textures_dirty=true;
   }
   void SetSampler(NativeBackendStage stage, uint32_t slot, NativeBackendSampler* sampler) override {
@@ -582,7 +582,7 @@ class D3D12Recorder final : public NativeBackendRecorder {
     const auto increment=gpu_->views(index_).increment();
     for(uint32_t slot=0;slot<NativeD3D12RootLayout::kPixelTextures;++slot) {
       const D3D12_CPU_DESCRIPTOR_HANDLE at{table.cpu.ptr+static_cast<SIZE_T>(slot)*increment};
-      auto* texture=bound_.textures[slot];
+      auto* texture=bound_.textures[slot].get();
       if(texture) {
         Transition(texture->tracked(),D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
         gpu_->device()->CopyDescriptorsSimple(1,at,texture->view(),
@@ -599,9 +599,22 @@ class D3D12Recorder final : public NativeBackendRecorder {
     bound_.textures_dirty=false;
   }
 
+  // A bound texture, held weakly. Expired means the caller destroyed it while
+  // it was still bound, which is a slot to leave empty rather than a
+  // descriptor to copy out of freed memory.
+  struct BoundTexture {
+    D3D12Texture* texture=nullptr;
+    std::weak_ptr<void> alive;
+    D3D12Texture* get() const { return alive.expired()?nullptr:texture; }
+    void reset() { texture=nullptr; alive.reset(); }
+    void set(D3D12Texture* value) {
+      texture=value;
+      if(value) alive=value->alive(); else alive.reset();
+    }
+  };
   struct Bound {
     D3D12Pipeline* pipeline=nullptr;
-    D3D12Texture* textures[NativeD3D12RootLayout::kPixelTextures]{};
+    BoundTexture textures[NativeD3D12RootLayout::kPixelTextures]{};
     D3D12Sampler* samplers[NativeD3D12RootLayout::kPixelSamplers]{};
     uint32_t render_targets=0;
     bool textures_dirty=false,samplers_dirty=false,blend_factor_set=false;
@@ -1233,15 +1246,23 @@ std::atomic<uint32_t>& UploadMegabytes() {
   static std::atomic<uint32_t> megabytes{0};
   return megabytes;
 }
+std::atomic<bool>& DebugLayer() {
+  static std::atomic<bool> enabled{false};
+  return enabled;
+}
 NativeD3D12Options RegistryOptions() {
   NativeD3D12Options options;
   if(const auto megabytes=UploadMegabytes().load(std::memory_order_relaxed))
     options.upload_bytes=uint64_t(megabytes)<<20;
+  options.debug_layer=DebugLayer().load(std::memory_order_relaxed);
   return options;
 }
 }  // namespace
 void SetNativeD3D12UploadMegabytes(uint32_t megabytes) {
   UploadMegabytes().store(megabytes,std::memory_order_relaxed);
+}
+void SetNativeD3D12DebugLayer(bool enabled) {
+  DebugLayer().store(enabled,std::memory_order_relaxed);
 }
 void RegisterNativeD3D12Backend() {
   static bool registered=false;
@@ -1257,6 +1278,8 @@ void RegisterNativeD3D12Backend() {
   RegisterNativeRenderBackend("d3d12-warp",[]() -> std::unique_ptr<NativeRenderBackend> {
     auto options=RegistryOptions();
     options.prefer_warp=true;
+    // Always on for WARP: it exists to attribute a difference, and a run
+    // without validation cannot do that.
     options.debug_layer=true;
     return CreateNativeD3D12Backend(options);
   });

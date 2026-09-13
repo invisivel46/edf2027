@@ -16,6 +16,11 @@ void RegisterNativeD3D12Backend();
 // Set before the backend is created; ignored afterwards. Exists because the
 // right value is a measurement of one frame's constants, not a constant.
 void SetNativeD3D12UploadMegabytes(uint32_t megabytes);
+// Turns the debug layer on for backends built through the registry, including
+// the hardware one. Only the WARP variant had it, which is the wrong way round
+// for finding a hang: the hang happens on hardware, and WARP is far too slow to
+// reach the part of the game where it happens.
+void SetNativeD3D12DebugLayer(bool enabled);
 
 std::unique_ptr<NativeRenderBackend> CreateNativeD3D12Backend(const NativeD3D12Options& options={});
 }  // namespace edf::native

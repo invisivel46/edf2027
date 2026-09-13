@@ -139,6 +139,10 @@ REXCVAR_DEFINE_STRING(edf_native_scene_backend, "d3d11", "EDF2027",
                      "Backend that owns the scene's own resources - its textures, meshes and targets - while the draw paths are being moved onto the backend interface one at a time. Must stay d3d11 until the last of them has moved: a ported path and an unported one have to share the same targets, and only the adopted d3d11 backend is this renderer's own device. Setting it to d3d12 before then gives the unported paths nothing to bind");
 REXCVAR_DEFINE_INT32(edf_native_upload_megabytes, 256, "EDF2027",
                     "Upload-ring megabytes for a D3D12 backend. Every recorded draw stages its constants here and the ring is retired by fence, so it has to hold every frame still in flight. A frame that does not fit is refused with the high water it reached, which is what to set this from");
+REXCVAR_DEFINE_INT32(edf_native_frame_operations, 8192, "EDF2027",
+                    "Recorded operations after which the scene's frame is submitted and a new one opened, rather than waiting for the guest's swap. The guest swaps once a frame but begins render targets far more often than that - measured at 1,000 begins across 8 swaps - so a frame tied only to the swap accumulates without bound during loading, which is one command list, one ring's worth of uploads, and eventually a GPU with more work in one submission than it will accept");
+REXCVAR_DEFINE_BOOL(edf_native_d3d12_debug_layer, false, "EDF2027",
+                   "Turn the D3D12 debug layer on for every backend this process builds, including the hardware one. Slow, and worth it when something removes the device: validation names the command that did it, where the removal reason only names the device");
 REXCVAR_DEFINE_BOOL(edf_native_seam_draws, false, "EDF2027",
                    "Record the scene's draws through the backend interface instead of calling the D3D11 context directly. With --edf_native_scene_backend=d3d11 both draw the same thing on the same device, which is what makes this the A/B control for the port: a difference is a wiring mistake, because the backend underneath has not changed. It must be true before the scene backend can be anything else");
 REXCVAR_DEFINE_BOOL(edf_native_backend_present, true, "EDF2027",
@@ -617,6 +621,11 @@ struct Bridge {
   // did not, which is why nothing needed this until now.
   bool scene_frame_open=false;
   uint64_t scene_frames=0;
+  // Recorded operations in the open frame. A backend frame has to be bounded
+  // by something: the guest's swap alone is not, because the renderer records
+  // far more between two swaps than one command list should carry.
+  uint64_t scene_frame_operations=0;
+  uint64_t scene_frame_splits=0;
   // The scene's finished frame, in a surface the window's backend can open.
   //
   // This is how a scene drawn on one backend reaches a window presented by
@@ -1850,6 +1859,7 @@ edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state) {
   if(name.empty()) throw std::runtime_error("the scene's resources were asked for but --edf_native_scene_backend is empty");
   if(!state.device) throw std::runtime_error("the scene's resources were asked for before the renderer had a device");
   edf::native::RegisterNativeD3D11Backend();
+  edf::native::SetNativeD3D12DebugLayer(REXCVAR_GET(edf_native_d3d12_debug_layer));
   // Sized from a measured frame, not from a guess; see the cvar.
   edf::native::SetNativeD3D12UploadMegabytes(
     uint32_t((std::max)(16,REXCVAR_GET(edf_native_upload_megabytes))));
@@ -1867,11 +1877,23 @@ edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state) {
 }
 edf::native::NativeBackendRecorder& SceneRecorderLocked(Bridge& state) {
   auto& backend=EnsureSceneBackendLocked(state);
+  // Submitted and reopened when it has carried enough, so the work between two
+  // guest swaps is not one unbounded command list. Everything recorded is
+  // already ordered by submission order, so splitting a frame changes when the
+  // GPU sees the work and nothing about what it sees.
+  const auto limit=REXCVAR_GET(edf_native_frame_operations);
+  if(state.scene_frame_open && limit>0 &&
+     state.scene_frame_operations>=uint64_t(limit)) {
+    ++state.scene_frame_splits;
+    SubmitSceneFrameLocked(state);
+  }
   if(!state.scene_frame_open) {
     backend.BeginFrame();
     state.scene_frame_open=true;
+    state.scene_frame_operations=0;
     ++state.scene_frames;
   }
+  ++state.scene_frame_operations;
   // Recorder 0: this renderer records the scene from one thread. Parallel
   // recording is a later question and a different one - it needs the draws to
   // be independent first, which is what moving them here is for.
