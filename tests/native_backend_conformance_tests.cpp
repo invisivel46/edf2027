@@ -45,7 +45,8 @@ constexpr uint32_t kFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
 
 // What one backend produced. Compared against every other backend's.
 struct Rendered {
-  std::vector<uint8_t> flat, textured, instanced, mipped, resolved;
+  std::vector<uint8_t> flat, textured, instanced, mipped, resolved, compressed, blended;
+  bool refused_missing_blend_factor=false;
   uint64_t query_samples = 0;
   std::vector<std::string> validation;
 };
@@ -225,6 +226,77 @@ Rendered Render(NativeRenderBackend& backend) {
   backend.Submit();
   out.mipped = backend.ReadRenderTarget(*target);
 
+  // Blending against a constant blend factor. The guest word sets the source
+  // factor to the constant colour and the destination to zero, so the result
+  // is exactly source x factor: drawing white with (0.5, 0.25, 0.75) must read
+  // back as that, which no other blend state produces by accident.
+  constexpr uint32_t kFactorBlend = 12u | (1u << 16);  // src=BLEND_FACTOR, dst=ZERO, alpha src=ONE
+  NativeBackendPipelineDesc blended_desc = flat_desc;
+  blended_desc.state = {kFactorBlend, 0, 0, 0, 15, 0};
+  blended_desc.vertex_id = 13;
+  blended_desc.pixel_id = 14;
+  auto& blended_pipeline = backend.CreatePipeline(blended_desc);
+  const std::array<float, 4> opaque_white{1.0f, 1.0f, 1.0f, 1.0f};
+  const std::array<float, 4> factor{0.5f, 0.25f, 0.75f, 1.0f};
+
+  backend.BeginFrame();
+  {
+    auto& recorder = backend.Recorder();
+    recorder.SetRenderTargets(colors, nullptr);
+    recorder.SetViewport({0, 0, kSize, kSize, 0, 1});
+    recorder.ClearColor(*target, {0.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetPipeline(blended_pipeline);
+    recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+    recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                          {reinterpret_cast<const uint8_t*>(opaque_white.data()), sizeof(float) * 4});
+    // A draw needing a factor and given none must be refused, not drawn in the
+    // wrong colour. Checked here, inside the frame, before supplying one.
+    try { recorder.Draw(3, 0); }
+    catch (const std::runtime_error&) { out.refused_missing_blend_factor = true; }
+    recorder.SetBlendFactor(factor);
+    recorder.Draw(3, 0);
+  }
+  backend.Submit();
+  out.blended = backend.ReadRenderTarget(*target);
+
+  // Block-compressed, which is what the game's textures actually are. A BC1
+  // block is two RGB565 endpoints and four bytes of 2-bit indices; setting
+  // both endpoints to the same colour and all indices to zero gives a solid
+  // block, which is enough to tell whether the blocks landed where they were
+  // meant to. 8x8 is 2x2 blocks, so each quadrant is one block of its own
+  // colour -- a backend that computed the row pitch in texels instead of
+  // blocks gets the second row of blocks from the wrong offset and shows it.
+  const auto bc1_block=[](uint16_t colour,uint8_t* out) {
+    out[0]=uint8_t(colour&0xff); out[1]=uint8_t(colour>>8);
+    out[2]=out[0]; out[3]=out[1];
+    out[4]=out[5]=out[6]=out[7]=0;
+  };
+  uint8_t bc1[32]{};
+  bc1_block(0xf800,bc1);       // red    (RGB565)
+  bc1_block(0x07e0,bc1+8);     // green
+  bc1_block(0x001f,bc1+16);    // blue
+  bc1_block(0xffe0,bc1+24);    // yellow
+  NativeBackendTextureDesc compressed_desc{};
+  compressed_desc.width=compressed_desc.height=8;
+  compressed_desc.levels=1;
+  compressed_desc.format=71;  // DXGI_FORMAT_BC1_UNORM
+  const auto compressed=backend.CreateTexture(compressed_desc,bc1);
+
+  backend.BeginFrame();
+  {
+    auto& recorder = backend.Recorder();
+    recorder.SetRenderTargets(colors, nullptr);
+    recorder.SetViewport({0, 0, kSize, kSize, 0, 1});
+    recorder.ClearColor(*target, {0.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetPipeline(textured_pipeline);
+    recorder.SetVertexBuffer(0, *cover_buffer, sizeof(float) * 3, 0);
+    recorder.SetTexture(NativeBackendStage::Pixel, 0, compressed.get());
+    recorder.SetSampler(NativeBackendStage::Pixel, 0, &sampler);
+    recorder.Draw(3, 0);
+  }
+  backend.Submit();
+  out.compressed = backend.ReadRenderTarget(*target);
+
   // Indexed instanced, with a per-instance input element.
   const float quad[] = {-0.2f, -0.2f, 0.0f, 0.2f, -0.2f, 0.0f, -0.2f, 0.2f, 0.0f, 0.2f, 0.2f, 0.0f};
   const uint16_t indices[] = {0, 2, 1, 1, 2, 3};
@@ -363,10 +435,12 @@ int main() {
       if (name == "d3d11-warp") continue;
       const std::pair<const char*, const std::vector<uint8_t>*> surfaces[] = {
           {"flat", &rendered.flat}, {"textured", &rendered.textured},
-          {"instanced", &rendered.instanced}, {"mipped", &rendered.mipped}};
+          {"instanced", &rendered.instanced}, {"mipped", &rendered.mipped},
+          {"compressed", &rendered.compressed}, {"blended", &rendered.blended}};
       const std::vector<uint8_t>* references[] = {&reference.flat, &reference.textured,
-                                                  &reference.instanced, &reference.mipped};
-      for (size_t index = 0; index < 4; ++index) {
+                                                  &reference.instanced, &reference.mipped,
+                                                  &reference.compressed, &reference.blended};
+      for (size_t index = 0; index < 6; ++index) {
         const auto difference = Compare(*references[index], *surfaces[index].second);
         Check(difference.pixels == 0,
               std::string(name) + " differs from d3d11-warp on the " + surfaces[index].first +
@@ -385,7 +459,7 @@ int main() {
             std::string(name) + " counted " + std::to_string(rendered.query_samples) +
                 " occlusion samples where d3d11-warp counted " +
                 std::to_string(reference.query_samples));
-      std::cout << name << " vs d3d11-warp: identical on flat/textured/instanced/mipped, resolve "
+      std::cout << name << " vs d3d11-warp: identical on flat/textured/instanced/mipped/compressed/blended, resolve "
                 << "differs by at most " << resolve.worst << " on " << resolve.pixels << " pixels\n";
     }
 
@@ -411,6 +485,30 @@ int main() {
       Check(at(rendered.textured, kSize * 3 / 4, kSize * 3 / 4, 0) > 200 &&
                 at(rendered.textured, kSize * 3 / 4, kSize * 3 / 4, 1) > 200,
             name + ": bottom-right quadrant is not the texture's yellow texel");
+      // Each quadrant is one BC1 block, so a pitch computed in texels rather
+      // than blocks reads the lower row from the wrong place and fails here.
+      Check(at(rendered.compressed, kSize / 4, kSize / 4, 0) > 200 &&
+                at(rendered.compressed, kSize / 4, kSize / 4, 1) < 60,
+            name + ": BC1 top-left block is not red");
+      Check(at(rendered.compressed, kSize * 3 / 4, kSize / 4, 1) > 200 &&
+                at(rendered.compressed, kSize * 3 / 4, kSize / 4, 0) < 60,
+            name + ": BC1 top-right block is not green");
+      Check(at(rendered.compressed, kSize / 4, kSize * 3 / 4, 2) > 200 &&
+                at(rendered.compressed, kSize / 4, kSize * 3 / 4, 0) < 60,
+            name + ": BC1 bottom-left block is not blue");
+      Check(at(rendered.compressed, kSize * 3 / 4, kSize * 3 / 4, 0) > 200 &&
+                at(rendered.compressed, kSize * 3 / 4, kSize * 3 / 4, 1) > 200,
+            name + ": BC1 bottom-right block is not yellow");
+      Check(rendered.refused_missing_blend_factor,
+            name + ": a draw needing a constant blend factor was allowed without one");
+      // source x factor, within the rounding of an 8-bit target.
+      const auto blended = at(rendered.blended, kSize / 2, kSize / 2, 0);
+      Check(std::abs(int(blended) - 128) <= 2,
+            name + ": blend factor red is " + std::to_string(blended) + ", expected ~128");
+      Check(std::abs(int(at(rendered.blended, kSize / 2, kSize / 2, 1)) - 64) <= 2,
+            name + ": blend factor green is not ~64");
+      Check(std::abs(int(at(rendered.blended, kSize / 2, kSize / 2, 2)) - 191) <= 2,
+            name + ": blend factor blue is not ~191");
       Check(at(rendered.mipped, kSize / 2, kSize / 2, 2) > 200 &&
                 at(rendered.mipped, kSize / 2, kSize / 2, 0) < 60,
             name + ": level 1 of the mipped texture is not the colour it was given");

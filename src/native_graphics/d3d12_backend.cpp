@@ -77,13 +77,15 @@ class D3D12RenderTarget final : public NativeBackendRenderTarget {
 
 class D3D12Pipeline final : public NativeBackendPipeline {
  public:
-  D3D12Pipeline(ID3D12PipelineState& state, D3D12_PRIMITIVE_TOPOLOGY topology)
-      : state_(&state),topology_(topology) {}
+  D3D12Pipeline(ID3D12PipelineState& state, D3D12_PRIMITIVE_TOPOLOGY topology, bool requires_blend_factor)
+      : state_(&state),topology_(topology),requires_blend_factor_(requires_blend_factor) {}
   ID3D12PipelineState& state() const { return *state_; }
   D3D12_PRIMITIVE_TOPOLOGY topology() const { return topology_; }
+  bool requires_blend_factor() const { return requires_blend_factor_; }
  private:
   ID3D12PipelineState* state_;
   D3D12_PRIMITIVE_TOPOLOGY topology_;
+  bool requires_blend_factor_;
 };
 
 class D3D12Sampler final : public NativeBackendSampler {
@@ -224,6 +226,10 @@ class D3D12Recorder final : public NativeBackendRecorder {
   void SetTopology(NativeBackendTopology topology) override {
     Commands().IASetPrimitiveTopology(Topology(topology));
   }
+  void SetBlendFactor(const std::array<float,4>& factor) override {
+    Commands().OMSetBlendFactor(factor.data());
+    bound_.blend_factor_set=true;
+  }
 
   void SetConstants(NativeBackendStage stage, uint32_t slot, std::span<const uint8_t> bytes) override {
     // Straight into the upload ring and then into a root descriptor: no
@@ -306,17 +312,20 @@ class D3D12Recorder final : public NativeBackendRecorder {
   }
 
   void Draw(uint32_t vertices, uint32_t first_vertex) override {
+    RequireBlendFactor();
     FlushTextures();
     FlushSamplers();
     Commands().DrawInstanced(vertices,1,first_vertex,0);
   }
   void DrawIndexed(uint32_t indices, uint32_t first_index, int32_t base_vertex) override {
+    RequireBlendFactor();
     FlushTextures();
     FlushSamplers();
     Commands().DrawIndexedInstanced(indices,1,first_index,base_vertex,0);
   }
   void DrawIndexedInstanced(uint32_t indices, uint32_t instances, uint32_t first_index,
                             int32_t base_vertex, uint32_t first_instance) override {
+    RequireBlendFactor();
     FlushTextures();
     FlushSamplers();
     Commands().DrawIndexedInstanced(indices,instances,first_index,base_vertex,first_instance);
@@ -431,6 +440,10 @@ class D3D12Recorder final : public NativeBackendRecorder {
   // The whole table is resolved at once from the cache, because that is the
   // only shape the 2,048-descriptor sampler heap allows. Slots left unbound get
   // a defined sampler rather than whatever the last combination had there.
+  void RequireBlendFactor() {
+    if(bound_.pipeline && bound_.pipeline->requires_blend_factor() && !bound_.blend_factor_set)
+      throw std::runtime_error("this draw blends against a constant blend factor that was never set");
+  }
   void FlushSamplers() {
     if(!bound_.samplers_dirty) return;
     std::array<D3D12_SAMPLER_DESC,NativeD3D12RootLayout::kPixelSamplers> descs{};
@@ -477,7 +490,7 @@ class D3D12Recorder final : public NativeBackendRecorder {
     D3D12Texture* textures[NativeD3D12RootLayout::kPixelTextures]{};
     D3D12Sampler* samplers[NativeD3D12RootLayout::kPixelSamplers]{};
     uint32_t render_targets=0;
-    bool textures_dirty=false,samplers_dirty=false;
+    bool textures_dirty=false,samplers_dirty=false,blend_factor_set=false;
   };
 
   NativeD3D12Device* gpu_;
@@ -708,7 +721,9 @@ class D3D12Backend final : public NativeRenderBackend {
     auto found=wrappers_.find(key);
     if(found==wrappers_.end())
       found=wrappers_.emplace(std::move(key),
-                              std::make_unique<D3D12Pipeline>(state,Topology(desc.topology))).first;
+                              std::make_unique<D3D12Pipeline>(state,Topology(desc.topology),
+                                                              DecodeNativeRenderState(desc.state)
+                                                                .requires_blend_factor)).first;
     return *found->second;
   }
 

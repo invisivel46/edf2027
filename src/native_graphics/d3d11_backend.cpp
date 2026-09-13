@@ -1,4 +1,5 @@
 #include "d3d11_backend.h"
+#include "native_dxgi_format.h"
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
 #include <wrl/client.h>
@@ -85,6 +86,7 @@ class D3D11Pipeline final : public NativeBackendPipeline {
   ComPtr<ID3D11DepthStencilState> depth;
   ComPtr<ID3D11RasterizerState> raster;
   D3D11_PRIMITIVE_TOPOLOGY topology=D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+  bool requires_blend_factor=false;
 };
 
 class D3D11Query final : public NativeBackendQuery {
@@ -119,25 +121,6 @@ D3D11_TEXTURE_ADDRESS_MODE AddressMode(NativeBackendAddress address) {
 
 constexpr uint32_t kTextureSlots=8,kSamplerSlots=8,kConstantSlots=4;
 
-// Deliberately narrow: the seam's format field is a backend-specific code, and
-// a format this does not know must fail rather than be guessed at a plausible
-// size and silently read the wrong number of bytes.
-uint32_t BytesPerTexelPublic(DXGI_FORMAT format) {
-  switch(format) {
-    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_R10G10B10A2_UNORM:
-    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R32_FLOAT:
-      return 4;
-    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
-    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
-    case DXGI_FORMAT_R8_UNORM: return 1;
-    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R16_FLOAT: return 2;
-    default: break;
-  }
-  throw std::runtime_error("this backend does not know the texel size of format "+
-                           std::to_string(static_cast<uint32_t>(format)));
-}
-
 class D3D11Recorder final : public NativeBackendRecorder {
  public:
   D3D11Recorder(ID3D11Device& device, ID3D11DeviceContext& context)
@@ -150,8 +133,7 @@ class D3D11Recorder final : public NativeBackendRecorder {
     context_->VSSetShader(concrete.vertex.Get(),nullptr,0);
     context_->PSSetShader(concrete.pixel.Get(),nullptr,0);
     context_->IASetInputLayout(concrete.layout.Get());
-    const float factor[4]{1,1,1,1};
-    context_->OMSetBlendState(concrete.blend.Get(),factor,0xffffffff);
+    context_->OMSetBlendState(concrete.blend.Get(),bound_.blend_factor.data(),0xffffffff);
     context_->OMSetDepthStencilState(concrete.depth.Get(),0);
     context_->RSSetState(concrete.raster.Get());
     context_->IASetPrimitiveTopology(concrete.topology);
@@ -168,6 +150,14 @@ class D3D11Recorder final : public NativeBackendRecorder {
   }
   void SetTopology(NativeBackendTopology topology) override {
     context_->IASetPrimitiveTopology(Topology(topology));
+  }
+  void SetBlendFactor(const std::array<float,4>& factor) override {
+    bound_.blend_factor=factor;
+    bound_.blend_factor_set=true;
+    // D3D11 carries the factor on the blend state, so it is re-sent with the
+    // state rather than on its own.
+    if(bound_.pipeline)
+      context_->OMSetBlendState(bound_.pipeline->blend.Get(),factor.data(),0xffffffff);
   }
 
   void SetConstants(NativeBackendStage stage, uint32_t slot, std::span<const uint8_t> bytes) override {
@@ -283,10 +273,12 @@ class D3D11Recorder final : public NativeBackendRecorder {
     auto& concrete=static_cast<D3D11Texture&>(texture);
     D3D11_TEXTURE2D_DESC description{};
     concrete.texture()->GetDesc(&description);
-    const UINT pitch=description.Width*BytesPerTexelPublic(description.Format);
-    if(bytes.size()<static_cast<size_t>(pitch)*description.Height)
+    const auto info=DescribeNativeDxgiFormat(description.Format);
+    const UINT pitch=static_cast<UINT>(NativeDxgiRowPitch(info,description.Width));
+    const uint64_t needed=NativeDxgiLevelBytes(info,description.Width,description.Height);
+    if(bytes.size()<needed)
       throw std::runtime_error("texture update is "+std::to_string(bytes.size())+
-                               " bytes but the texture needs "+std::to_string(pitch*description.Height));
+                               " bytes but the texture needs "+std::to_string(needed));
     context_->UpdateSubresource(concrete.texture(),0,nullptr,bytes.data(),pitch,0);
   }
 
@@ -311,6 +303,8 @@ class D3D11Recorder final : public NativeBackendRecorder {
   // send the same number of API calls per draw and a timing comparison between
   // them is a comparison of the APIs rather than of two binding strategies.
   void Flush() {
+    if(bound_.pipeline && bound_.pipeline->requires_blend_factor && !bound_.blend_factor_set)
+      throw std::runtime_error("this draw blends against a constant blend factor that was never set");
     if(bound_.textures_dirty) {
       context_->PSSetShaderResources(0,kTextureSlots,bound_.textures);
       bound_.textures_dirty=false;
@@ -343,7 +337,8 @@ class D3D11Recorder final : public NativeBackendRecorder {
     D3D11Pipeline* pipeline=nullptr;
     ID3D11ShaderResourceView* textures[kTextureSlots]{};
     ID3D11SamplerState* samplers[kSamplerSlots]{};
-    bool textures_dirty=false,samplers_dirty=false;
+    std::array<float,4> blend_factor{1,1,1,1};
+    bool textures_dirty=false,samplers_dirty=false,blend_factor_set=false;
   };
 
   ID3D11Device* device_;
@@ -421,15 +416,18 @@ class D3D11Backend final : public NativeRenderBackend {
     // does not have to know which backend it is talking to.
     std::vector<D3D11_SUBRESOURCE_DATA> levels;
     size_t offset=0;
-    const uint32_t bytes_per_texel=BytesPerTexelPublic(description.Format);
+    const auto info=DescribeNativeDxgiFormat(description.Format);
     for(UINT level=0;level<description.MipLevels && !initial.empty();++level) {
       const uint32_t width=(std::max)(1u,desc.width>>level),height=(std::max)(1u,desc.height>>level);
-      const size_t pitch=static_cast<size_t>(width)*bytes_per_texel;
-      if(offset+pitch*height>initial.size())
+      // Blocks, not texels: a 2x2 level of a BC format still costs a whole
+      // 4x4 block, and width x bytes would under-count it.
+      const size_t pitch=static_cast<size_t>(NativeDxgiRowPitch(info,width));
+      const size_t level_bytes=static_cast<size_t>(NativeDxgiLevelBytes(info,width,height));
+      if(offset+level_bytes>initial.size())
         throw std::runtime_error("initial texture contents are "+std::to_string(initial.size())+
                                  " bytes, too few for "+std::to_string(description.MipLevels)+" levels");
       levels.push_back({initial.data()+offset,static_cast<UINT>(pitch),0});
-      offset+=pitch*height;
+      offset+=level_bytes;
     }
     ComPtr<ID3D11Texture2D> texture;
     Require(device_->CreateTexture2D(&description,levels.empty()?nullptr:levels.data(),&texture),
@@ -575,6 +573,7 @@ class D3D11Backend final : public NativeRenderBackend {
     raster.MultisampleEnable=desc.sample_count>1;
     Require(device_->CreateRasterizerState(&raster,&pipeline->raster),"raster state creation");
     pipeline->topology=Topology(desc.topology);
+    pipeline->requires_blend_factor=decoded.requires_blend_factor;
 
     auto& stored=pipelines_.emplace(std::move(key),std::move(pipeline)).first->second;
     return *stored;
@@ -626,7 +625,10 @@ class D3D11Backend final : public NativeRenderBackend {
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     Require(context_->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"staging map");
-    const size_t pitch=static_cast<size_t>(description.Width)*BytesPerTexelPublic(description.Format);
+    // Render targets are never block compressed, but the shared helper is used
+    // anyway so an unexpected format is refused rather than mis-sized.
+    const auto info=DescribeNativeDxgiFormat(description.Format);
+    const size_t pitch=static_cast<size_t>(NativeDxgiRowPitch(info,description.Width));
     std::vector<uint8_t> pixels(pitch*description.Height);
     for(UINT row=0;row<description.Height;++row)
       std::memcpy(pixels.data()+static_cast<size_t>(row)*pitch,

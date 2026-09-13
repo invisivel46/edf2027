@@ -92,6 +92,15 @@ class NativeBackendRecorder {
   virtual void SetIndexBuffer(NativeBackendBuffer& buffer,NativeBackendIndexFormat format,uint32_t offset)=0;
   virtual void SetTopology(NativeBackendTopology topology)=0;
 
+  // The constant blend colour, for the guest states that blend against one.
+  // Separate from the pipeline because it is not pipeline state on either
+  // target API, and because the same pipeline is used with different factors.
+  //
+  // A draw whose pipeline blends against this and has not been given one is
+  // refused. The renderer it replaces refuses it too, and the alternative is a
+  // material drawn in the wrong colour with nothing to say why.
+  virtual void SetBlendFactor(const std::array<float,4>& factor)=0;
+
   // Constants are handed over as bytes rather than as a mapped buffer: at the
   // measured ~45,000 material activations a second, how that memory is staged
   // is a backend decision (UpdateSubresource here, an upload ring with fencing
