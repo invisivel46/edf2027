@@ -584,6 +584,12 @@ struct Bridge {
   // Declared after the backend so it is destroyed before it: the preview
   // thread uses the backend on every tick and must be stopped first.
   std::unique_ptr<edf::native::NativeD3D12Preview> backend_preview;
+  // Run-length accounting for the XUI path, the same question the indexed
+  // audit answered: how many consecutive draws differ only in things a batch
+  // would carry per-item, and how many change state that a batch cannot.
+  uint64_t xui_batch_draws=0,xui_batch_runs=0,xui_batch_run=0,xui_batch_longest=0;
+  uint64_t xui_batch_collapsible=0,xui_last_state=0,xui_last_constants=0;
+  uint64_t xui_constants_differ=0;
   std::array<uint32_t,12> last_batch_key{};
   uint64_t batch_draws=0,batch_runs=0,batch_run=0,batch_run_total=0,batch_longest=0,batch_collapsible=0;
   uint64_t instance_shape=0,last_instance_shape=0,batch_shape_breaks=0;
@@ -5508,6 +5514,41 @@ REX_HOOK_RAW(sub_821FD8F8) {
           sampler=state.samplers.emplace(sampler_key,std::move(native)).first;
         }
         pixel_plan.SetSampler(pixel,sampler->second.Get());
+        }
+        if(REXCVAR_GET(edf_native_batch_audit)) {
+          // State a batch must share, and constants it would have to carry per
+          // draw, hashed apart - so the answer says not just "could these
+          // merge" but what a merge would have to do about their differences.
+          const auto mix=[](uint64_t hash,uint64_t value) {
+            hash^=value; return hash*1099511628211ull;
+          };
+          uint64_t shape=1469598103934665603ull;
+          for(const auto word:key) shape=mix(shape,word);
+          shape=mix(shape,uint64_t(solid?1:mask?2:0));
+          shape=mix(shape,reinterpret_cast<uintptr_t>(texture==state.textures.end()?nullptr:texture->second.view.Get()));
+          shape=mix(shape,uint64_t(viewport.reverse_depth));
+          shape=mix(shape,uint64_t(viewport.viewport.Width)*8191+uint64_t(viewport.viewport.Height));
+          uint64_t constants=1469598103934665603ull;
+          for(const auto byte:vertex_registers) constants=mix(constants,byte);
+          ++state.xui_batch_draws;
+          if(shape==state.xui_last_state && state.xui_batch_draws>1) {
+            ++state.xui_batch_run;
+            ++state.xui_batch_collapsible;
+            if(constants!=state.xui_last_constants) ++state.xui_constants_differ;
+          } else {
+            state.xui_batch_longest=(std::max)(state.xui_batch_longest,state.xui_batch_run);
+            if(state.xui_batch_run) ++state.xui_batch_runs;
+            state.xui_batch_run=1;
+          }
+          state.xui_last_state=shape;
+          state.xui_last_constants=constants;
+          if(state.xui_batch_draws%500000==0)
+            REXLOG_INFO("Native XUI batch audit: draws={}, runs={}, longest_run={}, collapsible={} ({:.1f}% share the state of the draw before), of those {} also change constants ({:.1f}%)",
+              state.xui_batch_draws,state.xui_batch_runs,state.xui_batch_longest,
+              state.xui_batch_collapsible,
+              100.0*double(state.xui_batch_collapsible)/double(state.xui_batch_draws),
+              state.xui_constants_differ,
+              state.xui_batch_collapsible?100.0*double(state.xui_constants_differ)/double(state.xui_batch_collapsible):0.0);
         }
         xui_decode.Finish();
         edf::native::HookTiming xui_bind(edf::native::HookPhase::XuiBind);
