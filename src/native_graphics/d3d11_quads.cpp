@@ -1,4 +1,5 @@
 #include "d3d11_quads.h"
+#include "native_guest_vertex_stream.h"
 #include <cstring>
 #include <bit>
 #include <cmath>
@@ -16,19 +17,13 @@ PositionTriangleStream::PositionTriangleStream(ID3D11Device& device,const Native
     throw std::runtime_error("position triangle input layout mismatch");
 }
 void PositionTriangleStream::Draw(ID3D11DeviceContext& context,std::span<const uint8_t> guest) {
-  if(guest.empty() || guest.size()%24 || guest.size()>16384*8)
-    throw std::runtime_error("invalid position triangle span");
   Microsoft::WRL::ComPtr<ID3D11Device> owner; context.GetDevice(&owner);
   if(owner.Get()!=device_.Get() || context.GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)
     throw std::runtime_error("position triangles require matching immediate context");
-  // Validate before modifying the reusable buffer or issuing a draw.
-  for(size_t i=0;i<guest.size();i+=4) {
-    const uint32_t word=(uint32_t(guest[i])<<24)|(uint32_t(guest[i+1])<<16)|
-                        (uint32_t(guest[i+2])<<8)|guest[i+3];
-    if(!std::isfinite(std::bit_cast<float>(word)))
-      throw std::runtime_error("nonfinite position triangle vertex");
-  }
-  const auto bytes=static_cast<UINT>(guest.size());
+  // Validation and the endian swap are guest logic, shared with whatever
+  // draws these next; only the upload and the draw are D3D11's business.
+  const auto host=ConvertGuestPositionTriangles(guest);
+  const auto bytes=static_cast<UINT>(host.size());
   if(bytes>capacity_) {
     D3D11_BUFFER_DESC desc{};
     desc.ByteWidth=bytes; desc.Usage=D3D11_USAGE_DYNAMIC;
@@ -41,9 +36,7 @@ void PositionTriangleStream::Draw(ID3D11DeviceContext& context,std::span<const u
   D3D11_MAPPED_SUBRESOURCE mapped{};
   if(FAILED(context.Map(vertices_.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mapped)))
     throw std::runtime_error("position triangle upload failed");
-  auto* destination=static_cast<uint8_t*>(mapped.pData);
-  for(size_t i=0;i<guest.size();i+=4) for(size_t b=0;b<4;++b)
-    destination[i+b]=guest[i+3-b];
+  std::memcpy(mapped.pData,host.data(),host.size());
   context.Unmap(vertices_.Get(),0);
   auto* buffer=vertices_.Get(); const UINT stride=8,offset=0;
   context.IASetInputLayout(layout_.Get());
@@ -99,11 +92,8 @@ void QuadStream::DrawTriangleStrip(ID3D11DeviceContext& context,std::span<const 
   DrawStream(context,guest,true);
 }
 void QuadStream::DrawStream(ID3D11DeviceContext& context,std::span<const uint8_t> guest,bool strip) {
-  // Four 16-byte vertices per quad; bounded before arithmetic/allocation.
-  if (guest.empty() || guest.size() > 4096 * 64 ||
-      (strip ? guest.size()<48 || guest.size()%16 : guest.size()%64!=0))
-    throw std::runtime_error("invalid immediate quad vertex span");
-  const UINT bytes = static_cast<UINT>(strip ? guest.size() : guest.size()/64*96);
+  const auto host = ConvertGuestQuads(guest,strip);
+  const UINT bytes = static_cast<UINT>(host.size());
   if (bytes > capacity_) {
     D3D11_BUFFER_DESC desc{};
     desc.ByteWidth = bytes; desc.Usage = D3D11_USAGE_DYNAMIC;
@@ -116,14 +106,7 @@ void QuadStream::DrawStream(ID3D11DeviceContext& context,std::span<const uint8_t
   D3D11_MAPPED_SUBRESOURCE mapped{};
   if (FAILED(context.Map(vertices_.Get(),0,D3D11_MAP_WRITE_DISCARD,0,&mapped)))
     throw std::runtime_error("native quad vertex upload failed");
-  auto* destination = static_cast<uint8_t*>(mapped.pData);
-  constexpr unsigned order[]{0,1,2,0,2,3};
-  for (size_t vertex = 0; vertex < bytes/16; ++vertex) {
-      const size_t source=strip ? vertex : vertex/6*4+order[vertex%6];
-      for (size_t word = 0; word < 4; ++word)
-        for (size_t b = 0; b < 4; ++b)
-          destination[vertex*16+word*4+b] = guest[source*16+word*4+3-b];
-  }
+  std::memcpy(mapped.pData,host.data(),host.size());
   context.Unmap(vertices_.Get(),0);
   auto* buffer = vertices_.Get();
   const UINT stride = 16, offset = 0;
