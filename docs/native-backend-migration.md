@@ -744,10 +744,12 @@ things make the skip trustworthy:
 
 ### What selecting d3d12 for the scene found
 
-`--edf_native_scene_backend=d3d12` now creates every scene resource, compiles
-every pipeline and records every draw. Getting there turned up four defects that
-only exist on a backend with no D3D11 handles, and every one of them was a
-question asked of a null pointer:
+`--edf_native_scene_backend=d3d12` now starts, creates the scene's targets and
+its textures, builds pipelines and records draws through the menus. It has not
+reached the mission - see "What is left" - so "every draw" is not yet a claim
+anyone can make. Getting this far turned up four defects that only exist on a
+backend with no D3D11 handles, and every one of them was a question asked of a
+null pointer:
 
 | what asked | what it did on D3D12 |
 |---|---|
@@ -756,11 +758,12 @@ question asked of a null pointer:
 | the XUI batch audit's shape hash | hashed the same null for every texture |
 | frame publication and the HDR captures | dereferenced a null texture |
 
-Two guesses in the D3D12 backend also became measurements. The upload ring was
-16 MB with a comment saying so; a real recorded frame wants more, and it is a
-setting now, set from the high-water figure the ring reports when a frame does
-not fit. And the post chain's three converting targets resolved through a
-compute shader and an unordered-access view - the one operation in this renderer
+It also replaced one guess with a measurement and closed one capability gap.
+The upload ring was 16 MB with a comment saying it was a guess and that the
+high-water report should replace it; a real recorded frame wants more, so it is
+a setting now, set from the figure the ring reports when a frame does not fit.
+And the post chain's three converting targets resolved through a compute shader
+and an unordered-access view - the one operation in this renderer
 the seam cannot express, and one it never needed: the kernel read its source at
 the dispatch coordinate and wrote the result, which is a full-screen draw
 reading its own pixel coordinate. The arithmetic is unchanged.
