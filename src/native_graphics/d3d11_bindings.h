@@ -3,6 +3,7 @@
 #include <map>
 #include <array>
 #include <optional>
+#include <span>
 #include <memory>
 
 namespace edf::native {
@@ -61,6 +62,16 @@ class ShaderBindings {
   void SetSampler(const std::string& name, ID3D11SamplerState* sampler);
   bool TrySetSampler(const std::string& name, ID3D11SamplerState* sampler);
   void Bind(ID3D11DeviceContext& context);
+  // The packed CPU image of each constant buffer - the exact bytes Bind would
+  // upload - without touching the GPU buffer or the dirty flag.
+  //
+  // This is what lets a draw carry its own constants. Today every draw on a
+  // shader points at the one GPU buffer this object owns, which is overwritten
+  // per activation, so draws cannot be built independently or recorded from
+  // more than one thread. A caller that copies these bytes per draw instead
+  // has no such dependency, and it is the shape both target APIs want anyway.
+  struct ConstantImage { UINT slot; std::span<const uint8_t> bytes; };
+  std::vector<ConstantImage> ConstantImages() const;
   bool HasAllTextureInputs() const;
   bool UsesTextureResource(ID3D11Resource& resource) const;
   std::vector<float> ReadFloatVector(const std::string& name) const;

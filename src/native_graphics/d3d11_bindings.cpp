@@ -298,6 +298,13 @@ std::optional<std::array<float,16>> ShaderBindings::ReadFloat4x4(const std::stri
   }
   return values;
 }
+std::vector<ShaderBindings::ConstantImage> ShaderBindings::ConstantImages() const {
+  std::vector<ConstantImage> images;
+  images.reserve(buffers_.size());
+  for(const auto& buffer:buffers_) images.push_back({buffer.slot,buffer.bytes});
+  return images;
+}
+
 void ShaderBindings::Bind(ID3D11DeviceContext& context) {
   if (shader_.entry.pixel) context.PSSetShader(shader_.pixel.Get(), nullptr, 0);
   else context.VSSetShader(shader_.vertex.Get(), nullptr, 0);

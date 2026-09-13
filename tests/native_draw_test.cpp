@@ -8,6 +8,7 @@
 #include "native_graphics/d3d11_signals.h"
 #include "native_graphics/d3d11_gpu_timer.h"
 #include <array>
+#include <cstring>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -80,6 +81,34 @@ float4 PackingPS() : SV_TARGET {
     Require(ps.ReadFloatVector("gain")==std::vector<float>{gain},"scalar diagnostic constant differs");
     Require(ps.ReadFloatVector("bias")==std::vector<float>(bias.begin(),bias.end()),"vector diagnostic constant differs");
     Require(ps.ReadFloatVector("absent").empty(),"absent diagnostic constant invented");
+    {
+      // The per-draw constant image must be the same bytes Bind would upload.
+      // A draw that carries its own copy of these is independent of every other
+      // draw on this shader, which is what lets draws be built off the submit
+      // thread; a copy that did not match would put the wrong material on
+      // screen only once the restructuring happened, which is far too late to
+      // find out.
+      const auto images = ps.ConstantImages();
+      Require(!images.empty(), "no constant image for a shader with constants");
+      bool found_gain = false;
+      for (const auto& image : images) {
+        // The reflected accessors are already verified above, so they are what
+        // the image is checked against rather than a hand-computed offset.
+        const auto expected = ps.ReadFloatVector("gain");
+        if (expected.empty() || image.bytes.size() < sizeof(float)) continue;
+        for (size_t at = 0; at + sizeof(float) <= image.bytes.size(); at += sizeof(float)) {
+          float value = 0;
+          std::memcpy(&value, image.bytes.data() + at, sizeof(value));
+          if (value == expected.front()) { found_gain = true; break; }
+        }
+      }
+      Require(found_gain, "the constant image does not contain the value the shader was given");
+      // Reading the image must not disturb the binding: the next Bind still has
+      // to upload, or a draw built from an image would clear the dirty flag for
+      // a draw that never got the bytes.
+      Require(ps.ReadFloatVector("gain")==std::vector<float>{gain},
+              "reading the constant image changed the binding");
+    }
     Require(!ps.SetGuestFloatRegisters("not_in_native_shader", {}), "optimized-out guest parameter");
     const auto resolved_gain=ps.ResolveFloatRegisters("gain");
     Require(resolved_gain.bytes()==16 && ps.Owns(resolved_gain),"resolved scalar ownership/extent");
