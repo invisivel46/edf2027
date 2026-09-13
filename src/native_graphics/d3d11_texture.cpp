@@ -1,4 +1,5 @@
 #include "d3d11_texture.h"
+#include "native_dds_decode.h"
 #include <d3dcompiler.h>
 #include <string>
 #include <string_view>
@@ -252,95 +253,28 @@ void ResolveNativeRenderTarget(ID3D11DeviceContext& context, NativeRenderTarget&
   target.sampled.content_valid = target.content_valid;
 }
 NativeTexture CreateNativeDdsTexture(ID3D11Device& device, std::span<const uint8_t> data) {
-  if (data.size() < 128 || Word(data, 0) != 0x20534444 || Word(data, 4) != 124 || Word(data, 76) != 32)
-    throw std::runtime_error("invalid DDS header");
+  // Everything about what the file contains is decided by the shared decoder,
+  // so a second backend creating the same texture cannot reach a different
+  // answer. Only the creation below is D3D11's.
+  const auto decoded = DecodeNativeDdsTexture(data);
   NativeTexture result;
-  result.width = Word(data, 16); result.height = Word(data, 12);
-  result.mip_count = (std::max)(1u, Word(data, 28));
-  const uint32_t caps2 = Word(data, 112);
-  result.cube = (caps2 & 0x200) != 0;
-  if (!result.width || !result.height || result.width > 16384 || result.height > 16384 ||
-      result.mip_count > std::bit_width((std::max)(result.width, result.height)) ||
-      Word(data, 24) > 1 || (caps2 & 0x200000)) throw std::runtime_error("unsupported DDS dimensions");
-  if (result.cube && ((caps2 & 0xfc00) != 0xfc00 || result.width != result.height))
-    throw std::runtime_error("incomplete or nonsquare DDS cube");
-  uint32_t block_bytes = 0, pixel_bytes = 0;
-  DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
-  const auto flags = Word(data, 80);
-  // Retail MapXX/Shadow*.dds use DDPF_ALPHA / A8, not RGB luminance.
-  // Expand to (0,0,0,A); Common.fx consumes the sampled alpha component.
-  const bool alpha_only=flags==2 && Word(data,88)==8 && Word(data,92)==0 &&
-    Word(data,96)==0 && Word(data,100)==0 && Word(data,104)==255;
-  if (flags & 4) {
-    switch (Word(data, 84)) {
-      case 0x31545844: block_bytes = 8; format = DXGI_FORMAT_BC1_UNORM; break;
-      case 0x33545844: block_bytes = 16; format = DXGI_FORMAT_BC2_UNORM; break;
-      case 0x35545844: block_bytes = 16; format = DXGI_FORMAT_BC3_UNORM; break;
-      default: throw std::runtime_error("unsupported DDS FourCC: " + std::to_string(Word(data,84)));
-    }
-  } else {
-    const auto bits = Word(data, 88);
-    if ((!alpha_only && !(flags & 0x40)) || !bits || bits > 32 || bits % 8)
-      throw std::runtime_error("unsupported DDS pixel format: flags=" + std::to_string(flags) +
-        " bits=" + std::to_string(bits) + " masks=" + std::to_string(Word(data,92)) + "/" +
-        std::to_string(Word(data,96)) + "/" + std::to_string(Word(data,100)) + "/" + std::to_string(Word(data,104)));
-    pixel_bytes = bits / 8;
-  }
-  std::array<uint32_t,4> masks{Word(data,92), Word(data,96), Word(data,100), Word(data,104)};
-  if (!block_bytes) {
-    uint32_t used = 0;
-    for (auto mask : masks) {
-      if ((used & mask) || (pixel_bytes < 4 && (mask >> (pixel_bytes * 8))))
-        throw std::runtime_error("overlapping or out-of-range DDS channel masks");
-      if (mask) {
-        const auto normalized = mask >> std::countr_zero(mask);
-        if (normalized & (normalized + 1u)) throw std::runtime_error("noncontiguous DDS channel mask");
-      }
-      used |= mask;
-    }
-    if (!alpha_only && (!masks[0] || !masks[1] || !masks[2])) throw std::runtime_error("missing DDS RGB mask");
-  }
-  const uint32_t faces = result.cube ? 6 : 1;
-  std::vector<std::vector<uint8_t>> converted(faces * result.mip_count);
-  std::vector<D3D11_SUBRESOURCE_DATA> subresources(faces * result.mip_count);
-  size_t cursor = 128, decoded_total = 0;
-  for (uint32_t face = 0; face < faces; ++face) for (uint32_t mip = 0; mip < result.mip_count; ++mip) {
-    const uint32_t width = (std::max)(1u, result.width >> mip), height = (std::max)(1u, result.height >> mip);
-    const uint32_t rows = block_bytes ? (height + 3) / 4 : height;
-    uint32_t pitch = block_bytes ? ((width + 3) / 4) * block_bytes : width * pixel_bytes;
-    // For raw top levels DDSD_PITCH describes row padding; subsequent mip
-    // rows in this importer use their tightly packed byte width.
-    if (!block_bytes && mip == 0 && (Word(data, 8) & 8)) {
-      const auto declared = Word(data, 20);
-      if (declared < pitch) throw std::runtime_error("DDS row pitch is too small");
-      pitch = declared;
-    }
-    const size_t size = size_t(pitch) * rows;
-    if (cursor > data.size() || size > data.size() - cursor) throw std::runtime_error("truncated DDS mip payload");
-    const size_t index = size_t(face) * result.mip_count + mip;
-    if (block_bytes) {
-      subresources[index] = {data.data() + cursor, pitch, static_cast<UINT>(size)};
-    } else {
-      const size_t decoded_size = size_t(width) * height * 4;
-      decoded_total += decoded_size;
-      if (decoded_total > 256 * 1024 * 1024) throw std::runtime_error("DDS decoded size limit exceeded");
-      auto& pixels = converted[index]; pixels.resize(decoded_size);
-      for (uint32_t y = 0; y < height; ++y) for (uint32_t x = 0; x < width; ++x) {
-        const auto* source = data.data() + cursor + size_t(y) * pitch + size_t(x) * pixel_bytes;
-        uint32_t value = 0;
-        for (uint32_t b = 0; b < pixel_bytes; ++b) value |= uint32_t(source[b]) << (8 * b);
-        auto* target = pixels.data() + (size_t(y) * width + x) * 4;
-        for (size_t c = 0; c < 4; ++c) target[c] = Channel(value, masks[c], c == 3 ? 255 : 0);
-      }
-      subresources[index] = {pixels.data(), width * 4, static_cast<UINT>(decoded_size)};
-    }
-    cursor += size;
+  result.width = decoded.width;
+  result.height = decoded.height;
+  result.mip_count = decoded.mip_count;
+  result.cube = decoded.cube;
+
+  std::vector<D3D11_SUBRESOURCE_DATA> subresources(decoded.levels.size());
+  for (size_t index = 0; index < decoded.levels.size(); ++index) {
+    const auto& level = decoded.levels[index];
+    subresources[index] = {level.bytes.data(), level.pitch,
+                           static_cast<UINT>(level.bytes.size())};
   }
   D3D11_TEXTURE2D_DESC desc{};
-  desc.Width = result.width; desc.Height = result.height; desc.MipLevels = result.mip_count;
-  desc.ArraySize = faces; desc.Format = format; desc.SampleDesc.Count = 1;
+  desc.Width = decoded.width; desc.Height = decoded.height; desc.MipLevels = decoded.mip_count;
+  desc.ArraySize = decoded.faces; desc.Format = static_cast<DXGI_FORMAT>(decoded.format);
+  desc.SampleDesc.Count = 1;
   desc.Usage = D3D11_USAGE_IMMUTABLE; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  desc.MiscFlags = result.cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+  desc.MiscFlags = decoded.cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
   if (FAILED(device.CreateTexture2D(&desc, subresources.data(), &result.resource)))
     throw std::runtime_error("native DDS texture creation failed");
   if (FAILED(device.CreateShaderResourceView(result.resource.Get(), nullptr, &result.view)))
