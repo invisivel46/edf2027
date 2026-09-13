@@ -1,3 +1,4 @@
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/movie_effect.h"
 #include "native_graphics/native_movie_bindings.h"
 #include "native_graphics/d3d11_bindings.h"
@@ -22,6 +23,10 @@ int main() {
     ComPtr<ID3D11Device> device; ComPtr<ID3D11DeviceContext> context;
     Require(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
       D3D11_SDK_VERSION,&device,nullptr,&context)),"movie device creation");
+    // Render targets are created through the backend now; adopting this device
+    // keeps them usable by the direct D3D11 calls the rest of this test makes.
+    auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
+    Require(bool(backend),"adopted backend");
     const auto effect=MakeNativeMovieEffect();
     ShaderBindings vs(*device.Get(),CompileNativeShader(*device.Get(),effect,effect.entries[0],"movie.fx"));
     ShaderBindings ps(*device.Get(),CompileNativeShader(*device.Get(),effect,effect.entries[pixel_entry],"movie.fx"));
@@ -58,7 +63,7 @@ int main() {
     ComPtr<ID3D11SamplerState> sampler;
     Require(SUCCEEDED(device->CreateSamplerState(&sampler_desc,&sampler)),"movie sampler creation");
     for (size_t i=0;i<3;++i) { plan.SetTexture(ps,i,views[i].Get()); plan.SetSampler(ps,i,sampler.Get()); }
-    auto target=CreateNativeRenderTarget(*device.Get(),4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    auto target=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     auto* rtv=target.target.Get(); context->OMSetRenderTargets(1,&rtv,nullptr);
     CreateNativeRenderState(*device.Get(),{0x10001,0,0,0,15,0}).Bind(*context.Get());
     MakeNativeViewport(0,0,4,2,0,1,false,{}).Bind(*context.Get());

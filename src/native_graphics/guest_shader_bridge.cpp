@@ -670,7 +670,10 @@ struct Bridge {
   uint32_t color_probe_draws=0;
   bool color_probe_done=false;
   uint64_t depth_clears = 0, depth_clear_skips = 0, depth_errors = 0;
-  std::map<SamplerStateWords, Microsoft::WRL::ComPtr<ID3D11SamplerState>> samplers;
+  // Backend samplers, keyed by the guest words they were decoded from. The
+  // backend owns the sampler objects and caches them by combination too; this
+  // map only saves decoding the same words again.
+  std::map<SamplerStateWords, edf::native::NativeBackendSampler*> samplers;
   std::map<RenderStateWords,NativeRenderState> render_states;
   std::map<std::pair<uint32_t,uint32_t>,GuestStream> streams;
   std::map<uint32_t,uint32_t> index_bindings;
@@ -1140,8 +1143,10 @@ void UploadTextures(const Reader& reader, uint32_t instance, uint32_t device, Sh
       const auto& name=parameter.name;
       const auto handle=value.handle;
       const auto found = state.textures.find(handle);
-      auto* view = found == state.textures.end() || !found->second.content_valid ? nullptr : found->second.view.Get();
-      if (!bindings.TrySetTexture(target, view)) {
+      auto texture = found == state.textures.end() || !found->second.content_valid
+        ? nullptr : found->second.backend;
+      auto* view = texture.get();
+      if (!bindings.TrySetTexture(target, std::move(texture))) {
         // Guest material records describe Xbox compiler usage. A native entry
         // can optimize a combined sampler out; it then has neither binding.
         // Do not let an unused record erase the material's remaining textures.
@@ -1155,14 +1160,16 @@ void UploadTextures(const Reader& reader, uint32_t instance, uint32_t device, Sh
                                         REXCVAR_GET(edf_native_anisotropic_filtering));
       auto cached = state.samplers.find(key);
       if (cached == state.samplers.end()) {
-        const auto desc = DecodeNativeSampler(key);
-        Microsoft::WRL::ComPtr<ID3D11SamplerState> native;
-        if (FAILED(state.device->CreateSamplerState(&desc,&native))) throw std::runtime_error("native sampler creation failed");
-        cached = state.samplers.emplace(key,std::move(native)).first;
-        REXLOG_INFO("Native sampler: cached={}, address={}/{}/{}, filter={:#x}, lod={}..{}, bias={}",
-                    state.samplers.size(),uint32_t(desc.AddressU),uint32_t(desc.AddressV),uint32_t(desc.AddressW),uint32_t(desc.Filter),desc.MinLOD,desc.MaxLOD,desc.MipLODBias);
+        // Decoded by the shared guest decoder, not by a D3D11-shaped one, so a
+        // second backend cannot filter this material differently.
+        const auto desc = DecodeNativeGuestSampler(key);
+        cached = state.samplers.emplace(key,&EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
+        REXLOG_INFO("Native sampler: cached={}, address={}/{}/{}, filter={}/{}/{}, lod={}..{}, bias={}, anisotropy={}",
+                    state.samplers.size(),uint32_t(desc.u),uint32_t(desc.v),uint32_t(desc.w),
+                    uint32_t(desc.min),uint32_t(desc.mag),uint32_t(desc.mip),
+                    desc.min_lod,desc.max_lod,desc.mip_lod_bias,desc.max_anisotropy);
       }
-      if(!bindings.TrySetSampler(target,cached->second.Get()))
+      if(!bindings.TrySetSampler(target,cached->second))
         throw std::runtime_error("unknown sampler: "+name);
       ++state.sampler_bindings;
       if (handle && !view) {
@@ -1198,9 +1205,9 @@ void RegisterRenderTarget(const GuestReader& reader, uint32_t owner) {
   const auto texture = reader.Word(reader.Add(owner,4));
   const auto surface = reader.Word(reader.Add(owner,12));
   if (!texture || !surface || !state.device) throw std::runtime_error("invalid native render target registration");
-  auto native = luminance ? CreateNativeLuminanceTarget(*state.device.Get(),width,height) :
-    bloom ? CreateNativeBloomTarget(*state.device.Get(),width,height) :
-    CreateNativeRenderTarget(*state.device.Get(),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT);
+  auto native = luminance ? CreateNativeLuminanceTarget(EnsureSceneBackendLocked(state),width,height) :
+    bloom ? CreateNativeBloomTarget(EnsureSceneBackendLocked(state),width,height) :
+    CreateNativeRenderTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT);
   if (luminance && width==1 && height==1) {
     // 8213B730 inserts the allocation address in the header's upper 20 bits
     // at +32. Snapshot at creation, before any GPU writes; never reread stale
@@ -3920,7 +3927,7 @@ REX_HOOK_RAW(sub_8213B850) {
         if (msaa) {
           REXLOG_INFO("Native depth allocation: {}x{}, MSAA={} not supported",width,height,msaa);
         } else {
-          auto target=edf::native::CreateNativeDepthTarget(*state.device.Get(),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+          auto target=edf::native::CreateNativeDepthTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
           state.depth_targets.insert_or_assign(ctx.r3.u32,std::move(target));
           REXLOG_INFO("Native depth allocation: handle={:#x}, {}x{}, host=D32S8 (development)",ctx.r3.u32,width,height);
         }
@@ -4167,8 +4174,8 @@ REX_HOOK_RAW(sub_8219C7A8) {
       auto found=state.scenes.find(owner);
       if (found==state.scenes.end() || found->second.color.sampled.width!=width || found->second.color.sampled.height!=height || found->second.samples!=samples) {
         edf::native::NativeScene scene{
-          edf::native::CreateNativeRenderTarget(*state.device.Get(),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,samples),
-          edf::native::CreateNativeDepthTarget(*state.device.Get(),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples)};
+          edf::native::CreateNativeRenderTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,samples),
+          edf::native::CreateNativeDepthTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples)};
         scene.samples=samples;
         found=state.scenes.insert_or_assign(owner,std::move(scene)).first;
         REXLOG_INFO("Native full scene allocated: owner={:#x}, {}x{}, samples={}, guest_surface={:#x}",owner,width,height,samples,color_surface);
@@ -4279,7 +4286,7 @@ REX_HOOK_RAW(sub_8219C930) {
           (creation.format!=0x1a220186 && creation.format!=0x18280186))
         throw std::runtime_error("unsupported ordinary output surface contract");
       if (scene.output_surface!=surface || !scene.output.target) {
-        scene.output=edf::native::CreateNativeRenderTarget(*state.device.Get(),creation.width,creation.height,DXGI_FORMAT_R8G8B8A8_UNORM);
+        scene.output=edf::native::CreateNativeRenderTarget(EnsureSceneBackendLocked(state),creation.width,creation.height,DXGI_FORMAT_R8G8B8A8_UNORM);
         scene.output_surface=surface;
       }
       scene.output.content_valid=false;
@@ -4383,7 +4390,7 @@ REX_HOOK_RAW(sub_8219C840) {
           throw std::runtime_error("unsupported direct frame destination format/dimensions: "+std::to_string(creation.format));
         auto& direct=scene.direct_outputs[handle];
         if(!direct.surface)
-          direct=edf::native::CreateNativeOpaqueFrameTarget(*state.device.Get(),creation.width,creation.height);
+          direct=edf::native::CreateNativeOpaqueFrameTarget(EnsureSceneBackendLocked(state),creation.width,creation.height);
         edf::native::ResolveNativeRgba8Frame(*state.context.Get(),scene.color,direct);
         state.textures.insert_or_assign(handle,direct.sampled);
         if(state.presentation_frames) {
@@ -5159,13 +5166,14 @@ REX_HOOK_RAW(sub_821FE358) {
                 // cannot be negative; a signed or float one can.
                 for(const auto* name:{"m_DiffuseTexture0_Sampler","m_ParameterTexture0_Sampler",
                     "m_NormalTexture0_Sampler","m_CubeTexture0_Sampler"}) {
-                  const auto view=state.shaders.at(state.linked_pixel).bindings->ReadTexture(name);
-                  if(!view) continue;
+                  auto* bound=state.shaders.at(state.linked_pixel).bindings->ReadTexture(name);
+                  if(!bound) continue;
+                  auto* view=edf::native::NativeD3D11TextureView(*bound);
+                  auto* resource=edf::native::NativeD3D11TextureResource(*bound);
+                  if(!view || !resource) continue; // A D3D11-only diagnostic.
                   D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{}; view->GetDesc(&view_desc);
-                  Microsoft::WRL::ComPtr<ID3D11Resource> resource; view->GetResource(&resource);
-                  Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
                   D3D11_TEXTURE2D_DESC desc{};
-                  if(SUCCEEDED(resource.As(&texture))) texture->GetDesc(&desc);
+                  resource->GetDesc(&desc);
                   REXLOG_INFO("Native invalid RGB texture: name={}, view_format={}, resource_format={}, {}x{}, mips={}",
                     name,uint32_t(view_desc.Format),uint32_t(desc.Format),desc.Width,desc.Height,desc.MipLevels);
                 }
@@ -5532,17 +5540,15 @@ REX_HOOK_RAW(sub_821FD8F8) {
           if (texture==state.textures.end() || !texture->second.content_valid ||
               creation==state.texture_creations.end() || creation->second.format!=0x28000002)
             throw std::runtime_error("movie draw missing decoded native plane");
-          movie_plan.SetTexture(movie_pixel,i,texture->second.view.Get());
+          movie_plan.SetTexture(movie_pixel,i,texture->second.backend);
           const auto offset=1024+i*24;
           const auto key=edf::native::SamplerStateKey({word(offset),word(offset+12),word(offset+16),word(offset+20)});
           auto cached=state.samplers.find(key);
           if(cached==state.samplers.end()) {
-            const auto desc=edf::native::DecodeNativeSampler(key);
-            Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;
-            if(FAILED(state.device->CreateSamplerState(&desc,&sampler))) throw std::runtime_error("movie sampler creation failed");
-            cached=state.samplers.emplace(key,std::move(sampler)).first;
+            const auto desc=edf::native::DecodeNativeGuestSampler(key);
+            cached=state.samplers.emplace(key,&EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
           }
-          movie_plan.SetSampler(movie_pixel,i,cached->second.Get());
+          movie_plan.SetSampler(movie_pixel,i,cached->second);
         }
         const auto key=edf::native::ReadAuditedRenderStateWords(reader,ctx.r3.u32);
         if ((key[1]&3)!=0) throw std::runtime_error("movie requires an unbound depth/stencil surface");
@@ -5677,16 +5683,14 @@ REX_HOOK_RAW(sub_821FD8F8) {
         const auto& pixel_plan=*state.xui_pixel_bindings[solid?1:mask?2:0];
         pixel_plan.SetConstants(pixel,registers(5904,16),solid?registers(5888,16):std::span<const uint8_t>{});
         if(!solid) {
-        pixel_plan.SetTexture(pixel,texture->second.view.Get());
+        pixel_plan.SetTexture(pixel,texture->second.backend);
         const auto sampler_key=edf::native::SamplerStateKey(edf::native::ReadSamplerWords(reader,device,0));
         auto sampler=state.samplers.find(sampler_key);
         if(sampler==state.samplers.end()) {
-          const auto desc=edf::native::DecodeNativeSampler(sampler_key);
-          Microsoft::WRL::ComPtr<ID3D11SamplerState> native;
-          if(FAILED(state.device->CreateSamplerState(&desc,&native))) throw std::runtime_error("XUI sampler creation failed");
-          sampler=state.samplers.emplace(sampler_key,std::move(native)).first;
+          const auto desc=edf::native::DecodeNativeGuestSampler(sampler_key);
+          sampler=state.samplers.emplace(sampler_key,&EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
         }
-        pixel_plan.SetSampler(pixel,sampler->second.Get());
+        pixel_plan.SetSampler(pixel,sampler->second);
         }
         if(REXCVAR_GET(edf_native_batch_audit)) {
           // State a batch must share, and constants it would have to carry per
@@ -5811,16 +5815,14 @@ REX_HOOK_RAW(sub_821FD8F8) {
         state.font_bindings->SetConstants(*state.font_vertex,*state.font_pixel,vs,ps,
           font_canvas?float(scene.output.sampled.width)/1280.0f:1.0f,
           font_canvas?float(scene.output.sampled.height)/720.0f:1.0f);
-        state.font_bindings->SetTexture(*state.font_pixel,texture->second.view.Get());
+        state.font_bindings->SetTexture(*state.font_pixel,texture->second.backend);
         const auto sampler_key=edf::native::SamplerStateKey(edf::native::ReadSamplerWords(reader,device,0));
         auto sampler=state.samplers.find(sampler_key);
         if(sampler==state.samplers.end()) {
-          const auto desc=edf::native::DecodeNativeSampler(sampler_key);
-          Microsoft::WRL::ComPtr<ID3D11SamplerState> native;
-          if(FAILED(state.device->CreateSamplerState(&desc,&native))) throw std::runtime_error("font sampler creation failed");
-          sampler=state.samplers.emplace(sampler_key,std::move(native)).first;
+          const auto desc=edf::native::DecodeNativeGuestSampler(sampler_key);
+          sampler=state.samplers.emplace(sampler_key,&EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
         }
-        state.font_bindings->SetSampler(*state.font_pixel,sampler->second.Get());
+        state.font_bindings->SetSampler(*state.font_pixel,sampler->second);
         auto render=state.render_states.find(key);
         if(render==state.render_states.end())
           render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
@@ -6140,27 +6142,21 @@ REX_HOOK_RAW(sub_821FD8F8) {
             REXLOG_INFO("Native post chain pass: frame={}, pass={}, shader={}, target={}x{}",
               post_frame,pass,pixel.shader().entry.name,target.sampled.width,target.sampled.height);
             for(const auto* name:{"m_DiffuseTexture0_Sampler","m_DiffuseTexture1_Sampler","m_Tone_Sampler","m_OldTone_Sampler"}) {
-              const auto view=pixel.ReadTexture(name);
-              if(!view) continue; // A pass only reflects the inputs it consumes.
-              const auto sampler=pixel.ReadSampler(name);
-              if(sampler) {
-                D3D11_SAMPLER_DESC desc{}; sampler->GetDesc(&desc);
-                REXLOG_INFO("Native exact post sampler: frame={}, pass={}, name={}, filter={}, address={}/{}/{}, lod={}..{}, bias={}",
-                  post_frame,pass,name,uint32_t(desc.Filter),uint32_t(desc.AddressU),uint32_t(desc.AddressV),uint32_t(desc.AddressW),desc.MinLOD,desc.MaxLOD,desc.MipLODBias);
-              }
+              auto* bound=pixel.ReadTexture(name);
+              if(!bound) continue; // A pass only reflects the inputs it consumes.
+              auto* view=edf::native::NativeD3D11TextureView(*bound);
+              auto* texture=edf::native::NativeD3D11TextureResource(*bound);
+              if(!view || !texture) continue; // A D3D11-only diagnostic.
               D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{}; view->GetDesc(&view_desc);
               if(view_desc.ViewDimension!=D3D11_SRV_DIMENSION_TEXTURE2D || view_desc.Texture2D.MostDetailedMip!=0)
                 throw std::runtime_error("unsupported post diagnostic view");
-              Microsoft::WRL::ComPtr<ID3D11Resource> resource; view->GetResource(&resource);
-              Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
-              if(FAILED(resource.As(&texture))) throw std::runtime_error("post diagnostic input is not 2D");
               D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
-              const auto value=edf::native::ReadNativeColorPixel(*state.context.Get(),*texture.Get(),desc.Width/2,desc.Height/2);
+              const auto value=edf::native::ReadNativeColorPixel(*state.context.Get(),*texture,desc.Width/2,desc.Height/2);
               REXLOG_INFO("Native exact post input: frame={}, pass={}, name={}, {}x{}, view_format={}, center={},{},{},{}",
                 post_frame,pass,name,desc.Width,desc.Height,uint32_t(view_desc.Format),value[0],value[1],value[2],value[3]);
               // The saved BMP clamps to [0,1]; the tone curve's behaviour depends
               // on whether anything actually exceeds 1. Report the real range.
-              const auto hdr=edf::native::InspectNativeHdrColor(*state.context.Get(),*texture.Get());
+              const auto hdr=edf::native::InspectNativeHdrColor(*state.context.Get(),*texture);
               REXLOG_INFO("Native exact post input range: frame={}, pass={}, name={}, pixels={}, nonfinite={}, min={},{},{}, max={},{},{}, mean={},{},{}, above_1={}, above_2={}, above_4={}, above_8={}",
                 post_frame,pass,name,hdr.pixels,hdr.nonfinite_pixels,
                 hdr.minimum[0],hdr.minimum[1],hdr.minimum[2],hdr.maximum[0],hdr.maximum[1],hdr.maximum[2],
@@ -6170,7 +6166,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
                   post_frame,pass,name,hdr.negative_pixels,hdr.pixels,hdr.worst_x,hdr.worst_y);
               const auto path=std::filesystem::path(post_prefix+".pass."+std::to_string(pass)+"."+pixel.shader().entry.name+".input."+name+"."+std::to_string(post_frame)+".bmp");
               if(std::filesystem::exists(path)) throw std::runtime_error("post input capture already exists");
-              const auto bmp=edf::native::CaptureNativeHdrBmp(*state.context.Get(),*texture.Get());
+              const auto bmp=edf::native::CaptureNativeHdrBmp(*state.context.Get(),*texture);
               std::ofstream file(path,std::ios::binary);
               file.write(reinterpret_cast<const char*>(bmp.data()),bmp.size()); file.close();
               if(!file) throw std::runtime_error("post input capture write failed");

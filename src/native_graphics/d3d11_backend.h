@@ -60,6 +60,10 @@ std::unique_ptr<NativeBackendTexture> AdoptNativeD3D11Texture(
 // returns null if the resource did not come from a D3D11 backend, which is a
 // real case - the player can select d3d12 - and so is checked, not assumed.
 ID3D11Buffer* NativeD3D11Buffer(NativeBackendBuffer& buffer);
+ID3D11SamplerState* NativeD3D11SamplerState(NativeBackendSampler& sampler);
+ID3D11RenderTargetView* NativeD3D11RenderTargetView(NativeBackendRenderTarget& target);
+ID3D11DepthStencilView* NativeD3D11DepthStencilView(NativeBackendRenderTarget& target);
+ID3D11Texture2D* NativeD3D11RenderTargetResource(NativeBackendRenderTarget& target);
 ID3D11ShaderResourceView* NativeD3D11TextureView(NativeBackendTexture& texture);
 ID3D11Texture2D* NativeD3D11TextureResource(NativeBackendTexture& texture);
 // The device itself, for the few things that still create D3D11 objects of

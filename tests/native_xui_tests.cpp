@@ -1,3 +1,4 @@
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/xui_effect.h"
 #include "native_graphics/font_effect.h"
 #include "native_graphics/native_font_bindings.h"
@@ -29,6 +30,10 @@ int main() {
     ComPtr<ID3D11Device> device; ComPtr<ID3D11DeviceContext> context;
     Require(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
       D3D11_SDK_VERSION,&device,nullptr,&context)),"XUI device");
+    // Render targets are created through the backend now; adopting this device
+    // keeps them usable by the direct D3D11 calls the rest of this test makes.
+    auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
+    Require(bool(backend),"adopted backend");
     const auto effect=MakeNativeXuiTextureEffect();
     auto clip=MakeNativeViewport(0,0,1920,1080,0,1,true,{784,668,854,680});
     const auto scaled_clip=ScaleNativeCanvasScissor(clip,1.5f,1.5f,true);
@@ -67,7 +72,7 @@ int main() {
     ComPtr<ID3D11SamplerState> sampler;
     Require(SUCCEEDED(device->CreateSamplerState(&sd,&sampler)),"XUI sampler");
     ps.SetTexture("BrushTexture",view.Get()); ps.SetSampler("BrushSampler",sampler.Get());
-    auto target=CreateNativeRenderTarget(*device.Get(),4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    auto target=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     auto* rtv=target.target.Get(); context->OMSetRenderTargets(1,&rtv,nullptr);
     const D3D11_VIEWPORT viewport{0,0,4,2,0,1}; context->RSSetViewports(1,&viewport);
     std::vector<uint8_t> guest;
@@ -138,7 +143,7 @@ int main() {
       reject([&]{scene_plan.SetConstants(scene_vs,scene_registers,std::span(scene_bias).first(15));});
       reject([&]{scene_plan.SetConstants(vs,scene_registers,scene_bias);});
       Require(scene_vs.ReadFloatVector("Params")==prior_params,"rejected XUI plan changed constants");
-      auto depth=CreateNativeDepthTarget(*device.Get(),4,2,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+      auto depth=CreateNativeDepthTarget(*backend,4,2,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
       context->OMSetRenderTargets(1,&rtv,depth.target.Get());
       for(unsigned mode=0;mode<3;++mode) {
         const bool visible=mode!=0;

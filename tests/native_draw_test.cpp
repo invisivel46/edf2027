@@ -207,20 +207,24 @@ float4 PackingPS() : SV_TARGET {
     Require(rejected,"unsupported sampler address mode accepted");
     Require(SamplerStateKey({0xfff803ff,0x7ffff,3,0xfffffe00}) == SamplerStateWords{},
             "sampler cache retained resource-specific fields");
-    ComPtr<ID3D11SamplerState> sampler;
-    Require(SUCCEEDED(device->CreateSamplerState(&sampler_desc, &sampler)), "sampler creation");
+    // A backend sampler, because that is what a binding now holds. The decode
+    // above still produces the D3D11 desc the D3D11 path wants; this is the
+    // neutral one the seam takes.
+    NativeBackendSamplerDesc neutral_sampler{};
+    neutral_sampler.min=neutral_sampler.mag=neutral_sampler.mip=NativeBackendFilter::Point;
+    auto* sampler=&backend->CreateSampler(neutral_sampler);
     Require(!ps.HasAllTextureInputs(),"unbound texture inputs accepted");
     Require(!ps.ReadTexture("image") && !ps.ReadTexture("absent"),"unbound diagnostic texture read");
     Require(!ps.ReadSampler("filtering") && !ps.ReadSampler("absent"),"unbound diagnostic sampler read");
     const auto resolved_image=ps.ResolveResource("image");
     const auto resolved_filter=ps.ResolveResource("filtering");
-    Require(ps.TrySetTexture(resolved_image,view.Get()),"resolved texture upload");
-    const auto diagnostic_view=ps.ReadTexture("image");
-    Require(diagnostic_view.Get()==view.Get() && !ps.ReadTexture("filtering"),"diagnostic view snapshot mismatch");
+    Require(ps.TrySetTexture(resolved_image,texture.backend),"resolved texture upload");
+    auto* diagnostic_view=ps.ReadTexture("image");
+    Require(diagnostic_view==texture.backend.get() && !ps.ReadTexture("filtering"),"diagnostic view snapshot mismatch");
     Require(!ps.HasAllTextureInputs(),"unbound sampler accepted");
-    Require(ps.TrySetSampler(resolved_filter,sampler.Get()),"resolved sampler upload");
-    const auto diagnostic_sampler=ps.ReadSampler("filtering");
-    Require(diagnostic_sampler.Get()==sampler.Get() && !ps.ReadSampler("image"),"diagnostic sampler snapshot mismatch");
+    Require(ps.TrySetSampler(resolved_filter,sampler),"resolved sampler upload");
+    auto* diagnostic_sampler=ps.ReadSampler("filtering");
+    Require(diagnostic_sampler==sampler && !ps.ReadSampler("image"),"diagnostic sampler snapshot mismatch");
     Require(!ps.TrySetSampler(resolved_image,nullptr) && !ps.TrySetTexture(resolved_filter,nullptr),
       "separate texture and sampler slots preserved");
     for(const auto& target:{ShaderBindings::ResourceBinding{},vs.ResolveResource("image")}) {
@@ -327,7 +331,7 @@ float4 WhitePS():SV_TARGET { return 1; }
       ShaderBindings triangle(*device.Get(),CompileNativeShader(*device.Get(),polygon_effect,{false,"TriangleVS","vs_5_0"},"polygon.fx"));
       ShaderBindings reversed(*device.Get(),CompileNativeShader(*device.Get(),polygon_effect,{false,"ReversedVS","vs_5_0"},"polygon.fx"));
       ShaderBindings white(*device.Get(),CompileNativeShader(*device.Get(),polygon_effect,{true,"WhitePS","ps_5_0"},"polygon.fx"));
-      auto polygon_target=CreateNativeRenderTarget(*device.Get(),32,32,DXGI_FORMAT_R8G8B8A8_UNORM);
+      auto polygon_target=CreateNativeRenderTarget(*backend,32,32,DXGI_FORMAT_R8G8B8A8_UNORM);
       D3D11_TEXTURE2D_DESC desc{}; polygon_target.surface->GetDesc(&desc);
       desc.BindFlags=0; desc.Usage=D3D11_USAGE_STAGING; desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
       ComPtr<ID3D11Texture2D> pixels;
@@ -534,13 +538,11 @@ float4 WhitePS():SV_TARGET { return 1; }
     std::copy(mip_pixels.begin(),mip_pixels.end(),mip_dds.begin()+128);
     auto mip_texture = CreateNativeDdsTexture(*backend,mip_dds);
     ShaderBindings probe_shader(*device.Get(),CompileNativeShader(*device.Get(),effect,{true,"SamplerPS","ps_5_0"},"test.fx"));
-    probe_shader.SetTexture("mipImage",mip_texture.view.Get());
+    probe_shader.SetTexture("mipImage",mip_texture.backend);
     auto sample = [&](uint32_t address, uint32_t filter, uint32_t lod_range,
                       float u, float lod, std::array<uint8_t,4> expected) {
-      const auto desc = DecodeNativeSampler({address<<10,filter,lod_range,0});
-      ComPtr<ID3D11SamplerState> state;
-      Require(SUCCEEDED(device->CreateSamplerState(&desc,&state)),"probe sampler creation");
-      probe_shader.SetSampler("filtering",state.Get());
+      probe_shader.SetSampler("filtering",
+        &backend->CreateSampler(DecodeNativeGuestSampler({address<<10,filter,lod_range,0})));
       const std::array<float,2> uv{u,.25f};
       probe_shader.SetConstant("probe",Bytes(uv)); probe_shader.SetConstant("probeLod",Bytes(lod));
       draw(probe_shader,expected);
@@ -553,10 +555,10 @@ float4 WhitePS():SV_TARGET { return 1; }
     sample(2,0,1u<<6,.25f,1,{0,0,255,255}); // Authored blue mip.
     sample(2,0,0,.25f,1,{255,0,0,255}); // Maximum LOD clamps to base.
     // Rebinding must not retain resources from the previous material.
-    Require(!ps.TrySetTexture("not_in_native_shader", view.Get()), "unknown texture accepted");
+    Require(!ps.TrySetTexture("not_in_native_shader", texture.backend), "unknown texture accepted");
     ps.ClearTextures(); ps.ClearSamplers(); ps.Bind(*context.Get());
-    Require(!ps.ReadTexture("image") && diagnostic_view.Get()==view.Get(),"diagnostic snapshot lost retained view or stale current binding");
-    Require(!ps.ReadSampler("filtering") && diagnostic_sampler.Get()==sampler.Get(),"diagnostic sampler snapshot lost retention or stale current binding");
+    Require(!ps.ReadTexture("image") && diagnostic_view==texture.backend.get(),"diagnostic snapshot lost retained view or stale current binding");
+    Require(!ps.ReadSampler("filtering") && diagnostic_sampler==sampler,"diagnostic sampler snapshot lost retention or stale current binding");
     Require(!ps.HasAllTextureInputs(),"cleared texture inputs accepted");
     ComPtr<ID3D11ShaderResourceView> bound_texture;
     ComPtr<ID3D11SamplerState> bound_sampler;
@@ -572,13 +574,12 @@ float4 PS(float2 uv:TEXCOORD0):SV_TARGET {
   return a.Sample(sa,uv)+b.Sample(sb,uv)+c.Sample(sc,uv);
 })";
       ShaderBindings batch(*device.Get(),CompileNativeShader(*device.Get(),sparse,{true,"PS","ps_5_0"},"batch.fx"));
-      const auto desc=DecodeNativeSampler({0,0,0,0});
-      ComPtr<ID3D11SamplerState> sentinel;
-      Require(SUCCEEDED(device->CreateSamplerState(&desc,&sentinel)),"batch sampler creation");
-      auto* view=mip_texture.view.Get(); auto* sampler=sentinel.Get();
+      auto* sentinel=&backend->CreateSampler(DecodeNativeGuestSampler({0,0,0,0}));
+      auto* view=mip_texture.view.Get();
+      auto* sampler=NativeD3D11SamplerState(*sentinel);
       context->PSSetShaderResources(2,1,&view); context->PSSetSamplers(2,1,&sampler);
-      batch.SetTexture("a",view); batch.SetTexture("b",nullptr); batch.SetTexture("c",view);
-      batch.SetSampler("sa",sampler); batch.SetSampler("sb",nullptr); batch.SetSampler("sc",sampler);
+      batch.SetTexture("a",mip_texture.backend); batch.SetTexture("b",nullptr); batch.SetTexture("c",mip_texture.backend);
+      batch.SetSampler("sa",sentinel); batch.SetSampler("sb",nullptr); batch.SetSampler("sc",sentinel);
       batch.Bind(*context.Get());
       for(UINT slot=0;slot<4;++slot) {
         context->PSGetShaderResources(slot,1,bound_texture.ReleaseAndGetAddressOf());
@@ -593,7 +594,7 @@ float4 PS(float2 uv:TEXCOORD0):SV_TARGET {
         Require(bound_texture.Get()==(slot==2?view:nullptr) &&
                 bound_sampler.Get()==(slot==2?sampler:nullptr),"precomputed slots retain cleared resources");
       }
-      batch.SetTexture("b",view); batch.SetSampler("sb",sampler);
+      batch.SetTexture("b",mip_texture.backend); batch.SetSampler("sb",sentinel);
       batch.Bind(*context.Get());
       context->PSGetShaderResources(1,1,bound_texture.ReleaseAndGetAddressOf());
       context->PSGetSamplers(1,1,bound_sampler.ReleaseAndGetAddressOf());
@@ -651,7 +652,7 @@ float4 ScenePS() : SV_TARGET { return sceneImage.Sample(sceneFilter,float2(.5,.5
 )";
     ShaderBindings scene_ps(*device.Get(),CompileNativeShader(*device.Get(),scene_effect,
       {true,"ScenePS","ps_5_0"},"scene.fx"));
-    auto scene=CreateNativeRenderTarget(*device.Get(),4,4,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    auto scene=CreateNativeRenderTarget(*backend,4,4,DXGI_FORMAT_R16G16B16A16_FLOAT);
     const float scene_first[]{.25f,.5f,.75f,1},scene_next[]{.75f,.25f,.5f,1};
     context->ClearRenderTargetView(scene.target.Get(),scene_first); scene.content_valid=true;
     ResolveNativeRenderTarget(*context.Get(),scene);

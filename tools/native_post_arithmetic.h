@@ -1,6 +1,7 @@
 #pragma once
 #include "native_graphics/d3d11_quads.h"
 #include "native_graphics/d3d11_texture.h"
+#include "native_graphics/d3d11_backend.h"
 #include <bit>
 #include <cmath>
 
@@ -12,6 +13,10 @@ inline void CheckRetailPostArithmetic(ID3D11Device& device,const std::filesystem
   if(EffectSourceFingerprint(effect.source)!=0x6b7926f9747c6933ull)
     throw std::runtime_error("post arithmetic oracle requires the audited retail source");
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context; device.GetImmediateContext(&context);
+  // Targets, textures and samplers come from the backend now. Adopting this
+  // device keeps them usable by the direct D3D11 draws this oracle makes.
+  auto backend=AdoptNativeD3D11Backend(device,*context.Get());
+  if(!backend) throw std::runtime_error("post oracle backend");
   auto entry=[&](const std::string& name)->ShaderEntry {
     for(const auto& candidate:effect.entries) if(candidate.name==name) return candidate;
     throw std::runtime_error("missing retail post entry: "+name);
@@ -28,26 +33,22 @@ inline void CheckRetailPostArithmetic(ID3D11Device& device,const std::filesystem
   };
   const std::array<float,16> corners{-1,1,0,0, 1,1,1,0, 1,-1,1,1, -1,-1,0,1};
   const auto vertices=guest(corners);
-  D3D11_SAMPLER_DESC sampler_desc{};
-  sampler_desc.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
-  sampler_desc.AddressU=sampler_desc.AddressV=sampler_desc.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
-  sampler_desc.MaxAnisotropy=1; sampler_desc.ComparisonFunc=D3D11_COMPARISON_ALWAYS;
-  Microsoft::WRL::ComPtr<ID3D11SamplerState> sampler;
-  if(FAILED(device.CreateSamplerState(&sampler_desc,&sampler))) throw std::runtime_error("post oracle sampler");
-  auto input=[&](const std::array<float,4>& value) {
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width=desc.Height=desc.MipLevels=desc.ArraySize=desc.SampleDesc.Count=1;
-    desc.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;
-    desc.Usage=D3D11_USAGE_IMMUTABLE; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA data{value.data(),16,0};
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
-    if(FAILED(device.CreateTexture2D(&desc,&data,&texture)) ||
-       FAILED(device.CreateShaderResourceView(texture.Get(),nullptr,&view)))
-      throw std::runtime_error("post oracle input");
-    return view;
+  NativeBackendSamplerDesc sampler_desc{};
+  sampler_desc.min=sampler_desc.mag=sampler_desc.mip=NativeBackendFilter::Point;
+  sampler_desc.u=sampler_desc.v=sampler_desc.w=NativeBackendAddress::Clamp;
+  auto* sampler=&backend->CreateSampler(sampler_desc);
+  auto texture_from=[&](std::span<const uint8_t> bytes,uint32_t width,uint32_t height,uint32_t format) {
+    NativeBackendTextureDesc desc{};
+    desc.width=width; desc.height=height; desc.levels=1; desc.format=format;
+    std::shared_ptr<NativeBackendTexture> texture=backend->CreateTexture(desc,bytes);
+    if(!texture) throw std::runtime_error("post oracle input");
+    return texture;
   };
-  auto target=CreateNativeRenderTarget(device,1,1,DXGI_FORMAT_R16G16B16A16_FLOAT);
+  auto input=[&](const std::array<float,4>& value) {
+    return texture_from({reinterpret_cast<const uint8_t*>(value.data()),sizeof(value)},1,1,
+                        DXGI_FORMAT_R32G32B32A32_FLOAT);
+  };
+  auto target=CreateNativeRenderTarget(*backend,1,1,DXGI_FORMAT_R16G16B16A16_FLOAT);
   D3D11_VIEWPORT viewport{0,0,1,1,0,1}; context->RSSetViewports(1,&viewport);
   D3D11_RASTERIZER_DESC raster_desc{}; raster_desc.FillMode=D3D11_FILL_SOLID;
   raster_desc.CullMode=D3D11_CULL_NONE; raster_desc.DepthClipEnable=true;
@@ -70,12 +71,12 @@ inline void CheckRetailPostArithmetic(ID3D11Device& device,const std::filesystem
       const std::array<float,4> bloom{.41568628f,.42745098f,.44313726f,1};
       const std::array<float,4> history{tone,1,1,1};
       const auto scene_view=input(scene),bloom_view=input(bloom),tone_view=input(history);
-      pixel.TrySetTexture("m_DiffuseTexture0_Sampler",scene_view.Get());
-      pixel.TrySetTexture("m_DiffuseTexture1_Sampler",bloom_view.Get());
-      pixel.TrySetTexture("m_Tone_Sampler",tone_view.Get());
-      pixel.TrySetTexture("m_OldTone_Sampler",tone_view.Get());
+      pixel.TrySetTexture("m_DiffuseTexture0_Sampler",scene_view);
+      pixel.TrySetTexture("m_DiffuseTexture1_Sampler",bloom_view);
+      pixel.TrySetTexture("m_Tone_Sampler",tone_view);
+      pixel.TrySetTexture("m_OldTone_Sampler",tone_view);
       for(const auto* binding:{"m_DiffuseTexture0_Sampler","m_DiffuseTexture1_Sampler","m_Tone_Sampler","m_OldTone_Sampler"})
-        pixel.TrySetSampler(binding,sampler.Get());
+        pixel.TrySetSampler(binding,sampler);
       if(!pixel.HasAllTextureInputs()) throw std::runtime_error("post oracle unbound input");
       auto* rtv=target.target.Get(); context->OMSetRenderTargets(1,&rtv,nullptr);
       vertex.Bind(*context.Get()); pixel.Bind(*context.Get()); quad.Draw(*context.Get(),vertices);
@@ -118,19 +119,16 @@ inline void CheckRetailPostArithmetic(ID3D11Device& device,const std::filesystem
     desc.Width=desc.Height=4; desc.MipLevels=desc.ArraySize=desc.SampleDesc.Count=1;
     desc.Format=DXGI_FORMAT_R32G32B32A32_FLOAT;
     desc.Usage=D3D11_USAGE_IMMUTABLE; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-    D3D11_SUBRESOURCE_DATA data{texels.data(),64,0};
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
-    if(FAILED(device.CreateTexture2D(&desc,&data,&texture)) || FAILED(device.CreateShaderResourceView(texture.Get(),nullptr,&view)))
-      throw std::runtime_error("spatial oracle texture");
-    pixel.SetTexture("m_DiffuseTexture0_Sampler",view.Get());
-    pixel.SetSampler("m_DiffuseTexture0_Sampler",sampler.Get());
+    const auto view=texture_from({reinterpret_cast<const uint8_t*>(texels.data()),texels.size()*sizeof(texels[0])},
+                                 desc.Width,desc.Height,desc.Format);
+    pixel.SetTexture("m_DiffuseTexture0_Sampler",view);
+    pixel.SetSampler("m_DiffuseTexture0_Sampler",sampler);
     const std::array<float,16> offsets{0,0,0,0, .25f,0,0,0, .25f,.25f,0,0, 0,.25f,0,0};
     pixel.SetGuestFloatRegisters("m_DownsampleUVOffset",guest(offsets));
     auto shifted_uv=corners;
     for(size_t v=0;v<4;++v) { shifted_uv[v*4+2]+=.125f; shifted_uv[v*4+3]+=.125f; }
     const auto spatial_vertices=guest(shifted_uv);
-    auto spatial_target=CreateNativeRenderTarget(device,2,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    auto spatial_target=CreateNativeRenderTarget(*backend,2,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     const std::array<float,4> expected{.15625f,.28125f,.65625f,.78125f};
     bool unadjusted_differs=false;
     for(const float shift:{0.0f,.5f}) {
@@ -150,9 +148,9 @@ inline void CheckRetailPostArithmetic(ID3D11Device& device,const std::filesystem
     // and columns at fractional viewport boundaries, including the 1x1 history.
     const std::array<float,4> constant{.375f,.5f,.625f,.75f};
     const auto constant_view=input(constant);
-    pixel.SetTexture("m_DiffuseTexture0_Sampler",constant_view.Get());
+    pixel.SetTexture("m_DiffuseTexture0_Sampler",constant_view);
     for(const uint32_t extent:{1u,2u,3u,8u}) {
-      auto coverage=CreateNativeRenderTarget(device,extent,extent,DXGI_FORMAT_R16G16B16A16_FLOAT);
+      auto coverage=CreateNativeRenderTarget(*backend,extent,extent,DXGI_FORMAT_R16G16B16A16_FLOAT);
       const float clear[]{0,0,0,0}; context->ClearRenderTargetView(coverage.target.Get(),clear);
       auto* rtv=coverage.target.Get(); context->OMSetRenderTargets(1,&rtv,nullptr);
       D3D11_VIEWPORT coverage_view{.5f,.5f,float(extent),float(extent),0,1};
@@ -175,19 +173,15 @@ inline void CheckRetailPostArithmetic(ID3D11Device& device,const std::filesystem
         pixels[at]=float(x)/128; pixels[at+1]=float(y)/64;
         pixels[at+2]=float((x+y)%3)/4; pixels[at+3]=1;
       }
-      auto source_desc=desc; source_desc.Width=sw; source_desc.Height=sh;
-      D3D11_SUBRESOURCE_DATA source_data{pixels.data(),sw*16,0};
-      Microsoft::WRL::ComPtr<ID3D11Texture2D> source;
-      Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> source_view;
-      if(FAILED(device.CreateTexture2D(&source_desc,&source_data,&source)) || FAILED(device.CreateShaderResourceView(source.Get(),nullptr,&source_view)))
-        throw std::runtime_error("rectangular oracle texture");
-      pixel.SetTexture("m_DiffuseTexture0_Sampler",source_view.Get());
+      const auto source_view=texture_from({reinterpret_cast<const uint8_t*>(pixels.data()),
+                                           pixels.size()*sizeof(pixels[0])},sw,sh,desc.Format);
+      pixel.SetTexture("m_DiffuseTexture0_Sampler",source_view);
       const std::array<float,16> sample_offsets{0,0,0,0, 1.f/sw,0,0,0, 1.f/sw,1.f/sh,0,0, 0,1.f/sh,0,0};
       pixel.SetGuestFloatRegisters("m_DownsampleUVOffset",guest(sample_offsets));
       auto uv=corners;
       for(size_t v=0;v<4;++v) { uv[v*4+2]+=.5f/sw; uv[v*4+3]+=.5f/sh; }
       const auto rect_vertices=guest(uv);
-      auto output=CreateNativeRenderTarget(device,dw,dh,DXGI_FORMAT_R16G16B16A16_FLOAT);
+      auto output=CreateNativeRenderTarget(*backend,dw,dh,DXGI_FORMAT_R16G16B16A16_FLOAT);
       const float clear[]{-1,-1,-1,-1}; context->ClearRenderTargetView(output.target.Get(),clear);
       auto* rtv=output.target.Get(); context->OMSetRenderTargets(1,&rtv,nullptr);
       D3D11_VIEWPORT rect_view{.5f,.5f,float(dw),float(dh),0,1}; context->RSSetViewports(1,&rect_view);

@@ -496,6 +496,13 @@ class D3D11Backend final : public NativeRenderBackend {
     return std::make_unique<D3D11Texture>(std::move(texture),std::move(view),desc.width,desc.height);
   }
 
+  bool SupportsSamples(uint32_t format,uint32_t samples) override {
+    if(samples==1) return true;
+    if(samples!=2 && samples!=4) return false;
+    UINT levels=0;
+    return SUCCEEDED(device_->CheckMultisampleQualityLevels(static_cast<DXGI_FORMAT>(format),samples,&levels)) && levels;
+  }
+
   std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc) override {
     if(desc.sampled && desc.samples>1)
       throw std::runtime_error("a multisampled target cannot be sampled directly; resolve it into a texture");
@@ -833,6 +840,22 @@ ID3D11Device* NativeD3D11BackendDevice(NativeRenderBackend& backend) {
 ID3D11Buffer* NativeD3D11Buffer(NativeBackendBuffer& buffer) {
   auto* d3d11=dynamic_cast<D3D11Buffer*>(&buffer);
   return d3d11?d3d11->buffer():nullptr;
+}
+ID3D11SamplerState* NativeD3D11SamplerState(NativeBackendSampler& sampler) {
+  auto* d3d11=dynamic_cast<D3D11Sampler*>(&sampler);
+  return d3d11?d3d11->state():nullptr;
+}
+ID3D11RenderTargetView* NativeD3D11RenderTargetView(NativeBackendRenderTarget& target) {
+  auto* d3d11=dynamic_cast<D3D11RenderTarget*>(&target);
+  return d3d11?d3d11->colour():nullptr;
+}
+ID3D11DepthStencilView* NativeD3D11DepthStencilView(NativeBackendRenderTarget& target) {
+  auto* d3d11=dynamic_cast<D3D11RenderTarget*>(&target);
+  return d3d11?d3d11->depth():nullptr;
+}
+ID3D11Texture2D* NativeD3D11RenderTargetResource(NativeBackendRenderTarget& target) {
+  auto* d3d11=dynamic_cast<D3D11RenderTarget*>(&target);
+  return d3d11?d3d11->resource():nullptr;
 }
 ID3D11ShaderResourceView* NativeD3D11TextureView(NativeBackendTexture& texture) {
   auto* d3d11=dynamic_cast<D3D11Texture*>(&texture);

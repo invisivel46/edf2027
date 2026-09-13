@@ -60,7 +60,7 @@ void CheckBuffer(ID3D11Device& device,ID3D11DeviceContext& context,
 void CheckComposition(ID3D11Device& device,ID3D11DeviceContext& context,
                       NativeWindowPresenter& presenter) {
   NativeFrameCompositor compositor(device);
-  auto source=CreateNativeRenderTarget(device,4,2,DXGI_FORMAT_R8G8B8A8_UNORM);
+  auto source=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R8G8B8A8_UNORM);
   ClearNativeColorTarget(context,source,0xff4080bfu);
   ResolveNativeRenderTarget(context,source);
   Require(presenter.BeginFrame(8,8),"composition target resize");
@@ -96,7 +96,7 @@ void CheckComposition(ID3D11Device& device,ID3D11DeviceContext& context,
     pixel(x,y,x<2 || x>=6 ? std::array<float,4>{0,0,0,1}:color);
   output.Reset(); texture.Reset();
   Require(presenter.BeginFrame(2,2),"orientation target resize");
-  auto corners=CreateNativeRenderTarget(device,2,2,DXGI_FORMAT_R8G8B8A8_UNORM);
+  auto corners=CreateNativeRenderTarget(*backend,2,2,DXGI_FORMAT_R8G8B8A8_UNORM);
   const unsigned char rgba[]{255,0,0,255, 0,255,0,255, 0,0,255,255, 255,255,255,255};
   context.UpdateSubresource(corners.sampled.resource.Get(),0,nullptr,rgba,8,16);
   compositor.Draw(context,*corners.sampled.view.Get(),*presenter.target(),false);
@@ -123,7 +123,7 @@ void CheckComposition(ID3D11Device& device,ID3D11DeviceContext& context,
   Require(SUCCEEDED(device.CreateDeferredContext(0,&deferred)),"compositor deferred context");
   Reject([&]{compositor.Draw(*deferred.Get(),*corners.sampled.view.Get(),*presenter.target());},
          "compositor accepted deferred context");
-  auto hdr=CreateNativeRenderTarget(device,2,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+  auto hdr=CreateNativeRenderTarget(*backend,2,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
   Reject([&]{compositor.Draw(context,*hdr.sampled.view.Get(),*presenter.target());},
          "untonemapped HDR accepted");
   ComPtr<ID3D11RenderTargetView> alias;
@@ -144,8 +144,8 @@ void CheckComposition(ID3D11Device& device,ID3D11DeviceContext& context,
 }
 void CheckDisplayGamma(ID3D11Device& device,ID3D11DeviceContext& context) {
   NativeFrameCompositor compositor(device);
-  auto source=CreateNativeRenderTarget(device,256,1,DXGI_FORMAT_R8G8B8A8_UNORM);
-  auto target=CreateNativeRenderTarget(device,256,1,DXGI_FORMAT_R8G8B8A8_UNORM);
+  auto source=CreateNativeRenderTarget(*backend,256,1,DXGI_FORMAT_R8G8B8A8_UNORM);
+  auto target=CreateNativeRenderTarget(*backend,256,1,DXGI_FORMAT_R8G8B8A8_UNORM);
   std::array<uint8_t,1024> pixels{};
   for(unsigned i=0;i<256;++i) {
     pixels[i*4]=pixels[i*4+1]=pixels[i*4+2]=uint8_t(i); pixels[i*4+3]=255;
@@ -176,8 +176,8 @@ void CheckDisplayGamma(ID3D11Device& device,ID3D11DeviceContext& context) {
   Require(std::abs(ReadNativeColorPixel(context,*target.surface.Get(),64,0)[0]-64/255.f)<0.002f,
     "gamma state leaked into disabled draw");
   // Nonlinear gamma must be applied before bilinear window scaling.
-  auto edges=CreateNativeRenderTarget(device,2,1,DXGI_FORMAT_R8G8B8A8_UNORM);
-  auto scaled=CreateNativeRenderTarget(device,3,1,DXGI_FORMAT_R8G8B8A8_UNORM);
+  auto edges=CreateNativeRenderTarget(*backend,2,1,DXGI_FORMAT_R8G8B8A8_UNORM);
+  auto scaled=CreateNativeRenderTarget(*backend,3,1,DXGI_FORMAT_R8G8B8A8_UNORM);
   const uint8_t edge_pixels[]{0,0,0,255,255,255,255,255};
   context.UpdateSubresource(edges.sampled.resource.Get(),0,nullptr,edge_pixels,8,8);
   std::array<uint8_t,1536> curve{};
@@ -202,7 +202,7 @@ void CheckHandoff(ID3D11Device& device,ID3D11DeviceContext& context,
   });
   Require(empty_context_visited,"context access required a published frame");
   Reject([&]{handoff.VisitContext({});},"empty context consumer accepted");
-  auto source=CreateNativeRenderTarget(device,4,2,DXGI_FORMAT_R8G8B8A8_UNORM);
+  auto source=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R8G8B8A8_UNORM);
   ClearNativeColorTarget(context,source,0xffff0000u);
   handoff.Publish(*source.surface.Get(),NativeFrameKind::Movie);
   ClearNativeColorTarget(context,source,0xff00ff00u);
@@ -247,10 +247,10 @@ void CheckHandoff(ID3D11Device& device,ID3D11DeviceContext& context,
   Require(handoff.Visit([&](auto&,auto&,auto&,auto sequence,auto kind,auto*) {
     Require(sequence==2 && kind==NativeFrameKind::PartialScene,"republish metadata");
   }),"republish failed");
-  auto hdr=CreateNativeRenderTarget(device,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+  auto hdr=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
   Reject([&]{handoff.Publish(*hdr.surface.Get(),NativeFrameKind::PartialScene);},"HDR handoff accepted");
   Require(!handoff.Visit({}),"failed publication exposed stale snapshot");
-  auto resized=CreateNativeRenderTarget(device,2,1,DXGI_FORMAT_R8G8B8A8_UNORM);
+  auto resized=CreateNativeRenderTarget(*backend,2,1,DXGI_FORMAT_R8G8B8A8_UNORM);
   ClearNativeColorTarget(context,resized,0xff0000ffu);
   handoff.Publish(*resized.surface.Get(),NativeFrameKind::PartialScene);
   resized={}; // Publication is independent of producer resource lifetime.

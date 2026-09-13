@@ -60,7 +60,7 @@ float4 PS(Varying input) : SV_TARGET { return float4(input.coord,0,1); }
     catch (const std::runtime_error&) { rejected_link = true; }
     Require(rejected_link,"mismatched varying registers accepted");
     QuadStream stream(*device.Get(),vs);
-    auto target = CreateNativeRenderTarget(*device.Get(),4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    auto target = CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     auto* rtv = target.target.Get();
     context->OMSetRenderTargets(1,&rtv,nullptr);
     context->VSSetShader(vs.vertex.Get(),nullptr,0);
@@ -1055,7 +1055,7 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
     }
     NativeIndexedMesh far_mesh(*backend,mesh_vs,declaration,40,far_vertices,indices16,2);
     for (auto format : {DXGI_FORMAT_D24_UNORM_S8_UINT,DXGI_FORMAT_D32_FLOAT,DXGI_FORMAT_D32_FLOAT_S8X24_UINT}) {
-      auto depth=CreateNativeDepthTarget(*device.Get(),4,2,format);
+      auto depth=CreateNativeDepthTarget(*backend,4,2,format);
       Require(!depth.depth_valid && !depth.stencil_valid,"new depth storage marked valid");
       context->OMSetRenderTargets(1,&rtv,depth.target.Get());
       auto depth_write=CreateNativeRenderState(*device.Get(),{0x10001,0x16,0,0,15,0});
@@ -1257,7 +1257,7 @@ float4 PS():SV_TARGET {return float4(tex2D_DXT5N_xGxR(NormalSampler,float2(.5,.5
 )";
       ShaderBindings normal_ps(*device.Get(),CompileNativeShader(*device.Get(),normal_effect,
         {true,"PS","ps_5_0"},"normal_decode.fx"));
-      auto normal_texture=CreateNativeRenderTarget(*device.Get(),1,1,DXGI_FORMAT_R16G16B16A16_FLOAT);
+      auto normal_texture=CreateNativeRenderTarget(*backend,1,1,DXGI_FORMAT_R16G16B16A16_FLOAT);
       D3D11_SAMPLER_DESC desc{}; desc.Filter=D3D11_FILTER_MIN_MAG_MIP_POINT;
       desc.AddressU=desc.AddressV=desc.AddressW=D3D11_TEXTURE_ADDRESS_CLAMP;
       desc.MaxLOD=D3D11_FLOAT32_MAX;
@@ -1433,7 +1433,7 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
         scene_vs.SetGuestFloatRegisters("_g_DX2DOffset",Guest(std::array<float,4>{-1,1,0,0}));
         NativeIndexedMesh scene_mesh(*backend,scene_vs.shader(),native_utility_decl,
           uint32_t(stride),utility_vertices,utility_indices,2);
-        auto scene_depth=CreateNativeDepthTarget(*device.Get(),4,2,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+        auto scene_depth=CreateNativeDepthTarget(*backend,4,2,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
         context->OMSetRenderTargets(1,&rtv,scene_depth.target.Get());
         MakeNativeDrawViewport(0,0,4,2,reversed?1.f:0.f,reversed?0.f:1.f,false,{}).Bind(*context.Get());
         scene_vs.Bind(*context.Get()); utility_ps.Bind(*context.Get());

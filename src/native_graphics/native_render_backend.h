@@ -241,6 +241,11 @@ class NativeRenderBackend {
   virtual std::unique_ptr<NativeBackendTexture> CreateTexture(const NativeBackendTextureDesc& desc,
                                                               std::span<const uint8_t> initial)=0;
   virtual std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc)=0;
+  // Whether this backend can give a target of this format that many samples.
+  // Asked rather than assumed because the renderer chooses the count - from a
+  // guest mode or a user override - and has to be able to refuse a combination
+  // this machine does not have before it creates anything.
+  virtual bool SupportsSamples(uint32_t format,uint32_t samples)=0;
   virtual std::unique_ptr<NativeBackendQuery> CreateQuery(NativeBackendQueryKind kind)=0;
   // False when the result is not ready; never blocks. On the backend rather
   // than the recorder, where it started: reading a result is not a recorded

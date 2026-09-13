@@ -24,10 +24,10 @@ class NativeMovieBindings {
     for(size_t i=0;i<4;++i) vertex.SetGuestFloatRegisters(vertex_[i],registers.subspan(offsets[i],sizes[i]));
     pixel.SetGuestFloatRegisters(factor_,factor);
   }
-  void SetTexture(ShaderBindings& pixel,size_t plane,ID3D11ShaderResourceView* view) const {
-    if(plane>=3 || !pixel.TrySetTexture(planes_[plane],view)) throw std::runtime_error("invalid native movie plane binding");
+  void SetTexture(ShaderBindings& pixel,size_t plane,std::shared_ptr<NativeBackendTexture> texture) const {
+    if(plane>=3 || !pixel.TrySetTexture(planes_[plane],std::move(texture))) throw std::runtime_error("invalid native movie plane binding");
   }
-  void SetSampler(ShaderBindings& pixel,size_t plane,ID3D11SamplerState* sampler) const {
+  void SetSampler(ShaderBindings& pixel,size_t plane,NativeBackendSampler* sampler) const {
     if(plane>=3 || !pixel.TrySetSampler(samplers_[plane],sampler)) throw std::runtime_error("invalid native movie sampler binding");
   }
  private:

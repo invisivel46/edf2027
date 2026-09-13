@@ -33,6 +33,12 @@ struct NativeTexture {
 };
 struct NativeRenderTarget {
   enum class Conversion { none, luminance, rgba8 };
+  // What draws go into, created through the backend. Declared sampled when a
+  // conversion has to read it back.
+  std::shared_ptr<NativeBackendRenderTarget> backend_surface;
+  // The same surface's D3D11 handles, for the paths that have not moved:
+  // presentation hand-off, the HDR/depth diagnostics, and the output-merger
+  // binding. They go with those paths.
   Microsoft::WRL::ComPtr<ID3D11Texture2D> surface;
   Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target;
   NativeTexture sampled;
@@ -43,6 +49,7 @@ struct NativeRenderTarget {
   Conversion conversion=Conversion::none;
 };
 struct NativeDepthTarget {
+  std::shared_ptr<NativeBackendRenderTarget> backend_target;
   Microsoft::WRL::ComPtr<ID3D11Texture2D> surface;
   Microsoft::WRL::ComPtr<ID3D11DepthStencilView> target;
   uint32_t width = 0, height = 0;
@@ -51,11 +58,11 @@ struct NativeDepthTarget {
 };
 // Native host depth storage. Guest depth format mapping and explicit
 // depth resolves are separate contracts; no implicit conversion is performed.
-NativeDepthTarget CreateNativeDepthTarget(ID3D11Device& device,uint32_t width,
+NativeDepthTarget CreateNativeDepthTarget(NativeRenderBackend& backend,uint32_t width,
                                           uint32_t height,DXGI_FORMAT format,uint32_t samples=1);
 void ClearNativeDepthTarget(ID3D11DeviceContext& context,NativeDepthTarget& target,
                             bool depth,bool stencil,float depth_value,uint8_t stencil_value);
-NativeRenderTarget CreateNativeRenderTarget(ID3D11Device& device, uint32_t width,
+NativeRenderTarget CreateNativeRenderTarget(NativeRenderBackend& backend, uint32_t width,
                                            uint32_t height, DXGI_FORMAT format,uint32_t samples=1);
 // Separate surface and sampled texture retain the guest's explicit resolve
 // boundary and permit a pass to sample the previous resolved contents.
@@ -65,10 +72,10 @@ void ClearNativeColorTarget(ID3D11DeviceContext& context, NativeRenderTarget& ta
                            uint32_t argb);
 // Luminance pair: R32F surface -> half-precision R111 sampled values.
 // RGBA16F host storage represents the guest texture's fixed channel mapping.
-NativeRenderTarget CreateNativeLuminanceTarget(ID3D11Device& device,uint32_t width,uint32_t height);
+NativeRenderTarget CreateNativeLuminanceTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height);
 // HDR render surface -> clamped/quantized RGBA8 sampled bloom texture.
-NativeRenderTarget CreateNativeBloomTarget(ID3D11Device& device,uint32_t width,uint32_t height);
-NativeRenderTarget CreateNativeOpaqueFrameTarget(ID3D11Device& device,uint32_t width,uint32_t height);
+NativeRenderTarget CreateNativeBloomTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height);
+NativeRenderTarget CreateNativeOpaqueFrameTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height);
 // Direct color resolve to RGBA8, without exposure, bloom or gamma. Destination
 // is a dedicated bloom/opaque-frame conversion pair, never the HDR history.
 void ResolveNativeRgba8Frame(ID3D11DeviceContext& context,const NativeRenderTarget& source,

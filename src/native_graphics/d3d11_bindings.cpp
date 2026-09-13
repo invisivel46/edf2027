@@ -1,4 +1,5 @@
 #include "d3d11_bindings.h"
+#include "d3d11_backend.h"
 #include "binding_runs.h"
 #include <cstring>
 #include <stdexcept>
@@ -59,10 +60,10 @@ ShaderBindings::ShaderBindings(ID3D11Device& device, NativeShader shader)
     }
   }
   EmitBindingRuns<ID3D11ShaderResourceView*,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>(
-    texture_values_,[](const auto& value) { return value.Get(); },
+    texture_values_,[](const auto&) -> ID3D11ShaderResourceView* { return nullptr; },
     [&](UINT slot,UINT count,auto) { texture_runs_.emplace_back(slot,count); });
   EmitBindingRuns<ID3D11SamplerState*,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT>(
-    sampler_values_,[](const auto& value) { return value.Get(); },
+    sampler_values_,[](const auto&) -> ID3D11SamplerState* { return nullptr; },
     [&](UINT slot,UINT count,auto) { sampler_runs_.emplace_back(slot,count); });
 }
 void ShaderBindings::SetConstant(const std::string& name, std::span<const uint8_t> bytes) {
@@ -183,26 +184,26 @@ bool ShaderBindings::PatchGuestFloatRegisters(const FloatRegisterBinding& bindin
   }
   return true;
 }
-void ShaderBindings::SetTexture(const std::string& name, ID3D11ShaderResourceView* texture) {
-  if (!TrySetTexture(name, texture)) throw std::runtime_error("unknown texture: " + name);
+void ShaderBindings::SetTexture(const std::string& name, std::shared_ptr<NativeBackendTexture> texture) {
+  if (!TrySetTexture(name, std::move(texture))) throw std::runtime_error("unknown texture: " + name);
 }
-bool ShaderBindings::TrySetTexture(const std::string& name, ID3D11ShaderResourceView* texture) {
+bool ShaderBindings::TrySetTexture(const std::string& name, std::shared_ptr<NativeBackendTexture> texture) {
   const auto found = textures_.find(name);
   if (found == textures_.end()) return false;
-  texture_values_.at(found->second) = texture;
-  texture_slots_.at(found->second)=texture;
+  texture_slots_.at(found->second)=texture?NativeD3D11TextureView(*texture):nullptr;
+  texture_values_.at(found->second) = std::move(texture);
   return true;
 }
 void ShaderBindings::ClearTextures() {
-  for (auto& [slot, texture] : texture_values_) { texture.Reset(); texture_slots_[slot]=nullptr; }
+  for (auto& [slot, texture] : texture_values_) { texture.reset(); texture_slots_[slot]=nullptr; }
 }
-Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> ShaderBindings::ReadTexture(const std::string& name) const {
+NativeBackendTexture* ShaderBindings::ReadTexture(const std::string& name) const {
   const auto found=textures_.find(name);
-  return found==textures_.end() ? Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>{} : texture_values_.at(found->second);
+  return found==textures_.end() ? nullptr : texture_values_.at(found->second).get();
 }
-Microsoft::WRL::ComPtr<ID3D11SamplerState> ShaderBindings::ReadSampler(const std::string& name) const {
+NativeBackendSampler* ShaderBindings::ReadSampler(const std::string& name) const {
   const auto found=samplers_.find(name);
-  return found==samplers_.end() ? Microsoft::WRL::ComPtr<ID3D11SamplerState>{} : sampler_values_.at(found->second);
+  return found==samplers_.end() ? nullptr : sampler_values_.at(found->second);
 }
 ShaderBindings::ResourceBinding ShaderBindings::ResolveResource(const std::string& name) const {
   ResourceBinding binding; binding.owner_=generation_;
@@ -210,31 +211,31 @@ ShaderBindings::ResourceBinding ShaderBindings::ResolveResource(const std::strin
   if(const auto found=samplers_.find(name);found!=samplers_.end()) binding.sampler_=found->second;
   return binding;
 }
-bool ShaderBindings::TrySetTexture(const ResourceBinding& binding,ID3D11ShaderResourceView* texture) {
+bool ShaderBindings::TrySetTexture(const ResourceBinding& binding,std::shared_ptr<NativeBackendTexture> texture) {
   if(binding.owner_!=generation_) throw std::runtime_error("foreign native texture binding");
   if(!binding.texture_) return false;
-  texture_values_.at(*binding.texture_)=texture;
-  texture_slots_.at(*binding.texture_)=texture;
+  texture_slots_.at(*binding.texture_)=texture?NativeD3D11TextureView(*texture):nullptr;
+  texture_values_.at(*binding.texture_)=std::move(texture);
   return true;
 }
-bool ShaderBindings::TrySetSampler(const ResourceBinding& binding,ID3D11SamplerState* sampler) {
+bool ShaderBindings::TrySetSampler(const ResourceBinding& binding,NativeBackendSampler* sampler) {
   if(binding.owner_!=generation_) throw std::runtime_error("foreign native sampler binding");
   if(!binding.sampler_) return false;
   sampler_values_.at(*binding.sampler_)=sampler;
-  sampler_slots_.at(*binding.sampler_)=sampler;
+  sampler_slots_.at(*binding.sampler_)=sampler?NativeD3D11SamplerState(*sampler):nullptr;
   return true;
 }
 void ShaderBindings::ClearSamplers() {
-  for (auto& [slot, sampler] : sampler_values_) { sampler.Reset(); sampler_slots_[slot]=nullptr; }
+  for (auto& [slot, sampler] : sampler_values_) { sampler=nullptr; sampler_slots_[slot]=nullptr; }
 }
-void ShaderBindings::SetSampler(const std::string& name, ID3D11SamplerState* sampler) {
+void ShaderBindings::SetSampler(const std::string& name, NativeBackendSampler* sampler) {
   if (!TrySetSampler(name,sampler)) throw std::runtime_error("unknown sampler: " + name);
 }
-bool ShaderBindings::TrySetSampler(const std::string& name, ID3D11SamplerState* sampler) {
+bool ShaderBindings::TrySetSampler(const std::string& name, NativeBackendSampler* sampler) {
   const auto found = samplers_.find(name);
   if (found == samplers_.end()) return false;
   sampler_values_.at(found->second) = sampler;
-  sampler_slots_.at(found->second)=sampler;
+  sampler_slots_.at(found->second)=sampler?NativeD3D11SamplerState(*sampler):nullptr;
   return true;
 }
 bool ShaderBindings::HasAllTextureInputs() const {
@@ -243,12 +244,26 @@ bool ShaderBindings::HasAllTextureInputs() const {
   return true;
 }
 bool ShaderBindings::UsesTextureResource(ID3D11Resource& resource) const {
-  for(const auto& [slot,view]:texture_values_) if(view) {
-    Microsoft::WRL::ComPtr<ID3D11Resource> bound;
-    view->GetResource(&bound);
-    if(bound.Get()==&resource) return true;
+  for(const auto& [slot,texture]:texture_values_) if(texture) {
+    if(NativeD3D11TextureResource(*texture)==&resource) return true;
   }
   return false;
+}
+bool ShaderBindings::UsesTexture(const NativeBackendTexture& texture) const {
+  for(const auto& [slot,bound]:texture_values_) if(bound.get()==&texture) return true;
+  return false;
+}
+std::vector<ShaderBindings::TextureImage> ShaderBindings::TextureImages() const {
+  std::vector<TextureImage> images;
+  images.reserve(texture_values_.size());
+  for(const auto& [slot,texture]:texture_values_) images.push_back({slot,texture.get()});
+  return images;
+}
+std::vector<ShaderBindings::SamplerImage> ShaderBindings::SamplerImages() const {
+  std::vector<SamplerImage> images;
+  images.reserve(sampler_values_.size());
+  for(const auto& [slot,sampler]:sampler_values_) images.push_back({slot,sampler});
+  return images;
 }
 std::vector<float> ShaderBindings::ReadFloatVector(const std::string& name) const {
   const auto found=variables_.find(name);

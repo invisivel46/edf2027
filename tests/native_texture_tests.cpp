@@ -125,7 +125,7 @@ int main() {
     invalid = Header(0,4,1); Reject(*backend,invalid);
     invalid = Header(4,4,1); Word(invalid,80,4); Word(invalid,84,0x30315844);
     Reject(*backend,invalid); // DX10 is deliberately not silently misread.
-    auto capture_target=CreateNativeRenderTarget(*device.Get(),3,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    auto capture_target=CreateNativeRenderTarget(*backend,3,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     const std::array<uint16_t,24> capture_pixels{
       0x3c00,0,0,0x3c00, 0,0x3800,0,0x3c00, 0,0,0x4000,0x3c00,
       0xbc00,0,0,0x3c00, 1,1,1,0x3c00, 0x7e00,0,0,0x3c00};
@@ -144,7 +144,7 @@ int main() {
       0,0,0, 0,0,0, 255,0,255, 0,0,0};
     Require(std::equal(expected_bgr.begin(),expected_bgr.end(),bmp.begin()+54),"native BMP orientation/channel/clamp/padding");
     Require(!capture_target.content_valid && !capture_target.sampled.content_valid,"diagnostic capture published partial target");
-    auto output_capture=CreateNativeRenderTarget(*device.Get(),3,2,DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto output_capture=CreateNativeRenderTarget(*backend,3,2,DXGI_FORMAT_R8G8B8A8_UNORM);
     const std::array<uint8_t,24> output_pixels{1,2,3,4, 5,6,7,8, 9,10,11,12,
                                              13,14,15,16, 17,18,19,20, 21,22,23,24};
     context->UpdateSubresource(output_capture.surface.Get(),0,nullptr,output_pixels.data(),12,0);
@@ -155,8 +155,8 @@ int main() {
     Require(output_bmp.size()==78 && std::equal(output_bgr.begin(),output_bgr.end(),output_bmp.begin()+54),"native RGBA8 capture changed channels/rows/padding");
     Require(!output_capture.content_valid && !output_capture.sampled.content_valid,"output capture initialized partial frame");
     for(uint32_t samples:{2u,4u}) {
-      auto msaa=CreateNativeRenderTarget(*device.Get(),4,2,DXGI_FORMAT_R16G16B16A16_FLOAT,samples);
-      auto depth=CreateNativeDepthTarget(*device.Get(),4,2,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples);
+      auto msaa=CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT,samples);
+      auto depth=CreateNativeDepthTarget(*backend,4,2,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples);
       D3D11_TEXTURE2D_DESC color_desc{},depth_desc{},sample_desc{};
       msaa.surface->GetDesc(&color_desc); depth.surface->GetDesc(&depth_desc);
       msaa.sampled.resource->GetDesc(&sample_desc);
@@ -231,13 +231,13 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
     }
     for(uint32_t samples:{0u,3u,8u,UINT32_MAX}) {
       bool color_rejected=false,depth_rejected=false;
-      try { CreateNativeRenderTarget(*device.Get(),4,2,DXGI_FORMAT_R16G16B16A16_FLOAT,samples); }
+      try { CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT,samples); }
       catch(const std::runtime_error&) {color_rejected=true;}
-      try { CreateNativeDepthTarget(*device.Get(),4,2,DXGI_FORMAT_D32_FLOAT,samples); }
+      try { CreateNativeDepthTarget(*backend,4,2,DXGI_FORMAT_D32_FLOAT,samples); }
       catch(const std::runtime_error&) {depth_rejected=true;}
       Require(color_rejected && depth_rejected,"unsupported sample count accepted");
     }
-    auto target = CreateNativeRenderTarget(*device.Get(),4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+    auto target = CreateNativeRenderTarget(*backend,4,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
     Require(!target.content_valid && !target.sampled.content_valid,"allocated target marked initialized");
     ResolveNativeRenderTarget(*context.Get(),target);
     Require(!target.sampled.content_valid,"unwritten resolve marked initialized");
@@ -313,11 +313,11 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
     catch (const std::runtime_error&) { rejected_color_clear=true; }
     Require(rejected_color_clear && !absent.content_valid,"invalid color clear initialized target");
     bool invalid_target = false;
-    try { CreateNativeRenderTarget(*device.Get(),0,1,DXGI_FORMAT_R16_FLOAT); }
+    try { CreateNativeRenderTarget(*backend,0,1,DXGI_FORMAT_R16_FLOAT); }
     catch (const std::runtime_error&) { invalid_target = true; }
     Require(invalid_target,"zero-sized target accepted");
     {
-      auto history=CreateNativeLuminanceTarget(*device.Get(),1,1);
+      auto history=CreateNativeLuminanceTarget(*backend,1,1);
       std::array<uint8_t,4096> initial_page{};
       initial_page.back()=1;
       Require(!ImportZeroLuminanceHistory(*context.Get(),history,initial_page),"nonuniform initial history accepted");
@@ -338,9 +338,9 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       context->Unmap(history_readback.Get(),0);
       Require(history_correct,"initial history R111 pixels differ");
       Require(!ImportZeroLuminanceHistory(*context.Get(),history,initial_page),"history import overwrote existing data");
-      auto invalid_history=CreateNativeLuminanceTarget(*device.Get(),2,1);
+      auto invalid_history=CreateNativeLuminanceTarget(*backend,2,1);
       Require(!ImportZeroLuminanceHistory(*context.Get(),invalid_history,initial_page),"non-1x1 history accepted");
-      auto luminance=CreateNativeLuminanceTarget(*device.Get(),9,3);
+      auto luminance=CreateNativeLuminanceTarget(*backend,9,3);
       Require(!luminance.content_valid && !luminance.sampled.content_valid,"luminance allocation initialized");
       ResolveNativeRenderTarget(*context.Get(),luminance);
       Require(!luminance.sampled.content_valid,"unwritten luminance resolve initialized");
@@ -382,7 +382,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       context->OMSetRenderTargets(0,nullptr,nullptr);
     }
     {
-      auto bloom=CreateNativeBloomTarget(*device.Get(),9,3);
+      auto bloom=CreateNativeBloomTarget(*backend,9,3);
       const std::array<uint16_t,4> hdr{0xbc00,0x3800,0x4000,0x3400};
       std::array<uint16_t,108> pixels{};
       for (size_t i=0;i<pixels.size();++i) pixels[i]=hdr[i%4];
@@ -409,7 +409,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       };
       verify_bloom();
       for(uint32_t samples:{1u,2u,4u}) {
-        auto direct=CreateNativeRenderTarget(*device.Get(),9,3,DXGI_FORMAT_R16G16B16A16_FLOAT,samples);
+        auto direct=CreateNativeRenderTarget(*backend,9,3,DXGI_FORMAT_R16G16B16A16_FLOAT,samples);
         const float clear[]{-1,.5f,2,.25f};
         context->ClearRenderTargetView(direct.target.Get(),clear);
         direct.content_valid=true;
@@ -421,7 +421,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
         Require(!bloom.sampled.content_valid,"unwritten direct frame published");
         verify_bloom(); // Invalidating must not overwrite old sampled bytes.
         direct.content_valid=true;
-        auto opaque=CreateNativeOpaqueFrameTarget(*device.Get(),9,3);
+        auto opaque=CreateNativeOpaqueFrameTarget(*backend,9,3);
         ResolveNativeRgba8Frame(*context.Get(),direct,opaque);
         Require(opaque.sampled.content_valid,"opaque direct resolve not initialized");
         for(uint32_t y=0;y<3;++y) for(uint32_t x=0;x<9;++x) {
@@ -431,7 +431,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
         }
       }
       {
-        auto wrong=CreateNativeRenderTarget(*device.Get(),8,3,DXGI_FORMAT_R16G16B16A16_FLOAT);
+        auto wrong=CreateNativeRenderTarget(*backend,8,3,DXGI_FORMAT_R16G16B16A16_FLOAT);
         bool rejected=false;
         try { ResolveNativeRgba8Frame(*context.Get(),wrong,bloom); }
         catch(const std::exception&) { rejected=true; }
@@ -443,11 +443,11 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
       }
       ClearNativeColorTarget(*context.Get(),bloom,0xffffffff);
       verify_bloom(); // Retain previous resolved blur until the explicit copy.
-      auto not_history=CreateNativeBloomTarget(*device.Get(),1,1);
+      auto not_history=CreateNativeBloomTarget(*backend,1,1);
       std::array<uint8_t,4096> zero{};
       Require(!ImportZeroLuminanceHistory(*context.Get(),not_history,zero),"RGBA8 target accepted as luminance history");
     }
-    auto depth=CreateNativeDepthTarget(*device.Get(),4,2,DXGI_FORMAT_D24_UNORM_S8_UINT);
+    auto depth=CreateNativeDepthTarget(*backend,4,2,DXGI_FORMAT_D24_UNORM_S8_UINT);
     D3D11_TEXTURE2D_DESC depth_desc{}; depth.surface->GetDesc(&depth_desc);
     depth_desc.Usage=D3D11_USAGE_STAGING; depth_desc.BindFlags=0;
     depth_desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
@@ -473,13 +473,13 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
     try { ClearNativeDepthTarget(*context.Get(),depth,true,false,2,0); }
     catch (const std::runtime_error&) { rejected_clear=true; }
     Require(rejected_clear,"out-of-range depth accepted"); verify_depth(0xa6000000);
-    auto depth32=CreateNativeDepthTarget(*device.Get(),4,2,DXGI_FORMAT_D32_FLOAT);
+    auto depth32=CreateNativeDepthTarget(*backend,4,2,DXGI_FORMAT_D32_FLOAT);
     rejected_clear=false;
     try { ClearNativeDepthTarget(*context.Get(),depth32,false,true,0,1); }
     catch (const std::runtime_error&) { rejected_clear=true; }
     Require(rejected_clear && !depth32.stencil_valid,"stencil clear accepted without stencil storage");
     for (auto format : {DXGI_FORMAT_D32_FLOAT,DXGI_FORMAT_D32_FLOAT_S8X24_UINT}) {
-      auto inspected=CreateNativeDepthTarget(*device.Get(),4,3,format);
+      auto inspected=CreateNativeDepthTarget(*backend,4,3,format);
       ClearNativeDepthTarget(*context.Get(),inspected,true,false,0,0);
       auto coverage=InspectNativeDepth(*context.Get(),*inspected.surface.Get(),0);
       Require(!coverage.changed_pixels && !coverage.nonfinite_pixels && coverage.minimum==0 && coverage.maximum==0,
@@ -490,7 +490,7 @@ float4 PS():SV_TARGET { return float4(1,0,0,1); }
         coverage.vertical_bands==std::array<uint64_t,3>{4,4,4},"depth diagnostic stride/bands/range");
     }
     {
-      auto region=CreateNativeRenderTarget(*device.Get(),3,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
+      auto region=CreateNativeRenderTarget(*backend,3,2,DXGI_FORMAT_R16G16B16A16_FLOAT);
       std::array<uint16_t,24> data{};
       // Finite magenta must not collide with the diagnostic's BMP marker.
       for(size_t p=0;p<6;++p) {data[p*4]=0x3c00;data[p*4+2]=0x3c00;data[p*4+3]=0x7c00;}

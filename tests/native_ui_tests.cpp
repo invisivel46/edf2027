@@ -1,3 +1,4 @@
+#include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d11_ui.h"
 #include "native_graphics/d3d11_texture.h"
 #include <array>
@@ -18,8 +19,12 @@ int main() {
     ComPtr<ID3D11Device> device; ComPtr<ID3D11DeviceContext> context;
     Require(SUCCEEDED(D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,
       D3D11_SDK_VERSION,&device,nullptr,&context)),"UI WARP creation");
+    // Render targets are created through the backend now; adopting this device
+    // keeps them usable by the direct D3D11 calls the rest of this test makes.
+    auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
+    Require(bool(backend),"adopted backend");
     NativeUiRenderer renderer(*device.Get());
-    auto target=CreateNativeRenderTarget(*device.Get(),4,4,DXGI_FORMAT_R8G8B8A8_UNORM);
+    auto target=CreateNativeRenderTarget(*backend,4,4,DXGI_FORMAT_R8G8B8A8_UNORM);
     std::array<NativeUiVertex,4> vertices{{{0,0,0,0,0x800000ff},{2,0,1,0,0x800000ff},
       {2,2,1,1,0x800000ff},{0,2,0,1,0x800000ff}}};
     const uint16_t indices[]{0,1,2,0,2,3};

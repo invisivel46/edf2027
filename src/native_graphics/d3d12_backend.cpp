@@ -646,6 +646,16 @@ class D3D12Backend final : public NativeRenderBackend {
     return texture;
   }
 
+  bool SupportsSamples(uint32_t format,uint32_t samples) override {
+    if(samples==1) return true;
+    if(samples!=2 && samples!=4) return false;
+    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS levels{};
+    levels.Format=static_cast<DXGI_FORMAT>(format);
+    levels.SampleCount=samples;
+    return SUCCEEDED(gpu_.device()->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
+                                                        &levels,sizeof(levels))) && levels.NumQualityLevels;
+  }
+
   std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc) override {
     TrackedResource tracked;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,

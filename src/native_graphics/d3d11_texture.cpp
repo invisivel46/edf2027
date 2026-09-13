@@ -14,14 +14,18 @@
 
 namespace edf::native {
 namespace {
-void ValidateSamples(ID3D11Device& device,DXGI_FORMAT format,uint32_t samples) {
+void ValidateSamples(NativeRenderBackend& backend,DXGI_FORMAT format,uint32_t samples) {
   if(samples!=1 && samples!=2 && samples!=4)
     throw std::runtime_error("unsupported native sample count");
-  if(samples>1) {
-    UINT levels=0;
-    if(FAILED(device.CheckMultisampleQualityLevels(format,samples,&levels)) || !levels)
-      throw std::runtime_error("native format/sample count unavailable");
-  }
+  if(!backend.SupportsSamples(format,samples))
+    throw std::runtime_error("native format/sample count unavailable");
+}
+// The D3D11 handles behind a target the backend made, for the paths that still
+// bind, capture and hand off through the context. Null on a backend that is not
+// D3D11, which every one of those paths then refuses rather than using nothing.
+void AttachD3D11Handles(NativeRenderTarget& target) {
+  target.surface=NativeD3D11RenderTargetResource(*target.backend_surface);
+  target.target=NativeD3D11RenderTargetView(*target.backend_surface);
 }
 Microsoft::WRL::ComPtr<ID3D11Texture2D> ResolveDiagnosticColor(
     ID3D11DeviceContext& context,ID3D11Texture2D& surface) {
@@ -51,21 +55,21 @@ uint8_t Channel(uint32_t pixel, uint32_t mask, uint8_t absent) {
   return static_cast<uint8_t>((uint64_t((pixel & mask) >> shift) * 255 + maximum / 2) / maximum);
 }
 }
-NativeDepthTarget CreateNativeDepthTarget(ID3D11Device& device,uint32_t width,
+NativeDepthTarget CreateNativeDepthTarget(NativeRenderBackend& backend,uint32_t width,
                                           uint32_t height,DXGI_FORMAT format,uint32_t samples) {
   if (!width || !height || width>16384 || height>16384 ||
       (format!=DXGI_FORMAT_D24_UNORM_S8_UINT && format!=DXGI_FORMAT_D32_FLOAT &&
        format!=DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
     throw std::runtime_error("unsupported native depth target dimensions/format");
-  ValidateSamples(device,format,samples);
+  ValidateSamples(backend,format,samples);
   NativeDepthTarget result;
-  D3D11_TEXTURE2D_DESC desc{};
-  desc.Width=width; desc.Height=height; desc.MipLevels=desc.ArraySize=1;
-  desc.Format=format; desc.SampleDesc.Count=samples;
-  desc.Usage=D3D11_USAGE_DEFAULT; desc.BindFlags=D3D11_BIND_DEPTH_STENCIL;
-  if (FAILED(device.CreateTexture2D(&desc,nullptr,&result.surface)) ||
-      FAILED(device.CreateDepthStencilView(result.surface.Get(),nullptr,&result.target)))
-    throw std::runtime_error("native depth target creation failed");
+  NativeBackendTextureDesc desc{};
+  desc.width=width; desc.height=height; desc.levels=1;
+  desc.format=format; desc.samples=samples; desc.depth=true;
+  result.backend_target=backend.CreateRenderTarget(desc);
+  if(!result.backend_target) throw std::runtime_error("native depth target creation failed");
+  result.surface=NativeD3D11RenderTargetResource(*result.backend_target);
+  result.target=NativeD3D11DepthStencilView(*result.backend_target);
   result.width=width; result.height=height;
   result.has_stencil=format!=DXGI_FORMAT_D32_FLOAT;
   return result;
@@ -79,7 +83,7 @@ void ClearNativeDepthTarget(ID3D11DeviceContext& context,NativeDepthTarget& targ
   if (depth) target.depth_valid=true;
   if (stencil) target.stencil_valid=true;
 }
-NativeRenderTarget CreateNativeRenderTarget(ID3D11Device& device, uint32_t width,
+NativeRenderTarget CreateNativeRenderTarget(NativeRenderBackend& backend, uint32_t width,
                                            uint32_t height, DXGI_FORMAT format,uint32_t samples) {
   if (!width || !height || width > 16384 || height > 16384)
     throw std::runtime_error("invalid native render target dimensions");
@@ -90,54 +94,71 @@ NativeRenderTarget CreateNativeRenderTarget(ID3D11Device& device, uint32_t width
     case DXGI_FORMAT_R8G8B8A8_UNORM: break;
     default: throw std::runtime_error("unsupported native render target format");
   }
-  ValidateSamples(device,format,samples);
+  ValidateSamples(backend,format,samples);
   NativeRenderTarget result;
-  D3D11_TEXTURE2D_DESC desc{};
-  desc.Width = width; desc.Height = height;
-  desc.MipLevels = desc.ArraySize = 1; desc.SampleDesc.Count=samples;
-  desc.Format = format; desc.Usage = D3D11_USAGE_DEFAULT;
-  desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-  if (FAILED(device.CreateTexture2D(&desc,nullptr,&result.surface)) ||
-      FAILED(device.CreateRenderTargetView(result.surface.Get(),nullptr,&result.target)))
-    throw std::runtime_error("native render surface creation failed");
-  desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  desc.SampleDesc.Count=1; // Shaders sample the explicit single-sample resolve.
+  NativeBackendTextureDesc desc{};
+  desc.width=width; desc.height=height; desc.levels=1;
+  desc.format=format; desc.samples=samples; desc.render_target=true;
+  result.backend_surface=backend.CreateRenderTarget(desc);
+  if(!result.backend_surface) throw std::runtime_error("native render surface creation failed");
+  AttachD3D11Handles(result);
+  // Shaders sample the explicit single-sample resolve, never the surface.
+  NativeBackendTextureDesc sampled_desc{};
+  sampled_desc.width=width; sampled_desc.height=height; sampled_desc.levels=1;
+  sampled_desc.format=format;
   auto& sampled = result.sampled;
-  if (FAILED(device.CreateTexture2D(&desc,nullptr,&sampled.resource)) ||
-      FAILED(device.CreateShaderResourceView(sampled.resource.Get(),nullptr,&sampled.view)))
-    throw std::runtime_error("native resolve texture creation failed");
+  sampled.backend=backend.CreateTexture(sampled_desc,{});
+  if(!sampled.backend) throw std::runtime_error("native resolve texture creation failed");
+  sampled.resource=NativeD3D11TextureResource(*sampled.backend);
+  sampled.view=NativeD3D11TextureView(*sampled.backend);
   sampled.width = width; sampled.height = height; sampled.mip_count = 1;
   sampled.content_valid = false;
   return result;
 }
-static NativeRenderTarget CreateConvertedTarget(ID3D11Device& device,uint32_t width,uint32_t height,
+static NativeRenderTarget CreateConvertedTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height,
   DXGI_FORMAT surface_format,DXGI_FORMAT sampled_format,std::string_view source,NativeRenderTarget::Conversion conversion) {
-  auto result=CreateNativeRenderTarget(device,width,height,surface_format);
+  // The surface is read back by the conversion, so it is declared sampled. The
+  // converted result is written by a compute shader through a UAV, which is the
+  // one thing here the seam cannot express, and so the one thing still built
+  // from the device.
+  NativeRenderTarget result;
   result.conversion=conversion;
-  D3D11_TEXTURE2D_DESC desc{};
-  result.surface->GetDesc(&desc);
-  desc.BindFlags=D3D11_BIND_RENDER_TARGET|D3D11_BIND_SHADER_RESOURCE;
-  result.target.Reset(); result.surface.Reset();
-  if (FAILED(device.CreateTexture2D(&desc,nullptr,&result.surface)) ||
-      FAILED(device.CreateRenderTargetView(result.surface.Get(),nullptr,&result.target)) ||
-      FAILED(device.CreateShaderResourceView(result.surface.Get(),nullptr,&result.resolve_source)))
-    throw std::runtime_error("native converted render surface creation failed");
-  desc.Format=sampled_format;
-  desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
-  result.sampled.view.Reset(); result.sampled.resource.Reset();
-  if (FAILED(device.CreateTexture2D(&desc,nullptr,&result.sampled.resource)) ||
-      FAILED(device.CreateShaderResourceView(result.sampled.resource.Get(),nullptr,&result.sampled.view)) ||
-      FAILED(device.CreateUnorderedAccessView(result.sampled.resource.Get(),nullptr,&result.resolve_destination)))
+  NativeBackendTextureDesc desc{};
+  desc.width=width; desc.height=height; desc.levels=1;
+  desc.format=surface_format; desc.render_target=true; desc.sampled=true;
+  result.backend_surface=backend.CreateRenderTarget(desc);
+  if(!result.backend_surface) throw std::runtime_error("native converted render surface creation failed");
+  AttachD3D11Handles(result);
+  auto* surface_texture=result.backend_surface->texture();
+  if(!surface_texture) throw std::runtime_error("a converted target surface cannot be sampled");
+  result.resolve_source=NativeD3D11TextureView(*surface_texture);
+
+  auto* device=NativeD3D11BackendDevice(backend);
+  if(!device)
+    throw std::runtime_error("a converting render target needs a compute pass, which the "+
+                             std::string(backend.name())+" backend cannot be given through the seam yet");
+  D3D11_TEXTURE2D_DESC sampled_desc{};
+  sampled_desc.Width=width; sampled_desc.Height=height;
+  sampled_desc.MipLevels=sampled_desc.ArraySize=1;
+  sampled_desc.SampleDesc={1,0};
+  sampled_desc.Format=sampled_format;
+  sampled_desc.Usage=D3D11_USAGE_DEFAULT;
+  sampled_desc.BindFlags=D3D11_BIND_SHADER_RESOURCE|D3D11_BIND_UNORDERED_ACCESS;
+  if (FAILED(device->CreateTexture2D(&sampled_desc,nullptr,&result.sampled.resource)) ||
+      FAILED(device->CreateShaderResourceView(result.sampled.resource.Get(),nullptr,&result.sampled.view)) ||
+      FAILED(device->CreateUnorderedAccessView(result.sampled.resource.Get(),nullptr,&result.resolve_destination)))
     throw std::runtime_error("native converted sampled texture creation failed");
+  result.sampled.width=width; result.sampled.height=height; result.sampled.mip_count=1;
+  result.sampled.content_valid=false;
   Microsoft::WRL::ComPtr<ID3DBlob> code,errors;
   if (FAILED(D3DCompile(source.data(),source.size(),"native-target-resolve",nullptr,nullptr,"CS","cs_5_0",
                         D3DCOMPILE_OPTIMIZATION_LEVEL3,0,&code,&errors)) ||
-      FAILED(device.CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&result.resolve_shader)))
+      FAILED(device->CreateComputeShader(code->GetBufferPointer(),code->GetBufferSize(),nullptr,&result.resolve_shader)))
     throw std::runtime_error("native target resolve shader creation failed");
   return result;
 }
-NativeRenderTarget CreateNativeLuminanceTarget(ID3D11Device& device,uint32_t width,uint32_t height) {
-  return CreateConvertedTarget(device,width,height,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R16G16B16A16_FLOAT,R"(
+NativeRenderTarget CreateNativeLuminanceTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height) {
+  return CreateConvertedTarget(backend,width,height,DXGI_FORMAT_R32_FLOAT,DXGI_FORMAT_R16G16B16A16_FLOAT,R"(
 Texture2D<float> Source : register(t0);
 RWTexture2D<float4> Destination : register(u0);
 [numthreads(8,8,1)] void CS(uint3 at:SV_DispatchThreadID) {
@@ -145,10 +166,10 @@ RWTexture2D<float4> Destination : register(u0);
   if (at.x<width && at.y<height) Destination[at.xy]=float4(Source.Load(int3(at.xy,0)),1,1,1);
 })",NativeRenderTarget::Conversion::luminance);
 }
-NativeRenderTarget CreateNativeBloomTarget(ID3D11Device& device,uint32_t width,uint32_t height) {
+NativeRenderTarget CreateNativeBloomTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height) {
   // The guest swaps red/blue on resolve for the BGRA texture and swaps them
   // back on sampling. Native RGBA storage directly represents logical color.
-  return CreateConvertedTarget(device,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R8G8B8A8_UNORM,R"(
+  return CreateConvertedTarget(backend,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R8G8B8A8_UNORM,R"(
 Texture2D<float4> Source : register(t0);
 RWTexture2D<float4> Destination : register(u0);
 [numthreads(8,8,1)] void CS(uint3 at:SV_DispatchThreadID) {
@@ -156,10 +177,10 @@ RWTexture2D<float4> Destination : register(u0);
   if (at.x<width && at.y<height) Destination[at.xy]=Source.Load(int3(at.xy,0));
 })",NativeRenderTarget::Conversion::rgba8);
 }
-NativeRenderTarget CreateNativeOpaqueFrameTarget(ID3D11Device& device,uint32_t width,uint32_t height) {
+NativeRenderTarget CreateNativeOpaqueFrameTarget(NativeRenderBackend& backend,uint32_t width,uint32_t height) {
   // XRGB backbuffers have constant-one sampled alpha. Logical RGB is already
   // channel-correct; no tone mapping or display gamma belongs in this resolve.
-  return CreateConvertedTarget(device,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R8G8B8A8_UNORM,R"(
+  return CreateConvertedTarget(backend,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,DXGI_FORMAT_R8G8B8A8_UNORM,R"(
 Texture2D<float4> Source : register(t0);
 RWTexture2D<float4> Destination : register(u0);
 [numthreads(8,8,1)] void CS(uint3 at:SV_DispatchThreadID) {

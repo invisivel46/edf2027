@@ -1,5 +1,6 @@
 #pragma once
 #include "d3d11_effect.h"
+#include "native_render_backend.h"
 #include <map>
 #include <array>
 #include <optional>
@@ -35,8 +36,13 @@ class ShaderBindings {
     std::optional<UINT> texture_,sampler_;
   };
   ResourceBinding ResolveResource(const std::string& name) const;
-  bool TrySetTexture(const ResourceBinding& binding,ID3D11ShaderResourceView* texture);
-  bool TrySetSampler(const ResourceBinding& binding,ID3D11SamplerState* sampler);
+  // Textures and samplers are backend handles, not D3D11 views. A texture is
+  // held by shared_ptr because the registry it came from can drop it while a
+  // material still has it bound - which the ComPtr this replaces also handled,
+  // and a raw pointer would not. Samplers are owned by the backend for its
+  // whole life, so those stay raw.
+  bool TrySetTexture(const ResourceBinding& binding,std::shared_ptr<NativeBackendTexture> texture);
+  bool TrySetSampler(const ResourceBinding& binding,NativeBackendSampler* sampler);
   bool Owns(const FloatRegisterBinding& binding) const { return binding.owner_==generation_; }
   bool SetGuestFloatRegisters(const FloatRegisterBinding& binding,std::span<const uint8_t> registers);
   ShaderBindings(ID3D11Device& device, NativeShader shader);
@@ -52,15 +58,15 @@ class ShaderBindings {
   bool PatchGuestFloatRegisters(const FloatRegisterBinding& binding,size_t first_slot,
                                std::span<const uint8_t> registers);
   size_t GuestFloatRegisterBytes(const std::string& name) const;
-  void SetTexture(const std::string& name, ID3D11ShaderResourceView* texture);
-  bool TrySetTexture(const std::string& name, ID3D11ShaderResourceView* texture);
+  void SetTexture(const std::string& name, std::shared_ptr<NativeBackendTexture> texture);
+  bool TrySetTexture(const std::string& name, std::shared_ptr<NativeBackendTexture> texture);
   void ClearTextures();
-  // Diagnostic snapshot of the current named view; does not change binding state.
-  Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> ReadTexture(const std::string& name) const;
-  Microsoft::WRL::ComPtr<ID3D11SamplerState> ReadSampler(const std::string& name) const;
+  // Diagnostic snapshot of the current named binding; changes no state.
+  NativeBackendTexture* ReadTexture(const std::string& name) const;
+  NativeBackendSampler* ReadSampler(const std::string& name) const;
   void ClearSamplers();
-  void SetSampler(const std::string& name, ID3D11SamplerState* sampler);
-  bool TrySetSampler(const std::string& name, ID3D11SamplerState* sampler);
+  void SetSampler(const std::string& name, NativeBackendSampler* sampler);
+  bool TrySetSampler(const std::string& name, NativeBackendSampler* sampler);
   void Bind(ID3D11DeviceContext& context);
   // Upload and set only the constants, for a draw that follows one which left
   // this shader, its textures and its samplers already bound. In a run of
@@ -80,8 +86,16 @@ class ShaderBindings {
   // has no such dependency, and it is the shape both target APIs want anyway.
   struct ConstantImage { UINT slot; std::span<const uint8_t> bytes; };
   std::vector<ConstantImage> ConstantImages() const;
+  // What a recorder has to be told to bind, slot by slot, including the empty
+  // slots: leaving one unset inherits the previous material's resource, which
+  // is a wrong texture rather than a missing one.
+  struct TextureImage { UINT slot; NativeBackendTexture* texture; };
+  struct SamplerImage { UINT slot; NativeBackendSampler* sampler; };
+  std::vector<TextureImage> TextureImages() const;
+  std::vector<SamplerImage> SamplerImages() const;
   bool HasAllTextureInputs() const;
   bool UsesTextureResource(ID3D11Resource& resource) const;
+  bool UsesTexture(const NativeBackendTexture& texture) const;
   std::vector<float> ReadFloatVector(const std::string& name) const;
   // Flattened float array: `Elements * Columns` values, skipping each element's
   // constant-buffer padding. Missing/optimized-out names return an empty span;
@@ -106,8 +120,8 @@ class ShaderBindings {
   std::vector<Buffer> buffers_;
   std::map<std::string, Variable> variables_;
   std::map<std::string, UINT> textures_, samplers_;
-  std::map<UINT, Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> texture_values_;
-  std::map<UINT, Microsoft::WRL::ComPtr<ID3D11SamplerState>> sampler_values_;
+  std::map<UINT, std::shared_ptr<NativeBackendTexture>> texture_values_;
+  std::map<UINT, NativeBackendSampler*> sampler_values_;
   // Immutable reflected runs, with live pointers backed by the owning maps.
   // These cache binding data, never D3D context state: Bind always re-emits it.
   std::vector<std::pair<UINT,UINT>> texture_runs_,sampler_runs_;

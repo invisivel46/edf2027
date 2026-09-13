@@ -29,10 +29,10 @@ class NativeFontBindings {
         i==3?std::span<const uint8_t>(scale):vs.subspan(i*16,16));
     for(size_t i=0;i<pixel_.size();++i) pixel.SetGuestFloatRegisters(pixel_[i],ps.subspan(i*16,16));
   }
-  void SetTexture(ShaderBindings& pixel,ID3D11ShaderResourceView* view) const {
-    if(!pixel.TrySetTexture(texture_,view)) throw std::runtime_error("missing native font texture binding");
+  void SetTexture(ShaderBindings& pixel,std::shared_ptr<NativeBackendTexture> texture) const {
+    if(!pixel.TrySetTexture(texture_,std::move(texture))) throw std::runtime_error("missing native font texture binding");
   }
-  void SetSampler(ShaderBindings& pixel,ID3D11SamplerState* sampler) const {
+  void SetSampler(ShaderBindings& pixel,NativeBackendSampler* sampler) const {
     if(!pixel.TrySetSampler(sampler_,sampler)) throw std::runtime_error("missing native font sampler binding");
   }
  private:

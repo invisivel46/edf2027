@@ -41,10 +41,10 @@ class NativeXuiPixelBindings {
     shader.SetGuestFloatRegisters(factor_,factor);
     if(solid_) shader.SetGuestFloatRegisters(brush_,brush);
   }
-  void SetTexture(ShaderBindings& shader,ID3D11ShaderResourceView* view) const {
-    if(solid_ || !shader.TrySetTexture(texture_,view)) throw std::runtime_error("missing native XUI texture binding");
+  void SetTexture(ShaderBindings& shader,std::shared_ptr<NativeBackendTexture> texture) const {
+    if(solid_ || !shader.TrySetTexture(texture_,std::move(texture))) throw std::runtime_error("missing native XUI texture binding");
   }
-  void SetSampler(ShaderBindings& shader,ID3D11SamplerState* sampler) const {
+  void SetSampler(ShaderBindings& shader,NativeBackendSampler* sampler) const {
     if(solid_ || !shader.TrySetSampler(sampler_,sampler)) throw std::runtime_error("missing native XUI sampler binding");
   }
  private:
