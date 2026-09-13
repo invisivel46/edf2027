@@ -131,8 +131,8 @@ REXCVAR_DEFINE_INT32(edf_native_probe_height, 1, "EDF2027", "Invalid-RGB diagnos
 REXCVAR_DEFINE_INT32(edf_native_probe_draw_limit, 4096, "EDF2027", "Maximum invalid-RGB diagnostic draws, capped at 65536");
 REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
-REXCVAR_DEFINE_STRING(edf_native_backend, "", "EDF2027",
-                     "Graphics backend to create: d3d11, d3d11-warp, d3d12, d3d12-warp. Empty keeps the renderer on its direct D3D11 path. An unknown name is refused at startup rather than silently falling back");
+REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
+                     "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
 REXCVAR_DEFINE_BOOL(edf_native_backend_preview, false, "EDF2027",
                    "Open a second window drawn and presented entirely by the selected backend. Needs --edf_native_backend and --edf_native_publish_frames. The renderer's own window is untouched");
 REXCVAR_DEFINE_BOOL(edf_native_batch_audit, false, "EDF2027",
@@ -1411,6 +1411,48 @@ NativeViewportState ReadNativeDrawViewport(const Reader& reader,uint32_t device)
   const auto render=ReadAuditedRenderStateWords(reader,device);
   return DecodeDrawViewport(ReadViewportWords(reader,device,render[5]!=0));
 }
+namespace {
+// Builds the backend named by --edf_native_backend, once, with the state lock
+// already held. One place knows how to do this; the public accessor below only
+// adds the lock.
+//
+// Refused on an unknown name rather than falling back to whatever exists: an
+// A/B run silently comparing a backend against itself would be worse than a
+// failure to start.
+edf::native::NativeRenderBackend& EnsureBackendLocked(Bridge& state) {
+  if(state.backend) return *state.backend;
+  const std::string name=REXCVAR_GET(edf_native_backend);
+  if(name.empty()) throw std::runtime_error("a render backend was asked for but --edf_native_backend is empty");
+  if(!state.device) throw std::runtime_error("a render backend was asked for before the renderer had a device");
+  edf::native::RegisterNativeD3D11Backend();
+  edf::native::RegisterNativeD3D12Backend();
+  try {
+    // "d3d11" means the device this renderer already has, not a second one: a
+    // separate device could not share a texture or a target with the paths
+    // that still draw through D3D11 directly, which is what lets the port
+    // proceed one path at a time.
+    state.backend=name=="d3d11"
+      ? edf::native::AdoptNativeD3D11Backend(*state.device.Get(),*state.context.Get())
+      : edf::native::CreateNativeRenderBackend(name);
+  } catch(const std::exception& error) {
+    std::string known;
+    for(const auto& candidate:edf::native::NativeRenderBackendNames())
+      known+=(known.empty()?"":", ")+candidate;
+    REXLOG_ERROR("Native render backend: --edf_native_backend={} was refused: {}. Available: {}",
+      name,error.what(),known.empty()?std::string("none"):known);
+    throw;
+  }
+  REXLOG_INFO("Native render backend ready: name={}, recorders={}, parallel_recording={}; selected by --edf_native_backend={}. {}",
+    std::string(state.backend->name()),state.backend->RecorderCount(),
+    state.backend->SupportsParallelRecording(),name,
+    name=="d3d11"?"Sharing this renderer's own device, so ported and unported paths draw into the same targets."
+                 :"On its own device, so it cannot share targets with the paths that still draw through D3D11 directly.");
+  for(const auto& message:state.backend->DrainValidationMessages())
+    REXLOG_WARN("Native render backend validation: {}",message);
+  return *state.backend;
+}
+}  // namespace
+
 void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
   REXLOG_INFO("Native render-state consumption: owned={}, audit={}",
     REXCVAR_GET(edf_native_owned_render_state),REXCVAR_GET(edf_native_render_state_audit));
@@ -1434,48 +1476,16 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
                               D3D11_SDK_VERSION, &state.device, nullptr, &state.context)))
     throw std::runtime_error("native shader bridge: D3D11 device creation failed");
   REXLOG_INFO("Native shader bridge: initialized hardware D3D11 device");
-  if(const std::string name=REXCVAR_GET(edf_native_backend);!name.empty()) {
-    edf::native::RegisterNativeD3D11Backend();
-    edf::native::RegisterNativeD3D12Backend();
-    // Refused on an unknown name. Falling back to whichever backend exists
-    // would mean an A/B run silently comparing a backend against itself.
-    //
-    // Caught only to say why. Throwing out of here stops the game with the
-    // reason nowhere in the log, which is failing silently with extra steps;
-    // the reason goes in first, then the throw stands.
-    try {
-      // "d3d11" means the device this renderer already has, not a second one.
-      // A separate device could not share a texture or a target with the
-      // paths that have not been ported yet, which is the whole reason the
-      // port can proceed one path at a time.
-      state.backend=name=="d3d11"
-        ? edf::native::AdoptNativeD3D11Backend(*state.device.Get(),*state.context.Get())
-        : edf::native::CreateNativeRenderBackend(name);
-    } catch(const std::exception& error) {
-      std::string known;
-      for(const auto& candidate:edf::native::NativeRenderBackendNames())
-        known+=(known.empty()?"":", ")+candidate;
-      REXLOG_ERROR("Native render backend: --edf_native_backend={} was refused: {}. Available: {}",
-        name,error.what(),known.empty()?std::string("none"):known);
-      throw;
-    }
-    REXLOG_INFO("Native render backend: name={}, recorders={}, parallel_recording={}; selected by --edf_native_backend={}. {} The game's own window is still drawn by the direct D3D11 path{}",
-      std::string(state.backend->name()),state.backend->RecorderCount(),
-      state.backend->SupportsParallelRecording(),name,
-      name=="d3d11"?"Sharing this renderer's own device, so ported and unported paths can draw into the same targets.":
-                    "On its own device, so it cannot share targets with the unported paths yet.",
-      REXCVAR_GET(edf_native_backend_preview)
-        ?"; the backend preview window is drawn by this backend"
-        :"; this backend is created, not yet drawing");
-    for(const auto& message:state.backend->DrainValidationMessages())
-      REXLOG_WARN("Native render backend validation: {}",message);
-    if(REXCVAR_GET(edf_native_backend_preview)) {
-      if(!REXCVAR_GET(edf_native_publish_frames))
-        throw std::runtime_error("--edf_native_backend_preview needs --edf_native_publish_frames: it draws the frames the renderer publishes");
-      state.backend_preview=std::make_unique<edf::native::NativeD3D12Preview>(*state.backend);
-      REXLOG_INFO("Native render backend preview: opened a window drawn and presented entirely by the {} backend",
-        std::string(state.backend->name()));
-    }
+  REXLOG_INFO("Native render backend: --edf_native_backend={}; built on first use, so selecting one costs nothing until something draws through it. The renderer's own draw path is still direct D3D11 and does not use it yet",
+    REXCVAR_GET(edf_native_backend).empty()?std::string("none"):REXCVAR_GET(edf_native_backend));
+  if(REXCVAR_GET(edf_native_backend_preview)) {
+    if(!REXCVAR_GET(edf_native_publish_frames))
+      throw std::runtime_error("--edf_native_backend_preview needs --edf_native_publish_frames: it draws the frames the renderer publishes");
+    // Built here, under the lock already held, through the same creator the
+    // lazy accessor uses - so there is one place that knows how to build the
+    // selected backend rather than two that can drift.
+    state.backend_preview=std::make_unique<edf::native::NativeD3D12Preview>(
+      EnsureBackendLocked(state));
   }
   if(REXCVAR_GET(edf_native_publish_frames))
     state.presentation_frames=std::make_unique<NativeFrameHandoff>(*state.device.Get(),*state.context.Get());

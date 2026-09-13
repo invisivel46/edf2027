@@ -74,8 +74,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     fsr_sharp_ = static_cast<float>(GetDouble("present_fsr_sharpness_reduction", 0.2));
     fsr_passes_ = FsrPassesValue(GetInt("present_fsr_max_upsampling_passes", 4));
     dither_ = GetBool("present_dither", false);
-    backend_index_ = BackendIndex(GetStr("edf_native_backend", ""));
-    backend_preview_ = backend_index_ > 0 && GetBool("edf_native_backend_preview", false);
+    backend_index_ = BackendIndex(GetStr("edf_native_backend", "d3d12"));
+    backend_preview_ = backend_index_ != 2 && GetBool("edf_native_backend_preview", false);
     async_shaders_ = GetBool("async_shader_compilation", true);
     int refresh = static_cast<int>(GetDouble("video_mode_refresh_rate", 60));
     for (int i = 0; i < 4; ++i) if (refresh == kRefresh[i]) refresh_index_ = i;
@@ -121,9 +121,9 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     if (ImGui::Combo("Window size *", &res_index_, labels.c_str())) restart_ = true;
     if (res_index_ == (int)kPresets.size() - 1) { ImGui::InputInt("Width", &custom_w_); ImGui::InputInt("Height", &custom_h_); }
     if (ImGui::Combo("Graphics backend *", &backend_index_,
-                     "Direct3D 11 (default)\0" "Direct3D 11 backend\0" "Direct3D 12 backend\0")) {
+                     "Direct3D 12 (default)\0" "Direct3D 11\0" "None\0")) {
       rex::cvar::SetFlagByName("edf_native_backend", std::string(BackendValue(backend_index_)));
-      if (backend_index_ == 0) {
+      if (backend_index_ == 2) {
         // The preview window has nothing to draw it without a backend, and
         // leaving the flag set would refuse to start next time.
         backend_preview_ = false;
@@ -132,12 +132,12 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       restart_ = true;
     }
     ImGui::SameLine(); HelpMarker(
-      "The renderer is being moved onto a backend interface so a second one can be used. "
-      "Direct3D 11 (default) is the renderer as it has always been. The two backend options "
-      "create that backend at startup and report it in the log. The game's own window is still "
-      "drawn by the direct Direct3D 11 path either way - selecting Direct3D 12 does not move it "
-      "yet. Save and restart to apply.");
-    if (backend_index_ > 0) {
+      "Which backend anything drawing through the renderer's backend interface uses. Direct3D "
+      "12 is the default. It is built the first time something needs it, so this costs nothing "
+      "until something draws through it. The game's own scene rendering is still a direct "
+      "Direct3D 11 path that does not use the backend yet, so changing this does not change how "
+      "the game looks. Save and restart to apply.");
+    if (backend_index_ != 2) {
       if (ImGui::Checkbox("Backend preview window *", &backend_preview_)) {
         rex::cvar::SetFlagByName("edf_native_backend_preview", backend_preview_ ? "true" : "false");
         // The preview draws the frames the renderer publishes, so it cannot
@@ -457,13 +457,14 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   std::filesystem::path config_path_; std::string pad_name_; std::function<void()> on_close_;
   std::function<bool()> on_restart_;
   static std::string_view BackendValue(int index) {
-    return index == 1 ? "d3d11" : index == 2 ? "d3d12" : "";
+    return index == 1 ? "d3d11" : index == 2 ? "" : "d3d12";
   }
   static int BackendIndex(const std::string& value) {
     // Unknown values read as the default rather than being invented into a
     // menu position, so a hand-edited config cannot make the menu lie about
-    // what the game will start with.
-    return value == "d3d11" ? 1 : value == "d3d12" ? 2 : 0;
+    // what the game will start with. The WARP variants are diagnostic, set
+    // from the command line, and deliberately not menu positions.
+    return value == "d3d11" ? 1 : value.empty() ? 2 : 0;
   }
 
   int backend_index_ = 0;
