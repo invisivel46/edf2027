@@ -335,6 +335,69 @@ were wrong. Each is now fixed rather than worked around:
 - It could not read its own output, so a backend could not be compared against
   the one it replaces.
 
+## Backend compatibility: what the seam can and cannot express
+
+Every capability the renderer uses is now expressible through the seam and
+produces **bit-identical output on both backends**. Checked by running the same
+rendering through each and comparing pixels, not by inspection:
+
+flat draw, textured draw, block-compressed (BC1) textures, mipped upload
+sampled at an explicit level, indexed instanced draws with a per-instance
+element, constant blend factor, depth testing against a depth target,
+two render targets from one draw, 4x multisample resolve, occlusion queries.
+Zero differing pixels on every one, including the resolve, where a tolerance
+for differing sample positions turned out to be unnecessary.
+
+Four real gaps were found by checking the renderer's own state rather than
+assuming, and each would have rendered wrongly rather than failed:
+
+- **BC row pitch computed in texels rather than blocks.** A 2x2 level of a BC
+  format still costs a whole 4x4 block, so the second row of blocks came from
+  the wrong offset.
+- **BC format numbers shifted by one**, putting BC4's 8-byte blocks in with
+  BC3's 16-byte ones. This would have halved every BC3 mip offset - the game's
+  commonest texture format. The BC1 test passed anyway, which is why the format
+  table is now proved by static_assert rather than by a test.
+- **No constant blend factor.** The decode computes `requires_blend_factor` and
+  the renderer honours it; the backends bound a hardcoded white. Those
+  materials would have drawn in the wrong colour. A draw that needs one and was
+  not given one is now refused, as the renderer refuses it.
+- **No MIRROR_ONCE address mode**, which the guest sampler decode does emit.
+
+Deliberately still absent, with reasons:
+
+- **Stencil.** The renderer's own decode refuses it too, so the backends are as
+  capable as the thing they replace. It would have to be added to both at once.
+- **Vertex-stage textures and samplers.** No shader uses any - not the 44 disc
+  effects, and not the renderer's own UI, font, movie and post HLSL, which bind
+  only t0/s0/b0. Reflection at pipeline creation refuses a shader that needs
+  more, so this fails loudly if it ever stops being true.
+
+## What stands between here and D3D12 by default
+
+Compatibility is no longer the blocker. The renderer is.
+
+Every resource the game draws with is still made of D3D11 objects created by
+these files, and D3D12 cannot borrow them - unlike the D3D11 backend, which can
+adopt the renderer's own device. They have to be built through the seam:
+
+| file | lines | D3D11 references |
+|---|---|---|
+| `d3d11_texture` | 555 | 84 |
+| `d3d11_mesh` | 527 | 50 |
+| `d3d11_ui` | 156 | 44 |
+| `d3d11_render_state` | 124 | 30 |
+| `d3d11_quads` | 136 | 27 |
+| `d3d11_frame_compositor` | 115 | 25 |
+| `d3d11_bindings` | 332 | 24 |
+| `d3d11_frame_handoff` | 64 | 14 |
+| the rest (`gpu_timer`, `completion`, `signals`, `presenter`, `effect`) | 552 | 32 |
+
+Until those are ported there is nothing for D3D12 to draw, so making it the
+default would mean a device that costs memory and start-up time and renders
+nothing. The default stays D3D11 until the port lands; the flip itself is one
+line and the conformance test is what says it was clean.
+
 ## How the port actually has to happen
 
 Two facts decide this, and neither was obvious before a backend existed.
