@@ -2,6 +2,9 @@
 #define NOMINMAX
 #endif
 #include "guest_shader_bridge.h"
+#include "d3d11_backend.h"
+#include "d3d12_backend.h"
+#include "native_render_backend.h"
 #include "guest_instance_parameters.h"
 #include "guest_parameter_records.h"
 #include "guest_draw_state.h"
@@ -127,6 +130,8 @@ REXCVAR_DEFINE_INT32(edf_native_probe_height, 1, "EDF2027", "Invalid-RGB diagnos
 REXCVAR_DEFINE_INT32(edf_native_probe_draw_limit, 4096, "EDF2027", "Maximum invalid-RGB diagnostic draws, capped at 65536");
 REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
+REXCVAR_DEFINE_STRING(edf_native_backend, "", "EDF2027",
+                     "Graphics backend to create: d3d11, d3d11-warp, d3d12, d3d12-warp. Empty keeps the renderer on its direct D3D11 path. An unknown name is refused at startup rather than silently falling back");
 REXCVAR_DEFINE_BOOL(edf_native_batch_audit, false, "EDF2027",
                    "Measure runs of consecutive indexed draws that differ only in per-instance constants; the mean run length is the draw-call reduction instancing would give");
 REXCVAR_DEFINE_INT32(edf_native_contract_limit, 4096, "EDF2027",
@@ -562,6 +567,11 @@ struct Bridge {
   uint64_t shared_constant_both_supplied=0;
   uint32_t last_activation_instance=0,last_activation_vertex=0,last_activation_pixel=0;
   uint64_t repeat_activations=0;
+  // Created when --edf_native_backend names one. The renderer still draws
+  // through its direct D3D11 path; this exists so the backend can be created
+  // and reported inside the real process, which is where device creation
+  // actually fails, and so paths can be moved onto it one at a time.
+  std::unique_ptr<edf::native::NativeRenderBackend> backend;
   std::array<uint32_t,12> last_batch_key{};
   uint64_t batch_draws=0,batch_runs=0,batch_run=0,batch_run_total=0,batch_longest=0,batch_collapsible=0;
   uint64_t instance_shape=0,last_instance_shape=0,batch_shape_breaks=0;
@@ -1418,6 +1428,31 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
                               D3D11_SDK_VERSION, &state.device, nullptr, &state.context)))
     throw std::runtime_error("native shader bridge: D3D11 device creation failed");
   REXLOG_INFO("Native shader bridge: initialized hardware D3D11 device");
+  if(const std::string name=REXCVAR_GET(edf_native_backend);!name.empty()) {
+    edf::native::RegisterNativeD3D11Backend();
+    edf::native::RegisterNativeD3D12Backend();
+    // Refused on an unknown name. Falling back to whichever backend exists
+    // would mean an A/B run silently comparing a backend against itself.
+    //
+    // Caught only to say why. Throwing out of here stops the game with the
+    // reason nowhere in the log, which is failing silently with extra steps;
+    // the reason goes in first, then the throw stands.
+    try {
+      state.backend=edf::native::CreateNativeRenderBackend(name);
+    } catch(const std::exception& error) {
+      std::string known;
+      for(const auto& candidate:edf::native::NativeRenderBackendNames())
+        known+=(known.empty()?"":", ")+candidate;
+      REXLOG_ERROR("Native render backend: --edf_native_backend={} was refused: {}. Available: {}",
+        name,error.what(),known.empty()?std::string("none"):known);
+      throw;
+    }
+    REXLOG_INFO("Native render backend: name={}, recorders={}, parallel_recording={}; selected by --edf_native_backend={}. The renderer still draws through its direct D3D11 path; this backend is created, not yet drawing",
+      std::string(state.backend->name()),state.backend->RecorderCount(),
+      state.backend->SupportsParallelRecording(),name);
+    for(const auto& message:state.backend->DrainValidationMessages())
+      REXLOG_WARN("Native render backend validation: {}",message);
+  }
   if(REXCVAR_GET(edf_native_publish_frames))
     state.presentation_frames=std::make_unique<NativeFrameHandoff>(*state.device.Get(),*state.context.Get());
 }
