@@ -152,5 +152,8 @@ class NativeD3D12Device {
   uint64_t next_fence_=0,frame_counter_=0,upload_stalls_=0,descriptor_stalls_=0;
   uint32_t open_frame_=0;
   bool open_=false,is_warp_=false,debug_layer_active_=false;
+  // Things worth telling the caller that the info queue cannot hold, because
+  // they happened before there was one. Drained with the validation messages.
+  std::vector<std::string> notes_;
 };
 }  // namespace edf::native

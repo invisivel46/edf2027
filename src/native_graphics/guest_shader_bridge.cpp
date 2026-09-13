@@ -1818,6 +1818,18 @@ NativeViewportState ReadNativeDrawViewport(const Reader& reader,uint32_t device)
   return DecodeDrawViewport(ReadViewportWords(reader,device,render[5]!=0));
 }
 namespace {
+// The D3D12 options the cvars carry, applied before anything can build a D3D12
+// device. Every site that registers the backend goes through here, because the
+// debug layer is a process-wide switch that only the first device gets to throw
+// and the presenter's device is usually the first: setting it later - which is
+// what the scene backend used to do - removes the device that already exists.
+void RegisterD3D12BackendLocked() {
+  edf::native::SetNativeD3D12DebugLayer(REXCVAR_GET(edf_native_d3d12_debug_layer));
+  // Sized from a measured frame, not from a guess; see the cvar.
+  edf::native::SetNativeD3D12UploadMegabytes(
+    uint32_t((std::max)(16,REXCVAR_GET(edf_native_upload_megabytes))));
+  edf::native::RegisterNativeD3D12Backend();
+}
 // Builds the backend named by --edf_native_backend, once, with the state lock
 // already held. One place knows how to do this; the public accessor below only
 // adds the lock.
@@ -1831,7 +1843,7 @@ edf::native::NativeRenderBackend& EnsureBackendLocked(Bridge& state) {
   if(name.empty()) throw std::runtime_error("a render backend was asked for but --edf_native_backend is empty");
   if(!state.device) throw std::runtime_error("a render backend was asked for before the renderer had a device");
   edf::native::RegisterNativeD3D11Backend();
-  edf::native::RegisterNativeD3D12Backend();
+  RegisterD3D12BackendLocked();
   try {
     // "d3d11" means the device this renderer already has, not a second one: a
     // separate device could not share a texture or a target with the paths
@@ -1869,11 +1881,7 @@ edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state) {
   if(name.empty()) throw std::runtime_error("the scene's resources were asked for but --edf_native_scene_backend is empty");
   if(!state.device) throw std::runtime_error("the scene's resources were asked for before the renderer had a device");
   edf::native::RegisterNativeD3D11Backend();
-  edf::native::SetNativeD3D12DebugLayer(REXCVAR_GET(edf_native_d3d12_debug_layer));
-  // Sized from a measured frame, not from a guess; see the cvar.
-  edf::native::SetNativeD3D12UploadMegabytes(
-    uint32_t((std::max)(16,REXCVAR_GET(edf_native_upload_megabytes))));
-  edf::native::RegisterNativeD3D12Backend();
+  RegisterD3D12BackendLocked();
   state.scene_backend=name=="d3d11"
     ? edf::native::AdoptNativeD3D11Backend(*state.device.Get(),*state.context.Get())
     : edf::native::CreateNativeRenderBackend(name);
@@ -2005,7 +2013,7 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
     const std::string name=REXCVAR_GET(edf_native_backend);
     if(name.empty()) return nullptr;
     edf::native::RegisterNativeD3D11Backend();
-    edf::native::RegisterNativeD3D12Backend();
+    RegisterD3D12BackendLocked();
     return edf::native::CreateNativeRenderBackend(name);
   });
   REXLOG_INFO("Native render backend: --edf_native_backend={}; built on first use, so selecting one costs nothing until something draws through it. The renderer's own draw path is still direct D3D11 and does not use it yet",
@@ -2017,7 +2025,7 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
     // lazy accessor uses - so there is one place that knows how to build the
     // selected backend rather than two that can drift.
     edf::native::RegisterNativeD3D11Backend();
-    edf::native::RegisterNativeD3D12Backend();
+    RegisterD3D12BackendLocked();
     state.backend_preview=std::make_unique<edf::native::NativeD3D12Preview>(
       REXCVAR_GET(edf_native_backend));
   }
@@ -6057,9 +6065,11 @@ REX_HOOK_RAW(sub_821FD8F8) {
         if(!solid && (texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend))
           throw std::runtime_error("XUI textured brush has no native texture");
         if(!solid) {
-          D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{}; texture->second.view->GetDesc(&view_desc);
-          if(view_desc.ViewDimension!=D3D11_SRV_DIMENSION_TEXTURE2D ||
-             texture->second.resource.Get()==target.surface.Get())
+          // Asked of the seam, not of a D3D11 view: a texture created on the
+          // scene's own backend has no view to ask, and dereferencing one is a
+          // null read rather than a refusal.
+          if(texture->second.cube || !target.backend_surface ||
+             texture->second.backend.get()==target.backend_surface->texture())
             throw std::runtime_error("unsupported or aliased XUI brush texture");
         }
         if(!state.xui_vertex) {
@@ -6235,9 +6245,9 @@ REX_HOOK_RAW(sub_821FD8F8) {
         const auto texture=state.textures.find(snapshot.texture);
         if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
           throw std::runtime_error("font atlas has no native texture");
-        D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{}; texture->second.view->GetDesc(&view_desc);
-        if(view_desc.ViewDimension!=D3D11_SRV_DIMENSION_TEXTURE2D ||
-           texture->second.resource.Get()==scene.output.surface.Get())
+        // Asked of the seam; see the XUI brush above.
+        if(texture->second.cube || !scene.output.backend_surface ||
+           texture->second.backend.get()==scene.output.backend_surface->texture())
           throw std::runtime_error("unsupported or aliased font atlas");
         if(!state.font_vertex) {
           const auto effect=edf::native::MakeNativeFontEffect();

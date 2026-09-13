@@ -1,6 +1,7 @@
 #include "d3d12_device.h"
 #include <windows.h>
 #include <algorithm>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -13,6 +14,49 @@ void Require(HRESULT result, const char* what) {
   char code[16];
   std::snprintf(code,sizeof(code),"0x%08lx",static_cast<unsigned long>(result));
   throw std::runtime_error(std::string("D3D12 ")+what+" failed: "+code);
+}
+// The debug layer is a process-wide switch that can only be thrown before the
+// first D3D12 device exists: turning it on afterwards removes every device
+// already created. That is not hypothetical here - the window's presenter
+// builds its device first, and the scene backend used to turn the layer on when
+// it built its own, which removed the presenter's mid-frame and read as a
+// present failure with no cause.
+//
+// So the first device to be built decides for the process, and a later
+// disagreement is reported rather than acted on.
+std::mutex& DebugLayerMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+bool debug_layer_decided=false;
+bool debug_layer_on=false;
+// Empty when the request was honoured; otherwise why it could not be.
+std::string DecideDebugLayer(bool wanted) {
+  std::lock_guard lock(DebugLayerMutex());
+  if(!debug_layer_decided) {
+    debug_layer_decided=true;
+    if(!wanted) return {};
+    ComPtr<ID3D12Debug> debug;
+    if(FAILED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
+      return "the D3D12 debug layer was asked for but is not installed on this machine";
+    debug->EnableDebugLayer();
+    debug_layer_on=true;
+    // GPU-based validation as well, because the ordinary debug layer checks
+    // the API calls and this checks what the shaders actually did with them -
+    // a descriptor read that points nowhere, an index out of range. Those are
+    // the ones that present as a GPU hang with nothing in the log, which the
+    // plain layer is silent about. It is very slow, and it is the only thing
+    // that finds this class of fault.
+    ComPtr<ID3D12Debug1> gpu_validation;
+    if(SUCCEEDED(debug.As(&gpu_validation)))
+      gpu_validation->SetEnableGPUBasedValidation(TRUE);
+    return {};
+  }
+  if(wanted==debug_layer_on) return {};
+  return wanted
+    ? "the D3D12 debug layer was asked for after a device already existed; turning "
+      "it on now would remove that device, so this one runs without it"
+    : "the D3D12 debug layer is already on for this process, so this device has it too";
 }
 std::string Narrow(const wchar_t* wide) {
   if(!wide) return {};
@@ -29,29 +73,15 @@ NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options) {
     throw std::runtime_error("D3D12 needs at least one frame in flight");
   if(!options.recorders) throw std::runtime_error("D3D12 needs at least one recorder");
 
-  // The debug layer has to be enabled before the device exists, and it is the
-  // only thing that will tell us about a missing barrier - the failure mode
-  // this migration is most exposed to, because it is silent on the hardware
-  // that happens to tolerate it.
-  if(options.debug_layer) {
-    ComPtr<ID3D12Debug> debug;
-    if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
-      debug->EnableDebugLayer();
-      debug_layer_active_=true;
-      // GPU-based validation as well, because the ordinary debug layer checks
-      // the API calls and this checks what the shaders actually did with them -
-      // a descriptor read that points nowhere, an index out of range. Those are
-      // the ones that present as a GPU hang with nothing in the log, which the
-      // plain layer is silent about. It is very slow, and it is the only thing
-      // that finds this class of fault.
-      ComPtr<ID3D12Debug1> gpu_validation;
-      if(SUCCEEDED(debug.As(&gpu_validation)))
-        gpu_validation->SetEnableGPUBasedValidation(TRUE);
-    }
-  }
+  // Whether this device gets the layer is the process's answer, not this
+  // call's; see DecideDebugLayer. A refusal is a note to hand back, not a
+  // failure to create a device.
+  if(auto note=DecideDebugLayer(options.debug_layer); !note.empty())
+    notes_.push_back(std::move(note));
+  debug_layer_active_=debug_layer_on;
 
   UINT factory_flags=0;
-  if(options.debug_layer) factory_flags|=DXGI_CREATE_FACTORY_DEBUG;
+  if(debug_layer_active_) factory_flags|=DXGI_CREATE_FACTORY_DEBUG;
   Require(CreateDXGIFactory2(factory_flags,IID_PPV_ARGS(&factory_)),"factory creation");
 
   ComPtr<IDXGIAdapter1> adapter;
@@ -255,6 +285,7 @@ void NativeD3D12Device::WaitIdle() {
 
 std::vector<std::string> NativeD3D12Device::DrainValidationErrors() {
   std::vector<std::string> found;
+  found.swap(notes_);
   if(!messages_) return found;
   const UINT64 count=messages_->GetNumStoredMessagesAllowedByRetrievalFilter();
   for(UINT64 index=0;index<count;++index) {
