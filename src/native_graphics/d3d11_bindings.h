@@ -62,6 +62,14 @@ class ShaderBindings {
   void SetSampler(const std::string& name, ID3D11SamplerState* sampler);
   bool TrySetSampler(const std::string& name, ID3D11SamplerState* sampler);
   void Bind(ID3D11DeviceContext& context);
+  // Upload and set only the constants, for a draw that follows one which left
+  // this shader, its textures and its samplers already bound. In a run of
+  // same-material draws that is everything that actually changed - the rest is
+  // the same calls with the same arguments, once per draw.
+  //
+  // The caller owns the claim that nothing has bound since; this cannot check
+  // it. Getting that wrong draws with the previous material's textures.
+  void BindConstants(ID3D11DeviceContext& context);
   // The packed CPU image of each constant buffer - the exact bytes Bind would
   // upload - without touching the GPU buffer or the dirty flag.
   //

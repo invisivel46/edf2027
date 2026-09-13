@@ -135,6 +135,8 @@ REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
 REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
                      "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
+REXCVAR_DEFINE_BOOL(edf_native_reuse_material, true, "EDF2027",
+                   "Skip re-binding the shader pair, textures and samplers when the previous indexed draw already bound the same ones and nothing has bound since. Set false if repeated objects ever show another material's textures; that is what a wrong guard here looks like");
 REXCVAR_DEFINE_INT32(edf_native_shader_workers, -1, "EDF2027",
                     "Threads used to compile a shader registration's entries: -1 picks one per core up to eight, 0 compiles inline on the calling thread. Compilation is the load cost worth threading - the entries are a real batch and each takes milliseconds, unlike the per-draw work, which has neither property");
 REXCVAR_DEFINE_BOOL(edf_native_backend_preview, false, "EDF2027",
@@ -599,6 +601,9 @@ struct Bridge {
   uint64_t bind_generation=0,indexed_bind_generation=0;
   edf::native::RenderStateWords indexed_bind_key{};
   uint32_t indexed_bind_target=0,indexed_bind_scene=0,indexed_bind_output=0;
+  uint32_t indexed_bind_vertex=0,indexed_bind_pixel=0;
+  bool indexed_bind_reversed=false;
+  uint64_t indexed_materials_reused=0;
   bool indexed_bind_valid=false;
   uint64_t indexed_binds_skipped=0,indexed_binds_bound=0;
   uint64_t xui_batch_draws=0,xui_batch_runs=0,xui_batch_run=0,xui_batch_longest=0;
@@ -4837,6 +4842,21 @@ REX_HOOK_RAW(sub_821FE358) {
             state.indexed_bind_scene==state.active_scene &&
             state.indexed_bind_output==state.active_output &&
             !found->second.requires_blend_factor;
+          // The same guard extended to the material. When the previous draw
+          // left this very shader pair bound with these textures and samplers,
+          // the only thing this draw changes is its constants, which an
+          // activation has just patched. Re-sending the shader, the texture
+          // runs and the sampler runs is the same calls with the same
+          // arguments, once per draw, for 77.4% of them.
+          //
+          // The reversed-depth variant is a different shader object under the
+          // same handle, so it has to be part of the comparison: a draw that
+          // flips depth direction would otherwise reuse the wrong one.
+          const bool same_material=same_binding &&
+            REXCVAR_GET(edf_native_reuse_material) &&
+            state.indexed_bind_vertex==state.active_vertex &&
+            state.indexed_bind_pixel==state.linked_pixel &&
+            state.indexed_bind_reversed==viewport.reverse_depth;
           if(same_binding) ++state.indexed_binds_skipped;
           else {
             edf::native::BindActiveTarget(state);
@@ -4851,8 +4871,17 @@ REX_HOOK_RAW(sub_821FE358) {
             ++state.indexed_binds_bound;
           }
           viewport.Bind(*state.context.Get());
-          bindings.Bind(*state.context.Get());
-          state.shaders.at(state.linked_pixel).bindings->Bind(*state.context.Get());
+          if(same_material) {
+            bindings.BindConstants(*state.context.Get());
+            state.shaders.at(state.linked_pixel).bindings->BindConstants(*state.context.Get());
+            ++state.indexed_materials_reused;
+          } else {
+            bindings.Bind(*state.context.Get());
+            state.shaders.at(state.linked_pixel).bindings->Bind(*state.context.Get());
+            state.indexed_bind_vertex=state.active_vertex;
+            state.indexed_bind_pixel=state.linked_pixel;
+            state.indexed_bind_reversed=viewport.reverse_depth;
+          }
           binding_timing.Finish();
           if(REXCVAR_GET(edf_native_capture_indexed_state) &&
              !REXCVAR_GET(edf_native_scene_capture).empty()) {
@@ -4934,6 +4963,10 @@ REX_HOOK_RAW(sub_821FE358) {
               state.indexed_binds_bound,state.indexed_binds_skipped,
               (state.indexed_binds_bound+state.indexed_binds_skipped)
                 ?100.0*double(state.indexed_binds_skipped)/double(state.indexed_binds_bound+state.indexed_binds_skipped):0.0);
+          if(REXCVAR_GET(edf_native_batch_audit) && state.indexed_draws%1000000==0)
+            REXLOG_INFO("Native indexed material reuse: draws={}, constants_only={} ({:.1f}% re-sent only their constants, keeping the shader pair, textures and samplers the previous draw bound)",
+              state.indexed_draws,state.indexed_materials_reused,
+              state.indexed_draws?100.0*double(state.indexed_materials_reused)/double(state.indexed_draws):0.0);
           if(REXCVAR_GET(edf_native_batch_audit)) {
             const std::array<uint32_t,12> batch_key{stream.resource,ib,decl,
               state.active_vertex,state.linked_pixel,ctx.r6.u32,ctx.r7.u32,uint32_t(ctx.r5.s32),

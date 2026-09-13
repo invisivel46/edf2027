@@ -312,6 +312,22 @@ std::vector<ShaderBindings::ConstantImage> ShaderBindings::ConstantImages() cons
   return images;
 }
 
+void ShaderBindings::BindConstants(ID3D11DeviceContext& context) {
+  for (auto& buffer : buffers_) {
+    if (buffer.dirty) {
+      D3D11_MAPPED_SUBRESOURCE mapped{};
+      if (SUCCEEDED(context.Map(buffer.gpu.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        std::memcpy(mapped.pData, buffer.bytes.data(), buffer.bytes.size());
+        context.Unmap(buffer.gpu.Get(), 0);
+      }
+      buffer.dirty = false;
+    }
+    auto* value = buffer.gpu.Get();
+    if (shader_.entry.pixel) context.PSSetConstantBuffers(buffer.slot, 1, &value);
+    else context.VSSetConstantBuffers(buffer.slot, 1, &value);
+  }
+}
+
 void ShaderBindings::Bind(ID3D11DeviceContext& context) {
   if (shader_.entry.pixel) context.PSSetShader(shader_.pixel.Get(), nullptr, 0);
   else context.VSSetShader(shader_.vertex.Get(), nullptr, 0);
