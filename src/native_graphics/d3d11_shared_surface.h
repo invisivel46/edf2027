@@ -36,9 +36,11 @@ class NativeSharedSurface {
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
   bool valid() const { return shared_texture_ && shared_fence_; }
+  // Public so an owner can release it inside whatever scope its device
+  // requires, rather than only at destruction.
+  void Release();
 
  private:
-  void Release();
 
   Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_;
   Microsoft::WRL::ComPtr<ID3D11RenderTargetView> target_;

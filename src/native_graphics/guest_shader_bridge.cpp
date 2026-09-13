@@ -1560,11 +1560,20 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
   REXLOG_INFO("Native shader bridge: initialized hardware D3D11 device");
   // The host window asks for a backend through this rather than calling into
   // the bridge, so it can still be built standalone by its own test.
+  // A backend of its own for presentation, never the bridge's. The bridge's
+  // may be the adopted D3D11 one, which shares this renderer's immediate
+  // context - and presentation runs on the window thread outside the context
+  // lock, so sharing it would drive that context from two threads.
+  //
   // The flag is read here rather than in the host surface, which is also
   // built standalone by its own test and cannot see the bridge's cvars.
-  edf::native::SetNativeHostBackendProvider([]() -> edf::native::NativeRenderBackend* {
+  edf::native::SetNativeHostBackendFactory([]() -> std::unique_ptr<edf::native::NativeRenderBackend> {
     if(!REXCVAR_GET(edf_native_backend_present)) return nullptr;
-    return edf::native::EnsureNativeRenderBackend();
+    const std::string name=REXCVAR_GET(edf_native_backend);
+    if(name.empty()) return nullptr;
+    edf::native::RegisterNativeD3D11Backend();
+    edf::native::RegisterNativeD3D12Backend();
+    return edf::native::CreateNativeRenderBackend(name);
   });
   REXLOG_INFO("Native render backend: --edf_native_backend={}; built on first use, so selecting one costs nothing until something draws through it. The renderer's own draw path is still direct D3D11 and does not use it yet",
     REXCVAR_GET(edf_native_backend).empty()?std::string("none"):REXCVAR_GET(edf_native_backend));

@@ -21,13 +21,13 @@ REXCVAR_DEFINE_BOOL(edf_native_host_capture_require_image,false,"EDF2027",
                    "Wait for a published game image before the one-time host GPU capture (development)");
 namespace edf::native {
 namespace {
-NativeHostBackendProvider& HostBackendProvider() {
-  static NativeHostBackendProvider provider;
-  return provider;
+NativeHostBackendFactory& HostBackendFactory() {
+  static NativeHostBackendFactory factory;
+  return factory;
 }
 }  // namespace
-void SetNativeHostBackendProvider(NativeHostBackendProvider provider) {
-  HostBackendProvider()=std::move(provider);
+void SetNativeHostBackendFactory(NativeHostBackendFactory factory) {
+  HostBackendFactory()=std::move(factory);
 }
 
 std::shared_ptr<NativeHostSurface> NativeHostSurface::Create(HWND window,std::function<void(UINT,UINT)> overlays,
@@ -67,8 +67,16 @@ void NativeHostSurface::Stop() {
   if(!painting_) ReleaseResources();
 }
 void NativeHostSurface::ReleaseResources() {
-  if(presenter_ || compositor_)
-    VisitNativePresentationContext([&](auto&,auto&) { presenter_.reset(); compositor_.reset(); });
+  // The presenting backend is on its own device and needs no isolated scope,
+  // but its presenter holds resources built from it, so that goes first.
+  backend_presenter_.reset();
+  present_backend_.reset();
+  // The shared surface belongs to the renderer's device, so it is released
+  // inside the isolated scope with everything else that does.
+  if(presenter_ || compositor_ || shared_.valid())
+    VisitNativePresentationContext([&](auto&,auto&) {
+      presenter_.reset(); compositor_.reset(); shared_.Release();
+    });
 }
 void NativeHostSurface::Paint() {
   if(painting_ || failed_ || !window_ || IsIconic(window_)) return;
@@ -91,7 +99,18 @@ void NativeHostSurface::Paint() {
     // Resolved before the visit below, never inside it: that callback runs
     // with the bridge's lock held, and asking the bridge for a backend from
     // there takes the same lock again and deadlocks. It did, once.
-    auto* backend=(backend_present_failed_||!HostBackendProvider())?nullptr:HostBackendProvider()();
+    // Created once, on its own device, and kept. Creation can fail - no
+    // backend selected, no D3D12 - and that is the only case the D3D11
+    // presenter below still exists for.
+    if(!present_backend_ && !backend_present_failed_ && HostBackendFactory()) {
+      try { present_backend_=HostBackendFactory()(); }
+      catch(const std::exception& error) {
+        backend_present_failed_=true;
+        REXLOG_INFO("Native host surface: no presenting backend ({}); using the D3D11 presenter",error.what());
+      }
+      if(!present_backend_) backend_present_failed_=true;
+    }
+    auto* backend=backend_present_failed_?nullptr:present_backend_.get();
     auto render=[&](ID3D11Device& device,ID3D11DeviceContext& context,ID3D11ShaderResourceView* frame,const NativeDisplayGamma* gamma) {
       // Includes bridge lock acquisition and context isolation, not pure lock time.
       if(timed) acquire_ms=milliseconds(Clock::now()-entered);

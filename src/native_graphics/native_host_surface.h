@@ -10,14 +10,20 @@
 #include "ui_ticker.h"
 
 namespace edf::native {
-// How this window finds a backend to present with.
+// How this window gets a backend to present with.
 //
-// Injected rather than looked up, because the host surface is also built
-// standalone by its lifetime test, which has no bridge and no backend and
-// must keep using the D3D11 presenter exactly as before. An unset provider is
+// A factory, not a lookup, and the distinction matters. The presenting backend
+// must own its device: presentation happens on the window thread, outside the
+// renderer's context lock, and a backend sharing the renderer's immediate
+// context would then be driving it from two threads at once. Borrowing the
+// bridge's backend would do exactly that whenever the selected one is the
+// adopted D3D11 backend.
+//
+// Injected rather than looked up because the host surface is also built
+// standalone by its lifetime test, which has no bridge. An unset factory is
 // the normal state for that test, not an error.
-using NativeHostBackendProvider=std::function<NativeRenderBackend*()>;
-void SetNativeHostBackendProvider(NativeHostBackendProvider provider);
+using NativeHostBackendFactory=std::function<std::unique_ptr<NativeRenderBackend>()>;
+void SetNativeHostBackendFactory(NativeHostBackendFactory factory);
 
 // App-owned rendering on the SDK HWND when no GPU plugin owns its presenter.
 // Construct/destroy on that window's thread. Removing the subclass before
@@ -42,6 +48,8 @@ class NativeHostSurface : public std::enable_shared_from_this<NativeHostSurface>
   // presented to the window by the backend. Null, or refusing, means the
   // D3D11 presenter above stays in charge - a window that shows nothing would
   // be a far worse outcome than one presented by the API it always used.
+  // Owned, and on its own device; see NativeHostBackendFactory.
+  std::unique_ptr<NativeRenderBackend> present_backend_;
   std::unique_ptr<NativeBackendWindowPresenter> backend_presenter_;
   NativeSharedSurface shared_;
   bool backend_present_failed_=false;
