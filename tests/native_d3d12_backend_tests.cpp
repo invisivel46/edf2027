@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -383,6 +384,87 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET { return tint; }
         DestroyWindow(window);
       }
       UnregisterClassW(window_class.lpszClassName, window_class.hInstance);
+    }
+
+    {
+      // Parallel recording, from real threads. Two recorders, two command
+      // lists, each writing its own half of the target. The lists execute in
+      // recorder order, so recorder 0 clears and recorder 1 can rely on it.
+      NativeD3D12Options parallel_options;
+      parallel_options.prefer_warp = true;
+      parallel_options.debug_layer = true;
+      parallel_options.recorders = 2;
+      const auto parallel = CreateNativeD3D12Backend(parallel_options);
+      Check(parallel->RecorderCount() == 2, "the backend did not create two recorders");
+      Check(parallel->SupportsParallelRecording(),
+            "a two-recorder backend still reports it cannot record in parallel");
+
+      const auto split_target = parallel->CreateRenderTarget(target_desc);
+      NativeBackendRenderTarget* split_colors[] = {split_target.get()};
+
+      // Two triangles, each covering one half, so a recorder writing the wrong
+      // half or not writing at all is visible rather than averaged away.
+      const float left[] = {-1.0f, -1.0f, 0.0f, 0.0f, -1.0f, 0.0f, -1.0f, 1.0f, 0.0f};
+      const float right[] = {0.0f, -1.0f, 0.0f, 1.0f, -1.0f, 0.0f, 1.0f, 1.0f, 0.0f};
+      NativeBackendBufferDesc half_desc{};
+      half_desc.bytes = sizeof(left);
+      half_desc.vertex = true;
+      const auto left_buffer =
+          parallel->CreateBuffer(half_desc, {reinterpret_cast<const uint8_t*>(left), sizeof(left)});
+      const auto right_buffer =
+          parallel->CreateBuffer(half_desc, {reinterpret_cast<const uint8_t*>(right), sizeof(right)});
+
+      NativeBackendPipelineDesc split_pipeline_desc = pipeline_desc;
+      auto& split_pipeline = parallel->CreatePipeline(split_pipeline_desc);
+
+      const std::array<float, 4> green{0.0f, 1.0f, 0.0f, 1.0f};
+      const std::array<float, 4> blue{0.0f, 0.0f, 1.0f, 1.0f};
+
+      parallel->BeginFrame();
+      const auto record = [&](uint32_t index) {
+        auto& recorder = parallel->Recorder(index);
+        recorder.SetRenderTargets(split_colors, nullptr);
+        recorder.SetViewport({0, 0, static_cast<float>(kSize), static_cast<float>(kSize), 0, 1});
+        if (index == 0) recorder.ClearColor(*split_target, {1.0f, 0.0f, 0.0f, 1.0f});
+        recorder.SetPipeline(split_pipeline);
+        recorder.SetVertexBuffer(0, index == 0 ? *left_buffer : *right_buffer, sizeof(float) * 3, 0);
+        const auto& colour = index == 0 ? green : blue;
+        recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                              {reinterpret_cast<const uint8_t*>(colour.data()), sizeof(float) * 4});
+        recorder.Draw(3, 0);
+      };
+      std::thread worker([&] { record(1); });
+      record(0);
+      worker.join();
+      parallel->Submit();
+
+      const auto halves = parallel->ReadRenderTarget(*split_target);
+      const auto channel = [&](uint32_t x, uint32_t y, uint32_t component) {
+        return halves[(static_cast<size_t>(y) * kSize + x) * 4 + component];
+      };
+      // Counted rather than spot-checked. The first version of this sampled
+      // points that sat exactly on a triangle edge, where coverage is a coin
+      // flip, and blamed the backend for it.
+      uint32_t green_left = 0, green_right = 0, blue_left = 0, blue_right = 0, cleared = 0;
+      for (uint32_t y = 0; y < kSize; ++y)
+        for (uint32_t x = 0; x < kSize; ++x) {
+          const bool left_half = x < kSize / 2;
+          if (channel(x, y, 1) > 200) ++(left_half ? green_left : green_right);
+          else if (channel(x, y, 2) > 200) ++(left_half ? blue_left : blue_right);
+          else if (channel(x, y, 0) > 200) ++cleared;
+        }
+      Check(green_left > 0, "recorder 0 drew nothing");
+      Check(blue_right > 0, "recorder 1 drew nothing");
+      // Each recorder owns a half, so its colour must not appear in the other.
+      Check(green_right == 0, "recorder 0 drew into recorder 1's half");
+      Check(blue_left == 0, "recorder 1 drew into recorder 0's half");
+      // Recorder 0 issued the clear and recorder 1 relies on the lists
+      // executing in order; red surviving on the right would mean they did not.
+      Check(cleared > 0, "nothing was left cleared, so the triangles are not the shape this expects");
+      for (const auto& message : parallel->DrainValidationMessages())
+        Check(false, "D3D12 validation error while recording in parallel: " + message);
+      std::cout << "parallel recording: " << green_left << " px from recorder 0, " << blue_right
+                << " px from recorder 1\n";
     }
 
     // A missing barrier would not change a single pixel above; only the API's
