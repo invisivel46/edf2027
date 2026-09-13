@@ -1297,6 +1297,19 @@ struct ActiveTargets {
   uint32_t dsv_format=0,samples=1;
   uint32_t width=0,height=0;
 };
+// Whether this shader samples the target it is drawing into.
+//
+// What a shader can actually sample is the resolved texture, or the surface
+// itself when the target is one of the converting ones that declares it
+// sampled. Both are checked; neither is a D3D11 pointer, because this used to
+// compare those and a backend without them made every answer yes.
+bool SamplesTarget(const ShaderBindings& shader,const NativeRenderTarget& target) {
+  if(target.sampled.backend && shader.UsesTexture(*target.sampled.backend)) return true;
+  if(target.backend_surface)
+    if(auto* surface=target.backend_surface->texture())
+      if(shader.UsesTexture(*surface)) return true;
+  return false;
+}
 ActiveTargets ActiveTargetsLocked(Bridge& state) {
   ActiveTargets result;
   const auto found=state.render_targets.find(state.active_target);
@@ -4584,7 +4597,10 @@ REX_HOOK_RAW(sub_8219C840) {
       if(state.presentation_frames) {
         state.presentation_frames->Invalidate();
         if(scene.output.content_valid) {
-          try { state.presentation_frames->Publish(*scene.output.surface.Get(),edf::native::NativeFrameKind::PartialScene,
+          try { if(!scene.output.surface) throw std::runtime_error(
+                  "frame publication needs a D3D11 texture; the scene is on the "+
+                  std::string(state.scene_backend?state.scene_backend->name():"?")+" backend");
+                state.presentation_frames->Publish(*scene.output.surface.Get(),edf::native::NativeFrameKind::PartialScene,
             state.display_gamma?&*state.display_gamma:nullptr); }
           catch(const std::exception& error) { REXLOG_ERROR("Native frame publication: {}",error.what()); }
         }
@@ -5864,7 +5880,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         native_submitted=true;
         scene.frame_complete=false;
         ++state.movie_draws;
-        if(state.presentation_frames && scene.output.content_valid)
+        if(state.presentation_frames && scene.output.content_valid && scene.output.surface)
           state.presentation_frames->Publish(*scene.output.surface.Get(),edf::native::NativeFrameKind::Movie,
             state.display_gamma?&*state.display_gamma:nullptr);
         if(state.movie_draws<=3 || state.movie_draws==30 || state.movie_draws==60 || state.movie_draws==120) {
@@ -5919,7 +5935,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         const bool solid=ps->second.source==0x82060DB0;
         const bool mask=ps->second.source==0x82061848;
         const auto texture=state.textures.find(snapshot.texture);
-        if(!solid && (texture==state.textures.end() || !texture->second.content_valid || !texture->second.view))
+        if(!solid && (texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend))
           throw std::runtime_error("XUI textured brush has no native texture");
         if(!solid) {
           D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{}; texture->second.view->GetDesc(&view_desc);
@@ -6005,7 +6021,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           uint64_t shape=1469598103934665603ull;
           for(const auto word:key) shape=mix(shape,word);
           shape=mix(shape,uint64_t(solid?1:mask?2:0));
-          shape=mix(shape,reinterpret_cast<uintptr_t>(texture==state.textures.end()?nullptr:texture->second.view.Get()));
+          shape=mix(shape,reinterpret_cast<uintptr_t>(texture==state.textures.end()?nullptr:texture->second.backend.get()));
           shape=mix(shape,uint64_t(viewport.reverse_depth));
           shape=mix(shape,uint64_t(viewport.viewport.Width)*8191+uint64_t(viewport.viewport.Height));
           uint64_t constants=1469598103934665603ull;
@@ -6094,7 +6110,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         if(viewport.reverse_depth || (key[1]&3))
           throw std::runtime_error("unimplemented font depth contract");
         const auto texture=state.textures.find(snapshot.texture);
-        if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.view)
+        if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
           throw std::runtime_error("font atlas has no native texture");
         D3D11_SHADER_RESOURCE_VIEW_DESC view_desc{}; texture->second.view->GetDesc(&view_desc);
         if(view_desc.ViewDimension!=D3D11_SRV_DIMENSION_TEXTURE2D ||
@@ -6221,7 +6237,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto& bindings=viewport.reverse_depth?*vertex->second.reversed_bindings:*vertex->second.bindings;
           if(!bindings.HasAllTextureInputs() || !ps.HasAllTextureInputs())
             throw std::runtime_error("Utility 3D missing texture inputs");
-          if(bindings.UsesTextureResource(*scene.color.surface.Get()) || ps.UsesTextureResource(*scene.color.surface.Get()))
+          if(edf::native::SamplesTarget(bindings,scene.color) || edf::native::SamplesTarget(ps,scene.color))
             throw std::runtime_error("native scene immediate samples its target");
           const auto owned_indices=state.generated_indices.Get(strip?edf::native::NativeIndexPattern::Strip:
             edf::native::NativeIndexPattern::Quads,ctx.r5.u32);
@@ -6314,7 +6330,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto& bindings=viewport.reverse_depth?*vertex->second.reversed_bindings:vs;
           if(!bindings.HasAllTextureInputs()) throw std::runtime_error("Utility vertex shader has missing native texture inputs");
           if(!ps.HasAllTextureInputs()) throw std::runtime_error("Utility has missing native texture inputs");
-          if(ps.UsesTextureResource(*target.surface.Get()) || bindings.UsesTextureResource(*target.surface.Get()))
+          if(edf::native::SamplesTarget(ps,target) || edf::native::SamplesTarget(bindings,target))
             throw std::runtime_error("Utility samples its active surface");
           const auto owned_indices=state.generated_indices.Get(lines?edf::native::NativeIndexPattern::Lines:
             edf::native::NativeIndexPattern::Quads,ctx.r5.u32);
