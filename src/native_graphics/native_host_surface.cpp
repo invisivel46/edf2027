@@ -194,7 +194,7 @@ void NativeHostSurface::Paint() {
     if(backend && !backend_present_failed_) {
       NativeFrameHandoff::SharedFrame scene{};
       uint64_t scene_sequence=0;
-      if(VisitNativePresentationSharedFrame(scene,scene_sequence) && scene &&
+      if(VisitNativeSceneSharedFrame(scene,scene_sequence) && scene &&
          scene_sequence!=shared_scene_sequence_) {
         if(!backend_presenter_)
           backend_presenter_=std::make_unique<NativeBackendWindowPresenter>(*backend);

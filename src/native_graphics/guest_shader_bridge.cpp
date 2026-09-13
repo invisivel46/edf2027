@@ -142,7 +142,7 @@ REXCVAR_DEFINE_INT32(edf_native_upload_megabytes, 256, "EDF2027",
 REXCVAR_DEFINE_INT32(edf_native_frame_operations, 8192, "EDF2027",
                     "Recorded operations after which the scene's frame is submitted and a new one opened, rather than waiting for the guest's swap. The guest swaps once a frame but begins render targets far more often than that - measured at 1,000 begins across 8 swaps - so a frame tied only to the swap accumulates without bound during loading, which is one command list, one ring's worth of uploads, and eventually a GPU with more work in one submission than it will accept");
 REXCVAR_DEFINE_BOOL(edf_native_d3d12_debug_layer, false, "EDF2027",
-                   "Turn the D3D12 debug layer on for every backend this process builds, including the hardware one. Slow, and worth it when something removes the device: validation names the command that did it, where the removal reason only names the device");
+                   "Turn the D3D12 debug layer, and GPU-based validation with it, on for every backend this process builds - including the hardware one. Very slow. Worth it when something removes the device: the plain layer names an invalid call, and GPU-based validation names what a shader did with a valid one, which is the half that presents as a hang with nothing in the log");
 REXCVAR_DEFINE_BOOL(edf_native_seam_draws, false, "EDF2027",
                    "Record the scene's draws through the backend interface instead of calling the D3D11 context directly. With --edf_native_scene_backend=d3d11 both draw the same thing on the same device, which is what makes this the A/B control for the port: a difference is a wiring mistake, because the backend underneath has not changed. It must be true before the scene backend can be anything else");
 REXCVAR_DEFINE_BOOL(edf_native_backend_present, true, "EDF2027",
@@ -2022,22 +2022,28 @@ NativeRenderBackend* EnsureNativeRenderBackend() {
   return &EnsureBackendLocked(state);
 }
 
+// The scene's own finished frame, when the scene is on a backend that cannot
+// hand the compositor a view. Deliberately separate from the handoff's shared
+// frame below: that one is the *composited* window image, already letterboxed
+// and gamma-corrected, and a caller that took it for this one would present it
+// without ever running the composite that fills it.
+bool VisitNativeSceneSharedFrame(NativeFrameHandoff::SharedFrame& shared,uint64_t& sequence) {
+  auto& state=State();
+  std::lock_guard lock(state.mutex);
+  if(!state.scene_shared || !state.scene_shared_sequence) return false;
+  shared.texture=state.scene_shared->texture_handle();
+  shared.fence=state.scene_shared->fence_handle();
+  shared.value=state.scene_shared->value();
+  shared.width=state.scene_shared->width();
+  shared.height=state.scene_shared->height();
+  shared.format=state.scene_shared->format();
+  sequence=state.scene_shared_sequence;
+  return bool(shared);
+}
+
 bool VisitNativePresentationSharedFrame(NativeFrameHandoff::SharedFrame& shared,uint64_t& sequence) {
   auto& state=State();
   std::lock_guard lock(state.mutex);
-  // The scene's own shared surface first. When the scene is not on D3D11 this
-  // is the only route to the window, and when it is, this is empty and the
-  // handoff below is the one that has a frame.
-  if(state.scene_shared && state.scene_shared_sequence) {
-    shared.texture=state.scene_shared->texture_handle();
-    shared.fence=state.scene_shared->fence_handle();
-    shared.value=state.scene_shared->value();
-    shared.width=state.scene_shared->width();
-    shared.height=state.scene_shared->height();
-    shared.format=state.scene_shared->format();
-    sequence=state.scene_shared_sequence;
-    return bool(shared);
-  }
   if(!state.presentation_frames) return false;
   shared=state.presentation_frames->Shared();
   sequence=state.presentation_frames->SharedSequence();

@@ -38,6 +38,15 @@ NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options) {
     if(SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug)))) {
       debug->EnableDebugLayer();
       debug_layer_active_=true;
+      // GPU-based validation as well, because the ordinary debug layer checks
+      // the API calls and this checks what the shaders actually did with them -
+      // a descriptor read that points nowhere, an index out of range. Those are
+      // the ones that present as a GPU hang with nothing in the log, which the
+      // plain layer is silent about. It is very slow, and it is the only thing
+      // that finds this class of fault.
+      ComPtr<ID3D12Debug1> gpu_validation;
+      if(SUCCEEDED(debug.As(&gpu_validation)))
+        gpu_validation->SetEnableGPUBasedValidation(TRUE);
     }
   }
 
@@ -170,7 +179,23 @@ NativeD3D12Device::~NativeD3D12Device() {
 void NativeD3D12Device::WaitForFence(uint64_t value) {
   if(!value || fence_->GetCompletedValue()>=value) return;
   Require(fence_->SetEventOnCompletion(value,fence_event_),"fence event registration");
-  WaitForSingleObject(fence_event_,INFINITE);
+  // Deadlined, not INFINITE. A GPU that has hung never signals, and an
+  // infinite wait turns that into a frozen process with nothing in the log -
+  // which is how every hang in this port presented, and why each one cost a
+  // bisect to find. Ten seconds is far longer than any frame and far shorter
+  // than a person's patience.
+  if(WaitForSingleObject(fence_event_,10000)==WAIT_OBJECT_0) return;
+  std::string reason="the device reports no removal reason";
+  switch(device_->GetDeviceRemovedReason()) {
+    case DXGI_ERROR_DEVICE_HUNG: reason="the GPU hung on this device's own work"; break;
+    case DXGI_ERROR_DEVICE_RESET: reason="the device was reset"; break;
+    case DXGI_ERROR_DRIVER_INTERNAL_ERROR: reason="the driver reported an internal error"; break;
+    case DXGI_ERROR_INVALID_CALL: reason="an invalid call was made on this device"; break;
+    case S_OK: break;
+    default: reason="an unrecognised removal reason"; break;
+  }
+  throw std::runtime_error("D3D12 waited 10 seconds for fence value "+std::to_string(value)+
+                           " (completed "+std::to_string(fence_->GetCompletedValue())+"); "+reason);
 }
 
 void NativeD3D12Device::BeginFrame() {

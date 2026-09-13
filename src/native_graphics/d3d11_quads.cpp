@@ -56,11 +56,15 @@ void PositionTriangleStream::Upload(NativeRenderBackend& backend,NativeBackendRe
   if(host.size()>capacity_ || !backend_vertices_) {
     NativeBackendBufferDesc desc{};
     desc.bytes=host.size(); desc.vertex=true; desc.dynamic=true;
-    backend_vertices_=backend.CreateBuffer(desc,host);
+    // Created empty and filled through the recorder, never with contents
+    // supplied at creation. A backend that stages creation-time contents until
+    // its next frame opens - which D3D12 must, having no command list before
+    // then - would leave this draw reading uninitialised memory, and vertex
+    // positions read out of uninitialised memory hang the GPU rather than
+    // drawing something wrong.
+    backend_vertices_=backend.CreateBuffer(desc,{});
     if(!backend_vertices_) throw std::runtime_error("position triangle buffer creation failed");
     capacity_=static_cast<UINT>(host.size());
-    staging_.assign(host.begin(),host.end());
-    return;
   }
   staging_.assign(capacity_,0);
   std::memcpy(staging_.data(),host.data(),host.size());
@@ -131,11 +135,10 @@ void QuadStream::Upload(NativeRenderBackend& backend,NativeBackendRecorder& reco
   if(host.size()>capacity_ || !backend_vertices_) {
     NativeBackendBufferDesc desc{};
     desc.bytes=host.size(); desc.vertex=true; desc.dynamic=true;
-    backend_vertices_=backend.CreateBuffer(desc,host);
+    // Empty at creation; see PositionTriangleStream::Upload for why.
+    backend_vertices_=backend.CreateBuffer(desc,{});
     if(!backend_vertices_) throw std::runtime_error("native quad vertex buffer creation failed");
     capacity_=static_cast<UINT>(host.size());
-    staging_.assign(host.begin(),host.end());
-    return;
   }
   staging_.assign(capacity_,0);
   std::memcpy(staging_.data(),host.data(),host.size());
