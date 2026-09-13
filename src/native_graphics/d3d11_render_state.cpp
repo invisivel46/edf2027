@@ -24,85 +24,50 @@ NativeViewportState ScaleNativeCanvasScissor(NativeViewportState state,float sx,
   if(old.top>=old.bottom) state.scissor.bottom=state.scissor.top;
   return state;
 }
-namespace {
-D3D11_BLEND Factor(uint32_t value,bool alpha) {
-  switch (value) {
-    case 0: return D3D11_BLEND_ZERO;
-    case 1: return D3D11_BLEND_ONE;
-    case 4: return alpha ? D3D11_BLEND_SRC_ALPHA : D3D11_BLEND_SRC_COLOR;
-    case 5: return alpha ? D3D11_BLEND_INV_SRC_ALPHA : D3D11_BLEND_INV_SRC_COLOR;
-    case 6: return D3D11_BLEND_SRC_ALPHA;
-    case 7: return D3D11_BLEND_INV_SRC_ALPHA;
-    case 8: return alpha ? D3D11_BLEND_DEST_ALPHA : D3D11_BLEND_DEST_COLOR;
-    case 9: return alpha ? D3D11_BLEND_INV_DEST_ALPHA : D3D11_BLEND_INV_DEST_COLOR;
-    case 10: return D3D11_BLEND_DEST_ALPHA;
-    case 11: return D3D11_BLEND_INV_DEST_ALPHA;
-    case 12: case 14: return D3D11_BLEND_BLEND_FACTOR;
-    case 13: case 15: return D3D11_BLEND_INV_BLEND_FACTOR;
-    case 16: return alpha ? D3D11_BLEND_ONE : D3D11_BLEND_SRC_ALPHA_SAT;
-    default: throw std::runtime_error("unsupported native blend factor (constant blend needs a separate value)");
-  }
-}
-D3D11_BLEND_OP Operation(uint32_t value) {
-  switch (value) {
-    case 0: return D3D11_BLEND_OP_ADD;
-    case 1: return D3D11_BLEND_OP_SUBTRACT;
-    case 2: return D3D11_BLEND_OP_MIN;
-    case 3: return D3D11_BLEND_OP_MAX;
-    case 4: return D3D11_BLEND_OP_REV_SUBTRACT;
-    default: throw std::runtime_error("unsupported native blend operation");
-  }
-}
-D3D11_FILL_MODE FillMode(uint32_t raster) {
-  // CPU PA_SU_SC_MODE_CNTL encoding, decoded without a GPU register runtime.
-  const auto mode=(raster>>3)&3;
-  if(!mode) return D3D11_FILL_SOLID; // Per-face type fields are inactive.
-  if(mode!=1) throw std::runtime_error("unsupported native polygon mode");
-  const auto front=(raster>>5)&7,back=(raster>>8)&7;
-  const auto visible=(raster&1)?back:front;
-  if(!(raster&3) && front!=back)
-    throw std::runtime_error("native mixed-face polygon mode requires split draws");
-  if(visible==1) return D3D11_FILL_WIREFRAME;
-  if(visible==2) return D3D11_FILL_SOLID;
-  throw std::runtime_error("unsupported native point/invalid polygon type");
-}
-}
+// The six guest words are decoded once, in native_render_state_decode.cpp,
+// and shared with every other backend. These assertions are what make that
+// sharing safe: the neutral values are only usable as D3D11 enumerators
+// because they are numerically the same, and if that ever stops being true
+// this file stops compiling instead of blending wrongly.
+static_assert(kNativeBlendZero==D3D11_BLEND_ZERO && kNativeBlendOne==D3D11_BLEND_ONE);
+static_assert(kNativeBlendSrcColor==D3D11_BLEND_SRC_COLOR && kNativeBlendInvSrcColor==D3D11_BLEND_INV_SRC_COLOR);
+static_assert(kNativeBlendSrcAlpha==D3D11_BLEND_SRC_ALPHA && kNativeBlendInvSrcAlpha==D3D11_BLEND_INV_SRC_ALPHA);
+static_assert(kNativeBlendDestAlpha==D3D11_BLEND_DEST_ALPHA && kNativeBlendInvDestAlpha==D3D11_BLEND_INV_DEST_ALPHA);
+static_assert(kNativeBlendDestColor==D3D11_BLEND_DEST_COLOR && kNativeBlendInvDestColor==D3D11_BLEND_INV_DEST_COLOR);
+static_assert(kNativeBlendSrcAlphaSat==D3D11_BLEND_SRC_ALPHA_SAT);
+static_assert(kNativeBlendFactor==D3D11_BLEND_BLEND_FACTOR && kNativeBlendInvFactor==D3D11_BLEND_INV_BLEND_FACTOR);
+static_assert(kNativeBlendOpAdd==D3D11_BLEND_OP_ADD && kNativeBlendOpSubtract==D3D11_BLEND_OP_SUBTRACT);
+static_assert(kNativeBlendOpRevSubtract==D3D11_BLEND_OP_REV_SUBTRACT);
+static_assert(kNativeBlendOpMin==D3D11_BLEND_OP_MIN && kNativeBlendOpMax==D3D11_BLEND_OP_MAX);
+static_assert(kNativeFillWireframe==D3D11_FILL_WIREFRAME && kNativeFillSolid==D3D11_FILL_SOLID);
+static_assert(kNativeCullNone==D3D11_CULL_NONE && kNativeCullFront==D3D11_CULL_FRONT && kNativeCullBack==D3D11_CULL_BACK);
+static_assert(kNativeDepthWriteZero==D3D11_DEPTH_WRITE_MASK_ZERO && kNativeDepthWriteAll==D3D11_DEPTH_WRITE_MASK_ALL);
+
 NativeRenderState CreateNativeRenderState(ID3D11Device& device,const RenderStateWords& words) {
-  const auto blend = words[0], depth = words[1], raster = words[2], alpha = words[3];
-  if (depth & 1) throw std::runtime_error("native stencil state not implemented");
-  if (alpha & 24) throw std::runtime_error("native alpha test/coverage requires shader or MSAA handling");
-  if ((raster & 3) == 3 || (raster & 0x3800))
-    throw std::runtime_error("unsupported native cull/polygon/offset state");
+  const auto decoded=DecodeNativeRenderState(words);
   D3D11_BLEND_DESC blend_desc{};
   auto& target = blend_desc.RenderTarget[0];
-  target.BlendEnable = blend != 0x10001;
-  target.SrcBlend = Factor(blend & 31,false); target.DestBlend = Factor((blend>>8)&31,false);
-  target.BlendOp = Operation((blend>>5)&7);
-  target.SrcBlendAlpha = Factor((blend>>16)&31,true); target.DestBlendAlpha = Factor((blend>>24)&31,true);
-  target.BlendOpAlpha = Operation((blend>>21)&7);
-  if (words[4] > 15 || words[5] > 1) throw std::runtime_error("invalid native write-mask/scissor state");
-  target.RenderTargetWriteMask = static_cast<UINT8>(words[4]);
+  target.BlendEnable = decoded.blend_enable;
+  target.SrcBlend = static_cast<D3D11_BLEND>(decoded.src_color);
+  target.DestBlend = static_cast<D3D11_BLEND>(decoded.dst_color);
+  target.BlendOp = static_cast<D3D11_BLEND_OP>(decoded.color_op);
+  target.SrcBlendAlpha = static_cast<D3D11_BLEND>(decoded.src_alpha);
+  target.DestBlendAlpha = static_cast<D3D11_BLEND>(decoded.dst_alpha);
+  target.BlendOpAlpha = static_cast<D3D11_BLEND_OP>(decoded.alpha_op);
+  target.RenderTargetWriteMask = decoded.write_mask;
   D3D11_DEPTH_STENCIL_DESC depth_desc{};
-  depth_desc.DepthEnable = (depth & 2) != 0;
-  depth_desc.DepthWriteMask = depth & 4 ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-  depth_desc.DepthFunc = static_cast<D3D11_COMPARISON_FUNC>(((depth>>4)&7)+1);
+  depth_desc.DepthEnable = decoded.depth_enable;
+  depth_desc.DepthWriteMask = decoded.depth_write ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+  depth_desc.DepthFunc = static_cast<D3D11_COMPARISON_FUNC>(decoded.depth_func);
   D3D11_RASTERIZER_DESC raster_desc{};
-  raster_desc.FillMode = FillMode(raster);
-  raster_desc.CullMode = raster & 1 ? D3D11_CULL_FRONT : raster & 2 ? D3D11_CULL_BACK : D3D11_CULL_NONE;
-  raster_desc.FrontCounterClockwise = (raster & 4) == 0;
-  raster_desc.DepthClipEnable = true;
-  raster_desc.ScissorEnable = words[5] != 0;
+  raster_desc.FillMode = static_cast<D3D11_FILL_MODE>(decoded.fill);
+  raster_desc.CullMode = static_cast<D3D11_CULL_MODE>(decoded.cull);
+  raster_desc.FrontCounterClockwise = decoded.front_counter_clockwise;
+  raster_desc.DepthClipEnable = decoded.depth_clip;
+  raster_desc.ScissorEnable = decoded.scissor;
   NativeRenderState result;
-  const auto color_factor=[](uint32_t v){return v==12 || v==13;};
-  const auto alpha_factor=[](uint32_t v){return v==14 || v==15;};
-  const auto src=blend&31,dst=(blend>>8)&31;
-  if((color_factor(src) || color_factor(dst)) && (alpha_factor(src) || alpha_factor(dst)))
-    throw std::runtime_error("native mixed constant color/alpha RGB blending requires shader handling");
-  result.replicate_blend_alpha=alpha_factor(src) || alpha_factor(dst);
-  for(unsigned shift:{0u,8u,16u,24u}) {
-    const auto value=(blend>>shift)&31;
-    result.requires_blend_factor|=color_factor(value) || alpha_factor(value);
-  }
+  result.requires_blend_factor=decoded.requires_blend_factor;
+  result.replicate_blend_alpha=decoded.replicate_blend_alpha;
   if (FAILED(device.CreateBlendState(&blend_desc,&result.blend)) ||
       FAILED(device.CreateDepthStencilState(&depth_desc,&result.depth)) ||
       FAILED(device.CreateRasterizerState(&raster_desc,&result.raster)))

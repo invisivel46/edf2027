@@ -1,4 +1,4 @@
-add_library(edf_native_effects STATIC effect.cpp movie_effect.cpp xui_effect.cpp font_effect.cpp native_render_backend.cpp)
+add_library(edf_native_effects STATIC effect.cpp movie_effect.cpp xui_effect.cpp font_effect.cpp native_render_backend.cpp native_render_state_decode.cpp)
 target_include_directories(edf_native_effects PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_compile_features(edf_native_effects PUBLIC cxx_std_20)
 

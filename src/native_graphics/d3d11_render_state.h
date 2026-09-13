@@ -1,12 +1,11 @@
 #pragma once
+#include "native_render_state_decode.h"
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <array>
 #include <cstdint>
 
 namespace edf::native {
-// Blend, depth, raster, alpha control, RT0 channel mask, scissor enable.
-using RenderStateWords = std::array<uint32_t,6>;
 struct NativeViewportState {
   D3D11_VIEWPORT viewport;
   D3D11_RECT scissor;
