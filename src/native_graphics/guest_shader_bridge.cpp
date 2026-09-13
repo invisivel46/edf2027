@@ -127,6 +127,8 @@ REXCVAR_DEFINE_INT32(edf_native_probe_height, 1, "EDF2027", "Invalid-RGB diagnos
 REXCVAR_DEFINE_INT32(edf_native_probe_draw_limit, 4096, "EDF2027", "Maximum invalid-RGB diagnostic draws, capped at 65536");
 REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
+REXCVAR_DEFINE_BOOL(edf_native_batch_audit, false, "EDF2027",
+                   "Measure runs of consecutive indexed draws that differ only in per-instance constants; the mean run length is the draw-call reduction instancing would give");
 REXCVAR_DEFINE_INT32(edf_native_contract_limit, 4096, "EDF2027",
                     "Distinct draw contracts the coverage ledger retains (1..1048576); reaching it is counted, never silently dropped");
 REXCVAR_DEFINE_STRING(edf_native_contract_export, "", "EDF2027",
@@ -560,6 +562,10 @@ struct Bridge {
   uint64_t shared_constant_both_supplied=0;
   uint32_t last_activation_instance=0,last_activation_vertex=0,last_activation_pixel=0;
   uint64_t repeat_activations=0;
+  std::array<uint32_t,12> last_batch_key{};
+  uint64_t batch_draws=0,batch_runs=0,batch_run=0,batch_run_total=0,batch_longest=0,batch_collapsible=0;
+  uint64_t instance_shape=0,last_instance_shape=0,batch_shape_breaks=0;
+
   std::set<std::array<uint32_t,2>> shared_constant_pairs;
   std::set<std::array<uint32_t,3>> shared_constant_storage_reported;
   std::set<std::array<uint32_t,3>> shared_constant_reported;
@@ -992,6 +998,11 @@ void UploadParameters(const Reader& reader, uint32_t instance, uint32_t stage_of
       }
     }
     };
+    // Windowing the scattered payload reads as well was measured and did not
+    // pay: the pixel stage improved 14% but the vertex stage lost 5% to the
+    // extra pass, and activation.native did not move outside the 5% run-to-run
+    // drift of the untouched phases. Not worth a second pass and a fallback in
+    // this routine.
     if(record_base && record_bytes)
       upload(edf::native::GuestReadWindow(reader,record_base,record_bytes));
     else upload(reader);
@@ -1847,6 +1858,16 @@ REX_HOOK_RAW(sub_821D9600) {
     const edf::native::GuestReader reader(base);
     if(!state.active_vertex || !state.active_vertex_parameters || state.shader_bindings.Vertex(device)!=state.active_vertex) return;
     auto& shader=state.shaders.at(state.active_vertex);
+    // A single instanced shader variant can only serve a run whose instances
+    // all patch the same register range. Fingerprint the shape (not the data)
+    // so the indexed hook can tell whether a collapsible run is also uniform.
+    uint64_t shape=1469598103934665603ull;
+    for(const auto& entry:edf::native::ReadInstanceParameters(reader,list)) {
+      for(const auto word:{entry.first,entry.count}) {
+        shape^=word; shape*=1099511628211ull;
+      }
+    }
+    state.instance_shape=shape;
     for(const auto& [data,first,count]:edf::native::ReadInstanceParameters(reader,list)) {
       for(const auto& parameter:*state.active_vertex_parameters) {
         const auto low=(std::max)(first,parameter.first),high=(std::min)(first+count,parameter.first+parameter.count);
@@ -4705,6 +4726,41 @@ REX_HOOK_RAW(sub_821FE358) {
           if (!REXCVAR_GET(edf_native_scene_capture).empty() && state.scene_captures<3 && state.visibility.size()<2048) {
             const D3D11_QUERY_DESC query_desc{D3D11_QUERY_OCCLUSION,0};
             if (SUCCEEDED(state.device->CreateQuery(&query_desc,&visibility))) state.context->Begin(visibility.Get());
+          }
+          // Batching precondition. A run of draws that share mesh, declaration,
+          // shader pair, render state and index range, and differ only in the
+          // per-instance constants patched by 821D9600, is exactly what one
+          // DrawIndexedInstanced replaces. Measure the run lengths before
+          // building that: the mean run length is the draw-call reduction, and
+          // a mean near 1 would mean there is nothing to collapse.
+          if(REXCVAR_GET(edf_native_batch_audit)) {
+            const std::array<uint32_t,12> batch_key{stream.resource,ib,decl,
+              state.active_vertex,state.linked_pixel,ctx.r6.u32,ctx.r7.u32,uint32_t(ctx.r5.s32),
+              key[0],key[1],key[2],key[3]};
+            ++state.batch_draws;
+            if(batch_key==state.last_batch_key && state.instance_shape!=state.last_instance_shape)
+              ++state.batch_shape_breaks;
+            if(batch_key==state.last_batch_key) ++state.batch_run;
+            else {
+              if(state.batch_run) {
+                state.batch_longest=(std::max)(state.batch_longest,state.batch_run);
+                state.batch_run_total+=state.batch_run;
+                ++state.batch_runs;
+                if(state.batch_run>=2) state.batch_collapsible+=state.batch_run-1;
+              }
+              state.batch_run=1; state.last_batch_key=batch_key;
+            }
+            state.last_instance_shape=state.instance_shape;
+            if(state.batch_draws%1000000==0) {
+              REXLOG_INFO("Native batch audit: draws={}, runs={}, mean_run={:.2f}, longest_run={}, collapsible_draws={} ({:.1f}% of draws could be folded into a preceding instanced draw)",
+                state.batch_draws,state.batch_runs,
+                state.batch_runs?double(state.batch_run_total)/double(state.batch_runs):0.0,
+                state.batch_longest,state.batch_collapsible,
+                100.0*double(state.batch_collapsible)/double(state.batch_draws));
+              REXLOG_INFO("Native batch shape: collapsible={}, register_shape_breaks={} ({:.2f}% of collapsible draws patch a different register range than the draw before, so cannot share one instanced variant)",
+                state.batch_collapsible,state.batch_shape_breaks,
+                state.batch_collapsible?100.0*double(state.batch_shape_breaks)/double(state.batch_collapsible):0.0);
+            }
           }
           try { mesh.Draw(*state.context.Get(),ctx.r6.u32,ctx.r7.u32,ctx.r5.s32); }
           catch (...) { if (visibility) state.context->End(visibility.Get()); throw; }
