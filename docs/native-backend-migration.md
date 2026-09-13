@@ -426,6 +426,68 @@ conformance test already says the two backends agree on everything the
 renderer does.
 
 
+## Threading: three designs, and why only one of them can work
+
+The simulation said 3.59x at four threads. Getting there needs a design that
+fits how the game actually calls us, and two of the three obvious ones do not.
+
+**Fan out each hook.** Dead. There is no batch to spread: a material
+activation carries about 2.5 parameter uploads and each draw is its own call.
+Dispatching 0.63 microseconds of work to a pool costs more than doing it.
+
+**Decode ahead of the draw.** Also dead, and less obviously. The idea was that
+the hook copies the guest bytes it must read now - the game may overwrite them
+the moment it returns - and queues the conversion, so following draws submit
+while it happens beside them. Measured against the real call order, there are
+no following draws to overlap with: the hooks strictly alternate, activate,
+draw, activate, draw. The draw that would hide the latency is the one waiting
+for it. Nothing overlaps.
+
+**Record, then submit.** The only one left. Hooks record what each draw needs -
+pipeline, constant bytes, textures, buffers, draw arguments, viewport, target -
+into a per-frame buffer, and the frame is decoded and submitted at the end.
+That gives a batch, which is what both dead designs were missing, and it is
+what makes parallel recording on several command lists reachable.
+
+The record format is the seam. A recorded draw is a `NativeBackendPipelineDesc`
+plus the arguments to `SetConstants`, `SetTexture` and `DrawIndexed`, which is
+what those calls were shaped for. So **threading and the port are the same
+work**, not two things to schedule against each other.
+
+### What is built
+
+`NativeDecodeWorkers` is the pool that design needs, and it is finished and
+tested: 4,000 contended jobs, out-of-order completion, drain, destruction with
+work outstanding. Retirement only advances past tickets nothing is still
+working on - the naive "highest finished ticket" would let a draw bind
+constants that were never written, and the test catches that mutant by name.
+
+Zero workers runs every job inline, so threading off is the same code path
+rather than a special case.
+
+### What the ceiling actually looks like
+
+Measured per activation, in a menu scene where the sub-phases are visible:
+
+| | us/call |
+|---|---|
+| `activation.native` total | 2.438 |
+| of which `activation.original` - the guest's own recompiled code | 0.778 |
+| `activation.textures` | 0.577 |
+| `activation.resolve` | 0.518 |
+| `activation.params_ps` + `params_vs` | 0.627 |
+| `activation.bind` - must stay on the submitting thread | 0.314 |
+
+Roughly a third of an activation is the game's own function and cannot move at
+all, and the bind cannot leave the submit thread. That is a smaller
+parallelisable fraction than the simulation assumed, so 3.59x should be read
+as an upper bound that nothing will reach rather than a target.
+
+These are menu numbers. Gameplay is the case that matters - it is where
+`indexed.native` dominates and where the earlier 62.8% draw-thread figure came
+from - and the same breakdown has not been taken there yet. It should be, before
+the record buffer is sized or the worker count is chosen.
+
 ## How the port actually has to happen
 
 Two facts decide this, and neither was obvious before a backend existed.
