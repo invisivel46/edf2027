@@ -1,4 +1,5 @@
 #include "d3d11_mesh.h"
+#include "native_input_layout.h"
 #include "native_declarations.h"
 #include "native_generated_indices.h"
 #include <array>
@@ -72,7 +73,9 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
       vertices.empty() || vertices.size()%stride || vertices.size()>128*1024*1024 ||
       (index_bytes!=2 && index_bytes!=4) || indices.empty() || indices.size()%index_bytes || indices.size()>128*1024*1024)
     throw std::runtime_error("invalid native indexed mesh input");
-  std::vector<D3D11_INPUT_ELEMENT_DESC> elements;
+  // Built neutrally and converted just below, so the same layout can describe
+  // a pipeline on any backend instead of only a D3D11 input layout.
+  NativeOwnedInputLayout layout;
   std::vector<NativeVertexAttribute> attributes;
   UINT native_stride=0;
   std::vector<bool> occupied(stride,false);
@@ -118,7 +121,7 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
         }
       }
     }
-    elements.push_back({Semantic(usage),index,format,0,native_stride,D3D11_INPUT_PER_VERTEX_DATA,0});
+    layout.Add(Semantic(usage),index,format,0,native_stride);
     attributes.push_back({offset,native_stride,components,type,integer});
     native_stride+=components*4;
   }
@@ -133,8 +136,8 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
     if (FAILED(shader.reflection->GetInputParameterDesc(i,&input))) throw std::runtime_error("cannot reflect mesh input");
     if (input.SystemValueType!=D3D_NAME_UNDEFINED) continue;
     bool supplied=false;
-    for (const auto& element:elements)
-      if (!_stricmp(element.SemanticName,input.SemanticName) && element.SemanticIndex==input.SemanticIndex) supplied=true;
+    for (const auto& element:layout.elements())
+      if (!_stricmp(element.semantic,input.SemanticName) && element.semantic_index==input.SemanticIndex) supplied=true;
     if (supplied) continue;
     bool known=false;
     for (uint8_t usage : {0,1,2,3,4,5,6,7,10})
@@ -145,10 +148,17 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
     if (input.ComponentType==D3D_REGISTER_COMPONENT_SINT32) format=DXGI_FORMAT_R32G32B32A32_SINT;
     else if (input.ComponentType==D3D_REGISTER_COMPONENT_UINT32) format=DXGI_FORMAT_R32G32B32A32_UINT;
     else if (integer) throw std::runtime_error("unsupported default vertex component type");
-    elements.push_back({input.SemanticName,input.SemanticIndex,format,0,native_stride,D3D11_INPUT_PER_VERTEX_DATA,0});
+    layout.Add(input.SemanticName,input.SemanticIndex,format,0,native_stride);
     attributes.push_back({0,native_stride,4,0,integer,true});
     native_stride+=16;
   }
+  std::vector<D3D11_INPUT_ELEMENT_DESC> elements;
+  elements.reserve(layout.size());
+  for(const auto& element:layout.elements())
+    elements.push_back({element.semantic,element.semantic_index,
+                        static_cast<DXGI_FORMAT>(element.format),element.slot,element.offset,
+                        element.per_instance?D3D11_INPUT_PER_INSTANCE_DATA:D3D11_INPUT_PER_VERTEX_DATA,
+                        element.step_rate});
   const auto layout_result=device.CreateInputLayout(elements.data(),static_cast<UINT>(elements.size()),
       shader.bytecode->GetBufferPointer(),shader.bytecode->GetBufferSize(),&layout_);
   if (FAILED(layout_result)) {
@@ -156,9 +166,9 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
     message << "native mesh shader input layout mismatch: entry=" << shader.entry.name
             << " HRESULT=0x" << std::hex << uint32_t(layout_result) << std::dec
             << " guest_stride=" << stride << " supplied=[";
-    for (size_t i=0;i<elements.size();++i) {
-      const auto& e=elements[i]; const auto& a=attributes[i];
-      message << e.SemanticName << e.SemanticIndex << ":format=" << e.Format
+    for (size_t i=0;i<layout.size();++i) {
+      const auto& e=layout.elements()[i]; const auto& a=attributes[i];
+      message << e.semantic << e.semantic_index << ":format=" << e.format
               << ":guest_offset=" << a.guest_offset << ":type=0x" << std::hex << a.type << std::dec << ' ';
     }
     message << "] required=[";
@@ -174,6 +184,7 @@ NativeIndexedMesh::NativeIndexedMesh(ID3D11Device& device,const NativeShader& sh
     message << ']';
     throw std::runtime_error(message.str());
   }
+  input_layout_=std::move(layout);
   vertex_count_=static_cast<uint32_t>(vertices.size()/stride);
   stride_=native_stride;
   if(index_storage && !index_storage->Matches(device,indices,index_bytes)) {

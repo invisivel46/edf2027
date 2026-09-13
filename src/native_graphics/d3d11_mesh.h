@@ -1,4 +1,5 @@
 #pragma once
+#include "native_input_layout.h"
 #include "mesh_key.h"
 #include "d3d11_effect.h"
 #include <array>
@@ -99,6 +100,12 @@ class NativeIndexedMesh {
   const std::shared_ptr<const NativeIndexBuffer>& IndexStorage() const { return index_storage_; }
   const std::shared_ptr<NativeVertexBuffer>& VertexStorage() const { return vertex_storage_; }
  private:
+  // The vertex layout this mesh was built with, in neutral form, so a pipeline
+  // can be created from it without rebuilding it from the guest declaration.
+ public:
+  const NativeOwnedInputLayout& input_layout() const { return input_layout_; }
+ private:
+  NativeOwnedInputLayout input_layout_;
   void ValidateRange(uint32_t first,uint32_t count,int32_t base,uint32_t primitive_width) const;
   void BindAndDraw(ID3D11DeviceContext& context,uint32_t first,uint32_t count,int32_t base,D3D11_PRIMITIVE_TOPOLOGY topology) const;
   std::shared_ptr<NativeVertexBuffer> vertex_storage_;
