@@ -197,6 +197,7 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        ImmediateContextWait, PresentationContextWait,
                        ActivationLock, ActivationResolve, ActivationVertexParams, ActivationPixelParams,
                        ActivationTextures, ActivationBind,
+                       XuiNative, XuiDecode, XuiBind, XuiDraw,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
@@ -228,6 +229,7 @@ class HookTiming {
       "immediate.context_wait","presentation.context_wait",
       "activation.lock","activation.resolve","activation.params_vs","activation.params_ps",
       "activation.textures","activation.bind",
+      "xui.native","xui.decode","xui.bind","xui.draw",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
       "load.shader.registration","load.shader.lock","load.shader.entry",
       "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
@@ -5467,6 +5469,12 @@ REX_HOOK_RAW(sub_821FD8F8) {
         }
         auto& vertex=viewport.reverse_depth?*state.xui_reversed_vertex:*state.xui_vertex;
         auto& pixel=solid ? *state.xui_solid_pixel : mask ? *state.xui_mask_pixel : *state.xui_pixel;
+        // Split into the three parts a batch would separate: converting guest
+        // data, binding, and the draw itself. 2.87 million of these went
+        // through here with no timing at all, so what they cost - and which
+        // part of them is worth batching - was unknown.
+        edf::native::HookTiming xui_total(edf::native::HookPhase::XuiNative);
+        edf::native::HookTiming xui_decode(edf::native::HookPhase::XuiDecode);
         auto registers=[&](uint32_t offset,size_t bytes){
           return std::span<const uint8_t>{reader.Bytes(reader.Add(device,offset),bytes),bytes};};
         const auto vertex_registers=registers(1792,192);
@@ -5501,14 +5509,19 @@ REX_HOOK_RAW(sub_821FD8F8) {
         }
         pixel_plan.SetSampler(pixel,sampler->second.Get());
         }
+        xui_decode.Finish();
+        edf::native::HookTiming xui_bind(edf::native::HookPhase::XuiBind);
         auto render=state.render_states.find(key);
         if(render==state.render_states.end())
           render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(*state.device.Get(),key)).first;
         edf::native::BindActiveTarget(state);
         edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32); viewport.Bind(*state.context.Get());
         vertex.Bind(*state.context.Get()); pixel.Bind(*state.context.Get());
+        xui_bind.Finish();
+        edf::native::HookTiming xui_draw(edf::native::HookPhase::XuiDraw);
         const size_t bytes=size_t(ctx.r5.u32)*8;
         state.xui_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,bytes),bytes});
+        xui_draw.Finish();
         native_submitted=true;
         // Partial alpha geometry cannot establish initialized full-frame pixels.
         // Preserve the preceding clear/post pass's initialization state.
