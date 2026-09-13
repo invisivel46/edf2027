@@ -119,6 +119,10 @@ class NativeBackendRecorder {
   virtual void CopyTexture(NativeBackendTexture& destination,NativeBackendTexture& source)=0;
   virtual void ResolveTarget(NativeBackendTexture& destination,NativeBackendRenderTarget& source)=0;
   virtual void UpdateBuffer(NativeBackendBuffer& buffer,uint32_t offset,std::span<const uint8_t> bytes)=0;
+  // Replace a texture's top level. Bytes are tightly packed, smallest stride,
+  // the same layout CreateTexture takes, so a caller never has to know what
+  // row pitch the backend's hardware wants.
+  virtual void UpdateTexture(NativeBackendTexture& texture,std::span<const uint8_t> bytes)=0;
 
   virtual void BeginQuery(NativeBackendQuery& query)=0;
   virtual void EndQuery(NativeBackendQuery& query)=0;

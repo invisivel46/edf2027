@@ -119,6 +119,25 @@ D3D11_TEXTURE_ADDRESS_MODE AddressMode(NativeBackendAddress address) {
 
 constexpr uint32_t kTextureSlots=8,kSamplerSlots=8,kConstantSlots=4;
 
+// Deliberately narrow: the seam's format field is a backend-specific code, and
+// a format this does not know must fail rather than be guessed at a plausible
+// size and silently read the wrong number of bytes.
+uint32_t BytesPerTexelPublic(DXGI_FORMAT format) {
+  switch(format) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R32_FLOAT:
+      return 4;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
+    case DXGI_FORMAT_R8_UNORM: return 1;
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R16_FLOAT: return 2;
+    default: break;
+  }
+  throw std::runtime_error("this backend does not know the texel size of format "+
+                           std::to_string(static_cast<uint32_t>(format)));
+}
+
 class D3D11Recorder final : public NativeBackendRecorder {
  public:
   D3D11Recorder(ID3D11Device& device, ID3D11DeviceContext& context)
@@ -260,6 +279,17 @@ class D3D11Recorder final : public NativeBackendRecorder {
     context_->UpdateSubresource(concrete.buffer(),0,&box,bytes.data(),0,0);
   }
 
+  void UpdateTexture(NativeBackendTexture& texture, std::span<const uint8_t> bytes) override {
+    auto& concrete=static_cast<D3D11Texture&>(texture);
+    D3D11_TEXTURE2D_DESC description{};
+    concrete.texture()->GetDesc(&description);
+    const UINT pitch=description.Width*BytesPerTexelPublic(description.Format);
+    if(bytes.size()<static_cast<size_t>(pitch)*description.Height)
+      throw std::runtime_error("texture update is "+std::to_string(bytes.size())+
+                               " bytes but the texture needs "+std::to_string(pitch*description.Height));
+    context_->UpdateSubresource(concrete.texture(),0,nullptr,bytes.data(),pitch,0);
+  }
+
   void BeginQuery(NativeBackendQuery& query) override {
     context_->Begin(static_cast<D3D11Query&>(query).query());
   }
@@ -391,7 +421,7 @@ class D3D11Backend final : public NativeRenderBackend {
     // does not have to know which backend it is talking to.
     std::vector<D3D11_SUBRESOURCE_DATA> levels;
     size_t offset=0;
-    const uint32_t bytes_per_texel=BytesPerTexel(description.Format);
+    const uint32_t bytes_per_texel=BytesPerTexelPublic(description.Format);
     for(UINT level=0;level<description.MipLevels && !initial.empty();++level) {
       const uint32_t width=(std::max)(1u,desc.width>>level),height=(std::max)(1u,desc.height>>level);
       const size_t pitch=static_cast<size_t>(width)*bytes_per_texel;
@@ -596,7 +626,7 @@ class D3D11Backend final : public NativeRenderBackend {
 
     D3D11_MAPPED_SUBRESOURCE mapped{};
     Require(context_->Map(staging.Get(),0,D3D11_MAP_READ,0,&mapped),"staging map");
-    const size_t pitch=static_cast<size_t>(description.Width)*BytesPerTexel(description.Format);
+    const size_t pitch=static_cast<size_t>(description.Width)*BytesPerTexelPublic(description.Format);
     std::vector<uint8_t> pixels(pitch*description.Height);
     for(UINT row=0;row<description.Height;++row)
       std::memcpy(pixels.data()+static_cast<size_t>(row)*pitch,
@@ -677,25 +707,6 @@ class D3D11Backend final : public NativeRenderBackend {
   }
 
  private:
-  // Enough to read back and to lay out initial contents. Deliberately narrow:
-  // the seam's format field is a backend-specific code, and a format this does
-  // not know must fail rather than be guessed at a plausible size.
-  static uint32_t BytesPerTexel(DXGI_FORMAT format) {
-    switch(format) {
-      case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
-      case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_R10G10B10A2_UNORM:
-      case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R32_FLOAT:
-        return 4;
-      case DXGI_FORMAT_R16G16B16A16_FLOAT: return 8;
-      case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16;
-      case DXGI_FORMAT_R8_UNORM: return 1;
-      case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R16_FLOAT: return 2;
-      default: break;
-    }
-    throw std::runtime_error("this backend does not know the texel size of format "+
-                             std::to_string(static_cast<uint32_t>(format)));
-  }
-
   ComPtr<ID3D11Device> device_;
   ComPtr<ID3D11DeviceContext> context_;
   ComPtr<ID3D11InfoQueue> messages_;

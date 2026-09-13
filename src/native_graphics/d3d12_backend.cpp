@@ -357,6 +357,31 @@ class D3D12Recorder final : public NativeBackendRecorder {
                                 upload.offset,bytes.size());
   }
 
+  void UpdateTexture(NativeBackendTexture& texture, std::span<const uint8_t> bytes) override {
+    auto& concrete=static_cast<D3D12Texture&>(texture);
+    const auto description=concrete.tracked().resource->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+    UINT64 total=0,row_bytes=0;
+    UINT rows=0;
+    gpu_->device()->GetCopyableFootprints(&description,0,1,0,&footprint,&rows,&row_bytes,&total);
+    if(bytes.size()<static_cast<size_t>(row_bytes)*rows)
+      throw std::runtime_error("texture update is "+std::to_string(bytes.size())+
+                               " bytes but the texture needs "+std::to_string(row_bytes*rows));
+    const auto upload=gpu_->Allocate(total,D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,index_);
+    for(UINT row=0;row<rows;++row)
+      std::memcpy(upload.cpu+static_cast<size_t>(row)*footprint.Footprint.RowPitch,
+                  bytes.data()+static_cast<size_t>(row)*row_bytes,static_cast<size_t>(row_bytes));
+    footprint.Offset=upload.offset;
+    Transition(concrete.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
+    const D3D12_TEXTURE_COPY_LOCATION from{upload.resource,
+                                           D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,{footprint}};
+    D3D12_TEXTURE_COPY_LOCATION to{};
+    to.pResource=concrete.tracked().resource.Get();
+    to.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    to.SubresourceIndex=0;
+    Commands().CopyTextureRegion(&to,0,0,0,&from,nullptr);
+  }
+
   void BeginQuery(NativeBackendQuery& query) override {
     auto& concrete=static_cast<D3D12Query&>(query);
     Commands().BeginQuery(concrete.heap(),D3D12_QUERY_TYPE_OCCLUSION,0);
