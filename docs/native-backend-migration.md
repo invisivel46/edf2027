@@ -259,7 +259,8 @@ collapsible into a preceding instanced draw, with zero register-shape breaks
 across 14.7M draws. It helps D3D11 now and makes every later stage cheaper:
 fewer pipeline binds, fewer command-list entries, less to record per thread.
 
-**Stage 1 - the interface.** Introduce a backend interface at the level the
+**Stage 1 - the interface.** *Done, and with two backends behind it rather
+than one; see the status sections below.* Introduce a backend interface at the level the
 bridge actually needs (resources, pipeline state, bindings, targets, clears,
 draws, copies, dynamic uploads, queries) rather than a 1:1 mirror of D3D11's 47
 methods. A D3D11 implementation sits behind it and keeps working. This is where
@@ -307,7 +308,9 @@ Working, each verified by reading pixels back rather than by inspection:
 
 Not done, and loud rather than silent about it:
 
-- **The bridge still calls D3D11 directly.** Not wired to the game.
+- **The bridge still calls D3D11 directly.** The game can now create and
+  report a backend (`--edf_native_backend`), but nothing draws through one
+  yet. See "How the port actually has to happen" below.
 - No vertex-stage textures or samplers (no disc shader uses any, so this is a
   declared limit rather than a missing feature).
 - Wiring is the 13 touchpoints and is the largest remaining piece, and it
@@ -331,6 +334,55 @@ were wrong. Each is now fixed rather than worked around:
 - It declared a sampler type with no way to create one.
 - It could not read its own output, so a backend could not be compared against
   the one it replaces.
+
+## How the port actually has to happen
+
+Two facts decide this, and neither was obvious before a backend existed.
+
+**Backends cannot be mixed inside a frame.** A D3D12 render target cannot be
+composited by a D3D11 path, and two D3D11 devices cannot share a texture
+either. Taken alone, that would force the whole 3,529-line port to land as one
+change that either works or does not.
+
+**But a backend can adopt the device the renderer already owns.** With
+`AdoptNativeD3D11Backend`, ported paths and unported paths draw into the same
+targets, so the port can go one path at a time with the game playable after
+each. `--edf_native_backend=d3d11` does exactly this in the game today.
+
+So the order is:
+
+1. **Backend selection in the game.** Done. `--edf_native_backend` creates a
+   backend inside the real process and reports it; an unknown name is refused
+   with the reason and the valid names in the log.
+2. **Move paths onto the seam, D3D11 adopted underneath.** Each path
+   verifiable by playing. The renderer keeps working throughout, and any
+   rendering change is a wiring mistake, because the backend underneath has
+   not changed.
+3. **Restructure constants as each path moves.** Not a separate step: a path
+   on the seam already carries its own constant bytes through `SetConstants`,
+   which is what makes draws independent. `ShaderBindings::ConstantImages`
+   supplies them.
+4. **Flip to D3D12.** One change, once nothing calls the context directly.
+   The conformance test is what says the flip was clean.
+5. **Then threads**, which only step 3 makes possible.
+
+### What has to move, measured
+
+The bridge itself barely touches D3D11 directly - about 17 context calls. The
+work is in what it hands the context to: 69 sites pass `*state.context.Get()`
+to a helper, and those helpers are the port.
+
+| | |
+|---|---|
+| `state.context` / `state.device` references in the bridge | 137 |
+| direct context calls in the bridge | ~17 |
+| sites handing the context to a helper | 69 |
+| D3D11-specific lines across the renderer | 3,529 |
+
+Helpers to move, roughly in dependency order: `d3d11_render_state` (already
+decoded through the shared path, so only the objects remain),
+`d3d11_bindings`, `d3d11_mesh`, `d3d11_texture`, `d3d11_quads`, then the
+effect paths (`d3d11_ui`, font, movie, XUI) and the presenter.
 
 ## What this replaces
 
