@@ -24,7 +24,14 @@ ShaderBindings::ShaderBindings(ID3D11Device& device, NativeShader shader)
       Buffer buffer{binding.BindPoint, std::vector<uint8_t>((desc.Size + 15u) & ~15u), {}};
       D3D11_BUFFER_DESC gpu_desc{};
       gpu_desc.ByteWidth = static_cast<UINT>(buffer.bytes.size());
-      gpu_desc.Usage = D3D11_USAGE_DEFAULT;
+      // Dynamic, so the upload below can discard-and-rename rather than
+      // overwrite. That is what makes draws independent of each other: a draw
+      // already recorded keeps the values it was given instead of seeing the
+      // next material's. It is the prerequisite for recording draws on more
+      // than one thread, and it is also what every other backend requires,
+      // since neither D3D12 nor Vulkan renames anything on its own.
+      gpu_desc.Usage = D3D11_USAGE_DYNAMIC;
+      gpu_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
       gpu_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
       Require(device.CreateBuffer(&gpu_desc, nullptr, &buffer.gpu), "cannot create constant buffer");
       for (UINT v = 0; v < desc.Variables; ++v) {
@@ -310,7 +317,13 @@ void ShaderBindings::Bind(ID3D11DeviceContext& context) {
   else context.VSSetShader(shader_.vertex.Get(), nullptr, 0);
   for (auto& buffer : buffers_) {
     if (buffer.dirty) {
-      context.UpdateSubresource(buffer.gpu.Get(), 0, nullptr, buffer.bytes.data(), 0, 0);
+      // WRITE_DISCARD hands back a fresh version of the buffer; the one the
+      // previous draw was given stays intact until that draw has executed.
+      D3D11_MAPPED_SUBRESOURCE mapped{};
+      if (SUCCEEDED(context.Map(buffer.gpu.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+        std::memcpy(mapped.pData, buffer.bytes.data(), buffer.bytes.size());
+        context.Unmap(buffer.gpu.Get(), 0);
+      }
       buffer.dirty = false;
     }
     auto* value = buffer.gpu.Get();
