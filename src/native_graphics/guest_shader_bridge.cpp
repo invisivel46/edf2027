@@ -5345,11 +5345,13 @@ REX_HOOK_RAW(sub_821FE358) {
           // building that: the mean run length is the draw-call reduction, and
           // a mean near 1 would mean there is nothing to collapse.
           if(state.recorded_draws && state.recorded_draws%1000000==0)
-            REXLOG_INFO("Native recorded binding reuse: draws={}, pipeline_skips={} ({:.1f}%), material_skips={} ({:.1f}%) (a skip is a draw whose pipeline or material the recorder already held)",
+            REXLOG_INFO("Native recorded binding reuse: draws={}, pipeline_skips={} ({:.1f}%), material_skips={} ({:.1f}%), constant_buffer_skips={} ({:.2f} per draw) (a skip is something the recorder already held, so the draw did not re-send it)",
               state.recorded_draws,state.recorded_pipeline_skips,
               100.0*double(state.recorded_pipeline_skips)/double(state.recorded_draws),
               state.recorded_material_skips,
-              100.0*double(state.recorded_material_skips)/double(state.recorded_draws));
+              100.0*double(state.recorded_material_skips)/double(state.recorded_draws),
+              state.recorded_constant_skips,
+              double(state.recorded_constant_skips)/double(state.recorded_draws));
           if(REXCVAR_GET(edf_native_batch_audit) && state.indexed_draws%1000000==0)
             REXLOG_INFO("Native indexed binding reuse: bound={}, skipped={} ({:.1f}% of draws bound no target or render state, because the draw before them had already bound the same)",
               state.indexed_binds_bound,state.indexed_binds_skipped,
