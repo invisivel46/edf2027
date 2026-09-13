@@ -5,6 +5,7 @@
 #include "d3d11_backend.h"
 #include "d3d12_backend.h"
 #include "native_render_backend.h"
+#include "native_decode_workers.h"
 #include "native_d3d12_preview.h"
 #include "native_host_surface.h"
 #include "guest_instance_parameters.h"
@@ -134,6 +135,8 @@ REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
                    "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
 REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
                      "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
+REXCVAR_DEFINE_INT32(edf_native_shader_workers, -1, "EDF2027",
+                    "Threads used to compile a shader registration's entries: -1 picks one per core up to eight, 0 compiles inline on the calling thread. Compilation is the load cost worth threading - the entries are a real batch and each takes milliseconds, unlike the per-draw work, which has neither property");
 REXCVAR_DEFINE_BOOL(edf_native_backend_preview, false, "EDF2027",
                    "Open a second window drawn and presented entirely by the selected backend. Needs --edf_native_backend and --edf_native_publish_frames. The renderer's own window is untouched");
 REXCVAR_DEFINE_BOOL(edf_native_batch_audit, false, "EDF2027",
@@ -873,6 +876,22 @@ Effect SnapshotEffect(const GuestReader& reader, uint32_t data) {
   return result;
 }
 
+// One pool for the run. Created on first registration so a run that loads no
+// shaders never starts a thread.
+NativeDecodeWorkers& ShaderWorkers() {
+  static NativeDecodeWorkers workers([] {
+    const auto requested=REXCVAR_GET(edf_native_shader_workers);
+    if(requested==0) return uint32_t(0);
+    if(requested>0) return uint32_t((std::min)(requested,64));
+    // One per core, less the one doing the loading, capped: compilation is
+    // memory-bound enough that more threads stop helping well before the core
+    // count on a large machine.
+    const auto cores=std::thread::hardware_concurrency();
+    return uint32_t((std::min)(cores>1?cores-1:1u,8u));
+  }());
+  return workers;
+}
+
 void RegisterShaders(const GuestReader& reader, uint32_t owner, const Effect& effect) {
   HookTiming registration_timing(HookPhase::ShaderRegistration);
   auto& state = State();
@@ -886,24 +905,56 @@ void RegisterShaders(const GuestReader& reader, uint32_t owner, const Effect& ef
   if (count != effect.entries.size()) throw std::runtime_error("guest compiled shader count mismatch");
   const auto records = reader.Word(owner);
   reader.Bytes(records, size_t(count) * 72);
-  std::unordered_map<uint32_t, RegisteredShader> fresh;
+  // Guest memory is read here, on the calling thread, before anything is
+  // handed to a worker: the reads must happen while the game is inside this
+  // call, and a worker touching guest memory would be reading it at a time the
+  // game never agreed to.
+  std::vector<uint32_t> handles(count);
   for (uint32_t i = 0; i < count; ++i) {
-    HookTiming entry_timing(HookPhase::ShaderEntry);
     const auto& entry = effect.entries[i];
     const auto record = reader.Add(records, i * 72);
     if (reader.Word(reader.Add(record, 68)) != uint32_t(entry.pixel))
       throw std::runtime_error("guest compiled shader stage mismatch");
-    const auto handle = reader.Word(reader.Add(record, entry.pixel ? 4 : 0));
-    if (!handle) throw std::runtime_error("guest compiled shader handle is null");
-    auto shader = CompileNativeShader(*state.device.Get(), effect, entry, state.root / "Shader" / "guest.fx");
-    auto bindings = std::make_unique<ShaderBindings>(*state.device.Get(), std::move(shader));
-    RegisteredShader registered{owner,std::move(bindings)};
-    registered.source_fingerprint=EffectSourceFingerprint(effect.source);
-    if (!entry.pixel) registered.reversed_bindings=std::make_unique<ShaderBindings>(*state.device.Get(),
-      CompileNativeShader(*state.device.Get(),effect,entry,state.root / "Shader" / "guest.fx",true));
-    if (!fresh.emplace(handle, std::move(registered)).second)
-      throw std::runtime_error("duplicate guest shader handle");
+    handles[i] = reader.Word(reader.Add(record, entry.pixel ? 4 : 0));
+    if (!handles[i]) throw std::runtime_error("guest compiled shader handle is null");
   }
+
+  // Compilation is the part worth threading: each entry costs milliseconds and
+  // a registration brings several, which is the batch the per-draw path does
+  // not have. D3DCompile is thread-safe and ID3D11Device resource creation is
+  // free-threaded; nothing below touches the immediate context or the bridge
+  // state, both of which are not.
+  std::vector<RegisteredShader> built(count);
+  std::vector<std::exception_ptr> failures(count);
+  auto& workers = ShaderWorkers();
+  std::vector<uint64_t> tickets;
+  tickets.reserve(count);
+  const auto source_path = state.root / "Shader" / "guest.fx";
+  auto* device = state.device.Get();
+  for (uint32_t i = 0; i < count; ++i)
+    tickets.push_back(workers.Submit([&, i] {
+      HookTiming entry_timing(HookPhase::ShaderEntry);
+      try {
+        const auto& entry = effect.entries[i];
+        auto shader = CompileNativeShader(*device, effect, entry, source_path);
+        built[i] = RegisteredShader{owner, std::make_unique<ShaderBindings>(*device, std::move(shader))};
+        built[i].source_fingerprint = EffectSourceFingerprint(effect.source);
+        if (!entry.pixel)
+          built[i].reversed_bindings = std::make_unique<ShaderBindings>(*device,
+            CompileNativeShader(*device, effect, entry, source_path, true));
+      } catch (...) {
+        failures[i] = std::current_exception();
+      }
+    }));
+  for (const auto ticket : tickets) workers.Wait(ticket);
+  // Rethrown in entry order, so which entry is blamed does not depend on which
+  // worker happened to finish first.
+  for (uint32_t i = 0; i < count; ++i) if (failures[i]) std::rethrow_exception(failures[i]);
+
+  std::unordered_map<uint32_t, RegisteredShader> fresh;
+  for (uint32_t i = 0; i < count; ++i)
+    if (!fresh.emplace(handles[i], std::move(built[i])).second)
+      throw std::runtime_error("duplicate guest shader handle");
   // Handle equality is not shader-generation equality. The linked pair/active
   // ranges must not survive a replacement at the same guest address. Invalidate
   // before mutating the registry, including a handle reused by another owner.
