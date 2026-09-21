@@ -3,16 +3,21 @@
 A native PC build of the Xbox 360 game *Earth Defense Force 2017* (USA/Europe),
 made with static recompilation on the [ReXGlue](https://github.com/rexglue) SDK.
 
-The current Windows worktree uses a native Direct3D 11 renderer and no longer
-selects or packages the Xenos GPU plugin. This migration is still in development:
-mission player/HUD rendering is verified, but full rendering coverage, sustained
-combat, native synchronization and handheld performance are not yet certified.
+The Windows build defaults to native Direct3D 12 scene rendering and
+presentation, including display gamma, SDK overlays, GPU completion, and
+profiling. The default path creates no D3D11 device; D3D11 remains an explicit,
+delay-loaded fallback. No Xenos GPU plugin is selected or packaged. Full content coverage and handheld performance remain uncertified.
 The screenshots and graphics-option descriptions below include the older build.
 GPU-plugin quality and upscaling controls are disabled in the native path.
 Native VSync uses `edf_native_vsync` independently of the old GPU-plugin setting;
 it changes display synchronization, not the fixed 60 Hz simulation clock.
 Old build folders may still contain previously copied DLLs; use a fresh output
 folder to verify the native distribution. No game data is included.
+
+D3D12 geometry recording defaults to four CPU workers. For comparison,
+`--edf_native_geometry_workers=0` uses direct recording and `=1` uses one packet
+worker. The [migration notes](docs/native-backend-migration.md) explain ordering,
+validation, and measured performance.
 
 Native reads now validate live SDK commitment/protection metadata, with Windows
 validation for untracked or unsupported ranges. For diagnostic comparison,
@@ -95,13 +100,19 @@ or `sha1sum <file>.iso` elsewhere.
 ## Settings
 
 * **F1** in game — EDF2027 settings: display mode, window size, aspect handling,
-  native VSync, FPS cap, audio, controls, and diagnostics.
+  native VSync, experimental frame-rate unlock, FPS cap, audio, controls, and diagnostics.
   **Save** writes them to the config file; items marked `*` need a restart.
   The native renderer currently uses the game's render size. Render-resolution
   scaling and legacy anisotropic-filtering, MSAA, FXAA, background-compilation,
   CAS and FSR controls are disabled. The simulation clock remains 60 Hz.
   Some SDK builds require `amd_fidelityfx_dx12.dll` for loading `rexruntime.dll`;
   its presence does not enable native FidelityFX upscaling.
+* **Unlock frame rate (experimental)** — Direct3D 12 can render above 60 FPS
+  while simulation stays at 60 Hz. Enable it in F1, then choose a 120 FPS cap
+  or Off; VSync also limits presentation to the display refresh. Camera and
+  model interpolation add up to one simulation tick of latency. This is opt-in,
+  and achievable frame rates depend on scene cost. The Direct3D 11 fallback
+  remains limited by its host ticker. See [validation notes](docs/framerate-unlock.md).
 * **F2** — toggle the compact FPS overlay.
 * **F4** — advanced ReXGlue settings (every runtime option).
 * **F3** — debug overlay, **`** — console.
@@ -170,11 +181,17 @@ accept `--name` (true) or `--no-name` (false). Do not use `--name false`: the
 separate word does not disable the flag. Native presentation uses
 `edf_native_vsync`, not the legacy GPU-plugin `vsync` option.
 
+For a D3D11 comparison or driver fallback, pass
+`--edf_native_scene_backend=d3d11 --edf_native_backend=d3d11`.
+Recorded scene draws are enabled by default. To compare the older direct D3D11
+path, also pass `--edf_native_seam_draws=false`; direct draws require the D3D11
+scene backend. See [the migration status](docs/native-backend-migration.md).
+
 ## Troubleshooting
 
 * *"That disc image is not Earth Defense Force 2017"*: the title id in
   `default.xex` did not match `445007D3`; only the USA/Europe release is supported.
-* Black window / GPU error: this worktree uses native Direct3D 11 on Windows.
+* Black window / GPU error: this worktree defaults to native Direct3D 12 on Windows.
   Check the log for native shader, draw or presentation failures. Installing a
   Xenos plugin is not a fix; this port no longer selects one.
 * Logs: `--log_file run.log` writes next to the exe.
@@ -197,7 +214,7 @@ cmake --preset win-amd64-release -DCMAKE_PREFIX_PATH=C:\path\to\rexglue-sdk
 cmake --build --preset win-amd64-release
 ```
 
-The native D3D11 renderer does not use the SDK's DX12/Vulkan FidelityFX path,
+The native renderer does not use the SDK's DX12/Vulkan FidelityFX path,
 so CAS/FSR controls remain disabled even when those SDK DLLs are available.
 Note that `find_package` caches `rexglue_DIR`, so switching a build directory
 between SDKs needs its `CMakeCache.txt` deleted first.
@@ -224,3 +241,5 @@ partition directly), so a release package needs no external tools:
 ```powershell
 cmake --build out/build/win-amd64-release --target package_release
 ```
+
+The D3D12 renderer now uses two frame credits by default so CPU preparation can overlap the previous GPU frame. `--edf_native_frame_latency=1` restores the per-frame GPU drain for comparison. The ordered three-surface presentation queue preserves each frame until the host GPU copy completes. A five-minute Mission 1 validation reported 60.0 FPS throughout with zero repeated or skipped images across 17,440 host presentations. A closer-combat run at native 1920x1080 still dipped to 57 FPS, so this is not yet a locked-60 guarantee. Optional display feedback is available through `--edf_native_display_trace=path.csv`. D3D12 VSync off now enables the required variable-refresh flags where supported; VRR also requires monitor/driver configuration. With fixed refresh, a display rate divisible by 60 avoids the uneven refresh spacing of 60 FPS at 165 Hz.

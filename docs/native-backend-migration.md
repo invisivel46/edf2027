@@ -1,8 +1,885 @@
 # Native renderer backend migration
 
-Planning note for moving the native renderer off D3D11 onto a D3D12/Vulkan
-backend. Written before any backend code exists, so the measured surface and the
-design consequences are on record rather than discovered halfway through.
+## Direct texture/sampler binding slots - 2026-09-18
+
+ShaderBindings now builds direct slot pointers to its reflected texture and
+sampler map values. Named and pre-resolved setters use those pointers instead
+of looking up the slot in an ordered map again. The maps keep ownership and
+iteration order; their nodes are created during reflection and never erased or
+moved during the binding object's lifetime. Slot tables add 144 pointers per
+shader binding object. Generation checks still precede access through resolved
+tokens, and missing inputs are still cleared by EndResourceUpdate.
+
+Texture setters borrow their incoming shared pointer and acquire ownership only
+when the binding changes. Material activation borrows the registry's pointer
+under the existing bridge lock, eliminating the temporary ownership increment
+and decrement when a texture is already bound. Registry lookup, live sampler
+word reads, resource-generation changes, and D3D11 fallback views are preserved.
+
+Release build passed (`out/resource-binding-slots-build.log`). Runtime checks and
+benchmarks remain deferred; no FPS gain is claimed for this change. Follow-up
+checks should cover unchanged/replaced/null textures, partial resource updates,
+stale binding tokens, material retirement, and direct/recorded rendering.
+
+## Recent indexed-mesh lookup cache - 2026-09-18
+
+NativeMeshCache now checks a fixed 64-slot recent-entry table after its existing
+same-as-last shortcut and before the owning map. Alternating meshes can reuse
+their entry pointers without another tree traversal. All five key words are
+hashed and compared; collisions fall back to the map. A shortcut only selects
+a candidate: shader, declaration, stride, index format, and source checks remain
+in place. Exact owned-source hits also avoid calling the matching method again
+after the same identity has already been proven for diagnostic accounting.
+
+Entry replacement, update failure, eviction, explicit resource invalidation,
+and backend/cache clearing invalidate lookup pointers before erasing entries.
+The owning map, memory budget, eviction order, and guest-write verification
+policy are unchanged. The table adds fixed storage and no per-lookup allocations.
+
+Release build passed (`out/mesh-recent-lookup-build.log`). The user reports that
+the preceding optimizations work and performance is good. This new change has
+not been tested or benchmarked; those runs remain deferred. Follow-up checks
+should include alternating keys, collisions, shader/source replacement, eviction,
+failed dynamic updates, resource retirement, and backend switching.
+
+## Owned transient vertex handoff - 2026-09-18
+
+Immediate meshes, post quads/strips, and XUI position triangles now hand their
+converted vectors to the recorder through SetTransientVerticesOwned. The
+parallel recorder swaps that allocation into an unused frame-owned image and
+returns its retired allocation to the caller. This removes the conversion-buffer
+to packet-image memcpy; replay still copies the bytes into GPU upload storage.
+The ordinary span-based interface remains for callers that cannot give up their
+storage. Direct D3D11/D3D12 recorders consume the owned overload synchronously
+through their existing upload method.
+
+Quad and position-triangle converters now also support caller-owned reusable
+vectors, used by both recorded and direct stream draws. Original conversion
+entry points delegate to them. Validation and triangle expansion are unchanged;
+input must not alias the destination. Draw counts are captured before ownership
+transfer because the returned scratch vector may contain unrelated retired bytes.
+
+Published image slots are never swapped again in the same frame. Reset rewinds
+the pool only after worker recording completes and saved states are discarded,
+so subsequent conversions cannot overwrite pending draws. Retained capacity can
+grow as draw sizes change and remains allocated for reuse.
+
+Release build passed (`out/transient-vertex-ownership-build.log`), with three
+getenv deprecation warnings in unchanged scripted_input.h. Tests and gameplay
+measurements remain deferred; no frame-time gain is claimed. Later validation
+should cover mixed copied/owned uploads, scratch overwrite after transfer,
+multiple draws and flushes, saved-state restoration, reset/storage reuse, and
+invalid conversion inputs on both renderer paths.
+
+## Cached material constant upload plans - 2026-09-18
+
+Material activation now caches the active constant list, destination binding
+tokens, per-destination byte counts, maximum read extent, and canvas-scaling
+classification for each material/shader pair. Normal-only and normal/reversed
+uploads have separate plans. Repeated activations iterate that plan instead of
+reconstructing destination arrays and sizing decisions for every parameter.
+Parameters absent from both native destinations are counted as optimized out
+without reading their guest values; entirely inactive groups need no read window.
+
+Plans use the existing material ownership and shader lifetime boundaries.
+Resolved binding vectors remain immutable after publication. Live source
+pointers, global vector capacities, and payload bytes are still read on each
+activation, with validation before upload. Instance patches and conversion of
+active constants are unchanged; no guest value is assumed constant merely
+because the material address repeats. Optimized-out counts are added per group
+before active uploads, so partial-failure diagnostic totals can differ.
+
+Release build passed (`out/material-upload-plan-build.log`). Tests and gameplay
+benchmarks remain deferred; this is a reduction in repeated preparation work,
+not a measured FPS improvement. Later checks should cover local/global pointer
+changes, asymmetric normal/reversed shader layouts, optimized-out parameters,
+invalid live vector extents, canvas scaling, and material/shader replacement.
+
+## Shared draw binding snapshots - 2026-09-18
+
+The parallel recorder now separates per-draw geometry/constant references from
+pipeline, texture, sampler, target, and raster bindings. Binding setters invalidate
+a cached snapshot only when their values change; the next draw copies those
+bindings once into frame-owned storage. Subsequent draws retain a plain pointer.
+Worker replay skips shared binding comparisons when consecutive packets point
+to the same snapshot, while geometry and constant comparisons remain per draw.
+A compile-time assertion requires the complete draw packet to occupy less than
+half the size of the complete producer state.
+
+Snapshots keep stable addresses in a deque and survive intermediate flushes and
+PushState/PopState. Reset reuses storage only after recording workers finish and
+saved/previous states are discarded. Forget flushes pending draws, invalidates
+live and saved snapshots, and discards the serial previous-state cache so a
+retired resource cannot be reached through it. Submission order is unchanged.
+The pool retains its peak allocation until recorder destruction; workloads that
+change bindings on every draw receive less benefit and need memory measurement.
+
+Release build passed (`out/shared-draw-state-build.log`). Tests and gameplay
+measurements remain deferred at the user's request; no FPS improvement is
+claimed. Later validation should cover worker and serial replay, query draws,
+state restoration across flushes, resource retirement, target/SRV aliasing,
+buffer updates, and a matched combat capture.
+
+## Constant-set preparation fast path - 2026-09-18
+
+Recorded draw setup now checks one aggregate constant generation per shader
+stage before walking its reflected buffers. ShaderBindings updates that
+generation through the same Touch path as individual buffer versions, including
+initialization, direct writes, guest register uploads/patches, and mirrored
+constants. Consecutive draws with unchanged bindings skip the entire buffer loop.
+Changed sets retain per-register checks, now using a fixed b0..b13 array instead
+of hash lookups and allocated map nodes. The complete-set cache is recorded only
+after every buffer has been checked/sent; individual slot writes invalidate it.
+Frame and binding-generation changes still force constants to be sent again.
+
+The release executable built successfully (`out/constant-fast-path-build.log`).
+Tests and gameplay/performance validation are deferred at the user's request.
+This removes repeated CPU preparation work; no measured frame-time or FPS gain
+is claimed. Follow-up validation should cover shader switches with overlapping
+registers, each constant mutation path, mirrored bindings, frame/state resets,
+and a matched combat performance capture.
+
+## Allocation-free pipeline cache hits - 2026-09-15
+
+The D3D12 wrapper cache now looks up a stack-resident binary key through a
+transparent string comparator. Previously, every material transition constructed
+and then appended to an owning string before looking up an already compiled
+pipeline. Only cache misses now allocate the owning key. The key's bytes and
+primitive-topology distinction remain unchanged.
+All 32 tests passed (34.43 s): `out/pipeline-hit-build.log`,
+`out/pipeline-hit-tests.log`. The subsequent native 1080p approach run completed
+without hook sampling or coarse frame tracing, with host cadence reporting.
+Game seconds 140-240 recorded zero repeated/skipped images across 5,712 host
+presentations, a minimum reported 59.9 FPS, and zero errors. The capture verifies
+active city gameplay at 200/200 HP, with enemies farther away than some previous
+captures. This establishes a clean short window, not a controlled measurement
+of the cache change or a sustained combat lock. Artifacts:
+`out/pipeline-hit-1080-summary.json`, `out/pipeline-hit-1080.bmp`.
+Run: `out/native-bridge-run/binding-validation-20260915-113803-14692d16/game.log`
+(PID 40104, stopped).
+
+`tools/native-dodge-combat-input.txt` retains the same approach, then alternates
+20-second lateral holds with short A presses through game second 440. This is
+intended to improve survival for the longer validation. The resulting capture
+and logs must establish active gameplay without mission death/restart; a final
+living player alone is insufficient because A also confirms menu selections.
+Completed run: `out/native-bridge-run/binding-validation-20260915-114327-8e4c3fa2/game.log`
+(PID 42888, stopped), native 1080p, VSync off, host cadence reporting only.
+Game seconds 140-440 recorded four repeated images, zero skipped sequences,
+a lowest reported 59.2 FPS, and zero errors across 17,432 host presentations.
+The final capture shows active gameplay at 200/200 HP. However, a burst of XUI
+menu drawing begins near game second 321 and coincides with all four repeats;
+the script's A presses may have confirmed a retry. No shader re-registration
+occurred, so absence of registration cannot be used to rule out a cached restart.
+Uninterrupted combat is therefore unproven. Artifacts:
+`out/dodge-sustained-1080-summary.json`, `out/dodge-sustained-1080.bmp`.
+
+The next route, `tools/native-retreat-combat-input.txt`, preserves the initial
+approach then retreats along the same street while firing from seconds 240-440.
+It sends no button presses after menu setup, eliminating automatic confirmation
+of a retry. A surviving final capture can then provide stronger continuity
+evidence, while the initial approach retains the existing comparison workload.
+Completed run: `out/native-bridge-run/binding-validation-20260915-115426-69e13936/game.log`
+(PID 34300, stopped), native 1080p, VSync off, host timing reports only. The final
+capture shows mission failure and 0/200 HP against a building. Across seconds
+140-440, host reports contained 17,735 presentations with no repeated/skipped
+sequences, but the lowest game FPS sample was 58.2 and later samples include
+the failure screen. This cannot validate sustained combat. Artifacts:
+`out/retreat-sustained-1080-summary.json`, `out/retreat-sustained-1080.bmp`.
+
+The current native dependency audit passed: `out/pipeline-hit-dependencies.log`.
+All 32 native tests remain passing from the last code build. A representative
+manual combat session or a reproducible surviving route is now requested from
+the user; repeated blind scripted routes have not established a long combat
+window. No game is currently running. The performance goal remains unverified.
+
+For manual validation, `tools/start-native-binding-validation.ps1 -ManualInput`
+opens the current release executable visibly with scripted input disabled and a
+fresh test profile. It returns the exact process and log paths. A dry run checked
+visible launch mode, removal of inherited scripted-input variables, skipping
+script-file resolution, and restoration of the parent environment. Example
+without host, hook, or coarse-frame timing instrumentation:
+
+```powershell
+& tools/start-native-binding-validation.ps1 -ManualInput `
+  -RenderWidth 1920 -RenderHeight 1080 -NativeRenderSize `
+  -ExtraArgs @('--edf_native_contract_coverage=false',
+    '--edf_native_vsync=false', '--edf_native_host_timings=false')
+```
+
+## Frame-owned draw constants - 2026-09-15
+
+Draw packets now reference immutable constant images owned by the recording
+frame. Previously, copying each packet copied a 3-by-14 array of shared pointers
+and adjusted the reference counts of its populated slots on the producer thread.
+The new deque keeps image addresses stable while later bindings are appended;
+packets and saved states contain plain pointers. Intermediate flushes preserve
+the images. Reset retires them after workers have joined and the backend has
+copied their bytes into its fenced upload storage. This also removes the separate
+shared-pointer control-block allocation from each constant update. Images now
+remain alive until frame reset, including bindings superseded in earlier batches.
+Reset then rewinds the pool's used count, retaining vector capacities for later
+frames. After the pool grows to the workload's size, constant updates reuse that
+storage instead of allocating a new byte vector. Peak pool capacity remains
+allocated until the recorder is destroyed, like the packet vector's capacity.
+
+All 32 tests passed (34.20 s), including GPU readback after saved-state restoration
+across a worker flush and 128 replacement constant bindings. Logs:
+`out/frame-constants-build.log`, `out/frame-constants-tests.log`.
+The first 1080p approach run (before storage reuse), with hook sampling and frame
+tracing disabled, recorded a 58.4 FPS minimum, 11 repeated images, zero skipped
+sequences, and zero errors across 5,709 host presentations (game seconds 140-240).
+Its capture shows active city gameplay at 150/200 HP. Artifacts:
+`out/frame-constants-1080-summary.json`, `out/frame-constants-1080.bmp`.
+This is not a locked-60 result or a controlled proof of improvement.
+
+The storage-reuse follow-up passed all 32 tests (33.63 s):
+`out/pooled-constants-build.log`, `out/pooled-constants-tests.log`.
+A longer 1080p run completed with host timings, hook sampling, and frame tracing
+disabled, using `tools/native-heavy-sustained-input.txt`. It recorded a minimum
+58.8 FPS and zero errors over game seconds 140-440, but the final capture shows
+the mission-failed screen and 0/200 HP. The time of death is not established;
+later samples cannot count as sustained combat. This is a failed validation of
+the five-minute combat requirement, not a locked-60 result. Run:
+`out/native-bridge-run/binding-validation-20260915-111522-aac10c07/game.log`.
+PID 40152 is stopped. Artifacts: `out/pooled-constants-sustained-1080-summary.json`,
+`out/pooled-constants-sustained-1080.bmp`. The 140-240 subset is in
+`out/pooled-constants-approach-1080-summary.json`; it has the same FPS minimum,
+but no separate capture establishes the player's state at its end.
+The shorter pre-pool run's worker counters show 0.612 ms producer wait per batch
+over 5,400 batches (`out/frame-constants-worker-summary.json`). Overlapping
+recording with preparation can only remove that measured portion on average;
+serial preparation and game execution still require attention.
+
+The optional coarse frame trace now includes `engine_extra_steps`: additional
+simulation steps returned by the engine heartbeat in a single update. The retail
+tick accounting and clamp remain unchanged. This counter can establish whether
+coalesced updates accompany production dips before choosing a pacing change.
+It is cumulative across engine callers and sampled between swap completions;
+it is not an exact association with one rendered image. Long pauses clamped to
+one returned step contribute zero. The reporter summarizes totals, affected
+swap windows, and maximum extra steps, and accepts old traces without the column.
+Synthetic old/new-schema checks and all 32 native tests passed (35.08 s).
+Logs: `out/engine-step-trace-build.log`, `out/engine-step-trace-tests.log`.
+The shorter 1080p approach route is now tracing into `out/engine-step-1080.csv`,
+with a capture scheduled for 183 seconds at `out/engine-step-1080.bmp`.
+Completed run: `out/native-bridge-run/binding-validation-20260915-112429-8da83f57/game.log`
+(PID 9500, stopped). Game seconds 140-180 contained 2,392 swap samples, four extra
+simulation steps in four windows, and a lowest reported 58.4 FPS. Mean swap
+interval was 16.722 ms; the maximum was 85.674 ms, with 85.545 ms outside the
+swap hook and zero engine wait in that window. Engine waiting averaged 3.275 ms
+across the window, but these cross-thread totals must not be subtracted as a
+partition of producer execution. The host recorded nine repeats, no skips, and
+no errors. The capture shows active city gameplay at 200/200 HP. Artifacts:
+`out/engine-step-1080-summary.json`, `out/engine-step-1080-host-summary.json`.
+No mesh rebuild occurred across the long gap at 11:27:07.279-07.353. The four
+coalesced ticks do not by themselves establish the cause of that stall.
+
+Windows Performance Recorder CPU sampling could not start: policy enablement
+failed with 0xc5585011. A subsequent status query confirmed no recording active.
+The coarse trace now optionally queries process and swap-thread CPU accounting
+once per swap, with the thread identity recorded. The reporter includes these
+values for the ten longest windows, to distinguish CPU work from wall-clock
+stalls. Process CPU includes all threads and can exceed elapsed wall time;
+Windows accounting granularity also limits interpretation of individual frames.
+No CPU query runs when the coarse trace is disabled. All 32 tests passed (33.62 s),
+and synthetic checks cover all three trace schemas. Logs:
+`out/frame-cpu-trace-build.log`, `out/frame-cpu-trace-tests.log`.
+Completed validation: `out/native-bridge-run/binding-validation-20260915-113221-1e1b96b4/game.log`
+(PID 38296, stopped), writing `out/frame-cpu-1080.csv` and capturing
+`out/frame-cpu-1080.bmp` at 183 seconds. Game seconds 140-180 produced 2,399 swap
+samples with a 16.668 ms mean, 25.109 ms maximum, and zero extra simulation steps.
+The host recorded no repeated or skipped images across 2,103 presentations;
+the minimum reported game sample was 59.9 FPS. The capture verifies normal city
+gameplay with the player alive at 200/200 HP. No errors were logged.
+Process CPU averaged 21.630 ms per swap across all threads; the swap thread
+averaged 3.530 ms. Accounting increments are 15.625 ms here, too coarse to
+attribute individual small hitches. The earlier 85 ms stall did not recur, so
+this run does not establish its cause. Artifacts: `out/frame-cpu-1080-summary.json`,
+`out/frame-cpu-1080-host-summary.json`. These results predate the pipeline-key
+allocation change and do not establish a sustained combat lock.
+
+## Preparation cost reduction - 2026-09-15
+
+The sampled approach run (`binding-validation-20260915-103657-db1166a5`, game
+seconds 140-180, period 64) estimates 4.62 ms per target-60-Hz frame in indexed
+native preparation, 2.69 ms in activation, 2.23 ms in immediate draws, and
+1.32 ms in instance overrides. These inclusive estimates locate work; nested
+phases must not be summed. `out/approach-1080-sampled-hooks.json` was produced
+by `tools/report-native-sampled-hooks.py`, which only uses complete report
+windows per thread/phase. The sampler's report threshold now allows infrequent
+phases to report without waiting for 256 samples; full timing retains its old
+threshold. The profile process is stopped.
+
+Three repeated costs were removed from preparation:
+
+- Instance overrides decode their parameter list once. The second decode and
+  shape fingerprint were used only by the optional batching audit; the audit
+  now fingerprints the same decoded list only when enabled.
+- Recorded draws use the pipeline's cached blend-factor requirement instead
+  of decoding all render-state words again. D3D11 now exposes its existing
+  cached requirement through the common pipeline interface, with conformance
+  coverage for both backends.
+- Constant uploads and partial patches convert each complete Xbox register
+  together and compare/copy its reflected lanes in one operation. Full uploads
+  still zero padding; partial patches preserve it. Ownership and range checks
+  remain before mutation, and float bits are not numerically converted.
+
+All 32 tests passed after these changes (34.55 s), including scalar/vector/array
+padding, matrix patches, invalid extents, signed zero, NaN payloads, infinity,
+and blend-factor readback. The dependency audit passed. Logs:
+`out/preparation-final-build.log`, `out/preparation-final-tests.log`,
+`out/preparation-final-dependencies.log`.
+
+The subsequent 1080p run, with hook sampling and frame tracing disabled
+(`binding-validation-20260915-104639-9cca1fa3`, game seconds 140-240), reached
+a minimum reported 59.6 FPS, with two repeats and zero skipped sequences across
+5,708 host presentations. No errors were logged. Its capture verifies close
+combat among ants at 200/200 HP. This improves on the earlier 57.0 minimum and
+15 repeats with the same route/resolution, but does not prove a perfect lock.
+Artifacts: `out/preparation-1080-summary.json`,
+`out/preparation-1080-validation.bmp`. The process is stopped.
+
+A further indexed-draw optimization now asks the write registry to reuse the
+existing immutable snapshot using metadata before validating guest mappings.
+The fast path requires the exact owner lifetime, physical extent, immutable
+candidate and revision baseline, no active writer, and an unsampled observation
+under the existing policy. It does not read guest memory. Rejected attempts
+consume no observation and fall back to mapped-range validation followed by
+the original guarded comparison. Periodic verification and global revocation
+after an unreported write remain unchanged. Duplicate owners use the original
+sequential path. No SDK heap lock is acquired under the writer mutex.
+
+Regression tests cover initial/periodic verification, revoked trust, strict and
+audit policies, extents, candidates, partial pair rejection, active writers,
+tracked revisions, commit tokens, retirement and owner reuse. All 32 tests
+passed (33.31 s): `out/snapshot-reuse-build.log`,
+`out/snapshot-reuse-tests.log`. The subsequent exact 1080p route completed with a
+minimum reported 57.1 FPS, 18 repeated images, zero skipped sequences, and zero
+logged errors across 5,709 host presentations (game seconds 140-240). Artifact:
+`out/snapshot-reuse-1080-summary.json`. This does not establish an FPS improvement
+from metadata reuse, and the run is stopped.
+
+## 1080p frame-production profiling - 2026-09-15
+
+The same forward-approach route was replayed at native 1920x1080 with VSync off,
+coarse swap tracing enabled, and display-statistics tracing disabled
+(`binding-validation-20260915-102308-f83b8835`). Game seconds 140-240 contained
+5,978 swap samples: mean interval 16.731 ms, p99 19.108 ms, maximum 45.224 ms.
+Between-swaps wall time averaged 16.148 ms and peaked at 35.067 ms; end-of-frame
+GPU wait averaged 0.0047 ms and peaked at 0.0721 ms. Submission averaged 0.127 ms.
+The lowest five-second game FPS sample was 55.8 (ending at game second 160).
+Host reports contained 5,711 presentations, 22 repeats, zero skipped sequences,
+and zero errors. The capture verifies close combat with ants and 150/200 HP.
+Artifacts: `out/approach-1080-frame-summary.json`,
+`out/approach-1080-host-summary.json`, `out/approach-1080-profile.bmp`.
+
+This reproduces the shortfall without DXGI display-statistics queries. It rules
+out the end-of-frame GPU barrier as its principal cost, but between-swaps time
+also contains other waits and must not be called CPU execution time.
+
+Coarse frame traces now include engine heartbeat waiting, actual guest-fence
+poll sleeps, shared-surface reservation time, and the backend's frame-resource
+wait total. These diagnostics are enabled only by `edf_native_frame_trace` and
+add no per-draw timing. Counters span participating threads and are sampled
+between consecutive completed swaps, so their values are not an additive
+partition of one thread's execution. The reporter retains support for old CSVs.
+The build and all 32 tests passed (33.55 s); logs are
+`out/coarse-wait-build.log` and `out/coarse-wait-tests.log`. The more detailed
+wait-profile run is complete. No performance fix is claimed from tracing.
+
+The wait profile (`binding-validation-20260915-102956-05925740`, game seconds
+145-160) averaged 18.226 ms between swap entries and 17.891 ms outside the swap
+hook. Engine waiting averaged 0.059 ms, guest-fence sleeps and backend frame
+resource waits were zero, shared-slot reservation averaged 0.0036 ms, and the
+end-of-frame GPU wait averaged 0.0051 ms. These measured waits do not explain
+the production shortfall. The early-approach capture shows normal city gameplay
+at 200/200 HP, not a loading screen. Artifacts:
+`out/approach-1080-waits-summary.json`,
+`out/approach-1080-waits-host-summary.json`, `out/approach-1080-waits.bmp`.
+
+`--edf_native_hook_sample_period=64` now samples one in 64 active hook timing
+scopes independently of full hook/load timing flags. Phase offsets avoid timing
+all nested scopes on the same draw. Sampled reports use a distinct prefix and
+include the sample period, so existing full-timing reports cannot silently
+treat sample counts as complete counts. This is an estimator for locating CPU
+cost, not a benchmark result; nested scopes remain inclusive. Zero (default)
+disables sampling. All 32 tests passed after adding the sampler (34.03 s;
+`out/sampled-hook-build.log`, `out/sampled-hook-tests.log`). The same approach
+is now running as `binding-validation-20260915-103657-db1166a5`, writing
+`out/approach-1080-sampled.csv`; sampled reports with period 64 are confirmed.
+Analyze game seconds 140-180, then stop this diagnostic process. Earlier profile
+processes are stopped. No preparation optimization or locked-60 result is yet
+claimed from these diagnostic changes.
+
+## Display feedback and VSync-off support - 2026-09-15
+
+`--edf_native_display_trace=path.csv` optionally records raw DXGI frame statistics
+after presentation, including query status, display/refresh counts, QPC timing,
+the last submitted Present count, and the game image sequence. Empty (default)
+disables it. No flush/wait is added to force display statistics to update.
+`tools/report-native-display-trace.py` aligns complete CSV rows with the game
+clock. It reports unchanged observations and wider counter steps separately;
+neither is automatically classified as a dropped image. Failed/disjoint queries
+reset comparison history. Live reads exclude a partially written final row.
+
+The single attached display was independently queried with EnumDisplaySettings:
+2560x1440 at 165 Hz. The 720p VSync-on combat trace (game seconds 140-210) had
+4,200 successful queries, with 2,800 adjacent present-count observations. Their
+refresh spans were 1 (33), 2 (897), 3 (1,848), and 4 (22). There were also 699
+unchanged observations and 700 two-count steps, so this is incomplete per-image
+coverage. Median feedback refresh estimate was 164.93 Hz, while the aggregate
+was 158.18 Hz: the feedback is not precise enough to claim perfect scanout.
+Host reports remained at 60.0 FPS with zero repeats/skips over 3,907 presentations.
+Artifacts: `out/display-feedback-summary.json`,
+`out/display-feedback-host-summary.json`, `out/display-feedback-combat.bmp`.
+At fixed 165 Hz, 60 FPS cannot occupy an equal whole number of refreshes per
+image. The usual two/three-refresh alternation alone produces uneven spacing.
+
+The D3D12 VSync-off path previously used interval zero without allowing tearing,
+omitting the flags required for variable-refresh support. It now queries
+IDXGIFactory5 capability, includes ALLOW_TEARING at swap-chain creation when
+supported, and passes DXGI_PRESENT_ALLOW_TEARING only with VSync off. Resize
+recreates the chain with the same capability policy. The host uses windowed or
+borderless presentation; DXGI exclusive fullscreen is not used. VSync on keeps
+interval one and zero present flags. VRR still requires a capable and configured
+display/driver; the feature query does not prove VRR is active. Settings explain
+this choice and the fixed-refresh cadence constraint.
+
+Microsoft references: [frame statistics](https://learn.microsoft.com/en-us/windows/win32/api/dxgi/nf-dxgi-idxgiswapchain-getframestatistics)
+and [variable refresh rate requirements](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/variable-refresh-rate-displays).
+All 32 tests passed after the VSync-off fix (34.14 s), including host resize and
+VSync off/on/off transitions under GPU validation. The dependency audit passed.
+Logs: `out/vrr-present-build.log`, `out/vrr-present-tests.log`,
+`out/vrr-present-dependencies.log`.
+
+The 1080p forward-approach run (`binding-validation-20260915-101716-bcbe3421`,
+native render size 1920x1080, VSync off, game seconds 140-240) averaged 59.83 FPS
+from rounded logs, with a lowest five-second sample of 57.0. Its 5,709 host
+presentations repeated 15 images and skipped zero sequences; acquisition/copy
+CPU time peaked at 0.528 ms. No errors were logged. The capture confirms close
+combat with ants and the player alive at 150/200 HP. The display feedback still
+ran at approximately 164.96 Hz, so VRR activation is not established here.
+Artifacts: `out/vrr-1080-host-summary.json`,
+`out/vrr-1080-display-summary.json`, `out/vrr-1080-approach.bmp`.
+This run changes both resolution and route relative to the earlier 720p test;
+it establishes a remaining production shortfall, not which change caused it.
+Next: coarse frame tracing of this exact 1080p route to separate CPU preparation
+from GPU/resource waits before choosing the next optimization. Both diagnostic
+game processes are stopped. The locked-60 goal remains incomplete.
+
+## Ordered presentation handoff - 2026-09-15
+
+The longer overlap run exposed a separate cadence defect: sampling the newest
+shared surface repeated 733 images and skipped 733 sequences in 5,710 host
+presentations (game seconds 140-240), despite every game FPS report reading 60.0.
+See `out/sustained-latest-image-summary.json`. Producing frames at 60 Hz alone
+does not ensure that the host displays each image once.
+
+The handoff now uses three reusable shared surfaces and an ordered queue. The
+presenter initially buffers two images for a one-frame timing cushion, then
+consumes the oldest image. A full visible queue blocks the producer instead of
+overwriting a pending image. Slots retire only after the host GPU copy completes.
+The queue has its own mutex, so presenting no longer takes the renderer's lock
+during guest loading. Minimized/stopped consumers retain only the latest pending
+image, while outstanding GPU readers still pin their surfaces. The optional
+preview samples the latest image independently without consuming the main FIFO.
+
+Queue regression coverage checks ordering, bounded producer blocking, primary
+and preview copy lifetimes, background publication, and failure after possible
+GPU submission.
+
+The queued run (`binding-validation-20260915-095833-5187dd95`, game seconds
+140-440) reported 60.0 in all 59 complete game FPS samples. Its 58 complete host
+report buckets contained 17,440 presentations, zero repeated images, zero
+skipped sequences, and zero logged errors. Mean Present-return interval was
+16.66664 ms, maximum 20.215 ms; maximum frame acquisition/copy CPU time was
+0.5286 ms. The final capture confirms the player alive in the city mission.
+Artifacts: `out/queued-sustained-summary.json` and
+`out/queued-sustained-combat.bmp`. The aggregate FPS calculation uses rounded
+logged durations; use the explicit 60.0 FPS samples rather than interpreting
+its 60.12 aggregate as a speedup. This run predates the optional mirror-reader
+addition, which does not participate in normal main-window presentation.
+The final build, including mirror-reader regression coverage, passed all 32
+CTest tests in 33.58 seconds. The earlier legacy D3D11 presenter timeout did
+not recur. The packaged dependency audit also passed (run from the Visual Studio
+developer environment so `dumpbin` is available). Logs:
+`out/queued-final-build.log`, `out/queued-final-tests.log`, and
+`out/queued-final-dependencies.log`. The validation game process is stopped.
+CPU Present-return timestamps do not prove scanout cadence or performance in
+other missions; those remain open requirements for the locked-60 goal.
+
+## Frame pipeline redesign in progress - 2026-09-15
+
+Goal: sustained 60 FPS in combat, verified at both frame production and host
+presentation. This section is an ongoing experiment, not a completion claim.
+
+Coarse tracing (`--edf_native_frame_trace=path.csv`) records swap-entry intervals,
+wall time between swaps, lock/submission time, GPU-barrier wait, and pacing time.
+It performs no per-draw timing. `tools/report-native-frame-trace.py` aligns the CSV
+with the game's logged FPS clock; swap-entry intervals are not scanout timestamps.
+
+Baseline combat (160-210 seconds, 2,443 samples): mean interval 20.47 ms, p99
+28.77 ms. Between-swaps wall time averaged 14.86 ms; submission/lock entry 0.105 ms;
+GPU wait 5.49 ms (p99 12.91 ms); pacing 0.013 ms. The swap drained the current
+GPU frame before letting the CPU begin the next frame, serializing these costs.
+This is direct evidence for overlapping frame preparation and GPU execution;
+it does not establish that all between-swaps time is CPU work.
+
+The D3D12 prototype separates presentation credits from resource completion.
+`--edf_native_frame_latency=1` retains the current-frame drain for comparison.
+`=2` (new default) permits preparation of the next CPU frame while one submitted frame remains
+unfinished. Credits retire in order and bound CPU lead. Guest resource fences,
+worker callbacks, upload rings, and shared-image copy fences still require their
+actual GPU completion; credit acceptance does not publish those completions.
+The native pacing counters account for accepted presentation work in this mode.
+
+The first overlap test exposed a descriptor-capacity defect: four workers divided
+the original 65,536 descriptor budget into five 13,107-entry slices, including
+the recorder handling all UI draws. That run was stopped after allocation errors
+and is not a performance result. The scene factory now preserves a 65,536-entry
+budget per recorder (up to a 1M-entry heap), with fence-based retirement unchanged.
+At four workers this allocates 327,680 descriptors instead of 65,536.
+
+Baseline artifacts: `out/frame-architecture-baseline.csv`,
+`out/frame-architecture-baseline-summary.json`, and
+`out/native-bridge-run/binding-validation-20260915-092100-a3987d72/`.
+Failed capacity experiment: `binding-validation-20260915-092555-0977a63b`.
+
+Corrected overlap run: `binding-validation-20260915-092843-d9b97b75`, with
+`out/frame-architecture-overlap-v2.csv`, `out/frame-architecture-overlap-v2-summary.json`,
+and `out/frame-architecture-overlap-v2.bmp`. All 32 tests passed (33.77 s), no
+render errors or descriptor stalls were logged, and the final gameplay capture
+shows the scene and HUD intact.
+
+Combat swap-entry rate rose from 48.85 to 60.00 Hz. Mean GPU-barrier wait fell
+from 5.494 to 0.00495 ms. The 3,001-sample combat window averaged 16.6667 ms per
+entry, but p99 was 18.457 ms and max 21.844 ms. Every five-second FPS sample in
+that combat window reported 60.0. These results justify enabling two credits,
+but do not prove locked presentation: host repeated-image/scanout cadence and
+remaining preparation/pacing outliers still need verification. Earlier gameplay
+also contains a temporary dip around 115 seconds. The full goal remains active.
+
+Default-mode presentation verification (no per-draw or swap tracing):
+`binding-validation-20260915-093358-6d88996c`. During combat, nine complete host
+reporting windows covered 2,705 presents: zero repeated images and zero skipped
+sequences, mean Present-return interval 16.6666 ms, maximum 21.8023 ms. Game FPS
+samples all rounded to 60.0; the report computes 60.06 from rounded five-second
+bucket durations. No rendering errors. Results: `out/frame-flight-host-summary.json`
+and `out/frame-flight-default-fps.json`. These are host Present-return statistics,
+not scanout timestamps.
+
+A transient hitch remains around game time 115 s: the host reported a 284.98 ms
+maximum interval and 267.87 ms maximum acquire/copy phase in that reporting
+window, with game FPS falling to 47.7 for five seconds. Acquire/copy includes the
+bridge mutex, frame import, and copy submission; that aggregate does not isolate
+the precise cause. Next work must separate lock wait from resource preparation
+and GPU copy waits, then eliminate the long stall. Combat at 60 alone is not
+completion of the full locked-60 goal. All validation processes are stopped.
+
+### Loading-transition classification and longer validation
+
+A targeted capture at the apparent 115-second hitch shows the game's **Now
+Loading** screen (`out/host-acquisition-hitch.bmp`). The earlier description of
+this as a gameplay hitch was incorrect. That window tears down and reloads many
+textures/resources between the intro and the playable mission. The full goal
+still requires longer combat verification, but the loading dip is not evidence
+of a combat frame-rate failure.
+
+The host's acquisition diagnostics now separate registry-lock wait, consumer
+copy, and producer queue-wait insertion. In the load-timing run
+`binding-validation-20260915-094108-1e3d9801`, maxima were 269.29 ms for the lock,
+0.201 ms for the copy, and 0.007 ms for queue-wait insertion. This confirms lock
+contention during resource loading; it is not a GPU copy lasting hundreds of ms.
+Load instrumentation logs each loader call and must not be used as a normal
+combat performance baseline.
+
+The final release build passes all 32 tests (33.60 s) and the dependency audit.
+`tools/native-sustained-combat-input.txt` extends the test to five minutes of
+continuous firing and alternating movement, after the loading transition.
+`tools/report-native-host-cadence.py` reports complete FPS and presentation
+windows from rotated logs, including repeated/skipped images. The long-run
+results will determine whether further renderer work is necessary.
+
+## Serial material and mesh preparation - 2026-09-15
+
+Material activation now updates the resource set in place. Equal textures and
+samplers retain their resource generation, allowing the recorded draw to reuse
+its existing bindings. Slots omitted by the next material are cleared at the
+end of the update; explicit nulls and changed resources invalidate reuse.
+Failures still clear both binding sets. Guest texture handles and sampler words
+are read on each activation, so texture publication, resolves, and live filtering
+changes remain visible.
+
+An activation resolves its material and shader owners once. Each shader also
+keeps its most recently used parameter plan, keyed by weak shared-owner identity;
+retirement/republication at the same guest address cannot reuse a retired plan.
+Constant payloads and their pointers remain live, including per-instance patches.
+Reflected constant-buffer descriptions are built once and returned as a span over
+live bytes, removing two temporary vector allocations per recorded draw.
+
+The mesh cache accelerates consecutive identical keys, while still checking the
+shader, declaration, stride, index format, and both source generations/contents.
+Invalidation, replacement, eviction, backend changes, and clear retire the shortcut.
+Mesh internal timing calls now run only when hook timings are enabled. Geometry
+write observation and sampled verification retain their existing policy.
+
+Validation: release build and all 32 CTest tests pass (33.69 seconds).
+Binding regressions cover unchanged resources, omitted slots, explicit nulls,
+foreign/retired binding tokens, and live constant bytes behind cached descriptions.
+Existing mesh tests cover byte changes, shader reloads, lifetime invalidation,
+clear, dynamic updates, and both budget and entry-count eviction.
+
+Hardware comparison: same movement/fire script, fresh user directories, 1280x720,
+four workers, hook timings off, host/GPU timings off, contract collection off.
+Normal FPS reporting and built-in counters remain enabled in both runs. The final
+capture occurs after the measured combat window. No rendering errors were logged;
+the capture shows the gameplay scene and HUD intact.
+
+| Window (game seconds) | Before FPS | After FPS | Resource binding reuse before/after |
+| --- | ---: | ---: | ---: |
+| 90-150 | 52.25 | 52.67 | 57.9% / 77.4% |
+| 160-210 (movement/fire) | 47.62 | 48.50 | 65.8% / 79.8% |
+
+This single before/after pair confirms reduced binding work, but the small FPS
+change is not sufficient to establish a reliable speedup or locked 60. Runtime
+workload and scheduling vary between runs; FPS samples are five-second averages,
+not per-frame deadline measurements. Resource reuse percentages use the counter
+snapshots inside each window, whose spans differ slightly from the FPS windows.
+
+Artifacts:
+- Baseline: `out/native-bridge-run/binding-validation-20260915-090349-e0b53ec4/`
+- Final: `out/native-bridge-run/binding-validation-20260915-091226-d3ad619b/`
+- Comparison: `out/serial-preparation-comparison.json`
+- Capture: `out/serial-preparation-host.bmp`
+- Build/tests: `out/serial-preparation-build.log`, `out/serial-preparation-tests.log`
+
+## Multithreaded geometry recording - 2026-09-15
+
+The D3D12 scene backend now captures resolved draw state into immutable
+packets and records contiguous ranges with persistent CPU workers. Configure
+`--edf_native_geometry_workers=0` for direct recording, `=1` for a serial
+packet baseline, or `=4` for four recording workers (current default).
+Presentation continues to use its own direct backend.
+
+Each packet owns its constant bytes and preserves its pipeline, geometry bindings,
+textures, samplers, targets, viewport, and clipping state. Worker command lists
+execute in original packet order. Resource destruction drains pending packets
+before releasing CPU wrappers; uploads, copies, resolves, and queries establish
+ordering boundaries. Occlusion-query draws stay on their owning command list.
+Small batches remain on the direct list to avoid per-draw worker dispatch and
+GPU submission overhead. The first hardware run exposed that overhead in XUI;
+it was stopped and the scheduler corrected before performance comparison.
+
+Resource transitions are local to each recording list. At submission, ordered
+barrier preambles reconcile first-use states with preceding lists; workers do
+not mutate a shared resource-state map. The shared sampler table cache is
+synchronized. Tests cover reversed CPU recording order, concurrent access to
+shared resources, resource destruction before submission, and indexed packets
+with distinct constants and scissors. Conformance also forces the worker path
+for small scenes and compares it with D3D11 and direct D3D12. The mixed
+small-batch path is tested separately, including buffer updates and sampled
+target reuse. Worker exceptions join every job and permanently reject further
+submission of that failed stream; partial command lists cannot be retried.
+
+Pipeline-cache hits now return before shader reflection, render-state decode,
+or input-layout allocation. Previously those operations ran again for every
+pipeline request, even though the native pipeline itself was cached. The
+wrapper key also preserves the exact primitive topology.
+
+The producer still reads guest state and performs mesh lookup/decode. Workers
+perform command recording, constant uploads, descriptor preparation, and local
+barrier recording. This does not make all bridge work parallel.
+
+### Hardware results
+
+Matched runs use the same release executable, 1280x720, VSync, fresh user
+folders, `tools/native-movement-fire-input.txt`, hook timings, contract coverage,
+and the FPS overlay. The comparison includes complete FPS reporting intervals
+within game seconds 90 through 150. Hook costs use complete per-thread reporting
+buckets within that window and are inclusive; nested phases cannot be summed.
+These are single-run diagnostic comparisons, not all-map or handheld benchmarks.
+
+| Recording mode | Average FPS | Indexed hook CPU wall time / call | Producer wait / parallel batch |
+|---|---:|---:|---:|
+| Direct (`=0`) | 49.62 | 2.87 us | n/a |
+| One packet worker (`=1`) | 48.95 | 2.77 us | 0.908 ms |
+| Four packet workers (`=4`, default) | 50.92 | 2.77 us | 0.438 ms |
+
+The four-worker run reports `worker_mask=0xf` and `max_concurrent=4`; the
+one-worker control reports `0x1` and `1`. Four workers roughly halve producer
+wait per recording batch versus one worker. The FPS difference is modest:
+about 4.0% versus one packet worker and 2.6% versus direct recording in this
+window. The larger gain came from fixing pipeline-cache hits: the preceding
+direct run measured 36.70 FPS and about 9.18 us per indexed hook. Do not
+attribute that cache improvement solely to multithreading.
+
+All three final runs complete the movement/fire schedule with 28 submitted
+rendering contracts and no logged errors. GPU captures of the four-worker and
+direct paths show the scene, firing, HUD, and SDK overlay rendering correctly.
+No upload or descriptor stalls were observed in these runs.
+
+Evidence under `out/native-bridge-run/`:
+
+- Four workers: `binding-validation-20260915-084025-8f5a2f22`; capture
+  `out/parallel-geometry-host-v3.bmp`.
+- Direct: `binding-validation-20260915-084436-4bc4d392`; capture
+  `out/parallel-geometry-host-direct-v2.bmp`.
+- One worker: `binding-validation-20260915-084832-75fae9cc`.
+- Earlier direct run before the pipeline-cache fix:
+  `binding-validation-20260915-083308-a274b6cb`.
+- Report: `out/parallel-geometry-comparison-final.json`.
+
+Regenerate a comparison with
+`python tools/report-native-geometry-runs.py <four/game.log> <direct/game.log> <one/game.log> --output report.json`.
+The reporter includes rotated log files and excludes partial timing buckets.
+The release build, 32 CTest checks (including expanded parallel conformance),
+and native dependency audit pass.
+
+## Current D3D12 runtime - 2026-09-15
+
+The default runtime uses D3D12 for scene rendering, display gamma, aspect
+fitting, SDK overlays, presentation, guest completion fences/signals, and GPU
+profiling. It creates no D3D11 device. Shader compilation and reflection keep
+CPU metadata; executable shaders, buffers, textures, and pipelines belong to
+D3D12. The optional preview also consumes owned D3D12 snapshots with gamma.
+
+The frame path is:
+
+`D3D12 scene queue -> owned D3D12 snapshot -> D3D12 gamma/UI -> D3D12 swap chain`
+
+The host has its own device/queue so presentation does not hold the scene
+recording lock. The producer publishes a shared RGBA8 image and signals a
+fence; the host copies it and signals a completion fence before producer
+reuse. Repeated paints retain the snapshot. The cross-runtime D3D11 round
+trip has been removed from the default path.
+
+### Completion and lifetime
+
+- Guest fence and callback queues mark actual submitted D3D12 work. Capturing
+  a guest command range does not submit or complete it. A later completed
+  range cannot bypass an earlier unsubmitted fence.
+- GPU timings use D3D12 timestamp queries and the queue's timestamp frequency.
+  Query heaps and readback resources retire behind GPU fences, including when
+  a timing span is cancelled.
+- Backend owners outlive all scene resources and query objects. The host and
+  SDK drawer share ownership of their backend. Resize, closure during an
+  overlay callback, exception cleanup, and deferred-paint lifetime are tested.
+- Texture creation during an open frame uploads immediately; creation outside
+  a frame is staged until the next frame. SDK font/texture creation is covered.
+
+### D3D11 fallback boundary
+
+The explicit fallback is selected with
+`--edf_native_scene_backend=d3d11 --edf_native_backend=d3d11`.
+The settings menu saves both choices together and requires a restart. It has
+no empty/None renderer choice, and the selected next-launch backend does not
+replace the running scene backend in place.
+
+D3D11 is delay-loaded only for the fallback. The package audit rejects eager
+D3D11 imports in the executable and packaged DLLs. A tested import hook
+rejects calls to D3D11 fallback exports while D3D12 is selected. Windows or
+other process components may still load the system D3D11 DLL; module presence
+alone is not evidence that the game renderer called it.
+
+### Verification
+
+- Release build and all 32 CTest checks pass.
+- D3D11/D3D12 compositor pixel comparisons cover both display-gamma modes,
+  stretching, and letterboxing. UI tests cover blending, clipping, texture
+  sampling, invalid ranges, and multiple batches before submission.
+- Full-size WARP D3D12-to-D3D12 transfer tests cover repeated snapshots,
+  producer overwrite, source replacement, and resize. They no longer use the
+  D3D12-to-D3D11 path whose full-size WARP readback hung.
+- Completion/signal tests cover capture versus submission, contiguous guest
+  fence ordering, callback acknowledgement, timestamp spans, and cancellation.
+- Hardware gameplay with `tools/native-movement-fire-input.txt` reaches
+  Mission 1, moves and fires, and reports 29 submitted rendering contracts
+  with zero rejected draws, omissions, or bridge errors. The no-D3D11-device
+  run is in `out/native-bridge-run/binding-validation-20260915-075612-e22f4e6c`;
+  its GPU capture is `out/full-d3d12-host-v5.bmp`, including the SDK FPS overlay while the
+  optional D3D12 preview also runs.
+- Actual SDK settings and first-run setup screens render on D3D12:
+  `out/full-d3d12-settings-v2.bmp` and `out/full-d3d12-setup-v2.bmp`.
+  The settings menu identifies the D3D12 default and separate D3D11 fallback.
+- Host pacing diagnostics report snapshot acquisition/copy, CPU Present
+  return cadence, and repeated/skipped source images on D3D12.
+- Explicit D3D11 fallback boots and renders the intro without bridge errors:
+  `out/native-bridge-run/binding-validation-20260915-080610-cadb898f`
+  (`out/full-port-d3d11-fallback-v1.bmp`, captured during the logo fade).
+- `audit_native_dependencies` passes with two packaged non-system DLLs,
+  no eager D3D11 import, and no Xenos import or staged plugin.
+
+This verifies the rendering API migration. It does not certify every map,
+long-session stability, or handheld performance. Diagnostic mission runs are
+below 60 FPS; no performance improvement is claimed without a matched
+comparison. Previously unimplemented native quality/upscaling features are
+outside this API migration.
+
+## Previous scene integration checkpoint - 2026-09-15
+
+The Windows default is now `edf_native_scene_backend=d3d12` with recorded
+scene draws enabled. `edf_native_backend=d3d12` presents the window. The
+D3D11 compositor remains responsible for display gamma and SDK overlays;
+this is a scene/backend migration, not removal of every D3D11 dependency.
+
+Completed in the final integration:
+
+- Publish the resolved RGBA8 target rather than its HDR working surface.
+- Copy the shared D3D12 frame into the host's owned snapshot. Producer and
+  consumer fences order the copy and prevent the next overwrite. Repeated
+  host paints retain the image and run the compositor and overlays.
+- Retain imported textures and fences. Reopening/releasing a 1280x720 import
+  every frame reproduced a hardware GPU hang; retaining imports fixes the
+  standalone hardware regression. Owned duplicate handles and kernel-object
+  comparison also protect against handle-value reuse on resize.
+- Initialize tone-map history and upload pitched YUV movie planes through the
+  backend. Without the history seed, every final output remained invalid even
+  while millions of draws were counted as submitted.
+- Reuse ordinary output targets by backend-resource identity, not a null D3D11
+  view. Cache constants by register, not shader reflection order. Restore the
+  viewport scissor when scissoring is disabled on either recorded backend.
+- Keep BMP output/movie/font capture working through backend readback and
+  reject direct draws paired with a non-D3D11 scene backend at startup.
+
+### Validation
+
+- Full release build and all 27 CTest checks pass.
+- Backend conformance matches D3D11 and D3D12 pixels, including the new
+  scissor-disable regression.
+- Constant-cache regression checks register identity across shader changes.
+- Handoff tests check history initialization, gamma metadata, source overwrite,
+  repeated visits, resizing and full-size hardware transfers.
+
+### Runtime evidence and limits
+
+A fresh-user hardware run using `tools/native-movement-fire-input.txt` reached
+Mission 1, completed the movement/fire schedule, and captured the player,
+city, sky, radar, health and weapon HUD while firing at 1280x720. The run
+reported 28 submitted contracts, zero rejected draws, zero distinct rejections,
+zero omissions and zero bridge errors. The host GPU capture contains the real
+composited image, not an offline renderer fixture.
+
+This is functional integration evidence, **not performance certification**.
+The diagnostic run started at 60 Hz and fell to roughly 29-47 FPS in mission
+content. It ran with contract accounting and other diagnostics enabled; no
+matched D3D11 performance claim is made from it. All-map content coverage,
+long-session stability and handheld performance still need separate testing.
+
+The full-size asynchronous D3D12-to-D3D11 handoff regression is run with
+`edf_native_presenter_tests --hardware`. WARP still hangs on the full-size
+cross-runtime readback case; the normal WARP suite exercises small shared
+copies and the separate backend rendering conformance suite. D3D12 WARP is an
+offline diagnostic backend, not a certified game/presentation fallback.
+
+For the hardware D3D11 fallback use
+`--edf_native_scene_backend=d3d11 --edf_native_backend=d3d11`.
+Adding `--edf_native_seam_draws=false` selects the older direct scene path.
+
+## Historical planning and implementation notes
+
+The notes below record the investigation as it happened. The current status
+above supersedes their earlier defaults, blockers and undecided work.
 
 ## Why
 
@@ -253,6 +1130,15 @@ corruption that appears only on some hardware, which makes this the hardest
 class of bug to catch in this project's usual way.
 
 ## Staged plan
+
+Historical plan: the 77.4% figure below is a candidate estimate from the old
+12-word bridge audit, not a verified instancing eligibility rate. Its key covers
+geometry handles, shader identities, draw ranges, and four render-state words.
+It does not compare textures/samplers, render targets, viewport/scissor, buffer
+revisions, or complete constant payloads. Actual batching would need compatible
+recorded state plus shaders that consume distinct instance constants, with
+ordering and resource lifetime preserved. The current backend supports explicit
+instanced draws but does not automatically merge the game's draws.
 
 **Stage 0 - instancing (do first, independent of this).** 77.4% of draws are
 collapsible into a preceding instanced draw, with zero register-shape breaks
