@@ -46,3 +46,6 @@ Desktop.ini
 *.mp4
 *.mkv
 
+
+# Python bytecode caches from the tools/ report scripts
+__pycache__/
