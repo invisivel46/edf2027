@@ -21,6 +21,9 @@
 #include "native_graphics/native_preview_window.h"
 #include "native_graphics/native_host_surface.h"
 #include "native_graphics/native_immediate_drawer.h"
+#include "native_graphics/native_backend_immediate_drawer.h"
+#include "native_graphics/native_backend_host.h"
+#include "native_graphics/d3d12_backend.h"
 #endif
 
 REXCVAR_DECLARE(std::string, game_data_root);
@@ -28,6 +31,7 @@ REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
 REXCVAR_DECLARE(bool, edf_native_preview_window);
 REXCVAR_DECLARE(bool, edf_native_host);
+REXCVAR_DECLARE(std::string, edf_native_scene_backend);
 REXCVAR_DECLARE(bool, edf_native_untiled_scene);
 REXCVAR_DECLARE(bool, edf_native_mesh_watch_audit);
 
@@ -63,7 +67,7 @@ class Edf2017App : public rex::ReXApp {
     config.gpu_plugin.clear();
 #if defined(_WIN32)
     if(!REXCVAR_GET(edf_native_host))
-      REXLOG_INFO("EDF2027: ignoring legacy edf_native_host=false; the port uses native D3D11");
+      REXLOG_INFO("EDF2027: ignoring legacy edf_native_host=false; the port uses native rendering");
     rex::cvar::SetFlagByName("edf_native_host","true");
     if(!REXCVAR_GET(edf_native_untiled_scene))
       REXLOG_INFO("EDF2027: ignoring legacy edf_native_untiled_scene=false; Xbox tile recording is not supported");
@@ -80,6 +84,29 @@ class Edf2017App : public rex::ReXApp {
 #if defined(_WIN32)
     if(REXCVAR_GET(edf_native_host)) {
       edf::native::InitializeGuestShaderBridge({});
+      if(REXCVAR_GET(edf_native_scene_backend).starts_with("d3d12")) {
+        edf::native::RegisterNativeD3D12Backend();
+        auto backend=std::shared_ptr<edf::native::NativeRenderBackend>(
+          edf::native::CreateNativeRenderBackend(REXCVAR_GET(edf_native_scene_backend)));
+        auto drawer=std::make_unique<edf::native::NativeBackendImmediateDrawer>(backend);
+        native_backend_immediate_=drawer.get();
+        native_backend_host_=edf::native::NativeBackendHost::Create(
+          static_cast<HWND>(window()->GetNativeWindowHandle()),backend,
+          [this](edf::native::NativeBackendRenderTarget& target) {
+            if(!imgui_drawer()) return;
+            native_backend_immediate_->SetTarget(&target);
+            rex::ui::AppUIDrawContext context(target.width(),target.height());
+            try { imgui_drawer()->Draw(context); }
+            catch(...) {
+              if(native_backend_immediate_) { native_backend_immediate_->End(); native_backend_immediate_->SetTarget(nullptr); }
+              throw;
+            }
+            if(native_backend_immediate_) native_backend_immediate_->SetTarget(nullptr);
+          },[context=&app_context()](std::function<void()> callback) {
+            return context->CallInUIThreadDeferred(std::move(callback));
+          });
+        return drawer;
+      }
       std::unique_ptr<edf::native::NativeImmediateDrawer> drawer;
       edf::native::VisitNativePresentationContext([&](auto& device,auto& context) {
         drawer=std::make_unique<edf::native::NativeImmediateDrawer>(device,context);
@@ -203,6 +230,8 @@ class Edf2017App : public rex::ReXApp {
 #if defined(_WIN32)
     edf::native::SetNativeMeshWatchAudit({});
     native_mesh_audit_.reset();
+    if(native_backend_host_) native_backend_host_->Stop();
+    native_backend_host_.reset(); native_backend_immediate_=nullptr;
     if(native_host_) native_host_->Stop();
     native_host_.reset(); native_immediate_=nullptr;
     native_preview_.reset();
@@ -210,6 +239,8 @@ class Edf2017App : public rex::ReXApp {
   }
   bool OnWindowCloseRequested() override {
 #if defined(_WIN32)
+    if(native_backend_host_) native_backend_host_->Stop();
+    native_backend_host_.reset(); native_backend_immediate_=nullptr;
     if(native_host_) native_host_->Stop();
     native_host_.reset(); native_immediate_=nullptr;
     native_preview_.reset();
@@ -220,6 +251,8 @@ class Edf2017App : public rex::ReXApp {
 #if defined(_WIN32)
   std::unique_ptr<edf::native::NativePreviewWindow> native_preview_;
   std::shared_ptr<edf::native::GuestMeshWatchAudit> native_mesh_audit_;
+  std::shared_ptr<edf::native::NativeBackendHost> native_backend_host_;
+  edf::native::NativeBackendImmediateDrawer* native_backend_immediate_=nullptr;
   std::shared_ptr<edf::native::NativeHostSurface> native_host_;
   edf::native::NativeImmediateDrawer* native_immediate_=nullptr; // Owned by SDK.
 #endif

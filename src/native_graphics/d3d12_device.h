@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -46,6 +47,9 @@ struct NativeD3D12Options {
   // own command allocator, its own slice of the upload ring and its own slice
   // of the descriptor heap, so recording needs no lock.
   uint32_t recorders=1;
+  // Zero preserves direct recording. Positive values enable draw packets.
+  uint32_t geometry_workers=0;
+  uint32_t geometry_minimum_draws=32;
 };
 
 class NativeD3D12Device {
@@ -55,11 +59,13 @@ class NativeD3D12Device {
   NativeD3D12Device(const NativeD3D12Device&)=delete;
   NativeD3D12Device& operator=(const NativeD3D12Device&)=delete;
 
+  std::function<void(const void*)> before_resource_destroy;
   ID3D12Device* device() const { return device_.Get(); }
   ID3D12CommandQueue* queue() const { return queue_.Get(); }
   IDXGIFactory4* factory() const { return factory_.Get(); }
   // Valid only between BeginFrame and EndFrame.
   ID3D12GraphicsCommandList* commands(uint32_t recorder=0) const { return lists_.at(recorder).Get(); }
+  ID3D12GraphicsCommandList* preamble(uint32_t recorder) const { return preambles_.at(recorder).Get(); }
   uint32_t recorders() const { return static_cast<uint32_t>(lists_.size()); }
   const std::string& adapter_name() const { return adapter_name_; }
   bool is_warp() const { return is_warp_; }
@@ -93,7 +99,7 @@ class NativeD3D12Device {
   // the allocator next puts at that address. That is not a validation error,
   // it is a GPU page fault - the hang with the empty log. So the owner drops
   // it here instead, and the frame fence decides when it actually goes.
-  void Retire(Microsoft::WRL::ComPtr<ID3D12Resource> resource);
+  void Retire(Microsoft::WRL::ComPtr<IUnknown> resource);
   // How many retired resources are still waiting on the GPU. A number that
   // only grows means frames are not completing.
   size_t retiring() const { return retiring_.size(); }
@@ -148,14 +154,14 @@ class NativeD3D12Device {
     // One allocator per recorder: two threads writing one allocator is
     // undefined, and it is the first thing that breaks when recording is
     // parallelised.
-    std::vector<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>> allocators;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>> allocators,preamble_allocators;
     uint64_t fence=0;  // Value signalled after this frame's work; 0 = never used.
   };
 
   Microsoft::WRL::ComPtr<IDXGIFactory4> factory_;
   Microsoft::WRL::ComPtr<ID3D12Device> device_;
   Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue_;
-  std::vector<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>> lists_;
+  std::vector<Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList>> lists_,preambles_;
   Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
   Microsoft::WRL::ComPtr<ID3D12InfoQueue> messages_;
   Microsoft::WRL::ComPtr<ID3D12Resource> upload_;
@@ -165,7 +171,7 @@ class NativeD3D12Device {
   // is done.
   struct Retiring {
     uint64_t fence=0;
-    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    Microsoft::WRL::ComPtr<IUnknown> resource;
   };
   std::vector<Retiring> retiring_;
   void* fence_event_=nullptr;

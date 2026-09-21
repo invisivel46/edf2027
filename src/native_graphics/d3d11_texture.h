@@ -111,6 +111,8 @@ void ResolveNativeRgba8Frame(NativeBackendRecorder& recorder,const NativeRenderT
 // Uniform zero bytes have the same value for any tiling/endian layout.
 bool ImportZeroLuminanceHistory(ID3D11DeviceContext& context,NativeRenderTarget& target,
                                 std::span<const uint8_t> initial_page);
+bool ImportZeroLuminanceHistory(NativeBackendRecorder& recorder,NativeRenderTarget& target,
+                                std::span<const uint8_t> initial_page);
 // Native DDS upload: retains BC1/BC2/BC3 compression and all authored mip/face
 // data. RGB mask formats and alpha-only A8 are converted to RGBA8. No Xbox texture descriptors,
 // tiled GPU memory, or GPU command processing is involved.
@@ -139,6 +141,8 @@ std::vector<uint8_t> CaptureNativeBmp(NativeRenderBackend& backend,NativeBackend
                                       uint32_t format);
 // Diagnostic one-pixel readback, without quantizing HDR or changing validity.
 std::array<float,4> ReadNativeColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,uint32_t x,uint32_t y);
+std::array<float,4> ReadNativeColorPixel(NativeRenderBackend& backend,NativeBackendTexture& texture,
+                                      uint32_t format,uint32_t x,uint32_t y);
 // Diagnostic region scan. Returns the first nonfinite RGB pixel in row order;
 // finite magenta and nonfinite alpha alone are not errors. No rendering state
 // or content-validity flag is changed. Coordinates are absolute surface pixels.

@@ -1,4 +1,5 @@
 #include "native_graphics/d3d11_backend.h"
+#include "native_graphics/d3d12_backend.h"
 #include "native_graphics/d3d11_presenter.h"
 #include "native_graphics/d3d11_frame_compositor.h"
 #include "native_graphics/d3d11_frame_handoff.h"
@@ -199,6 +200,84 @@ void CheckDisplayGamma(ID3D11Device& device,ID3D11DeviceContext& context) {
   Require(std::abs(ReadNativeColorPixel(context,*scaled.surface.Get(),1,0)[0]-0.5f)<0.003f,
     "gamma applied after scaling instead of before");
 }
+void CheckSharedHandoff(ID3D11Device& device,ID3D11DeviceContext& context,bool hardware) {
+  NativeD3D12Options options{}; options.prefer_warp=!hardware; options.debug_layer=true;
+  auto producer=CreateNativeD3D12Backend(options);
+  {
+    auto history=CreateNativeLuminanceTarget(*producer,1,1);
+    std::array<uint8_t,4096> initial{};
+    initial[17]=1;
+    producer->BeginFrame();
+    Require(!ImportZeroLuminanceHistory(producer->Recorder(),history,initial),
+            "nonzero history page imported through recorder");
+    initial[17]=0;
+    Require(ImportZeroLuminanceHistory(producer->Recorder(),history,initial),
+            "D3D12 tone history initialization failed");
+    Require(history.sampled.content_valid && !history.content_valid,
+            "history initialization claimed a rendered surface");
+    Require(!ImportZeroLuminanceHistory(producer->Recorder(),history,initial),
+            "history initialization replaced valid contents");
+    producer->Submit();
+    const auto bytes=producer->ReadTexture(*history.sampled.backend);
+    Require(bytes==std::vector<uint8_t>({0,0,0,0x3c,0,0x3c,0,0x3c}),
+            "D3D12 initial luminance swizzle differs from D3D11");
+  }
+  NativeFrameHandoff handoff(device,context);
+  std::array<uint8_t,1536> curve{};
+  const auto gamma=NativeDisplayGamma::Decode(curve,NativeDisplayGamma::Mode::Table256);
+  for(uint32_t width:{4u,7u,1280u,4u}) {
+    // Full-size asynchronous D3D12/D3D11 sharing is a hardware regression
+    // check. WARP's cross-runtime readback deadlocks at this size; its small
+    // copies still cover synchronization and resize, while the backend
+    // conformance suite exercises full rendering without cross-runtime sharing.
+    if(width==1280 && !hardware) continue;
+    const uint32_t height=width==1280?720:2;
+    NativeBackendTextureDesc desc{};
+    desc.width=width; desc.height=height; desc.levels=1;
+    desc.format=DXGI_FORMAT_R8G8B8A8_UNORM; desc.render_target=true;
+    auto target=producer->CreateRenderTarget(desc);
+    auto shared=producer->CreateSharedSurface(desc);
+    Require(bool(shared),"D3D12 shared surface creation");
+    // The large repeat count reproduces the hardware import-lifetime hang;
+    // WARP needs only enough iterations to reuse the three frame slots.
+    for(unsigned frame=0;frame<(hardware?128u:4u);++frame) {
+      producer->BeginFrame();
+      producer->Recorder().ClearColor(*target,{0,0,1,1});
+      producer->Recorder().CopyToShared(*shared,*target);
+      producer->Submit(); producer->SignalShared(*shared);
+      handoff.PublishShared({shared->texture_handle(),shared->fence_handle(),shared->value(),
+                            width,height,desc.format},NativeFrameKind::Movie,&gamma);
+      const auto ack=handoff.Shared();
+      Require(producer->WaitSharedFence(ack.fence,ack.value),"repeated snapshot acknowledgment");
+    }
+    producer->BeginFrame();
+    producer->Recorder().ClearColor(*target,{1,0,0,1});
+    producer->Recorder().CopyToShared(*shared,*target);
+    producer->Submit(); producer->SignalShared(*shared);
+    handoff.PublishShared({shared->texture_handle(),shared->fence_handle(),shared->value(),
+                          width,height,desc.format},NativeFrameKind::Movie,&gamma);
+    const auto copied=handoff.Shared();
+    Require(producer->WaitSharedFence(copied.fence,copied.value),"snapshot acknowledgment wait");
+    producer->BeginFrame();
+    producer->Recorder().ClearColor(*target,{0,1,0,1});
+    producer->Recorder().CopyToShared(*shared,*target);
+    producer->Submit();
+    // Reading twice without another publication exercises host repeats. The
+    // source has been overwritten, but the snapshot and gamma must survive.
+    for(int repeat=0;repeat<2;++repeat)
+      Require(handoff.Visit([&](auto&,auto& c,auto& view,auto,auto kind,auto* table) {
+        Require(kind==NativeFrameKind::Movie && table && table->EvaluateCode(0,255)==0,
+                "shared frame gamma/kind lost");
+        ComPtr<ID3D11Resource> resource; view.GetResource(&resource);
+        ComPtr<ID3D11Texture2D> snapshot; resource.As(&snapshot);
+        const auto color=ReadNativeColorPixel(c,*snapshot.Get(),width-1,1);
+        Require(color[0]==1 && color[1]==0,"shared snapshot changed with producer");
+      }),"shared frame unavailable on repeated visit");
+  }
+  Reject([&]{handoff.PublishShared({},NativeFrameKind::Movie);},"empty shared frame accepted");
+  Require(!handoff.Visit({}),"failed shared publication exposed stale frame");
+  Require(producer->DrainValidationMessages().empty(),"D3D12 shared handoff validation errors");
+}
 void CheckHandoff(ID3D11Device& device,ID3D11DeviceContext& context,
                   NativeWindowPresenter& presenter) {
   // Render targets come from the backend now; adopting this device keeps them
@@ -298,8 +377,10 @@ int main(int argc,char** argv) {
     static_assert(!std::is_copy_assignable_v<NativeWindowPresenter>);
     Window window;
     Require(window.handle!=nullptr,"hidden test window creation");
-    const bool hardware=argc==2 && std::string(argv[1])=="--visible-hardware";
-    const bool visible=hardware || (argc==2 && std::string(argv[1])=="--visible");
+    const bool hardware=argc==2 && (std::string(argv[1])=="--visible-hardware" ||
+                                    std::string(argv[1])=="--hardware");
+    const bool visible=argc==2 && (std::string(argv[1])=="--visible-hardware" ||
+                                   std::string(argv[1])=="--visible");
     if(visible) {
       const auto desktop_name=[](HANDLE handle) {
         wchar_t name[256]{}; DWORD needed=0;
@@ -408,6 +489,7 @@ int main(int argc,char** argv) {
     CheckComposition(*device.Get(),*context.Get(),presenter);
     CheckDisplayGamma(*device.Get(),*context.Get());
     CheckHandoff(*device.Get(),*context.Get(),presenter);
+    CheckSharedHandoff(*device.Get(),*context.Get(),hardware);
     DestroyWindow(window.handle); window.handle=nullptr;
     Reject([&]{presenter.Present(false);},"destroyed window accepted");
     context->ClearState();

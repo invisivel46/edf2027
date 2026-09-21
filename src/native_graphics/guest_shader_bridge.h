@@ -20,9 +20,6 @@ NativeRenderBackend* EnsureNativeRenderBackend();
 // Handles for the published frame, so a backend can sample it in place.
 // False when nothing has been published or the surface is not shareable.
 bool VisitNativePresentationSharedFrame(NativeFrameHandoff::SharedFrame& shared,uint64_t& sequence);
-// The scene's own frame, for a scene the compositor cannot take a view of.
-// Never the composited window image; see the definition.
-bool VisitNativeSceneSharedFrame(NativeFrameHandoff::SharedFrame& shared,uint64_t& sequence);
 bool VisitNativePresentationFrame(const NativeFrameHandoff::Consumer& consumer);
 bool VisitNativePresentationContext(
     const std::function<void(ID3D11Device&,ID3D11DeviceContext&)>& consumer);

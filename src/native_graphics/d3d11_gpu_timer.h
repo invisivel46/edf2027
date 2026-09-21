@@ -1,5 +1,7 @@
 #pragma once
 #include <d3d11.h>
+#include "native_render_backend.h"
+#include <functional>
 #include <wrl/client.h>
 #include <cstdint>
 #include <deque>
@@ -26,6 +28,7 @@ struct NativeGpuTiming {
 class NativeGpuTimer {
  public:
   NativeGpuTimer(ID3D11Device& device,ID3D11DeviceContext& context,size_t capacity=8);
+  NativeGpuTimer(NativeRenderBackend& backend,std::function<NativeBackendRecorder&()> recorder,size_t capacity=8);
   ~NativeGpuTimer();
   NativeGpuTimer(const NativeGpuTimer&)=delete;
   NativeGpuTimer& operator=(const NativeGpuTimer&)=delete;
@@ -40,9 +43,12 @@ class NativeGpuTimer {
   struct Span {
     uint64_t tag=0;
     Microsoft::WRL::ComPtr<ID3D11Query> disjoint,begin,middle,end;
+    std::unique_ptr<NativeBackendQuery> backend_begin,backend_middle,backend_end;
   };
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
+  NativeRenderBackend* backend_=nullptr;
+  std::function<NativeBackendRecorder&()> recorder_;
   size_t capacity_;
   std::optional<Span> active_;
   std::deque<Span> submitted_;
@@ -53,6 +59,8 @@ class NativePresentProfiler {
  public:
   NativePresentProfiler(ID3D11Device& device,ID3D11DeviceContext& context)
       :timer_(device,context,4) {}
+  NativePresentProfiler(NativeRenderBackend& backend,std::function<NativeBackendRecorder&()> recorder)
+      :timer_(backend,std::move(recorder),4) {}
   void Start(uint32_t sequence);
   void Finish(uint32_t sequence);
   std::optional<NativeGpuTiming> Poll() { return timer_.Poll(true); }

@@ -54,6 +54,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     for(size_t i=0;i+1<kRenderPresets.size();++i)
       if(kRenderPresets[i].w==render_w_ && kRenderPresets[i].h==render_h_) render_index_=int(i);
     vsync_ = rex::cvar::GetFlagByName("edf_native_vsync") != "false";
+    unlock_framerate_ = GetBool("edf_native_unlock_framerate", false);
     fps_cap_index_ = 0; for (int i = 0; i < 4; i++) if (kFpsCaps[i] == REXCVAR_GET(edf_fps_cap)) fps_cap_index_ = i;
     mute_ = REXCVAR_GET(audio_mute);
     mnk_ = REXCVAR_GET(mnk_mode);
@@ -74,8 +75,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     fsr_sharp_ = static_cast<float>(GetDouble("present_fsr_sharpness_reduction", 0.2));
     fsr_passes_ = FsrPassesValue(GetInt("present_fsr_max_upsampling_passes", 4));
     dither_ = GetBool("present_dither", false);
-    backend_index_ = BackendIndex(GetStr("edf_native_backend", "d3d12"));
-    backend_preview_ = backend_index_ != 2 && GetBool("edf_native_backend_preview", false);
+    backend_index_ = BackendIndex(GetStr("edf_native_scene_backend", "d3d12"));
     async_shaders_ = GetBool("async_shader_compilation", true);
     int refresh = static_cast<int>(GetDouble("video_mode_refresh_rate", 60));
     for (int i = 0; i < 4; ++i) if (refresh == kRefresh[i]) refresh_index_ = i;
@@ -121,39 +121,10 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     if (ImGui::Combo("Window size *", &res_index_, labels.c_str())) restart_ = true;
     if (res_index_ == (int)kPresets.size() - 1) { ImGui::InputInt("Width", &custom_w_); ImGui::InputInt("Height", &custom_h_); }
     if (ImGui::Combo("Graphics backend *", &backend_index_,
-                     "Direct3D 12 (default)\0" "Direct3D 11\0" "None\0")) {
-      rex::cvar::SetFlagByName("edf_native_backend", std::string(BackendValue(backend_index_)));
-      if (backend_index_ == 2) {
-        // The preview window has nothing to draw it without a backend, and
-        // leaving the flag set would refuse to start next time.
-        backend_preview_ = false;
-        rex::cvar::SetFlagByName("edf_native_backend_preview", "false");
-      }
-      restart_ = true;
-    }
+                     "Direct3D 12 (default)\0" "Direct3D 11 (fallback)\0")) restart_ = true;
     ImGui::SameLine(); HelpMarker(
-      "Which backend anything drawing through the renderer's backend interface uses. Direct3D "
-      "12 is the default. It is built the first time something needs it, so this costs nothing "
-      "until something draws through it. The game's own scene rendering is still a direct "
-      "Direct3D 11 path that does not use the backend yet, so changing this does not change how "
-      "the game looks. Save and restart to apply.");
-    if (backend_index_ != 2) {
-      if (ImGui::Checkbox("Backend preview window *", &backend_preview_)) {
-        rex::cvar::SetFlagByName("edf_native_backend_preview", backend_preview_ ? "true" : "false");
-        // The preview draws the frames the renderer publishes, so it cannot
-        // work without them. Turning it on here rather than refusing to start
-        // later is the only version of this that is not a trap.
-        if (backend_preview_) rex::cvar::SetFlagByName("edf_native_publish_frames", "true");
-        restart_ = true;
-      }
-      ImGui::SameLine(); HelpMarker(
-        "Opens a second window whose every pixel is drawn and presented by the selected backend, "
-        "showing the frames the renderer publishes. It is how the backend can be seen working "
-        "before the game's own window moves onto it. Costs a copy of each frame through system "
-        "memory, so it is slower than the game's own window and is not meant to replace it. "
-        "Also enables frame publishing.");
-    }
-    ImGui::TextDisabled("Renderer: native Direct3D 11");
+      "Selects the game's native renderer. Direct3D 12 renders the scene, display gamma, "
+      "and overlays. Direct3D 11 is available as a fallback. Save and restart to apply.");
     std::string render_labels; for(const auto& p:kRenderPresets) { render_labels+=p.name; render_labels.push_back('\0'); }
     if(ImGui::Combo("Render resolution *",&render_index_,render_labels.c_str())) {
       if(render_index_!=int(kRenderPresets.size())-1) {
@@ -169,6 +140,18 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     if(!ValidNativeRenderMode(render_w_,render_h_))
       ImGui::TextColored(ImVec4(1,.4f,.3f,1),"Render size must be 640..4095 x 480..4095, or 0 x 0 (original).");
     if (ImGui::Checkbox("VSync", &vsync_)) rex::cvar::SetFlagByName("edf_native_vsync", vsync_ ? "true" : "false");
+    if(ImGui::IsItemHovered()) ImGui::SetTooltip(
+      "On synchronizes frames to the display refresh. Off enables the D3D12 variable-refresh path "
+      "when supported and configured by your display driver; otherwise tearing may occur. "
+      "For evenly paced 60 FPS with fixed refresh, use a display rate divisible by 60.");
+    ImGui::BeginDisabled(!GetStr("edf_native_scene_backend", "d3d12").starts_with("d3d12"));
+    if (ImGui::Checkbox("Unlock frame rate (experimental)", &unlock_framerate_))
+      rex::cvar::SetFlagByName("edf_native_unlock_framerate", unlock_framerate_ ? "true" : "false");
+    ImGui::EndDisabled();
+    ImGui::SameLine(); HelpMarker(
+      "Direct3D 12: render above 60 FPS while gameplay remains at 60 Hz. "
+      "Camera and model interpolation smooth motion and add up to one simulation tick of latency. "
+      "Use the FPS cap and VSync to control presentation. Gameplay coverage is still in progress.");
     if (ImGui::Combo("FPS cap", &fps_cap_index_, "Off\0" "30\0" "60\0" "120\0")) rex::cvar::SetFlagByName("edf_fps_cap", std::to_string(FpsCapValue(fps_cap_index_)));
     ImGui::TextDisabled("Game simulation clock: 60 Hz (original)");
     if (ImGui::Combo("Aspect ratio *", &aspect_index_,
@@ -183,7 +166,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       rex::cvar::SetFlagByName("edf_native_anisotropic_filtering", std::to_string(AnisotropicValue(af_index_)));
     ImGui::SameLine(); HelpMarker("Applies immediately to linearly filtered, mipmapped materials. Point filtering, movies and UI are preserved.");
     if (ImGui::Combo("Scene anti-aliasing *", &msaa_index_, "Game default\0" "Off\0" "2x MSAA\0" "4x MSAA\0")) restart_=true;
-    ImGui::SameLine(); HelpMarker("Native D3D11 scene color and depth sampling. Game default preserves the game's request (normally 2x). Save and restart to apply. Higher sample counts use more GPU time and memory; UI and post-processing remain single-sampled.");
+    ImGui::SameLine(); HelpMarker("Native scene color and depth sampling. Game default preserves the game's request (normally 2x). Save and restart to apply. Higher sample counts use more GPU time and memory; UI and post-processing remain single-sampled.");
     ImGui::TextDisabled("The options below still need native implementations.");
     ImGui::BeginDisabled();
     if (ImGui::Combo("Post anti-aliasing *", &fxaa_index_, "Off\0" "FXAA\0" "FXAA extreme\0")) {
@@ -438,6 +421,10 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   }
   void Save() {
     if(!ValidNativeRenderMode(render_w_,render_h_)) return;
+    const auto backend=std::string(BackendValue(backend_index_));
+    rex::cvar::SetFlagByName("edf_native_scene_backend",backend);
+    rex::cvar::SetFlagByName("edf_native_backend",backend);
+    rex::cvar::SetFlagByName("edf_native_seam_draws","true");
     rex::cvar::SetFlagByName("edf_native_render_width",std::to_string(render_w_));
     rex::cvar::SetFlagByName("edf_native_render_height",std::to_string(render_h_));
     constexpr int sample_counts[]{0,1,2,4};
@@ -457,21 +444,21 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   std::filesystem::path config_path_; std::string pad_name_; std::function<void()> on_close_;
   std::function<bool()> on_restart_;
   static std::string_view BackendValue(int index) {
-    return index == 1 ? "d3d11" : index == 2 ? "" : "d3d12";
+    return index == 1 ? "d3d11" : "d3d12";
   }
   static int BackendIndex(const std::string& value) {
     // Unknown values read as the default rather than being invented into a
     // menu position, so a hand-edited config cannot make the menu lie about
     // what the game will start with. The WARP variants are diagnostic, set
     // from the command line, and deliberately not menu positions.
-    return value == "d3d11" ? 1 : value.empty() ? 2 : 0;
+    return value == "d3d11" ? 1 : 0;
   }
 
   int backend_index_ = 0;
-  bool backend_preview_ = false;
   int display_mode_ = 0, res_index_ = 0, custom_w_ = 1280, custom_h_ = 720, fps_cap_index_ = 0;
   int render_index_=0,render_w_=0,render_h_=0;
   bool vsync_ = true, mute_ = false, mnk_ = false, mnk_mouse_ = true, rumble_ = true;
+  bool unlock_framerate_ = false;
   bool restart_ = false, saved_ = false, restart_failed_ = false;
   bool show_fps_ = false, frametime_log_ = false, trace_input_ = false;
   float mnk_sens_ = 1.0f;

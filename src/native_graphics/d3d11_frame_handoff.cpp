@@ -1,8 +1,62 @@
 #include "d3d11_frame_handoff.h"
 #include <dxgi1_2.h>
 #include <stdexcept>
+#include <string>
 
 namespace edf::native {
+NativeFrameHandoff::~NativeFrameHandoff() {
+  if(shared_texture_) CloseHandle(shared_texture_);
+  if(shared_fence_) CloseHandle(shared_fence_);
+  if(imported_texture_handle_) CloseHandle(imported_texture_handle_);
+  if(imported_fence_handle_) CloseHandle(imported_fence_handle_);
+}
+void NativeFrameHandoff::PublishShared(const SharedFrame& source,NativeFrameKind kind,
+                                      const NativeDisplayGamma* gamma) {
+  Invalidate();
+  Microsoft::WRL::ComPtr<ID3D11Device5> device;
+  Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context;
+  if(!source || !source.value || FAILED(device_.As(&device)) ||
+     FAILED(context_.As(&context)))
+    throw std::runtime_error("native shared frame import failed");
+  // Keep imports alive across submissions. Releasing/reopening a 720p import
+  // every frame hangs the hardware driver, even though tiny WARP copies pass.
+  // Compare kernel objects using owned duplicate handles: the producer may
+  // close a handle on resize and Windows may reuse its numerical value.
+  if(!imported_texture_ || !CompareObjectHandles(source.texture,imported_texture_handle_)) {
+    const auto opened=device->OpenSharedResource1(source.texture,
+      IID_PPV_ARGS(imported_texture_.ReleaseAndGetAddressOf()));
+    if(FAILED(opened))
+      throw std::runtime_error("native shared frame texture import failed: "+std::to_string(uint32_t(opened))+
+        "; removed="+std::to_string(uint32_t(device->GetDeviceRemovedReason())));
+    if(imported_texture_handle_) CloseHandle(imported_texture_handle_);
+    imported_texture_handle_=nullptr;
+    if(!DuplicateHandle(GetCurrentProcess(),source.texture,GetCurrentProcess(),
+                        &imported_texture_handle_,0,FALSE,DUPLICATE_SAME_ACCESS))
+      throw std::runtime_error("native shared texture handle duplication failed");
+  }
+  if(!imported_fence_ || !CompareObjectHandles(source.fence,imported_fence_handle_)) {
+    const auto opened=device->OpenSharedFence(source.fence,
+      IID_PPV_ARGS(imported_fence_.ReleaseAndGetAddressOf()));
+    if(FAILED(opened))
+      throw std::runtime_error("native shared frame fence import failed: "+std::to_string(uint32_t(opened)));
+    if(imported_fence_handle_) CloseHandle(imported_fence_handle_);
+    imported_fence_handle_=nullptr;
+    if(!DuplicateHandle(GetCurrentProcess(),source.fence,GetCurrentProcess(),
+                        &imported_fence_handle_,0,FALSE,DUPLICATE_SAME_ACCESS))
+      throw std::runtime_error("native shared fence handle duplication failed");
+  }
+  D3D11_TEXTURE2D_DESC desc{}; imported_texture_->GetDesc(&desc);
+  if(desc.Width!=source.width || desc.Height!=source.height || desc.Format!=source.format)
+    throw std::runtime_error("native shared frame metadata mismatch");
+  if(FAILED(context->Wait(imported_fence_.Get(),source.value)))
+    throw std::runtime_error("native shared frame producer wait failed");
+  Publish(*imported_texture_.Get(),kind,gamma);
+  if(!Shared()) {
+    Invalidate();
+    throw std::runtime_error("native shared frame copy has no completion fence");
+  }
+  context->Flush(); // Submit the copy and acknowledgment before the producer waits.
+}
 NativeFrameHandoff::NativeFrameHandoff(ID3D11Device& device,ID3D11DeviceContext& context)
     : device_(&device) {
   Microsoft::WRL::ComPtr<ID3D11Device> owner;
@@ -57,7 +111,11 @@ void NativeFrameHandoff::Publish(ID3D11Texture2D& source,NativeFrameKind kind,co
   context_->CopyResource(snapshot_.Get(),&source);
   // Signalled after the copy, so a consumer that waits for this value is
   // guaranteed a finished surface rather than one still being written.
-  if(fence_ && fenced_context_) fenced_context_->Signal(fence_.Get(),++fence_value_);
+  if(fence_ && fenced_context_) {
+    if(FAILED(fenced_context_->Signal(fence_.Get(),fence_value_+1)))
+      throw std::runtime_error("native frame snapshot signal failed");
+    ++fence_value_;
+  }
   if(gamma) gamma_=*gamma;
   ++sequence_; kind_=kind; valid_=true;
 }

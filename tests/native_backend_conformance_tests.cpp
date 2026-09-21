@@ -8,6 +8,9 @@
 #include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d12_backend.h"
 #include "native_graphics/native_render_backend.h"
+#include "native_graphics/d3d11_effect.h"
+#include "native_graphics/d3d11_bindings.h"
+#include "native_graphics/native_input_layout.h"
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -17,6 +20,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <thread>
+#include <barrier>
+#include <exception>
 
 using Microsoft::WRL::ComPtr;
 using namespace edf::native;
@@ -53,6 +59,7 @@ struct Rendered {
   std::vector<uint8_t> depth_tested, target0, target1;
   // Two targets drawn from one dynamic vertex buffer, rewritten between them.
   std::vector<uint8_t> dynamic_before, dynamic_after;
+  std::vector<uint8_t> transient_before, transient_after;
   // A target drawn into and then sampled, in one frame, without a resolve.
   // Twice, because one round trip does not diverge a per-view state tracker.
   std::vector<uint8_t> sampled_target, sampled_target_again;
@@ -177,6 +184,30 @@ Rendered Render(NativeRenderBackend& backend) {
   std::span<uint8_t> into{reinterpret_cast<uint8_t*>(&out.query_samples), sizeof(out.query_samples)};
   for (uint32_t attempt = 0; attempt < 10000 && !backend.ReadQuery(*query, into); ++attempt) {}
 
+  // Turning scissor off without changing the viewport must restore the full
+  // viewport. D3D11 does that in its raster state; D3D12 needs a new rectangle.
+  auto clipped_desc=flat_desc;
+  clipped_desc.state[5]=1;
+  auto& clipped_pipeline=backend.CreatePipeline(clipped_desc);
+  backend.BeginFrame();
+  {
+    auto& recorder=backend.Recorder();
+    recorder.SetRenderTargets(colors,nullptr);
+    recorder.SetViewport({0,0,kSize,kSize,0,1});
+    recorder.ClearColor(*target,{1,0,0,1});
+    recorder.SetPipeline(clipped_pipeline);
+    recorder.SetVertexBuffer(0,*half_buffer,sizeof(float)*3,0);
+    recorder.SetConstants(NativeBackendStage::Pixel,0,
+      {reinterpret_cast<const uint8_t*>(green.data()),sizeof(green)});
+    recorder.SetScissor({0,0,1,1},true);
+    recorder.Draw(3,0);
+    recorder.SetPipeline(flat_pipeline);
+    recorder.SetScissor({},false);
+    recorder.Draw(3,0);
+  }
+  backend.Submit();
+  Check(backend.ReadRenderTarget(*target)==out.flat,std::string(backend.name())+": disabled scissor retained its previous rectangle");
+
   // A dynamic vertex buffer rewritten between two draws in one frame.
   //
   // This is the one thing a dynamic buffer has to promise: the draw recorded
@@ -226,6 +257,32 @@ Rendered Render(NativeRenderBackend& backend) {
   backend.Submit();
   out.dynamic_before = backend.ReadRenderTarget(*before_target);
   out.dynamic_after = backend.ReadRenderTarget(*after_target);
+
+  // The same two triangles through transient vertices: no buffer at all, the
+  // bytes staged by the backend for this frame. The draw recorded first must
+  // keep its triangle after the second one's bytes are staged - what the
+  // dynamic buffer promised, without the flush that promise cost.
+  backend.BeginFrame();
+  {
+    auto& recorder = backend.Recorder();
+    recorder.SetViewport({0, 0, kSize, kSize, 0, 1});
+    recorder.SetPipeline(flat_pipeline);
+    recorder.SetConstants(NativeBackendStage::Pixel, 0,
+                          {reinterpret_cast<const uint8_t*>(green.data()), sizeof(float) * 4});
+    recorder.SetRenderTargets(before_colors, nullptr);
+    recorder.ClearColor(*before_target, {1.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetTransientVertices(0, {reinterpret_cast<const uint8_t*>(upper), sizeof(upper)},
+                                  sizeof(float) * 3);
+    recorder.Draw(3, 0);
+    recorder.SetRenderTargets(after_colors, nullptr);
+    recorder.ClearColor(*after_target, {1.0f, 0.0f, 0.0f, 1.0f});
+    recorder.SetTransientVertices(0, {reinterpret_cast<const uint8_t*>(half), sizeof(half)},
+                                  sizeof(float) * 3);
+    recorder.Draw(3, 0);
+  }
+  backend.Submit();
+  out.transient_before = backend.ReadRenderTarget(*before_target);
+  out.transient_after = backend.ReadRenderTarget(*after_target);
 
   // Textured, with a 2x2 texture whose four texels differ, so a flipped or
   // row-swapped upload cannot match the other backend by accident.
@@ -382,6 +439,8 @@ Rendered Render(NativeRenderBackend& backend) {
   blended_desc.vertex_id = 13;
   blended_desc.pixel_id = 14;
   auto& blended_pipeline = backend.CreatePipeline(blended_desc);
+  if(!blended_pipeline.requires_blend_factor())
+    throw std::runtime_error("pipeline lost its constant blend-factor requirement");
   const std::array<float, 4> opaque_white{1.0f, 1.0f, 1.0f, 1.0f};
   const std::array<float, 4> factor{0.5f, 0.25f, 0.75f, 1.0f};
 
@@ -639,14 +698,327 @@ Difference Compare(const std::vector<uint8_t>& left, const std::vector<uint8_t>&
 }
 }  // namespace
 
+// CPU recording order must not choose resource states or GPU draw order.
+// All four workers write the same resource, then copy their own result. The
+// lists execute 0..3, even when list 3 is completely recorded before list 0.
+void ParallelResourceOrdering() {
+  NativeD3D12Options options; options.prefer_warp=true; options.debug_layer=true;
+  options.recorders=4;
+  auto backend=CreateNativeD3D12Backend(options);
+  NativeBackendTextureDesc desc{}; desc.width=desc.height=16; desc.format=kFormat;
+  auto source=backend->CreateRenderTarget(desc);
+  std::array<std::unique_ptr<NativeBackendTexture>,4> outputs;
+  for(auto& output:outputs) output=backend->CreateTexture(desc,{});
+  const std::array<std::array<float,4>,4> colors{{{1,0,0,1},{0,1,0,1},{0,0,1,1},{1,1,0,1}}};
+  for(unsigned frame=0;frame<12;++frame) {
+    backend->BeginFrame();
+    auto record=[&](unsigned index) {
+      auto& recorder=backend->Recorder(index);
+      recorder.ClearColor(*source,colors[index]);
+      recorder.ResolveTarget(*outputs[index],*source);
+    };
+    if(frame%2==0) {
+      for(unsigned index=4;index--;) record(index);
+    } else {
+      std::barrier start(4);
+      std::array<std::exception_ptr,4> errors{};
+      std::vector<std::jthread> workers;
+      for(unsigned index=0;index<4;++index) workers.emplace_back([&,index] {
+        start.arrive_and_wait();
+        try { record(index); } catch(...) { errors[index]=std::current_exception(); }
+      });
+      workers.clear();
+      for(auto& error:errors) if(error) std::rethrow_exception(error);
+    }
+    backend->Submit();
+    for(unsigned index=0;index<4;++index) {
+      const auto pixels=backend->ReadTexture(*outputs[index]);
+      for(size_t pixel=0;pixel<pixels.size();pixel+=4)
+        for(unsigned channel=0;channel<4;++channel)
+          Check(pixels[pixel+channel]==uint8_t(colors[index][channel]*255),
+                "parallel resource transition followed CPU recording order");
+    }
+  }
+  // A resource wrapper may die before Submit: first-use state and the native
+  // resource must remain available to the submission's barrier preamble.
+  backend->BeginFrame();
+  backend->Recorder(2).ClearColor(*source,colors[2]);
+  source.reset();
+  backend->Submit();
+  backend->ReadTexture(*outputs[0]);
+  for(const auto& message:backend->DrainValidationMessages())
+    Check(message.find("error")==std::string::npos && message.find("ERROR")==std::string::npos,
+          "parallel validation: "+message);
+}
+
+void ParallelGeometryPackets() {
+  NativeD3D12Options options; options.prefer_warp=true; options.debug_layer=true; options.geometry_workers=4;
+  auto backend=CreateNativeD3D12Backend(options);
+  const char* shader=R"(
+    cbuffer Tint : register(b0) { float4 color; };
+    Texture2D image : register(t0); SamplerState sample_image : register(s0);
+    float4 VS(uint id:SV_VertexID):SV_Position {
+      float2 p=float2((id<<1)&2,id&2); return float4(p*float2(2,-2)+float2(-1,1),0,1);
+    }
+    float4 PS():SV_Target { return color*image.SampleLevel(sample_image,float2(.5,.5),0); }
+  )";
+  auto vs=Compile(shader,"VS","vs_5_0"),ps=Compile(shader,"PS","ps_5_0");
+  NativeBackendPipelineDesc pipeline{}; pipeline.vertex=Bytes(*vs.Get()); pipeline.pixel=Bytes(*ps.Get());
+  pipeline.vertex_id=100; pipeline.pixel_id=101; pipeline.state={0x10001,0,0,0,15,0};
+  pipeline.render_targets=1; pipeline.rtv_format[0]=kFormat;
+  auto& pso=backend->CreatePipeline(pipeline);
+  NativeBackendTextureDesc desc{}; desc.width=64; desc.height=16; desc.format=kFormat;
+  auto target=backend->CreateRenderTarget(desc);
+  const uint16_t indices[]{0,1,2};
+  NativeBackendBufferDesc ib{}; ib.bytes=sizeof(indices); ib.index=true;
+  auto buffer=backend->CreateBuffer(ib,{reinterpret_cast<const uint8_t*>(indices),sizeof(indices)});
+  NativeBackendTextureDesc white_desc{}; white_desc.width=white_desc.height=1; white_desc.format=kFormat;
+  const std::array<uint8_t,4> white{255,255,255,255};
+  auto texture=backend->CreateTexture(white_desc,white);
+  auto& sampler=backend->CreateSampler({});
+  for(unsigned frame=0;frame<4;++frame) {
+    backend->BeginFrame(); auto& r=backend->Recorder();
+    r.ClearColor(*target,{0,0,0,0});
+    NativeBackendRenderTarget* targets[]{target.get()}; r.SetRenderTargets(targets,nullptr);
+    r.SetViewport({0,0,64,16,0,1}); r.SetPipeline(pso);
+    r.SetIndexBuffer(*buffer,NativeBackendIndexFormat::Uint16,0);
+    r.SetTexture(NativeBackendStage::Pixel,0,texture.get());
+    r.SetSampler(NativeBackendStage::Pixel,0,&sampler);
+    for(unsigned x=0;x<64;++x) {
+      std::array<float,4> color{float(x)/63,0,float(frame)/3,1};
+      r.SetConstants(NativeBackendStage::Pixel,0,{reinterpret_cast<const uint8_t*>(color.data()),sizeof(color)});
+      r.SetScissor({int(x),0,int(x+1),16},true);
+      r.DrawIndexed(3,0,0);
+      color.fill(0); // The worker must own a snapshot, not this caller's bytes.
+      if(x==31) {
+        // A saved constant image must survive an intermediate worker flush,
+        // deque growth, and a replacement binding. Restore and redraw the same
+        // column so a dangling or overwritten snapshot changes the readback.
+        r.PushState();
+        r.UpdateBuffer(*buffer,0,{reinterpret_cast<const uint8_t*>(indices),sizeof(indices)});
+        for(unsigned replacement=0;replacement<128;++replacement)
+          r.SetConstants(NativeBackendStage::Pixel,0,
+            {reinterpret_cast<const uint8_t*>(color.data()),sizeof(color)});
+        r.PopState();
+        r.DrawIndexed(3,0,0);
+      }
+    }
+    if(frame==3) {
+      // Destruction must drain deferred CPU work while both wrappers and their
+      // descriptors still exist, then retire GPU resources behind the fence.
+      texture.reset(); buffer.reset();
+    }
+    backend->Submit();
+    const auto pixels=backend->ReadRenderTarget(*target);
+    for(unsigned y=0;y<16;++y) for(unsigned x=0;x<64;++x) {
+      const auto offset=(y*64+x)*4;
+      Check(std::abs(int(pixels[offset])-int(x*255/63))<=1 &&
+            std::abs(int(pixels[offset+2])-int(frame*255/3))<=1 && pixels[offset+3]==255,
+            "parallel indexed draw lost its constants, scissor, or frame lifetime");
+    }
+  }
+  const auto statistics=backend->Statistics();
+  Check(statistics.geometry_batches>=4 && statistics.geometry_worker_mask==15,
+        "geometry test did not execute all four recording workers");
+  for(const auto& message:backend->DrainValidationMessages()) Check(false,"parallel geometry validation: "+message);
+  // Worker errors must reach the producer, join every job, and poison retries:
+  // submitting a partially recorded batch on a later call would lose draws.
+  backend->BeginFrame();
+  auto& bad=backend->Recorder(); bad.SetPipeline(pso);
+  bad.SetTexture(NativeBackendStage::Vertex,0,nullptr); // Outside this root signature.
+  for(unsigned draw=0;draw<64;++draw) bad.Draw(3,0);
+  bool rejected=false,retry_rejected=false;
+  try { backend->Submit(); } catch(const std::exception&) { rejected=true; }
+  try { backend->Submit(); } catch(const std::exception&) { retry_rejected=true; }
+  Check(rejected && retry_rejected,"failed worker recording was silently retried or submitted");
+
+}
+
+// Transient vertices exist so that immediate geometry stops being a flush
+// boundary: with a dynamic buffer, each rewrite joined the workers and
+// replayed whatever was pending on the producer. Sixty-four transient draws
+// must therefore reach the workers as one batch, and none of them serially.
+void TransientVerticesDoNotFlush() {
+  NativeD3D12Options options; options.prefer_warp=true; options.debug_layer=true; options.geometry_workers=4;
+  auto backend=CreateNativeD3D12Backend(options);
+  auto vs=Compile(kFlat,"VS","vs_5_0"),ps=Compile(kFlat,"PS","ps_5_0");
+  const NativeBackendInputElement position[]{{"POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,false,0}};
+  NativeBackendPipelineDesc pipeline{}; pipeline.vertex=Bytes(*vs.Get()); pipeline.pixel=Bytes(*ps.Get());
+  pipeline.vertex_id=200; pipeline.pixel_id=201; pipeline.input_layout=position; pipeline.input_layout_id=202;
+  pipeline.state={0x10001,0,0,0,15,0}; pipeline.topology=NativeBackendTopology::TriangleList;
+  pipeline.render_targets=1; pipeline.rtv_format[0]=kFormat;
+  auto& pso=backend->CreatePipeline(pipeline);
+  NativeBackendTextureDesc desc{}; desc.width=64; desc.height=16; desc.format=kFormat;
+  auto target=backend->CreateRenderTarget(desc);
+  const auto before=backend->Statistics();
+  backend->BeginFrame();
+  {
+    auto& r=backend->Recorder();
+    r.ClearColor(*target,{0,0,0,0});
+    NativeBackendRenderTarget* targets[]{target.get()}; r.SetRenderTargets(targets,nullptr);
+    r.SetViewport({0,0,64,16,0,1}); r.SetPipeline(pso);
+    for(unsigned x=0;x<64;++x) {
+      // A full-covering triangle whose bytes are overwritten after the draw:
+      // the worker must own the staged copy, not this caller's array.
+      float cover[]{-1,-1,0, 3,-1,0, -1,3,0};
+      std::array<float,4> color{float(x)/63,0,1,1};
+      r.SetConstants(NativeBackendStage::Pixel,0,{reinterpret_cast<const uint8_t*>(color.data()),sizeof(color)});
+      r.SetTransientVertices(0,{reinterpret_cast<const uint8_t*>(cover),sizeof(cover)},sizeof(float)*3);
+      r.SetScissor({int(x),0,int(x+1),16},true);
+      r.Draw(3,0);
+      for(auto& value:cover) value=0;
+    }
+  }
+  backend->Submit();
+  const auto pixels=backend->ReadRenderTarget(*target);
+  for(unsigned y=0;y<16;++y) for(unsigned x=0;x<64;++x) {
+    const auto offset=(y*64+x)*4;
+    Check(std::abs(int(pixels[offset])-int(x*255/63))<=1 && pixels[offset+2]==255 && pixels[offset+3]==255,
+          "a transient-vertex draw lost its vertices or its constants");
+  }
+  const auto after=backend->Statistics();
+  Check(after.geometry_draws-before.geometry_draws==64,"transient draws were not all recorded as packets");
+  Check(after.geometry_serial_flushes==before.geometry_serial_flushes,
+        "transient vertices flushed the recorder: "+std::to_string(after.geometry_serial_flushes-before.geometry_serial_flushes)+" serial flushes");
+  Check(after.geometry_batches>before.geometry_batches && after.geometry_worker_mask==15,
+        "transient draws did not reach the recording workers as a batch");
+  for(const auto& message:backend->DrainValidationMessages()) Check(false,"transient vertex validation: "+message);
+}
+
+void WorldInstancePackets() {
+  for(uint32_t minimum:{1u,128u}) {
+    NativeD3D12Options options; options.prefer_warp=true; options.debug_layer=true;
+    options.geometry_workers=4; options.geometry_minimum_draws=minimum;
+    auto backend=CreateNativeD3D12Backend(options);
+    for(bool row_major:{false,true}) for(bool reversed:{false,true}) {
+      Effect effect;
+      effect.source=std::string(row_major?"row_major":"column_major")+R"( float4x4 g_mWorld : WORLD < bool SasUiVisible=false; >;
+        float4 gain;
+        struct V { float4 position:SV_Position; float4 color:COLOR0; };
+        V VS(float3 position:POSITION0) {
+          V o; o.position=mul(float4(position,1),g_mWorld); o.color=gain; return o;
+        }
+        float4 tint;
+        float4 PS(V v):SV_Target { return v.color*tint; }
+      )";
+      auto vs=CompileNativeShader(nullptr,effect,{false,"VS","vs_3_0"},"instance-test.fx",reversed);
+      Check(AddNativeWorldInstancing(vs,effect,"instance-test.fx",reversed),"world instance variant rejected supported matrix");
+      if(!vs.instanced_bytecode) throw std::runtime_error("missing test instance variant");
+      auto ps=CompileNativeShader(nullptr,effect,{true,"PS","ps_3_0"},"instance-test.fx");
+      ShaderBindings vertex(nullptr,vs),pixel(nullptr,ps);
+      NativeOwnedInputLayout ordinary,instanced;
+      ordinary.Add("POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0);
+      instanced.Add("POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0);
+      for(uint32_t row=0;row<4;++row) instanced.Add("EDFINSTANCE",row,DXGI_FORMAT_R32G32B32A32_FLOAT,15,row*16,true,1);
+      NativeBackendPipelineDesc desc{};
+      desc.vertex=Bytes(*vs.bytecode.Get()); desc.pixel=Bytes(*ps.bytecode.Get());
+      desc.vertex_id=200+uint64_t(row_major)*4+uint64_t(reversed)*2; desc.pixel_id=210;
+      desc.state={0x10001,0,0,0,15,1}; desc.render_targets=1; desc.rtv_format[0]=kFormat;
+      desc.input_layout=ordinary.elements(); desc.input_layout_id=ordinary.fingerprint();
+      auto& pipeline=backend->CreatePipeline(desc);
+      desc.vertex=Bytes(*vs.instanced_bytecode.Get()); desc.vertex_id|=uint64_t(1)<<63;
+      desc.input_layout=instanced.elements(); desc.input_layout_id=instanced.fingerprint();
+      pipeline.world_instanced=&backend->CreatePipeline(desc);
+      pipeline.instance_world_slot=vs.instance_world_slot;
+      pipeline.instance_world_offset=vs.instance_world_offset;
+      NativeBackendTextureDesc target_desc{}; target_desc.width=64; target_desc.height=16; target_desc.format=kFormat;
+      auto target=backend->CreateRenderTarget(target_desc);
+      const float positions[]{-1,-1,0, -1,1,0, -1+2.f/64,1,0, -1+2.f/64,-1,0};
+      const uint16_t indices[]{0,1,2,0,2,3};
+      NativeBackendBufferDesc vb{}; vb.bytes=sizeof(positions); vb.vertex=true;
+      NativeBackendBufferDesc ib{}; ib.bytes=sizeof(indices); ib.index=true;
+      auto vertices=backend->CreateBuffer(vb,{reinterpret_cast<const uint8_t*>(positions),sizeof(positions)});
+      auto index=backend->CreateBuffer(ib,{reinterpret_cast<const uint8_t*>(indices),sizeof(indices)});
+      std::vector<uint8_t> reference;
+      uint64_t reference_snapshot_bytes=0;
+      const auto before=backend->Statistics();
+      for(bool enabled:{false,true}) {
+        const auto snapshot_start=backend->Statistics().geometry_constant_snapshot_bytes;
+        backend->BeginFrame(); auto& r=backend->Recorder();
+        r.ClearColor(*target,{0,0,0,0}); NativeBackendRenderTarget* targets[]{target.get()};
+        r.SetRenderTargets(targets,nullptr); r.SetViewport({0,0,64,16,0,1}); r.SetPipeline(pipeline);
+        r.SetVertexBuffer(0,*vertices,12,0); r.SetIndexBuffer(*index,NativeBackendIndexFormat::Uint16,0);
+        r.SetWorldInstancing(enabled);
+        for(unsigned draw=0;draw<300;++draw) {
+          r.SetWorldInstancing(enabled && draw!=298); // Explicit ordinary-draw boundary.
+          // Non-symmetric transforms expose a row/column transpose error.
+          std::array<float,16> matrix{1,0,0,0,0,.8f,0,0,0,0,1,0,float(draw%64)/32,.1f,0,1};
+          if(!row_major) for(unsigned row=0;row<4;++row) for(unsigned col=row+1;col<4;++col)
+            std::swap(matrix[row*4+col],matrix[col*4+row]);
+          vertex.SetConstant("g_mWorld",{reinterpret_cast<const uint8_t*>(matrix.data()),sizeof(matrix)});
+          const std::array<float,4> gain{1,draw<280?1.f:.25f,1,1},tint{1,1,draw<295?1.f:.5f,1};
+          vertex.SetConstant("gain",{reinterpret_cast<const uint8_t*>(gain.data()),sizeof(gain)});
+          pixel.SetConstant("tint",{reinterpret_cast<const uint8_t*>(tint.data()),sizeof(tint)});
+          for(const auto& c:vertex.ConstantImages()) r.SetConstants(NativeBackendStage::Vertex,c.slot,c.bytes);
+          for(const auto& c:pixel.ConstantImages()) r.SetConstants(NativeBackendStage::Pixel,c.slot,c.bytes);
+          r.SetScissor({0,0,64,draw<290?16:8},true);
+          r.DrawIndexed(6,0,0);
+        }
+        // Save a deferred matrix after a merged draw, overwrite it with a
+        // second instance, then restore and force ordinary rendering. The
+        // red redraw must land on the saved instance, not the latest one.
+        for(const auto& c:vertex.ConstantImages()) if(c.slot==vs.instance_world_slot) {
+          std::vector<uint8_t> constants(c.bytes.begin(),c.bytes.end());
+          for(unsigned extra=0;extra<2;++extra) {
+            const float x=float(44+extra)/32;
+            std::memcpy(constants.data()+vs.instance_world_offset+(row_major?12:3)*4,&x,4);
+            r.SetConstants(NativeBackendStage::Vertex,c.slot,constants);
+            r.DrawIndexed(6,0,0);
+            if(!extra) r.PushState();
+          }
+        }
+        r.PopState(); r.SetWorldInstancing(false);
+        const std::array<float,4> red{1,0,0,1};
+        pixel.SetConstant("tint",{reinterpret_cast<const uint8_t*>(red.data()),sizeof(red)});
+        for(const auto& c:pixel.ConstantImages()) r.SetConstants(NativeBackendStage::Pixel,c.slot,c.bytes);
+        r.DrawIndexed(6,0,0);
+        backend->Submit(); const auto pixels=backend->ReadRenderTarget(*target);
+        const auto snapshot_bytes=backend->Statistics().geometry_constant_snapshot_bytes-snapshot_start;
+        if(!enabled) { reference=pixels; reference_snapshot_bytes=snapshot_bytes; }
+        else {
+          Check(pixels==reference,"instanced world matrices/state breaks changed rendered pixels");
+          Check(snapshot_bytes<reference_snapshot_bytes,"world reuse did not reduce constant snapshot copies");
+        }
+      }
+      const auto after=backend->Statistics();
+      Check(after.geometry_folded_draws-before.geometry_folded_draws==295 &&
+          after.geometry_instanced_draws-before.geometry_instanced_draws==6,
+          "world instance cap, constant/scissor changes, or explicit fallback boundary failed");
+      Check(after.geometry_world_constant_reuses-before.geometry_world_constant_reuses>=295,
+            "world-only updates failed to reuse shared constants");
+      Check(std::any_of(reference.begin(),reference.end(),[](auto value){return value!=0;}),"world instance reference was empty");
+      for(const auto& message:backend->DrainValidationMessages()) Check(false,"world instance validation: "+message);
+    }
+  }
+}
+
 int main() {
+  try { WorldInstancePackets(); }
+  catch(const std::exception& error) { std::cerr << "world instancing: " << error.what() << "\n"; return 1; }
+  try { ParallelResourceOrdering(); ParallelGeometryPackets(); TransientVerticesDoNotFlush(); }
+  catch(const std::exception& error) { std::cerr << "parallel ordering: " << error.what() << "\n"; return 1; }
   std::cout << std::unitbuf;
   try {
     RegisterNativeD3D11Backend();
     RegisterNativeD3D12Backend();
 
+    RegisterNativeRenderBackend("d3d12-packets-1",[]() -> std::unique_ptr<NativeRenderBackend> {
+      NativeD3D12Options options; options.prefer_warp=true; options.debug_layer=true;
+      options.geometry_workers=1; options.geometry_minimum_draws=1;
+      return CreateNativeD3D12Backend(options);
+    });
+    RegisterNativeRenderBackend("d3d12-packets-4",[]() -> std::unique_ptr<NativeRenderBackend> {
+      NativeD3D12Options options; options.prefer_warp=true; options.debug_layer=true;
+      options.geometry_workers=4; options.geometry_minimum_draws=1;
+      return CreateNativeD3D12Backend(options);
+    });
+    RegisterNativeRenderBackend("d3d12-packets-mixed",[]() -> std::unique_ptr<NativeRenderBackend> {
+      NativeD3D12Options options; options.prefer_warp=true; options.debug_layer=true;
+      options.geometry_workers=4;
+      return CreateNativeD3D12Backend(options);
+    });
     std::map<std::string, Rendered> results;
-    for (const char* name : {"d3d11-warp", "d3d12-warp"}) {
+    for (const char* name : {"d3d11-warp", "d3d12-warp", "d3d12-packets-1", "d3d12-packets-4", "d3d12-packets-mixed"}) {
       const auto backend = CreateNativeRenderBackend(name);
       results.emplace(name, Render(*backend));
       for (const auto& message : results.at(name).validation)
@@ -667,6 +1039,8 @@ int main() {
           {"target1", &rendered.target1},
           {"dynamic-before", &rendered.dynamic_before},
           {"dynamic-after", &rendered.dynamic_after},
+          {"transient-before", &rendered.transient_before},
+          {"transient-after", &rendered.transient_after},
           {"sampled-target", &rendered.sampled_target},
           {"sampled-target-again", &rendered.sampled_target_again},
           {"uploaded", &rendered.uploaded}};
@@ -675,10 +1049,11 @@ int main() {
                                                   &reference.compressed, &reference.blended,
                                                   &reference.depth_tested, &reference.target0,
                                                   &reference.target1, &reference.dynamic_before,
-                                                  &reference.dynamic_after, &reference.sampled_target,
+                                                  &reference.dynamic_after, &reference.transient_before,
+                                                  &reference.transient_after, &reference.sampled_target,
                                                   &reference.sampled_target_again,
                                                   &reference.uploaded};
-      for (size_t index = 0; index < 14; ++index) {
+      for (size_t index = 0; index < 16; ++index) {
         const auto difference = Compare(*references[index], *surfaces[index].second);
         Check(difference.pixels == 0,
               std::string(name) + " differs from d3d11-warp on the " + surfaces[index].first +
@@ -720,6 +1095,12 @@ int main() {
       // already recorded against, this is where it shows.
       Check(Compare(rendered.dynamic_after, rendered.flat).pixels == 0,
             name + ": the draw after the dynamic rewrite did not use the new vertices");
+      // Transient vertices are the dynamic buffer's contract without the
+      // buffer, so the two pairs of targets must be pixel-identical.
+      Check(Compare(rendered.transient_before, rendered.dynamic_before).pixels == 0,
+            name + ": transient vertices drew differently from the dynamic buffer before its rewrite");
+      Check(Compare(rendered.transient_after, rendered.dynamic_after).pixels == 0,
+            name + ": transient vertices drew differently from the dynamic buffer after its rewrite");
       uint32_t before_covered = 0, both_green = 0;
       for (uint32_t y = 0; y < kSize; ++y)
         for (uint32_t x = 0; x < kSize; ++x) {

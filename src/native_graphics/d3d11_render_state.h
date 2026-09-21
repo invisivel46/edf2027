@@ -29,4 +29,5 @@ struct NativeRenderState {
   void Bind(ID3D11DeviceContext& context,const std::array<float,4>& factor) const;
 };
 NativeRenderState CreateNativeRenderState(ID3D11Device& device,const RenderStateWords& words);
+NativeRenderState CreateNativeRenderState(ID3D11Device* device,const RenderStateWords& words);
 }

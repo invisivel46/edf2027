@@ -102,6 +102,15 @@ void TestFrameLogic() {
   CHECK(edf::FramePeriodNanoseconds(-1) == 0);
   CHECK(edf::FramePeriodNanoseconds(60) == 16666666);
   CHECK(edf::FramePeriodNanoseconds(120) == 8333333);
+  using Clock=std::chrono::steady_clock;
+  using namespace std::chrono_literals;
+  const auto epoch=Clock::time_point{};
+  CHECK(edf::NextFrameDeadline(epoch,epoch+2ms,120,false)==epoch+8333333ns);
+  CHECK(edf::NextFrameDeadline(epoch,epoch+20ms,120,false)==epoch+20ms);
+  CHECK(edf::NextFrameDeadline(epoch+20ms,epoch+40ms,120,false)==epoch+40ms);
+  CHECK(edf::NextFrameDeadline(epoch+40ms,epoch+41ms,120,false)==epoch+40ms+8333333ns);
+  CHECK(edf::NextFrameDeadline(epoch,epoch+2ms,60,true)==epoch+2ms);
+  CHECK(edf::NextFrameDeadline(epoch,epoch+2ms,0,false)==epoch+2ms);
 }
 
 void TestGraphicsMapping() {

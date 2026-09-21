@@ -131,15 +131,24 @@ NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options) {
   frames_.resize(options.frames_in_flight);
   for(auto& frame:frames_) {
     frame.allocators.resize(options.recorders);
+    frame.preamble_allocators.resize(options.recorders);
+    for(auto& allocator:frame.preamble_allocators)
+      Require(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),
+              "preamble allocator creation");
     for(auto& allocator:frame.allocators)
       Require(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)),
               "command allocator creation");
   }
   lists_.resize(options.recorders);
+  preambles_.resize(options.recorders);
   for(uint32_t index=0;index<options.recorders;++index) {
     Require(device_->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
                                        frames_.front().allocators[index].Get(),nullptr,
                                        IID_PPV_ARGS(&lists_[index])),"command list creation");
+    Require(device_->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                       frames_.front().preamble_allocators[index].Get(),nullptr,
+                                       IID_PPV_ARGS(&preambles_[index])),"preamble creation");
+    Require(preambles_[index]->Close(),"preamble close");
     // Created open; every frame opens them itself.
     Require(lists_[index]->Close(),"command list close");
   }
@@ -255,6 +264,8 @@ void NativeD3D12Device::BeginFrame() {
   for(uint32_t index=0;index<lists_.size();++index) {
     rings_[index].Retire(completed);
     views_[index]->Retire(completed);
+    Require(frame.preamble_allocators[index]->Reset(),"preamble allocator reset");
+    Require(preambles_[index]->Reset(frame.preamble_allocators[index].Get(),nullptr),"preamble reset");
     Require(frame.allocators[index]->Reset(),"command allocator reset");
     Require(lists_[index]->Reset(frame.allocators[index].Get(),nullptr),"command list reset");
     rings_[index].BeginFrame(next_fence_);
@@ -263,7 +274,7 @@ void NativeD3D12Device::BeginFrame() {
   open_=true;
 }
 
-void NativeD3D12Device::Retire(ComPtr<ID3D12Resource> resource) {
+void NativeD3D12Device::Retire(ComPtr<IUnknown> resource) {
   if(!resource) return;
   // The open frame's value, or the last one signalled when none is open.
   // Either way it is the highest value any submitted or recording work can
@@ -274,8 +285,11 @@ void NativeD3D12Device::Retire(ComPtr<ID3D12Resource> resource) {
 void NativeD3D12Device::EndFrame() {
   if(!open_) throw std::runtime_error("D3D12 has no open frame");
   std::vector<ID3D12CommandList*> lists;
-  lists.reserve(lists_.size());
-  for(auto& list:lists_) {
+  lists.reserve(lists_.size()*2);
+  for(size_t index=0;index<lists_.size();++index) {
+    auto& list=lists_[index];
+    Require(preambles_[index]->Close(),"preamble close");
+    lists.push_back(preambles_[index].Get());
     Require(list->Close(),"command list close");
     lists.push_back(list.Get());
   }

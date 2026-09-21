@@ -39,7 +39,7 @@ int main() {
       D3D11_SDK_VERSION,&device,nullptr,&context)),"device creation");
     // Mesh storage comes from the backend now; adopting this device keeps it
     // usable by the direct D3D11 draws the rest of this test makes.
-    auto backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
+    std::shared_ptr<NativeRenderBackend> backend=AdoptNativeD3D11Backend(*device.Get(),*context.Get());
     Require(bool(backend),"adopted backend");
     Effect effect;
     effect.source = R"(
@@ -447,6 +447,61 @@ Varying VS(float3 position:POSITION0,float2 uv:TEXCOORD0,float3 tangent:TANGENT0
       try { owned_cache.Acquire(*backend,mesh_vs,cache_key,declaration,40,mesh_vertices,indices16,2,first); }
       catch(const std::runtime_error&) { rejected=true; }
       Require(rejected,"declaration token accepted unrelated storage");
+      {
+        NativeMeshCache consecutive;
+        auto& mesh=consecutive.Acquire(*backend,mesh_vs,cache_key,first->bytes(),40,mesh_vertices,indices16,2,first);
+        const auto vertices=mesh.VertexStorage()->SourceSnapshot();
+        const auto indices=mesh.IndexStorage()->SourceSnapshot();
+        auto hit=[&](const auto& key,const NativeDeclaration& identity,uint32_t stride,
+                     std::span<const uint8_t> v,std::span<const uint8_t> i,uint32_t width) {
+          return consecutive.TryAcquireOwned(*backend,mesh_vs,key,identity,stride,v,i,width);
+        };
+        Require(hit(cache_key,*first,40,*vertices,*indices,2)==&mesh,"owned mesh hit missed identical sources");
+        Require(consecutive.owned_hits()==1 && consecutive.hits()==1,"owned mesh hit accounting");
+        auto other_key=cache_key; ++other_key[0];
+        const auto other_declaration=NativeDeclaration::Create(first->bytes());
+        Require(!hit(other_key,*first,40,*vertices,*indices,2),"owned hit reused another resource");
+        Require(!hit(cache_key,*other_declaration,40,*vertices,*indices,2),"owned hit reused replaced declaration");
+        Require(!hit(cache_key,*first,44,*vertices,*indices,2),"owned hit ignored stride change");
+        Require(!hit(cache_key,*first,40,*vertices,*indices,4),"owned hit ignored index width");
+        Require(!hit(cache_key,*first,40,mesh_vertices,*indices,2),"owned hit accepted unowned vertex bytes");
+        Require(!hit(cache_key,*first,40,*vertices,indices16,2),"owned hit accepted unowned index bytes");
+        Require(!hit(cache_key,*first,40,std::span<const uint8_t>(*vertices).subspan(4),*indices,2),
+          "owned hit ignored source offset/extent");
+        submit=[&] { hit(cache_key,*first,40,*vertices,*indices,2)->Draw(*context.Get(),0,6,-1); }; verify(false);
+        const auto& prepared=mesh.PrepareDraw(0,6,-1);
+        Require(mesh.FindPreparedDraw(0,6,-1)==&prepared && !mesh.FindPreparedDraw(0,6,0) &&
+          !mesh.FindPreparedDraw(3,3,-1),"prepared draw ignored range/base identity");
+        bool invalid_preparation=false;
+        try { mesh.PrepareDraw(0,6,-100); } catch(const std::runtime_error&) { invalid_preparation=true; }
+        Require(invalid_preparation && mesh.FindPreparedDraw(0,6,-1)==&prepared,
+          "invalid range was prepared or displaced valid preparation");
+        submit=[&] { backend->BeginFrame(); prepared.Draw(backend->Recorder()); backend->Submit(); }; verify(false);
+        const auto retained=mesh.RetainDraw(backend,0,6,-1);
+        const auto retained_layout=mesh.input_layout().fingerprint();
+        bool invalid_retention=false;
+        try { mesh.RetainDraw(backend,0,6,-100); } catch(const std::runtime_error&) { invalid_retention=true; }
+        Require(invalid_retention,"scene geometry retained an invalid range");
+        invalid_retention=false;
+        try { mesh.RetainDraw({},0,6,-1); } catch(const std::runtime_error&) { invalid_retention=true; }
+        Require(invalid_retention,"scene geometry omitted backend ownership");
+        consecutive.Invalidate(cache_key[0]);
+        Require(!hit(cache_key,*first,40,*vertices,*indices,2),"owned hit survived resource invalidation");
+        consecutive.Clear();
+        Require(!hit(cache_key,*first,40,*vertices,*indices,2),"owned hit survived clear");
+        Require(retained.input_layout().fingerprint()==retained_layout,
+          "retained scene layout borrowed destroyed mesh semantics");
+        submit=[&] { backend->BeginFrame(); retained.Draw(backend->Recorder()); backend->Submit(); }; verify(false);
+        // Reusing the guest resource identity must not replace an old scene's GPU generation.
+        auto replacement_vertices=mesh_vertices;
+        std::fill(replacement_vertices.begin(),replacement_vertices.end(),0);
+        consecutive.Acquire(*backend,mesh_vs,cache_key,first->bytes(),40,replacement_vertices,indices16,2,first);
+        verify(false);
+        NativeIndexedMesh dynamic(*backend,mesh_vs,first->bytes(),40,mesh_vertices,indices16,2,true);
+        invalid_retention=false;
+        try { dynamic.RetainDraw(backend,0,6,-1); } catch(const std::runtime_error&) { invalid_retention=true; }
+        Require(invalid_retention,"scene geometry retained mutable vertex storage");
+      }
       rejected=false;
       try { declarations.Publish(103,std::span<const uint8_t>{declaration}.first(1)); }
       catch(const std::runtime_error&) { rejected=true; }

@@ -1,5 +1,6 @@
 #include "native_d3d12_preview.h"
 #include "guest_shader_bridge.h"
+#include "native_backend_frame.h"
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wrl/client.h>
@@ -156,6 +157,14 @@ void NativeD3D12Preview::Draw(const uint8_t* pixels,uint32_t width,uint32_t heig
 void NativeD3D12Preview::Composite(NativeBackendTexture& frame,uint32_t width,uint32_t height) {
   auto* back=backend_->BackBuffer();
   if(!back) return;
+  if(source_generation_) {
+    if(!compositor_) compositor_=std::make_unique<NativeBackendCompositor>(*backend_);
+    backend_->BeginFrame();
+    compositor_->Draw(backend_->Recorder(),frame,*back,true,gamma_?&*gamma_:nullptr);
+    backend_->Submit(); backend_->Present(false);
+    presented_.fetch_add(1,std::memory_order_relaxed);
+    return;
+  }
   NativeBackendRenderTarget* colors[]={back};
 
   // Letterbox rather than stretch, matching the D3D11 compositor: a preview
@@ -185,6 +194,36 @@ void NativeD3D12Preview::Composite(NativeBackendTexture& frame,uint32_t width,ui
 }
 
 bool NativeD3D12Preview::DrawShared() {
+  if(backend_->name()=="d3d12") {
+    VisitNativeBackendFrameMirror(last_sequence_,[&](const NativeBackendPublishedFrame& source) {
+      NativeBackendTextureDesc desc{}; desc.width=source.width; desc.height=source.height; desc.format=source.format;
+      if(source_generation_!=source.generation) {
+        shared_frame_=backend_->OpenSharedTexture(source.texture,desc);
+        frame_=backend_->CreateTexture(desc,{});
+        if(!shared_frame_) throw std::runtime_error("D3D12 preview scene import failed");
+        source_generation_=source.generation; frame_width_=source.width; frame_height_=source.height;
+      }
+      if(!copied_) {
+        desc.width=desc.height=1; copied_=backend_->CreateSharedSurface(desc);
+        if(!copied_) throw std::runtime_error("D3D12 preview copy fence creation failed");
+      }
+      if(!backend_->WaitSharedFence(source.fence,source.value))
+        throw std::runtime_error("D3D12 preview scene fence import failed");
+      backend_->BeginFrame();
+      backend_->Recorder().CopyTexture(*frame_,*shared_frame_);
+      backend_->Recorder().ReleaseSharedTexture(*shared_frame_);
+      backend_->Submit(); backend_->SignalShared(*copied_);
+      last_sequence_=source.sequence; gamma_=source.gamma;
+      return NativeBackendFrameCopied{copied_->fence_handle(),copied_->value(),backend_->MarkCompletion()};
+    });
+    if(source_generation_) {
+      Composite(*frame_,frame_width_,frame_height_);
+      if(presented_.load(std::memory_order_relaxed)%120==1)
+        REXLOG_INFO("D3D12 preview: owned GPU snapshot, gamma applied; frame={}x{}, sequence={}",
+          frame_width_,frame_height_,last_sequence_);
+      return true;
+    }
+  }
   if(shared_refused_) return false;
   NativeFrameHandoff::SharedFrame shared;
   uint64_t sequence=0;

@@ -1,4 +1,5 @@
 #pragma once
+#include <mutex>
 #include "native_upload_ring.h"
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -127,6 +128,7 @@ class NativeD3D12SamplerCache {
     uint32_t index=0;      // First slot, so an evicted table's slots can be reused.
     uint64_t used=0;       // Frame this was last handed out for.
   };
+  std::mutex mutex_;
   std::map<std::string,Entry> tables_;
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_start_{};
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_start_{};

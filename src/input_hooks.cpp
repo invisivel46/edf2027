@@ -129,8 +129,8 @@ REX_HOOK_RAW(sub_820A6B10) {
 }
 
 // ---- frame pacer + frame-time statistics on the game's VdSwap wrapper ----
-// The game itself waits on the guest vblank (video_mode_refresh_rate), so the pacer only matters for caps
-// below the refresh rate or when vsync is off. Sleep to ~1.5 ms before the deadline, then spin.
+// Independent rendering cap. Sleep until the configurable final spin interval;
+// frames already over budget must not receive another full period of delay.
 REXCVAR_DECLARE(int32_t, edf_fps_cap);
 REXCVAR_DECLARE(bool, edf_frametime_log);
 namespace edf {
@@ -157,10 +157,8 @@ REX_HOOK_RAW(sub_82151460) {
   else __imp__sub_82151460(ctx, base);
   int cap = REXCVAR_GET(edf_fps_cap);
   if (cap > 0) {
-    auto period = std::chrono::nanoseconds(edf::FramePeriodNanoseconds(cap));
     auto now = clock::now();
-    if (cap != previous_cap || next_frame < now - period) next_frame = now;
-    next_frame += period;
+    next_frame = edf::NextFrameDeadline(next_frame,now,cap,cap!=previous_cap);
     const auto spin = std::chrono::microseconds(REXCVAR_GET(edf_frame_pacer_spin_us));
     auto sleep_until = next_frame - spin;
     if (sleep_until > now) std::this_thread::sleep_until(sleep_until);

@@ -30,6 +30,8 @@ class ShaderBindings {
   };
   FloatRegisterBinding ResolveFloatRegisters(const std::string& name) const;
   class ResourceBinding {
+   public:
+    bool used() const { return texture_.has_value() || sampler_.has_value(); }
    private:
     friend class ShaderBindings;
     std::shared_ptr<const uint8_t> owner_;
@@ -41,11 +43,13 @@ class ShaderBindings {
   // material still has it bound - which the ComPtr this replaces also handled,
   // and a raw pointer would not. Samplers are owned by the backend for its
   // whole life, so those stay raw.
-  bool TrySetTexture(const ResourceBinding& binding,std::shared_ptr<NativeBackendTexture> texture);
+  bool TrySetTexture(const ResourceBinding& binding,const std::shared_ptr<NativeBackendTexture>& texture);
   bool TrySetSampler(const ResourceBinding& binding,NativeBackendSampler* sampler);
   bool Owns(const FloatRegisterBinding& binding) const { return binding.owner_==generation_; }
   bool SetGuestFloatRegisters(const FloatRegisterBinding& binding,std::span<const uint8_t> registers);
   ShaderBindings(ID3D11Device& device, NativeShader shader);
+  // Null device retains CPU binding images for a backend recorder only.
+  ShaderBindings(ID3D11Device* device, NativeShader shader);
   ShaderBindings(const ShaderBindings&)=delete;
   ShaderBindings& operator=(const ShaderBindings&)=delete;
   void SetConstant(const std::string& name, std::span<const uint8_t> packed_bytes);
@@ -59,8 +63,12 @@ class ShaderBindings {
                                std::span<const uint8_t> registers);
   size_t GuestFloatRegisterBytes(const std::string& name) const;
   void SetTexture(const std::string& name, std::shared_ptr<NativeBackendTexture> texture);
-  bool TrySetTexture(const std::string& name, std::shared_ptr<NativeBackendTexture> texture);
+  bool TrySetTexture(const std::string& name, const std::shared_ptr<NativeBackendTexture>& texture);
   void ClearTextures();
+  // Replace a material's resource set without clearing unchanged bindings.
+  // End removes slots not supplied since Begin. On failure clear both sets.
+  void BeginResourceUpdate();
+  void EndResourceUpdate();
   // Diagnostic snapshot of the current named binding; changes no state.
   NativeBackendTexture* ReadTexture(const std::string& name) const;
   NativeBackendSampler* ReadSampler(const std::string& name) const;
@@ -84,15 +92,34 @@ class ShaderBindings {
   // per activation, so draws cannot be built independently or recorded from
   // more than one thread. A caller that copies these bytes per draw instead
   // has no such dependency, and it is the shape both target APIs want anyway.
-  struct ConstantImage { UINT slot; std::span<const uint8_t> bytes; };
-  std::vector<ConstantImage> ConstantImages() const;
+  //
+  // `version` counts this buffer's changes, from a counter shared by every
+  // binding object, so (owner, version) names one exact image: a recorder
+  // that sent it can tell whether the draw after needs it again without
+  // comparing the bytes.
+  struct ConstantImage { UINT slot; std::span<const uint8_t> bytes; const uint64_t* version; };
+  std::span<const ConstantImage> ConstantImages() const { return constant_images_; }
+  // Changes whenever any constant buffer changes, including mirrored updates.
+  uint64_t constant_generation() const { return constant_generation_; }
   // What a recorder has to be told to bind, slot by slot, including the empty
   // slots: leaving one unset inherits the previous material's resource, which
   // is a wrong texture rather than a missing one.
   struct TextureImage { UINT slot; NativeBackendTexture* texture; };
   struct SamplerImage { UINT slot; NativeBackendSampler* sampler; };
-  std::vector<TextureImage> TextureImages() const;
-  std::vector<SamplerImage> SamplerImages() const;
+  // Rebuilt only when the resources change; asked for per draw.
+  const std::vector<TextureImage>& TextureImages() const;
+  // Retain the exact bound generation for a persistent native material.
+  std::shared_ptr<NativeBackendTexture> RetainTexture(UINT slot) const;
+  const std::vector<SamplerImage>& SamplerImages() const;
+  // Whether `other` reflects the same constant buffers, slot for slot and
+  // variable for variable, so its bytes can stand in for this object's.
+  bool SharesConstantLayout(const ShaderBindings& other) const;
+  // Copy `source`'s constant bytes into this object's buffers, those that have
+  // changed since the last copy. The reversed-depth variant of a shader is a
+  // second compilation of the same source and reflects the same buffers, and
+  // the scene draws only one variant; uploading every material into both, and
+  // patching every instance into both, was half of the activation cost.
+  void MirrorConstantsFrom(const ShaderBindings& source);
   // Bumped by every texture and sampler change. A caller that re-sent this
   // material's resources last draw can skip them this draw only if this has
   // not moved; comparing the object's address would not catch an activation
@@ -123,15 +150,33 @@ class ShaderBindings {
     std::vector<uint8_t> bytes;
     Microsoft::WRL::ComPtr<ID3D11Buffer> gpu;
     bool dirty = true;
+    uint64_t version = 0;
   };
+  // Every change to a buffer's bytes goes through here: dirty for the D3D11
+  // upload, a fresh version for everyone else.
+  void Touch(Buffer& buffer);
+  uint64_t constant_generation_=0;
   const std::shared_ptr<const uint8_t> generation_=std::make_shared<const uint8_t>(0);
   NativeShader shader_;
   std::vector<Buffer> buffers_;
+  // Buffer extents are immutable after reflection; bytes are updated in place.
+  std::vector<ConstantImage> constant_images_;
   std::map<std::string, Variable> variables_;
   std::map<std::string, UINT> textures_, samplers_;
   std::map<UINT, std::shared_ptr<NativeBackendTexture>> texture_values_;
   std::map<UINT, NativeBackendSampler*> sampler_values_;
+  // Reflected map nodes never move or get erased. Direct slot access avoids
+  // tree lookups during activation while the maps retain ownership/iteration.
+  std::array<std::shared_ptr<NativeBackendTexture>*,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> texture_values_by_slot_{};
+  std::array<NativeBackendSampler**,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> sampler_values_by_slot_{};
   uint64_t resource_generation_=1;
+  mutable std::vector<TextureImage> texture_images_;
+  mutable std::vector<SamplerImage> sampler_images_;
+  mutable uint64_t images_generation_=0;
+  // Per buffer, the source version MirrorConstantsFrom last copied.
+  std::vector<uint64_t> mirrored_versions_;
+  std::array<bool,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> texture_seen_{};
+  std::array<bool,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT> sampler_seen_{};
   // Immutable reflected runs, with live pointers backed by the owning maps.
   // These cache binding data, never D3D context state: Bind always re-emits it.
   std::vector<std::pair<UINT,UINT>> texture_runs_,sampler_runs_;

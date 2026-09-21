@@ -1,11 +1,14 @@
 #include "d3d12_backend.h"
 #include "d3d12_pipeline.h"
+#include "native_parallel_recorder.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -33,14 +36,14 @@ struct TrackedResource {
   TrackedResource()=default;
   explicit TrackedResource(NativeD3D12Device& retire_to):retire_to_(&retire_to) {}
   TrackedResource(TrackedResource&& other) noexcept
-      : resource(std::move(other.resource)),state(other.state),retire_to_(other.retire_to_) {
+      : resource(std::move(other.resource)),state(std::move(other.state)),retire_to_(other.retire_to_) {
     other.retire_to_=nullptr;
   }
   TrackedResource& operator=(TrackedResource&& other) noexcept {
     if(this==&other) return *this;
     Release();
     resource=std::move(other.resource);
-    state=other.state;
+    state=std::move(other.state);
     retire_to_=other.retire_to_;
     other.retire_to_=nullptr;
     return *this;
@@ -49,8 +52,12 @@ struct TrackedResource {
   TrackedResource& operator=(const TrackedResource&)=delete;
   ~TrackedResource() { Release(); }
 
+  void NotifyDestroyed(const void* object) const {
+    if(retire_to_ && retire_to_->before_resource_destroy) retire_to_->before_resource_destroy(object);
+  }
   ComPtr<ID3D12Resource> resource;
-  D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COMMON;
+  std::shared_ptr<D3D12_RESOURCE_STATES> state=
+    std::make_shared<D3D12_RESOURCE_STATES>(D3D12_RESOURCE_STATE_COMMON);
 
  private:
   void Release() {
@@ -64,6 +71,7 @@ class D3D12Buffer final : public NativeBackendBuffer {
  public:
   D3D12Buffer(TrackedResource tracked, size_t bytes, bool dynamic)
       : tracked_(std::move(tracked)),bytes_(bytes),dynamic_(dynamic) {}
+  ~D3D12Buffer() override { tracked_.NotifyDestroyed(this); }
   size_t bytes() const override { return bytes_; }
   bool dynamic() const { return dynamic_; }
   // A token that expires with this object, so a staged upload can tell whether
@@ -90,7 +98,7 @@ class D3D12Texture final : public NativeBackendTexture {
   D3D12Texture(TrackedResource tracked, uint32_t width, uint32_t height,
                D3D12_CPU_DESCRIPTOR_HANDLE view, NativeD3D12CpuDescriptorHeap& heap)
       : D3D12Texture(std::make_shared<TrackedResource>(std::move(tracked)),width,height,view,heap) {}
-  ~D3D12Texture() override { if(heap_) heap_->Free(view_); }
+  ~D3D12Texture() override { tracked_->NotifyDestroyed(this); if(heap_) heap_->Free(view_); }
   uint32_t width() const override { return width_; }
   uint32_t height() const override { return height_; }
   TrackedResource& tracked() { return *tracked_; }
@@ -116,7 +124,7 @@ class D3D12RenderTarget final : public NativeBackendRenderTarget {
                     D3D12_CPU_DESCRIPTOR_HANDLE view, NativeD3D12CpuDescriptorHeap& heap)
       : D3D12RenderTarget(std::make_shared<TrackedResource>(std::move(tracked)),width,height,depth,
                           view,heap) {}
-  ~D3D12RenderTarget() override { if(heap_) heap_->Free(view_); }
+  ~D3D12RenderTarget() override { tracked_->NotifyDestroyed(this); if(heap_) heap_->Free(view_); }
   uint32_t width() const override { return width_; }
   uint32_t height() const override { return height_; }
   NativeBackendTexture* texture() override { return sampled_.get(); }
@@ -172,7 +180,7 @@ class D3D12Pipeline final : public NativeBackendPipeline {
         replicate_blend_alpha_(replicate_blend_alpha) {}
   ID3D12PipelineState& state() const { return *state_; }
   D3D12_PRIMITIVE_TOPOLOGY topology() const { return topology_; }
-  bool requires_blend_factor() const { return requires_blend_factor_; }
+  bool requires_blend_factor() const override { return requires_blend_factor_; }
   bool replicate_blend_alpha() const { return replicate_blend_alpha_; }
  private:
   ID3D12PipelineState* state_;
@@ -208,14 +216,18 @@ class D3D12Sampler final : public NativeBackendSampler {
 // why the query remembers a fence value rather than a flag.
 class D3D12Query final : public NativeBackendQuery {
  public:
-  D3D12Query(ComPtr<ID3D12QueryHeap> heap, ComPtr<ID3D12Resource> readback, NativeBackendQueryKind kind)
-      : heap_(std::move(heap)),readback_(std::move(readback)),kind_(kind) {}
+  D3D12Query(NativeD3D12Device& gpu,ComPtr<ID3D12QueryHeap> heap, ComPtr<ID3D12Resource> readback, NativeBackendQueryKind kind)
+      : gpu_(&gpu),heap_(std::move(heap)),readback_(std::move(readback)),kind_(kind) {}
+  ~D3D12Query() override { gpu_->Retire(std::move(heap_)); gpu_->Retire(std::move(readback_)); }
+  D3D12_QUERY_TYPE type() const { return kind_==NativeBackendQueryKind::Timestamp?
+    D3D12_QUERY_TYPE_TIMESTAMP:D3D12_QUERY_TYPE_OCCLUSION; }
   ID3D12QueryHeap* heap() const { return heap_.Get(); }
   ID3D12Resource* readback() const { return readback_.Get(); }
   NativeBackendQueryKind kind() const { return kind_; }
   void Resolved(uint64_t fence) { fence_=fence; }
   uint64_t fence() const { return fence_; }
  private:
+  NativeD3D12Device* gpu_;
   ComPtr<ID3D12QueryHeap> heap_;
   ComPtr<ID3D12Resource> readback_;
   NativeBackendQueryKind kind_;
@@ -290,23 +302,40 @@ class D3D12Recorder final : public NativeBackendRecorder {
     commands_->SetGraphicsRootSignature(signature_);
     bound_={};
     stack_.clear();
+    transitions_.clear();
   }
-  void End() { commands_=nullptr; }
+  void End() { commands_=nullptr; transitions_.clear(); }
 
-  // Transitions a resource only when it is not already in the state wanted.
-  // The redundant-barrier case is not merely wasteful: the debug layer reports
-  // a transition whose before state is wrong, and emitting one unconditionally
-  // would make every such report a false alarm.
+  // First-use transitions are resolved on the submitting thread in command-list
+  // order. Workers never read or mutate the resource's global state. Later uses
+  // within this list have a known local predecessor and can record barriers now.
   void Transition(TrackedResource& tracked, D3D12_RESOURCE_STATES wanted) {
-    if(tracked.state==wanted) return;
+    auto found=transitions_.find(tracked.state.get());
+    if(found==transitions_.end()) {
+      transitions_.emplace(tracked.state.get(),TransitionState{tracked.resource,tracked.state,wanted,wanted});
+      return;
+    }
+    if(found->second.last==wanted) return;
+    Barrier(Commands(),tracked.resource.Get(),found->second.last,wanted);
+    found->second.last=wanted;
+  }
+  void ResolveTransitions() {
+    auto& before=*gpu_->preamble(index_);
+    for(auto& [key,transition]:transitions_) {
+      if(*transition.global!=transition.first)
+        Barrier(before,transition.resource.Get(),*transition.global,transition.first);
+      *transition.global=transition.last;
+    }
+  }
+  static void Barrier(ID3D12GraphicsCommandList& commands,ID3D12Resource* resource,
+                      D3D12_RESOURCE_STATES before,D3D12_RESOURCE_STATES after) {
     D3D12_RESOURCE_BARRIER barrier{};
     barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource=tracked.resource.Get();
+    barrier.Transition.pResource=resource;
     barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore=tracked.state;
-    barrier.Transition.StateAfter=wanted;
-    Commands().ResourceBarrier(1,&barrier);
-    tracked.state=wanted;
+    barrier.Transition.StateBefore=before;
+    barrier.Transition.StateAfter=after;
+    commands.ResourceBarrier(1,&barrier);
   }
 
   void SetPipeline(NativeBackendPipeline& pipeline) override {
@@ -330,6 +359,16 @@ class D3D12Recorder final : public NativeBackendRecorder {
                                        format==NativeBackendIndexFormat::Uint16?DXGI_FORMAT_R16_UINT
                                                                                :DXGI_FORMAT_R32_UINT};
     Commands().IASetIndexBuffer(&view);
+  }
+  void SetTransientVertices(uint32_t slot, std::span<const uint8_t> bytes, uint32_t stride) override {
+    if(bytes.empty()) throw std::runtime_error("transient vertices need at least one byte");
+    // The upload ring is an upload heap, which is always readable as a vertex
+    // buffer: a copy and a view, no resource and no transition. The same
+    // fenced slice SetConstants uses, retired when the frame completes.
+    const auto upload=gpu_->Allocate(bytes.size(),16,index_);
+    std::memcpy(upload.cpu,bytes.data(),bytes.size());
+    const D3D12_VERTEX_BUFFER_VIEW view{upload.gpu,static_cast<UINT>(bytes.size()),stride};
+    Commands().IASetVertexBuffers(slot,1,&view);
   }
   void SetTopology(NativeBackendTopology topology) override {
     Commands().IASetPrimitiveTopology(Topology(topology));
@@ -401,12 +440,13 @@ class D3D12Recorder final : public NativeBackendRecorder {
     const D3D12_RECT rect{static_cast<LONG>(viewport.x),static_cast<LONG>(viewport.y),
                           static_cast<LONG>(viewport.x+viewport.width),
                           static_cast<LONG>(viewport.y+viewport.height)};
-    Commands().RSSetScissorRects(1,&rect);
+    bound_.viewport_scissor=rect;
+    Commands().RSSetScissorRects(1,bound_.scissor_enabled?&bound_.scissor:&bound_.viewport_scissor);
   }
   void SetScissor(const NativeBackendScissor& scissor, bool enabled) override {
-    if(!enabled) return;  // The viewport-sized rectangle set above stands.
-    const D3D12_RECT rect{scissor.left,scissor.top,scissor.right,scissor.bottom};
-    Commands().RSSetScissorRects(1,&rect);
+    bound_.scissor_enabled=enabled;
+    bound_.scissor={scissor.left,scissor.top,scissor.right,scissor.bottom};
+    Commands().RSSetScissorRects(1,enabled?&bound_.scissor:&bound_.viewport_scissor);
   }
 
   void ClearColor(NativeBackendRenderTarget& target, const std::array<float,4>& color) override {
@@ -451,6 +491,9 @@ class D3D12Recorder final : public NativeBackendRecorder {
     Transition(to.tracked(),D3D12_RESOURCE_STATE_COPY_DEST);
     Transition(from.tracked(),D3D12_RESOURCE_STATE_COPY_SOURCE);
     Commands().CopyResource(to.tracked().resource.Get(),from.tracked().resource.Get());
+  }
+  void ReleaseSharedTexture(NativeBackendTexture& texture) override {
+    Transition(static_cast<D3D12Texture&>(texture).tracked(),D3D12_RESOURCE_STATE_COMMON);
   }
   void ResolveTarget(NativeBackendTexture& destination, NativeBackendRenderTarget& source) override {
     auto& to=static_cast<D3D12Texture&>(destination);
@@ -539,15 +582,17 @@ class D3D12Recorder final : public NativeBackendRecorder {
 
   void BeginQuery(NativeBackendQuery& query) override {
     auto& concrete=static_cast<D3D12Query&>(query);
-    Commands().BeginQuery(concrete.heap(),D3D12_QUERY_TYPE_OCCLUSION,0);
+    if(concrete.kind()!=NativeBackendQueryKind::Occlusion)
+      throw std::runtime_error("timestamp queries are recorded with EndQuery only");
+    Commands().BeginQuery(concrete.heap(),concrete.type(),0);
   }
   void EndQuery(NativeBackendQuery& query) override {
     auto& concrete=static_cast<D3D12Query&>(query);
-    Commands().EndQuery(concrete.heap(),D3D12_QUERY_TYPE_OCCLUSION,0);
+    Commands().EndQuery(concrete.heap(),concrete.type(),0);
     // Resolved straight away rather than on a later frame: the result is only
     // readable out of a buffer, and deferring the resolve would mean tracking
     // which frame each unresolved query belonged to.
-    Commands().ResolveQueryData(concrete.heap(),D3D12_QUERY_TYPE_OCCLUSION,0,1,
+    Commands().ResolveQueryData(concrete.heap(),concrete.type(),0,1,
                                 concrete.readback(),0);
     concrete.Resolved(gpu_->pending_fence());
   }
@@ -695,6 +740,8 @@ class D3D12Recorder final : public NativeBackendRecorder {
     BoundTexture textures[NativeD3D12RootLayout::kPixelTextures]{};
     D3D12Sampler* samplers[NativeD3D12RootLayout::kPixelSamplers]{};
     uint32_t render_targets=0;
+    D3D12_RECT viewport_scissor{},scissor{};
+    bool scissor_enabled=false;
     bool textures_dirty=false,samplers_dirty=false,blend_factor_set=false;
   };
 
@@ -710,11 +757,30 @@ class D3D12Recorder final : public NativeBackendRecorder {
   ID3D12RootSignature* signature_;
   uint32_t index_=0;
   ID3D12GraphicsCommandList* commands_=nullptr;
+  struct TransitionState {
+    ComPtr<ID3D12Resource> resource;
+    std::shared_ptr<D3D12_RESOURCE_STATES> global;
+    D3D12_RESOURCE_STATES first,last;
+  };
+  std::unordered_map<D3D12_RESOURCE_STATES*,TransitionState> transitions_;
   Bound bound_;
   std::vector<Bound> stack_;
 
  public:
   D3D12_CPU_DESCRIPTOR_HANDLE null_texture_view_{};
+};
+
+class D3D12Completion final : public NativeBackendCompletion {
+ public:
+  D3D12Completion(ComPtr<ID3D12Fence> fence,uint64_t value) : fence_(std::move(fence)),value_(value) {}
+  bool Complete() const override {
+    const auto completed=fence_->GetCompletedValue();
+    if(completed==UINT64_MAX) throw std::runtime_error("D3D12 completion fence device removed");
+    return completed>=value_;
+  }
+ private:
+  ComPtr<ID3D12Fence> fence_;
+  uint64_t value_;
 };
 
 class D3D12Backend final : public NativeRenderBackend {
@@ -738,6 +804,17 @@ class D3D12Backend final : public NativeRenderBackend {
     null.Texture2D.MipLevels=1;
     gpu_.device()->CreateShaderResourceView(nullptr,&null,null_texture_);
     for(auto& recorder:recorders_) recorder->null_texture_view_=null_texture_;
+    if(options.geometry_workers) {
+      std::vector<NativeBackendRecorder*> workers;
+      for(auto& recorder:recorders_) workers.push_back(recorder.get());
+      parallel_=std::make_unique<NativeParallelRecorder>(std::move(workers),[this](bool reopen) {
+        SubmitRecorded(); if(reopen) BeginRecorded();
+      },options.geometry_minimum_draws);
+      gpu_.before_resource_destroy=[this](const void* resource) {
+        try { if(!parallel_failure_) parallel_->Forget(resource); }
+        catch(...) { parallel_failure_=std::current_exception(); }
+      };
+    }
   }
 
   void ReleaseFrameLatency() {
@@ -746,7 +823,11 @@ class D3D12Backend final : public NativeRenderBackend {
     frame_latency_=nullptr;
   }
   ~D3D12Backend() override {
+    gpu_.before_resource_destroy={};
+    if(open_) { try { Submit(); } catch(...) {} }
+    parallel_.reset();
     ReleaseFrameLatency();
+    if(shared_fence_handle_) CloseHandle(shared_fence_handle_);
     // The swap chain and its buffers are released before this object's own
     // device member is destroyed, so nothing here waits for the GPU on our
     // behalf. Presenting work may still be in flight, and releasing a back
@@ -760,21 +841,22 @@ class D3D12Backend final : public NativeRenderBackend {
                                                     std::span<const uint8_t> initial) override {
     if(!desc.bytes) throw std::runtime_error("a zero-byte buffer cannot be created");
     TrackedResource tracked(gpu_);
-    tracked.state=D3D12_RESOURCE_STATE_COMMON;
+    *tracked.state=D3D12_RESOURCE_STATE_COMMON;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN,0,0};
     const D3D12_RESOURCE_DESC description{D3D12_RESOURCE_DIMENSION_BUFFER,0,desc.bytes,1,1,1,
                                           DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
                                           D3D12_RESOURCE_FLAG_NONE};
     Require(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
-                                                   tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
+                                                   *tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
             "buffer creation");
     auto buffer=std::make_unique<D3D12Buffer>(std::move(tracked),desc.bytes,desc.dynamic);
     if(!initial.empty()) {
       if(initial.size()>desc.bytes)
         throw std::runtime_error("initial buffer contents are larger than the buffer");
-      pending_.push_back({buffer->alive(),buffer.get(),
-                          std::vector<uint8_t>(initial.begin(),initial.end())});
+      if(open_) recorders_.front()->UpdateBuffer(*buffer,0,initial);
+      else pending_.push_back({buffer->alive(),buffer.get(),
+                                std::vector<uint8_t>(initial.begin(),initial.end())});
     }
     return buffer;
   }
@@ -793,7 +875,7 @@ class D3D12Backend final : public NativeRenderBackend {
   std::unique_ptr<NativeBackendTexture> CreateTexture(const NativeBackendTextureDesc& desc,
                                                       std::span<const uint8_t> initial) override {
     TrackedResource tracked(gpu_);
-    tracked.state=D3D12_RESOURCE_STATE_COMMON;
+    *tracked.state=D3D12_RESOURCE_STATE_COMMON;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN,0,0};
     D3D12_RESOURCE_DESC description{};
@@ -805,7 +887,7 @@ class D3D12Backend final : public NativeRenderBackend {
     description.Format=static_cast<DXGI_FORMAT>(desc.format);
     description.SampleDesc={1,0};
     RequireDevice(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
-                                                        tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
+                                                        *tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
                   "texture creation");
     const auto view=texture_views_.Allocate();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -827,9 +909,11 @@ class D3D12Backend final : public NativeRenderBackend {
                                                 texture_views_);
     // Staged on the next frame that opens, like buffer contents: there is no
     // command list to copy with until then.
-    if(!initial.empty())
-      pending_textures_.push_back({texture->alive(),texture.get(),
-                                   std::vector<uint8_t>(initial.begin(),initial.end())});
+    if(!initial.empty()) {
+      std::vector<uint8_t> bytes(initial.begin(),initial.end());
+      if(open_) UploadTexture(*texture,bytes);
+      else pending_textures_.push_back({texture->alive(),texture.get(),std::move(bytes)});
+    }
     return texture;
   }
 
@@ -859,14 +943,14 @@ class D3D12Backend final : public NativeRenderBackend {
     description.SampleDesc={desc.samples?desc.samples:1,0};
     description.Flags=desc.depth?D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
                                 :D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-    tracked.state=desc.depth?D3D12_RESOURCE_STATE_DEPTH_WRITE:D3D12_RESOURCE_STATE_RENDER_TARGET;
+    *tracked.state=desc.depth?D3D12_RESOURCE_STATE_DEPTH_WRITE:D3D12_RESOURCE_STATE_RENDER_TARGET;
     // A clear value must be declared up front or every clear is a slow path,
     // and it must match what is actually cleared or validation complains.
     D3D12_CLEAR_VALUE clear{};
     clear.Format=description.Format;
     if(desc.depth) clear.DepthStencil={1.0f,0};
     Require(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
-                                                   tracked.state,&clear,IID_PPV_ARGS(&tracked.resource)),
+                                                   *tracked.state,&clear,IID_PPV_ARGS(&tracked.resource)),
             "render target creation");
     auto shared=std::make_shared<TrackedResource>(std::move(tracked));
     auto& pool=desc.depth?depth_views_:render_target_views_;
@@ -901,9 +985,10 @@ class D3D12Backend final : public NativeRenderBackend {
   }
 
   std::unique_ptr<NativeBackendQuery> CreateQuery(NativeBackendQueryKind kind) override {
-    if(kind!=NativeBackendQueryKind::Occlusion)
-      throw std::runtime_error("only occlusion queries are implemented in the D3D12 backend");
-    const D3D12_QUERY_HEAP_DESC desc{D3D12_QUERY_HEAP_TYPE_OCCLUSION,1,0};
+    if(kind!=NativeBackendQueryKind::Occlusion && kind!=NativeBackendQueryKind::Timestamp)
+      throw std::runtime_error("D3D12 timestamp domains use the command queue frequency");
+    const D3D12_QUERY_HEAP_DESC desc{kind==NativeBackendQueryKind::Timestamp?
+      D3D12_QUERY_HEAP_TYPE_TIMESTAMP:D3D12_QUERY_HEAP_TYPE_OCCLUSION,1,0};
     ComPtr<ID3D12QueryHeap> heap;
     Require(gpu_.device()->CreateQueryHeap(&desc,IID_PPV_ARGS(&heap)),"query heap creation");
     // Its own readback buffer, created in COPY_DEST because that is the state
@@ -917,13 +1002,18 @@ class D3D12Backend final : public NativeRenderBackend {
     Require(gpu_.device()->CreateCommittedResource(&readback_heap,D3D12_HEAP_FLAG_NONE,&readback_desc,
                                                    D3D12_RESOURCE_STATE_COPY_DEST,nullptr,
                                                    IID_PPV_ARGS(&readback)),"query readback creation");
-    return std::make_unique<D3D12Query>(std::move(heap),std::move(readback),kind);
+    return std::make_unique<D3D12Query>(gpu_,std::move(heap),std::move(readback),kind);
   }
 
+  uint64_t TimestampFrequency() const override {
+    UINT64 frequency=0;
+    Require(gpu_.queue()->GetTimestampFrequency(&frequency),"timestamp frequency query");
+    return frequency;
+  }
   bool ReadQuery(NativeBackendQuery& query, std::span<uint8_t> result) override {
     auto& concrete=static_cast<D3D12Query&>(query);
     if(result.size()<sizeof(uint64_t))
-      throw std::runtime_error("an occlusion query result needs 8 bytes");
+      throw std::runtime_error("a backend query result needs 8 bytes");
     // Never blocks, as the interface promises. Not yet resolved, or resolved
     // by a frame the GPU has not reached, both mean "ask again later".
     if(!concrete.fence()||gpu_.completed_fence()<concrete.fence()) return false;
@@ -937,6 +1027,35 @@ class D3D12Backend final : public NativeRenderBackend {
   }
 
   NativeBackendPipeline& CreatePipeline(const NativeBackendPipelineDesc& desc) override {
+    NativeD3D12PipelineCache::Request request{};
+    request.key.vertex_shader=desc.vertex_id;
+    request.key.pixel_shader=desc.pixel_id;
+    request.key.input_layout=desc.input_layout_id;
+    request.key.blend=desc.state[0];
+    request.key.depth=desc.state[1];
+    request.key.raster=desc.state[2];
+    request.key.alpha=desc.state[3];
+    request.key.write_mask=desc.state[4];
+    request.key.topology=TopologyType(desc.topology);
+    request.key.render_targets=desc.render_targets;
+    for(size_t index=0;index<desc.rtv_format.size();++index)
+      request.key.rtv_format[index]=desc.rtv_format[index];
+    request.key.dsv_format=desc.dsv_format;
+    request.key.sample_count=desc.sample_count;
+    // A warm pipeline lookup must not reflect shader bytecode, decode render
+    // state, or allocate an input-layout vector again for every geometry draw.
+    // Shader/layout identities are stable by the backend interface contract.
+    const uint32_t primitive=uint32_t(Topology(desc.topology));
+    // Cache hits only borrow this stack key. Own the bytes on a miss, avoiding
+    // string allocation and growth for every routine material transition.
+    std::array<char,sizeof(request.key)+sizeof(primitive)> key_bytes;
+    std::memcpy(key_bytes.data(),&request.key,sizeof(request.key));
+    std::memcpy(key_bytes.data()+sizeof(request.key),&primitive,sizeof(primitive));
+    const std::string_view key(key_bytes.data(),key_bytes.size());
+    if(const auto found=wrappers_.find(key);found!=wrappers_.end()) {
+      ++wrapper_hits_;
+      return *found->second;
+    }
     // Decoded once here rather than twice: the pipeline cache builds its own
     // state from these words, and the wrapper below needs the two blend-factor
     // answers out of the same decode.
@@ -953,21 +1072,6 @@ class D3D12Backend final : public NativeRenderBackend {
                                               :D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
                           element.step_rate});
 
-    NativeD3D12PipelineCache::Request request{};
-    request.key.vertex_shader=desc.vertex_id;
-    request.key.pixel_shader=desc.pixel_id;
-    request.key.input_layout=desc.input_layout_id;
-    request.key.blend=desc.state[0];
-    request.key.depth=desc.state[1];
-    request.key.raster=desc.state[2];
-    request.key.alpha=desc.state[3];
-    request.key.write_mask=desc.state[4];
-    request.key.topology=TopologyType(desc.topology);
-    request.key.render_targets=desc.render_targets;
-    for(size_t index=0;index<desc.rtv_format.size();++index)
-      request.key.rtv_format[index]=desc.rtv_format[index];
-    request.key.dsv_format=desc.dsv_format;
-    request.key.sample_count=desc.sample_count;
     request.vertex={desc.vertex.data(),desc.vertex.size()};
     request.pixel={desc.pixel.data(),desc.pixel.size()};
     request.input_layout=elements;
@@ -977,10 +1081,9 @@ class D3D12Backend final : public NativeRenderBackend {
     // The wrapper is keyed the same way as the pipeline, so repeated calls with
     // the same description hand back the same object rather than leaking one
     // wrapper per call for the same underlying pipeline.
-    std::string key(reinterpret_cast<const char*>(&request.key),sizeof(request.key));
     auto found=wrappers_.find(key);
     if(found==wrappers_.end())
-      found=wrappers_.emplace(std::move(key),
+      found=wrappers_.emplace(std::string(key),
                               std::make_unique<D3D12Pipeline>(state,Topology(desc.topology),
                                                               decoded.requires_blend_factor,
                                                               decoded.replicate_blend_alpha)).first;
@@ -988,19 +1091,27 @@ class D3D12Backend final : public NativeRenderBackend {
   }
 
   NativeBackendRecorder& Recorder(uint32_t index) override {
+    if(parallel_failure_) std::rethrow_exception(parallel_failure_);
     if(!open_) throw std::runtime_error("the D3D12 backend has no frame open; call BeginFrame first");
+    if(parallel_) {
+      if(index) throw std::runtime_error("the draw-packet recorder is owned by one producer");
+      return *parallel_;
+    }
     if(index>=recorders_.size())
       throw std::runtime_error("recorder "+std::to_string(index)+" does not exist; this backend has "+
                                std::to_string(recorders_.size()));
     return *recorders_[index];
   }
-  uint32_t RecorderCount() const override { return static_cast<uint32_t>(recorders_.size()); }
-  // True only when there is genuinely more than one command list. A backend
-  // that claimed this with one recorder would have callers spawn threads that
-  // then serialise on it, which is slower than not threading at all.
-  bool SupportsParallelRecording() const override { return recorders_.size()>1; }
+  uint32_t RecorderCount() const override { return parallel_?1:static_cast<uint32_t>(recorders_.size()); }
+  // This capability describes caller-owned recorders. Packet mode exposes one
+  // producer; its internal worker concurrency is reported in Statistics().
+  bool SupportsParallelRecording() const override { return !parallel_ && recorders_.size()>1; }
 
   void Submit() override {
+    if(parallel_failure_) std::rethrow_exception(parallel_failure_);
+    if(parallel_) parallel_->Flush(false); else SubmitRecorded();
+  }
+  void SubmitRecorded() {
     if(!open_) throw std::runtime_error("Submit with no frame open");
     // A flip-model back buffer must be in PRESENT state when it is presented,
     // and only the open command list can put it there. Doing it here rather
@@ -1009,19 +1120,30 @@ class D3D12Backend final : public NativeRenderBackend {
     // for a buffer already in that state.
     for(auto& buffer:back_buffers_)
       recorders_.front()->Transition(buffer->tracked(),D3D12_RESOURCE_STATE_PRESENT);
-    for(auto& recorder:recorders_) recorder->End();
+    for(auto& recorder:recorders_) { recorder->ResolveTransitions(); recorder->End(); }
     gpu_.EndFrame();
     open_=false;
   }
 
+  std::shared_ptr<NativeBackendCompletion> MarkCompletion() override {
+    if(open_) throw std::runtime_error("D3D12 completion requires submitted command lists");
+    if(!completion_fence_)
+      Require(gpu_.device()->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(&completion_fence_)),
+              "completion fence creation");
+    if(completion_value_==UINT64_MAX-1) throw std::runtime_error("D3D12 completion fence exhausted");
+    const auto value=completion_value_+1;
+    auto completion=std::make_shared<D3D12Completion>(completion_fence_,value);
+    Require(gpu_.queue()->Signal(completion_fence_.Get(),value),"completion fence signal");
+    completion_value_=value;
+    return completion;
+  }
+
   void BeginFrame() override {
+    if(parallel_failure_) std::rethrow_exception(parallel_failure_);
+    BeginRecorded(); if(parallel_) parallel_->Reset();
+  }
+  void BeginRecorded() {
     if(open_) throw std::runtime_error("a D3D12 frame is already open");
-    // The swap chain's own throttle, taken here rather than inside Present.
-    // Only a backend with a window has one; the scene's backend never does,
-    // and never waits. Deadlined for the same reason every other wait in this
-    // file is: a window that stops being presented must not freeze the game.
-    if(frame_latency_ && WaitForSingleObject(frame_latency_,1000)==WAIT_TIMEOUT)
-      ++present_waits_timed_out_;
     gpu_.BeginFrame();
     for(uint32_t index=0;index<recorders_.size();++index)
       recorders_[index]->Begin(*gpu_.commands(index));
@@ -1106,7 +1228,7 @@ class D3D12Backend final : public NativeRenderBackend {
     TrackedResource tracked(gpu_);
     // A surface another API owns and may still be writing. It arrives in
     // COMMON, which is the only state a shared resource can be handed over in.
-    tracked.state=D3D12_RESOURCE_STATE_COMMON;
+    *tracked.state=D3D12_RESOURCE_STATE_COMMON;
     if(FAILED(gpu_.device()->OpenSharedHandle(handle,IID_PPV_ARGS(&tracked.resource)))) return {};
     const auto view=texture_views_.Allocate();
     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -1124,7 +1246,7 @@ class D3D12Backend final : public NativeRenderBackend {
     TrackedResource tracked(gpu_);
     // COMMON, because that is the state a shared resource has to be in for
     // another API to pick it up, and where CopyToShared leaves it.
-    tracked.state=D3D12_RESOURCE_STATE_COMMON;
+    *tracked.state=D3D12_RESOURCE_STATE_COMMON;
     const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                                      D3D12_MEMORY_POOL_UNKNOWN,0,0};
     D3D12_RESOURCE_DESC description{};
@@ -1137,7 +1259,7 @@ class D3D12Backend final : public NativeRenderBackend {
     description.SampleDesc={1,0};
     description.Flags=D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     if(FAILED(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_SHARED,&description,
-                                                     tracked.state,nullptr,
+                                                     *tracked.state,nullptr,
                                                      IID_PPV_ARGS(&tracked.resource))))
       return nullptr;
     void* texture_handle=nullptr;
@@ -1166,16 +1288,22 @@ class D3D12Backend final : public NativeRenderBackend {
     // value that is never going to arrive, which is not an error anywhere - it
     // is the window quietly never drawing again.
     const auto value=concrete.value()+1;
-    if(FAILED(gpu_.queue()->Signal(concrete.fence(),value))) return concrete.value();
+    if(FAILED(gpu_.queue()->Signal(concrete.fence(),value)))
+      throw std::runtime_error("D3D12 shared surface signal failed");
     return concrete.Advance();
   }
 
   bool WaitSharedFence(void* handle, uint64_t value) override {
     if(!handle) return false;
-    if(!shared_fence_ || shared_fence_handle_!=handle) {
-      shared_fence_.Reset();
-      if(FAILED(gpu_.device()->OpenSharedHandle(handle,IID_PPV_ARGS(&shared_fence_)))) return false;
-      shared_fence_handle_=handle;
+    if(!shared_fence_ || !CompareObjectHandles(shared_fence_handle_,handle)) {
+      ComPtr<ID3D12Fence> imported;
+      if(FAILED(gpu_.device()->OpenSharedHandle(handle,IID_PPV_ARGS(&imported)))) return false;
+      HANDLE retained=nullptr;
+      if(!DuplicateHandle(GetCurrentProcess(),handle,GetCurrentProcess(),&retained,0,FALSE,DUPLICATE_SAME_ACCESS))
+        return false;
+      if(shared_fence_handle_) CloseHandle(shared_fence_handle_);
+      shared_fence_handle_=retained;
+      shared_fence_=std::move(imported);
     }
     // A queue-side wait, not a CPU one: the GPU stalls until the producer has
     // signalled, and this thread carries on recording. Remembered because a
@@ -1190,10 +1318,20 @@ class D3D12Backend final : public NativeRenderBackend {
   NativeBackendStatistics Statistics() const override {
     NativeBackendStatistics out;
     out.frames=gpu_.frames_submitted();
+    if(parallel_) {
+      const auto geometry=parallel_->statistics();
+      out.geometry_draws=geometry.draws; out.geometry_batches=geometry.batches;
+      out.geometry_worker_mask=geometry.worker_mask; out.geometry_max_concurrent=geometry.max_concurrent;
+      out.geometry_record_ns=geometry.record_ns; out.geometry_wait_ns=geometry.wait_ns;
+      out.geometry_serial_draws=geometry.serial_draws; out.geometry_serial_flushes=geometry.serial_flushes;
+      out.geometry_instanced_draws=geometry.instanced_draws; out.geometry_folded_draws=geometry.folded_draws;
+      out.geometry_world_constant_reuses=geometry.world_constant_reuses;
+      out.geometry_constant_snapshot_bytes=geometry.constant_snapshot_bytes;
+    }
     out.upload_stalls=gpu_.upload_stalls();
     out.descriptor_stalls=gpu_.descriptor_stalls();
     out.pipelines=pipelines_.size();
-    out.pipeline_hits=pipelines_.hits();
+    out.pipeline_hits=pipelines_.hits()+wrapper_hits_;
     out.pipeline_misses=pipelines_.misses();
     out.sampler_tables=gpu_.samplers().tables();
     out.sampler_hits=gpu_.samplers().hits();
@@ -1234,6 +1372,12 @@ class D3D12Backend final : public NativeRenderBackend {
     // it, to a sixth of its frame rate. The wait belongs before the frame, on
     // a handle, which is what this flag buys.
     desc.Flags=DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    ComPtr<IDXGIFactory5> modern_factory;
+    BOOL supported=FALSE;
+    allow_tearing_=SUCCEEDED(gpu_.factory()->QueryInterface(IID_PPV_ARGS(&modern_factory))) &&
+      SUCCEEDED(modern_factory->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+        &supported,sizeof(supported))) && supported;
+    if(allow_tearing_) desc.Flags|=DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
     ComPtr<IDXGISwapChain1> chain;
     Require(gpu_.factory()->CreateSwapChainForHwnd(gpu_.queue(),static_cast<HWND>(window),&desc,
@@ -1250,7 +1394,7 @@ class D3D12Backend final : public NativeRenderBackend {
 
     for(uint32_t index=0;index<kBackBuffers;++index) {
       TrackedResource tracked;
-      tracked.state=D3D12_RESOURCE_STATE_PRESENT;
+      *tracked.state=D3D12_RESOURCE_STATE_PRESENT;
       Require(swap_chain_->GetBuffer(index,IID_PPV_ARGS(&tracked.resource)),"swap chain buffer");
       const auto view=render_target_views_.Allocate();
       D3D12_RENDER_TARGET_VIEW_DESC rtv{};
@@ -1284,6 +1428,20 @@ class D3D12Backend final : public NativeRenderBackend {
   // producer on another device. A completed value below the awaited one says
   // the producer never signalled, which is a different bug from anything this
   // device's own command lists did.
+  std::optional<NativeBackendPresentationStatistics> PresentationStatistics() const override {
+    if(!swap_chain_) return std::nullopt;
+    NativeBackendPresentationStatistics result;
+    DXGI_FRAME_STATISTICS stats{};
+    result.result=swap_chain_->GetFrameStatistics(&stats);
+    result.last_present_result=swap_chain_->GetLastPresentCount(&result.last_present_count);
+    if(SUCCEEDED(result.result)) {
+      result.present_count=stats.PresentCount;
+      result.present_refresh_count=stats.PresentRefreshCount;
+      result.sync_refresh_count=stats.SyncRefreshCount;
+      result.sync_qpc=stats.SyncQPCTime.QuadPart;
+    }
+    return result;
+  }
   std::string SharedWaitState() {
     if(!shared_fence_ || !shared_wait_value_) return {};
     return ", awaiting shared fence "+std::to_string(shared_wait_value_)+
@@ -1303,9 +1461,15 @@ class D3D12Backend final : public NativeRenderBackend {
   void Present(bool vsync) override {
     if(!swap_chain_) throw std::runtime_error("Present with no window attached");
     if(open_) throw std::runtime_error("Present inside an open frame; submit it first");
-    // Never DXGI_PRESENT_ALLOW_TEARING here: without it a zero interval still
-    // queues rather than tears, which is the behaviour the caller asked for.
-    const auto result=swap_chain_->Present(vsync?1:0,0);
+    // Throttle once per presentation, never once per command submission:
+    // snapshot copies and readbacks also open frames without presenting.
+    if(frame_latency_ && WaitForSingleObject(frame_latency_,1000)==WAIT_TIMEOUT)
+      ++present_waits_timed_out_;
+    // The host uses windowed/borderless presentation, never DXGI exclusive
+    // fullscreen. Explicit VSync-off must permit tearing where supported;
+    // these flags are also required for the driver's variable-refresh path.
+    // VSync-on always retains interval 1 with no tearing flag.
+    const auto result=swap_chain_->Present(vsync?1:0,!vsync && allow_tearing_?DXGI_PRESENT_ALLOW_TEARING:0);
     if(result==DXGI_ERROR_DEVICE_REMOVED || result==DXGI_ERROR_DEVICE_RESET)
       throw std::runtime_error(std::string("D3D12 present failed: the device was removed - ")+
                                RemovedReason()+SharedWaitState());
@@ -1372,11 +1536,14 @@ class D3D12Backend final : public NativeRenderBackend {
   struct PendingTexture { std::weak_ptr<void> alive; D3D12Texture* texture; std::vector<uint8_t> bytes; };
 
   NativeD3D12Device gpu_;
+  ComPtr<ID3D12Fence> completion_fence_;
+  uint64_t completion_value_=0;
   ComPtr<ID3D12RootSignature> signature_;
   NativeD3D12PipelineCache pipelines_;
+  uint64_t wrapper_hits_=0;
   NativeD3D12CpuDescriptorHeap texture_views_,render_target_views_,depth_views_;
   std::vector<std::unique_ptr<D3D12Recorder>> recorders_;
-  std::map<std::string,std::unique_ptr<D3D12Pipeline>> wrappers_;
+  std::map<std::string,std::unique_ptr<D3D12Pipeline>,std::less<>> wrappers_;
   // Three, to match the frames in flight: the device will not reuse a frame
   // slot until its fence has passed, which is also what keeps us off a buffer
   // the display is still showing.
@@ -1386,6 +1553,7 @@ class D3D12Backend final : public NativeRenderBackend {
   // Signalled when the swap chain is ready for another frame. Waited on before
   // recording rather than inside Present; see AttachWindow.
   HANDLE frame_latency_=nullptr;
+  bool allow_tearing_=false;
   uint64_t present_waits_timed_out_=0;
   void* shared_fence_handle_=nullptr;
   ComPtr<IDXGISwapChain3> swap_chain_;
@@ -1395,11 +1563,18 @@ class D3D12Backend final : public NativeRenderBackend {
   std::map<std::string,std::unique_ptr<D3D12Sampler>> samplers_;
   D3D12_CPU_DESCRIPTOR_HANDLE null_texture_{};
   bool open_=false;
+  std::exception_ptr parallel_failure_;
+  std::unique_ptr<NativeParallelRecorder> parallel_;
 };
 }  // namespace
 
 std::unique_ptr<NativeRenderBackend> CreateNativeD3D12Backend(const NativeD3D12Options& options) {
-  return std::make_unique<D3D12Backend>(options);
+  auto configured=options;
+  if(configured.geometry_workers) {
+    if(configured.geometry_workers>32) throw std::runtime_error("geometry worker limit is 32");
+    configured.recorders=configured.geometry_workers+1;
+  }
+  return std::make_unique<D3D12Backend>(configured);
 }
 
 namespace {
@@ -1424,6 +1599,18 @@ void SetNativeD3D12UploadMegabytes(uint32_t megabytes) {
 }
 void SetNativeD3D12DebugLayer(bool enabled) {
   DebugLayer().store(enabled,std::memory_order_relaxed);
+}
+std::unique_ptr<NativeRenderBackend> CreateNativeD3D12SceneBackend(bool warp,uint32_t workers) {
+  auto options=RegistryOptions();
+  options.prefer_warp=warp; options.debug_layer|=warp;
+  if(workers>32) throw std::runtime_error("geometry worker limit is 32");
+  // Recorder zero handles the entire UI/serial prefix. Adding geometry workers
+  // must not divide that recorder's descriptor budget by the worker count.
+  // Keep the default 64K budget per recorder, subject to the 1M heap limit.
+  // Descriptors remain fence-retired; this provides room for overlapping frames.
+  options.view_descriptors=(std::min)(1u<<20,options.view_descriptors*(workers?workers+1:1));
+  options.geometry_workers=workers;
+  return CreateNativeD3D12Backend(options);
 }
 void RegisterNativeD3D12Backend() {
   static bool registered=false;

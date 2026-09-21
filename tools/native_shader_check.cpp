@@ -18,8 +18,8 @@ using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
 
 int main(int argc, char** argv) {
-  if (argc < 2 || argc > 3 || (argc == 3 && std::string(argv[2]) != "--bindings" && std::string(argv[2]) != "--source" && std::string(argv[2]) != "--fingerprints" && std::string(argv[2]) != "--post-arithmetic" && std::string(argv[2]) != "--slots")) {
-    std::cerr << "usage: edf_native_shader_check <game directory> [--bindings|--source|--fingerprints|--post-arithmetic]\n";
+  if (argc < 2 || argc > 3 || (argc == 3 && std::string(argv[2]) != "--bindings" && std::string(argv[2]) != "--source" && std::string(argv[2]) != "--fingerprints" && std::string(argv[2]) != "--post-arithmetic" && std::string(argv[2]) != "--slots" && std::string(argv[2]) != "--instancing")) {
+    std::cerr << "usage: edf_native_shader_check <game directory> [--bindings|--source|--fingerprints|--post-arithmetic|--slots|--instancing]\n";
     return 2;
   }
   try {
@@ -50,6 +50,8 @@ int main(int argc, char** argv) {
     // uses 5 costs root-signature space and descriptor traffic on every draw.
     struct Widest { UINT slot = 0; std::string where; bool seen = false; };
     const bool slots_mode = argc == 3 && std::string(argv[2]) == "--slots";
+    const bool instancing_mode = argc == 3 && std::string(argv[2]) == "--instancing";
+    size_t instanced=0,instanced_reversed=0;
     std::map<std::string, Widest> widest;  // "vs.cb", "ps.texture", ...
     UINT widest_cb_bytes = 0, widest_inputs = 0;
     std::string widest_cb_where, widest_inputs_where;
@@ -80,6 +82,14 @@ int main(int argc, char** argv) {
           compiled.emplace(key,shader);
           if (!entry.pixel) {
             auto reversed=edf::native::CompileNativeShader(*device.Get(),effect,entry,path,true);
+            if(instancing_mode) {
+              std::string reason;
+              const bool normal=edf::native::AddNativeWorldInstancing(shader,effect,path,false,&reason);
+              const bool reverse=edf::native::AddNativeWorldInstancing(reversed,effect,path,true);
+              instanced+=normal; instanced_reversed+=reverse;
+              std::cout << path.filename().string() << ':' << entry.name
+                        << " world_instancing=" << normal << " reversed=" << reverse << " " << reason << '\n';
+            }
             reversed_compiled.emplace(key,reversed);
             edf::native::ShaderBindings reversed_bindings(*device.Get(),std::move(reversed));
             ++reversed_shaders;
@@ -87,7 +97,7 @@ int main(int argc, char** argv) {
           D3D11_SHADER_DESC description{};
           if (FAILED(shader.reflection->GetDesc(&description)))
             throw std::runtime_error("cannot inspect native shader bindings");
-          if (argc == 3) for (UINT i = 0; i < description.BoundResources; ++i) {
+          if (argc == 3 && !instancing_mode) for (UINT i = 0; i < description.BoundResources; ++i) {
             D3D11_SHADER_INPUT_BIND_DESC binding{};
             if (FAILED(shader.reflection->GetResourceBindingDesc(i, &binding)))
               throw std::runtime_error("cannot inspect native resource binding");
@@ -139,6 +149,7 @@ int main(int argc, char** argv) {
         }
       }
     }
+    if(instancing_mode) std::cout << instanced << " world-instance variants, " << instanced_reversed << " reversed world-instance variants\n";
     if (slots_mode) {
       std::cout << "widest slot actually used by any disc shader (root signature must cover these):\n";
       for (const auto& [key, entry] : widest)

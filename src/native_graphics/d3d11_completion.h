@@ -1,5 +1,6 @@
 #pragma once
 #include "guest_fence.h"
+#include "native_render_backend.h"
 #include <d3d11.h>
 #include <wrl/client.h>
 #include <deque>
@@ -14,6 +15,7 @@ namespace edf::native {
 class NativeCompletionQueue {
  public:
   NativeCompletionQueue(ID3D11Device& device,ID3D11DeviceContext& context,size_t capacity=4096);
+  explicit NativeCompletionQueue(NativeRenderBackend& backend,size_t capacity=4096);
   NativeCompletionQueue(const NativeCompletionQueue&)=delete;
   NativeCompletionQueue& operator=(const NativeCompletionQueue&)=delete;
   void Submit(uint32_t value,uint32_t cursor=0);
@@ -29,7 +31,9 @@ class NativeCompletionQueue {
   size_t pending() const { return entries_.size(); }
   size_t unsubmitted() const;
  private:
-  struct Entry { uint32_t value,cursor; Microsoft::WRL::ComPtr<ID3D11Query> query; uint32_t begin=0,bytes=0; };
+  struct Entry { uint32_t value,cursor; Microsoft::WRL::ComPtr<ID3D11Query> query; uint32_t begin=0,bytes=0; std::shared_ptr<NativeBackendCompletion> completion;
+    bool armed() const { return bool(query) || bool(completion); } };
+  NativeRenderBackend* backend_=nullptr;
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
   size_t capacity_;

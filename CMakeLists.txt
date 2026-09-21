@@ -17,7 +17,7 @@ if(EDF2027_NATIVE_GRAPHICS_ONLY)
 endif()
 
 if(NOT WIN32)
-    message(FATAL_ERROR "The native game renderer currently requires Windows/D3D11. Native analysis tools remain available with EDF2027_NATIVE_GRAPHICS_ONLY=ON.")
+    message(FATAL_ERROR "The native game renderer currently requires Windows/D3D12. Native analysis tools remain available with EDF2027_NATIVE_GRAPHICS_ONLY=ON.")
 endif()
 
 include(generated/rexglue.cmake)
@@ -30,23 +30,28 @@ set(EDF2027_SOURCES
 )
 
 if(WIN32)
-    add_library(edf_native_sdk_ui STATIC src/native_graphics/native_immediate_drawer.cpp)
+    add_library(edf_native_sdk_ui STATIC src/native_graphics/native_immediate_drawer.cpp src/native_graphics/native_backend_immediate_drawer.cpp)
     target_link_libraries(edf_native_sdk_ui PUBLIC edf_native_d3d11 rex::runtime)
     add_executable(edf2027 WIN32 ${EDF2027_SOURCES})
     target_sources(edf2027 PRIVATE src/native_graphics/guest_shader_bridge.cpp)
+    target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_d3d12_preview.cpp)
-    target_sources(edf2027 PRIVATE src/native_graphics/native_host_surface.cpp)
+    target_sources(edf2027 PRIVATE src/native_graphics/native_host_surface.cpp src/native_graphics/native_backend_host.cpp)
     target_link_libraries(edf2027 PRIVATE comctl32)
     target_link_libraries(edf2027 PRIVATE gdi32)
     target_link_libraries(edf2027 PRIVATE edf_native_d3d11)
     target_link_libraries(edf2027 PRIVATE edf_native_d3d12)
     target_link_libraries(edf2027 PRIVATE edf_native_sdk_ui)
+    # Keep the explicit D3D11 fallback dormant: the default runtime must not
+    # load D3D11 merely because its fallback factory is linked into the binary.
+    target_link_libraries(edf2027 PRIVATE delayimp)
+    target_link_options(edf2027 PRIVATE "LINKER:/DELAYLOAD:d3d11.dll")
 else()
     add_executable(edf2027 ${EDF2027_SOURCES})
 endif()
 
-# The host owns D3D11 rendering. Do not request an SDK GPU emulation plugin.
+# The host owns native D3D12 rendering. Do not request an SDK GPU emulation plugin.
 rexglue_setup_target(edf2027)
 
 # Allow an independent candidate while the default executable is being playtested.
@@ -253,6 +258,16 @@ if(BUILD_TESTING)
         add_test(NAME edf_native_immediate_tail_tests COMMAND edf_native_immediate_tail_tests)
         target_link_libraries(edf_native_sdk_ui_tests PRIVATE edf_native_sdk_ui)
         add_test(NAME edf_native_sdk_ui_tests COMMAND edf_native_sdk_ui_tests)
+        add_executable(edf_native_backend_sdk_ui_tests tests/native_backend_sdk_ui_tests.cpp
+            src/native_graphics/native_fallback_imports.cpp)
+        target_link_libraries(edf_native_backend_sdk_ui_tests PRIVATE edf_native_sdk_ui delayimp)
+        target_link_options(edf_native_backend_sdk_ui_tests PRIVATE "LINKER:/DELAYLOAD:d3d11.dll")
+        add_test(NAME edf_native_backend_sdk_ui_tests COMMAND edf_native_backend_sdk_ui_tests)
+        add_executable(edf_native_backend_host_tests tests/native_backend_host_tests.cpp
+            src/native_graphics/native_backend_host.cpp)
+        target_link_libraries(edf_native_backend_host_tests PRIVATE edf_native_d3d11 rex::runtime comctl32)
+        add_test(NAME edf_native_backend_host_tests COMMAND edf_native_backend_host_tests)
+        set_tests_properties(edf_native_backend_host_tests PROPERTIES TIMEOUT 30)
         add_executable(edf_native_host_lifetime_tests tests/native_host_lifetime_tests.cpp
             src/native_graphics/native_host_surface.cpp)
         target_link_libraries(edf_native_host_lifetime_tests PRIVATE edf_native_d3d11 rex::runtime comctl32)
@@ -284,8 +299,8 @@ add_custom_command(TARGET edf2027 POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/gamecontrollerdb.txt $<TARGET_FILE_DIR:edf2027>/
     VERBATIM)
 
-# SDK DX12/Vulkan post-processing is not used by the native D3D11 presenter.
-message(STATUS "EDF2027 renderer: native D3D11; no GPU emulation plugin staged")
+# SDK DX12/Vulkan post-processing is not used by the native renderer.
+message(STATUS "EDF2027 renderer: native D3D12 scene/composition/presentation/completion; explicit delay-loaded D3D11 fallback; no GPU emulation plugin staged")
 # Some SDK builds directly import FidelityFX from rexruntime.dll, even when no
 # GPU plugin/upscaler is active. Satisfy that loader dependency without exposing
 # unsupported native upscaling controls. This is not the Xenos plugin.

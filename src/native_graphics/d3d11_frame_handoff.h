@@ -17,6 +17,7 @@ class NativeFrameHandoff {
   using Consumer=std::function<void(ID3D11Device&,ID3D11DeviceContext&,
       ID3D11ShaderResourceView&,uint64_t,NativeFrameKind,const NativeDisplayGamma*)>;
   NativeFrameHandoff(ID3D11Device& device,ID3D11DeviceContext& context);
+  ~NativeFrameHandoff();
   NativeFrameHandoff(const NativeFrameHandoff&)=delete;
   NativeFrameHandoff& operator=(const NativeFrameHandoff&)=delete;
   void Publish(ID3D11Texture2D& source,NativeFrameKind kind,const NativeDisplayGamma* gamma=nullptr);
@@ -35,6 +36,10 @@ class NativeFrameHandoff {
     uint32_t width=0,height=0,format=0;
     explicit operator bool() const { return texture && fence; }
   };
+  // Copy a cross-device frame into the owned snapshot. The caller must wait
+  // on Shared()'s fence before writing the source again.
+  void PublishShared(const SharedFrame& source,NativeFrameKind kind,
+                     const NativeDisplayGamma* gamma=nullptr);
   SharedFrame Shared() const;
   uint64_t SharedSequence() const { return sequence_; }
   void Invalidate() { valid_=false; gamma_.reset(); }
@@ -60,5 +65,9 @@ class NativeFrameHandoff {
   NativeFrameKind kind_=NativeFrameKind::PartialScene;
   bool valid_=false;
   std::optional<NativeDisplayGamma> gamma_;
+  Microsoft::WRL::ComPtr<ID3D11Texture2D> imported_texture_;
+  Microsoft::WRL::ComPtr<ID3D11Fence> imported_fence_;
+  void* imported_texture_handle_=nullptr;
+  void* imported_fence_handle_=nullptr;
 };
 }

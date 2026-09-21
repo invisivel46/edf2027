@@ -12,11 +12,22 @@ NativeCompletionQueue::NativeCompletionQueue(ID3D11Device& device,ID3D11DeviceCo
   if(!capacity || capacity>4096 || owner.Get()!=&device || context.GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)
     throw std::runtime_error("invalid native completion queue context/capacity");
 }
+NativeCompletionQueue::NativeCompletionQueue(NativeRenderBackend& backend,size_t capacity)
+    : backend_(&backend),capacity_(capacity) {
+  if(!capacity || capacity>4096) throw std::invalid_argument("invalid backend completion capacity");
+}
 void NativeCompletionQueue::Submit(uint32_t value,uint32_t cursor) {
   if(issued_ && uint32_t(value-*issued_)!=2)
     throw std::runtime_error("native completion fence sequence changed without reset");
   if(entries_.size()>=capacity_) throw std::runtime_error("native completion queue capacity exceeded");
   Entry entry{value,cursor,{}};
+  if(backend_) {
+    entries_.push_back(std::move(entry));
+    try { entries_.back().completion=backend_->MarkCompletion(); }
+    catch(...) { entries_.pop_back(); throw; }
+    submitted_=issued_=value;
+    return;
+  }
   const D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT,0};
   if(FAILED(device_->CreateQuery(&desc,&entry.query)))
     throw std::runtime_error("native completion query creation failed");
@@ -42,23 +53,34 @@ void NativeCompletionQueue::Capture(uint32_t begin,uint32_t bytes,uint32_t value
     throw std::runtime_error("native captured fence sequence changed without reset");
   if(entries_.size()>=capacity_) throw std::runtime_error("native completion queue capacity exceeded");
   for(const auto& entry:entries_)
-    if(!entry.query && begin<uint64_t(entry.begin)+entry.bytes && entry.begin<end)
+    if(!entry.armed() && begin<uint64_t(entry.begin)+entry.bytes && entry.begin<end)
       throw std::runtime_error("unsubmitted native fence storage overwritten");
   entries_.push_back({value,cursor,{},begin,bytes});
   issued_=value;
 }
 size_t NativeCompletionQueue::unsubmitted() const {
-  return std::count_if(entries_.begin(),entries_.end(),[](const auto& entry){return !entry.query;});
+  return std::count_if(entries_.begin(),entries_.end(),[](const auto& entry){return !entry.armed();});
 }
 size_t NativeCompletionQueue::SubmitRange(uint32_t begin,uint32_t bytes) {
   const auto end=CompletionRangeEnd(begin,bytes);
   struct Armed { Entry* entry; Microsoft::WRL::ComPtr<ID3D11Query> query; };
   std::vector<Armed> selected;
   for(auto& entry:entries_) {
-    if(entry.query || begin>=uint64_t(entry.begin)+entry.bytes || entry.begin>=end) continue;
+    if(entry.armed() || begin>=uint64_t(entry.begin)+entry.bytes || entry.begin>=end) continue;
     if(entry.begin<begin || uint64_t(entry.begin)+entry.bytes>end)
       throw std::runtime_error("native submission splits a captured fence");
     selected.push_back({&entry,{}});
+  }
+  if(backend_) {
+    if(!selected.empty()) {
+      const auto completion=backend_->MarkCompletion();
+      for(auto& item:selected) item.entry->completion=completion;
+    }
+    for(const auto& entry:entries_) {
+      if(!entry.armed()) break;
+      submitted_=entry.value;
+    }
+    return selected.size();
   }
   const D3D11_QUERY_DESC desc{D3D11_QUERY_EVENT,0};
   for(auto& item:selected)
@@ -72,14 +94,21 @@ size_t NativeCompletionQueue::SubmitRange(uint32_t begin,uint32_t bytes) {
   if(!selected.empty()) context_->Flush();
   // Submission knowledge may advance only through a contiguous issued prefix.
   for(const auto& entry:entries_) {
-    if(!entry.query) break;
+    if(!entry.armed()) break;
     submitted_=entry.value;
   }
   return selected.size();
 }
 std::optional<uint32_t> NativeCompletionQueue::Poll(bool allow_flush) {
   while(!entries_.empty()) {
-    if(!entries_.front().query) break;
+    if(!entries_.front().armed()) break;
+    if(backend_) {
+      if(!entries_.front().completion->Complete()) break;
+      completed_=entries_.front().value;
+      completed_cursor_=entries_.front().cursor;
+      entries_.pop_front();
+      continue;
+    }
     BOOL finished=FALSE;
     const auto result=context_->GetData(entries_.front().query.Get(),&finished,sizeof(finished),
                                         allow_flush?0:D3D11_ASYNC_GETDATA_DONOTFLUSH);

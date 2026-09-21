@@ -179,6 +179,84 @@ class NativeBufferWrites {
     std::span<const uint8_t> bytes;
     std::shared_ptr<const std::vector<uint8_t>> candidate;
   };
+  struct SnapshotIdentity {
+    uint32_t owner,physical;
+    size_t bytes;
+    std::shared_ptr<const std::vector<uint8_t>> candidate;
+  };
+  // Synchronous borrowed identities. The caller retains each immutable
+  // candidate throughout this call and any use of the returned version.
+  struct SnapshotIdentityView {
+    uint32_t owner,physical;
+    size_t bytes;
+    const std::shared_ptr<const std::vector<uint8_t>>* candidate;
+  };
+  // Same writer exclusion, revision proof and verification cadence as the
+  // owning API, without constructing new shared snapshot handles on a hit.
+  template<size_t Count>
+  std::optional<std::array<ObservedVersion,Count>> TryValidateObservedSet(
+      const std::array<SnapshotIdentityView,Count>& sources,SnapshotPolicy policy) {
+    std::lock_guard lock(mutex_);
+    if(subscriptions_unknown_ || active_writers_ || trust_revoked_ ||
+       policy.audit_revisions || !policy.verify_interval) return {};
+    std::array<ObservedVersion,Count> result;
+    std::array<decltype(subscriptions_)::mapped_type*,Count> observed{};
+    // Most draws ask about the pair the draw before asked about. Map nodes
+    // keep their address until erased, and an erase bumps the generation, so
+    // the previous answer's nodes can be reused without the two lookups.
+    if(reuse_generation_!=subscriptions_generation_) {
+      reuse_last_={}; reuse_generation_=subscriptions_generation_;
+    }
+    for(size_t i=0;i<Count;++i) {
+      const auto& source=sources[i];
+      if(!source.candidate) return {};
+      const auto& candidate=*source.candidate;
+      // Duplicate owners advance one subscription's schedule more than once.
+      // Leave that uncommon case to the sequential comparison path.
+      for(size_t earlier=0;earlier<i;++earlier)
+        if(sources[earlier].owner==source.owner) return {};
+      decltype(subscriptions_)::mapped_type* subscription_pointer=nullptr;
+      if(i<reuse_last_.size() && reuse_last_[i].second && reuse_last_[i].first==source.owner)
+        subscription_pointer=reuse_last_[i].second;
+      else {
+        const auto found=subscriptions_.find(source.owner);
+        if(found==subscriptions_.end()) return {};
+        subscription_pointer=&found->second;
+        if(i<reuse_last_.size()) reuse_last_[i]={source.owner,subscription_pointer};
+      }
+      auto& subscription=*subscription_pointer;
+      observed[i]=&subscription;
+      if(subscription.range.address!=source.physical || subscription.range.bytes!=source.bytes ||
+         !candidate || candidate->size()!=source.bytes ||
+         subscription.audited_contents.lock()!=candidate ||
+         subscription.audited_revision!=subscription.version.revision ||
+         subscription.observations<policy.verify_initial ||
+         subscription.observations%policy.verify_interval==0) return {};
+      result[i]=subscription.version;
+      result[i].writer_epoch=writer_epoch_;
+    }
+    // The lookups above found these; every indexed draw comes through here,
+    // so they are not repeated.
+    for(auto* subscription:observed) {
+      ++subscription->observations;
+      ++trusted_;
+    }
+    return result;
+  }
+  // Metadata-only equivalent of an unsampled CopyObservedSet. Failure
+  // consumes no observation; the caller then performs the guarded comparison.
+  template<size_t Count>
+  std::optional<std::array<ObservedSnapshot,Count>> TryReuseObservedSet(
+      const std::array<SnapshotIdentity,Count>& sources,SnapshotPolicy policy) {
+    std::array<SnapshotIdentityView,Count> views;
+    for(size_t i=0;i<Count;++i)
+      views[i]={sources[i].owner,sources[i].physical,sources[i].bytes,&sources[i].candidate};
+    const auto versions=TryValidateObservedSet(views,policy);
+    if(!versions) return {};
+    std::array<ObservedSnapshot,Count> result;
+    for(size_t i=0;i<Count;++i) result[i]={(*versions)[i],sources[i].candidate,false,true,false};
+    return result;
+  }
   enum class SnapshotRejection { None, UnknownTracking, ActiveWriter, MissingOwner, ExtentMismatch };
   struct SnapshotFailure {
     SnapshotRejection reason=SnapshotRejection::None;
@@ -455,6 +533,7 @@ class NativeBufferWrites {
     const auto at=subscriptions_.find(owner);
     if(at==subscriptions_.end()) return;
     ChangePages(at->second.range,false); subscriptions_.erase(at);
+    ++subscriptions_generation_; // Node addresses cached by TryReuseObservedSet die here.
     intervals_dirty_=true;
   }
   bool TouchesSubscription(uint32_t address,uint32_t bytes) const {
@@ -495,6 +574,9 @@ class NativeBufferWrites {
   std::vector<SubscriptionInterval> subscription_intervals_;
   bool intervals_dirty_=true;
   std::map<uint32_t,Subscription> subscriptions_;
+  // Bumped on every erase; see TryReuseObservedSet.
+  uint64_t subscriptions_generation_=0,reuse_generation_=UINT64_MAX;
+  std::array<std::pair<uint32_t,Subscription*>,2> reuse_last_{};
   uint64_t next_lifetime_=0;
   uint64_t writer_epoch_=0,active_writers_=0;
   WriterScope* writers_=nullptr; // Intrusive live scopes; all access under mutex_.

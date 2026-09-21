@@ -24,11 +24,23 @@ NativeGpuTimer::NativeGpuTimer(ID3D11Device& device,ID3D11DeviceContext& context
      context.GetType()!=D3D11_DEVICE_CONTEXT_IMMEDIATE)
     throw std::invalid_argument("invalid native GPU timer context/capacity");
 }
+NativeGpuTimer::NativeGpuTimer(NativeRenderBackend& backend,std::function<NativeBackendRecorder&()> recorder,size_t capacity)
+    :backend_(&backend),recorder_(std::move(recorder)),capacity_(capacity) {
+  if(!capacity || capacity>4096 || !recorder_ || !backend.TimestampFrequency())
+    throw std::invalid_argument("invalid backend GPU timer");
+}
 NativeGpuTimer::~NativeGpuTimer() { Cancel(); }
 void NativeGpuTimer::Begin(uint64_t tag) {
   if(active_) throw std::logic_error("nested native GPU timing span");
   if(submitted_.size()>=capacity_) throw std::runtime_error("native GPU timing capacity exceeded");
   Span span; span.tag=tag;
+  if(backend_) {
+    span.backend_begin=backend_->CreateQuery(NativeBackendQueryKind::Timestamp);
+    span.backend_end=backend_->CreateQuery(NativeBackendQueryKind::Timestamp);
+    active_.emplace(std::move(span));
+    recorder_().EndQuery(*active_->backend_begin);
+    return;
+  }
   const D3D11_QUERY_DESC disjoint{D3D11_QUERY_TIMESTAMP_DISJOINT,0};
   const D3D11_QUERY_DESC timestamp{D3D11_QUERY_TIMESTAMP,0};
   if(FAILED(device_->CreateQuery(&disjoint,&span.disjoint)) ||
@@ -40,7 +52,12 @@ void NativeGpuTimer::Begin(uint64_t tag) {
   context_->End(active_->begin.Get());
 }
 void NativeGpuTimer::MarkMiddle() {
-  if(!active_ || active_->middle) throw std::logic_error("native GPU middle marker requires an unmarked active span");
+  if(!active_ || active_->middle || active_->backend_middle) throw std::logic_error("native GPU middle marker requires an unmarked active span");
+  if(backend_) {
+    active_->backend_middle=backend_->CreateQuery(NativeBackendQueryKind::Timestamp);
+    recorder_().EndQuery(*active_->backend_middle);
+    return;
+  }
   const D3D11_QUERY_DESC timestamp{D3D11_QUERY_TIMESTAMP,0};
   Microsoft::WRL::ComPtr<ID3D11Query> query;
   if(FAILED(device_->CreateQuery(&timestamp,&query)))
@@ -54,12 +71,14 @@ void NativeGpuTimer::End() {
   // failure leaves the active span owned and cancellable.
   submitted_.push_back(std::move(*active_));
   active_.reset();
+  if(backend_) { recorder_().EndQuery(*submitted_.back().backend_end); return; }
   context_->End(submitted_.back().end.Get());
   context_->End(submitted_.back().disjoint.Get());
   context_->Flush();
 }
 void NativeGpuTimer::Cancel() {
   if(!active_) return;
+  if(backend_) { active_.reset(); return; }
   context_->End(active_->end.Get());
   context_->End(active_->disjoint.Get());
   active_.reset();
@@ -67,6 +86,19 @@ void NativeGpuTimer::Cancel() {
 std::optional<NativeGpuTiming> NativeGpuTimer::Poll(bool allow_flush) {
   if(submitted_.empty()) return std::nullopt;
   const auto& span=submitted_.front();
+  if(backend_) {
+    NativeGpuTiming result; result.tag=span.tag; result.frequency=backend_->TimestampFrequency();
+    const auto read=[&](NativeBackendQuery& query,uint64_t& value) {
+      return backend_->ReadQuery(query,{reinterpret_cast<uint8_t*>(&value),sizeof(value)});
+    };
+    if(!read(*span.backend_begin,result.begin) || !read(*span.backend_end,result.end)) return std::nullopt;
+    result.reliable=result.frequency && result.end>=result.begin;
+    if(span.backend_middle) {
+      uint64_t middle=0; if(!read(*span.backend_middle,middle)) return std::nullopt;
+      result.middle=middle; result.reliable=result.reliable && middle>=result.begin && middle<=result.end;
+    }
+    submitted_.pop_front(); return result;
+  }
   const UINT flags=allow_flush?0:D3D11_ASYNC_GETDATA_DONOTFLUSH;
   D3D11_QUERY_DATA_TIMESTAMP_DISJOINT domain{};
   const auto ready=context_->GetData(span.disjoint.Get(),&domain,sizeof(domain),flags);

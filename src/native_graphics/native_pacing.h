@@ -10,9 +10,17 @@ namespace edf::native {
 // writeback and must apply it at the corresponding native completion boundary.
 struct NativeSwapPacingState {
   uint32_t ticks=0,acknowledged=0,pending=0,callbacks=0;
-  // Native presentation has no Xbox raster phase. Once GPU work is complete
-  // and the requested interval has elapsed, acknowledge now instead of adding
-  // another synthetic vblank. Display VSync belongs to the DXGI presenter.
+  // Render acceptance without a synthetic refresh wait. GPU completion is
+  // checked separately by the caller and must never be inferred from this.
+  bool CompleteUnpaced(uint32_t interval) {
+    if(interval<1 || interval>3) throw std::invalid_argument("invalid native swap interval");
+    ++callbacks; pending=0; acknowledged=ticks;
+    return true;
+  }
+  // Native presentation has no Xbox raster phase. Once the renderer grants
+  // a presentation credit and the requested interval has elapsed, acknowledge
+  // acceptance without another synthetic vblank. This does not acknowledge a
+  // guest resource fence. Display VSync belongs to the DXGI presenter.
   bool CompleteNative(uint32_t interval) {
     if(interval<1 || interval>3) throw std::invalid_argument("invalid native swap interval");
     ++callbacks;
@@ -67,6 +75,12 @@ class NativePacingClock {
     const auto ns=static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now-epoch_).count());
     return uint32_t(((ns%1000000000)*60%1000000000)/10000000)+1;
+  }
+  float Fraction(Clock::time_point now) const {
+    (void)Sample(now);
+    const auto ns=static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(now-epoch_).count());
+    return float(double((ns%1000000000)*60%1000000000)/1000000000.0);
   }
  private:
   Clock::time_point epoch_{};

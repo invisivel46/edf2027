@@ -3,12 +3,21 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+#include <stdexcept>
 
 namespace edf::native {
+// A queue marker owns its completion fence, so polling remains safe after
+// later submissions and does not depend on the lifetime of a frame allocator.
+class NativeBackendCompletion {
+ public:
+  virtual ~NativeBackendCompletion()=default;
+  virtual bool Complete() const=0;
+};
 // The seam a second graphics backend plugs into.
 //
 // Deliberately NOT a 1:1 mirror of the 47 D3D11 context methods this renderer
@@ -56,6 +65,10 @@ class NativeBackendSampler {
 class NativeBackendPipeline {
  public:
   virtual ~NativeBackendPipeline()=default;
+  virtual bool requires_blend_factor() const { return false; }
+  // Backend-owned alternate pipeline, valid for this pipeline's lifetime.
+  NativeBackendPipeline* world_instanced=nullptr;
+  uint32_t instance_world_slot=0,instance_world_offset=0;
 };
 class NativeBackendRenderTarget {
  public:
@@ -98,8 +111,23 @@ class NativeBackendSharedSurface {
 // and the default is zero rather than an error: this exists so a slow frame can
 // be attributed instead of guessed at, and a backend that cannot answer should
 // not stop the caller asking.
+// Raw display feedback, kept separate from CPU submission statistics. A failed
+// query must remain visible to diagnostics rather than look like zero drops.
+struct NativeBackendPresentationStatistics {
+  int32_t result=0,last_present_result=0;
+  uint32_t present_count=0,present_refresh_count=0,sync_refresh_count=0,last_present_count=0;
+  int64_t sync_qpc=0;
+};
 struct NativeBackendStatistics {
   uint64_t frames=0;
+  uint64_t geometry_draws=0,geometry_batches=0,geometry_worker_mask=0;
+  uint64_t geometry_record_ns=0,geometry_wait_ns=0;
+  // Draws replayed inline on the producer because a flush found fewer packets
+  // than the worker minimum, and how many such flushes there were.
+  uint64_t geometry_serial_draws=0,geometry_serial_flushes=0;
+  uint64_t geometry_instanced_draws=0,geometry_folded_draws=0;
+  uint64_t geometry_world_constant_reuses=0,geometry_constant_snapshot_bytes=0;
+  uint32_t geometry_max_concurrent=0;
   // Times a frame had to wait for the GPU to give back upload memory or
   // shader-visible descriptors. Anything but zero is a budget that is too small
   // and shows to a player as a stutter with no other explanation.
@@ -139,8 +167,26 @@ class NativeBackendRecorder {
   virtual ~NativeBackendRecorder()=default;
 
   virtual void SetPipeline(NativeBackendPipeline& pipeline)=0;
+  // Only packet recorders combine draws. Direct recorders keep ordinary draws.
+  virtual void SetWorldInstancing(bool enabled,bool reuse_constants=true) {}
   virtual void SetVertexBuffer(uint32_t slot,NativeBackendBuffer& buffer,uint32_t stride,uint32_t offset)=0;
   virtual void SetIndexBuffer(NativeBackendBuffer& buffer,NativeBackendIndexFormat format,uint32_t offset)=0;
+  // Vertex data that lives only for this frame, bound at `slot` from wherever
+  // the backend stages it: the upload ring on D3D12, a renamed dynamic buffer
+  // on D3D11. No buffer object is created or rewritten, so unlike a dynamic
+  // buffer's UpdateBuffer this is not an ordering boundary - a draw recorded
+  // with these bytes keeps them, and the draws around it can still be recorded
+  // on any worker. Immediate geometry (particles, UI quads, fonts) is what this
+  // is for: rewriting a dynamic buffer per draw made every one of those draws
+  // flush the recorder, which put a fifth of the frame's draws back on the
+  // producer thread.
+  virtual void SetTransientVertices(uint32_t slot,std::span<const uint8_t> bytes,uint32_t stride)=0;
+  // Consume caller-owned conversion storage synchronously. A queued recorder
+  // may exchange it for retired storage; afterwards its contents are unspecified
+  // but it is safe to refill. Other backends use the copying upload above.
+  virtual void SetTransientVerticesOwned(uint32_t slot,std::vector<uint8_t>& bytes,uint32_t stride) {
+    SetTransientVertices(slot,bytes,stride);
+  }
   virtual void SetTopology(NativeBackendTopology topology)=0;
 
   // The constant blend colour, for the guest states that blend against one.
@@ -183,6 +229,9 @@ class NativeBackendRecorder {
                                     uint32_t first_index,int32_t base_vertex,uint32_t first_instance)=0;
 
   virtual void CopyTexture(NativeBackendTexture& destination,NativeBackendTexture& source)=0;
+  // Return an imported shared texture to the cross-queue COMMON state after
+  // the consumer's last access and before signalling its completion fence.
+  virtual void ReleaseSharedTexture(NativeBackendTexture& texture) {}
   // Copies a finished frame into a shared surface, resolving it if the source
   // is multisampled. Recorded, not immediate: the copy has to be ordered
   // against the draws that produced it.
@@ -306,6 +355,7 @@ class NativeRenderBackend {
   // command, and a caller polling for one has no frame open and so no recorder
   // to ask.
   virtual bool ReadQuery(NativeBackendQuery& query, std::span<uint8_t> result)=0;
+  virtual uint64_t TimestampFrequency() const { return 0; }
   // Expensive on both target APIs, and cached by the backend on the whole
   // description - so calling this every frame with the same description is
   // cheap, while a combination first seen mid-gameplay is a visible hitch.
@@ -337,6 +387,11 @@ class NativeRenderBackend {
   // Hand everything recorded so far to the GPU. Ordering between recorders is
   // the backend's responsibility.
   virtual void Submit()=0;
+  // Marks all work already submitted. An open frame must be submitted first;
+  // completion must never acknowledge draws still in a CPU command list.
+  virtual std::shared_ptr<NativeBackendCompletion> MarkCompletion() {
+    throw std::runtime_error("backend queue completion is unavailable");
+  }
 
   // Tightly packed RGBA bytes of a render target, for diagnostics, screenshots
   // and tests. Blocking by construction: it waits for the GPU, so it must
@@ -369,6 +424,9 @@ class NativeRenderBackend {
   // buffer, and holding the old one writes to something being displayed.
   virtual NativeBackendRenderTarget* BackBuffer()=0;
   virtual void Present(bool vsync)=0;
+  virtual std::optional<NativeBackendPresentationStatistics> PresentationStatistics() const {
+    return std::nullopt;
+  }
 
   // Cross-API sharing, for the stretch of the migration where one API produces
   // a surface another consumes. Without it the only way across is a copy
@@ -399,8 +457,7 @@ class NativeRenderBackend {
 };
 
 // Backends register here; selection is by name so a run can A/B them without a
-// rebuild. Only D3D11 exists today - the registry is the seam, not a promise
-// that a second backend is present.
+// rebuild. D3D12 is the default; D3D11 remains an explicit fallback.
 const std::vector<std::string>& NativeRenderBackendNames();
 // Throws if the name is unknown, so a typo fails loudly at startup rather than
 // silently falling back to a backend the caller did not ask for.

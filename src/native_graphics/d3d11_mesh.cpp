@@ -73,7 +73,7 @@ NativeIndexedMesh::NativeIndexedMesh(NativeRenderBackend& backend,const NativeSh
   std::shared_ptr<const std::vector<uint8_t>> index_contents) : stride_(stride) {
   if(index_contents && (index_contents->size()!=indices.size() || index_contents->data()!=indices.data()))
     throw std::runtime_error("native index contents do not own supplied bytes");
-  if (shader.entry.pixel || !shader.vertex || !shader.bytecode || declaration.empty() ||
+  if (shader.entry.pixel || !shader.bytecode || declaration.empty() ||
       declaration.size()%12 || declaration.size()>64*12 || !stride || stride>2048 ||
       vertices.empty() || vertices.size()%stride || vertices.size()>128*1024*1024 ||
       (index_bytes!=2 && index_bytes!=4) || indices.empty() || indices.size()%index_bytes || indices.size()>128*1024*1024)
@@ -263,12 +263,17 @@ bool NativeVertexBuffer::MatchesSource(std::span<const uint8_t> bytes) const {
     std::equal(bytes.begin(),bytes.end(),source_->begin()+source_offset_));
 }
 std::vector<uint8_t> NativeVertexBuffer::ConvertVertices(std::span<const uint8_t> vertices) const {
+  std::vector<uint8_t> native_vertices;
+  ConvertVerticesInto(vertices,native_vertices);
+  return native_vertices;
+}
+void NativeVertexBuffer::ConvertVerticesInto(std::span<const uint8_t> vertices,std::vector<uint8_t>& native_vertices) const {
   if(vertices.size()!=size_t(vertex_count_)*guest_stride_)
     throw std::runtime_error("native mesh vertex update size mismatch");
   const auto native_stride=stride_;
   const size_t native_size=size_t(vertex_count_)*native_stride;
   if (native_size>128*1024*1024) throw std::runtime_error("expanded native mesh exceeds size limit");
-  std::vector<uint8_t> native_vertices(native_size,0);
+  native_vertices.assign(native_size,0);
   for (size_t vertex=0;vertex<vertex_count_;++vertex) for (const auto& attribute:attributes_) {
     const auto source=vertex*guest_stride_+attribute.guest_offset;
     const auto target=vertex*native_stride+attribute.host_offset;
@@ -283,10 +288,11 @@ std::vector<uint8_t> NativeVertexBuffer::ConvertVertices(std::span<const uint8_t
         const auto byte=(BigWord(vertices,source)>>(channel*8))&255;
         value=attribute.integer ? byte : std::bit_cast<uint32_t>(float(byte)/(attribute.type==0x182886?255.0f:1.0f));
       } else value=BigWord(vertices,source+c*4);
-      for (UINT b=0;b<4;++b) native_vertices[target+c*4+b]=uint8_t(value>>(b*8));
+      // Host order, which is what the byte-at-a-time store this replaces
+      // produced on the little-endian hosts this runs on.
+      std::memcpy(native_vertices.data()+target+c*4,&value,4);
     }
   }
-  return native_vertices;
 }
 void NativeIndexedMesh::UpdateVertices(ID3D11DeviceContext& context,std::span<const uint8_t> vertices) {
   vertex_storage_->Update(context,vertices);
@@ -326,6 +332,53 @@ void NativeVertexBuffer::Update(ID3D11DeviceContext& context,std::span<const uin
 }
 void NativeIndexedMesh::ValidateDraw(uint32_t first,uint32_t count,int32_t base) const {
   ValidateRange(first,count,base,3);
+}
+const NativeIndexedMesh::PreparedDraw* NativeIndexedMesh::FindPreparedDraw(
+    uint32_t first,uint32_t count,int32_t base) const {
+  const auto* draw=prepared_draw_?&*prepared_draw_:nullptr;
+  return draw && draw->first_==first && draw->count_==count && draw->base_==base?draw:nullptr;
+}
+const NativeIndexedMesh::PreparedDraw& NativeIndexedMesh::PrepareDraw(uint32_t first,uint32_t count,int32_t base) {
+  if(const auto* draw=FindPreparedDraw(first,count,base)) return *draw;
+  ValidateDraw(first,count,base);
+  prepared_draw_=PreparedDraw(this,first,count,base);
+  return *prepared_draw_;
+}
+void NativeIndexedMesh::PreparedDraw::Draw(NativeBackendRecorder& recorder) const {
+  mesh_->BindAndDraw(recorder,first_,count_,base_,NativeBackendTopology::TriangleList);
+}
+NativeIndexedMesh::RetainedDraw NativeIndexedMesh::RetainDraw(
+    std::shared_ptr<NativeRenderBackend> backend,uint32_t first,uint32_t count,int32_t base) const {
+  if(!backend || vertex_storage_->backend_!=backend.get() || index_storage_->backend_!=backend.get())
+    throw std::runtime_error("retained scene geometry requires its owning backend");
+  if(vertex_storage_->dynamic_vertices_)
+    throw std::runtime_error("retained scene geometry requires immutable vertices");
+  ValidateDraw(first,count,base);
+  return RetainedDraw(std::move(backend),*this,first,count,base);
+}
+NativeIndexedMesh::RetainedDraw::RetainedDraw(std::shared_ptr<NativeRenderBackend> backend,
+    const NativeIndexedMesh& mesh,uint32_t first,uint32_t count,int32_t base)
+    :backend_(std::move(backend)),vertices_(mesh.vertex_storage_),indices_(mesh.index_storage_),
+     stride_(mesh.stride_),first_(first),count_(count),base_(base) {
+  auto layout=std::make_shared<NativeOwnedInputLayout>();
+  for(const auto& e:mesh.input_layout().elements())
+    layout->Add(e.semantic,e.semantic_index,e.format,e.slot,e.offset,e.per_instance,e.step_rate);
+  layout_=std::move(layout);
+}
+void NativeIndexedMesh::RetainedDraw::Bind(NativeBackendRecorder& recorder) const {
+  recorder.SetVertexBuffer(0,*vertices_->storage_,stride_,0);
+  recorder.SetIndexBuffer(*indices_->storage_,
+    indices_->width_==2?NativeBackendIndexFormat::Uint16:NativeBackendIndexFormat::Uint32,0);
+  recorder.SetTopology(NativeBackendTopology::TriangleList);
+}
+void NativeIndexedMesh::RetainedDraw::Draw(NativeBackendRecorder& recorder) const {
+  Bind(recorder);
+  recorder.DrawIndexed(count_,first_,base_);
+}
+void NativeIndexedMesh::RetainedDraw::DrawInstanced(NativeBackendRecorder& recorder,uint32_t instances) const {
+  if(!instances) return;
+  Bind(recorder);
+  recorder.DrawIndexedInstanced(count_,instances,first_,base_,0);
 }
 std::vector<std::array<float,3>> NativeIndexedMesh::CaptureSourceFloat3(
     uint32_t first,uint32_t count,int32_t base,uint32_t offset) const {
@@ -379,6 +432,31 @@ void NativeIndexedMesh::DrawLines(NativeBackendRecorder& recorder,uint32_t first
 void NativeIndexedMesh::BindAndDraw(NativeBackendRecorder& recorder,uint32_t first,uint32_t count,
                                     int32_t base,NativeBackendTopology topology) const {
   recorder.SetVertexBuffer(0,*vertex_storage_->storage_,stride_,0);
+  recorder.SetIndexBuffer(*index_storage_->storage_,
+    index_storage_->width_==2?NativeBackendIndexFormat::Uint16:NativeBackendIndexFormat::Uint32,0);
+  recorder.SetTopology(topology);
+  recorder.DrawIndexed(count,first,base);
+}
+void NativeIndexedMesh::DrawTransient(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                                      uint32_t first,uint32_t count,int32_t base) const {
+  ValidateDraw(first,count,base);
+  BindTransientAndDraw(recorder,guest_vertices,first,count,base,NativeBackendTopology::TriangleList);
+}
+void NativeIndexedMesh::DrawLinesTransient(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                                           uint32_t first,uint32_t count,int32_t base) const {
+  ValidateLineDraw(first,count,base);
+  BindTransientAndDraw(recorder,guest_vertices,first,count,base,NativeBackendTopology::LineList);
+}
+void NativeIndexedMesh::BindTransientAndDraw(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                                             uint32_t first,uint32_t count,int32_t base,
+                                             NativeBackendTopology topology) const {
+  if(!vertex_storage_->dynamic_vertices_)
+    throw std::runtime_error("transient vertices are for a dynamic mesh; an immutable one draws its own buffer");
+  // One scratch conversion per thread, reused: this runs a few hundred times a
+  // frame. Queued recorders take ownership and return retired scratch storage.
+  static thread_local std::vector<uint8_t> converted;
+  vertex_storage_->ConvertVerticesInto(guest_vertices,converted);
+  recorder.SetTransientVerticesOwned(0,converted,stride_);
   recorder.SetIndexBuffer(*index_storage_->storage_,
     index_storage_->width_==2?NativeBackendIndexFormat::Uint16:NativeBackendIndexFormat::Uint32,0);
   recorder.SetTopology(topology);
@@ -455,9 +533,13 @@ std::vector<std::array<float,4>> NativeIndexedMesh::CaptureClipPositions(
   return result;
 }
 void NativeMeshCache::Clear() {
+  last_entry_=nullptr;
+  recent_={};
   entries_.clear(); transient_.reset(); index_resources_.clear(); vertex_resources_.clear(); bytes_=0;
 }
 void NativeMeshCache::Invalidate(uint32_t resource) {
+  last_entry_=nullptr;
+  recent_={};
   index_resources_.erase(resource);
   vertex_resources_.erase(resource);
   for (auto it=entries_.begin();it!=entries_.end();) {
@@ -467,6 +549,28 @@ void NativeMeshCache::Invalidate(uint32_t resource) {
     } else ++it;
   }
   transient_.reset();
+}
+NativeIndexedMesh* NativeMeshCache::TryAcquireOwned(NativeRenderBackend& backend,const NativeShader& shader,
+    const Key& key,const NativeDeclaration& declaration,uint32_t stride,
+    std::span<const uint8_t> vertices,std::span<const uint8_t> indices,uint32_t index_bytes) {
+  const auto start=timings_enabled_?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+  auto* entry=last_entry_;
+  if(dynamic_vertices_ || backend_!=&backend || !entry || last_key_!=key ||
+     shader.entry.pixel || !shader.bytecode || !shader.reflection ||
+     entry->shader.Get()!=shader.bytecode.Get() || entry->owned_declaration.get()!=&declaration ||
+     entry->stride!=stride || entry->index_bytes!=index_bytes || entry->owned_indices ||
+     !entry->mesh->IndexStorage()->OwnsSource(backend,indices,index_bytes) ||
+     !entry->mesh->VertexStorage()->OwnsSource(vertices)) return nullptr;
+  // Identity here means the exact byte span owned by the cached resource, not
+  // a guest address or a content hash. Source observation and draw bounds are
+  // still checked by the caller, and normal invalidation clears last_entry_.
+  transient_.reset();
+  entry->used=++tick_;
+  ++hits_; ++owned_hits_; ++spend_.calls;
+  ++source_checks_.index_identity_hits; ++source_checks_.vertex_identity_hits;
+  if(timings_enabled_) spend_.lookup_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now()-start).count());
+  return entry->mesh.get();
 }
 NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const NativeShader& shader,const Key& key,
     std::span<const uint8_t> declaration,uint32_t stride,std::span<const uint8_t> vertices,
@@ -487,24 +591,26 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
   if(owned_declaration && (owned_declaration->bytes().data()!=declaration.data() ||
       owned_declaration->bytes().size()!=declaration.size()))
     throw std::runtime_error("native declaration identity does not own supplied bytes");
-  if (shader.entry.pixel || !shader.vertex || !shader.bytecode || !shader.reflection)
+  if (shader.entry.pixel || !shader.bytecode || !shader.reflection)
     throw std::runtime_error("invalid cached mesh shader");
   // A different backend means different resources; nothing cached here can be
   // bound by it, so the cache starts again rather than handing back a buffer
   // the new backend has never seen.
-  const auto spend_start=std::chrono::steady_clock::now();
+  const auto clock_now=[&] { return timings_enabled_?std::chrono::steady_clock::now():
+    std::chrono::steady_clock::time_point{}; };
+  const auto spend_start=clock_now();
   ++spend_.calls;
   if (backend_!=&backend) { Clear(); backend_=&backend; }
   transient_.reset();
   ++tick_;
-  const auto after_prologue=std::chrono::steady_clock::now();
+  const auto after_prologue=clock_now();
   spend_.prologue_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
     after_prologue-spend_start).count());
   // Charged to the lookup until something takes the tail; every return below
   // the hit either goes through the tail marker or is the hit itself.
   auto charge_lookup=[&] {
     spend_.lookup_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-      std::chrono::steady_clock::now()-after_prologue).count());
+      clock_now()-after_prologue).count());
   };
   auto equal=[](const std::vector<uint8_t>& owned,std::span<const uint8_t> guest) {
     return owned.size()==guest.size() && std::equal(owned.begin(),owned.end(),guest.begin());
@@ -516,40 +622,66 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
   // the same rejected source again, including through the weak resource cache.
   std::shared_ptr<const NativeIndexBuffer> rejected_index;
   std::shared_ptr<NativeVertexBuffer> rejected_vertex;
-  auto found=entries_.find(key);
-  if (found!=entries_.end()) {
-    auto& e=found->second;
+  auto found=entries_.end();
+  Entry* candidate=last_entry_ && last_key_==key?last_entry_:nullptr;
+  if(!candidate) {
+    const auto& recent=recent_[RecentSlot(key)];
+    if(recent.entry && recent.key==key) candidate=recent.entry;
+  }
+  if(!candidate) {
+    found=entries_.find(key);
+    if(found!=entries_.end()) candidate=&found->second;
+  }
+  if (candidate) {
+    auto& e=*candidate;
     const bool layout_matches=e.shader.Get()==shader.bytecode.Get() && e.stride==stride && e.index_bytes==index_bytes &&
         (owned_declaration ? e.owned_declaration==owned_declaration : equal(e.declaration,declaration));
     bool indices_match=false;
     if(layout_matches) {
       if(owned_indices) indices_match=e.owned_indices==owned_indices;
       else {
-        if(e.mesh->IndexStorage()->OwnsSource(backend,indices,index_bytes)) ++source_checks_.index_identity_hits;
+        if(e.mesh->IndexStorage()->OwnsSource(backend,indices,index_bytes)) {
+          ++source_checks_.index_identity_hits;
+          indices_match=true;
+        }
         else {
           ++source_checks_.index_checks;
           source_checks_.index_candidate_bytes+=indices.size();
+          indices_match=e.mesh->IndexStorage()->Matches(backend,indices,index_bytes);
         }
-        indices_match=e.mesh->IndexStorage()->Matches(backend,indices,index_bytes);
       }
     }
     if(layout_matches && !indices_match && !owned_indices) {
       ++index_mismatches_; last_index_mismatch_=key;
       rejected_index=e.mesh->IndexStorage();
     }
+    if (indices_match && dynamic_vertices_ && recorder &&
+        e.mesh->VertexStorage()->SourceBytes()==vertices.size()) {
+      // A dynamic mesh drawn through a recorder takes its vertices per draw
+      // (DrawTransient), so the cached buffer's contents are never consulted:
+      // nothing to compare against and nothing to rewrite. The bytes it was
+      // built from only fixed its declaration and vertex count.
+      if(last_entry_!=&e) Remember(key,e);
+      e.used=tick_; ++hits_; charge_lookup(); return *e.mesh;
+    }
     if (indices_match) {
-      if(e.mesh->VertexStorage()->OwnsSource(vertices)) ++source_checks_.vertex_identity_hits;
+      bool vertices_match=e.mesh->VertexStorage()->OwnsSource(vertices);
+      if(vertices_match) ++source_checks_.vertex_identity_hits;
       else {
         ++source_checks_.vertex_checks;
         source_checks_.vertex_candidate_bytes+=vertices.size();
+        vertices_match=e.mesh->VertexStorage()->MatchesSource(vertices);
       }
-      if(e.mesh->VertexStorage()->MatchesSource(vertices)) {
+      if(vertices_match) {
+        if(last_entry_!=&e) Remember(key,e);
         e.used=tick_; ++hits_; charge_lookup(); return *e.mesh;
       }
       ++vertex_mismatches_;
       last_vertex_mismatch_=key;
       rejected_vertex=e.mesh->VertexStorage();
       if(dynamic_vertices_ && e.mesh->VertexStorage()->SourceBytes()==vertices.size()) {
+        if(found==entries_.end()) found=entries_.find(key);
+        ForgetLookup(key);
         try {
           if(before_snapshot) before_snapshot();
           if(recorder) e.mesh->UpdateVertices(*recorder,vertices);
@@ -569,18 +701,21 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
     // Invalidate before construction: malformed updates cannot revive old data.
     if(!index_storage) index_storage=e.mesh->IndexStorage();
     if(!vertex_storage) vertex_storage=e.mesh->VertexStorage();
+    ForgetLookup(key);
+    if(found==entries_.end()) found=entries_.find(key);
     bytes_-=e.bytes; entries_.erase(found);
   }
   charge_lookup();
-  const auto tail_start=std::chrono::steady_clock::now();
+  const auto tail_start=clock_now();
   struct TailCharge {
     NativeMeshCache::Spend* spend;
     std::chrono::steady_clock::time_point start;
     ~TailCharge() {
+      if(!spend) return;
       spend->tail_ns+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now()-start).count());
     }
-  } tail_charge{&spend_,tail_start};
+  } tail_charge{timings_enabled_?&spend_:nullptr,tail_start};
   // Only live meshes own these generations. Pruning weak entries keeps resource
   // address churn bounded independently of mesh eviction and transient uploads.
   std::erase_if(index_resources_,[](const auto& item) { return item.second.expired(); });
@@ -618,12 +753,14 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
     else ++budget_evictions_;
     const auto oldest=std::min_element(entries_.begin(),entries_.end(),
       [](const auto& a,const auto& b) { return a.second.used<b.second.used; });
+    ForgetLookup(oldest->first);
     bytes_-=oldest->second.bytes; entries_.erase(oldest);
   }
   Entry entry{shader.bytecode,owned_declaration?std::vector<uint8_t>{}:std::vector<uint8_t>{declaration.begin(),declaration.end()},
     stride,index_bytes,std::move(mesh),size,tick_,std::move(owned_declaration),std::move(owned_indices)};
   auto inserted=entries_.emplace(key,std::move(entry)).first;
   bytes_+=size;
+  Remember(key,inserted->second);
   return *inserted->second.mesh;
 }
 }

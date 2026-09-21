@@ -95,6 +95,7 @@ NativeD3D12SamplerCache::NativeD3D12SamplerCache(ID3D12Device& device, uint32_t 
 
 D3D12_GPU_DESCRIPTOR_HANDLE NativeD3D12SamplerCache::Table(std::span<const D3D12_SAMPLER_DESC> samplers,
                                                           uint64_t used,uint64_t completed) {
+  std::lock_guard lock(mutex_);
   if(samplers.size()>slots_per_table_)
     throw std::runtime_error("a shader asked for "+std::to_string(samplers.size())+
                              " samplers but the root signature has "+std::to_string(slots_per_table_));

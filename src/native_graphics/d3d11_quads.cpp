@@ -8,12 +8,15 @@
 
 namespace edf::native {
 PositionTriangleStream::PositionTriangleStream(ID3D11Device& device,const NativeShader& shader)
-    : device_(&device) {
-  if(shader.entry.pixel || !shader.vertex || !shader.bytecode)
+    : PositionTriangleStream(&device,shader) {}
+PositionTriangleStream::PositionTriangleStream(ID3D11Device* device,const NativeShader& shader)
+    : device_(device) {
+  if(shader.entry.pixel || (device && !shader.vertex) || !shader.bytecode)
     throw std::runtime_error("position triangles require a native vertex shader");
+  if(!device) return;
   const D3D11_INPUT_ELEMENT_DESC element{
     "POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA,0};
-  if(FAILED(device.CreateInputLayout(&element,1,shader.bytecode->GetBufferPointer(),
+  if(FAILED(device->CreateInputLayout(&element,1,shader.bytecode->GetBufferPointer(),
                                     shader.bytecode->GetBufferSize(),&layout_)))
     throw std::runtime_error("position triangle input layout mismatch");
 }
@@ -23,7 +26,8 @@ void PositionTriangleStream::Draw(ID3D11DeviceContext& context,std::span<const u
     throw std::runtime_error("position triangles require matching immediate context");
   // Validation and the endian swap are guest logic, shared with whatever
   // draws these next; only the upload and the draw are D3D11's business.
-  const auto host=ConvertGuestPositionTriangles(guest);
+  static thread_local std::vector<uint8_t> host;
+  ConvertGuestPositionTrianglesInto(guest,host);
   const auto bytes=static_cast<UINT>(host.size());
   if(bytes>capacity_) {
     D3D11_BUFFER_DESC desc{};
@@ -51,32 +55,16 @@ std::span<const NativeBackendInputElement> PositionTriangleStream::Layout() {
     {"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,false,0}};
   return elements;
 }
-void PositionTriangleStream::Upload(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
-                                    std::span<const uint8_t> host) {
-  if(host.size()>capacity_ || !backend_vertices_) {
-    NativeBackendBufferDesc desc{};
-    desc.bytes=host.size(); desc.vertex=true; desc.dynamic=true;
-    // Created empty and filled through the recorder, never with contents
-    // supplied at creation. A backend that stages creation-time contents until
-    // its next frame opens - which D3D12 must, having no command list before
-    // then - would leave this draw reading uninitialised memory, and vertex
-    // positions read out of uninitialised memory hang the GPU rather than
-    // drawing something wrong.
-    backend_vertices_=backend.CreateBuffer(desc,{});
-    if(!backend_vertices_) throw std::runtime_error("position triangle buffer creation failed");
-    capacity_=static_cast<UINT>(host.size());
-  }
-  staging_.assign(capacity_,0);
-  std::memcpy(staging_.data(),host.data(),host.size());
-  recorder.UpdateBuffer(*backend_vertices_,0,staging_);
-}
-void PositionTriangleStream::Draw(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
+void PositionTriangleStream::Draw(NativeRenderBackend&,NativeBackendRecorder& recorder,
                                   std::span<const uint8_t> guest) {
-  const auto host=ConvertGuestPositionTriangles(guest);
-  Upload(backend,recorder,host);
-  recorder.SetVertexBuffer(0,*backend_vertices_,8,0);
+  static thread_local std::vector<uint8_t> host;
+  ConvertGuestPositionTrianglesInto(guest,host);
+  // Staged by the recorder for this frame rather than written into a dynamic
+  // buffer: the write was a flush boundary, once per XUI draw.
+  const auto count=static_cast<uint32_t>(host.size()/8);
+  recorder.SetTransientVerticesOwned(0,host,8);
   recorder.SetTopology(NativeBackendTopology::TriangleList);
-  recorder.Draw(static_cast<uint32_t>(host.size()/8),0);
+  recorder.Draw(count,0);
 }
 bool CanInitializeReductionTarget(const NativeShader& vertex,const NativeShader& pixel,
   std::span<const uint8_t> guest,const NativeViewportState& viewport,
@@ -107,14 +95,16 @@ bool CanInitializeReductionTarget(const NativeShader& vertex,const NativeShader&
   }
   return true;
 }
-QuadStream::QuadStream(ID3D11Device& device, const NativeShader& shader) : device_(&device) {
-  if (shader.entry.pixel || !shader.vertex || !shader.bytecode)
+QuadStream::QuadStream(ID3D11Device& device, const NativeShader& shader) : QuadStream(&device,shader) {}
+QuadStream::QuadStream(ID3D11Device* device, const NativeShader& shader) : device_(device) {
+  if (shader.entry.pixel || (device && !shader.vertex) || !shader.bytecode)
     throw std::runtime_error("quad stream requires native vertex shader");
+  if(!device) return;
   const D3D11_INPUT_ELEMENT_DESC elements[]{
     {"POSITION",0,DXGI_FORMAT_R32G32_FLOAT,0,0,D3D11_INPUT_PER_VERTEX_DATA,0},
     {"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,8,D3D11_INPUT_PER_VERTEX_DATA,0}
   };
-  if (FAILED(device.CreateInputLayout(elements,2,shader.bytecode->GetBufferPointer(),
+  if (FAILED(device->CreateInputLayout(elements,2,shader.bytecode->GetBufferPointer(),
                                      shader.bytecode->GetBufferSize(),&layout_)))
     throw std::runtime_error("native post quad input layout mismatch");
 }
@@ -130,20 +120,6 @@ std::span<const NativeBackendInputElement> QuadStream::Layout() {
     {"TEXCOORD",0,DXGI_FORMAT_R32G32_FLOAT,0,8,false,0}};
   return elements;
 }
-void QuadStream::Upload(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
-                        std::span<const uint8_t> host) {
-  if(host.size()>capacity_ || !backend_vertices_) {
-    NativeBackendBufferDesc desc{};
-    desc.bytes=host.size(); desc.vertex=true; desc.dynamic=true;
-    // Empty at creation; see PositionTriangleStream::Upload for why.
-    backend_vertices_=backend.CreateBuffer(desc,{});
-    if(!backend_vertices_) throw std::runtime_error("native quad vertex buffer creation failed");
-    capacity_=static_cast<UINT>(host.size());
-  }
-  staging_.assign(capacity_,0);
-  std::memcpy(staging_.data(),host.data(),host.size());
-  recorder.UpdateBuffer(*backend_vertices_,0,staging_);
-}
 void QuadStream::Draw(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
                       std::span<const uint8_t> guest) {
   DrawStream(backend,recorder,guest,false);
@@ -152,16 +128,18 @@ void QuadStream::DrawTriangleStrip(NativeRenderBackend& backend,NativeBackendRec
                                    std::span<const uint8_t> guest) {
   DrawStream(backend,recorder,guest,true);
 }
-void QuadStream::DrawStream(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
+void QuadStream::DrawStream(NativeRenderBackend&,NativeBackendRecorder& recorder,
                             std::span<const uint8_t> guest,bool strip) {
-  const auto host=ConvertGuestQuads(guest,strip);
-  Upload(backend,recorder,host);
-  recorder.SetVertexBuffer(0,*backend_vertices_,16,0);
+  static thread_local std::vector<uint8_t> host;
+  ConvertGuestQuadsInto(guest,strip,host);
+  const auto count=static_cast<uint32_t>(host.size()/16);
+  recorder.SetTransientVerticesOwned(0,host,16);
   recorder.SetTopology(strip?NativeBackendTopology::TriangleStrip:NativeBackendTopology::TriangleList);
-  recorder.Draw(static_cast<uint32_t>(host.size()/16),0);
+  recorder.Draw(count,0);
 }
 void QuadStream::DrawStream(ID3D11DeviceContext& context,std::span<const uint8_t> guest,bool strip) {
-  const auto host = ConvertGuestQuads(guest,strip);
+  static thread_local std::vector<uint8_t> host;
+  ConvertGuestQuadsInto(guest,strip,host);
   const UINT bytes = static_cast<UINT>(host.size());
   if (bytes > capacity_) {
     D3D11_BUFFER_DESC desc{};

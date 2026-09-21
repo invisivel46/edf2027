@@ -2,15 +2,66 @@
 #include "d3d11_backend.h"
 #include "binding_runs.h"
 #include <cstring>
+#include <atomic>
+#include <bit>
 #include <stdexcept>
 
 namespace edf::native {
 namespace {
+// Shared by every binding object, so no two images ever carry the same
+// (owner, version) - not even after an object is freed and its address reused.
+uint64_t NextConstantVersion() {
+  static std::atomic<uint64_t> counter{0};
+  return ++counter;
+}
 void Require(HRESULT result, const char* message) {
   if (FAILED(result)) throw std::runtime_error(message);
 }
+template<size_t Components>
+bool UpdateGuestRegister(uint8_t* destination,const uint8_t* source) {
+  // Sources are complete Xbox float4 registers even for reflected float/float2
+  // variables. Convert their bits together, but only write reflected lanes:
+  // partial patches must preserve padding and the neighbouring variables.
+  std::array<uint32_t,4> packed;
+  std::memcpy(packed.data(),source,sizeof(packed));
+  for(auto& word:packed) word=std::byteswap(word);
+  constexpr auto bytes=Components*sizeof(uint32_t);
+  if(std::memcmp(destination,packed.data(),bytes)==0) return false;
+  std::memcpy(destination,packed.data(),bytes);
+  return true;
+}
+// Dispatch once per reflected value, outside its register loop. Fixed lane
+// counts let the compiler inline the comparisons and copies, including the
+// scalar/vector cases, without reading or overwriting neighbouring variables.
+template<bool ClearPadding>
+bool UpdateGuestRegisters(uint8_t* destination,const uint8_t* source,
+                          size_t slots,size_t components,size_t extent=0) {
+  const auto update=[&]<size_t Components>() {
+    bool changed=false;
+    for(size_t slot=0;slot<slots;++slot) {
+      changed=UpdateGuestRegister<Components>(destination+slot*16,source+slot*16) || changed;
+      if constexpr(ClearPadding && Components<4) {
+        const size_t end=slot+1==slots?extent:(slot+1)*16;
+        for(size_t offset=slot*16+Components*4;offset<end;++offset) if(destination[offset]) {
+          destination[offset]=0;
+          changed=true;
+        }
+      }
+    }
+    return changed;
+  };
+  switch(components) {
+    case 1: return update.template operator()<1>();
+    case 2: return update.template operator()<2>();
+    case 3: return update.template operator()<3>();
+    case 4: return update.template operator()<4>();
+    default: throw std::runtime_error("invalid native constant components");
+  }
+}
 }
 ShaderBindings::ShaderBindings(ID3D11Device& device, NativeShader shader)
+    : ShaderBindings(&device,std::move(shader)) {}
+ShaderBindings::ShaderBindings(ID3D11Device* device, NativeShader shader)
     : shader_(std::move(shader)) {
   D3D11_SHADER_DESC description{};
   Require(shader_.reflection->GetDesc(&description), "cannot reflect shader");
@@ -23,6 +74,7 @@ ShaderBindings::ShaderBindings(ID3D11Device& device, NativeShader shader)
       D3D11_SHADER_BUFFER_DESC desc{};
       Require(reflected->GetDesc(&desc), "cannot reflect constant buffer");
       Buffer buffer{binding.BindPoint, std::vector<uint8_t>((desc.Size + 15u) & ~15u), {}};
+      Touch(buffer);
       D3D11_BUFFER_DESC gpu_desc{};
       gpu_desc.ByteWidth = static_cast<UINT>(buffer.bytes.size());
       // Dynamic, so the upload below can discard-and-rename rather than
@@ -34,7 +86,7 @@ ShaderBindings::ShaderBindings(ID3D11Device& device, NativeShader shader)
       gpu_desc.Usage = D3D11_USAGE_DYNAMIC;
       gpu_desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
       gpu_desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-      Require(device.CreateBuffer(&gpu_desc, nullptr, &buffer.gpu), "cannot create constant buffer");
+      if(device) Require(device->CreateBuffer(&gpu_desc, nullptr, &buffer.gpu), "cannot create constant buffer");
       for (UINT v = 0; v < desc.Variables; ++v) {
         D3D11_SHADER_VARIABLE_DESC variable{};
         auto* reflected_variable = reflected->GetVariableByIndex(v);
@@ -59,12 +111,16 @@ ShaderBindings::ShaderBindings(ID3D11Device& device, NativeShader shader)
       throw std::runtime_error("unsupported native shader resource type");
     }
   }
+  constant_images_.reserve(buffers_.size());
+  for(const auto& buffer:buffers_) constant_images_.push_back({buffer.slot,buffer.bytes,&buffer.version});
   EmitBindingRuns<ID3D11ShaderResourceView*,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>(
     texture_values_,[](const auto&) -> ID3D11ShaderResourceView* { return nullptr; },
     [&](UINT slot,UINT count,auto) { texture_runs_.emplace_back(slot,count); });
   EmitBindingRuns<ID3D11SamplerState*,D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT>(
     sampler_values_,[](const auto&) -> ID3D11SamplerState* { return nullptr; },
     [&](UINT slot,UINT count,auto) { sampler_runs_.emplace_back(slot,count); });
+  for(auto& [slot,value]:texture_values_) texture_values_by_slot_.at(slot)=&value;
+  for(auto& [slot,value]:sampler_values_) sampler_values_by_slot_.at(slot)=&value;
 }
 void ShaderBindings::SetConstant(const std::string& name, std::span<const uint8_t> bytes) {
   const auto found = variables_.find(name);
@@ -75,8 +131,13 @@ void ShaderBindings::SetConstant(const std::string& name, std::span<const uint8_
   auto* destination = buffer.bytes.data() + variable.offset;
   if (std::memcmp(destination, bytes.data(), bytes.size()) != 0) {
     std::memcpy(destination, bytes.data(), bytes.size());
-    buffer.dirty = true;
+    Touch(buffer);
   }
+}
+void ShaderBindings::Touch(Buffer& buffer) {
+  buffer.dirty=true;
+  buffer.version=NextConstantVersion();
+  constant_generation_=buffer.version;
 }
 size_t ShaderBindings::GuestFloatRegisterBytes(const std::string& name) const {
   const auto found=variables_.find(name);
@@ -134,23 +195,9 @@ bool ShaderBindings::SetGuestFloatRegisters(const FloatRegisterBinding& binding,
   // Ownership and the live source size were checked above before mutation.
   auto& buffer = buffers_.at(variable.buffer);
   auto* destination = buffer.bytes.data() + variable.offset;
-  for(size_t slot=0;slot<slots;++slot) {
-    for(size_t lane=0;lane<components;++lane) {
-      const size_t offset=slot*16+lane*4;
-      const uint8_t packed[]{registers[offset+3],registers[offset+2],registers[offset+1],registers[offset]};
-      if(std::memcmp(destination+offset,packed,4)!=0) {
-        std::memcpy(destination+offset,packed,4);
-        buffer.dirty=true;
-      }
-    }
-    // Full uploads, unlike partial register patches, zero reflected padding.
-    // The final array element need not occupy all16bytes in reflection.
-    const size_t end=slot+1==slots?variable.size:(slot+1)*16;
-    for(size_t offset=slot*16+components*4;offset<end;++offset) if(destination[offset]) {
-      destination[offset]=0;
-      buffer.dirty=true;
-    }
-  }
+  // Full uploads zero reflected padding; the final array element may be short.
+  const bool changed=UpdateGuestRegisters<true>(destination,registers.data(),slots,components,variable.size);
+  if(changed) Touch(buffer);
   return true;
 }
 bool ShaderBindings::PatchGuestFloatRegisters(const std::string& name, size_t first_slot,
@@ -174,26 +221,35 @@ bool ShaderBindings::PatchGuestFloatRegisters(const FloatRegisterBinding& bindin
     throw std::runtime_error("native constant patch packing overflow");
   auto& buffer=buffers_.at(variable.buffer);
   auto* destination=buffer.bytes.data()+variable.offset;
-  for(size_t slot=0;slot<count;++slot) for(size_t lane=0;lane<components;++lane) {
-    const auto target=(first_slot+slot)*16+lane*4, source=slot*16+lane*4;
-    const uint8_t packed[]{registers[source+3],registers[source+2],registers[source+1],registers[source]};
-    if(std::memcmp(destination+target,packed,4)!=0) {
-      std::memcpy(destination+target,packed,4);
-      buffer.dirty=true;
-    }
-  }
+  const bool changed=UpdateGuestRegisters<false>(destination+first_slot*16,registers.data(),count,components);
+  if(changed) Touch(buffer);
   return true;
 }
 void ShaderBindings::SetTexture(const std::string& name, std::shared_ptr<NativeBackendTexture> texture) {
   if (!TrySetTexture(name, std::move(texture))) throw std::runtime_error("unknown texture: " + name);
 }
-bool ShaderBindings::TrySetTexture(const std::string& name, std::shared_ptr<NativeBackendTexture> texture) {
-  const auto found = textures_.find(name);
-  if (found == textures_.end()) return false;
-  texture_slots_.at(found->second)=texture?NativeD3D11TextureView(*texture):nullptr;
-  texture_values_.at(found->second) = std::move(texture);
-  ++resource_generation_;
+bool ShaderBindings::TrySetTexture(const std::string& name, const std::shared_ptr<NativeBackendTexture>& texture) {
+  const auto found=textures_.find(name);
+  if(found==textures_.end()) return false;
+  const auto slot=found->second;
+  texture_seen_.at(slot)=true;
+  auto& current=*texture_values_by_slot_.at(slot);
+  if(current==texture) return true;
+  texture_slots_.at(slot)=texture?NativeD3D11TextureView(*texture):nullptr;
+  current=texture; ++resource_generation_;
   return true;
+}
+void ShaderBindings::BeginResourceUpdate() {
+  texture_seen_.fill(false);
+  sampler_seen_.fill(false);
+}
+void ShaderBindings::EndResourceUpdate() {
+  for(auto& [slot,texture]:texture_values_) if(!texture_seen_.at(slot) && texture) {
+    texture.reset(); texture_slots_.at(slot)=nullptr; ++resource_generation_;
+  }
+  for(auto& [slot,sampler]:sampler_values_) if(!sampler_seen_.at(slot) && sampler) {
+    sampler=nullptr; sampler_slots_.at(slot)=nullptr; ++resource_generation_;
+  }
 }
 void ShaderBindings::ClearTextures() {
   for (auto& [slot, texture] : texture_values_) { texture.reset(); texture_slots_[slot]=nullptr; }
@@ -213,18 +269,24 @@ ShaderBindings::ResourceBinding ShaderBindings::ResolveResource(const std::strin
   if(const auto found=samplers_.find(name);found!=samplers_.end()) binding.sampler_=found->second;
   return binding;
 }
-bool ShaderBindings::TrySetTexture(const ResourceBinding& binding,std::shared_ptr<NativeBackendTexture> texture) {
+bool ShaderBindings::TrySetTexture(const ResourceBinding& binding,const std::shared_ptr<NativeBackendTexture>& texture) {
   if(binding.owner_!=generation_) throw std::runtime_error("foreign native texture binding");
   if(!binding.texture_) return false;
+  texture_seen_.at(*binding.texture_)=true;
+  auto& current=*texture_values_by_slot_.at(*binding.texture_);
+  if(current==texture) return true;
   texture_slots_.at(*binding.texture_)=texture?NativeD3D11TextureView(*texture):nullptr;
-  texture_values_.at(*binding.texture_)=std::move(texture);
+  current=texture;
   ++resource_generation_;
   return true;
 }
 bool ShaderBindings::TrySetSampler(const ResourceBinding& binding,NativeBackendSampler* sampler) {
   if(binding.owner_!=generation_) throw std::runtime_error("foreign native sampler binding");
   if(!binding.sampler_) return false;
-  sampler_values_.at(*binding.sampler_)=sampler;
+  sampler_seen_.at(*binding.sampler_)=true;
+  auto& current=*sampler_values_by_slot_.at(*binding.sampler_);
+  if(current==sampler) return true;
+  current=sampler;
   sampler_slots_.at(*binding.sampler_)=sampler?NativeD3D11SamplerState(*sampler):nullptr;
   ++resource_generation_;
   return true;
@@ -237,11 +299,14 @@ void ShaderBindings::SetSampler(const std::string& name, NativeBackendSampler* s
   if (!TrySetSampler(name,sampler)) throw std::runtime_error("unknown sampler: " + name);
 }
 bool ShaderBindings::TrySetSampler(const std::string& name, NativeBackendSampler* sampler) {
-  const auto found = samplers_.find(name);
-  if (found == samplers_.end()) return false;
-  sampler_values_.at(found->second) = sampler;
-  sampler_slots_.at(found->second)=sampler?NativeD3D11SamplerState(*sampler):nullptr;
-  ++resource_generation_;
+  const auto found=samplers_.find(name);
+  if(found==samplers_.end()) return false;
+  const auto slot=found->second;
+  sampler_seen_.at(slot)=true;
+  auto& current=*sampler_values_by_slot_.at(slot);
+  if(current==sampler) return true;
+  sampler_slots_.at(slot)=sampler?NativeD3D11SamplerState(*sampler):nullptr;
+  current=sampler; ++resource_generation_;
   return true;
 }
 bool ShaderBindings::HasAllTextureInputs() const {
@@ -259,17 +324,53 @@ bool ShaderBindings::UsesTexture(const NativeBackendTexture& texture) const {
   for(const auto& [slot,bound]:texture_values_) if(bound.get()==&texture) return true;
   return false;
 }
-std::vector<ShaderBindings::TextureImage> ShaderBindings::TextureImages() const {
-  std::vector<TextureImage> images;
-  images.reserve(texture_values_.size());
-  for(const auto& [slot,texture]:texture_values_) images.push_back({slot,texture.get()});
-  return images;
+const std::vector<ShaderBindings::TextureImage>& ShaderBindings::TextureImages() const {
+  if(images_generation_!=resource_generation_) {
+    texture_images_.clear(); sampler_images_.clear();
+    for(const auto& [slot,texture]:texture_values_) texture_images_.push_back({slot,texture.get()});
+    for(const auto& [slot,sampler]:sampler_values_) sampler_images_.push_back({slot,sampler});
+    images_generation_=resource_generation_;
+  }
+  return texture_images_;
 }
-std::vector<ShaderBindings::SamplerImage> ShaderBindings::SamplerImages() const {
-  std::vector<SamplerImage> images;
-  images.reserve(sampler_values_.size());
-  for(const auto& [slot,sampler]:sampler_values_) images.push_back({slot,sampler});
-  return images;
+std::shared_ptr<NativeBackendTexture> ShaderBindings::RetainTexture(UINT slot) const {
+  return texture_values_.at(slot);
+}
+const std::vector<ShaderBindings::SamplerImage>& ShaderBindings::SamplerImages() const {
+  TextureImages();
+  return sampler_images_;
+}
+bool ShaderBindings::SharesConstantLayout(const ShaderBindings& other) const {
+  if(buffers_.size()!=other.buffers_.size() || variables_.size()!=other.variables_.size()) return false;
+  for(size_t i=0;i<buffers_.size();++i)
+    if(buffers_[i].slot!=other.buffers_[i].slot || buffers_[i].bytes.size()!=other.buffers_[i].bytes.size())
+      return false;
+  for(const auto& [name,variable]:variables_) {
+    const auto found=other.variables_.find(name);
+    if(found==other.variables_.end()) return false;
+    const auto& theirs=found->second;
+    if(variable.buffer!=theirs.buffer || variable.offset!=theirs.offset || variable.size!=theirs.size ||
+       variable.type.Class!=theirs.type.Class || variable.type.Type!=theirs.type.Type ||
+       variable.type.Rows!=theirs.type.Rows || variable.type.Columns!=theirs.type.Columns ||
+       variable.type.Elements!=theirs.type.Elements)
+      return false;
+  }
+  return true;
+}
+void ShaderBindings::MirrorConstantsFrom(const ShaderBindings& source) {
+  if(buffers_.size()!=source.buffers_.size())
+    throw std::runtime_error("mirrored constants need the same constant buffers");
+  mirrored_versions_.resize(buffers_.size(),0);
+  for(size_t i=0;i<buffers_.size();++i) {
+    const auto& from=source.buffers_[i];
+    auto& to=buffers_[i];
+    if(mirrored_versions_[i]==from.version) continue;
+    if(from.bytes.size()!=to.bytes.size() || from.slot!=to.slot)
+      throw std::runtime_error("mirrored constant buffers differ in slot or size");
+    std::memcpy(to.bytes.data(),from.bytes.data(),to.bytes.size());
+    Touch(to);
+    mirrored_versions_[i]=from.version;
+  }
 }
 std::vector<float> ShaderBindings::ReadFloatVector(const std::string& name) const {
   const auto found=variables_.find(name);
@@ -326,14 +427,9 @@ std::optional<std::array<float,16>> ShaderBindings::ReadFloat4x4(const std::stri
   }
   return values;
 }
-std::vector<ShaderBindings::ConstantImage> ShaderBindings::ConstantImages() const {
-  std::vector<ConstantImage> images;
-  images.reserve(buffers_.size());
-  for(const auto& buffer:buffers_) images.push_back({buffer.slot,buffer.bytes});
-  return images;
-}
 
 void ShaderBindings::BindConstants(ID3D11DeviceContext& context) {
+  if(!shader_.vertex && !shader_.pixel) throw std::runtime_error("CPU shader bindings require a backend recorder");
   for (auto& buffer : buffers_) {
     if (buffer.dirty) {
       D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -350,6 +446,7 @@ void ShaderBindings::BindConstants(ID3D11DeviceContext& context) {
 }
 
 void ShaderBindings::Bind(ID3D11DeviceContext& context) {
+  if(!shader_.vertex && !shader_.pixel) throw std::runtime_error("CPU shader bindings require a backend recorder");
   if (shader_.entry.pixel) context.PSSetShader(shader_.pixel.Get(), nullptr, 0);
   else context.VSSetShader(shader_.vertex.Get(), nullptr, 0);
   for (auto& buffer : buffers_) {

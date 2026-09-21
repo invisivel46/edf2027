@@ -240,6 +240,20 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET {
   return float4(Source.Load(int3(position.xy,0)).rgb,1);
 })",NativeRenderTarget::Conversion::rgba8,2);
 }
+bool ImportZeroLuminanceHistory(NativeBackendRecorder& recorder,NativeRenderTarget& target,
+                                std::span<const uint8_t> initial_page) {
+  if(target.sampled.width!=1 || target.sampled.height!=1 ||
+     target.conversion!=NativeRenderTarget::Conversion::luminance ||
+     !target.convert_pipeline || !target.sampled.backend || target.content_valid ||
+     target.sampled.content_valid || initial_page.size()!=4096 ||
+     !std::all_of(initial_page.begin(),initial_page.end(),[](uint8_t value) { return value==0; }))
+    return false;
+  const uint16_t pixel[]{0,0x3c00,0x3c00,0x3c00};
+  recorder.UpdateTexture(*target.sampled.backend,
+    {reinterpret_cast<const uint8_t*>(pixel),sizeof(pixel)});
+  target.sampled.content_valid=true;
+  return true;
+}
 bool ImportZeroLuminanceHistory(ID3D11DeviceContext& context,NativeRenderTarget& target,
                                 std::span<const uint8_t> initial_page) {
   if (target.sampled.width!=1 || target.sampled.height!=1 || target.conversion!=NativeRenderTarget::Conversion::luminance ||
@@ -429,6 +443,28 @@ NativeHdrRange InspectNativeHdrColor(ID3D11DeviceContext& context,ID3D11Texture2
   if (range.pixels) for (size_t i=0;i<3;++i) range.mean[i]=totals[i]/double(range.pixels);
   else { range.minimum={}; range.maximum={}; }
   return range;
+}
+std::array<float,4> ReadNativeColorPixel(NativeRenderBackend& backend,NativeBackendTexture& texture,
+    uint32_t format,uint32_t x,uint32_t y) {
+  if((format!=DXGI_FORMAT_R8G8B8A8_UNORM && format!=DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+     x>=texture.width() || y>=texture.height())
+    throw std::runtime_error("unsupported backend diagnostic pixel format/coordinates");
+  const auto pixels=backend.ReadTexture(texture);
+  const size_t stride=format==DXGI_FORMAT_R8G8B8A8_UNORM?4:8;
+  const size_t offset=(size_t(y)*texture.width()+x)*stride;
+  if(offset+stride>pixels.size()) throw std::runtime_error("backend diagnostic pixel readback is incomplete");
+  std::array<float,4> result{};
+  for(size_t i=0;i<4;++i) {
+    if(stride==4) result[i]=pixels[offset+i]/255.f;
+    else {
+      uint16_t bits=0; std::memcpy(&bits,pixels.data()+offset+i*2,2);
+      const int exponent=(bits>>10)&31,mantissa=bits&1023;
+      const float value=exponent==31 ? (mantissa ? std::numeric_limits<float>::quiet_NaN() : std::numeric_limits<float>::infinity()) :
+        exponent ? std::ldexp(float(1024+mantissa),exponent-25) : std::ldexp(float(mantissa),-24);
+      result[i]=bits&0x8000 ? -value : value;
+    }
+  }
+  return result;
 }
 std::array<float,4> ReadNativeColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& surface,uint32_t x,uint32_t y) {
   if(auto resolved=ResolveDiagnosticColor(context,surface))

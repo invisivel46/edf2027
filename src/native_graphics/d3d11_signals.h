@@ -1,5 +1,6 @@
 #pragma once
 #include <d3d11.h>
+#include "native_render_backend.h"
 #include <wrl/client.h>
 #include <cstdint>
 #include <deque>
@@ -60,6 +61,7 @@ inline uint32_t NativeSignalCommandAddress(uint32_t address) {
 class NativeSignalQueue {
  public:
   NativeSignalQueue(ID3D11Device& device,ID3D11DeviceContext& context,size_t capacity=4096);
+  explicit NativeSignalQueue(NativeRenderBackend& backend,size_t capacity=4096);
   NativeSignalQueue(const NativeSignalQueue&)=delete;
   NativeSignalQueue& operator=(const NativeSignalQueue&)=delete;
   void Capture(uint32_t begin,uint32_t bytes,NativeSignal signal);
@@ -78,7 +80,8 @@ class NativeSignalQueue {
   size_t unsubmitted() const { return captured_.size(); }
  private:
   struct Captured { uint32_t begin,bytes; NativeSignal signal; };
-  struct Submitted { std::vector<NativeSignal> signals; Microsoft::WRL::ComPtr<ID3D11Query> query; };
+  struct Submitted { std::vector<NativeSignal> signals; Microsoft::WRL::ComPtr<ID3D11Query> query; std::shared_ptr<NativeBackendCompletion> completion; };
+  NativeRenderBackend* backend_=nullptr;
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
   size_t capacity_,count_=0;

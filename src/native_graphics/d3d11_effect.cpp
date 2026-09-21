@@ -13,10 +13,14 @@ std::string AdaptNormalReconstruction(std::string source) {
   // of sending a negative radicand to SM5 sqrt. Preserve all valid inputs and
   // genuine NaNs; this is scoped to the authored normal decoder, not sqrt.
   static const std::regex helper(R"(float3\s+tex2D_DXT5N_xGxR\s*\([^)]*\)\s*\{[^{}]*\})");
-  static const std::regex reconstruction(R"(N\.z\s*=\s*sqrt\s*\(\s*1\s*-\s*dot\s*\(\s*N\.xy\s*,\s*N\.xy\s*\)\s*\)\s*;)");
+  static const std::regex reconstruction(R"(N\s*\.\s*z\s*=\s*sqrt\s*\(\s*1\s*-\s*dot\s*\(\s*N\s*\.\s*xy\s*,\s*N\s*\.\s*xy\s*\)\s*\)\s*;)");
   std::smatch match;
   if(std::regex_search(source,match,helper)) {
     const auto body=match.str();
+    // A preprocessed instance variant already contains the include adapter's
+    // correction. Recognize that exact expression instead of adapting twice.
+    static const std::regex corrected_reconstruction(R"(float\s+EdfNormalZSquared\s*=\s*1\s*-\s*dot\s*\(\s*N\s*\.\s*xy\s*,\s*N\s*\.\s*xy\s*\)\s*;\s*N\s*\.\s*z\s*=\s*sqrt\s*\(\s*EdfNormalZSquared\s*<\s*0\s*\?\s*0\s*:\s*EdfNormalZSquared\s*\)\s*;)");
+    if(std::regex_search(body,corrected_reconstruction)) return source;
     if(!std::regex_search(body,reconstruction))
       throw std::runtime_error("unrecognized authored DXT5 normal reconstruction");
     const auto corrected=std::regex_replace(body,reconstruction,
@@ -82,7 +86,11 @@ void ValidateNativeShaderLink(const NativeShader& vertex, const NativeShader& pi
                                            pixel.entry.name + " at " + input.SemanticName + std::to_string(input.SemanticIndex));
   }
 }
-NativeShader CompileNativeShader(ID3D11Device& device, const Effect& effect,
+NativeShader CompileNativeShader(ID3D11Device& device,const Effect& effect,const ShaderEntry& entry,
+    const std::filesystem::path& source_path,bool reverse_depth) {
+  return CompileNativeShader(&device,effect,entry,source_path,reverse_depth);
+}
+NativeShader CompileNativeShader(ID3D11Device* device, const Effect& effect,
                                  const ShaderEntry& entry,
                                  const std::filesystem::path& source_path,bool reverse_depth) {
   NativeShader result;
@@ -161,11 +169,106 @@ float4 EdfNativeNormalize(float4 v) { if(dot(v,v)==0) return 0; return normalize
   hr = D3DReflect(result.bytecode->GetBufferPointer(), result.bytecode->GetBufferSize(),
                   __uuidof(ID3D11ShaderReflection), reinterpret_cast<void**>(result.reflection.GetAddressOf()));
   if (FAILED(hr)) throw std::runtime_error("native shader reflection failed: " + entry.name);
+  if (!device) return result;
   if (entry.pixel)
-    hr = device.CreatePixelShader(result.bytecode->GetBufferPointer(), result.bytecode->GetBufferSize(), nullptr, &result.pixel);
+    hr = device->CreatePixelShader(result.bytecode->GetBufferPointer(), result.bytecode->GetBufferSize(), nullptr, &result.pixel);
   else
-    hr = device.CreateVertexShader(result.bytecode->GetBufferPointer(), result.bytecode->GetBufferSize(), nullptr, &result.vertex);
+    hr = device->CreateVertexShader(result.bytecode->GetBufferPointer(), result.bytecode->GetBufferSize(), nullptr, &result.vertex);
   if (FAILED(hr)) throw std::runtime_error("native shader creation failed: " + entry.name);
   return result;
+}
+bool AddNativeWorldInstancing(NativeShader& shader,const Effect& effect,
+    const std::filesystem::path& source_path,bool reverse_depth,std::string* reason) {
+  const auto reject=[&](const char* message) { if(reason) *reason=message; return false; };
+  if(shader.entry.pixel || shader.instanced_bytecode) return reject("pixel shader or already compiled");
+  try {
+    auto* world=shader.reflection->GetVariableByName("g_mWorld");
+    D3D11_SHADER_VARIABLE_DESC wd{}; D3D11_SHADER_TYPE_DESC wt{};
+    D3D11_SHADER_BUFFER_DESC wb{}; D3D11_SHADER_INPUT_BIND_DESC binding{};
+    if(FAILED(world->GetDesc(&wd)) || !(wd.uFlags&D3D_SVF_USED) || wd.Size!=64 ||
+       FAILED(world->GetType()->GetDesc(&wt)) || wt.Type!=D3D_SVT_FLOAT ||
+       wt.Rows!=4 || wt.Columns!=4 || wt.Elements ||
+       (wt.Class!=D3D_SVC_MATRIX_ROWS && wt.Class!=D3D_SVC_MATRIX_COLUMNS) ||
+       FAILED(world->GetBuffer()->GetDesc(&wb)) ||
+       FAILED(shader.reflection->GetResourceBindingDescByName(wb.Name,&binding)) || binding.BindPoint>=14) return reject("world is absent, unused, or not a float4x4");
+    Includes includes(source_path.parent_path());
+    const D3D_SHADER_MACRO defines[]={{"__DX__","1"},{nullptr,nullptr}};
+    Microsoft::WRL::ComPtr<ID3DBlob> preprocessed,errors;
+    if(FAILED(D3DPreprocess(effect.source.data(),effect.source.size(),source_path.string().c_str(),
+      defines,&includes,&preprocessed,&errors))) return reject("preprocessing failed");
+    std::string source(static_cast<const char*>(preprocessed->GetBufferPointer()),preprocessed->GetBufferSize());
+    while(!source.empty() && source.back()=='\0') source.pop_back();
+    if(source.find("edf_instance_")!=std::string::npos ||
+       std::regex_search(source,std::regex("SV_InstanceID|SV_VertexID|EDFINSTANCE",std::regex::icase))) return reject("reserved/system-value input");
+    // Restrict rewriting to a plain, standalone world matrix declaration.
+    // Keep that declaration so the original uniform buffer's offsets survive.
+    const std::regex declaration(R"(\b(?:(?:shared|uniform|row_major|column_major)\s+)*float4x4\s+g_mWorld\s*(?::\s*(?:register\s*\(\s*c[0-9]+\s*\)|[A-Za-z_][A-Za-z_0-9]*))?\s*(?:<[^<>]*>\s*)?;)");
+    std::smatch declared;
+    if(!std::regex_search(source,declared,declaration)) return reject("unsupported world declaration");
+    const auto declaration_text=declared.str();
+    source.replace(size_t(declared.position()),size_t(declared.length()),"edf_instance_declaration_marker;");
+    source=std::regex_replace(source,std::regex(R"(\bg_mWorld\b)"),"edf_instance_world");
+    source.replace(source.find("edf_instance_declaration_marker;"),
+      std::strlen("edf_instance_declaration_marker;"),declaration_text);
+    std::smatch signature;
+    if(!std::regex_search(source,signature,std::regex("\\b([A-Za-z_][A-Za-z_0-9]*)\\s+"+
+        shader.entry.name+"\\s*\\(([^()]*)\\)\\s*\\{"))) return reject("unsupported entry signature");
+    const auto result_type=signature[1].str(),parameters=signature[2].str();
+    std::string arguments;
+    for(size_t begin=0;begin<parameters.size();) {
+      auto end=parameters.find(',',begin); if(end==std::string::npos) end=parameters.size();
+      std::smatch argument; const auto parameter=parameters.substr(begin,end-begin);
+      if(!std::regex_match(parameter,argument,std::regex(
+        "\\s*(?:in\\s+)?[A-Za-z_][A-Za-z_0-9]*\\s+([A-Za-z_][A-Za-z_0-9]*)(?:\\s*:\\s*[A-Za-z_][A-Za-z_0-9]*)?\\s*"))) return reject("unsupported entry parameter");
+      if(!arguments.empty()) arguments+=",";
+      arguments+=argument[1].str(); begin=end+1;
+    }
+    std::string rows;
+    for(unsigned i=0;i<4;++i) {
+      if(i) rows+=",";
+      rows+="edf_instance_row"+std::to_string(i);
+    }
+    std::string matrix="float4x4("+rows+")";
+    if(wt.Class==D3D_SVC_MATRIX_COLUMNS) matrix="transpose("+matrix+")";
+    source="static float4x4 edf_instance_world;\n"+source+"\n"+result_type+
+      " edf_instance_entry("+parameters;
+    for(unsigned i=0;i<4;++i) source+=(i || !parameters.empty()?",":"")+
+      std::string("float4 edf_instance_row")+std::to_string(i)+": EDFINSTANCE"+std::to_string(i);
+    source+=") { edf_instance_world="+matrix+"; return "+shader.entry.name+"("+arguments+"); }\n";
+    Effect variant; variant.source=std::move(source);
+    auto compiled=CompileNativeShader(nullptr,variant,{false,"edf_instance_entry","vs_3_0"},source_path,reverse_depth);
+    D3D11_SHADER_DESC original_desc{},variant_desc{};
+    shader.reflection->GetDesc(&original_desc); compiled.reflection->GetDesc(&variant_desc);
+    if(original_desc.OutputParameters!=variant_desc.OutputParameters) return reject("output count changed");
+    for(UINT i=0;i<original_desc.OutputParameters;++i) {
+      D3D11_SIGNATURE_PARAMETER_DESC a{},b{};
+      shader.reflection->GetOutputParameterDesc(i,&a); compiled.reflection->GetOutputParameterDesc(i,&b);
+      if(std::strcmp(a.SemanticName,b.SemanticName) || a.SemanticIndex!=b.SemanticIndex ||
+         a.Register!=b.Register || a.Mask!=b.Mask || a.ComponentType!=b.ComponentType ||
+         a.SystemValueType!=b.SystemValueType) return reject("output signature changed");
+    }
+    // Every consumed uniform in the alternate shader must still refer to the
+    // exact bytes uploaded for the original. Never infer layout from source.
+    for(UINT i=0;i<variant_desc.BoundResources;++i) {
+      D3D11_SHADER_INPUT_BIND_DESC resource{},old_resource{};
+      compiled.reflection->GetResourceBindingDesc(i,&resource);
+      if(resource.Type!=D3D_SIT_CBUFFER ||
+         FAILED(shader.reflection->GetResourceBindingDescByName(resource.Name,&old_resource)) ||
+         resource.BindPoint!=old_resource.BindPoint) return reject("constant resource layout changed");
+      auto* cb=compiled.reflection->GetConstantBufferByName(resource.Name);
+      D3D11_SHADER_BUFFER_DESC cbd{}; cb->GetDesc(&cbd);
+      for(UINT v=0;v<cbd.Variables;++v) {
+        D3D11_SHADER_VARIABLE_DESC variable{},old_variable{};
+        cb->GetVariableByIndex(v)->GetDesc(&variable);
+        if(!(variable.uFlags&D3D_SVF_USED)) continue;
+        if(FAILED(shader.reflection->GetVariableByName(variable.Name)->GetDesc(&old_variable)) ||
+           variable.StartOffset!=old_variable.StartOffset || variable.Size!=old_variable.Size) return reject("constant variable layout changed");
+      }
+    }
+    shader.instanced_bytecode=compiled.bytecode;
+    shader.instance_world_slot=binding.BindPoint;
+    shader.instance_world_offset=wd.StartOffset;
+    return true;
+  } catch(const std::exception& error) { return reject(error.what()); }
 }
 }  // namespace edf::native

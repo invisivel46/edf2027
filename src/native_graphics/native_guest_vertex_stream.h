@@ -19,6 +19,8 @@ namespace edf::native {
 // empty, not a whole number of triangles, larger than the cap, or contains a
 // non-finite float. Returns host bytes at 8 bytes per vertex.
 std::vector<uint8_t> ConvertGuestPositionTriangles(std::span<const uint8_t> guest);
+// Reuse caller-owned storage. Guest input must not alias host storage.
+void ConvertGuestPositionTrianglesInto(std::span<const uint8_t> guest,std::vector<uint8_t>& host);
 
 // POSITION0 float2 + TEXCOORD0 float2, 16 bytes per vertex. A strip is passed
 // through in order; otherwise the span is four-vertex quads, expanded to
@@ -29,4 +31,5 @@ std::vector<uint8_t> ConvertGuestPositionTriangles(std::span<const uint8_t> gues
 // taken from does not: adding the check here would change which draws the
 // renderer accepts, which is not a thing a refactor should do quietly.
 std::vector<uint8_t> ConvertGuestQuads(std::span<const uint8_t> guest, bool strip);
+void ConvertGuestQuadsInto(std::span<const uint8_t> guest,bool strip,std::vector<uint8_t>& host);
 }  // namespace edf::native

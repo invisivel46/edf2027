@@ -6,6 +6,7 @@
 #include <array>
 #include <map>
 #include <memory>
+#include <optional>
 
 namespace edf::native {
 struct NativeVertexAttribute {
@@ -35,6 +36,9 @@ class NativeVertexBuffer {
     uint32_t guest_stride,uint32_t native_stride,std::span<const uint8_t> source,bool dynamic,
     std::shared_ptr<const std::vector<uint8_t>> validated_snapshot={},size_t snapshot_offset=0);
   std::vector<uint8_t> ConvertVertices(std::span<const uint8_t> source) const;
+  // The same conversion into a caller-owned vector, so a per-draw caller can
+  // reuse one instead of allocating.
+  void ConvertVerticesInto(std::span<const uint8_t> source,std::vector<uint8_t>& native) const;
   void Update(ID3D11DeviceContext& context,std::span<const uint8_t> source);
   void Update(NativeBackendRecorder& recorder,std::span<const uint8_t> source);
   // The backend that made storage_, kept for the identity checks that used to
@@ -79,6 +83,51 @@ class NativeIndexBuffer {
 // Missing known semantics use the guest declaration binder's (0,0,0,1) default.
 class NativeIndexedMesh {
  public:
+  NativeIndexedMesh(const NativeIndexedMesh&)=delete;
+  NativeIndexedMesh& operator=(const NativeIndexedMesh&)=delete;
+  class PreparedDraw {
+   public:
+    void Draw(NativeBackendRecorder& recorder) const;
+   private:
+    friend class NativeIndexedMesh;
+    PreparedDraw(const NativeIndexedMesh* mesh,uint32_t first,uint32_t count,int32_t base)
+      :mesh_(mesh),first_(first),count_(count),base_(base) {}
+    const NativeIndexedMesh* mesh_;
+    uint32_t first_,count_;
+    int32_t base_;
+  };
+  // Bound to this mesh's immutable indices and fixed vertex extent. The
+  // returned reference lives until the next PrepareDraw or mesh destruction.
+  const PreparedDraw& PrepareDraw(uint32_t first,uint32_t count,int32_t base=0);
+  const PreparedDraw* FindPreparedDraw(uint32_t first,uint32_t count,int32_t base=0) const;
+  // A scene may outlive the guest resource and the mesh cache entry. Retain
+  // immutable GPU generations, never the PreparedDraw's borrowed mesh pointer.
+  class RetainedDraw {
+   public:
+    RetainedDraw(const RetainedDraw&)=default;
+    RetainedDraw(RetainedDraw&&)=default;
+    RetainedDraw& operator=(const RetainedDraw&)=delete;
+    RetainedDraw& operator=(RetainedDraw&&)=delete;
+    void Draw(NativeBackendRecorder& recorder) const;
+    // Caller binds an instanced pipeline and the matching instance stream.
+    void DrawInstanced(NativeBackendRecorder& recorder,uint32_t instances) const;
+    const NativeOwnedInputLayout& input_layout() const { return *layout_; }
+    const NativeRenderBackend* backend() const { return backend_.get(); }
+   private:
+    friend class NativeIndexedMesh;
+    RetainedDraw(std::shared_ptr<NativeRenderBackend> backend,
+      const NativeIndexedMesh& mesh,uint32_t first,uint32_t count,int32_t base);
+    void Bind(NativeBackendRecorder& recorder) const;
+    // Declaration order keeps the backend alive through resource destruction.
+    std::shared_ptr<NativeRenderBackend> backend_;
+    std::shared_ptr<const NativeVertexBuffer> vertices_;
+    std::shared_ptr<const NativeIndexBuffer> indices_;
+    std::shared_ptr<const NativeOwnedInputLayout> layout_;
+    uint32_t stride_,first_,count_;
+    int32_t base_;
+  };
+  RetainedDraw RetainDraw(std::shared_ptr<NativeRenderBackend> backend,
+    uint32_t first,uint32_t count,int32_t base=0) const;
   enum class IndexReuse { RequireMatch, ReplaceStale };
   NativeIndexedMesh(NativeRenderBackend& backend,const NativeShader& vertex_shader,
     std::span<const uint8_t> guest_declaration,uint32_t stride,
@@ -106,6 +155,15 @@ class NativeIndexedMesh {
   void DrawLines(ID3D11DeviceContext& context,uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
   void DrawLines(NativeBackendRecorder& recorder,uint32_t first_index,uint32_t index_count,
                  int32_t base_vertex=0) const;
+  // The same draws with this frame's vertices staged through the recorder
+  // instead of written into the mesh's buffer. For a dynamic mesh only: the
+  // bytes are converted per draw against this mesh's declaration, so their
+  // stride and count must be the mesh's. Not a flush boundary, which is the
+  // reason these exist.
+  void DrawTransient(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                     uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
+  void DrawLinesTransient(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                          uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
   // Vertex stride and index width, for a caller building the draw itself.
   uint32_t stride() const { return stride_; }
   void ValidateLineDraw(uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
@@ -125,10 +183,13 @@ class NativeIndexedMesh {
   const NativeOwnedInputLayout& input_layout() const { return input_layout_; }
  private:
   NativeOwnedInputLayout input_layout_;
+  std::optional<PreparedDraw> prepared_draw_;
   void ValidateRange(uint32_t first,uint32_t count,int32_t base,uint32_t primitive_width) const;
   void BindAndDraw(ID3D11DeviceContext& context,uint32_t first,uint32_t count,int32_t base,D3D11_PRIMITIVE_TOPOLOGY topology) const;
   void BindAndDraw(NativeBackendRecorder& recorder,uint32_t first,uint32_t count,int32_t base,
                    NativeBackendTopology topology) const;
+  void BindTransientAndDraw(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                            uint32_t first,uint32_t count,int32_t base,NativeBackendTopology topology) const;
   std::shared_ptr<NativeVertexBuffer> vertex_storage_;
   Microsoft::WRL::ComPtr<ID3D11InputLayout> layout_;
   std::shared_ptr<const NativeIndexBuffer> index_storage_;
@@ -153,6 +214,13 @@ class NativeMeshCache {
   using Key=std::array<uint32_t,5>;
   explicit NativeMeshCache(size_t budget=64*1024*1024,size_t entry_limit=1024,bool dynamic_vertices=false)
       : budget_(budget),entry_limit_(entry_limit),dynamic_vertices_(dynamic_vertices) {}
+  // A consecutive static draw may reuse the exact immutable sources already
+  // owned by its cached mesh. No ownership handles are copied on this path.
+  // A null result changes nothing; Acquire performs the full fallback.
+  NativeIndexedMesh* TryAcquireOwned(NativeRenderBackend& backend,const NativeShader& shader,
+    const Key& key,const NativeDeclaration& declaration,uint32_t stride,
+    std::span<const uint8_t> vertices,std::span<const uint8_t> indices,uint32_t index_bytes);
+  uint64_t owned_hits() const { return owned_hits_; }
   NativeIndexedMesh& Acquire(NativeRenderBackend& backend,const NativeShader& shader,const Key& key,
     std::span<const uint8_t> declaration,uint32_t stride,std::span<const uint8_t> vertices,
     std::span<const uint8_t> indices,uint32_t index_bytes,
@@ -192,6 +260,7 @@ class NativeMeshCache {
     uint64_t prologue_ns=0,lookup_ns=0,tail_ns=0,calls=0;
   };
   const Spend& spend() const { return spend_; }
+  void SetTimingsEnabled(bool enabled) { timings_enabled_=enabled; }
   // Cache-hit validation only; excludes construction/update copies. Candidate
   // lengths are not actual memory traffic: mismatches may short-circuit.
   const SourceChecks& source_checks() const { return source_checks_; }
@@ -215,6 +284,30 @@ class NativeMeshCache {
     std::shared_ptr<const NativeGeneratedIndices> owned_indices;
   };
   std::map<Key,Entry,NativeMeshKeyLess> entries_;
+  // Only accelerates key lookup; every hit still validates layout and sources.
+  Entry* last_entry_=nullptr;
+  Key last_key_{};
+  // A bounded shortcut for alternating meshes. Collisions fall back to the
+  // owning map; full keys and all existing source/layout checks still apply.
+  struct RecentEntry { Key key{}; Entry* entry=nullptr; };
+  std::array<RecentEntry,64> recent_{};
+  static size_t RecentSlot(const Key& key) {
+    uint32_t hash=2166136261u;
+    for(const auto word:key) hash=(hash^word)*16777619u;
+    hash^=hash>>16; hash*=0x7feb352du; hash^=hash>>15;
+    return hash&63u;
+  }
+  void Remember(const Key& key,Entry& entry) {
+    last_entry_=&entry; last_key_=key;
+    recent_[RecentSlot(key)]={key,&entry};
+  }
+  void ForgetLookup(const Key& key) {
+    if(last_entry_ && last_key_==key) last_entry_=nullptr;
+    auto& recent=recent_[RecentSlot(key)];
+    if(recent.entry && recent.key==key) recent.entry=nullptr;
+  }
+  bool timings_enabled_=false;
+  uint64_t owned_hits_=0;
   std::map<uint32_t,std::weak_ptr<const NativeIndexBuffer>> index_resources_;
   std::map<uint32_t,std::weak_ptr<NativeVertexBuffer>> vertex_resources_;
   std::unique_ptr<NativeIndexedMesh> transient_;

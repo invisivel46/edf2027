@@ -712,6 +712,54 @@ int main() {
   }
   {
     using namespace edf::native;
+    NativeBufferWrites reuse;
+    std::vector<uint8_t> payload(12,7);
+    reuse.Subscribe(1,0x1000,12);
+    using Source=NativeBufferWrites::SnapshotSource;
+    using Identity=NativeBufferWrites::SnapshotIdentity;
+    const NativeBufferWrites::SnapshotPolicy policy{0,2,false};
+    std::array<Source,1> sources{{{1,0x1000,payload}}};
+    sources[0].candidate=reuse.CopyObservedSet(sources,nullptr,policy)->front().contents;
+    std::array<Identity,1> identity{{{1,0x1000,12,sources[0].candidate}}};
+    Require(!reuse.TryReuseObservedSet(identity,{}) && !reuse.TryReuseObservedSet(identity,{0,2,true}),
+      "metadata reuse bypassed strict/audit policy");
+    auto invalid=identity; invalid[0].bytes=11;
+    Require(!reuse.TryReuseObservedSet(invalid,policy),"metadata reuse accepted wrong extent");
+    invalid=identity; invalid[0].physical+=4;
+    Require(!reuse.TryReuseObservedSet(invalid,policy),"metadata reuse accepted wrong physical address");
+    invalid=identity; invalid[0].candidate=std::make_shared<const std::vector<uint8_t>>(payload);
+    Require(!reuse.TryReuseObservedSet(invalid,policy),"metadata reuse accepted another candidate");
+    Require(!reuse.TryReuseObservedSet(std::array<Identity,2>{{identity[0],{99,0x2000,12,sources[0].candidate}}},policy),
+      "metadata pair accepted missing second owner");
+    Require(!reuse.TryReuseObservedSet(std::array<Identity,2>{{identity[0],identity[0]}},policy),
+      "duplicate owners bypassed sequential verification schedule");
+    {
+      NativeBufferWrites::WriterScope writer(&reuse);
+      Require(!reuse.TryReuseObservedSet(identity,policy),"active writer allowed metadata reuse");
+    }
+    using View=NativeBufferWrites::SnapshotIdentityView;
+    std::array<View,1> borrowed{{{1,0x1000,12,&sources[0].candidate}}};
+    auto null_view=borrowed; null_view[0].candidate=nullptr;
+    Require(!reuse.TryValidateObservedSet(null_view,policy),"borrowed identity accepted a missing handle");
+    const auto owners=sources[0].candidate.use_count();
+    const auto accepted=reuse.TryValidateObservedSet(borrowed,policy);
+    Require(accepted && sources[0].candidate.use_count()==owners,
+      "failed metadata attempts advanced the successful owner's schedule");
+    Require(!reuse.TryValidateObservedSet(borrowed,policy),"borrowed validation skipped periodic comparison");
+    Require(!reuse.TryReuseObservedSet(identity,policy),"metadata reuse skipped periodic comparison");
+    (void)reuse.CopyObservedSet(sources,nullptr,policy);
+    reuse.Record(0x1000,4);
+    Require(!reuse.TryReuseObservedSet(identity,policy),"changed revision reused old geometry");
+    Require(!reuse.TryValidateObservedSet(borrowed,policy),"borrowed identity crossed a changed revision");
+    Require(!reuse.CommitObserved(1,accepted->front(),[]{}),"metadata token crossed a tracked write");
+    (void)reuse.CopyObservedSet(sources,nullptr,policy);
+    reuse.Unsubscribe(1);
+    Require(!reuse.TryReuseObservedSet(identity,policy),"retired owner allowed metadata reuse");
+    reuse.Subscribe(1,0x1000,12);
+    Require(!reuse.TryReuseObservedSet(identity,policy),"reused owner inherited metadata baseline");
+  }
+  {
+    using namespace edf::native;
     NativeBufferWrites writes;
     writes.Subscribe(1,0x1000,12);
     const auto initial=*writes.Version(1);
@@ -899,17 +947,21 @@ int main() {
     Require(first && (*first)[0].verified && !(*first)[0].revision_audited,
       "first observation skipped its comparison or claimed a baseline");
     sources[0].candidate=(*first)[0].contents;
+    std::array<NativeBufferWrites::SnapshotIdentity,1> identities{{{1,0x1000,payload.size(),sources[0].candidate}}};
+    Require(!writes.TryReuseObservedSet(identities,sampled),"metadata reuse skipped initial verification");
     const auto second=writes.CopyObservedSet(sources,nullptr,sampled);
     Require(second && (*second)[0].verified && (*second)[0].revision_audited,
       "initial verification window ended early");
     // Observations 2 and 3 are proven and unsampled: no guest read at all.
     payload[0]=9; // Only an untrusted observation can still see this.
-    const auto trusted=writes.CopyObservedSet(sources,nullptr,sampled);
+    const auto trusted=writes.TryReuseObservedSet(identities,sampled);
     Require(trusted && !(*trusted)[0].verified && (*trusted)[0].revision_audited &&
       (*trusted)[0].contents==sources[0].candidate && !(*trusted)[0].unreported_change,
       "proven candidate was re-read despite the sampling schedule");
-    Require(!writes.CopyObservedSet(sources,nullptr,sampled)->front().verified,
-      "second unsampled observation was compared");
+    const auto third=writes.TryReuseObservedSet(identities,sampled);
+    Require(third && !third->front().verified,"second unsampled observation was compared");
+    Require(!writes.TryReuseObservedSet(identities,sampled) && !writes.TryReuseObservedSet(identities,sampled),
+      "metadata attempts consumed or bypassed scheduled verification");
     auto trust=writes.Trust();
     Require(trust.trusted==2 && trust.verified==2 && !trust.revoked && !trust.unreported_changes,
       "trust counters did not separate compared and trusted observations");
@@ -921,6 +973,8 @@ int main() {
     trust=writes.Trust();
     Require(trust.revoked && trust.unreported_changes==1,"detected miss did not revoke trust");
     sources[0].candidate=(*detected)[0].contents;
+    identities[0].candidate=sources[0].candidate;
+    Require(!writes.TryReuseObservedSet(identities,sampled),"revoked trust allowed metadata reuse");
     for(unsigned i=0;i<8;++i)
       Require(writes.CopyObservedSet(sources,nullptr,sampled)->front().verified,
         "revoked trust still skipped a comparison");

@@ -44,6 +44,9 @@ static_assert(kNativeCullNone==D3D11_CULL_NONE && kNativeCullFront==D3D11_CULL_F
 static_assert(kNativeDepthWriteZero==D3D11_DEPTH_WRITE_MASK_ZERO && kNativeDepthWriteAll==D3D11_DEPTH_WRITE_MASK_ALL);
 
 NativeRenderState CreateNativeRenderState(ID3D11Device& device,const RenderStateWords& words) {
+  return CreateNativeRenderState(&device,words);
+}
+NativeRenderState CreateNativeRenderState(ID3D11Device* device,const RenderStateWords& words) {
   const auto decoded=DecodeNativeRenderState(words);
   D3D11_BLEND_DESC blend_desc{};
   auto& target = blend_desc.RenderTarget[0];
@@ -68,9 +71,10 @@ NativeRenderState CreateNativeRenderState(ID3D11Device& device,const RenderState
   NativeRenderState result;
   result.requires_blend_factor=decoded.requires_blend_factor;
   result.replicate_blend_alpha=decoded.replicate_blend_alpha;
-  if (FAILED(device.CreateBlendState(&blend_desc,&result.blend)) ||
-      FAILED(device.CreateDepthStencilState(&depth_desc,&result.depth)) ||
-      FAILED(device.CreateRasterizerState(&raster_desc,&result.raster)))
+  if(!device) return result;
+  if (FAILED(device->CreateBlendState(&blend_desc,&result.blend)) ||
+      FAILED(device->CreateDepthStencilState(&depth_desc,&result.depth)) ||
+      FAILED(device->CreateRasterizerState(&raster_desc,&result.raster)))
     throw std::runtime_error("native render state creation failed");
   return result;
 }

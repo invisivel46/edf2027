@@ -126,7 +126,8 @@ class D3D11Pipeline final : public NativeBackendPipeline {
   ComPtr<ID3D11DepthStencilState> depth;
   ComPtr<ID3D11RasterizerState> raster;
   D3D11_PRIMITIVE_TOPOLOGY topology=D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
-  bool requires_blend_factor=false;
+  bool requires_blend_factor_=false;
+  bool requires_blend_factor() const override { return requires_blend_factor_; }
   bool replicate_blend_alpha=false;
 };
 // The factor this pipeline actually wants, from the factor the guest wrote.
@@ -217,6 +218,32 @@ class D3D11Recorder final : public NativeBackendRecorder {
                                format==NativeBackendIndexFormat::Uint16?DXGI_FORMAT_R16_UINT
                                                                        :DXGI_FORMAT_R32_UINT,offset);
   }
+  void SetTransientVertices(uint32_t slot, std::span<const uint8_t> bytes, uint32_t stride) override {
+    if(bytes.empty()) throw std::runtime_error("transient vertices need at least one byte");
+    // One dynamic buffer written NO_OVERWRITE behind a cursor and renamed with
+    // DISCARD when it wraps, so the draws already recorded keep the bytes they
+    // were given - the same promise SetConstants makes above, for vertices.
+    const UINT wanted=static_cast<UINT>((bytes.size()+15)&~size_t(15));
+    if(!transient_vertices_ || transient_capacity_<wanted) {
+      const UINT capacity=(std::max)(wanted,(std::max)(transient_capacity_*2,UINT(256*1024)));
+      const D3D11_BUFFER_DESC desc{capacity,D3D11_USAGE_DYNAMIC,D3D11_BIND_VERTEX_BUFFER,
+                                   D3D11_CPU_ACCESS_WRITE,0,0};
+      transient_vertices_.Reset();
+      Require(device_->CreateBuffer(&desc,nullptr,&transient_vertices_),"transient vertex buffer creation");
+      transient_capacity_=capacity; transient_cursor_=0;
+    }
+    if(transient_cursor_+wanted>transient_capacity_) transient_cursor_=0;
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    Require(context_->Map(transient_vertices_.Get(),0,
+                          transient_cursor_==0?D3D11_MAP_WRITE_DISCARD:D3D11_MAP_WRITE_NO_OVERWRITE,
+                          0,&mapped),"transient vertex map");
+    std::memcpy(static_cast<uint8_t*>(mapped.pData)+transient_cursor_,bytes.data(),bytes.size());
+    context_->Unmap(transient_vertices_.Get(),0);
+    auto* value=transient_vertices_.Get();
+    const UINT offset=transient_cursor_;
+    context_->IASetVertexBuffers(slot,1,&value,&stride,&offset);
+    transient_cursor_+=wanted;
+  }
   void SetTopology(NativeBackendTopology topology) override {
     context_->IASetPrimitiveTopology(Topology(topology));
   }
@@ -227,7 +254,7 @@ class D3D11Recorder final : public NativeBackendRecorder {
     // state rather than on its own.
     if(bound_.pipeline)
       context_->OMSetBlendState(bound_.pipeline->blend.Get(),
-        ResolvedBlendFactor(bound_.pipeline->requires_blend_factor,
+        ResolvedBlendFactor(bound_.pipeline->requires_blend_factor_,
                             bound_.pipeline->replicate_blend_alpha,factor).data(),0xffffffff);
   }
 
@@ -286,12 +313,13 @@ class D3D11Recorder final : public NativeBackendRecorder {
     const D3D11_RECT rect{static_cast<LONG>(viewport.x),static_cast<LONG>(viewport.y),
                           static_cast<LONG>(viewport.x+viewport.width),
                           static_cast<LONG>(viewport.y+viewport.height)};
-    context_->RSSetScissorRects(1,&rect);
+    bound_.viewport_scissor=rect;
+    context_->RSSetScissorRects(1,bound_.scissor_enabled?&bound_.scissor:&bound_.viewport_scissor);
   }
   void SetScissor(const NativeBackendScissor& scissor, bool enabled) override {
-    if(!enabled) return;
-    const D3D11_RECT rect{scissor.left,scissor.top,scissor.right,scissor.bottom};
-    context_->RSSetScissorRects(1,&rect);
+    bound_.scissor_enabled=enabled;
+    bound_.scissor={scissor.left,scissor.top,scissor.right,scissor.bottom};
+    context_->RSSetScissorRects(1,enabled?&bound_.scissor:&bound_.viewport_scissor);
   }
 
   void ClearColor(NativeBackendRenderTarget& target, const std::array<float,4>& color) override {
@@ -406,7 +434,7 @@ class D3D11Recorder final : public NativeBackendRecorder {
   // send the same number of API calls per draw and a timing comparison between
   // them is a comparison of the APIs rather than of two binding strategies.
   void Flush() {
-    if(bound_.pipeline && bound_.pipeline->requires_blend_factor && !bound_.blend_factor_set)
+    if(bound_.pipeline && bound_.pipeline->requires_blend_factor_ && !bound_.blend_factor_set)
       throw std::runtime_error("this draw blends against a constant blend factor that was never set");
     if(bound_.textures_dirty) {
       context_->PSSetShaderResources(0,kTextureSlots,bound_.textures);
@@ -437,6 +465,8 @@ class D3D11Recorder final : public NativeBackendRecorder {
   }
 
   struct Bound {
+    D3D11_RECT viewport_scissor{},scissor{};
+    bool scissor_enabled=false;
     D3D11Pipeline* pipeline=nullptr;
     ID3D11ShaderResourceView* textures[kTextureSlots]{};
     ID3D11SamplerState* samplers[kSamplerSlots]{};
@@ -447,6 +477,8 @@ class D3D11Recorder final : public NativeBackendRecorder {
   ID3D11Device* device_;
   ID3D11DeviceContext* context_;
   ComPtr<ID3D11Buffer> vertex_constants_[kConstantSlots],pixel_constants_[kConstantSlots];
+  ComPtr<ID3D11Buffer> transient_vertices_;
+  UINT transient_capacity_=0,transient_cursor_=0;
   Bound bound_;
   std::vector<Bound> stack_;
 };
@@ -705,7 +737,7 @@ class D3D11Backend final : public NativeRenderBackend {
     raster.MultisampleEnable=desc.sample_count>1;
     Require(device_->CreateRasterizerState(&raster,&pipeline->raster),"raster state creation");
     pipeline->topology=Topology(desc.topology);
-    pipeline->requires_blend_factor=decoded.requires_blend_factor;
+    pipeline->requires_blend_factor_=decoded.requires_blend_factor;
     pipeline->replicate_blend_alpha=decoded.replicate_blend_alpha;
 
     auto& stored=pipelines_.emplace(std::move(key),std::move(pipeline)).first->second;

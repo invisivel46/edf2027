@@ -1,4 +1,5 @@
 #include "native_graphics/native_render_backend.h"
+#include "native_graphics/native_constant_cache.h"
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -64,6 +65,20 @@ class StubBackend final : public edf::native::NativeRenderBackend {
 }  // namespace
 
 int main() {
+  {
+    edf::native::NativeConstantCache constants;
+    const int owner_a=0,owner_b=0; // Only their addresses matter.
+    constants.Store(0,&owner_a,7);
+    Check(constants.Matches(0,&owner_a,7),"unchanged register was not reusable");
+    Check(!constants.Matches(3,&owner_a,7),"shader switch skipped an identical image in a different register");
+    Check(!constants.Matches(0,&owner_b,7),"a different binding object at the same version was mistaken for the sent one");
+    Check(!constants.Matches(0,&owner_a,8),"a changed image was skipped as unchanged");
+    constants.Store(3,&owner_a,7);
+    constants.Store(0,&owner_a,9);
+    Check(constants.Matches(3,&owner_a,7) && !constants.Matches(0,&owner_a,7),"register snapshots alias");
+    constants={};
+    Check(!constants.Matches(3,&owner_a,7),"frame reset retained an unbound register");
+  }
   using namespace edf::native;
   try {
     // An unknown name must fail loudly. Falling back to whatever backend

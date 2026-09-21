@@ -1,5 +1,7 @@
 #pragma once
 #include "native_render_backend.h"
+#include "native_backend_compositor.h"
+#include <optional>
 #include <windows.h>
 #include <atomic>
 #include <cstdint>
@@ -65,6 +67,10 @@ class NativeD3D12Preview {
   std::unique_ptr<NativeBackendTexture> frame_;
   std::unique_ptr<NativeBackendTexture> shared_frame_;
   void* shared_handle_=nullptr;
+  uint64_t source_generation_=0;
+  std::unique_ptr<NativeBackendSharedSurface> copied_;
+  std::unique_ptr<NativeBackendCompositor> compositor_;
+  std::optional<NativeDisplayGamma> gamma_;
   bool shared_refused_=false;
   NativeBackendPipeline* pipeline_=nullptr;
   NativeBackendSampler* sampler_=nullptr;

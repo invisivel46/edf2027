@@ -15,6 +15,7 @@ inline constexpr uint64_t kNativeQuadLayoutId=0x9e3779b97f4a7c02ull;
 class PositionTriangleStream {
  public:
   PositionTriangleStream(ID3D11Device& device,const NativeShader& vertex_shader);
+  PositionTriangleStream(ID3D11Device* device,const NativeShader& vertex_shader);
   PositionTriangleStream(const PositionTriangleStream&)=delete;
   PositionTriangleStream& operator=(const PositionTriangleStream&)=delete;
   void Draw(ID3D11DeviceContext& context,std::span<const uint8_t> guest_vertices);
@@ -25,17 +26,10 @@ class PositionTriangleStream {
   // The layout these vertices are in, for the pipeline that will draw them.
   static std::span<const NativeBackendInputElement> Layout();
  private:
-  // A dynamic buffer is rewritten whole or not at all, so the staging copy is
-  // padded out to the buffer's size rather than the buffer resized per draw.
-  // The draw reads only the vertices that were actually written.
-  void Upload(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
-              std::span<const uint8_t> host);
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11InputLayout> layout_;
   Microsoft::WRL::ComPtr<ID3D11Buffer> vertices_;
   UINT capacity_=0;
-  std::unique_ptr<NativeBackendBuffer> backend_vertices_;
-  std::vector<uint8_t> staging_;
 };
 // Verified retail PostEffect VS_Main and its unconditional full-screen pixel entries. An unknown or
 // modified shader, partial quad, masked/blended draw, or missing input cannot
@@ -48,6 +42,7 @@ bool CanInitializeReductionTarget(const NativeShader& vertex,const NativeShader&
 class QuadStream {
  public:
   QuadStream(ID3D11Device& device, const NativeShader& vertex_shader);
+  QuadStream(ID3D11Device* device, const NativeShader& vertex_shader);
   void Draw(ID3D11DeviceContext& context, std::span<const uint8_t> guest_vertices);
   // XUI's observed immediate producer uses triangle strips with the same
   // float2 position/float2 UV layout. Shader identity remains a separate gate.
@@ -61,13 +56,9 @@ class QuadStream {
   void DrawStream(ID3D11DeviceContext& context,std::span<const uint8_t> guest_vertices,bool strip);
   void DrawStream(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
                   std::span<const uint8_t> guest_vertices,bool strip);
-  void Upload(NativeRenderBackend& backend,NativeBackendRecorder& recorder,
-              std::span<const uint8_t> host);
   Microsoft::WRL::ComPtr<ID3D11Device> device_;
   Microsoft::WRL::ComPtr<ID3D11InputLayout> layout_;
   Microsoft::WRL::ComPtr<ID3D11Buffer> vertices_;
   UINT capacity_ = 0;
-  std::unique_ptr<NativeBackendBuffer> backend_vertices_;
-  std::vector<uint8_t> staging_;
 };
 }

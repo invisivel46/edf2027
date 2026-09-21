@@ -95,6 +95,18 @@ float4 PackingPS() : SV_TARGET {
       // find out.
       const auto images = ps.ConstantImages();
       Require(!images.empty(), "no constant image for a shader with constants");
+      std::vector<std::vector<uint8_t>> previous_images;
+      for(const auto& image:images) previous_images.emplace_back(image.bytes.begin(),image.bytes.end());
+      const float changed_gain=2;
+      ps.SetGuestFloatRegisters("gain",GuestRegisters({&changed_gain,1}));
+      const auto updated_images=ps.ConstantImages();
+      Require(updated_images.data()==images.data() && updated_images.size()==images.size(),
+        "constant descriptions were rebuilt per draw");
+      bool live_change=false;
+      for(size_t i=0;i<images.size();++i)
+        live_change|=!std::equal(images[i].bytes.begin(),images[i].bytes.end(),previous_images[i].begin());
+      Require(live_change,"cached constant descriptions retained stale values");
+      ps.SetGuestFloatRegisters("gain",GuestRegisters({&gain,1}));
       bool found_gain = false;
       for (const auto& image : images) {
         // The reflected accessors are already verified above, so they are what
@@ -223,6 +235,37 @@ float4 PackingPS() : SV_TARGET {
     Require(diagnostic_view==texture.backend.get() && !ps.ReadTexture("filtering"),"diagnostic view snapshot mismatch");
     Require(!ps.HasAllTextureInputs(),"unbound sampler accepted");
     Require(ps.TrySetSampler(resolved_filter,sampler),"resolved sampler upload");
+    // Repeated activation must preserve the generation used by recorded draws.
+    const auto resources_before=ps.resource_generation();
+    ps.BeginResourceUpdate();
+    ps.TrySetTexture(resolved_image,texture.backend);
+    ps.TrySetSampler(resolved_filter,sampler);
+    ps.EndResourceUpdate();
+    Require(ps.resource_generation()==resources_before && ps.HasAllTextureInputs(),
+      "unchanged material invalidated recorded resource reuse");
+    ps.BeginResourceUpdate();
+    ps.TrySetTexture(resolved_image,texture.backend);
+    ps.EndResourceUpdate();
+    Require(!ps.ReadSampler("filtering") && ps.ReadTexture("image")==texture.backend.get() &&
+      ps.resource_generation()!=resources_before,"omitted material sampler stayed bound");
+    ps.BeginResourceUpdate();
+    ps.TrySetSampler(resolved_filter,sampler);
+    ps.EndResourceUpdate();
+    Require(!ps.ReadTexture("image") && ps.ReadSampler("filtering")==sampler,
+      "omitted material texture stayed bound");
+    ps.BeginResourceUpdate();
+    ps.TrySetTexture(resolved_image,texture.backend);
+    ps.TrySetSampler(resolved_filter,sampler);
+    ps.EndResourceUpdate();
+    const auto rebound=ps.resource_generation();
+    ps.BeginResourceUpdate();
+    ps.TrySetTexture(resolved_image,nullptr);
+    ps.TrySetSampler(resolved_filter,nullptr);
+    ps.EndResourceUpdate();
+    Require(!ps.ReadTexture("image") && !ps.ReadSampler("filtering") &&
+      ps.resource_generation()!=rebound,"explicit null material bindings were reused");
+    ps.TrySetTexture(resolved_image,texture.backend);
+    ps.TrySetSampler(resolved_filter,sampler);
     auto* diagnostic_sampler=ps.ReadSampler("filtering");
     Require(diagnostic_sampler==sampler && !ps.ReadSampler("image"),"diagnostic sampler snapshot mismatch");
     Require(!ps.TrySetSampler(resolved_image,nullptr) && !ps.TrySetTexture(resolved_filter,nullptr),

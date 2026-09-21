@@ -1,4 +1,6 @@
 #include "native_graphics/native_pacing.h"
+#include "native_graphics/native_camera_history.h"
+#include "native_graphics/native_model_pose_history.h"
 #include <iostream>
 #include <limits>
 
@@ -10,6 +12,89 @@ int main() {
     if (!ok) { std::cerr << message << '\n'; ++failures; }
   };
   NativePacingClock clock;
+  {
+    NativeModelPoseHistory poses;
+    std::vector<NativePoseMatrix> input{{2,0,0,0, 0,3,0,0, 0,0,4,0, 0,0,0,1}},output;
+    poses.Sample(input,100,0,output);
+    auto next=input;
+    next[0][0]=4; next[0][5]=5; next[0][10]=6; next[0][12]=10;
+    poses.Sample(next,101,.5f,output);
+    check(output[0][0]==3 && output[0][5]==4 && output[0][10]==5 && output[0][12]==5,
+      "scaled bone midpoint lost scale or translation");
+    check(input[0][0]==2 && next[0][12]==10,"bone history modified source poses");
+    poses.Reset(); poses.Sample(next,102,.1f,output);
+    check(output==next,"retired bone source retained previous model history");
+    next[0][1]=1; poses.Sample(next,103,.5f,output);
+    check(output==next,"unsupported sheared bone was distorted");
+    next.resize(2,input[0]); poses.Sample(next,104,.5f,output);
+    check(output==next,"changed skeleton size retained old bone state");
+    poses.Reset(); poses.Sample(input,200,0,output);
+    auto view_dependent=input; view_dependent[0][12]=1;
+    poses.Sample(view_dependent,200,.5f,output);
+    check(poses.render_dependent() && output==view_dependent,"render-dependent pose was interpolated twice");
+    view_dependent[0][12]=2; poses.Sample(view_dependent,201,.2f,output);
+    check(output==view_dependent,"render-dependent pose resumed stale fixed-step blending");
+  }
+  {
+    NativeCameraHistory history;
+    NativeCameraPose origin;
+    origin.world={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+    origin.fov=1;
+    origin.viewport={0,0,1280,720};
+    check(history.Sample(origin,10,.5f)==origin,"first camera sample blended with uninitialized history");
+    auto next=origin;
+    const float sine=std::sqrt(3.f)/2;
+    next.world={.5f,0,-sine,0, 0,1,0,0, sine,0,.5f,0, 10,0,0,1};
+    next.fov=1.1f;
+    const auto half=history.Sample(next,11,.5f);
+    check(std::abs(half.world[0]-sine)<.00001f && std::abs(half.world[2]+.5f)<.00001f &&
+      std::abs(half.world[12]-5)<.00001f && std::abs(half.fov-1.05f)<.00001f,
+      "camera midpoint is not a rigid halfway pose");
+    check(history.Sample(next,11,1)==next,"camera interpolation endpoint mismatch");
+    check(history.Sample(next,13,.1f)==next,"camera blended across missed ticks");
+    auto cut=next; cut.world[12]=1000;
+    check(history.Sample(cut,14,.5f)==cut,"camera teleports were interpolated");
+    cut.viewport[2]=640;
+    check(history.Sample(cut,15,.5f)==cut,"viewport switch retained camera history");
+    cut.world[12]=1001;
+    check(history.Sample(cut,15,.5f)==cut,"same-tick camera replacement retained history");
+    auto invalid=cut; invalid.world[0]=2;
+    check(history.Sample(invalid,16,.5f)==invalid,"non-rigid camera was modified");
+    check(history.Sample(origin,17,.5f)==origin,"invalid camera failed to reset history");
+    // Exercise quaternion extraction around 180 degrees on every major axis,
+    // including the shortest path across the equivalent +/- quaternion signs.
+    for(size_t axis=0;axis<3;++axis) {
+      auto rotated=[&](float angle) {
+        auto pose=origin;
+        const auto j=(axis+1)%3,k=(axis+2)%3;
+        pose.world[j*4+j]=pose.world[k*4+k]=std::cos(angle);
+        pose.world[j*4+k]=std::sin(angle);
+        pose.world[k*4+j]=-std::sin(angle);
+        return pose;
+      };
+      history.Reset();
+      constexpr float pi=3.14159265358979323846f;
+      history.Sample(rotated(pi*.95f),20,0);
+      const auto midpoint=history.Sample(rotated(-pi*.95f),21,.5f);
+      const auto expected=rotated(pi);
+      for(size_t i=0;i<16;++i)
+        check(std::abs(midpoint.world[i]-expected.world[i])<.00001f,"camera rotation took long arc at 180 degrees");
+    }
+    NativePacingClock fractional;
+    const auto epoch=NativePacingClock::Clock::time_point{};
+    fractional.Reset(epoch,123);
+    check(fractional.Fraction(epoch)==0 && std::abs(fractional.Fraction(epoch+milliseconds(25))-.5f)<.000001f &&
+      fractional.Sample(epoch+milliseconds(25))==124,"fractional render phase disagrees with simulation ticks");
+  }
+  for(uint32_t interval:{1u,2u,3u}) {
+    NativeSwapPacingState unpaced{100,99,3,7};
+    for(unsigned frame=0;frame<4;++frame)
+      check(unpaced.CompleteUnpaced(interval) && unpaced.ticks==100 &&
+        unpaced.acknowledged==100 && unpaced.pending==0 && unpaced.callbacks==8+frame,
+        "unpaced acceptance changed simulation ticks or waited for refresh");
+    check(!unpaced.CompleteNative(interval) && unpaced.pending==interval,
+      "returning to paced rendering did not restore interval wait");
+  }
   for(uint32_t phase=1;phase<=100;++phase) {
     NativeSwapPacingState retail{101,100,0,0},native=retail;
     check(!retail.Complete(1u<<16,phase) && retail.pending==1,
