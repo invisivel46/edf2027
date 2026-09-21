@@ -28,9 +28,10 @@ REXCVAR_DECLARE(int32_t, window_height);
 REXCVAR_DECLARE(int32_t, video_mode_width);
 REXCVAR_DECLARE(int32_t, video_mode_height);
 REXCVAR_DECLARE(bool, audio_mute);
-REXCVAR_DECLARE(bool, mnk_mode);
-REXCVAR_DECLARE(bool, mnk_mouse);
-REXCVAR_DECLARE(double, mnk_sensitivity);
+REXCVAR_DECLARE(bool, edf_kbm);
+REXCVAR_DECLARE(bool, edf_kbm_mouse_look);
+REXCVAR_DECLARE(bool, edf_kbm_invert_y);
+REXCVAR_DECLARE(double, edf_kbm_sensitivity);
 REXCVAR_DECLARE(std::string, input_backend);
 REXCVAR_DECLARE(std::string, edf_aspect);
 
@@ -57,9 +58,10 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     unlock_framerate_ = GetBool("edf_native_unlock_framerate", false);
     fps_cap_index_ = 0; for (int i = 0; i < 4; i++) if (kFpsCaps[i] == REXCVAR_GET(edf_fps_cap)) fps_cap_index_ = i;
     mute_ = REXCVAR_GET(audio_mute);
-    mnk_ = REXCVAR_GET(mnk_mode);
-    mnk_mouse_ = REXCVAR_GET(mnk_mouse);
-    mnk_sens_ = (float)REXCVAR_GET(mnk_sensitivity);
+    kbm_ = REXCVAR_GET(edf_kbm);
+    kbm_mouse_ = REXCVAR_GET(edf_kbm_mouse_look);
+    kbm_invert_y_ = REXCVAR_GET(edf_kbm_invert_y);
+    kbm_sens_ = (float)REXCVAR_GET(edf_kbm_sensitivity);
     rumble_ = REXCVAR_GET(edf_rumble);
     show_fps_ = REXCVAR_GET(edf_show_fps);
     frametime_log_ = REXCVAR_GET(edf_frametime_log);
@@ -226,9 +228,13 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     ImGui::Text("Controller: %s", pad_name_.c_str());
     if (ImGui::Checkbox("Controller vibration", &rumble_))
       rex::cvar::SetFlagByName("edf_rumble", rumble_ ? "true" : "false");
-    if (ImGui::Checkbox("Keyboard & mouse controller emulation *", &mnk_)) restart_ = true;
-    if (ImGui::Checkbox("Mouse look (right stick)", &mnk_mouse_)) rex::cvar::SetFlagByName("mnk_mouse", mnk_mouse_ ? "true" : "false");
-    if (ImGui::SliderFloat("Mouse sensitivity", &mnk_sens_, 0.1f, 5.0f, "%.2f")) rex::cvar::SetFlagByName("mnk_sensitivity", std::to_string(mnk_sens_));
+    // Native input, not pad emulation (native_kbm.cpp). The device list is read when the
+    // runtime starts, so switching it on or off needs a restart; the rest applies at once.
+    if (ImGui::Checkbox("Keyboard & mouse *", &kbm_)) restart_ = true;
+    if (ImGui::Checkbox("Aim with the mouse", &kbm_mouse_)) rex::cvar::SetFlagByName("edf_kbm_mouse_look", kbm_mouse_ ? "true" : "false");
+    if (ImGui::Checkbox("Invert vertical aim", &kbm_invert_y_)) rex::cvar::SetFlagByName("edf_kbm_invert_y", kbm_invert_y_ ? "true" : "false");
+    if (ImGui::SliderFloat("Mouse sensitivity", &kbm_sens_, 0.1f, 5.0f, "%.2f")) rex::cvar::SetFlagByName("edf_kbm_sensitivity", std::to_string(kbm_sens_));
+    ImGui::TextDisabled("Uses the Technical control type. A gamepad keeps working alongside.");
     DrawKeybinds();
     ImGui::SeparatorText("Diagnostics");
     if (ImGui::Checkbox("Show FPS", &show_fps_))
@@ -275,7 +281,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   }
 
   // One action row: current binding, then rebind / add / clear.
-  void DrawBindRow(const PadAction& action,
+  void DrawBindRow(const KeyAction& action,
                    const std::vector<std::pair<std::string, std::string>>& bindings) {
     const std::string value = rex::cvar::GetFlagByName(action.cvar);
     const bool capturing_this = capture_cvar_ == action.cvar;
@@ -317,7 +323,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     ImGui::PopID();
   }
 
-  void DrawMouseRow(const PadAction& action) {
+  void DrawMouseRow(const KeyAction& action) {
     ImGui::TableNextRow();
     ImGui::TableSetColumnIndex(0);
     ImGui::TextUnformatted(action.label);
@@ -335,20 +341,20 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
 
   void DrawKeybinds() {
     if (!ImGui::CollapsingHeader("Key bindings")) return;
-    if (!mnk_) ImGui::TextDisabled("Enable keyboard & mouse emulation above to use these.");
+    if (!kbm_) ImGui::TextDisabled("Enable keyboard & mouse above to use these.");
     ImGui::TextDisabled("Bindings apply immediately. Escape stays bound to quitting the game.");
     constexpr ImGuiTableFlags kFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg;
     // Snapshot every binding once per frame so each row can spot a key it shares.
     std::vector<std::pair<std::string, std::string>> bindings;
-    bindings.reserve(std::size(kPadActions));
-    for (const auto& action : kPadActions)
+    bindings.reserve(std::size(kKeyActions));
+    for (const auto& action : kKeyActions)
       bindings.emplace_back(action.cvar, rex::cvar::GetFlagByName(action.cvar));
     const char* group = nullptr;
     if (ImGui::BeginTable("keybinds", 3, kFlags)) {
       ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.40f);
       ImGui::TableSetupColumn("Bound to", ImGuiTableColumnFlags_WidthStretch, 0.35f);
       ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 0.25f);
-      for (const auto& action : kPadActions) {
+      for (const auto& action : kKeyActions) {
         if (!group || std::string_view(group) != action.group) {
           group = action.group;
           ImGui::TableNextRow();
@@ -437,7 +443,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     }
     // Retain legacy quality settings on disk, but do not apply unsupported
     // GPU-plugin controls to the native renderer.
-    rex::cvar::SetFlagByName("mnk_mode", mnk_ ? "true" : "false");
+    rex::cvar::SetFlagByName("edf_kbm", kbm_ ? "true" : "false");
     SaveUserConfig(config_path_);
   }
 
@@ -457,11 +463,11 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   int backend_index_ = 0;
   int display_mode_ = 0, res_index_ = 0, custom_w_ = 1280, custom_h_ = 720, fps_cap_index_ = 0;
   int render_index_=0,render_w_=0,render_h_=0;
-  bool vsync_ = true, mute_ = false, mnk_ = false, mnk_mouse_ = true, rumble_ = true;
+  bool vsync_ = true, mute_ = false, kbm_ = true, kbm_mouse_ = true, kbm_invert_y_ = false, rumble_ = true;
   bool unlock_framerate_ = false;
   bool restart_ = false, saved_ = false, restart_failed_ = false;
   bool show_fps_ = false, frametime_log_ = false, trace_input_ = false;
-  float mnk_sens_ = 1.0f;
+  float kbm_sens_ = 1.0f;
   int af_index_ = 4, fxaa_index_ = 0, aspect_index_ = 0, upscale_index_ = 0, refresh_index_ = 0;
   int fsr_quality_index_ = 0, fsr_passes_ = 4;
   std::string capture_cvar_;      // empty when not rebinding

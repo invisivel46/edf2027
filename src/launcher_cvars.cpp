@@ -21,32 +21,37 @@ REXCVAR_DEFINE_INT32(edf_frame_pacer_spin_us, 250, "EDF2027", "Busy-wait portion
 #include <filesystem>
 #include "keybind_logic.h"
 
-// Mouse buttons are absent from the SDK's mnk driver, so bind them here; input_hooks.cpp
-// folds the result into the guest's XInput state. Values are kMouseTargets tokens.
-REXCVAR_DEFINE_STRING(edf_mouse_left, "right_trigger", "EDF2027", "Pad action for the left mouse button");
-REXCVAR_DEFINE_STRING(edf_mouse_right, "left_trigger", "EDF2027", "Pad action for the right mouse button");
-REXCVAR_DEFINE_STRING(edf_mouse_middle, "lstick_press", "EDF2027", "Pad action for the middle mouse button");
+// Native keyboard bindings, one cvar per game action, generated from the table in
+// keybind_logic.h. Each cvar's default is its table default, so clearing a binding is a
+// real, persisted choice rather than something the next launch refills.
+#define EDF_DEFINE_KEY_CVAR(cvar, label, group, default_value)   REXCVAR_DEFINE_STRING(cvar, default_value, "EDF2027/Keys", label);
+EDF_KEY_ACTIONS(EDF_DEFINE_KEY_CVAR)
+#undef EDF_DEFINE_KEY_CVAR
+
+// Mouse buttons are chosen from a list rather than captured. Values are kMouseTargets tokens.
+REXCVAR_DEFINE_STRING(edf_mouse_left, "fire", "EDF2027", "Action for the left mouse button");
+REXCVAR_DEFINE_STRING(edf_mouse_right, "zoom", "EDF2027", "Action for the right mouse button");
+REXCVAR_DEFINE_STRING(edf_mouse_middle, "next_weapon", "EDF2027", "Action for the middle mouse button");
 
 namespace edf {
 
 // Keyboard & mouse defaults for this game; the binding table lives in keybind_logic.h so the
-// settings dialog and these defaults cannot drift apart. Pad actions in EDF 2017: RT fire,
-// LT zoom, A jump/roll, B reload, X weapon change, Y vehicle, LB/RB radio chat, Start pause,
-// Back retire.
+// settings dialog and these defaults cannot drift apart.
 void ApplyKeyboardDefaults() {
-  static const char* kModeDefaults[][2] = {
-      {"mnk_mode", "true"}, {"mnk_mouse", "true"}, {"mnk_sensitivity", "1.0"}};
-  for (auto& kv : kModeDefaults)
-    if (!rex::cvar::HasNonDefaultValue(kv[0])) rex::cvar::SetFlagByName(kv[0], kv[1]);
-  for (const auto& action : kPadActions)
-    if (!rex::cvar::HasNonDefaultValue(action.cvar)) rex::cvar::SetFlagByName(action.cvar, action.default_value);
+  // Native input replaces the SDK's keyboard-as-pad driver; a config saved by an older
+  // build may still ask for it, and both at once would press everything twice.
+  rex::cvar::SetFlagByName("mnk_mode", "false");
+  rex::cvar::SetFlagByName("mnk_mouse", "false");
+  // A mouse-button value from the pad-emulation era names a pad control, not an action.
   for (const auto& action : kMouseActions)
-    if (!rex::cvar::HasNonDefaultValue(action.cvar)) rex::cvar::SetFlagByName(action.cvar, action.default_value);
+    if (MouseTargetIndex(rex::cvar::GetFlagByName(action.cvar)) == 0 &&
+        rex::cvar::GetFlagByName(action.cvar) != "none")
+      rex::cvar::SetFlagByName(action.cvar, action.default_value);
 }
 
 // "Reset to defaults" in the settings dialog: overwrite whatever the user has set.
 void ResetKeyboardDefaults() {
-  for (const auto& action : kPadActions) rex::cvar::SetFlagByName(action.cvar, action.default_value);
+  for (const auto& action : kKeyActions) rex::cvar::SetFlagByName(action.cvar, action.default_value);
   for (const auto& action : kMouseActions) rex::cvar::SetFlagByName(action.cvar, action.default_value);
 }
 

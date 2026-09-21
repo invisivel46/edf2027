@@ -1,6 +1,6 @@
 // Guest-side input hook: overrides the game's XInputGetState wrapper
 // (sub_8212EA20: r3=user, r4=X_INPUT_STATE*) so we can see exactly what the
-// game polls/receives and adds mouse button bindings.
+// game polls/receives. Keyboard and mouse do not pass through here; see native_kbm.cpp.
 #include <chrono>
 #include <algorithm>
 #include <string>
@@ -11,15 +11,9 @@
 #include <rex/logging.h>
 #include <rex/input/input.h>
 #include <rex/types.h>
-#include <SDL3/SDL.h>
 #include "frame_stats.h"
 #include "core_logic.h"
-#include "keybind_logic.h"
 using rex::be;
-REXCVAR_DECLARE(bool, mnk_mode);
-REXCVAR_DECLARE(std::string, edf_mouse_left);
-REXCVAR_DECLARE(std::string, edf_mouse_right);
-REXCVAR_DECLARE(std::string, edf_mouse_middle);
 REXCVAR_DECLARE(bool, edf_trace_input);
 REXCVAR_DECLARE(bool, edf_rumble);
 REXCVAR_DECLARE(int32_t, edf_frame_pacer_spin_us);
@@ -44,28 +38,6 @@ REX_HOOK_RAW(sub_8212EA20) {
   auto* st = reinterpret_cast<rex::input::X_INPUT_STATE*>(base + ptr);
   uint16_t btn = st->gamepad.buttons;
   ++g_calls;
-  // Keyboard & mouse mode: the SDK driver has no mouse-button bindings, so fold them in here
-  // using this port's own edf_mouse_* cvars (see keybind_logic.h for the action tokens).
-  if (user == 0 && rc == 0 && REXCVAR_GET(mnk_mode)) {
-    static SDL_MouseButtonFlags previous_mouse_buttons = 0;
-    SDL_MouseButtonFlags mb = SDL_GetMouseState(nullptr, nullptr);
-    auto apply = [st](SDL_MouseButtonFlags pressed, const std::string& action) {
-      if (!pressed) return;
-      const edf::MouseTarget& target = edf::MouseTargetAt(edf::MouseTargetIndex(action));
-      if (target.right_trigger) st->gamepad.right_trigger = 0xFF;
-      if (target.left_trigger) st->gamepad.left_trigger = 0xFF;
-      if (target.button_mask) st->gamepad.buttons = (uint16_t)(st->gamepad.buttons | target.button_mask);
-    };
-    apply(mb & SDL_BUTTON_LMASK, REXCVAR_GET(edf_mouse_left));
-    apply(mb & SDL_BUTTON_RMASK, REXCVAR_GET(edf_mouse_right));
-    apply(mb & SDL_BUTTON_MMASK, REXCVAR_GET(edf_mouse_middle));
-    constexpr SDL_MouseButtonFlags kMappedButtons =
-        SDL_BUTTON_LMASK | SDL_BUTTON_RMASK | SDL_BUTTON_MMASK;
-    if ((mb & kMappedButtons) != (previous_mouse_buttons & kMappedButtons))
-      ++st->packet_number;
-    previous_mouse_buttons = mb;
-    btn = st->gamepad.buttons;
-  }
   if (REXCVAR_GET(edf_trace_input) && user == 0 &&
       (rc != g_last_rc || btn != g_last_btn || (g_calls % 6000) == 0)) {
     REXLOG_INFO("XInputGetState hook: user={} rc={:#x} buttons={:#06x} packet={} (call {})", user, rc, btn,

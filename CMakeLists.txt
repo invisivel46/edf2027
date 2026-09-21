@@ -27,6 +27,7 @@ set(EDF2027_SOURCES
     src/main.cpp
     src/input_hooks.cpp
     src/launcher_cvars.cpp
+    src/native_kbm.cpp
 )
 
 if(WIN32)

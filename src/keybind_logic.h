@@ -1,13 +1,14 @@
 // EDF2027 - keyboard and mouse binding tables and bind-string handling.
 //
-// Keyboard bindings live in the SDK's keybind_* cvars, read by its mnk input driver.
-// The value grammar is the driver's (see mnk_input_driver.cpp): a comma-separated list
-// of alternatives, each "Mod+Mod+Key", where Mod is Shift, Ctrl/Control or Alt and Key
-// is a name from the SDK's key table. Modifiers must match exactly at press time, so
-// "W" does not fire while Shift is held.
+// Bindings name game actions, not pad buttons: native_kbm.cpp writes them into the game's
+// own input channels (see native_kbm_logic.h), and the SDK's pad-emulation driver is off.
+// They live in this port's kbm_* cvars. The value grammar is a comma-separated list of
+// alternatives, each "Mod+Mod+Key", where Mod is Shift, Ctrl/Control or Alt and Key is a
+// name from the SDK's key table. A bind needs the modifiers it names and ignores others,
+// so "W" still moves while Shift is held.
 //
-// Mouse buttons are not part of that driver, so this port binds them to pad actions
-// itself (input_hooks.cpp folds them into the guest's XInput state).
+// Mouse buttons are chosen from a list rather than captured, since key capture runs
+// through the app's key events.
 //
 // Pure logic only - no SDK, ImGui or platform headers - so the unit tests can cover it.
 #pragma once
@@ -22,73 +23,72 @@
 
 namespace edf {
 
-struct PadAction {
+struct KeyAction {
   const char* cvar;
   const char* label;
   const char* group;
   const char* default_value;
 };
 
-// The keyboard bindings this port exposes, in display order. Also the source of truth
-// for the first-run defaults applied in launcher_cvars.cpp.
-inline constexpr PadAction kPadActions[] = {
-    {"keybind_lstick_up", "Move forward", "Movement", "W"},
-    {"keybind_lstick_down", "Move back", "Movement", "S"},
-    {"keybind_lstick_left", "Strafe left", "Movement", "A"},
-    {"keybind_lstick_right", "Strafe right", "Movement", "D"},
-    {"keybind_lstick_press", "Left stick press", "Movement", "F"},
-    {"keybind_rstick_up", "Look up", "Camera", "I"},
-    {"keybind_rstick_down", "Look down", "Camera", "K"},
-    {"keybind_rstick_left", "Look left", "Camera", "J"},
-    {"keybind_rstick_right", "Look right", "Camera", "L"},
-    {"keybind_rstick_press", "Right stick press", "Camera", "C"},
-    {"keybind_right_trigger", "Fire (RT)", "Combat", "Ctrl,X"},
-    {"keybind_left_trigger", "Zoom (LT)", "Combat", "Alt,Z"},
-    {"keybind_a", "Jump / roll (A)", "Combat", "Space"},
-    {"keybind_b", "Reload (B)", "Combat", "R"},
-    {"keybind_x", "Change weapon (X)", "Combat", "Q"},
-    {"keybind_y", "Enter vehicle (Y)", "Combat", "E"},
-    {"keybind_left_shoulder", "Radio chat left (LB)", "Combat", "1"},
-    {"keybind_right_shoulder", "Radio chat right (RB)", "Combat", "3"},
-    {"keybind_dpad_up", "D-pad up", "D-pad", "Up"},
-    {"keybind_dpad_down", "D-pad down", "D-pad", "Down"},
-    {"keybind_dpad_left", "D-pad left", "D-pad", "Left"},
-    {"keybind_dpad_right", "D-pad right", "D-pad", "Right"},
-    {"keybind_start", "Pause (Start)", "System", "Return"},
-    {"keybind_back", "Retire (Back)", "System", "Tab"},
-    {"keybind_guide", "Guide", "System", ""},
+// X(cvar, label, group, default). One list, so the table below and the cvar definitions
+// in launcher_cvars.cpp cannot disagree about a name or a default.
+#define EDF_KEY_ACTIONS(X) \
+  X(kbm_move_forward, "Move forward", "Movement", "W") \
+  X(kbm_move_back, "Move back", "Movement", "S") \
+  X(kbm_strafe_left, "Strafe left", "Movement", "A") \
+  X(kbm_strafe_right, "Strafe right", "Movement", "D") \
+  X(kbm_fire, "Fire", "Combat", "X") \
+  X(kbm_zoom, "Weapon zoom", "Combat", "Z") \
+  X(kbm_jump, "Jump / roll, menu confirm", "Combat", "Space") \
+  X(kbm_next_weapon, "Next weapon", "Combat", "Q") \
+  X(kbm_vehicle, "Enter vehicle (pad Y)", "Combat", "E") \
+  X(kbm_pad_x, "Pad X", "Combat", "R") \
+  X(kbm_cancel, "Menu cancel (pad B)", "Combat", "Backspace") \
+  X(kbm_lstick_press, "Left stick press", "Combat", "F") \
+  X(kbm_rstick_press, "Right stick press", "Combat", "C") \
+  X(kbm_menu_up, "Menu up", "Menus", "Up") \
+  X(kbm_menu_down, "Menu down", "Menus", "Down") \
+  X(kbm_menu_left, "Menu left", "Menus", "Left") \
+  X(kbm_menu_right, "Menu right", "Menus", "Right") \
+  X(kbm_start, "Start (title screen, pause)", "System", "Return") \
+  X(kbm_back, "Back (retire)", "System", "Tab")
+
+// The keyboard bindings this port exposes, in display order, which is also the order of
+// edf::kbm::Action in native_kbm_logic.h. Fire, zoom, jump and next weapon follow whatever pad
+// control the in-game controller settings give them; the rest are fixed controls, named
+// by what is known of them.
+#define EDF_KEY_ACTION_ROW(cvar, label, group, default_value) {#cvar, label, group, default_value},
+inline constexpr KeyAction kKeyActions[] = {EDF_KEY_ACTIONS(EDF_KEY_ACTION_ROW)};
+#undef EDF_KEY_ACTION_ROW
+
+// Mouse buttons are bound to an action rather than to a key.
+inline constexpr KeyAction kMouseActions[] = {
+    {"edf_mouse_left", "Left button", "Mouse", "fire"},
+    {"edf_mouse_right", "Right button", "Mouse", "zoom"},
+    {"edf_mouse_middle", "Middle button", "Mouse", "next_weapon"},
 };
 
-// Mouse buttons are bound to a pad action rather than to a key.
-inline constexpr PadAction kMouseActions[] = {
-    {"edf_mouse_left", "Left button", "Mouse", "right_trigger"},
-    {"edf_mouse_right", "Right button", "Mouse", "left_trigger"},
-    {"edf_mouse_middle", "Middle button", "Mouse", "lstick_press"},
-};
-
-// Pad actions a mouse button can be bound to, in combo order.
+// Actions a mouse button can be bound to, in combo order. `action` indexes kKeyActions
+// (and edf::kbm::Action); -1 is unbound.
 struct MouseTarget {
   const char* value;
   const char* label;
-  uint16_t button_mask;  // X_INPUT_GAMEPAD button bit, 0 for the triggers
-  bool left_trigger;
-  bool right_trigger;
+  int action;
 };
 
 inline constexpr MouseTarget kMouseTargets[] = {
-    {"none", "Unbound", 0, false, false},
-    {"right_trigger", "Fire (RT)", 0, false, true},
-    {"left_trigger", "Zoom (LT)", 0, true, false},
-    {"a", "Jump / roll (A)", 0x1000, false, false},
-    {"b", "Reload (B)", 0x2000, false, false},
-    {"x", "Change weapon (X)", 0x4000, false, false},
-    {"y", "Enter vehicle (Y)", 0x8000, false, false},
-    {"left_shoulder", "Radio chat left (LB)", 0x0100, false, false},
-    {"right_shoulder", "Radio chat right (RB)", 0x0200, false, false},
-    {"lstick_press", "Left stick press", 0x0040, false, false},
-    {"rstick_press", "Right stick press", 0x0080, false, false},
-    {"start", "Pause (Start)", 0x0010, false, false},
-    {"back", "Retire (Back)", 0x0020, false, false},
+    {"none", "Unbound", -1},
+    {"fire", "Fire", 4},
+    {"zoom", "Weapon zoom", 5},
+    {"jump", "Jump / roll, menu confirm", 6},
+    {"next_weapon", "Next weapon", 7},
+    {"vehicle", "Enter vehicle (pad Y)", 8},
+    {"pad_x", "Pad X", 9},
+    {"cancel", "Menu cancel (pad B)", 10},
+    {"lstick_press", "Left stick press", 11},
+    {"rstick_press", "Right stick press", 12},
+    {"start", "Start (title screen, pause)", 17},
+    {"back", "Back (retire)", 18},
 };
 
 inline constexpr int kMouseTargetCount = static_cast<int>(std::size(kMouseTargets));
@@ -176,7 +176,7 @@ inline std::string PrettyBind(std::string_view value) {
 
 // Display name for a cvar, for messages that name the other side of a conflict.
 inline std::string_view ActionLabel(std::string_view cvar) {
-  for (const auto& action : kPadActions)
+  for (const auto& action : kKeyActions)
     if (cvar == action.cvar) return action.label;
   for (const auto& action : kMouseActions)
     if (cvar == action.cvar) return action.label;

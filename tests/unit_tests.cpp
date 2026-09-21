@@ -1,6 +1,7 @@
 #include "core_logic.h"
 #include "scripted_input_logic.h"
 #include "keybind_logic.h"
+#include "native_kbm_logic.h"
 #include "xdvdfs.h"
 
 #include <algorithm>
@@ -306,32 +307,157 @@ void TestKeybinds() {
   CHECK(edf::PrettyBind("Space") == "Space");
   CHECK(edf::PrettyBind("Space,R") == "Space  or  R");
 
-  // Mouse targets: tokens are what input_hooks.cpp folds into the guest pad state.
-  CHECK(edf::MouseTargetIndex("none") == 0);
-  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("right_trigger")).right_trigger);
-  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("left_trigger")).left_trigger);
-  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("lstick_press")).button_mask == 0x0040);
-  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("a")).button_mask == 0x1000);
-  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("start")).button_mask == 0x0010);
+  // Mouse targets name game actions; each must point at the row it is labelled as.
+  CHECK(edf::MouseTargetIndex("none") == 0 && edf::MouseTargetAt(0).action == -1);
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("fire")).action == static_cast<int>(edf::kbm::Action::kFire));
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("zoom")).action == static_cast<int>(edf::kbm::Action::kZoom));
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("start")).action == static_cast<int>(edf::kbm::Action::kStart));
+  for (int i = 1; i < edf::kMouseTargetCount; ++i) {
+    const auto& target = edf::MouseTargetAt(i);
+    CHECK(target.action >= 0 && target.action < static_cast<int>(std::size(edf::kKeyActions)));
+    CHECK(std::string_view(target.label) == edf::kKeyActions[target.action].label);
+  }
   // Unknown or out-of-range values fall back to "unbound" rather than a random action.
   CHECK(edf::MouseTargetIndex("nonsense") == 0);
-  CHECK(edf::MouseTargetAt(-1).button_mask == 0 && edf::MouseTargetAt(999).button_mask == 0);
+  CHECK(edf::MouseTargetIndex("right_trigger") == 0);  // a pad-emulation era value
+  CHECK(edf::MouseTargetAt(-1).action == -1 && edf::MouseTargetAt(999).action == -1);
   for (int i = 0; i < edf::kMouseTargetCount; ++i)
     CHECK(edf::MouseTargetIndex(edf::MouseTargetAt(i).value) == i);
+  for (const auto& action : edf::kMouseActions)
+    CHECK(edf::MouseTargetIndex(action.default_value) != 0);
 
   // Every action needs a distinct cvar, or two rows would edit the same binding.
-  for (size_t i = 0; i < std::size(edf::kPadActions); ++i) {
-    CHECK(edf::kPadActions[i].label && edf::kPadActions[i].group);
-    for (size_t j = i + 1; j < std::size(edf::kPadActions); ++j)
-      CHECK(std::string_view(edf::kPadActions[i].cvar) != edf::kPadActions[j].cvar);
+  for (size_t i = 0; i < std::size(edf::kKeyActions); ++i) {
+    CHECK(edf::kKeyActions[i].label && edf::kKeyActions[i].group);
+    for (size_t j = i + 1; j < std::size(edf::kKeyActions); ++j)
+      CHECK(std::string_view(edf::kKeyActions[i].cvar) != edf::kKeyActions[j].cvar);
   }
 
   // Defaults must not collide, or an action would silently shadow another in game.
   std::vector<std::pair<std::string, std::string>> defaults;
-  for (const auto& action : edf::kPadActions) defaults.emplace_back(action.cvar, action.default_value);
-  for (const auto& action : edf::kPadActions)
+  for (const auto& action : edf::kKeyActions) defaults.emplace_back(action.cvar, action.default_value);
+  for (const auto& action : edf::kKeyActions)
     for (const auto& token : edf::SplitBind(action.default_value))
       CHECK(edf::ConflictingAction(token, action.cvar, defaults).empty());
+}
+
+uint16_t TestKeyCode(std::string_view name) {
+  if (name.size() == 1 && name[0] >= 'A' && name[0] <= 'Z') return static_cast<uint16_t>(name[0]);
+  if (name == "Space") return 0x20;
+  if (name == "Ctrl") return edf::kbm::kVkControl;
+  return 0;
+}
+
+void TestNativeKbm() {
+  using namespace edf::kbm;
+  // The action enum is the index into the binding table, so the two must stay in step.
+  CHECK(kActionCount == std::size(edf::kKeyActions));
+  CHECK(std::string_view(edf::kKeyActions[static_cast<size_t>(Action::kMoveForward)].cvar) == "kbm_move_forward");
+  CHECK(std::string_view(edf::kKeyActions[static_cast<size_t>(Action::kFire)].cvar) == "kbm_fire");
+  CHECK(std::string_view(edf::kKeyActions[static_cast<size_t>(Action::kNextWeapon)].cvar) == "kbm_next_weapon");
+  CHECK(std::string_view(edf::kKeyActions[static_cast<size_t>(Action::kRightStickPress)].cvar) == "kbm_rstick_press");
+  CHECK(std::string_view(edf::kKeyActions[static_cast<size_t>(Action::kMenuRight)].cvar) == "kbm_menu_right");
+  CHECK(std::string_view(edf::kKeyActions[static_cast<size_t>(Action::kBack)].cvar) == "kbm_back");
+
+  // Binds: unknown names are dropped, and a bind needs only the modifiers it names.
+  CHECK(ParseBind("", &TestKeyCode).empty());
+  CHECK(ParseBind("W", nullptr).empty());
+  CHECK(ParseBind("Nonsense", &TestKeyCode).empty());
+  { const auto bind = ParseBind("W, Shift+Q ,Nonsense", &TestKeyCode);
+    CHECK(bind.size() == 2 && bind[0].key == 'W' && bind[0].modifiers == 0);
+    CHECK(bind[1].key == 'Q' && bind[1].modifiers == kModShift); }
+  { const auto move = ParseBind("W", &TestKeyCode);
+    const auto shifted = ParseBind("Shift+Q", &TestKeyCode);
+    const auto bare_modifier = ParseBind("Ctrl", &TestKeyCode);
+    KeyState keys{};
+    CHECK(!BindPressed(move, keys) && !BindPressed(shifted, keys));
+    keys['W'] = true;
+    CHECK(BindPressed(move, keys));
+    keys[kVkShift] = true;
+    CHECK(BindPressed(move, keys));  // still walks while Shift is held
+    keys['Q'] = true;
+    CHECK(BindPressed(shifted, keys));
+    keys[kVkShift] = false;
+    CHECK(!BindPressed(shifted, keys));
+    keys[kVkControl] = true;
+    CHECK(BindPressed(bare_modifier, keys)); }  // a bare modifier is a usable key
+
+  // Profile words outside the ten-name table keep the default instead of indexing past it.
+  CHECK(ResolvePadControl(7, PadControl::kA) == PadControl::kRightTrigger);
+  CHECK(ResolvePadControl(10, PadControl::kLeftShoulder) == PadControl::kLeftShoulder);
+  CHECK(ResolvePadControl(0xFFFFFFFFu, PadControl::kB) == PadControl::kB);
+
+  // Actions reach the pad controls the player's profile gives them.
+  { ActionState actions{};
+    const auto pressed = [](const ChannelFrame& frame, PadControl control) { return frame.pad[static_cast<size_t>(control)]; };
+    ChannelFrame idle = BuildChannelFrame(actions, {});
+    CHECK(idle.move_x == 0 && idle.move_y == 0 && idle.menu_x == 0 && idle.menu_y == 0 && !idle.start && !idle.back);
+    for (bool control : idle.pad) CHECK(!control);
+
+    actions[static_cast<size_t>(Action::kMoveForward)] = true;
+    actions[static_cast<size_t>(Action::kStrafeLeft)] = true;
+    actions[static_cast<size_t>(Action::kFire)] = true;
+    actions[static_cast<size_t>(Action::kJump)] = true;
+    ChannelFrame frame = BuildChannelFrame(actions, {});
+    CHECK(frame.move_x == -1 && frame.move_y == 1);
+    CHECK(pressed(frame, PadControl::kRightTrigger) && pressed(frame, PadControl::kLeftTrigger));
+    CHECK(pressed(frame, PadControl::kA));  // jump doubles as menu confirm
+    CHECK(!pressed(frame, PadControl::kLeftShoulder) && !pressed(frame, PadControl::kRightShoulder));
+
+    TechnicalBindings remapped;
+    remapped.fire = PadControl::kX;
+    frame = BuildChannelFrame(actions, remapped);
+    CHECK(pressed(frame, PadControl::kX) && !pressed(frame, PadControl::kRightTrigger));
+
+    actions[static_cast<size_t>(Action::kMoveBack)] = true;  // opposite keys cancel
+    CHECK(BuildChannelFrame(actions, {}).move_y == 0); }
+
+  CHECK(MergeButton(0.25f, false) == 0.25f && MergeButton(0.25f, true) == 1.0f);
+
+  // Mouse counts become the input that makes the guest turn by exactly that angle:
+  // angle = input * (profile_sensitivity / zoom) * 0.05, so with zoom 1 the product below
+  // must equal counts * sensitivity * 0.05 degrees.
+  { const float input = AimInputForCounts(100.0f, 2.0f, 0.5f);
+    const float turned = input * 0.5f * kGuestAimStep;
+    CHECK(std::fabs(turned - 100.0f * 2.0f * kDegreesPerCount * kRadiansPerDegree) < 1e-6f);
+    // The in-game stick sensitivity must not scale the mouse.
+    const float other = AimInputForCounts(100.0f, 2.0f, 1.0f) * 1.0f * kGuestAimStep;
+    CHECK(std::fabs(other - turned) < 1e-6f);
+    CHECK(AimInputForCounts(-40.0f, 1.0f, 0.5f) == -AimInputForCounts(40.0f, 1.0f, 0.5f));
+    // A zero, negative or non-finite profile value falls back to the guest default.
+    CHECK(AimInputForCounts(10.0f, 1.0f, 0.0f) == AimInputForCounts(10.0f, 1.0f, kGuestDefaultSensitivity));
+    CHECK(AimInputForCounts(10.0f, 1.0f, -3.0f) == AimInputForCounts(10.0f, 1.0f, kGuestDefaultSensitivity));
+    CHECK(AimInputForCounts(10.0f, 1.0f, NAN) == AimInputForCounts(10.0f, 1.0f, kGuestDefaultSensitivity));
+    CHECK(AimInputForCounts(NAN, 1.0f, 0.5f) == 0.0f); }
+
+  // Mouse routing: exact angles while the on-foot aim update is running, a right-stick
+  // rate otherwise, and nothing carried from one mode into the other.
+  { MouseRouter router;
+    float dx = 1.0f, dy = 1.0f;
+    MouseRouter::Stick stick = router.OnPoll(10.0f, -5.0f, 1.0f);  // nobody has aimed yet
+    CHECK(std::fabs(stick.x - 10.0f * MouseRouter::kStickPerCount) < 1e-6f);
+    CHECK(std::fabs(stick.y - 5.0f * MouseRouter::kStickPerCount) < 1e-6f);  // mouse up is stick up
+    router.OnAim(dx, dy);
+    CHECK(dx == 0.0f && dy == 0.0f);  // the fallback's motion is not replayed on foot
+
+    stick = router.OnPoll(3.0f, 4.0f, 1.0f);
+    CHECK(stick.x == 0.0f && stick.y == 0.0f);
+    router.OnPoll(1.0f, 1.0f, 1.0f);  // two polls before the next tick, as when unlocked
+    router.OnAim(dx, dy);
+    CHECK(dx == 4.0f && dy == 5.0f);
+    router.OnAim(dx, dy);
+    CHECK(dx == 0.0f && dy == 0.0f);
+
+    for (uint32_t i = 0; i < MouseRouter::kOnFootGracePolls; ++i) router.OnPoll(2.0f, 0.0f, 1.0f);
+    stick = router.OnPoll(1000.0f, 0.0f, 1.0f);  // aim stopped running: fallback, clamped
+    CHECK(stick.x == 1.0f);
+    router.OnAim(dx, dy);
+    CHECK(dx == 0.0f && dy == 0.0f);
+
+    router.OnPoll(7.0f, 0.0f, 1.0f);
+    router.Reset();
+    router.OnAim(dx, dy);
+    CHECK(dx == 0.0f && dy == 0.0f); }
 }
 }  // namespace
 
@@ -343,6 +469,7 @@ int main() {
   TestGraphicsMapping();
   TestXdvdfs();
   TestKeybinds();
+  TestNativeKbm();
   if (failures) std::cerr << failures << " test assertion(s) failed\n";
   else std::cout << "All unit tests passed\n";
   return failures ? 1 : 0;

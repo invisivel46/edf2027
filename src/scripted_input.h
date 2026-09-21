@@ -12,6 +12,7 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include "native_kbm_driver.h"
 #include "scripted_input_logic.h"
 
 class ScriptedInputDriver final : public rex::input::InputDriver {
@@ -101,6 +102,7 @@ class ScriptedInputDriver final : public rex::input::InputDriver {
 
 inline std::unique_ptr<rex::system::IInputSystem> CreateEdfInputSystem(bool tool_mode) {
   auto sys = rex::input::CreateDefaultInputSystem(tool_mode);
+  sys->AddDriver(std::make_unique<NativeKbmDriver>());  // reports nothing while edf_kbm is off
   if (ScriptedInputDriver::Enabled()) {
     sys->AddDriver(std::make_unique<ScriptedInputDriver>());
     sys->SetDeviceAssignment(std::make_unique<rex::input::SharedAssignment>());  // every device (incl. the scripted pad) feeds user 0

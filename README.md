@@ -133,24 +133,40 @@ Any gamepad SDL3 recognizes (Xbox, PlayStation, Switch Pro, …) works out of th
 box; `gamecontrollerdb.txt` adds community mappings. Prefer XInput with
 `--input_backend xinput`.
 
-Keyboard & mouse (enable *Keyboard & mouse controller emulation* in F1 settings):
+Keyboard & mouse are native, not a pretend gamepad: keys go straight into the
+game's own input channels, and the mouse is added to the soldier's aim as an
+angle, so it has no stick deadzone, no turn-rate cap and no acceleration. A
+gamepad keeps working alongside. It is on by default (*Keyboard & mouse* in F1
+settings) and uses the game's **Technical** control type, which it selects for
+player 1.
 
 | Key | Action | Key | Action |
 |---|---|---|---|
-| W A S D | Move | I J K L | Look (mouse-look fallback) |
-| Mouse | Look (right stick) | Arrows | D-pad |
-| Left mouse / Ctrl / X | Fire (RT) | Right mouse / Alt / Z | Zoom (LT) |
-| Space | Jump / roll (A) | R | Reload (B) |
-| Q | Change weapon (X) | E | Enter vehicle (Y) |
-| 1 / 3 | Radio chat (LB / RB) | F / C | Stick press (L3 / R3) |
-| Enter | Pause (Start) | Tab | Retire (Back) |
+| W A S D | Move | Mouse | Aim |
+| Left mouse / X | Fire | Right mouse / Z | Weapon zoom |
+| Space | Jump / roll, confirm in menus | Middle mouse / Q | Next weapon |
+| E | Enter vehicle (pad Y) | Backspace | Cancel in menus (pad B) |
+| Arrows | Menu navigation (d-pad) | R | Pad X |
+| Enter | Start: title screen, pause | Tab | Back: retire |
+| F / C | Stick press (L3 / R3) | | |
+
+Mouse sensitivity 1.0 turns 0.05° per mouse count; a zoomed weapon divides that
+by its magnification, as the game does for the stick. The in-game stick
+sensitivity does not affect the mouse. *Invert vertical aim* is in F1 settings.
+In vehicles the mouse falls back to driving the right stick as a rate, because
+how each vehicle turns that stick into aim has not been worked out yet. Menus
+are keyboard-driven; there is no mouse pointer in them.
+
+Fire, zoom, jump and next weapon follow the in-game controller settings: if you
+move *Fire* to another pad button there, the Fire key moves with it.
 
 Everything above is rebindable in the F1 settings under **Controls → Key
 bindings**: *Set* replaces a binding, *Add* gives an action a second key, and
-each mouse button can be pointed at any pad action. Bindings apply immediately
-and are written to the config file on **Save**. Modifiers are matched exactly,
-so a binding of `W` does not fire while Shift is held — bind `Shift+W` for that.
-The same settings are also editable as raw `keybind_*` cvars in the F4 overlay.
+each mouse button can be pointed at any action. Bindings apply immediately and
+are written to the config file on **Save**. A binding needs the modifiers it
+names and ignores others, so `W` still moves while Shift is held, and
+`Shift+W` needs Shift. The same settings are editable as raw `kbm_*` cvars in
+the F4 overlay. `--edf_kbm=false` turns native keyboard & mouse off.
 
 <img src="docs/media/keybinds.png" alt="Key bindings list" width="520">
 
