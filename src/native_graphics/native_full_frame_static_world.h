@@ -202,10 +202,10 @@ struct NativeFullFrameStaticFrame {
   Stats stats;
 };
 // Cross-frame state: the per-group material cache and instance reuse. The
-// material cache is keyed by the published group material (so its program
-// pointer and published constants), the program, geometry, pass base state
+// material cache is keyed by the program pointer, geometry, pass base state
 // and targets; never by guest state. A hit also requires this frame's pass
-// constants to match but for the camera matrices the capture derives (see
+// constants (the published ones with camera and animation applied) to match
+// but for the camera matrices the capture derives and the zeroed world (see
 // NativeStaticWorldGroupCache::Current). Not synchronized.
 class NativeFullFrameStaticWorld {
  public:
@@ -254,7 +254,7 @@ NativeFullFrameStaticFrame NativeFullFrameStaticWorld::Build(const NativeScenePu
     if(!first) { report("world register"); continue; }
     std::vector<NativeSceneMaterialInputs::Constant> constants;
     Cache::Key key{.group=selected.group,.vertex=program.inputs.vertex,.pixel=program.inputs.pixel,
-      .material=material,.program=material->program,.setup=geometry->setup.value_or(NativeSceneGeometrySource{}),
+      .program=material->program,.setup=geometry->setup.value_or(NativeSceneGeometrySource{}),
       .geometry=geometry->geometry,.backend=program.backend,.pass=base,.view=pass.targets,.filtering=pass.filtering};
     const NativeFullFrameStaticMaterial* resolved=nullptr;
     try {
@@ -267,7 +267,11 @@ NativeFullFrameStaticFrame NativeFullFrameStaticWorld::Build(const NativeScenePu
         NativeFullFrameStaticMaterial fresh=resolve(*material,geometry->geometry,base,std::span<const NativeSceneMaterialInputs::Constant>(constants));
         const auto captured=fresh.material;
         const auto view=fresh.camera;
-        resolved=&cache.Store(std::move(key),constants,{},base.After(program),std::move(fresh),captured.get(),view).material;
+        // No guest eligibility here: empty reads and witness. The published
+        // group material is recorded as an observation only.
+        auto& stored=cache.Store(std::move(key),constants,NativeRecordedReads{},NativeStaticEligibilityWitness{},
+          base.After(program),std::move(fresh),captured.get(),view,Cache::Observed{0,material});
+        resolved=&stored.material;
       }
     } catch(const std::exception& error) { report(error.what()); continue; }
     NativeFullFrameStaticDraw draw;
