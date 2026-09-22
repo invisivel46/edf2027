@@ -83,6 +83,7 @@
 #include "native_camera_history.h"
 #include "native_model_pose_history.h"
 #include "native_model_publication.h"
+#include "native_render_registry.h"
 #include "native_model_pass.h"
 #include "native_profile_result.h"
 #include "native_capture_policy.h"
@@ -230,6 +231,10 @@ REXCVAR_DEFINE_BOOL(edf_native_model_publication,false,"EDF2027",
                    "Capture model draw layouts at first sight and publish per-tick pose snapshots; draws are unchanged (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_publication_audit,false,"EDF2027",
                    "Compare published model layouts and poses with live memory at model draw entry (development)");
+REXCVAR_DEFINE_BOOL(edf_native_render_registry,false,"EDF2027",
+                   "Track render objects from the base constructor/destructor and update subscription, and publish a per-tick renderable snapshot at the end of 821A4DE8 for the full-frame renderer; draws are unchanged (development)");
+REXCVAR_DEFINE_BOOL(edf_native_render_registry_audit,false,"EDF2027",
+                   "Walk scene+84 and scene+100 each tick and count mismatches against the render registry's records and subscriptions; requires edf_native_render_registry (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_pass,false,"EDF2027",
                    "Draw rigid published models natively at 821C9C20; any unsupported object runs the original draw. Requires edf_native_model_publication and the static world pass scene flags (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_pass_skinned,false,"EDF2027",
@@ -6363,6 +6368,71 @@ REX_HOOK_RAW(sub_821A4FC0) {
   timing.Finish();
   if(trace) REXLOG_INFO("Native resource worker: end manager={:#x}",manager);
 }
+// Render registry feeds (native_render_registry.h). Off: one cvar read each.
+REX_EXTERN(__imp__sub_821C2090);
+REX_HOOK_RAW(sub_821C2090) {
+  const uint32_t object=ctx.r3.u32;
+  __imp__sub_821C2090(ctx,base);
+  if(REXCVAR_GET(edf_native_render_registry)) edf::native::RenderRegistry().Born(object);
+}
+REX_EXTERN(__imp__sub_821C1FE8);
+REX_HOOK_RAW(sub_821C1FE8) {
+  if(REXCVAR_GET(edf_native_render_registry)) edf::native::RenderRegistry().Died(ctx.r3.u32);
+  __imp__sub_821C1FE8(ctx,base);
+}
+REX_EXTERN(__imp__sub_821C0D70);
+REX_HOOK_RAW(sub_821C0D70) {
+  // r4==1 links obj+120 into scene+100; any other value unlinks it.
+  const uint32_t object=ctx.r3.u32,flag=ctx.r4.u32;
+  __imp__sub_821C0D70(ctx,base);
+  if(REXCVAR_GET(edf_native_render_registry)) edf::native::RenderRegistry().Subscribed(object,flag==1);
+}
+namespace {
+// End of 821A4DE8 (r3 is the scene): after the scene+100 slot-2 walk, so this
+// tick's pose builds are in memory. Failures stay native and are counted.
+void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
+  auto& registry=edf::native::RenderRegistry();
+  if(!REXCVAR_GET(edf_native_render_registry)) { if(registry.active()) registry.Clear(); return; }
+  try {
+    const edf::native::GuestReader reader(base);
+    // Buffer identities are read under the bridge lock, first sight only.
+    const auto decode=[&](uint32_t instance,uint32_t vector) {
+      auto& state=edf::native::State();
+      std::lock_guard lock(state.mutex);
+      return edf::native::DecodeNativeModelLayoutWith(reader,instance,vector,
+        [&](uint32_t owner,edf::native::NativeModelBuffers::Kind kind)->uint64_t {
+          const auto* found=state.model_buffers.Find(owner,kind);
+          return found?found->generation:0;
+        });
+    };
+    const auto snapshot=registry.Tick(reader,scene,native_loop_budget.tick,decode);
+    static uint64_t ticks=0;
+    const bool report=++ticks<=4 || ticks%1000==0;
+    if(report) {
+      const auto stats=registry.stats();
+      REXLOG_INFO("Native render registry: generation={} tick={} entries={} records={} subscribed={} births={} seeded={} deaths={} "
+        "rebirths={} unknown_deaths={} unknown_classes={} deferred={} foreign={} builds={} changed={} read_failures={} "
+        "layouts={} layout_failures={} retrying={}",snapshot->generation,snapshot->tick,snapshot->entries.size(),stats.records,
+        stats.subscribed,stats.births,stats.seeded,stats.deaths,stats.rebirths,stats.unknown_deaths,stats.unknown_classes,
+        stats.deferred,stats.foreign,stats.builds,stats.changed,stats.read_failures,stats.layout_captures,
+        stats.layout_failures,stats.retrying);
+    }
+    if(REXCVAR_GET(edf_native_render_registry_audit)) {
+      const auto audit=registry.AuditScene(reader,scene);
+      static uint64_t audits=0,mismatched=0;
+      ++audits; mismatched+=audit.mismatches()!=0;
+      if(report || (audit.mismatches() && mismatched<=8))
+        REXLOG_INFO("Native render registry audit: ticks={} mismatched_ticks={} guest={} guest_updates={} registry={} "
+          "missing={} extra={} subscription={}",audits,mismatched,audit.guest,audit.guest_updates,audit.registry,
+          audit.missing,audit.extra,audit.subscription);
+    }
+  } catch(const std::exception& error) {
+    static uint64_t failures=0;
+    if(++failures<=8 || (failures&(failures-1))==0)
+      REXLOG_WARN("Native render registry tick failed ({}): {}",failures,error.what());
+  }
+}
+}
 REX_EXTERN(__imp__sub_821A4DE8);
 REX_HOOK_RAW(sub_821A4DE8) {
   const bool trace=REXCVAR_GET(edf_native_load_timings);
@@ -6446,6 +6516,7 @@ REX_HOOK_RAW(sub_821A4DE8) {
       REXLOG_WARN("Native model pose publication failed: {}",error.what());
     }
   } else if(ModelPublications().size()) ModelPublications().Clear();
+  TickNativeRenderRegistry(base,manager);
   timing.Finish();
   if(edge) REXLOG_INFO("Native resource transition: end manager={:#x}",manager);
 }
