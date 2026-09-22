@@ -292,8 +292,14 @@ void StaticWorldPass() {
     for(uint32_t offset=0;offset<13520;offset+=4)
       if(reader.Word(device+offset)!=expected.Word(device+offset))
         throw std::runtime_error("static world handoff device word differs at +"+std::to_string(offset));
-    // Null slot: record+12's texture bits are M1's under M2's null bind.
-    Require(((reader.Word(device+1024+24+12)^setup.Word(0x51000+28+12))&~0x7ff80000u)==0 &&
+    // Null slot: M2's null bind leaves M1's descriptor. Words +0/+8 are M1's
+    // header outside the preserved bits; +12 is the header's filter bit over
+    // sampler bits, because M1's sampler step (texture lod present) cleared
+    // its low 19 texture bits after the bind; the pre-pass word had them set.
+    const auto slot1=device+1024+24;
+    Require(((reader.Word(slot1)^setup.Word(0x51000+28))&~0x3ffc00u)==0 && reader.Word(slot1+8)==setup.Word(0x51000+36) &&
+      (reader.Word(slot1+12)&~0x7ff80000u)==(setup.Word(0x51000+40)&0x80000000u) &&
+      (setup.Word(slot1+12)&0x7ffffu)!=0 &&
       reader.Word(device+12272+4)==0,"static world null bind kept pre-pass texture words");
     // Registers only a skipped activation wrote hold its values.
     Require(reader.Word(device+(20+112)*16)==expected.Word(0x60000) && reader.Word(device+(5+368)*16)==expected.Word(0x60100),
