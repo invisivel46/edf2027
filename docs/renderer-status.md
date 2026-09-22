@@ -41,7 +41,12 @@ All numbers in this section were measured on 2026-09-22.
 - The gate tool `tools/renderer-runtime-gate.py` measures the window from
   mission entry +10 s to +150 s, with the flicker script
   (`tools/native-flicker-input.txt`). Mission entry is the first scene draw
-  after the loading screen.
+  after the loading screen. That window mixes phases: after entry comes a
+  pre-mission scene, then the mission load (`MISSION\M202\MISSION.CAM`) and a
+  second loading screen (~70 s at 57 FPS), then gameplay, at different times
+  in each run. The gate's `--phase all` (the default when both logs show that
+  loading screen) gates intro, loading and gameplay FPS separately and reports
+  them under `phases_fps`; `--phase entry` is the numbers below.
 - Baseline exe `6e9c94b`: median 56.2 FPS.
 - Commit `8d9edd1` with default flags: 56.55 FPS.
 - Milestone run with all native scene flags on: median 6.3 FPS, and 0 of all

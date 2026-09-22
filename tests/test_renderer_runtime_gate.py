@@ -45,6 +45,37 @@ def hook(seconds, phase, calls, total, maximum, thread=1, sampled=False):
 
 
 ENTRY = 'Native indexed input: draw=1, vertices=3'
+# Verbatim shapes from the mission 1 logs of 2026-09-22.
+MISSION_CAM = "[NtCreateFile] FAILED: path='GAME:\\MISSION\\M202\\MISSION.CAM' -> 0xc000000f"
+PRESENTER = ('Native untiled scene viewport: caller=0x8219c828, requested=1280x720, stored=1280x720, '
+             'CPU transform/scissor updated without tile packets')
+
+
+def tline(seconds, thread, text, level='info'):
+    return f'{stamp(seconds)} [{level}] [core] [{thread}] {text}'
+
+
+def tfps(seconds, value, thread='t3'):
+    return tline(seconds, thread, f'FPS: {value} (frames {int(value * 5)} over 5.0 s, t={int(seconds)} s)')
+
+
+def phased(entry, load, resume, intro, loading, game, end, restart=None):
+    """Entry draw on the scene renderer t1, FPS on the main thread t3, a loading
+    screen presented by t9 from `load`, and t1 back at `resume`. `restart` adds
+    a second loading screen (t8) from restart[0] to restart[1]."""
+    out = [tline(0, 't3', 'boot'), tline(entry, 't1', ENTRY)]
+    out += [tfps(s, intro) for s in range(entry + 5, load + 1, 5)]
+    out += [tline(load, 't3', MISSION_CAM, 'warning'), tline(load + 0.5, 't9', PRESENTER)]
+    out += [tfps(s, loading, 't9') for s in range(load + 3, resume, 5)]
+    out += [tline(resume, 't1', 'Native Utility draw: submitted=93597')]
+    stop = restart[0] if restart else end
+    out += [tfps(s, game) for s in range(resume + 5, stop + 1, 5)]
+    if restart:
+        out += [tline(restart[0] + 0.5, 't8', PRESENTER)]
+        out += [tfps(s, loading, 't8') for s in range(restart[0] + 3, restart[1], 5)]
+        out += [tline(restart[1], 't1', 'Native scene tree: traversals=9')]
+        out += [tfps(s, game) for s in range(restart[1] + 5, end + 1, 5)]
+    return out
 
 
 class GateLogTests(unittest.TestCase):
@@ -202,6 +233,121 @@ class GateLogTests(unittest.TestCase):
         code, report = self.run_main(log, log, '--max-phase', 'render.model=0.2')
         self.assertEqual(report['phases']['metric'], 'ms_per_call')
         self.assertEqual(report['failures'], ['render.model costs 0.2500 ms/call, above the 0.2 limit'])
+
+    def test_markers_cut_scene_and_loading_segments(self):
+        lines = phased(entry=30, load=80, resume=150, intro=50.0, loading=57.0, game=27.0, end=250)
+        # t9 and t3 talk during the loading screen; only t1 (the entry draw's thread) ends it.
+        self.assertEqual(gate.markers(lines), dict(entry=30.0, load=80.0, gameplay=150.0, loading_screens=1))
+        self.assertEqual(gate.segments(lines), [['scene', 30.0, 80.0], ['loading', 80.0, 150.0],
+                                                ['scene', 150.0, 250.0]])
+
+    def test_presenter_viewport_alone_starts_loading(self):
+        lines = [tline(0, 't3', 'boot'), tline(10, 't1', ENTRY), tline(40, 't9', PRESENTER),
+                 tline(41, 't9', 'Native full scene begin: count=1'), tline(90, 't1', 'Native font draw')]
+        self.assertEqual(gate.markers(lines), dict(entry=10.0, load=40.0, gameplay=90.0, loading_screens=1))
+
+    def test_presenter_before_entry_is_not_a_loading_marker(self):
+        lines = [tline(0, 't3', 'boot'), tline(5, 't9', PRESENTER), tline(10, 't1', ENTRY), tline(90, 't1', 'x')]
+        self.assertEqual(gate.markers(lines), dict(entry=10.0, load=None, gameplay=None, loading_screens=0))
+
+    def test_phase_fps_keeps_only_samples_wholly_inside_a_phase(self):
+        lines = phased(entry=30, load=80, resume=150, intro=50.0, loading=57.0, game=27.0, end=250)
+        lines.append(tfps(152, 1.0))  # spans 147..152: straddles the resume, counted nowhere
+        phases = gate.phase_fps(lines, 10, 150)
+        self.assertEqual(phases['intro']['windows_s'], [[40.0, 80.0]])
+        self.assertEqual(phases['intro']['fps_samples'], 8)            # 45..80
+        self.assertEqual(phases['loading']['fps_samples'], 13)         # 88..148; 83 straddles the load
+        self.assertEqual(phases['loading']['fps_median'], 57.0)
+        self.assertEqual(phases['gameplay']['windows_s'], [[160.0, 250.0]])
+        self.assertEqual(phases['gameplay']['fps_samples'], 18)        # 165..250
+        self.assertEqual(phases['gameplay']['fps_min'], 27.0)
+
+    def test_return_to_loading_is_excluded_from_gameplay(self):
+        lines = phased(entry=30, load=80, resume=150, intro=50.0, loading=57.0, game=27.0, end=300,
+                       restart=(200, 240))
+        self.assertEqual(gate.markers(lines)['loading_screens'], 2)
+        phases = gate.phase_fps(lines, 10, 150)
+        self.assertEqual(phases['gameplay']['windows_s'], [[160.0, 200.5], [240.0, 300.0]])
+        self.assertEqual(phases['gameplay']['fps_median'], 27.0)
+        self.assertEqual(phases['loading']['windows_s'], [[80.0, 150.0], [200.5, 240.0]])
+        self.assertEqual(phases['loading']['fps_median'], 57.0)
+        self.assertEqual(phases['gameplay']['fps_min'], 27.0)
+
+    def test_all_mode_is_default_and_gates_every_phase(self):
+        # The baseline reaches gameplay sooner; a single window after entry would
+        # compare its gameplay against the candidate's loading screen.
+        base = self.write('base.log', phased(entry=30, load=80, resume=150, intro=55.0, loading=57.0,
+                                             game=27.0, end=330))
+        good = self.write('good.log', phased(entry=40, load=150, resume=220, intro=54.0, loading=57.0,
+                                             game=26.5, end=380))
+        code, report = self.run_main(good, base)
+        self.assertEqual(report['phase_mode'], 'all')
+        self.assertIn('found in both logs', report['phase_mode_reason'])
+        self.assertEqual(code, 0, report['failures'])
+        self.assertEqual(set(report['phases_fps']), {'intro', 'loading', 'gameplay'})
+        row = report['phases_fps']['gameplay']
+        self.assertEqual(row['baseline'], dict(fps_median=27.0, fps_min=27.0, fps_samples=28))
+        self.assertEqual(row['candidate']['fps_median'], 26.5)
+        self.assertEqual(report['baseline']['mission_entry_s'], 30.0)   # entry window kept for compatibility
+        self.assertEqual(report['window_after_entry'], [10, 150])
+
+        slow = self.write('slow.log', phased(entry=40, load=150, resume=220, intro=12.0, loading=57.0,
+                                             game=20.0, end=380))
+        code, report = self.run_main(slow, base)
+        self.assertEqual(code, 1)
+        self.assertEqual(report['failures'], ['intro: median FPS 12.0 is below baseline 55.0',
+                                              'gameplay: median FPS 20.0 is below baseline 27.0'])
+
+    def test_all_mode_fails_when_candidate_never_reaches_gameplay(self):
+        base = self.write('base.log', phased(entry=30, load=80, resume=150, intro=55.0, loading=57.0,
+                                             game=27.0, end=330))
+        stuck = self.write('stuck.log', [tline(0, 't3', 'boot'), tline(30, 't1', ENTRY)] +
+                           [tfps(s, 55.0) for s in range(35, 141, 5)] +
+                           [tline(140, 't3', MISSION_CAM, 'warning'), tline(140.5, 't9', PRESENTER)] +
+                           [tfps(s, 57.0, 't9') for s in range(145, 331, 5)])
+        code, report = self.run_main(stuck, base)
+        self.assertEqual(report['phase_mode'], 'all')
+        self.assertEqual(code, 1)
+        self.assertEqual(report['failures'],
+                         ['gameplay: no FPS samples in the candidate window; the run did not reach it'])
+        self.assertEqual(report['phases_fps']['loading']['candidate']['fps_median'], 57.0)
+        self.assertIsNone(report['candidate']['markers_s']['gameplay'])
+
+    def test_default_falls_back_to_entry_without_a_marker_in_both_logs(self):
+        base = self.write('base.log', phased(entry=30, load=80, resume=150, intro=55.0, loading=57.0,
+                                             game=27.0, end=330))
+        plain = self.write('plain.log', [line(0, 'boot'), line(30, ENTRY)] +
+                           [fps(30 + i, 56.0, 30 + i) for i in range(10, 150, 5)])
+        code, report = self.run_main(plain, base)
+        self.assertEqual(report['phase_mode'], 'entry')
+        self.assertEqual(report['phase_mode_reason'], 'no loading marker after entry in the candidate log')
+        self.assertEqual(set(report['phases_fps']), {'entry'})
+        self.assertEqual(report['phases_fps']['entry']['candidate']['fps_median'], 56.0)
+        code, report = self.run_main(plain, base, '--phase', 'all')
+        self.assertEqual(report['phase_mode'], 'all')
+        self.assertIn('intro', report['phases_fps'])
+
+    def test_gameplay_mode_windows_every_metric_from_the_gameplay_marker(self):
+        lines = phased(entry=30, load=80, resume=150, intro=55.0, loading=57.0, game=27.0, end=330)
+        text = 'Native static group execution: group={} completed=true recorded_batches=5 compatibility_calls=0'
+        lines += [tline(170, 't3', text.format('0x1')), tline(100, 't3', text.format('0x2'))]  # 0x2: loading
+        lines.sort(key=lambda text: text[:25])
+        log = self.write('game.log', lines)
+        summary = gate.summarize(log, 10, 150, anchor='gameplay')
+        self.assertEqual(summary['fps_median'], 27.0)
+        self.assertEqual(summary['native_groups'], 1)
+        code, report = self.run_main(log, log, '--phase', 'gameplay')
+        self.assertEqual(code, 0, report['failures'])
+        self.assertEqual(report['phase_mode'], 'gameplay')
+        self.assertEqual(report['window_after_gameplay'], [10, 150])
+        self.assertEqual(set(report['phases_fps']), {'gameplay'})
+
+    def test_entry_mode_reports_phases_fps_for_the_entry_window(self):
+        log = self.write('game.log', [line(0, 'boot'), line(10, ENTRY), fps(20, 60.0, 20)])
+        code, report = self.run_main(log, log)
+        self.assertEqual(report['phase_mode'], 'entry')
+        self.assertEqual(report['phases_fps']['entry']['baseline'],
+                         dict(fps_median=60.0, fps_min=60.0, fps_samples=1))
 
     def test_bad_max_phase_argument_is_rejected(self):
         with self.assertRaises(Exception):
