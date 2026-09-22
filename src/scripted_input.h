@@ -2,6 +2,8 @@
 // SlotAssignment; its state is merged with real pads). Enabled when the EDF_INPUT_SCRIPT environment
 // variable is set: "default" = Start at 7 s then A every 3 s; otherwise a file of
 // "start_ms dur_ms buttons_hex [LT RT LX LY RX RY]" (optional analogs decimal).
+// A "clock game" line times the file by engine simulation ticks instead of wall
+// time (see ScriptedClock in scripted_input_logic.h).
 #pragma once
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
@@ -10,6 +12,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
+#include <sstream>
 #include <string>
 #include <vector>
 #include "native_kbm_driver.h"
@@ -27,7 +31,10 @@ class ScriptedInputDriver final : public rex::input::InputDriver {
     const char* e = std::getenv("EDF_INPUT_SCRIPT");
     std::ifstream f(e ? e : "");
     if (e && std::string(e) != "default" && f) {
-      events_ = edf::ParseInputEvents(f);
+      const std::string text{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+      std::istringstream events_text(text), clock_text(text);
+      events_ = edf::ParseInputEvents(events_text);
+      clock_.clock = edf::ParseInputClock(clock_text);
     } else {
       events_ = edf::DefaultInputEvents();
     }
@@ -38,15 +45,22 @@ class ScriptedInputDriver final : public rex::input::InputDriver {
       REXLOG_INFO("Scripted pad: live file reload enabled; schedule clock is retained");
     }
     t0_ = std::chrono::steady_clock::now();
-    REXLOG_INFO("Scripted pad: {} events", events_.size());
+    REXLOG_INFO("Scripted pad: {} events, clock={}", events_.size(),
+                clock_.clock == edf::ScriptedClock::Game ? "game" : "wall");
   }
   void EnumerateDevices(std::vector<rex::input::DeviceInfo>& out) override {
     rex::input::DeviceInfo d; d.id = static_cast<rex::input::DeviceId>(0x5C71A7ED); d.name = "Scripted pad";
     d.guid = "scripted"; d.synthetic = true; out.push_back(d);
   }
   rex::X_RESULT GetDeviceState(rex::input::DeviceId id, rex::input::X_INPUT_STATE* out) override {
-    if (!started_) { t0_ = std::chrono::steady_clock::now(); started_ = true; } // clock starts at first poll (Setup is not called for late drivers)
-    const uint32_t ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0_).count();
+    const uint64_t ticks = edf::SimulationTicks().load(std::memory_order_relaxed);
+    if (!started_) { t0_ = std::chrono::steady_clock::now(); clock_.tick_base = ticks; started_ = true; } // clock starts at first poll (Setup is not called for late drivers)
+    const uint32_t wall_ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0_).count();
+    const uint32_t ms = edf::ScriptElapsedMs(clock_, wall_ms, ticks);
+    if (clock_.fell_back && !fallback_logged_) {
+      fallback_logged_ = true;
+      REXLOG_WARN("Scripted pad: no simulation ticks {} ms after the first poll; game clock falls back to wall time", wall_ms);
+    }
     const auto now=std::chrono::steady_clock::now();
     if(!reload_path_.empty() && now>=next_reload_) {
       next_reload_=now+std::chrono::seconds(1);
@@ -90,6 +104,8 @@ class ScriptedInputDriver final : public rex::input::InputDriver {
  private:
   std::vector<Event> events_;
   std::chrono::steady_clock::time_point t0_;
+  edf::ScriptedClockState clock_;
+  bool fallback_logged_ = false;
   uint32_t packet_ = 0;
   uint16_t last_ = 0xFFFF;
   edf::ScriptedAnalog last_analog_{};

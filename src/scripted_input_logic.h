@@ -10,6 +10,7 @@
 #include <fstream>
 #include <optional>
 #include <array>
+#include <atomic>
 
 namespace edf {
 
@@ -91,6 +92,64 @@ inline bool ReloadInputEvents(const std::filesystem::path& path,
   events=std::move(replacement);
   previous_write=written;
   return true;
+}
+
+// Script time base. "clock wall" (the default) measures milliseconds from the
+// first controller poll. "clock game" measures engine simulation ticks from the
+// first poll, written as milliseconds at 60 Hz (tick * 1000 / 60). The retail
+// heartbeat grants at most four ticks per update and only one after a longer
+// stall (NativePacingResult), so a slow renderer runs game time slower than the
+// wall clock; a game clock keeps routes aligned with what the game shows.
+// Times stay in milliseconds, so a build without game-clock support reads the
+// same script as wall time and still behaves correctly at full speed.
+enum class ScriptedClock { Wall, Game };
+
+// A line "clock wall" or "clock game" selects the clock; the last such line
+// wins. ParseInputEvents skips these lines like any other non-event text.
+inline ScriptedClock ParseInputClock(std::istream& input) {
+  ScriptedClock clock=ScriptedClock::Wall;
+  std::string line;
+  while(std::getline(input,line)) {
+    std::istringstream fields(line);
+    std::string keyword,value,extra;
+    if(!(fields>>keyword>>value) || keyword!="clock" || (fields>>extra)) continue;
+    if(value=="wall") clock=ScriptedClock::Wall;
+    else if(value=="game") clock=ScriptedClock::Game;
+  }
+  return clock;
+}
+
+// Simulation ticks granted by the engine heartbeat (the sub_821BEAB0 hook in
+// guest_shader_bridge.cpp). Process-wide and monotonic; zero when that hook is
+// disabled (edf_native_host=false).
+inline std::atomic<uint64_t>& SimulationTicks() {
+  static std::atomic<uint64_t> ticks{0};
+  return ticks;
+}
+
+inline uint32_t GameTicksToMs(uint64_t ticks) {
+  if(ticks/60>UINT32_MAX/1000) return UINT32_MAX;
+  const uint64_t ms=ticks/60*1000+ticks%60*1000/60;
+  return ms>UINT32_MAX?UINT32_MAX:static_cast<uint32_t>(ms);
+}
+
+// Game-clock scripts fall back to the wall clock when no tick has been counted
+// this long after the first poll, so a build without the heartbeat hook still
+// runs the menus instead of waiting forever.
+inline constexpr uint32_t kGameClockGraceMs=10000;
+struct ScriptedClockState {
+  ScriptedClock clock=ScriptedClock::Wall;
+  uint64_t tick_base=0;  // SimulationTicks() at the first poll
+  bool ticks_seen=false, fell_back=false;
+};
+inline uint32_t ScriptElapsedMs(ScriptedClockState& state,uint32_t wall_ms,uint64_t ticks) {
+  if(state.clock==ScriptedClock::Wall) return wall_ms;
+  if(ticks!=state.tick_base) state.ticks_seen=true;
+  if(state.ticks_seen) return GameTicksToMs(ticks-state.tick_base);
+  if(wall_ms<kGameClockGraceMs) return 0;
+  state.clock=ScriptedClock::Wall;
+  state.fell_back=true;
+  return wall_ms;
 }
 
 struct ScriptedKeystroke { uint16_t virtual_key, flags; };

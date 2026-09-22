@@ -1,0 +1,69 @@
+# Renderer benchmark route: Mission 1 street, player alive, same content at any frame rate.
+#
+# Clock. "clock game" times every line below in engine simulation ticks since
+# the first controller poll, written as milliseconds at 60 Hz (tick*1000/60).
+# The retail heartbeat grants at most 4 ticks per frame and only 1 after a
+# longer stall, so at ~11 FPS game time runs well behind the wall clock. The
+# Mission 1 intro took ~45 s of wall time at 50+ FPS but 110-153 s at ~13 FPS,
+# so wall-clock routes drift apart. Builds without game-clock support ignore
+# the clock line and read these times as wall milliseconds, which is equivalent
+# at full speed. With no tick seen 10 s after the first poll, the pad falls
+# back to wall time and logs a warning.
+clock game
+#
+# Log markers (seen in out/native-bridge-run/binding-validation-20260922-175637-c3a64acc/game.log):
+#  1. First 3D frame = the mothership intro, not gameplay. The gate's current ENTRY:
+#       17:58:55.247 ... Native indexed input: draw=1, primitive=4, ...
+#  2. Intro ends; the street map load starts. Logged once per Mission 1 load:
+#       17:59:41.549 [warning] [krnl] ... [NtCreateFile] FAILED: path='GAME:\MISSION\M202\MISSION.CAM' -> 0xc000000f
+#     The "Now Loading" screen follows (out/renderer-ab/late-native.png shows it
+#     at 18:49:00, right after this line in binding-validation-20260922-184340-7b5126ba).
+#  3. Street gameplay starts. Use this as the gameplay-start marker: the first
+#       Native indexed upload: uploaded=
+#     line after marker 2 (uploads pause during the loading screen). Here:
+#       18:00:49.868 ... Native indexed upload: uploaded=1668000, ...
+#     That is ~68 s after marker 2 at 57 FPS (also 18:40:33 -> 18:41:40 in
+#     binding-validation-20260922-183735-2f70d370).
+# The "left gameplay after ~110 s" in slow native runs was marker 2, which the
+# slow run reaches later than the baseline; it was not a death. Windows measured
+# from marker 1 therefore mix intro, loading and street content unequally.
+#
+# Route. Analog fields: LT RT LX LY RX RY. No pause, quit, save or retry input.
+# Menu confirmations: the same as tools/native-flicker-input.txt. The menus run
+# at full speed in every build, so these times match the flicker route.
+20000 1000 0010
+25000 1000 0010
+30000 1000 1000
+35000 1000 1000
+40000 1000 1000
+45000 1000 1000
+50000 1000 1000
+55000 1000 1000
+60000 1000 1000
+65000 1000 1000
+70000 1000 1000
+# Late confirmations for the difficulty dialog on slower diagnostic starts.
+# In fast builds they land in the mothership intro, as in the flicker route.
+150000 1000 1000
+155000 1000 1000
+# No input through the intro and the street load (~250 s of game time at 57 FPS).
+#
+# 262 s to 562 s game time: stand at the spawn point and hold fire (RT) down the
+# street. No stick input, so the camera keeps the spawn view: the street, the
+# mothership, NPC civilians and allied squads, with muzzle flash, tracers and
+# impacts from the player plus ant and ally effects as the waves arrive.
+# Standing still is deliberate. Past routes that walked toward the ants
+# (native-retreat-combat, native-heavy-sustained) ended on the mission-failed
+# screen, and A presses (native-dodge-combat) may confirm a retry. The idle
+# flicker route stays alive at the spawn point; firing from there thins the
+# approaching ants without chasing them. AF14 reloads by itself when empty.
+# The hold starts ~10 s after the expected street entry. An early start lands
+# on the loading screen, which ignores the trigger. It never touches a menu:
+# the last A press is at 156 s.
+# If a capture ever shows mission clear or failure inside the window, shorten
+# the hold. Do not add button presses.
+262000 300000 0000 0 255 0 0 0 0
+# After 562 s: no input. The gate window is street entry +10 s to +190 s or less.
+# Launch time: menus and loading take ~250 s of wall time. At full speed the
+# route needs ~9.5 min of wall time; a ~11 FPS run needs much longer for the
+# same game time, so pass -Seconds generously and cut windows at the marker.

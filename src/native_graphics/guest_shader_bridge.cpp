@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include "guest_shader_bridge.h"
+#include "../scripted_input_logic.h"
 #include "native_backend_frame.h"
 #include "native_backend_frame_queue.h"
 #include "native_frame_flight.h"
@@ -7176,6 +7177,8 @@ REX_HOOK_RAW(sub_821BEAB0) {
   // The retail outer loop treats zero as "skip all normal work". Its render
   // token stays nonzero; the actual step dispatcher receives the real budget.
   ctx.r3.u64=unlocked?1:simulation_steps;
+  // Game clock for scripted input ("clock game" scripts).
+  edf::SimulationTicks().fetch_add(simulation_steps,std::memory_order_relaxed);
   if(simulation_steps>1 && !REXCVAR_GET(edf_native_frame_trace).empty())
     edf::native::FrameExtraSimulationSteps().fetch_add(simulation_steps-1,std::memory_order_relaxed);
   if(++state.calls<=3)
