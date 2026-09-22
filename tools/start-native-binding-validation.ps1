@@ -17,6 +17,11 @@ param(
   [switch]$NativeRenderSize,
   [ValidateSet(0,1,2,4)][int]$Msaa = 0,
   [ValidateRange(-1,5)][int]$AnisotropicFiltering = -1,
+  # Write diagnostic captures as <run directory>/cap.output.<F>.bmp (the prefix
+  # is only known here, once the run directory exists). Pair it with
+  # --edf_native_output_capture_start_frame/interval/limit in -ExtraArgs;
+  # without them the capture limit stays 0 and nothing is written.
+  [switch]$SceneCapture,
   # Anything else this run needs, passed through verbatim. The options above
   # are the ones every run chooses between; this is for a flag that exists to
   # answer one question, such as a port's A/B control.
@@ -39,9 +44,10 @@ $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString
 $runRoot = Join-Path $workspace ('out/native-bridge-run/binding-validation-' + $stamp)
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 $log = Join-Path $runRoot 'game.log'
-# Do not pass --edf_native_scene_capture= : the current command-line parser
-# consumes the following flag as its string value. A fresh user directory has
-# no saved capture override, so omit the option and retain its empty default.
+# Do not pass an empty --edf_native_scene_capture= : the current command-line
+# parser consumes the following flag as its string value. A fresh user directory
+# has no saved capture override, so omit the option and retain its empty
+# default unless -SceneCapture asks for a non-empty, quoted prefix.
 $arguments = @(
   ('--game_data_root="' + $assets + '"'),
   ('--user_data_root="' + (Join-Path $runRoot 'user') + '"'),
@@ -62,6 +68,9 @@ $arguments = @(
   ('--edf_native_loading_trace=' + $LoadingTrace.IsPresent.ToString().ToLowerInvariant()),
   ('--edf_native_load_timings=' + $LoadTimings.IsPresent.ToString().ToLowerInvariant())
 )
+if ($SceneCapture) {
+  $arguments += '--edf_native_scene_capture="' + (Join-Path $runRoot 'cap') + '"'
+}
 # Omission tests the guest-driven pixel-centre default; pass -PixelCenters:$false
 # to restore the unshifted post viewport for regression diagnosis.
 if ($PSBoundParameters.ContainsKey('PixelCenters')) {
@@ -97,7 +106,8 @@ try {
   # diagnostics keep their existing hidden launch behavior.
   $windowStyle = if ($ManualInput) { 'Normal' } else { 'Hidden' }
   $game = Start-Process -FilePath $candidate -WorkingDirectory (Split-Path $candidate) -WindowStyle $windowStyle -ArgumentList $arguments -PassThru
-  [pscustomobject]@{ Id=$game.Id; Executable=$candidate; Log=$log; RunDirectory=$runRoot }
+  [pscustomobject]@{ Id=$game.Id; Executable=$candidate; Log=$log; RunDirectory=$runRoot
+    CapturePrefix=$(if ($SceneCapture) { Join-Path $runRoot 'cap' } else { $null }) }
 } finally {
   $env:EDF_INPUT_SCRIPT = $previousScript
   $env:EDF_INPUT_SCRIPT_RELOAD = $previousReload

@@ -234,6 +234,11 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
     add_test(NAME edf_renderer_ab_capture_tests COMMAND ${Python3_EXECUTABLE} -m unittest tools.test_compare_renderer_ab_captures)
     set_tests_properties(edf_renderer_ab_capture_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_custom_target(edf_renderer_ab_postprocess_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tools.test_renderer_ab_postprocess
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_renderer_ab_postprocess_tests COMMAND ${Python3_EXECUTABLE} -m unittest tools.test_renderer_ab_postprocess)
+    set_tests_properties(edf_renderer_ab_postprocess_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME edf_native_hook_boundary_audit
       COMMAND ${CMAKE_COMMAND}
         -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/guest_shader_bridge.cpp

@@ -25,13 +25,39 @@
 # draw), not after launch. Loading plus the scripted menu confirmations take
 # up to ~160 s, so -Seconds must cover loading + 150 s; the 360 s default does.
 #
+# -Capture writes output captures into each run directory as
+# cap.output.<F>.bmp, from indexed output frame -CaptureStartFrame (default
+# 1200) every -CaptureInterval frames (default 1200), at most -CaptureLimit
+# (default 8, the game clamps to 128). Indexed output frames count only 3D
+# frames, so the same F lines up across runs far better than a time since
+# launch does (menus and loading take different times in each run). After each
+# pair tools/renderer-ab-postprocess.py compares baseline and candidate captures
+# with the same F (tools/compare-renderer-images.py metrics), flags captures
+# that look like loading screens (a heuristic: mostly black or nearly uniform),
+# and writes pair-<i>/ thumbnails; contact-sheet.html in the output directory
+# shows them side by side. A "loading vs gameplay" mismatch means the two runs
+# were not at the same point, so neither the image diff nor that stretch of
+# the FPS comparison is trustworthy. Image results are reported, not gated.
+#
+#   powershell -File tools/run-renderer-ab.ps1 -Baseline edf2027-baseline-6e9c94b `
+#     -Candidate win-amd64-release -Capture -Name capture-check
+#
+# -AbAlternate N passes --edf_native_ab_alternate=N to the candidate only (it
+# alternates guest and native passes in runs of N indexed frames from
+# -CaptureStartFrame) and implies -Capture; unless given explicitly, the
+# interval becomes 1 and the limit max(8, 4N) (at most 128) so consecutive
+# guest/native frames are captured. tools/compare-renderer-ab-captures.py then
+# runs on the candidate's captures and log. The candidate's FPS then mixes both
+# paths, so read its gate verdict as a smoke test, not a performance result.
+#
 # Only one game may run at a time: the runner refuses to start while any
 # edf2027* process exists, and stops only the PID it launched after checking
 # that the PID's image is the executable it asked for. A run that dies early is
 # still gated; the gate then reports "no FPS samples" and the pair fails.
 #
 # Output: out/renderer-ab/<timestamp>-<Name>/summary.json with the arguments,
-# run logs, each pair's gate JSON and the verdict. One line is printed per pair
+# run logs, each pair's gate JSON and the verdict, plus each pair's "images"
+# report with -Capture (also in pair-<i>/postprocess.json). One line is printed per pair
 # plus the median over pairs. Exit code is 1 when any pair fails.
 param(
   [Parameter(Mandatory=$true)][string]$Baseline,
@@ -42,6 +68,11 @@ param(
   [ValidateRange(1,7200)][int]$Seconds = 360,
   [ValidateRange(1,50)][int]$Repeat = 1,
   [switch]$HookTimings,
+  [switch]$Capture,
+  [ValidateRange(1,100000000)][int]$CaptureStartFrame = 1200,
+  [ValidateRange(1,100000000)][int]$CaptureInterval = 1200,
+  [ValidateRange(1,128)][int]$CaptureLimit = 8,
+  [ValidateRange(0,1000)][int]$AbAlternate = 0,
   [string]$Name = 'ab',
   [string[]]$GateArgs = @(),
   [string]$Python = 'python'
@@ -50,6 +81,24 @@ $ErrorActionPreference = 'Stop'
 $workspace = Split-Path $PSScriptRoot -Parent
 $launcher = Join-Path $PSScriptRoot 'start-native-binding-validation.ps1'
 $gate = Join-Path $PSScriptRoot 'renderer-runtime-gate.py'
+$postprocess = Join-Path $PSScriptRoot 'renderer-ab-postprocess.py'
+if ($AbAlternate -gt 0) {
+  $Capture = [switch]$true
+  if (-not $PSBoundParameters.ContainsKey('CaptureInterval')) { $CaptureInterval = 1 }
+  if (-not $PSBoundParameters.ContainsKey('CaptureLimit')) { $CaptureLimit = [Math]::Min(128, [Math]::Max(8, 4 * $AbAlternate)) }
+}
+# Capture flags come first so that an explicit -BaselineArgs/-CandidateArgs
+# entry for the same option replaces them (the launcher keeps the last one).
+$captureArgs = @()
+if ($Capture) {
+  $captureArgs = @(
+    ('--edf_native_output_capture_start_frame=' + $CaptureStartFrame),
+    ('--edf_native_output_capture_interval=' + $CaptureInterval),
+    ('--edf_native_output_capture_limit=' + $CaptureLimit))
+}
+$abArgs = if ($AbAlternate -gt 0) { @('--edf_native_ab_alternate=' + $AbAlternate) } else { @() }
+$baselineRunArgs = @($captureArgs) + @($BaselineArgs)
+$candidateRunArgs = @($captureArgs) + @($abArgs) + @($CandidateArgs)
 
 function Resolve-GameExecutable([string]$Spec) {
   $candidates = @()
@@ -81,8 +130,7 @@ function Assert-NoGame {
   }
 }
 
-function Invoke-Gate([string]$CandidateLog, [string]$BaselineLog) {
-  $argv = @($gate, $CandidateLog, '--baseline', $BaselineLog) + $GateArgs
+function Invoke-Python([string[]]$argv) {
   $info = New-Object System.Diagnostics.ProcessStartInfo
   $info.FileName = $Python
   $info.Arguments = ($argv | ForEach-Object { '"' + ($_ -replace '"', '\"') + '"' }) -join ' '
@@ -99,10 +147,26 @@ function Invoke-Gate([string]$CandidateLog, [string]$BaselineLog) {
   [pscustomobject]@{ ExitCode=$process.ExitCode; Report=$report; Stdout=$stdout; Stderr=$stderrTask.Result }
 }
 
+function Invoke-Gate([string]$CandidateLog, [string]$BaselineLog) {
+  Invoke-Python (@($gate, $CandidateLog, '--baseline', $BaselineLog) + $GateArgs)
+}
+
+function Invoke-ImagePostprocess($Base, $Cand, [int]$Index) {
+  $argv = @($postprocess, 'pair', '--baseline-dir', $Base.run_directory, '--candidate-dir', $Cand.run_directory,
+    '--out', (Join-Path $outDir ('pair-' + $Index)), '--prefix', 'cap', '--label', ('pair ' + $Index))
+  if ($AbAlternate -gt 0) { $argv += @('--ab-alternate', '--candidate-log', $Cand.log) }
+  $result = Invoke-Python $argv
+  if (-not $result.Report) {
+    return [pscustomobject]@{ error=("postprocess produced no JSON (exit $($result.ExitCode)): " + $result.Stderr.Trim()) }
+  }
+  $result.Report
+}
+
 function Invoke-Run([string]$Role, [int]$Index, [string]$Executable, [string[]]$Extra) {
   Assert-NoGame
   $launch = @{ Executable=$Executable; InputScript=$Script; ExtraArgs=$Extra }
   if ($HookTimings) { $launch.HookTimings = $true }
+  if ($Capture) { $launch.SceneCapture = $true }
   $started = Get-Date
   $run = & $launcher @launch | Where-Object { $_ -and $_.PSObject.Properties['Id'] } | Select-Object -Last 1
   if (-not $run) { throw "$Role run $Index did not report a process" }
@@ -131,7 +195,7 @@ function Invoke-Run([string]$Role, [int]$Index, [string]$Executable, [string[]]$
   if ($exitedEarly) { Write-Warning "$Role run $Index exited after $([int]$elapsed) s, before the $Seconds s budget" }
   [pscustomobject]@{
     role=$Role; index=$Index; executable=$run.Executable; args=$Extra; pid=$run.Id
-    log=$run.Log; run_directory=$run.RunDirectory; log_exists=(Test-Path -LiteralPath $run.Log)
+    log=$run.Log; run_directory=$run.RunDirectory; capture_prefix=$run.CapturePrefix; log_exists=(Test-Path -LiteralPath $run.Log)
     started=$started.ToString('o'); seconds=[Math]::Round($elapsed, 1)
     exited_early=$exitedEarly; stopped_by_runner=$stopped
   }
@@ -153,8 +217,8 @@ $pairs = @()
 $aborted = $null
 try {
   for ($i = 1; $i -le $Repeat; $i++) {
-    $runs += Invoke-Run 'baseline' $i $baseExe $BaselineArgs
-    $runs += Invoke-Run 'candidate' $i $candExe $CandidateArgs
+    $runs += Invoke-Run 'baseline' $i $baseExe $baselineRunArgs
+    $runs += Invoke-Run 'candidate' $i $candExe $candidateRunArgs
   }
 } catch {
   # Keep whatever already ran: those logs are still worth gating and saving.
@@ -184,13 +248,14 @@ for ($i = 1; $i -le $Repeat; $i++) {
   $baseFps = if ($report) { $report.baseline.fps_median } else { $null }
   $candFps = if ($report) { $report.candidate.fps_median } else { $null }
   $ratio = if ($baseFps -and $candFps) { [Math]::Round($candFps / $baseFps, 4) } else { $null }
+  $images = if ($Capture) { Invoke-ImagePostprocess $base $cand $i } else { $null }
   $pairs += [pscustomobject]@{
     index=$i; baseline_log=$base.log; candidate_log=$cand.log
     baseline_exited_early=$base.exited_early; candidate_exited_early=$cand.exited_early
     baseline_fps_median=$baseFps; candidate_fps_median=$candFps; ratio=$ratio
     gate=$report; gate_exit_code=$(if ($gateResult) { $gateResult.ExitCode } else { $null })
     gate_stderr=$(if ($gateResult -and $gateResult.Stderr) { $gateResult.Stderr } else { $null })
-    passed=$passed; failures=@($failures)
+    passed=$passed; failures=@($failures); images=$images
   }
   $fmt = { param($v) if ($null -eq $v) { 'n/a' } else { '{0:N1}' -f [double]$v } }
   $verdict = if ($passed) { 'PASS' } else { 'FAIL' }
@@ -198,6 +263,30 @@ for ($i = 1; $i -le $Repeat; $i++) {
   if ($ratio) { $line += (' (x{0:N3})' -f $ratio) }
   if ($failures.Count) { $line += ' - ' + ($failures -join '; ') }
   Write-Host $line
+  if ($images) {
+    if ($images.PSObject.Properties['error']) {
+      Write-Warning "pair ${i}: image post-processing failed: $($images.error)"
+    } else {
+      $maxDiff = if ($null -ne $images.max_differing_percent) { '{0:N3}%' -f [double]$images.max_differing_percent } else { 'n/a' }
+      $imageLine = "pair {0} images: {1} matched frames, max differing {2}, loading baseline [{3}] candidate [{4}]" -f `
+        $i, $images.matched, $maxDiff, (@($images.baseline_loading) -join ','), (@($images.candidate_loading) -join ',')
+      if ($images.PSObject.Properties['ab_alternate'] -and $images.ab_alternate) {
+        $imageLine += ', A/B alternate ' + $(if ($images.ab_alternate.passed) { 'PASS' } else { 'FAIL' })
+      }
+      Write-Host $imageLine
+      if (@($images.loading_mismatch).Count) {
+        Write-Warning ("pair ${i}: loading screen vs gameplay at frames " + (@($images.loading_mismatch) -join ',') +
+          '; the runs were not at the same point there (see contact-sheet.html)')
+      }
+      if (-not $images.matched) { Write-Warning "pair ${i}: no capture frame exists in both runs" }
+    }
+  }
+}
+$contactSheet = $null
+if ($Capture) {
+  $sheet = Invoke-Python @($postprocess, 'sheet', $outDir)
+  if ($sheet.ExitCode -eq 0) { $contactSheet = Join-Path $outDir 'contact-sheet.html' }
+  else { Write-Warning "contact sheet failed: $($sheet.Stderr.Trim())" }
 }
 
 $medianBase = Get-Median @($pairs | Where-Object { $null -ne $_.baseline_fps_median } | ForEach-Object { [double]$_.baseline_fps_median })
@@ -210,7 +299,11 @@ $summary = [pscustomobject]@{
   args=[pscustomobject]@{
     baseline=$baseExe; candidate=$candExe; baseline_args=$BaselineArgs; candidate_args=$CandidateArgs
     script=$Script; seconds=$Seconds; repeat=$Repeat; hook_timings=$HookTimings.IsPresent; gate_args=$GateArgs
+    capture=[bool]$Capture; capture_start_frame=$(if ($Capture) { $CaptureStartFrame } else { $null })
+    capture_interval=$(if ($Capture) { $CaptureInterval } else { $null })
+    capture_limit=$(if ($Capture) { $CaptureLimit } else { $null }); ab_alternate=$AbAlternate
   }
+  contact_sheet=$contactSheet
   runs=$runs; pairs=$pairs; aborted=$aborted
   median=[pscustomobject]@{ baseline_fps=$medianBase; candidate_fps=$medianCand; ratio=$medianRatio }
   passed=$allPassed
@@ -223,5 +316,6 @@ $overall = "overall: {0} over {1}/{2} pairs, median baseline {3} fps, candidate 
 if ($null -ne $medianRatio) { $overall += (' (x{0:N3})' -f $medianRatio) }
 Write-Host $overall
 Write-Host "summary: $summaryPath"
+if ($contactSheet) { Write-Host "contact sheet: $contactSheet" }
 if (-not $allPassed) { exit 1 }
 exit 0
