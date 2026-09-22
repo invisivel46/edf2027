@@ -6,6 +6,7 @@
 #include "native_graphics/native_queued_scene.h"
 #include "native_graphics/native_scene_cpu_window.h"
 #include "native_graphics/native_scene_membership.h"
+#include "native_graphics/native_scene_tree_publication.h"
 #include "native_graphics/native_scene_geometry.h"
 #include "native_graphics/native_scene_handoff.h"
 #include "native_graphics/native_scene_execution.h"
@@ -41,6 +42,34 @@ struct GeometryRetryReader {
   void StoreDoubleWord(uint32_t at,uint64_t value) const { StoreWord(at,uint32_t(value>>32)); StoreWord(at+4,uint32_t(value)); }
   void StoreByte(uint32_t at,uint8_t value) const { bytes.at(at)=value; }
 };
+void TreePublicationReuse() {
+  std::vector<uint8_t> memory(0x10000);
+  const GeometryRetryReader reader{memory};
+  constexpr uint32_t owner=0x1000,levels=0x2000,node=0x3000;
+  reader.StoreWord(owner+52,levels); reader.StoreWord(owner+56,levels+32);
+  reader.StoreWord(levels+20,node); reader.StoreWord(levels+24,node+288);
+  reader.StoreWord(node+116,1); reader.StoreWord(node+32,17);
+  NativeSceneTreePublications trees;
+  Require(trees.Publish(reader,owner) && trees.captures()==1,"tree publication missing");
+  const auto first=trees.Acquire(owner);
+  Require(first && first->nodes==2,"tree publication node count");
+  Require(trees.Publish(reader,owner) && trees.captures()==1 && trees.Acquire(owner)==first,"unchanged tree was recaptured");
+  trees.Invalidate();
+  Require(!trees.Acquire(owner),"invalidated tree stayed current");
+  Require(trees.Publish(reader,owner) && trees.captures()==1,"invalidation without changed bytes recaptured the tree");
+  const auto restamped=trees.Acquire(owner);
+  Require(restamped && restamped!=first && restamped->regions==first->regions && !trees.Current(*first),
+    "restamp mutated or kept the published image current");
+  reader.StoreWord(node+32,19); // Untracked write: the epoch does not move.
+  Require(trees.Publish(reader,owner) && trees.captures()==2,"changed tree was not recaptured");
+  const auto changed=trees.Acquire(owner);
+  Require(changed && GuestBlockWord(changed->Find(node+32,4))==19 && GuestBlockWord(first->Find(node+32,4))==17 &&
+    GuestBlockWord(restamped->Find(node+32,4))==17,"recapture missed the change or mutated an old image");
+  reader.StoreWord(node+144+116,1); // An empty root becomes occupied and exposes new bounds.
+  Require(trees.Publish(reader,owner) && trees.captures()==3 && trees.Acquire(owner)->Find(node+144+32,36),
+    "occupancy change was not recaptured");
+  Require(trees.Publish(reader,owner) && trees.captures()==3 && trees.reuses()==3,"tree reuse count");
+}
 void GeometryPublicationRetry() {
   constexpr uint32_t device=0x1000,old_vertex=0x10000,old_index=0x10100,queue=0x18000;
   const NativeSceneGeometrySource input{0x11000,0x11100,0x12000,28,6,0x13000,0x14000};
@@ -1106,6 +1135,7 @@ int main() {
   try {
     PassCamera(); Visibility();
     QueuedGuestState();
+    TreePublicationReuse();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

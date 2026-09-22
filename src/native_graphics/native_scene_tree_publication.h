@@ -13,10 +13,13 @@ struct NativeSceneTreeImage {
   uint64_t epoch=0;
   uint32_t owner=0;
   size_t nodes=0;
-  std::map<uint32_t,std::vector<uint8_t>> regions;
+  using Regions=std::map<uint32_t,std::vector<uint8_t>>;
+  // Shared so a restamp for a newer epoch never copies or mutates captured bytes.
+  std::shared_ptr<const Regions> regions;
   const uint8_t* Find(uint32_t address,size_t bytes) const {
-    auto found=regions.upper_bound(address);
-    if(found==regions.begin()) return nullptr;
+    if(!regions) return nullptr;
+    auto found=regions->upper_bound(address);
+    if(found==regions->begin()) return nullptr;
     --found;
     const auto offset=uint64_t(address)-found->first;
     if(offset>found->second.size() || bytes>found->second.size()-offset) return nullptr;
@@ -26,9 +29,10 @@ struct NativeSceneTreeImage {
 template<class Reader>
 std::shared_ptr<NativeSceneTreeImage> CaptureNativeSceneTree(const Reader& reader,uint32_t owner) {
   auto image=std::make_shared<NativeSceneTreeImage>(); image->owner=owner;
+  auto regions=std::make_shared<NativeSceneTreeImage::Regions>();
   const auto copy=[&](uint32_t at,size_t size) {
     const auto* bytes=reader.Bytes(at,size);
-    image->regions.emplace(at,std::vector<uint8_t>(bytes,bytes+size));
+    regions->emplace(at,std::vector<uint8_t>(bytes,bytes+size));
   };
   const auto levels=reader.Word(reader.Add(owner,52));
   const auto level_end=reader.Word(reader.Add(owner,56));
@@ -48,7 +52,18 @@ std::shared_ptr<NativeSceneTreeImage> CaptureNativeSceneTree(const Reader& reade
       self(self,reader.Word(reader.Add(node,84+child*4)),depth+1);
   };
   for(auto node=begin;node!=end;node=reader.Add(node,144)) capture(capture,node,0);
+  image->regions=std::move(regions);
   return image;
+}
+// Every byte the capture reads lies in a copied region, so equal regions imply
+// an identical recapture. Hooked mutations only bump the epoch; unhooked
+// writers (see the audit) are caught here.
+template<class Reader>
+bool NativeSceneTreeUnchanged(const Reader& reader,const NativeSceneTreeImage& image) {
+  if(!image.regions) return false;
+  for(const auto& [at,bytes]:*image.regions)
+    if(std::memcmp(reader.Bytes(at,bytes.size()),bytes.data(),bytes.size())) return false;
+  return true;
 }
 class NativeSceneTreePublications {
  public:
@@ -70,20 +85,35 @@ class NativeSceneTreePublications {
     for(const auto& [owner,image]:images_) owners.push_back(owner);
     return owners;
   }
+  // Recaptures only when the tree bytes differ from the owner's last image;
+  // an unchanged tree keeps its image, or is restamped for a newer epoch.
   template<class Reader> bool Publish(const Reader& reader,uint32_t owner) {
     const auto epoch=epoch_.load(std::memory_order_acquire);
-    auto image=CaptureNativeSceneTree(reader,owner); image->epoch=epoch;
+    std::shared_ptr<const NativeSceneTreeImage> previous;
+    {
+      std::lock_guard lock(mutex_);
+      const auto found=images_.find(owner);
+      if(found!=images_.end()) previous=found->second;
+    }
+    std::shared_ptr<NativeSceneTreeImage> image;
+    if(previous && NativeSceneTreeUnchanged(reader,*previous)) {
+      if(previous->epoch==epoch) { ++reuses_; return Current(*previous); }
+      image=std::make_shared<NativeSceneTreeImage>(*previous); ++reuses_;
+    } else { image=CaptureNativeSceneTree(reader,owner); ++captures_; }
+    image->epoch=epoch;
     std::lock_guard lock(mutex_);
     if(!Current(*image)) return false;
     images_[owner]=std::move(image); return true;
   }
+  uint64_t captures() const { return captures_.load(std::memory_order_relaxed); }
+  uint64_t reuses() const { return reuses_.load(std::memory_order_relaxed); }
   std::shared_ptr<const NativeSceneTreeImage> Acquire(uint32_t owner) const {
     std::lock_guard lock(mutex_);
     const auto found=images_.find(owner);
     return found!=images_.end() && Current(*found->second)?found->second:nullptr;
   }
  private:
-  std::atomic<uint64_t> epoch_{1};
+  std::atomic<uint64_t> epoch_{1},captures_{0},reuses_{0};
   mutable std::mutex mutex_;
   std::map<uint32_t,std::shared_ptr<const NativeSceneTreeImage>> images_;
 };
