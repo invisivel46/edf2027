@@ -226,6 +226,20 @@ class NativeModelPublications {
     return result;
   }
   bool Retire(uint32_t instance) { std::lock_guard lock(mutex_); return RetireLocked(instance,true); }
+  // A pose that changes between renders of one tick (camera-facing
+  // attachments) is not what a tick publication can carry. Latched per layout
+  // generation by the pose audit or the interpolation history; a new
+  // generation starts clean.
+  void MarkRenderDependent(uint32_t instance,uint64_t generation) {
+    std::lock_guard lock(mutex_);
+    const auto found=entries_.find(instance);
+    if(found!=entries_.end() && found->second.layout.generation==generation) render_dependent_.insert_or_assign(instance,generation);
+  }
+  bool RenderDependent(uint32_t instance,uint64_t generation) const {
+    std::lock_guard lock(mutex_);
+    const auto found=render_dependent_.find(instance);
+    return found!=render_dependent_.end() && found->second==generation;
+  }
   // Deallocation (820B2510): the freed block was an instance, its model node
   // or the pose storage it was captured with. Vector growth (821C8F10) frees
   // the old storage the same way; a later draw captures a new generation.
@@ -285,7 +299,7 @@ class NativeModelPublications {
   void Clear() {
     std::lock_guard lock(mutex_);
     retirements_+=entries_.size();
-    entries_.clear(); keys_.clear(); vectors_.clear(); seeds_.clear(); rejected_.clear();
+    entries_.clear(); keys_.clear(); vectors_.clear(); seeds_.clear(); rejected_.clear(); render_dependent_.clear();
     poses_=decltype(poses_){}; published_.reset();
     count_.store(0,std::memory_order_relaxed);
   }
@@ -311,6 +325,7 @@ class NativeModelPublications {
       if(vector->second.empty()) { seeds_.erase(vector->first); vectors_.erase(vector); }
     }
     poses_.Erase(instance);
+    render_dependent_.erase(instance);
     entries_.erase(found);
     count_.store(entries_.size(),std::memory_order_relaxed);
     if(count) ++retirements_;
@@ -323,6 +338,7 @@ class NativeModelPublications {
   std::unordered_map<uint32_t,std::vector<uint32_t>> vectors_;
   std::unordered_set<uint32_t> seeds_;
   std::unordered_map<uint32_t,std::pair<uint32_t,uint32_t>> rejected_;
+  std::unordered_map<uint32_t,uint64_t> render_dependent_;
   NativeSharedMap<uint32_t,std::shared_ptr<const Pose>> poses_;
   std::shared_ptr<const PosePublication> published_;
   uint64_t generation_=0,pose_generation_=0,captures_=0,retirements_=0,pose_failures_=0,snapshots_=0;

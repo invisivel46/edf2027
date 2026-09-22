@@ -28,7 +28,7 @@ contracts = {
     'sub_820D3FD0': ('overlay', 'EDF_RENDER_PHASE(820D3FD0, RenderOverlay)',
                      'Timing wrapper forwards to original overlay function unconditionally.'),
     'sub_821C9C20': ('model', 'REX_HOOK_RAW(sub_821C9C20)',
-                     'Normal paths always invoke original model function: disabled/invalid-range early forwarding or temporary native pose context followed by original call. Exceptions are not modeled as successful rendering.'),
+                     'Invokes the original model function unless edf_native_model_pass draws a rigid published object natively (then the last record world, last batch bindings and material activations are handed off); otherwise disabled/invalid-range early forwarding or temporary native pose context followed by original call. Exceptions are not modeled as successful rendering.'),
     'sub_821A1738': ('matrix upload', 'REX_HOOK_RAW(sub_821A1738)',
                      'Original upload runs first; matching model source and valid destination/count allow a 12-word-per-matrix CPU scratch overwrite.'),
     'sub_821A17D8': ('single matrix upload', 'REX_HOOK_RAW(sub_821A17D8)',

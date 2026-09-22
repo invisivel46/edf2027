@@ -80,6 +80,7 @@
 #include "native_camera_history.h"
 #include "native_model_pose_history.h"
 #include "native_model_publication.h"
+#include "native_model_pass.h"
 #include "native_profile_result.h"
 #include "native_capture_policy.h"
 #include "native_ab_alternate.h"
@@ -225,6 +226,8 @@ REXCVAR_DEFINE_BOOL(edf_native_model_publication,false,"EDF2027",
                    "Capture model draw layouts at first sight and publish per-tick pose snapshots; draws are unchanged (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_publication_audit,false,"EDF2027",
                    "Compare published model layouts and poses with live memory at model draw entry (development)");
+REXCVAR_DEFINE_BOOL(edf_native_model_pass,false,"EDF2027",
+                   "Draw rigid published models natively at 821C9C20; any unsupported object runs the original draw. Requires edf_native_model_publication and the static world pass scene flags (development)");
 REXCVAR_DEFINE_BOOL(edf_native_capture_indexed_state,false,"EDF2027",
                    "Trace up to 256 indexed draw states per selected capture frame; requires scene capture prefix (development)");
 REXCVAR_DEFINE_INT32(edf_native_probe_x, -1, "EDF2027", "Optional native scene invalid-RGB probe pixel X");
@@ -906,6 +909,27 @@ struct Bridge {
     NativeSceneMaterialConstantLayout constants;
   };
   std::map<uint32_t,SceneMaterialLoad> scene_material_loads;
+  // Model pass (821C9C20): material programs keyed by pass record address and
+  // retained geometry keyed by (batch descriptor, vertex shader). Validated at
+  // each use; never trusted across a changed input.
+  struct ModelPassLoad {
+    std::shared_ptr<const NativeMaterialParameters::Groups> schema;
+    std::shared_ptr<const NativeSceneGroupMaterial> published;
+    NativeRecordedReads reads; // Program bytes only; constant values are re-read at each use.
+    NativeSceneMaterialConstantLayout layout;
+    uint64_t failed_tick=UINT64_MAX;
+  };
+  std::unordered_map<uint32_t,ModelPassLoad> model_pass_loads;
+  struct ModelGeometryLoad {
+    NativeSceneGeometrySource source;
+    uint64_t vertex_generation=0,index_generation=0;
+    std::array<NativeBufferWrites::ObservedVersion,2> versions{};
+    std::shared_ptr<const NativeDeclaration> declaration;
+    Microsoft::WRL::ComPtr<ID3DBlob> shader;
+    std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+  };
+  std::map<std::pair<uint32_t,uint32_t>,ModelGeometryLoad> model_geometry_loads;
+  uint64_t model_pass_loaded=0,model_pass_reused=0,model_pass_constants=0,model_geometry_loaded=0;
   uint64_t scene_preload_group_revision=UINT64_MAX;
   uint64_t scene_geometry_loaded=0,scene_geometry_reused=0,scene_geometry_deferred=0;
   uint64_t scene_geometry_unchanged=0,scene_geometry_verified=0,scene_material_unchanged=0;
@@ -3626,6 +3650,9 @@ REX_EXTERN(sub_821C3BB8);
 namespace edf::native {
 bool NativeStaticWorldPassEnabled();
 void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner);
+bool NativeModelPassEnabled();
+bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<NativePoseMatrix>* interpolated,
+  bool interpolating,bool render_dependent);
 }
 REX_HOOK_RAW(sub_820B4310) {
   if(REXCVAR_GET(edf_native_scene_group_order_audit)) {
@@ -4149,6 +4176,26 @@ REX_HOOK_RAW(sub_821D96D8) {
 }
 namespace edf::native {
 namespace {
+// Retains one descriptor's observed VB/IB snapshots as native indexed geometry
+// and commits them as the buffers' observed storage; throws if either buffer
+// changed generation or version meanwhile. Shared by the static preload and
+// the model pass, which draw the same 148-byte descriptor shape.
+std::shared_ptr<const NativeIndexedMesh::RetainedDraw> RetainNativeSceneGeometryLocked(Bridge& state,
+    const NativeSceneGeometrySource& input,const auto& vb,const auto& ib,const auto& declaration,const auto& shader,
+    const std::array<NativeBufferWrites::ObservedSnapshot,2>& observed) {
+  auto& backend=EnsureSceneBackendLocked(state);
+  auto& mesh=state.meshes.Acquire(backend,shader,
+    {input.vertex,input.index,input.declaration,input.shader,0},declaration->bytes(),input.stride,
+    *observed[0].contents,*observed[1].contents,ib.stride,declaration,{},
+    ib.index_storage,vb.vertex_storage,{},observed[0].contents,0,observed[1].contents);
+  auto geometry=state.scene_adapter.RetainGeometry(state.scene_backend,mesh,0,input.count);
+  if(!state.model_buffers.CommitObservedGeometry(
+      {input.vertex,vb.generation,observed[0].version},
+      {input.index,ib.generation,observed[1].version},
+      mesh.VertexStorage(),observed[0].contents,mesh.IndexStorage(),observed[1].contents))
+    throw std::runtime_error("native scene geometry changed before publication");
+  return geometry;
+}
 void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) {
   if(!state.initialized) return;
   // Only a membership change can leave an adapter entry or load record stale.
@@ -4250,17 +4297,7 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
         cached->second.reads=std::move(reads);
         ++state.scene_geometry_verified; continue;
       }
-      auto& backend=EnsureSceneBackendLocked(state);
-      auto& mesh=state.meshes.Acquire(backend,shader,
-        {input.vertex,input.index,input.declaration,input.shader,0},declaration->bytes(),input.stride,
-        *(*observed)[0].contents,*(*observed)[1].contents,ib->stride,declaration,{},
-        ib->index_storage,vb->vertex_storage,{},(*observed)[0].contents,0,(*observed)[1].contents);
-      auto geometry=state.scene_adapter.RetainGeometry(state.scene_backend,mesh,0,input.count);
-      if(!state.model_buffers.CommitObservedGeometry(
-          {input.vertex,vb->generation,(*observed)[0].version},
-          {input.index,ib->generation,(*observed)[1].version},
-          mesh.VertexStorage(),(*observed)[0].contents,mesh.IndexStorage(),(*observed)[1].contents))
-        throw std::runtime_error("static preload geometry changed before publication");
+      auto geometry=RetainNativeSceneGeometryLocked(state,input,*vb,*ib,declaration,shader,*observed);
       state.scene_adapter.PublishGroupGeometry(address,group.revision,std::move(geometry),input);
       state.scene_geometry_loads[address]={input,group.revision,vb->generation,ib->generation,
         {(*observed)[0].version,(*observed)[1].version},declaration,shader.bytecode,std::move(reads)};
@@ -4279,6 +4316,84 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
       state.scene_sources.Groups().size(),state.scene_adapter.geometry_groups(),state.scene_geometry_loaded,
       state.scene_geometry_reused,state.scene_geometry_verified,state.scene_geometry_unchanged,state.scene_geometry_deferred);
 }
+// Host identities behind a published material program: backend, schema,
+// shader variants and ready textures. Guest bytes are the caller's reads.
+bool NativeSceneMaterialHostCurrent(Bridge& state,const NativeSceneMaterialProgram& program,uint32_t material,
+    const std::shared_ptr<const NativeMaterialParameters::Groups>& schema) {
+  if(program.backend!=state.scene_backend) return false;
+  try { if(state.material_parameters.Get(material)!=schema) return false; }
+  catch(const std::exception&) { return false; }
+  const auto vs=state.shaders.find(program.inputs.vertex),ps=state.shaders.find(program.inputs.pixel);
+  if(vs==state.shaders.end() || ps==state.shaders.end() || !vs->second.bindings || !vs->second.reversed_bindings ||
+     !ps->second.bindings || !(program.vertex.bytecode==vs->second.bindings->shader().bytecode) ||
+     !(program.reversed_vertex.bytecode==vs->second.reversed_bindings->shader().bytecode) ||
+     !(program.pixel.bytecode==ps->second.bindings->shader().bytecode)) return false;
+  if(program.textures.size()!=program.inputs.textures.size()) return false;
+  for(size_t i=0;i<program.textures.size();++i) {
+    const auto handle=program.inputs.textures[i].handle;
+    if(!handle) { if(program.textures[i]) return false; continue; }
+    const auto texture=state.textures.find(handle);
+    if(texture==state.textures.end() || !texture->second.content_valid ||
+       texture->second.backend!=program.textures[i]) return false;
+  }
+  return true;
+}
+// One material (a 112-byte pass record: +96/+104 state operations, +108 the
+// shader pair) as an owned program plus its constant layout and values.
+// Program inputs go through `recorder` (the change signal); constant values
+// through `reader`, unrecorded, for the per-use refresh. The previous program
+// is kept when every program input and host identity is unchanged.
+struct NativeSceneMaterialBuild {
+  std::shared_ptr<const NativeMaterialParameters::Groups> schema;
+  NativeSceneMaterialConstantLayout layout;
+  std::shared_ptr<const NativeSceneMaterialProgram> program;
+  std::vector<NativeSceneMaterialInputs::Constant> constants;
+  bool reused=false;
+};
+template<class Recorder,class Reader>
+NativeSceneMaterialBuild BuildNativeSceneMaterialLocked(Bridge& state,const Recorder& recorder,const Reader& reader,
+    uint32_t material,const NativeSceneMaterialProgram* previous) {
+  const auto pass=recorder.Word(recorder.Add(material,108));
+  const auto vertex=recorder.Word(recorder.Word(pass));
+  const auto pixel=recorder.Word(recorder.Add(recorder.Word(recorder.Add(pass,4)),4));
+  const auto& vs=state.shaders.at(vertex);
+  const auto& ps=state.shaders.at(pixel);
+  if(!vs.reversed_bindings) throw std::runtime_error("native material has no vertex variants");
+  NativeSceneMaterialBuild result;
+  result.schema=state.material_parameters.Get(material);
+  const auto& schema=*result.schema;
+  result.layout=ResolveNativeSceneMaterialConstants(schema,[&](bool pixel_stage,const std::string& name) {
+    return pixel_stage?ps.bindings->GuestFloatRegisterBytes(name):std::max(
+      vs.bindings->GuestFloatRegisterBytes(name),vs.reversed_bindings->GuestFloatRegisterBytes(name));
+  });
+  auto definition=ReadNativeSceneMaterialDefinition(recorder,material,schema,
+    [&](const std::string& name) { return ps.bindings->ResolveResource(name).used(); });
+  auto sampler_operations=ReadNativeMaterialSamplerOperations(recorder,schema);
+  result.constants=ReadNativeSceneMaterialConstants(reader,schema,result.layout);
+  std::vector<std::shared_ptr<NativeBackendTexture>> textures;
+  for(const auto& input:definition.textures) {
+    if(!input.handle) { textures.emplace_back(); continue; }
+    const auto texture=state.textures.find(input.handle);
+    if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
+      throw std::runtime_error("native material texture is not ready");
+    textures.push_back(texture->second.backend);
+  }
+  if(previous && previous->inputs==definition && previous->textures==textures &&
+     previous->sampler_operations==sampler_operations && previous->backend==state.scene_backend &&
+     previous->vertex.bytecode==vs.bindings->shader().bytecode &&
+     previous->reversed_vertex.bytecode==vs.reversed_bindings->shader().bytecode &&
+     previous->pixel.bytecode==ps.bindings->shader().bytecode) {
+    result.reused=true;
+    return result;
+  }
+  auto program=std::make_shared<NativeSceneMaterialProgram>();
+  program->backend=state.scene_backend; program->inputs=std::move(definition); program->textures=std::move(textures);
+  program->sampler_operations=std::move(sampler_operations);
+  program->vertex=vs.bindings->shader(); program->reversed_vertex=vs.reversed_bindings->shader();
+  program->pixel=ps.bindings->shader();
+  result.program=std::move(program);
+  return result;
+}
 void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing) {
   const NativeSceneCpuWindow reader(backing);
   // Program change signals: group revision, the descriptor's material, the
@@ -4290,23 +4405,7 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
     if(load.revision!=group.revision || !load.published || geometry==state.scene_geometry_loads.end() ||
        geometry->second.source.material!=load.material ||
        state.scene_adapter.GroupMaterial(address,group.revision)!=load.published) return false;
-    const auto& program=*load.published->program;
-    if(program.backend!=state.scene_backend) return false;
-    try { if(state.material_parameters.Get(load.material)!=load.schema) return false; }
-    catch(const std::exception&) { return false; }
-    const auto vs=state.shaders.find(program.inputs.vertex),ps=state.shaders.find(program.inputs.pixel);
-    if(vs==state.shaders.end() || ps==state.shaders.end() || !vs->second.bindings || !vs->second.reversed_bindings ||
-       !ps->second.bindings || !(program.vertex.bytecode==vs->second.bindings->shader().bytecode) ||
-       !(program.reversed_vertex.bytecode==vs->second.reversed_bindings->shader().bytecode) ||
-       !(program.pixel.bytecode==ps->second.bindings->shader().bytecode)) return false;
-    if(program.textures.size()!=program.inputs.textures.size()) return false;
-    for(size_t i=0;i<program.textures.size();++i) {
-      const auto handle=program.inputs.textures[i].handle;
-      if(!handle) { if(program.textures[i]) return false; continue; }
-      const auto texture=state.textures.find(handle);
-      if(texture==state.textures.end() || !texture->second.content_valid ||
-         texture->second.backend!=program.textures[i]) return false;
-    }
+    if(!NativeSceneMaterialHostCurrent(state,*load.published->program,load.material,load.schema)) return false;
     return load.reads.Unchanged(reader);
   };
   for(const auto& [address,group]:state.scene_sources.Groups()) {
@@ -4338,37 +4437,10 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
       const auto material=geometry->second.source.material;
       NativeRecordedReads reads;
       const NativeRecordingReader recorder(reader,reads);
-      const auto pass=recorder.Word(recorder.Add(material,108));
-      const auto vertex=recorder.Word(recorder.Word(pass));
-      const auto pixel=recorder.Word(recorder.Add(recorder.Word(recorder.Add(pass,4)),4));
-      const auto& vs=state.shaders.at(vertex);
-      const auto& ps=state.shaders.at(pixel);
-      if(!vs.reversed_bindings) throw std::runtime_error("native material has no vertex variants");
-      const auto schema=state.material_parameters.Get(material);
-      auto layout=ResolveNativeSceneMaterialConstants(*schema,[&](bool pixel_stage,const std::string& name) {
-        return pixel_stage?ps.bindings->GuestFloatRegisterBytes(name):std::max(
-          vs.bindings->GuestFloatRegisterBytes(name),vs.reversed_bindings->GuestFloatRegisterBytes(name));
-      });
-      auto definition=ReadNativeSceneMaterialDefinition(recorder,material,*schema,
-        [&](const std::string& name) { return ps.bindings->ResolveResource(name).used(); });
-      auto sampler_operations=ReadNativeMaterialSamplerOperations(recorder,*schema);
-      // Values are not recorded: they are compared by the constant refresh.
-      auto constants=ReadNativeSceneMaterialConstants(reader,*schema,layout);
-      std::vector<std::shared_ptr<NativeBackendTexture>> textures;
-      for(const auto& input:definition.textures) {
-        if(!input.handle) { textures.emplace_back(); continue; }
-        const auto texture=state.textures.find(input.handle);
-        if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
-          throw std::runtime_error("native material texture is not ready");
-        textures.push_back(texture->second.backend);
-      }
       const auto previous=state.scene_adapter.GroupMaterial(address,group.revision);
-      if(previous && previous->program->inputs==definition && previous->program->textures==textures &&
-         previous->program->sampler_operations==sampler_operations &&
-         previous->program->backend==state.scene_backend &&
-         previous->program->vertex.bytecode==vs.bindings->shader().bytecode &&
-         previous->program->reversed_vertex.bytecode==vs.reversed_bindings->shader().bytecode &&
-         previous->program->pixel.bytecode==ps.bindings->shader().bytecode) {
+      // Values are read through `reader`, not recorded: the constant refresh compares them.
+      auto build=BuildNativeSceneMaterialLocked(state,recorder,reader,material,previous?previous->program.get():nullptr);
+      if(build.reused) {
         // Recorded program bytes moved without changing the program: report
         // where, so a per-frame program input can be moved out of `reads`.
         if(cached!=state.scene_material_loads.end() && cached->second.revision==group.revision)
@@ -4378,19 +4450,14 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
               REXLOG_INFO("Native scene material program bytes changed without a program change: group={:#x} material={:#x} address={:#x}",
                 address,material,*changed);
           }
-        state.scene_adapter.PublishGroupMaterial(address,group.revision,previous->program,std::move(constants));
+        state.scene_adapter.PublishGroupMaterial(address,group.revision,previous->program,std::move(build.constants));
         ++state.scene_material_reused;
       } else {
-        auto program=std::make_shared<NativeSceneMaterialProgram>();
-        program->backend=state.scene_backend; program->inputs=std::move(definition); program->textures=std::move(textures);
-        program->sampler_operations=std::move(sampler_operations);
-        program->vertex=vs.bindings->shader(); program->reversed_vertex=vs.reversed_bindings->shader();
-        program->pixel=ps.bindings->shader();
-        state.scene_adapter.PublishGroupMaterial(address,group.revision,std::move(program),std::move(constants));
+        state.scene_adapter.PublishGroupMaterial(address,group.revision,std::move(build.program),std::move(build.constants));
         ++state.scene_material_loaded;
       }
-      state.scene_material_loads[address]={group.revision,material,schema,
-        state.scene_adapter.GroupMaterial(address,group.revision),std::move(reads),std::move(layout)};
+      state.scene_material_loads[address]={group.revision,material,build.schema,
+        state.scene_adapter.GroupMaterial(address,group.revision),std::move(reads),std::move(build.layout)};
     } catch(const std::exception& error) {
       state.scene_adapter.RetireGroupMaterial(address); ++state.scene_material_deferred;
       state.scene_material_loads.erase(address);
@@ -5130,6 +5197,8 @@ void ObserveNativeModelPublication(uint8_t* base,uint32_t instance,uint32_t vect
         const auto layout_mismatches=layouts.fetch_add(audit.layout_mismatch,std::memory_order_relaxed)+audit.layout_mismatch;
         const auto pose_count=published_poses.fetch_add(audit.published,std::memory_order_relaxed)+audit.published;
         const auto pose_mismatches=poses_changed.fetch_add(audit.pose_mismatch,std::memory_order_relaxed)+audit.pose_mismatch;
+        // The live pose moved after its tick publication: keep the model pass off it.
+        if(audit.pose_mismatch) models.MarkRenderDependent(instance,published.generation);
         if(audit.layout_mismatch && layout_mismatches<=8)
           REXLOG_WARN("Native model publication audit: layout mismatch instance={:#x} generation={} decoded={}",
             instance,published.generation,audit.decoded);
@@ -5167,12 +5236,33 @@ void ObserveNativeModelPublication(uint8_t* base,uint32_t instance,uint32_t vect
   }
 }
 }
+namespace {
+// A throw must never unwind through guest code: the model pass is switched off
+// for the rest of the run and this object runs the original draw. A throw
+// after recording began can draw that object twice in this frame.
+bool TryNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<edf::native::NativePoseMatrix>* interpolated,
+    bool interpolating,bool render_dependent) {
+  static std::atomic<bool> failed=false;
+  if(failed.load(std::memory_order_relaxed)) return false;
+  try { return edf::native::RenderNativeModelPass(ctx,base,interpolated,interpolating,render_dependent); }
+  catch(const std::exception& error) {
+    if(!failed.exchange(true)) REXLOG_ERROR("Native model pass disabled after failure: {}",error.what());
+    return false;
+  }
+}
+}
 REX_EXTERN(__imp__sub_821C9C20);
 REX_HOOK_RAW(sub_821C9C20) {
   edf::native::HookTiming model_timing(edf::native::HookPhase::RenderModel);
   if(REXCVAR_GET(edf_native_model_publication)) ObserveNativeModelPublication(base,ctx.r3.u32,ctx.r4.u32);
+  // The native model pass takes the object only on the native A/B side; it
+  // draws the poses the original would upload (interpolated when unlocked).
+  const bool model_pass=edf::native::NativeModelPassEnabled() && edf::native::NativeAbNativeSide();
   if(!native_render_budget.unlocked || native_render_budget.divisor!=1 ||
-     !REXCVAR_GET(edf_native_model_interpolation)) { __imp__sub_821C9C20(ctx,base); return; }
+     !REXCVAR_GET(edf_native_model_interpolation)) {
+    if(model_pass && TryNativeModelPass(ctx,base,nullptr,false,false)) return;
+    __imp__sub_821C9C20(ctx,base); return;
+  }
   const edf::native::GuestReader reader(base);
   const auto vector=ctx.r4.u32;
   const auto range=edf::native::ReadGuestWords<2>(reader,reader.Add(vector,4));
@@ -5180,6 +5270,7 @@ REX_HOOK_RAW(sub_821C9C20) {
   if(!begin || end<=begin || (end-begin)%64 || (end-begin)/64>1024) {
     __imp__sub_821C9C20(ctx,base); return;
   }
+  bool render_dependent=false;
   const auto identity=edf::native::ReadGuestWords<2>(reader,ctx.r3.u32);
   std::vector<edf::native::NativePoseMatrix> input((end-begin)/64),output;
   const auto* bytes=reader.Bytes(begin,end-begin);
@@ -5200,6 +5291,7 @@ REX_HOOK_RAW(sub_821C9C20) {
     source.vector=vector; source.owner=identity[0]; source.node=identity[1];
     source.publication=native_render_publication;
     source.history.Sample(input,native_render_budget.tick,native_render_budget.fraction,output);
+    render_dependent=source.history.render_dependent();
     motion.history_bytes-=source.history_bytes;
     source.history_bytes=source.history.StorageBytes();
     motion.history_bytes+=source.history_bytes;
@@ -5228,6 +5320,7 @@ REX_HOOK_RAW(sub_821C9C20) {
     // changes. The current draw owns its output and survives cache eviction.
     if(motion.history_bytes>64u*1024u*1024u) motion.Clear();
   }
+  if(model_pass && TryNativeModelPass(ctx,base,&output,true,render_dependent)) return;
   const NativeModelRenderContext current{begin,&output};
   struct Scope {
     const NativeModelRenderContext* previous=native_model_render_context;
@@ -11267,8 +11360,10 @@ REX_HOOK_RAW(sub_8213DDA0) {
 REXCVAR_DEFINE_BOOL(edf_native_static_world_pass,false,"EDF2027",
   "Draw the static opaque world pass natively in published group order; unsupported groups run their guest group callback (development)");
 namespace edf::native {
-bool NativeStaticWorldPassEnabled() {
-  if(!REXCVAR_GET(edf_native_static_world_pass)) return false;
+namespace {
+// The scene publication, queue, ownership and preload flags a native pass
+// drawing published scene state depends on; the first one off, or null.
+const char* NativeScenePassMissingFlag() {
   const std::pair<const char*,bool> required[]{
     {"edf_native_frame_dispatch",REXCVAR_GET(edf_native_frame_dispatch)},
     {"edf_native_scene_tree",REXCVAR_GET(edf_native_scene_tree)},
@@ -11283,10 +11378,28 @@ bool NativeStaticWorldPassEnabled() {
     {"edf_native_scene_material_owned",REXCVAR_GET(edf_native_scene_material_owned)},
     {"edf_native_scene_preload",REXCVAR_GET(edf_native_scene_preload)},
     {"edf_native_scene_group_order",REXCVAR_GET(edf_native_scene_group_order)}};
-  for(const auto& [name,enabled]:required) if(!enabled) {
+  for(const auto& [name,enabled]:required) if(!enabled) return name;
+  return nullptr;
+}
+}
+bool NativeStaticWorldPassEnabled() {
+  if(!REXCVAR_GET(edf_native_static_world_pass)) return false;
+  if(const auto* name=NativeScenePassMissingFlag()) {
     static std::atomic<bool> reported=false;
     if(!reported.exchange(true))
       REXLOG_INFO("Native static world pass disabled: requires {} (original group traversal retained)",name);
+    return false;
+  }
+  return true;
+}
+bool NativeModelPassEnabled() {
+  if(!REXCVAR_GET(edf_native_model_pass)) return false;
+  const char* name=!REXCVAR_GET(edf_native_model_publication)?"edf_native_model_publication":
+    !REXCVAR_GET(edf_native_shader_bridge)?"edf_native_shader_bridge":NativeScenePassMissingFlag();
+  if(name) {
+    static std::atomic<bool> reported=false;
+    if(!reported.exchange(true))
+      REXLOG_INFO("Native model pass disabled: requires {} (original model draws retained)",name);
     return false;
   }
   return true;
@@ -11520,5 +11633,334 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
       passes,counters.native_groups,counters.empty_groups,counters.instances,counters.draws,counters.batches,fallbacks,
       f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.binds,counters.original);
   }
+}
+}
+
+namespace edf::native {
+// Replaces one 821C9C20 object (rigid path: per record 821A17D8 then 821B2C28,
+// which binds stream/declaration/indices per batch and runs 821B94E8 +
+// 821FE358 per material pass). Everything is resolved from the layout and
+// pose publications, the per-pass-record material programs and retained
+// batch geometry before anything is recorded; a decline leaves guest and
+// device state untouched and returns false so the caller runs the original.
+// After recording, the object's guest-visible CPU effects are handed off the
+// way the static world pass hands off its groups.
+bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<NativePoseMatrix>* interpolated,
+    bool interpolating,bool render_dependent) {
+  using D=NativeModelPassDecline;
+  static NativeModelPassCounters counters;
+  const GuestReader reader(base);
+  const auto instance=ctx.r3.u32,vector=ctx.r4.u32;
+  ++counters.objects;
+  const auto summary=[&] {
+    if(counters.objects>4 && counters.objects%1000) return;
+    std::string reasons;
+    for(size_t i=0;i<counters.fallbacks.size();++i)
+      if(counters.fallbacks[i]) reasons+=std::format(" {}={}",kNativeModelPassDeclineNames[i],counters.fallbacks[i]);
+    REXLOG_INFO("Native model pass: objects={} native={} draws={} passes={} handoffs={} replays={} fallbacks={}{}",
+      counters.objects,counters.native,counters.draws,counters.passes,counters.handoffs,counters.replays,
+      counters.Fallbacks(),reasons);
+  };
+  const auto report=[](const std::string& reason) {
+    static std::set<std::string> reported;
+    if(reported.size()<32 && reported.insert(reason).second) REXLOG_INFO("Native model pass declined: {}",reason);
+  };
+  const auto decline=[&](D reason) {
+    const auto count=++counters.fallbacks[size_t(reason)];
+    if(count<=4 || !(count&(count-1)))
+      REXLOG_INFO("Native model pass fallback: instance={:#x} reason={} count={}",instance,kNativeModelPassDeclineNames[size_t(reason)],count);
+    summary();
+    return false;
+  };
+  // Publication gate: rigid, layout current, pose published for this tick.
+  auto& models=::ModelPublications();
+  const auto published=models.Find(instance);
+  if(published && render_dependent) models.MarkRenderDependent(instance,published.generation);
+  const auto identity=ReadGuestWords<2>(reader,instance);
+  const auto poses=models.AcquirePoses();
+  const auto gate=GateNativeModelPass(published,published && models.Current(instance,identity[0],identity[1],vector),
+    reader.Bytes(reader.Add(instance,12),1)[0],poses.get(),native_render_budget.tick,
+    render_dependent || (published && models.RenderDependent(instance,published.generation)));
+  if(!gate) return decline(*gate.decline);
+  if(interpolating && (!interpolated || interpolated->size()!=gate.pose->matrices.size())) return decline(D::Pose);
+  const auto& matrices=interpolating?*interpolated:gate.pose->matrices;
+  const auto& layout=*published.layout;
+  const auto plan=NativeModelDrawPlan(layout);
+  // 821A17D8(*(*0x8257C02C+32)): a null parameter uploads nothing, which the
+  // native world cannot represent.
+  const auto parameter=reader.Word(reader.Add(reader.Word(0x8257C02C),32));
+  const auto world_storage=parameter?reader.Word(parameter):0;
+  if(!world_storage) return decline(D::World);
+  const auto device=reader.Word(reader.Add(reader.Word(0x8257BFB4),8));
+  // The 821C9C20 and 821B2C28 frames the setters and activations run under.
+  if(ctx.r1.u32<4096+128+176) return decline(D::Eligibility);
+  const uint32_t stack=ctx.r1.u32-128-176;
+  const auto batch_of=[&](const NativeModelDraw& draw) -> const NativeModelBatchLayout& {
+    return layout.meshes[draw.mesh].batches[draw.batch];
+  };
+  const auto source_of=[&](const NativeModelDraw& draw) {
+    const auto& batch=batch_of(draw);
+    return NativeSceneGeometrySource{batch.vertex.owner,batch.index.owner,batch.declaration,batch.stride,batch.draw_count,
+      draw.pass,reader.Word(reader.Word(reader.Add(draw.pass,108)))};
+  };
+  // Static-group eligibility per pass: the same descriptor shape and CPU
+  // activation contract. Guest reads only.
+  try {
+    for(const auto& draw:plan)
+      if(AssessNativeStaticGroup(reader,device,stack,source_of(draw))!=NativeStaticGroupEligibility::Supported)
+        return decline(D::Eligibility);
+  } catch(const std::exception& error) { report(error.what()); return decline(D::Eligibility); }
+  // Pass inputs at object entry: nothing runs between here and the original's
+  // first activation, and each pass chains the state its predecessor left.
+  NativeSceneMaterialPassState start;
+  try {
+    start.render=ReadNativeMaterialRenderPass(reader,device);
+    for(uint32_t slot=0;slot<16;++slot) start.samplers[slot]=ReadNativeMaterialSamplerPass(reader,device,slot);
+    start=start.Inputs();
+  } catch(const std::exception& error) { report(error.what()); return decline(D::PassState); }
+  auto& state=State();
+  std::vector<std::shared_ptr<const NativeSceneGroupMaterial>> materials;
+  std::vector<NativeStaticWorldHandoffGroup> owed;
+  NativeSceneMaterialPassState cursor=start;
+  {
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    if(!state.initialized) return decline(D::Scene);
+    if(BufferWrites().Pending()) return decline(D::Pending);
+    if(!state.active_scene || state.active_target || !state.scenes.contains(state.active_scene)) return decline(D::Scene);
+    const auto targets=ActiveTargetsLocked(state);
+    if(!targets.count) return decline(D::Scene);
+    EnsureSceneBackendLocked(state);
+    const auto viewport=DecodeDrawViewport(ReadNativeDrawViewportWords(reader,device));
+    const NativeSceneCpuWindow window(reader);
+    if(state.model_pass_loads.size()>8192) state.model_pass_loads.clear();
+    if(state.model_geometry_loads.size()>8192) state.model_geometry_loads.clear();
+    // Material program of one pass record (the static group material shape):
+    // the program is rebuilt only when its recorded program bytes or host
+    // identities changed; constant values are re-read at every use, since the
+    // guest activation uploads them live. That includes the pass-owned camera
+    // and animation globals (the static pass substitutes its published camera;
+    // a model draw uploads whatever the globals hold now), and excludes
+    // g_mWorld, which each record supplies. Failures retry once per tick.
+    const auto refresh=[&](Bridge::ModelPassLoad& load) {
+      const auto& schema=*load.schema;
+      const auto& published=load.published->constants;
+      if(published.size()!=load.layout.size()) throw std::runtime_error("native model material constants do not match their layout");
+      std::optional<std::vector<NativeSceneMaterialInputs::Constant>> constants;
+      for(size_t i=0;i<load.layout.size();++i) {
+        const auto& slot=load.layout[i];
+        if(published[i].global && published[i].name=="g_mWorld") continue;
+        const auto* data=ReadNativeSceneMaterialConstant(window,schema,slot);
+        const auto& old=published[i].registers;
+        if(old.size()==slot.bytes && std::equal(old.begin(),old.end(),data)) continue;
+        if(!constants) constants=published;
+        (*constants)[i].registers.assign(data,data+slot.bytes);
+      }
+      if(!constants) return;
+      auto material=std::make_shared<NativeSceneGroupMaterial>(*load.published);
+      material->constants=std::move(*constants);
+      load.published=std::move(material);
+      ++state.model_pass_constants;
+    };
+    const auto program_of=[&](uint32_t pass) -> std::shared_ptr<const NativeSceneGroupMaterial> {
+      auto& load=state.model_pass_loads[pass];
+      if(load.published && NativeSceneMaterialHostCurrent(state,*load.published->program,pass,load.schema) &&
+         load.reads.Unchanged(window)) {
+        try { refresh(load); ++state.model_pass_reused; return load.published; }
+        catch(const std::exception& error) { report(error.what()); }
+      }
+      if(!load.published && load.failed_tick==native_render_budget.tick) return nullptr;
+      try {
+        NativeRecordedReads reads;
+        const NativeRecordingReader recorder(window,reads);
+        auto build=BuildNativeSceneMaterialLocked(state,recorder,window,pass,load.published?load.published->program.get():nullptr);
+        auto material=std::make_shared<NativeSceneGroupMaterial>();
+        material->group=pass;
+        material->program=build.reused?load.published->program:std::move(build.program);
+        material->constants=std::move(build.constants);
+        load.schema=std::move(build.schema); load.layout=std::move(build.layout); load.published=std::move(material);
+        load.reads=std::move(reads); load.failed_tick=UINT64_MAX;
+        ++state.model_pass_loaded;
+        return load.published;
+      } catch(const std::exception& error) {
+        load.published.reset(); load.failed_tick=native_render_budget.tick;
+        report(error.what());
+        return nullptr;
+      }
+    };
+    // Retained geometry of one batch under one vertex shader, reloaded through
+    // the guarded observed-set copy, as the static preload does, when changed.
+    const auto geometry_of=[&](const NativeSceneGeometrySource& source,const NativeModelBatchLayout& batch)
+        -> std::shared_ptr<const NativeIndexedMesh::RetainedDraw> {
+      const auto* vb=state.model_buffers.Find(source.vertex,NativeModelBuffers::Kind::Vertex);
+      const auto* ib=state.model_buffers.Find(source.index,NativeModelBuffers::Kind::Index);
+      if(!vb || !ib || !vb->physical || !ib->physical || vb->generation!=batch.vertex.generation ||
+         ib->generation!=batch.index.generation || vb->stride!=source.stride || !vb->bytes || !ib->bytes) return nullptr;
+      const auto registered=state.shaders.find(source.shader);
+      if(registered==state.shaders.end() || !registered->second.bindings) return nullptr;
+      const auto declaration=state.declarations.Get(source.declaration);
+      const auto& shader=registered->second.bindings->shader();
+      const auto index_contents=ib->index_contents?ib->index_contents:(ib->index_storage?ib->index_storage->SourceSnapshot():nullptr);
+      NativeBufferWrites::SnapshotPolicy policy{};
+      policy.audit_revisions=REXCVAR_GET(edf_native_retirement_audit);
+      if(!policy.audit_revisions && state.mesh_watch_audit.expired()) {
+        policy.verify_interval=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_interval),0,1<<20));
+        policy.verify_initial=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_initial),0,1<<16));
+      }
+      using View=NativeBufferWrites::SnapshotIdentityView;
+      const auto versions=BufferWrites().TryValidateObservedSet(std::array<View,2>{{
+        {source.vertex,*vb->physical,vb->bytes,&vb->vertex_contents},
+        {source.index,*ib->physical,ib->bytes,&index_contents}}},policy);
+      auto& load=state.model_geometry_loads[{batch.address,source.shader}];
+      const bool same=load.geometry && load.source==source && load.vertex_generation==vb->generation &&
+        load.index_generation==ib->generation && load.declaration==declaration &&
+        load.shader.Get()==shader.bytecode.Get() && load.geometry->backend()==state.scene_backend.get();
+      const auto same_versions=[&](const std::array<NativeBufferWrites::ObservedVersion,2>& observed) {
+        for(size_t i=0;i<2;++i)
+          if(observed[i].lifetime!=load.versions[i].lifetime || observed[i].revision!=load.versions[i].revision) return false;
+        return true;
+      };
+      if(versions && same && same_versions(*versions)) return load.geometry;
+      using Snapshots=std::array<NativeBufferWrites::ObservedSnapshot,2>;
+      std::optional<Snapshots> observed;
+      if(versions) observed=Snapshots{{
+        {(*versions)[0],vb->vertex_contents,false,true,false},
+        {(*versions)[1],index_contents,false,true,false}}};
+      else {
+        using Source=NativeBufferWrites::SnapshotSource;
+        observed=BufferWrites().CopyObservedSet(std::array<Source,2>{{
+          {source.vertex,*vb->physical,{reader.Bytes(vb->address,vb->bytes),vb->bytes},vb->vertex_contents},
+          {source.index,*ib->physical,{reader.Bytes(ib->address,ib->bytes),ib->bytes},index_contents}}},nullptr,policy);
+      }
+      if(!observed) return nullptr;
+      if(same && (*observed)[0].contents==vb->vertex_contents && (*observed)[1].contents==index_contents &&
+         same_versions({(*observed)[0].version,(*observed)[1].version})) return load.geometry;
+      const auto vertex_generation=vb->generation,index_generation=ib->generation;
+      auto geometry=RetainNativeSceneGeometryLocked(state,source,*vb,*ib,declaration,shader,*observed);
+      load=Bridge::ModelGeometryLoad{source,vertex_generation,index_generation,
+        {(*observed)[0].version,(*observed)[1].version},declaration,shader.bytecode,geometry};
+      ++state.model_geometry_loaded;
+      return geometry;
+    };
+    struct Resolved { std::shared_ptr<const NativeSceneInstance> object; NativeSceneView view; };
+    std::vector<Resolved> resolved;
+    resolved.reserve(plan.size());
+    static uint64_t ids=0;
+    for(const auto& draw:plan) {
+      const auto source=source_of(draw);
+      const auto material=program_of(draw.pass);
+      if(!material || !material->program) return decline(D::Program);
+      const auto& program=*material->program;
+      if(!program.CanDeferCpuActivation()) return decline(D::Scissor);
+      std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+      try { geometry=geometry_of(source,batch_of(draw)); }
+      catch(const std::exception& error) { report(error.what()); }
+      if(!geometry || geometry->backend()!=state.scene_backend.get()) return decline(D::Geometry);
+      NativeSceneResolvedMaterial result;
+      NativeSceneMaterialPassState next;
+      try {
+        next=cursor.After(program);
+        DecodeNativeRenderState(next.render.words);
+        NativeBackendPipelineDesc desc;
+        desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(viewport.reverse_depth);
+        desc.pixel_id=program.inputs.pixel;
+        desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
+        desc.render_targets=targets.count; desc.rtv_format=targets.rtv_format;
+        desc.dsv_format=targets.dsv_format; desc.sample_count=targets.samples;
+        result=program.Resolve(desc,viewport.reverse_depth,material->constants,cursor.render,cursor.samplers,
+          REXCVAR_GET(edf_native_anisotropic_filtering));
+      } catch(const std::exception& error) { report(error.what()); return decline(D::PassState); }
+      // g_mWorld exactly as 821A17D8 stores it: the record's bone, column-major.
+      try { ApplyNativeScenePublishedWorld(result.capture,NativeModelWorldRegisters(matrices[layout.meshes[draw.mesh].bone])); }
+      catch(const std::exception& error) { report(error.what()); return decline(D::World); }
+      auto object=std::make_shared<NativeSceneInstance>();
+      object->id=(uint64_t(1)<<62)+ ++ids; object->changed_tick=UINT64_MAX;
+      object->object.geometry=std::move(geometry); object->object.material=result.capture.material;
+      object->object.world=result.capture.world; object->previous=result.capture.world;
+      resolved.push_back({std::move(object),NativeStaticInstanceView(result.capture.camera,viewport,result.render.words[5]!=0)});
+      uint32_t slots=0;
+      for(const auto& operation:program.sampler_operations) slots|=1u<<operation.slot;
+      owed.push_back({program.inputs.state_overrides,slots});
+      materials.push_back(material);
+      cursor=std::move(next);
+    }
+    // The handoff's combined state writes must be representable and land on
+    // the chained cursor before anything is recorded.
+    try {
+      if(!owed.empty() && NativeStaticWorldStateHandoff(start.render,owed).render!=cursor.render) return decline(D::PassState);
+    } catch(const std::exception& error) { report(error.what()); return decline(D::PassState); }
+    // Record in guest order. A partial recording cannot be rolled back; a
+    // throw past this point reaches TryNativeModelPass, which runs the original.
+    NativeQueuedSceneGroup batch;
+    batch.targets=targets;
+    const auto draws=state.scene_native_draws;
+    try {
+      for(auto& item:resolved) {
+        if(!batch.objects.empty() && (batch.view.view!=item.view.view || batch.view.projection!=item.view.projection ||
+           batch.view.view_projection!=item.view.view_projection || batch.view.scissor_enabled!=item.view.scissor_enabled))
+          FlushNativeQueuedSceneLocked(state,batch);
+        batch.view=item.view; batch.objects.push_back(std::move(item.object));
+      }
+      FlushNativeQueuedSceneLocked(state,batch);
+    } catch(const std::exception&) {
+      // The recorder may hold part of this object's bindings: invalidate its cache.
+      ++state.bind_generation; state.recorded={};
+      throw;
+    }
+    ++state.bind_generation;
+    counters.draws+=state.scene_native_draws-draws; counters.passes+=plan.size();
+  }
+  // Device-state handoff: guest calls run unlocked, in guest order.
+  auto frame=ctx;
+  frame.r1.u64=ctx.r1.u32-128; reader.StoreWord(frame.r1.u32,ctx.r1.u32);
+  frame.r1.u64=stack; reader.StoreWord(stack,ctx.r1.u32-128);
+  // 1. 821A17D8 of the last record: g_mWorld's storage holds its bone.
+  if(!layout.meshes.empty()) reader.StoreCpuWords(world_storage,NativeModelWorldWords(matrices[layout.meshes.back().bone]));
+  // 2. 821B2C28's stream/declaration/index setters for the last batch.
+  const NativeModelBatchLayout* last=nullptr;
+  for(const auto& mesh:layout.meshes) if(!mesh.batches.empty()) last=&mesh.batches.back();
+  if(last) {
+    NativeSceneGeometryInstallState progress;
+    auto work=frame;
+    ::InstallNativeStaticGeometry(work,base,device,NativeSceneGeometrySource{last->vertex.owner,last->index.owner,
+      last->declaration,last->stride,last->draw_count,last->passes.empty()?0:last->passes.back(),0},progress);
+  }
+  // 3. Material activations: the last pass and each sampler slot's last
+  // binder through 821B94E8, then every pass's combined render words, dirty
+  // masks and sampler words, exactly as for static world groups.
+  if(!owed.empty()) {
+    auto work=frame;
+    const auto writes=HandOffNativeStaticWorld(reader,device,start.render,cursor.samplers,owed,[&](size_t index) {
+      work.r3.u64=plan[index].pass; work.lr=0x821B2ECC; sub_821B94E8(work,base);
+      ++counters.replays;
+    });
+    if(writes.render!=cursor.render) throw std::runtime_error("native model handoff diverged from the pass cursor");
+    for(const auto offset:writes.operations) {
+      const auto setter=NativeMaterialStateSetter(offset);
+      if(offset==0x44) {
+        std::lock_guard lock(state.mutex);
+        state.render_state_snapshots.PublishBlend(device,ReadGuestWords<4>(reader,reader.Add(device,10336)),setter);
+      } else if(offset!=0x64) PublishNativeRenderState(base,device,setter);
+    }
+    if(REXCVAR_GET(edf_native_material_state_audit) || REXCVAR_GET(edf_native_material_sampler_audit)) {
+      NativeSceneMaterialPassState actual;
+      actual.render=ReadNativeMaterialRenderPass(reader,device);
+      for(uint32_t slot=0;slot<16;++slot) actual.samplers[slot]=ReadNativeMaterialSamplerPass(reader,device,slot);
+      actual=actual.Inputs();
+      if(actual!=cursor) {
+        REXLOG_ERROR("Native model handoff mismatch: instance={:#x} render_equal={} samplers_equal={}",
+          instance,actual.render==cursor.render,actual.samplers==cursor.samplers);
+        throw std::runtime_error("native model handoff differs from the pass cursor");
+      }
+    }
+  }
+  {
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    state.recorded={}; ++state.bind_generation;
+  }
+  ++counters.handoffs; ++counters.native;
+  summary();
+  return true;
 }
 }

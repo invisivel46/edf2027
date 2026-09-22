@@ -1,4 +1,6 @@
 #include "native_graphics/native_model_publication.h"
+#include "native_graphics/native_model_pass.h"
+#include "native_graphics/native_queued_scene.h"
 #include <bit>
 #include <cstring>
 #include <functional>
@@ -204,6 +206,93 @@ void PosePublicationIsImmutableAndDirtyOnly() {
   models.Clear();
   Require(!models.size() && !models.AcquirePoses() && !models.RetireAddress(0xF000),"clear");
 }
+// A rigid model whose three batches all have published buffers.
+void RigidBuffers(const Memory& memory,NativeModelBuffers& buffers) {
+  BuildModel(memory,2,false);
+  memory.StoreWord(kRecords+52+44,0); // Rigid instances upload every record's bone.
+  uint32_t address=0x10000;
+  for(const auto batch:{kBatches,kBatches+148,kSecondBatch}) {
+    buffers.Publish(batch+4,NativeModelBuffers::Kind::Vertex,address,32,4); address+=0x1000;
+    buffers.Publish(batch+84,NativeModelBuffers::Kind::Index,address,2,100); address+=0x1000;
+  }
+}
+void ModelPassGateDeclines() {
+  using D=NativeModelPassDecline;
+  std::vector<uint8_t> bytes(0x20000);
+  const Memory memory{bytes};
+  NativeModelBuffers buffers;
+  RigidBuffers(memory,buffers);
+  NativeModelPublications models;
+  const auto layout=models.Register(Decode(memory,&buffers),kPose);
+  const auto poses=models.PublishPoses(memory,10,{});
+  const auto accepted=GateNativeModelPass(layout,true,0,poses.get(),10,false);
+  Require(accepted && accepted.pose==poses->Find(kInstance) && accepted.pose->matrices.size()==2,"rigid published model declined");
+  const auto reason=[](const NativeModelPoseGate& gate) { return gate.decline.value_or(D::Count); };
+  Require(reason(GateNativeModelPass({},true,0,poses.get(),10,false))==D::Unpublished,"unpublished layout accepted");
+  Require(reason(GateNativeModelPass(layout,false,0,poses.get(),10,false))==D::Stale,"stale identity accepted");
+  Require(reason(GateNativeModelPass(layout,true,1,poses.get(),10,false))==D::Skinned,"live instance+12 byte ignored");
+  Require(reason(GateNativeModelPass(layout,true,0,poses.get(),11,false))==D::PoseTick,"pose from another tick accepted");
+  Require(reason(GateNativeModelPass(layout,true,0,nullptr,10,false))==D::PoseTick,"missing pose publication accepted");
+  Require(reason(GateNativeModelPass(layout,true,0,poses.get(),10,true))==D::RenderDependent,"render-dependent pose accepted");
+  // A bone outside the published pose (a hand-made layout: decoding rejects it).
+  auto moved=*layout.layout; moved.meshes[1].bone=5;
+  const NativeModelPublications::Layout bone_layout{layout.generation,std::make_shared<const NativeModelLayout>(moved)};
+  Require(reason(GateNativeModelPass(bone_layout,true,0,poses.get(),10,false))==D::Bone,"bone outside the pose accepted");
+  // Re-registration: the published pose belongs to the older generation.
+  const auto newer=models.Register(Decode(memory,&buffers),kPose);
+  Require(reason(GateNativeModelPass(newer,true,0,poses.get(),10,false))==D::Pose,"pose of an older layout generation accepted");
+  const auto seeded=models.PublishPoses(memory,11,{});
+  Require(GateNativeModelPass(newer,true,0,seeded.get(),11,false),"seeded pose of the new generation declined");
+  // The render-dependence latch follows the layout generation.
+  models.MarkRenderDependent(kInstance,layout.generation);
+  Require(!models.RenderDependent(kInstance,newer.generation),"latch applied to a stale generation");
+  models.MarkRenderDependent(kInstance,newer.generation);
+  Require(models.RenderDependent(kInstance,newer.generation),"render-dependence latch lost");
+  const auto relatched=models.Register(Decode(memory,&buffers),kPose);
+  Require(!models.RenderDependent(kInstance,relatched.generation) && !models.RenderDependent(kInstance,newer.generation),
+    "a new generation inherited the latch");
+  // Unpublished vertex/index buffers.
+  const auto bare=models.Register(Decode(memory),kPose);
+  const auto bare_poses=models.PublishPoses(memory,12,{});
+  Require(reason(GateNativeModelPass(bare,true,0,bare_poses.get(),12,false))==D::Buffers,"unpublished buffers accepted");
+  // A skinned layout declines even when the live byte reads rigid.
+  BuildModel(memory,2,true);
+  const auto skinned=models.Register(Decode(memory,&buffers),kPose);
+  const auto skinned_poses=models.PublishPoses(memory,13,{});
+  Require(reason(GateNativeModelPass(skinned,true,0,skinned_poses.get(),13,false))==D::Skinned,"skinned layout accepted");
+}
+void ModelPassDrawPlanFollowsGuestOrder() {
+  std::vector<uint8_t> bytes(0x20000);
+  const Memory memory{bytes};
+  NativeModelBuffers buffers;
+  RigidBuffers(memory,buffers);
+  const auto plan=NativeModelDrawPlan(Decode(memory,&buffers));
+  // Record 0: two batches of two passes; record 1: one batch of two passes.
+  const std::vector<std::array<uint32_t,3>> expected{{0,0,kPasses},{0,0,kPasses+112},{0,1,kPasses},{0,1,kPasses+112},
+    {1,0,kPasses},{1,0,kPasses+112}};
+  Require(plan.size()==expected.size(),"draw plan size");
+  for(size_t i=0;i<plan.size();++i)
+    Require(plan[i].mesh==expected[i][0] && plan[i].batch==expected[i][1] && plan[i].pass==expected[i][2],"draw plan order");
+}
+void ModelWorldMatchesGuestUpload() {
+  NativePoseMatrix pose;
+  for(size_t i=0;i<16;++i) pose[i]=float(i)+0.25f;
+  pose[5]=-0.f;
+  // 821C8000's stores, in destination order: the source byte offset of each word.
+  constexpr std::array<uint32_t,16> source{0,16,32,48,4,20,36,52,8,24,40,56,12,28,44,60};
+  const auto words=NativeModelWorldWords(pose);
+  for(size_t k=0;k<16;++k) Require(words[k]==std::bit_cast<uint32_t>(pose[source[k]/4]),"g_mWorld word differs from 821C8000");
+  Require(words[3]==std::bit_cast<uint32_t>(pose[12]) && words[7]==std::bit_cast<uint32_t>(pose[13]),
+    "pose translation row must land in the fourth register column");
+  Require(words[5]==0x80000000u,"signed zero must survive the upload");
+  const auto registers=NativeModelWorldRegisters(pose);
+  for(size_t k=0;k<16;++k) Require(GuestBlockWord(registers.data()+k*4)==words[k],"registers are not big-endian upload words");
+  const auto decoded=DecodeNativeQueuedWorld(registers,true);
+  Require(std::bit_cast<std::array<uint32_t,16>>(decoded)==std::bit_cast<std::array<uint32_t,16>>(pose),
+    "column-major world decode does not recover the row-major pose");
+  const auto transposed=DecodeNativeQueuedWorld(registers,false);
+  Require(transposed[1]==pose[4] && transposed[12]==pose[3],"row-major decode of the upload must transpose");
+}
 }
 int main() {
   try {
@@ -211,6 +300,9 @@ int main() {
     RejectsUnexpectedMemory();
     RegistryGenerationsAndRetirement();
     PosePublicationIsImmutableAndDirtyOnly();
+    ModelPassGateDeclines();
+    ModelPassDrawPlanFollowsGuestOrder();
+    ModelWorldMatchesGuestUpload();
   } catch(const std::exception& error) {
     std::cerr<<"native model publication test failed: "<<error.what()<<"\n";
     return 1;
