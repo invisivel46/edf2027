@@ -179,6 +179,16 @@ class NativeStaticWalkPlans {
       touches_.fetch_add(1,std::memory_order_acq_rel);
     }
   }
+  // Every current plan of `world`, in its list order (a Touch-dropped list is skipped).
+  template<class Visit>
+  void ForEachPlan(uint32_t world,Visit&& visit) const {
+    const auto found=worlds_.find(world);
+    if(found==worlds_.end()) return;
+    for(const auto list:found->second.lists) {
+      const auto slot=lists_.find(list);
+      if(slot!=lists_.end() && slot->second.plan && slot->second.plan->world==world) visit(*slot->second.plan);
+    }
+  }
   const Stats& stats() const { return stats_; }
   size_t lists() const { return lists_.size(); }
   size_t nodes() const { return nodes_.size(); }

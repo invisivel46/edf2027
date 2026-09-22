@@ -49,6 +49,7 @@
 #include "native_shader_binding.h"
 #include "native_frame_dispatch.h"
 #include "native_full_frame.h"
+#include "native_full_frame_static_world.h"
 #include "native_bucket_dispatch.h"
 #include "native_map_effects.h"
 #include "native_scene_tree.h"
@@ -364,7 +365,7 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        QueuedHandoff, QueuedHandoffBinds, QueuedHandoffReplays,
                        FrameNative, FrameNativeBegin, FrameNativeStaticWorld, FrameNativeModels,
                        FrameNativeSky, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
-                       FrameNativeEnd,
+                       FrameNativeEnd, FrameNativeOverlays, FrameNativePhases,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
@@ -423,7 +424,7 @@ class HookTiming {
       "render.queued.handoff","render.queued.handoff_binds","render.queued.handoff_replays",
       "frame.native","frame.native.begin","frame.native.static_world","frame.native.models",
       "frame.native.sky","frame.native.effects","frame.native.transparent","frame.native.post",
-      "frame.native.end",
+      "frame.native.end","frame.native.view_overlays","frame.native.phases",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
       "load.shader.registration","load.shader.lock","load.shader.entry",
       "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
@@ -917,6 +918,10 @@ struct Bridge {
   NativeSceneSources scene_sources;
   NativeSceneMembership scene_membership;
   NativeStaticWalkPlans static_walk_plans;
+  // edf_native_full_frame: sub_821C0C00's route words per world as of its last
+  // step (PublishStaticWalkPlans), and their union the frame acquires.
+  std::map<uint32_t,NativeFullFrameStaticRoutes> full_frame_world_routes;
+  std::shared_ptr<const NativeFullFrameStaticRoutes> full_frame_routes=std::make_shared<const NativeFullFrameStaticRoutes>();
   NativeStaticWalkAudit static_walk_audit;
   uint64_t static_walk_lists=0,static_walk_misses=0,static_walk_stale=0,static_walk_members=0;
   uint64_t static_walk_direct_reuses=0,static_walk_source_reuses=0,static_walk_abandoned=0,static_walk_bucket_native=0;
@@ -4088,6 +4093,8 @@ REXCVAR_DEFINE_BOOL(edf_native_scene_group_order,false,"EDF2027",
   "Publish each world owner's static group walk order (owner+240) at simulation step.");
 REXCVAR_DEFINE_BOOL(edf_native_scene_group_order_audit,false,"EDF2027",
   "Compare the published static group order with a live walk at world-pass entry (development).");
+REXCVAR_DEFINE_BOOL(edf_native_full_frame,false,"EDF2027",
+  "Full-frame native renderer: the render helper 821A5080 runs a native frame (scene begin, native static world, native post, then the guest HUD phase loop on the output) instead of the guest helper. Needs edf_native_host and edf_native_shader_bridge; edf_native_ab_alternate guest-side frames keep the guest helper (development)");
 namespace edf::native {
 void RetireGroupOrder(uint32_t owner) {
   // Destructor path of every world: stay off the bridge lock unless orders exist.
@@ -4096,14 +4103,23 @@ void RetireGroupOrder(uint32_t owner) {
   std::lock_guard lock(state.mutex);
   state.scene_adapter.RetireGroupOrder(owner);
 }
+// The full frame needs the plans for its route words even without the walk.
 bool NativeStaticWalkPlansEnabled() {
-  return REXCVAR_GET(edf_native_scene_static_walk) || REXCVAR_GET(edf_native_scene_static_walk_audit);
+  return REXCVAR_GET(edf_native_scene_static_walk) || REXCVAR_GET(edf_native_scene_static_walk_audit) ||
+    EDF_NATIVE_FLAG(full_frame);
+}
+// Rebuilds the frame's route union after one world's routes changed.
+void PublishFullFrameRoutesLocked(Bridge& state) {
+  NativeFullFrameStaticRoutes all;
+  for(const auto& [world,routes]:state.full_frame_world_routes) all.insert(routes.begin(),routes.end());
+  state.full_frame_routes=std::make_shared<const NativeFullFrameStaticRoutes>(std::move(all));
 }
 void RetireStaticWalkPlans(uint32_t owner) {
   if(!NativeStaticWalkPlansEnabled()) return;
   auto& state=State();
   std::lock_guard lock(state.mutex);
   state.static_walk_plans.Retire(owner);
+  if(state.full_frame_world_routes.erase(owner)) PublishFullFrameRoutesLocked(state);
 }
 // After a guest link/unlink: each anchor is a list header or a member node,
 // so the list it belongs to (by the plan's node index) loses its plan.
@@ -4129,8 +4145,25 @@ void PublishStaticWalkPlans(uint8_t* base,uint32_t owner) {
       REXLOG_INFO("Native static walk plan: owner={:#x} publications={} collections={} builds={} reuses={} refreshes={} touches={} lists={} nodes={}",
         owner,stats.publications,stats.collections,stats.builds,stats.reuses,stats.refreshes,stats.touches,
         state.static_walk_plans.lists(),state.static_walk_plans.nodes());
+    if(EDF_NATIVE_FLAG(full_frame)) {
+      // sub_821C0C00's route words as of this step, for the full frame's
+      // static world. Membership comes from the plans; the header words are
+      // read live here because a reused plan's copies are advisory.
+      NativeFullFrameStaticRoutes routes;
+      state.static_walk_plans.ForEachPlan(owner,[&](const NativeStaticWalkList& plan) {
+        for(const auto& member:plan.members) {
+          const auto vtable=reader.Word(member.owner);
+          routes[member.owner]={PlannedNativeStaticDirect(member,vtable,
+              [&](uint32_t table) { return reader.Word(reader.Add(table,16)); }),
+            reader.Word(reader.Add(member.owner,52)),uint16_t(reader.Word(reader.Add(member.owner,64))>>16)};
+        }
+      });
+      auto& previous=state.full_frame_world_routes[owner];
+      if(previous!=routes) { previous=std::move(routes); PublishFullFrameRoutesLocked(state); }
+    }
   } catch(const std::exception& error) {
     state.static_walk_plans.Retire(owner);
+    if(state.full_frame_world_routes.erase(owner)) PublishFullFrameRoutesLocked(state);
     static std::set<std::string> reported;
     if(reported.insert(error.what()).second) REXLOG_INFO("Native static walk plan deferred: {}",error.what());
   }
@@ -5754,15 +5787,86 @@ REX_HOOK_RAW(sub_821C0C00) {
 }
 REXCVAR_DEFINE_BOOL(edf_native_frame_dispatch,false,"EDF2027",
   "Own outer render phase dispatch in native code; remaining phase callbacks are retained.");
-REXCVAR_DEFINE_BOOL(edf_native_full_frame,false,"EDF2027",
-  "Full-frame native renderer: the render helper 821A5080 runs a native frame (inputs, scene begin, ordered native passes, end) instead of the guest helper and its callbacks. Needs edf_native_host and edf_native_shader_bridge; edf_native_ab_alternate guest-side frames keep the guest helper (development)");
 namespace {
-// NativeFullFrame's view of the bridge for one render helper call. It reads
-// guest memory and writes only owner+136; it never calls guest code. See
-// native_full_frame.h for where the frame sits between 8219C7A8 and 8219C840.
+// The full frame's StaticWorld pass: SelectNativeFullFrameStaticWorld +
+// NativeFullFrameStaticWorld::Build over the frame's publication, the step's
+// route words and the view's camera, recorded through the scene renderer on
+// the open scene target. No guest calls; the only guest reads are the view's
+// visibility camera (scene+96 matrix, +288 frustum, +400 depth scale), which
+// the publication does not carry yet.
+class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass {
+ public:
+  explicit NativeFullFrameStaticWorldPass(uint8_t* base):reader_(base) {}
+  const char* name() override { return "static_world"; }
+  void Record(edf::native::NativeFrameContext& context) override {
+    using namespace edf::native;
+    const auto& publication=context.inputs.publication;
+    if(!publication || !native_scene_pass_camera || !context.renderer) { ++skipped_; return; }
+    const auto scene=context.view.scene;
+    NativeFullFrameStaticCamera camera;
+    camera.visibility.matrix=ReadNativeVisibilityFloats<16>(reader_,reader_.Add(scene,96));
+    camera.visibility.frustum=ReadNativeVisibilityFloats<26>(reader_,reader_.Add(scene,288));
+    camera.visibility.depth_scale=std::bit_cast<float>(reader_.Word(reader_.Add(scene,400)));
+    camera.pass=*native_scene_pass_camera;
+    // One world animation per frame (one world in practice); with several the
+    // materials that need one decline rather than take the wrong world's.
+    if(const auto& animations=context.inputs.animations;animations && animations->size()==1)
+      camera.animation=animations->begin()->second;
+    auto& state=State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto routes=state.full_frame_routes;
+    const auto targets=ActiveTargetsLocked(state);
+    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) { ++skipped_; return; }
+    const auto& v=context.viewport;
+    const auto viewport=MakeNativeDrawViewport(v.x,v.y,v.width,v.height,v.min_depth,v.max_depth,false,{});
+    NativeFullFrameStaticPass pass;
+    pass.targets.count=targets.count; pass.targets.rtv_format=targets.rtv_format;
+    pass.targets.dsv_format=targets.dsv_format; pass.targets.samples=targets.samples;
+    pass.targets.reverse_depth=viewport.reverse_depth;
+    const auto& d=viewport.viewport; const auto& s=viewport.scissor;
+    pass.viewport={d.TopLeftX,d.TopLeftY,d.Width,d.Height,d.MinDepth,d.MaxDepth};
+    pass.scissor={s.left,s.top,s.right,s.bottom};
+    pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
+    const auto frame=world_.Build(*publication,camera,*routes,pass,NativeFullFrameStaticResolver(pass,
+      [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); }));
+    uint64_t drawn=0;
+    if(!frame.draws.empty()) {
+      auto& recorder=SceneRecorderLocked(state);
+      recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
+      for(const auto& draw:frame.draws) {
+        // Kept until the recording is submitted, as the renderer requires.
+        state.scene_recorded_snapshots.push_back(draw.Snapshot());
+        drawn+=state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),draw.view,1).draws;
+      }
+      // The batch bound its own targets and pipelines.
+      ++state.bind_generation;
+      state.recorded={};
+    }
+    const auto& selected=frame.selection.stats;
+    const auto& built=frame.stats;
+    if(++frames_<=4 || frames_%1000==0)
+      REXLOG_INFO("Native full frame static world: frames={} skipped={} routes={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={}",
+        frames_,skipped_,routes->size(),selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,
+        selected.unrouted,selected.not_direct,selected.unpublished,selected.undrawable,built.groups,built.draws,built.instances,drawn,
+        built.resolves,built.cache_hits,built.declined,built.missing_group,built.missing_material,built.missing_geometry,built.world_declines);
+  }
+ private:
+  const edf::native::GuestReader reader_;
+  edf::native::NativeFullFrameStaticWorld world_;  // Cross-frame material cache and instance reuse.
+  uint64_t frames_=0,skipped_=0;
+};
+// NativeFullFrame's view of the bridge for one render helper call. Native
+// work reads guest memory and writes only owner+136 and the guest frame
+// context; the remaining guest calls (kNativeFrameRemainingGuestCalls) go
+// through guest_, with the frame context at context_ as DispatchNativeFrame
+// passes it. See native_full_frame.h for where the frame sits between
+// 8219C7A8 and 8219C840.
 class NativeFullFrameHost final : public edf::native::NativeFrameHost {
  public:
-  NativeFullFrameHost(uint8_t* base,uint32_t owner):reader_(base),owner_(owner) {}
+  using GuestCall=std::function<void(uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr)>;
+  NativeFullFrameHost(uint8_t* base,uint32_t owner,uint32_t context,GuestCall guest)
+    :base_(base),reader_(base),owner_(owner),context_(context),guest_(std::move(guest)) {}
   // (a) One generation of publication, published cameras and world animations
   // under the producer lock, as the hook acquires them; the motion budget and
   // its publication were already acquired by the hook, which restores all of
@@ -5779,11 +5883,17 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     return {edf::native::native_scene_publication,edf::native::native_scene_pass_cameras,
       edf::native::native_scene_pass_animations,native_render_publication};
   }
-  // The helper's view loop condition and list (owner+0..owner+12, view at node+8).
+  // The helper's view loop condition and list (owner+0..owner+12, view at
+  // node+8), and the frame context it initializes before the loop.
   std::vector<uint32_t> Views() override {
     const auto flag=[&](uint32_t offset) { return *reader_.Bytes(reader_.Add(owner_,offset),1)!=0; };
     std::vector<uint32_t> views;
     if(flag(2261) || flag(2262) || !(flag(2216) || flag(2217))) return views;
+    const auto zero=reader_.Word(0x820009a4),one=reader_.Word(0x820008cc);
+    for(const auto offset:{0u,4u,32u,36u,40u}) reader_.StoreWord(reader_.Add(context_,offset),zero);
+    reader_.StoreWord(reader_.Add(context_,44),one);
+    reader_.StoreWord(reader_.Add(context_,12),0);
+    reader_.StoreWord(reader_.Add(context_,16),0);
     const auto end=Word(12);
     for(auto node=Word(0);node!=end;node=reader_.Word(node)) {
       if(views.size()>=256) throw std::runtime_error("native full frame view list is cyclic or excessive");
@@ -5791,11 +5901,20 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     }
     return views;
   }
-  // Helper side effect kept: the frame serial owner+136, advanced once per
-  // view as 821A5080 and DispatchNativeFrame advance it.
-  uint32_t AdvanceSerial() override {
+  // Helper side effects kept per view, as 821A5080 and DispatchNativeFrame
+  // write them: the frame context the view's guest listeners read (near, far,
+  // view+400, serial, view), the frame serial owner+136, and the bucket heads
+  // owner+168..+2215 cleared (nothing refills them: the world callbacks and
+  // 821A3BA0 are replaced by native passes).
+  uint32_t AdvanceSerial(uint32_t view) override {
     const auto serial=Word(136);
+    reader_.StoreWord(context_,reader_.Word(0x8201711c));
+    reader_.StoreWord(reader_.Add(context_,4),reader_.Word(0x82017120));
+    reader_.StoreWord(reader_.Add(context_,8),reader_.Word(reader_.Add(view,400)));
+    reader_.StoreWord(reader_.Add(context_,12),serial);
+    reader_.StoreWord(reader_.Add(context_,16),view);
     reader_.StoreWord(reader_.Add(owner_,136),serial+1);
+    for(uint32_t i=0;i<512;++i) reader_.StoreWord(reader_.Add(owner_,168+i*4),0);
     return serial;
   }
   // (b) The native half of 821BE8D0 (clSgsCoreRender +4) on the scene 8219C7A8
@@ -5804,8 +5923,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // 820009A4 (reversed), and the depth/stencil clear it issues for every view
   // but the first (8219C7A8 already cleared color and depth). Not replicated:
   // the guest view/projection globals (821A17F8/821A19F0 on 8257C02C) and
-  // 82135530(device,1), which only guest draws read; native passes take the
-  // pass camera and context.viewport.
+  // 82135530(device,1); native passes take the pass camera and
+  // context.viewport. The view's guest listeners (ViewOverlays) therefore see
+  // those two as the previous guest writer left them.
   bool BeginView(edf::native::NativeFrameContext& context) override {
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeBegin);
     const auto scene=context.view.scene;
@@ -5856,31 +5976,93 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     edf::native::HookTiming timing(index<count?edf::native::HookPhase(first+index):edf::native::HookPhase::FrameNative,index<count);
     pass.Record(context);
   }
+  // REMAINING GUEST CALLS, per view, in the helper's order: the overlay
+  // listeners' +12 (clSatoCallback 8216DA80) with the frame context, then the
+  // view's +16 (clPlayerCamera 820D3FD0: follow/talk icons and the trajectory
+  // ribbon). Their draws reach the native scene through the per-draw hooks.
+  // Not called: clSgsCoreRender +8 (821BE9D8, 82135530(device,0)), the
+  // counterpart of the +4 setter the frame does not call either.
+  void ViewOverlays(edf::native::NativeFrameContext& context) override {
+    edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeOverlays);
+    RemainingGuestCall(0);
+    const auto sentinel=[&] { return Word(2232); };
+    for(auto node=reader_.Word(sentinel());node!=sentinel();) {
+      Virtual(reader_.Word(reader_.Add(node,12)),12,context_,0,0x821A5268);
+      if(node==sentinel()) throw std::runtime_error("native full frame overlay iterator invalidated");
+      node=reader_.Word(node);
+    }
+    RemainingGuestCall(1);
+    Virtual(context.view.scene,16,0,0,0x821A5294);
+  }
   // HOOK POINT: helper side effects other code relies on, to be filled from
-  // the ongoing side-effect research. Known and not replicated yet: per view
-  // the helper zeroes the bucket heads owner+168..+2215, refills them from the
-  // world callbacks (vtable +8) and drains them in 821A3BA0; the guest frame
-  // context at stack+80 (near/far, view+400, serial, view); the post stage
-  // 820B0B80 (8219C930 resolve, 82135530, the 2D scope); the overlay and
-  // phase callbacks (owner+2232 list, phases owner+140..+144).
+  // the ongoing side-effect research. Known and not replicated: the world
+  // callbacks (owner+44 list, vtable +8) and the bucket drain 821A3BA0, which
+  // the native passes replace; clSgsCoreRender +16 (820AFEE8) is an empty
+  // body (branch to the blr at 8252B718) and needs nothing.
   void SideEffects(const edf::native::NativeFrameInputs&) override {}
-  // (d) The scene stays open for the engine's end frame: after this helper
-  // returns, 821A6508 calls clSgsCoreRender +20 (821BE9F0 -> 8219C840), whose
-  // hook resolves the active scene to the frame buffer and publishes it to the
-  // presentation queue; the next +24 (821BEA00 -> 8219C1F8 -> 82151460) reaches
-  // edf_native_swap_wait, which submits the scene recorder and paces.
-  void EndScene(const edf::native::NativeFrameInputs&,bool output_ready) override {
-    edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeEnd);
-    if(output_ready) throw std::runtime_error("native full frame post output has no end-scene route yet");
+  // The finish stage (clSgsCoreRender +12, 820B0B80): the native post with
+  // zero guest calls; the guest stage only when that reports an error, and
+  // then as a remaining guest call. 820B0B80 resolves the scene (mode 1) only
+  // while byte 2260 of [8257C030] is clear; the native post takes the same.
+  // Either way the output is the active target when it returns true: the
+  // native post leaves it so, and the guest's 8219C930 hook activates it.
+  bool Finish(edf::native::NativeFrameContext&) override {
+    const auto post=Word(132);
+    const bool resolve_scene=*reader_.Bytes(reader_.Add(reader_.Word(0x8257c030),2260),1)==0;
+    std::string error;
+    if(!edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error)) {
+      static std::atomic<bool> reported=false;
+      if(!reported.exchange(true))
+        REXLOG_WARN("Native full frame post failed, guest finish stage 820B0B80 used: {} (logged once)",error);
+      RemainingGuestCall(2);
+      Virtual(post,12,0,0,0x821A52E8);
+    }
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
     const auto renderer=reader_.Word(kRenderer);
+    return renderer && state.active_output==renderer && !state.active_scene;
+  }
+  // REMAINING GUEST CALLS: the phase loop, which draws the HUD/XUI onto the
+  // output (clNoguchiCallback 820A4DD0, clSatoCallback 8216E630); each draw
+  // is translated by the per-draw hooks (821FD8F8). The output is bound first.
+  void Phases(edf::native::NativeFrameContext&) override {
+    edf::native::HookTiming timing(edf::native::HookPhase::FrameNativePhases);
+    {
+      auto& state=edf::native::State();
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      edf::native::BindActiveTarget(state);
+    }
+    RemainingGuestCall(3);
+    const auto sentinel=[&] { return Word(2232); };
+    for(auto phase=Word(140);phase!=Word(144);++phase)
+      for(auto node=reader_.Word(sentinel());node!=sentinel();) {
+        Virtual(reader_.Word(reader_.Add(node,12)),16,phase,0,0x821A536C);
+        if(node==sentinel()) throw std::runtime_error("native full frame phase iterator invalidated");
+        node=reader_.Word(node);
+      }
+  }
+  // (d) After this helper returns, 821A6508 calls clSgsCoreRender +20
+  // (821BE9F0 -> 8219C840). With post output (output_ready) its hook publishes
+  // the active ordinary output, post and HUD included, and captures it as an
+  // indexed output frame; with the scene still open (no post) it resolves the
+  // scene to the frame buffer and publishes that. The next +24 (821BEA00 ->
+  // 8219C1F8 -> 82151460) reaches edf_native_swap_wait, which submits the
+  // scene recorder and paces. Nothing here publishes.
+  void EndScene(const edf::native::NativeFrameInputs&,bool output_ready) override {
+    edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeEnd);
+    auto& state=edf::native::State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto renderer=reader_.Word(kRenderer);
+    const bool output=renderer && state.active_output==renderer;
     const bool open=renderer && state.active_scene==renderer;
-    if(open) edf::native::BindActiveTarget(state);
-    static uint64_t frames=0;
-    if(++frames<=4 || frames%1000==0)
-      REXLOG_INFO("Native full frame end: frames={} renderer={:#x} scene_open={} (8219C840 publishes, swap presents)",frames,renderer,open);
+    static uint64_t frames=0,unpublished=0;
+    if(!output && !open) ++unpublished;
+    if(++frames<=4 || frames%1000==0 || (!output && !open && unpublished<=4))
+      REXLOG_INFO("Native full frame end: frames={} renderer={:#x} output_ready={} output={} scene_open={} unpublished={} (8219C840 publishes, swap presents)",
+        frames,renderer,output_ready,output,open,unpublished);
   }
   void Unimplemented(const char* pass) override {
     static std::mutex mutex;
@@ -5891,8 +6073,18 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
  private:
   static constexpr uint32_t kRenderer=0x8257bfb4;  // Renderer global: +8 device, +84/+88 extent.
   uint32_t Word(uint32_t offset) const { return reader_.Word(reader_.Add(owner_,offset)); }
+  void Virtual(uint32_t object,uint32_t method,uint32_t argument,uint32_t index,uint32_t lr) {
+    guest_(reader_.Word(reader_.Add(reader_.Word(object),method)),object,argument,index,lr);
+  }
+  static void RemainingGuestCall(size_t which) {
+    static std::array<std::atomic<bool>,std::size(edf::native::kNativeFrameRemainingGuestCalls)> logged{};
+    if(!logged[which].exchange(true))
+      REXLOG_INFO("Native full frame remaining guest call: {}",edf::native::kNativeFrameRemainingGuestCalls[which]);
+  }
+  uint8_t* base_;
   const edf::native::GuestReader reader_;
-  uint32_t owner_;
+  uint32_t owner_,context_;
+  GuestCall guest_;
 };
 }
 REXCVAR_DEFINE_INT32(edf_native_ab_alternate,0,"EDF2027",
@@ -5976,18 +6168,34 @@ REX_HOOK_RAW(sub_821A5080) {
       REXLOG_WARN("Native full frame disabled: requires edf_native_host and edf_native_shader_bridge (guest helper retained)");
   }
   if(route==edf::native::NativeFrameRoute::full_frame) {
-    // No guest helper and no guest callbacks: the frame is native end to end.
-    // 821A6508 joins each helper call (821A53A8) before the next, so the
+    // No guest helper: native scene begin, passes and post; the guest calls
+    // left are listed in kNativeFrameRemainingGuestCalls. 821A6508 joins each helper call (821A53A8) before the next, so the
     // single instance is never run concurrently.
     static edf::native::NativeFullFrame full_frame;
-    NativeFullFrameHost host(base,ctx.r3.u32);
+    static const bool wired=full_frame.Replace(std::make_unique<NativeFullFrameStaticWorldPass>(base));
+    if(!wired) throw std::runtime_error("native full frame has no static_world pass");
+    // The helper's stack frame and guest frame context (stack+80), as
+    // DispatchNativeFrame builds them, for the remaining guest calls.
+    const edf::native::GuestReader reader(base);
+    auto work=ctx;
+    if(work.r1.u32<224) throw std::runtime_error("invalid native full frame stack");
+    const auto stack=work.r1.u32-224;
+    reader.StoreWord(stack,work.r1.u32);
+    work.r1.u64=stack;
+    NativeFullFrameHost host(base,ctx.r3.u32,reader.Add(stack,80),
+      [&](uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr) {
+        work.r3.u64=object; work.r4.u64=argument; work.r5.u64=index;
+        work.ctr.u64=function; work.lr=lr;
+        rex::runtime::ResolveIndirectFunction(function)(work,base);
+      });
     {
       edf::native::HookTiming frame_timing(edf::native::HookPhase::FrameNative);
       full_frame.Run(host);
     }
     const auto frames=full_frame.frames();
     if(frames<=4 || frames%1000==0)
-      REXLOG_INFO("Native full frame dispatch: frames={} passes={} (guest helper not called)",frames,full_frame.passes().size());
+      REXLOG_INFO("Native full frame dispatch: frames={} view_passes={} frame_passes={} (guest helper not called; view listeners, finish fallback and HUD phases remain guest)",
+        frames,full_frame.view_passes().size(),full_frame.frame_passes().size());
   } else if(route==edf::native::NativeFrameRoute::frame_dispatch) {
     const edf::native::GuestReader reader(base);
     auto work=ctx;

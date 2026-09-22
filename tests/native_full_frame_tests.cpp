@@ -6,17 +6,18 @@
 
 namespace {
 using namespace edf::native;
-// Records every host call in order; views and view acceptance are scripted.
+// Records every host call in order; views, view acceptance and the finish
+// result are scripted.
 class TraceHost final : public NativeFrameHost {
  public:
   std::vector<std::string> trace;
   std::vector<uint32_t> views;
   std::vector<bool> accept;
   uint32_t serial=40;
-  bool output_ready=false;
+  bool finish=true,output_ready=false;
   NativeFrameInputs AcquireInputs() override { trace.push_back("acquire"); return {nullptr,nullptr,nullptr,7}; }
   std::vector<uint32_t> Views() override { trace.push_back("views"); return views; }
-  uint32_t AdvanceSerial() override { trace.push_back("serial"); return serial++; }
+  uint32_t AdvanceSerial(uint32_t view) override { trace.push_back("serial:"+std::to_string(view)); return serial++; }
   bool BeginView(NativeFrameContext& context) override {
     trace.push_back("begin:"+std::to_string(context.view.index)+":"+std::to_string(context.view.scene)+":"+std::to_string(context.view.serial));
     return context.view.index<accept.size()?bool(accept[context.view.index]):true;
@@ -25,66 +26,85 @@ class TraceHost final : public NativeFrameHost {
     trace.push_back(std::to_string(index)+":"+pass.name());
     NativeFrameHost::RunPass(index,pass,context);
   }
+  void ViewOverlays(NativeFrameContext& context) override { trace.push_back("overlays:"+std::to_string(context.view.scene)); }
   void EndView(NativeFrameContext&) override { trace.push_back("end_view"); }
   void SideEffects(const NativeFrameInputs& inputs) override { trace.push_back("side_effects:"+std::to_string(inputs.motion_publication)); }
+  bool Finish(NativeFrameContext& context) override { trace.push_back("finish:"+std::to_string(context.view.scene)); return finish; }
+  void Phases(NativeFrameContext&) override { trace.push_back("phases"); }
   void EndScene(const NativeFrameInputs&,bool ready) override { output_ready=ready; trace.push_back("end_scene"); }
   void Unimplemented(const char* pass) override { trace.push_back(std::string("stub:")+pass); }
 };
-class OutputPass final : public NativeFramePass {
+class NamedPass final : public NativeFramePass {
  public:
-  const char* name() override { return "output"; }
-  void Record(NativeFrameContext& context) override { context.output_ready=context.view.index==1; }
+  explicit NamedPass(const char* name):name_(name) {}
+  const char* name() override { return name_; }
+  void Record(NativeFrameContext& context) override { context.host.Unimplemented("replaced"); }
+ private:
+  const char* name_;
 };
+std::vector<std::string> Tail(bool with_finish=true) {
+  std::vector<std::string> tail{"side_effects:7"};
+  if(with_finish) { tail.push_back("5:post"); tail.push_back("finish:0"); }
+  tail.push_back("phases"); tail.push_back("end_scene");
+  return tail;
+}
 }
 
 int main() {
   int failures=0;
   auto check=[&](bool ok,const char* what) { if(!ok) { ++failures; std::cerr<<"failed: "<<what<<'\n'; } };
-  // Default passes: the documented order, every one a stub.
+  const std::vector<std::string> names{"static_world","models","sky","effects","transparent","post"};
+  // Default passes: the documented order; view passes are stubs, post finishes.
   {
     NativeFullFrame frame;
-    const std::vector<std::string> names{"static_world","models","sky","effects","transparent","post"};
-    check(frame.passes().size()==names.size(),"default pass count");
-    for(size_t i=0;i<names.size() && i<frame.passes().size();++i) {
-      check(frame.passes()[i]->name()==names[i],"default pass order");
+    check(frame.view_passes().size()==kNativeFrameViewPassCount && frame.frame_passes().size()==1,"default pass counts");
+    for(size_t i=0;i<names.size();++i) {
       check(kNativeFramePassOrder[i]==names[i],"pass order constant");
+      const auto* pass=i<kNativeFrameViewPassCount?frame.view_passes()[i].get():frame.frame_passes()[i-kNativeFrameViewPassCount].get();
+      check(pass->name()==names[i],"default pass order");
     }
-    TraceHost host; host.views={100,200};
+    TraceHost host; host.views={100};
     frame.Run(host);
-    std::vector<std::string> expected{"acquire","views"};
-    for(uint32_t view=0;view<2;++view) {
-      expected.push_back("serial");
-      expected.push_back("begin:"+std::to_string(view)+":"+std::to_string(100*(view+1))+":"+std::to_string(40+view));
-      for(size_t i=0;i<names.size();++i) { expected.push_back(std::to_string(i)+":"+names[i]); expected.push_back("stub:"+names[i]); }
-      expected.push_back("end_view");
-    }
-    expected.push_back("side_effects:7"); expected.push_back("end_scene");
-    check(host.trace==expected,"default frame call order");
-    check(host.serial==42,"serial advanced once per view");
-    check(!host.output_ready && frame.frames()==1,"stub frame has no output");
+    std::vector<std::string> expected{"acquire","views","serial:100","begin:0:100:40"};
+    for(size_t i=0;i<kNativeFrameViewPassCount;++i) { expected.push_back(std::to_string(i)+":"+names[i]); expected.push_back("stub:"+names[i]); }
+    expected.push_back("overlays:100"); expected.push_back("end_view");
+    for(const auto& step:Tail()) expected.push_back(step);
+    check(host.trace==expected,"one view frame call order");
+    check(host.serial==41 && host.output_ready && frame.frames()==1,"serial once per view; finish output reaches end_scene");
   }
-  // A rejected view still advances the serial, skips its passes and end_view.
+  // A declined view (no scene) skips only its native passes: the guest view
+  // listeners still run, then finish and phases as usual.
   {
-    std::vector<std::unique_ptr<NativeFramePass>> passes;
-    passes.push_back(std::make_unique<OutputPass>());
-    NativeFullFrame frame(std::move(passes));
-    TraceHost host; host.views={1,2,3}; host.accept={false,true,true};
+    NativeFullFrame frame({},MakeNativeFrameFinishPasses());
+    TraceHost host; host.views={1,2}; host.accept={false,true}; host.finish=false;
     frame.Run(host);
-    const std::vector<std::string> expected{"acquire","views",
-      "serial","begin:0:1:40",
-      "serial","begin:1:2:41","0:output","end_view",
-      "serial","begin:2:3:42","0:output","end_view",
-      "side_effects:7","end_scene"};
-    check(host.trace==expected,"rejected view order");
-    check(host.output_ready,"output from any view reaches end_scene");
+    std::vector<std::string> expected{"acquire","views",
+      "serial:1","begin:0:1:40","overlays:1","end_view",
+      "serial:2","begin:1:2:41","overlays:2","end_view",
+      "side_effects:7","0:post","finish:0","phases","end_scene"};
+    check(host.trace==expected,"declined view order");
+    check(!host.output_ready,"failed finish reports no output");
   }
-  // No views: the frame still acquires, runs the side effects and ends.
+  // Owner flags 2261/2262 (no views): the finish stage and phase loop still run.
   {
     NativeFullFrame frame;
     TraceHost host;
     frame.Run(host);
-    check(host.trace==std::vector<std::string>{"acquire","views","side_effects:7","end_scene"},"empty view list");
+    std::vector<std::string> expected{"acquire","views"};
+    for(const auto& step:Tail()) expected.push_back(step);
+    check(host.trace==expected,"empty view list still finishes");
     check(host.serial==40,"no serial without views");
+  }
+  // Replace swaps a pass by name, in either list, keeping its position.
+  {
+    NativeFullFrame frame;
+    check(frame.Replace(std::make_unique<NamedPass>("static_world")),"replace view pass");
+    check(frame.Replace(std::make_unique<NamedPass>("post")),"replace frame pass");
+    check(!frame.Replace(std::make_unique<NamedPass>("shadow")),"no such pass");
+    TraceHost host; host.views={9};
+    frame.Run(host);
+    check(host.trace[4]=="0:static_world" && host.trace[5]=="stub:replaced","replaced view pass runs first");
+    check(host.trace[host.trace.size()-3]=="stub:replaced" && !host.output_ready,"replaced post runs in the frame");
   }
   // Routing: full frame only on the native side with bridge and host; guest
   // side frames take today's path for frame-by-frame A/B comparison.
@@ -101,8 +121,7 @@ int main() {
     check(SelectNativeFrameRoute(false,false,true,true,true)==R::guest_helper,"off");
     // The hook's side comes from the latched A/B decision for the output frame.
     for(uint64_t frame=0;frame<8;++frame) {
-      const bool native=AbSide(frame,0,2);
-      NativeAbSideLatch latch(native);
+      NativeAbSideLatch latch(AbSide(frame,0,2));
       check((SelectNativeFrameRoute(true,false,true,true,NativeAbNativeSide())==R::full_frame)==((frame/2)%2==1),"A/B alternation");
     }
     static_assert(SelectNativeFrameRoute(true,false,true,true,true)==NativeFrameRoute::full_frame);

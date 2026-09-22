@@ -12,40 +12,48 @@ class NativeFrameStubPass final : public NativeFramePass {
  private:
   const char* name_;
 };
-// The native post finish plan (edf_native_post_finish) still issues its passes
-// through the guest setters 821BCD58/821BCE98/821BCF28, activation 821B94E8 and
-// draw 821A79B8, so it cannot run inside a native frame: a stub until the post
-// chain owns its parameter records, targets and draws. Without it the frame
-// leaves output_ready false and 8219C840 publishes the scene directly.
+// The finish stage: the host records the native post (RecordNativeFullFramePost)
+// and falls back to the guest 820B0B80 only when that reports an error.
 class NativeFramePostPass final : public NativeFramePass {
  public:
   const char* name() override { return "post"; }
-  void Record(NativeFrameContext& context) override { context.host.Unimplemented("post"); }
+  void Record(NativeFrameContext& context) override { context.output_ready=context.host.Finish(context); }
 };
 }
 std::vector<std::unique_ptr<NativeFramePass>> MakeNativeFramePasses() {
   std::vector<std::unique_ptr<NativeFramePass>> passes;
-  for(const auto name:kNativeFramePassOrder) {
-    if(name=="post") passes.push_back(std::make_unique<NativeFramePostPass>());
-    else passes.push_back(std::make_unique<NativeFrameStubPass>(name.data()));  // Literals: NUL-terminated.
-  }
+  for(size_t i=0;i<kNativeFrameViewPassCount;++i)
+    passes.push_back(std::make_unique<NativeFrameStubPass>(kNativeFramePassOrder[i].data()));  // Literals: NUL-terminated.
   return passes;
 }
-NativeFullFrame::NativeFullFrame():passes_(MakeNativeFramePasses()) {}
+std::vector<std::unique_ptr<NativeFramePass>> MakeNativeFrameFinishPasses() {
+  std::vector<std::unique_ptr<NativeFramePass>> passes;
+  passes.push_back(std::make_unique<NativeFramePostPass>());
+  return passes;
+}
+NativeFullFrame::NativeFullFrame():view_passes_(MakeNativeFramePasses()),frame_passes_(MakeNativeFrameFinishPasses()) {}
+bool NativeFullFrame::Replace(std::unique_ptr<NativeFramePass> pass) {
+  const std::string_view name=pass->name();
+  for(auto* list:{&view_passes_,&frame_passes_}) for(auto& slot:*list)
+    if(name==slot->name()) { slot=std::move(pass); return true; }
+  return false;
+}
 void NativeFullFrame::Run(NativeFrameHost& host) {
   ++frames_;
   const auto inputs=host.AcquireInputs();
   const auto views=host.Views();
-  bool output_ready=false;
   for(uint32_t index=0;index<views.size();++index) {
     NativeFrameContext context{host,inputs,{views[index],index,0}};
-    context.view.serial=host.AdvanceSerial();
-    if(!host.BeginView(context)) continue;
-    for(size_t pass=0;pass<passes_.size();++pass) host.RunPass(pass,*passes_[pass],context);
-    output_ready|=context.output_ready;
+    context.view.serial=host.AdvanceSerial(views[index]);
+    if(host.BeginView(context))
+      for(size_t pass=0;pass<view_passes_.size();++pass) host.RunPass(pass,*view_passes_[pass],context);
+    host.ViewOverlays(context);
     host.EndView(context);
   }
   host.SideEffects(inputs);
-  host.EndScene(inputs,output_ready);
+  NativeFrameContext frame{host,inputs,{}};
+  for(size_t pass=0;pass<frame_passes_.size();++pass) host.RunPass(view_passes_.size()+pass,*frame_passes_[pass],frame);
+  host.Phases(frame);
+  host.EndScene(inputs,frame.output_ready);
 }
 }
