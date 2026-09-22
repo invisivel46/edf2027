@@ -26,6 +26,7 @@ class NativeSceneSources {
       auto result=std::make_shared<NativeSceneSources>();
       result->owners_=owners_; result->parts_=parts_; result->groups_=groups_;
       result->group_revision_=group_revision_; result->next_=next_;
+      result->candidate_revision_=candidate_revision_;
       snapshot_=std::move(result);
     }
     return snapshot_;
@@ -50,10 +51,14 @@ class NativeSceneSources {
   const GroupMap& Groups() const { return groups_; }
   // Advances whenever any group is added, changed or erased.
   uint64_t GroupRevision() const { return group_revision_; }
+  // Advances whenever FindCandidate's answer for any owner can change (birth,
+  // retirement, changed parts or visibility). Copied into every snapshot, so
+  // equal revisions mean equal candidates. World registers do not move it.
+  uint64_t CandidateRevision() const { return candidate_revision_; }
   uint64_t Born(uint32_t owner) {
     if(!owner || next_==UINT64_MAX) throw std::runtime_error("invalid native scene source lifetime");
     Retire(owner);
-    snapshot_.reset();
+    snapshot_.reset(); ++candidate_revision_;
     const auto generation=next_;
     owners_.Set(owner,Owner{generation,std::make_shared<const Parts>(),{},{}});
     ++next_;
@@ -62,7 +67,7 @@ class NativeSceneSources {
   bool Retire(uint32_t owner) {
     const auto* found=owners_.Find(owner);
     if(!found) return false;
-    snapshot_.reset();
+    snapshot_.reset(); ++candidate_revision_;
     const auto parts=found->parts;
     for(const auto& part:parts->all) { RemoveGroupPart(part); parts_.Erase(part.instance); }
     owners_.Erase(owner); return true;
@@ -85,7 +90,7 @@ class NativeSceneSources {
         throw std::runtime_error("native scene part has two live owners");
     }
     next->all.assign(parts.begin(),parts.end());
-    snapshot_.reset();
+    snapshot_.reset(); ++candidate_revision_;
     for(const auto& part:old->all) { RemoveGroupPart(part); parts_.Erase(part.instance); }
     for(auto& [instance,source]:replacements) parts_.Set(instance,std::move(source));
     for(const auto& part:next->all) if(part.group) {
@@ -139,7 +144,7 @@ class NativeSceneSources {
     if(!found) return false;
     if(!found->visibility || *found->visibility!=visibility) {
       auto published=std::make_shared<const NativeSceneVisibility>(visibility);
-      snapshot_.reset();
+      snapshot_.reset(); ++candidate_revision_;
       owners_.Mutable(owner)->visibility=std::move(published);
     }
     return true;
@@ -182,7 +187,7 @@ class NativeSceneSources {
   NativeSharedMap<uint32_t,Owner> owners_;
   NativeSharedMap<uint32_t,Source> parts_;
   GroupMap groups_;
-  uint64_t group_revision_=0;
+  uint64_t group_revision_=0,candidate_revision_=0;
   void RemoveGroupPart(const Part& part) {
     if(!part.group) return;
     auto* group=groups_.Mutable(part.group);

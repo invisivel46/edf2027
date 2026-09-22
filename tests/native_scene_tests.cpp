@@ -4,6 +4,7 @@
 #include "native_graphics/native_scene_adapter.h"
 #include "native_graphics/native_scene_tree.h"
 #include "native_graphics/native_scene_walk_lock.h"
+#include "native_graphics/native_scene_static_walk.h"
 #include "native_graphics/native_scene_pass_inputs.h"
 #include "native_graphics/native_queued_scene.h"
 #include "native_graphics/native_scene_cpu_window.h"
@@ -557,6 +558,103 @@ void WalkLock() {
   // Exceptions unwind through the scope without leaving the mutex held.
   Reject([&] { Scope walk(mutex); walk.Hold(); throw std::runtime_error("walk failed"); });
   Require(!Scope::current && !mutex.locked,"failed walk left the lock held");
+}
+void StaticWalkPlan() {
+  using Route=NativeStaticWalkRoute;
+  Require(ClassifyNativeStaticWalk(1,0,true)==Route::Hidden && ClassifyNativeStaticWalk(0,0,true)==Route::Direct &&
+    ClassifyNativeStaticWalk(0,0,false)==Route::Virtual && ClassifyNativeStaticWalk(0,1,false)==Route::Bucket &&
+    ClassifyNativeStaticWalk(0,2,true)==Route::Bucket && ClassifyNativeStaticWalk(0,3,true)==Route::Unknown &&
+    ClassifyNativeStaticWalk(0,0xFFFFFFFFu,true)==Route::Unknown,"static walk route order differs from sub_821C0C00");
+  std::vector<uint8_t> memory(0x10000);
+  const GeometryRetryReader r{memory};
+  constexpr uint32_t owner=0x1000,levels=0x2000,root=0x3000,leaf=root+120,world_list=owner+372;
+  constexpr uint32_t first=0x5000,second=0x5010,sentinel=0x5100,a=0x6000,b=0x6100,va=0x7000,vb=0x7100;
+  r.StoreWord(owner+52,levels); r.StoreWord(owner+56,levels+32);
+  r.StoreWord(levels+20,root); r.StoreWord(levels+24,root+288);
+  r.StoreWord(root+116,1);  // Occupied leaf; the second root stays empty.
+  r.StoreWord(world_list,world_list+8); r.StoreWord(world_list+12,world_list+8);
+  r.StoreWord(leaf,first); r.StoreWord(leaf+12,sentinel);
+  r.StoreWord(first,second); r.StoreWord(first+8,a); r.StoreWord(second,sentinel); r.StoreWord(second+8,b);
+  r.StoreWord(a,va); r.StoreWord(b,vb); r.StoreWord(b+52,1); r.StoreWord(a+64,0);
+  r.StoreWord(va+16,kNativeStaticDirectRender); r.StoreWord(vb+16,0x820B0000);
+  std::vector<uint32_t> lists;
+  CollectNativeSceneLeafLists(r,owner,lists);
+  Require(lists==std::vector<uint32_t>{leaf} && r.Word(owner+100)==0,"leaf collection differs or wrote walk counters");
+  NativeSceneSources sources;
+  sources.Born(a);
+  NativeSceneVisibility visibility; visibility.radius=2; visibility.lod_count=1;
+  const auto born=sources.CandidateRevision();
+  Require(sources.PublishVisibility(a,visibility) && sources.CandidateRevision()==born+1,"visibility did not move the candidate revision");
+  sources.PublishWorld(a,NativeSceneSources::World{});
+  Require(sources.CandidateRevision()==born+1 && sources.AcquireSnapshot()->CandidateRevision()==born+1,
+    "world registers moved the candidate revision or a snapshot lost it");
+  const auto find=[&](uint32_t object) { return sources.FindCandidate(object); };
+  NativeStaticWalkPlans plans;
+  plans.Publish(r,owner,1,sources.CandidateRevision(),find);
+  const auto built=plans.Acquire(leaf);
+  Require(built && plans.Acquire(world_list) && plans.Acquire(world_list)->members.empty() && plans.stats().builds==2,
+    "static walk plan did not cover the leaves and world+372");
+  Require(built->Head()==first && built->end==sentinel && built->Next(0)==second && built->Next(1)==sentinel &&
+    built->members.size()==2 && built->members[0].owner==a && built->members[0].direct && built->members[0].mode==0 &&
+    !built->members[1].direct && built->members[1].mode==1 && built->members[0].source.registered &&
+    built->members[0].source.visibility && *built->members[0].source.visibility==visibility &&
+    !built->members[1].source.registered,"static walk plan members");
+  // The vtable slot is trusted only through the vtable it was read with.
+  uint32_t slot_reads=0;
+  const auto read_slot=[&](uint32_t vtable) { ++slot_reads; return r.Word(vtable+16); };
+  Require(PlannedNativeStaticDirect(built->members[0],va,read_slot) && slot_reads==0 &&
+    !PlannedNativeStaticDirect(built->members[0],vb,read_slot) && slot_reads==1,"planned vtable slot reuse");
+  plans.Publish(r,owner,1,sources.CandidateRevision(),find);
+  Require(plans.Acquire(leaf)==built && plans.stats().reuses==2 && plans.stats().collections==1,"unchanged plan was rebuilt");
+  // New sources refresh candidates without re-reading membership.
+  visibility.radius=3; sources.PublishVisibility(a,visibility);
+  const auto touches=plans.Touches();
+  plans.Publish(r,owner,1,sources.CandidateRevision(),find);
+  const auto refreshed=plans.Acquire(leaf);
+  Require(refreshed!=built && plans.stats().refreshes==2 && refreshed->membership==built->membership &&
+    plans.Current(leaf,*built) && plans.Touches()==touches && refreshed->members[0].source.visibility->radius==3 &&
+    built->members[0].source.visibility->radius==2,"source refresh changed membership or a published plan");
+  // Gameplay rewrites mode and hidden: the plan keeps its advisory copy, the
+  // audit counts drift and no route mismatch when the live words are used.
+  r.StoreWord(a+52,2);
+  NativeStaticWalkAudit audit;
+  Require(AuditNativeStaticWalkMember(*refreshed,0,first,second,a,audit),"aligned member flagged");
+  AuditNativeStaticWalkClassification(refreshed->members[0],va,r.Word(a+52),r.Word(a+64)>>16,true,&refreshed->members[0].source,audit);
+  Require(audit.drift==1 && !audit.mismatches(),"live mode drift counted as a mismatch");
+  AuditNativeStaticWalkClassification(refreshed->members[0],va,0,0,false,&built->members[0].source,audit);
+  Require(audit.routes==1 && audit.sources==1,"planned slot or stale source not counted");
+  Require(!AuditNativeStaticWalkMember(*refreshed,1,second,sentinel,a,audit) &&
+    !AuditNativeStaticWalkMember(*refreshed,2,sentinel,sentinel,b,audit) && audit.membership==2,"membership mismatch not counted");
+  // A member unlink (821A1678 hook) drops the plan by its node index.
+  r.StoreWord(first,sentinel);
+  Require(plans.Touch(second) && !plans.Acquire(leaf) && plans.Touches()!=touches && !plans.Current(leaf,*refreshed) &&
+    !plans.Touch(second),"member touch did not drop the list plan");
+  plans.Publish(r,owner,1,sources.CandidateRevision(),find);
+  const auto unlinked=plans.Acquire(leaf);
+  Require(unlinked && unlinked->members.size()==1 && unlinked->membership!=refreshed->membership && !plans.Touch(second) &&
+    plans.nodes()==1,"rebuilt plan kept an unlinked member");
+  Require(plans.Touch(leaf) && !plans.Acquire(leaf),"list header touch did not drop the plan");
+  plans.Publish(r,owner,1,sources.CandidateRevision(),find);
+  // A header rewritten without a hook is caught by the step's header check.
+  r.StoreWord(leaf,sentinel);
+  plans.Publish(r,owner,1,sources.CandidateRevision(),find);
+  Require(plans.Acquire(leaf)->members.empty(),"untracked header change kept the old plan");
+  // A tree epoch move recollects the leaf set.
+  r.StoreWord(root+144+116,1);
+  r.StoreWord(root+144+120,sentinel+16); r.StoreWord(root+144+132,sentinel+16);
+  plans.Publish(r,owner,1,sources.CandidateRevision(),find);
+  Require(!plans.Acquire(root+144+120),"leaf set recollected without an epoch move");
+  plans.Publish(r,owner,2,sources.CandidateRevision(),find);
+  Require(plans.stats().collections==2 && plans.Acquire(root+144+120) && plans.lists()==3,"epoch move did not recollect leaves");
+  r.StoreWord(root+116,0);
+  plans.Publish(r,owner,3,sources.CandidateRevision(),find);
+  Require(!plans.Acquire(leaf) && plans.lists()==2,"vacated leaf kept its plan");
+  plans.Retire(owner);
+  Require(!plans.Acquire(world_list) && !plans.Acquire(root+144+120) && plans.lists()==0 && plans.nodes()==0,
+    "retired world kept plans");
+  // A torn list is rejected, not planned.
+  r.StoreWord(owner+372,0);
+  Reject([&] { plans.Publish(r,owner,4,sources.CandidateRevision(),find); });
 }
 void GroupOrder() {
   std::vector<uint8_t> memory(0x1000);
@@ -1917,7 +2015,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
-    GroupOrder(); StaticWorldPass(); WalkLock();
+    GroupOrder(); StaticWorldPass(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

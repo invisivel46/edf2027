@@ -75,6 +75,7 @@ class NativeSceneTreePublications {
     return result;
   }
   void Invalidate() { epoch_.fetch_add(1,std::memory_order_acq_rel); }
+  uint64_t Epoch() const { return epoch_.load(std::memory_order_acquire); }
   void Retire(uint32_t owner) {
     Invalidate(); std::lock_guard lock(mutex_); images_.erase(owner);
   }

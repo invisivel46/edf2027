@@ -50,6 +50,7 @@
 #include "native_scene_tree.h"
 #include "native_scene_walk_lock.h"
 #include "native_scene_tree_publication.h"
+#include "native_scene_static_walk.h"
 #include "native_texture_binding.h"
 #include "native_render_state_snapshot.h"
 #include "native_declarations.h"
@@ -209,6 +210,10 @@ REXCVAR_DEFINE_BOOL(edf_native_bucket_dispatch_audit,false,"EDF2027",
                    "Compare the native sort-mode 1/2 bucket key and insert with sub_821C0C00 (development)");
 REXCVAR_DEFINE_BOOL(edf_native_bucket_dispatch,false,"EDF2027",
                    "Insert sort-mode 1/2 objects into the guest depth buckets natively instead of sub_821C0C00 (development)");
+REXCVAR_DEFINE_BOOL(edf_native_scene_static_walk,false,"EDF2027",
+                   "Publish a per-world static walk plan at the simulation step and drive the native visibility walk from it: planned membership, vtable slot and source candidates; mode, hidden flag and vtable stay live (development)");
+REXCVAR_DEFINE_BOOL(edf_native_scene_static_walk_audit,false,"EDF2027",
+                   "Publish the static walk plan and compare its classification with the live walk reads, counting mismatches; the walk itself stays live (development)");
 REXCVAR_DEFINE_BOOL(edf_native_unlock_framerate,false,"EDF2027",
                    "Experimental independent render loop with 60 Hz step dispatch; motion interpolation and timing validation are in progress");
 REXCVAR_DEFINE_BOOL(edf_native_camera_interpolation,true,"EDF2027",
@@ -868,6 +873,10 @@ struct Bridge {
   uint64_t instance_parameter_updates=0, instance_parameter_errors=0;
   NativeSceneSources scene_sources;
   NativeSceneMembership scene_membership;
+  NativeStaticWalkPlans static_walk_plans;
+  NativeStaticWalkAudit static_walk_audit;
+  uint64_t static_walk_lists=0,static_walk_misses=0,static_walk_stale=0,static_walk_members=0;
+  uint64_t static_walk_direct_reuses=0,static_walk_source_reuses=0,static_walk_abandoned=0,static_walk_bucket_native=0;
   uint64_t scene_membership_events=0,scene_membership_lists=0,scene_membership_nodes=0;
   uint64_t scene_membership_checks=0,scene_membership_mismatches=0;
   uint64_t scene_source_draws=0,scene_source_misses=0;
@@ -3407,6 +3416,45 @@ void RetireGroupOrder(uint32_t owner) {
   std::lock_guard lock(state.mutex);
   state.scene_adapter.RetireGroupOrder(owner);
 }
+bool NativeStaticWalkPlansEnabled() {
+  return REXCVAR_GET(edf_native_scene_static_walk) || REXCVAR_GET(edf_native_scene_static_walk_audit);
+}
+void RetireStaticWalkPlans(uint32_t owner) {
+  if(!NativeStaticWalkPlansEnabled()) return;
+  auto& state=State();
+  std::lock_guard lock(state.mutex);
+  state.static_walk_plans.Retire(owner);
+}
+// After a guest link/unlink: each anchor is a list header or a member node,
+// so the list it belongs to (by the plan's node index) loses its plan.
+void TouchStaticWalkPlans(std::initializer_list<uint32_t> anchors) {
+  if(!NativeStaticWalkPlansEnabled()) return;
+  auto& state=State();
+  std::lock_guard lock(state.mutex);
+  for(const auto anchor:anchors) state.static_walk_plans.Touch(anchor);
+}
+// 820B4250 post-hook: the world's plan, published after its tree.
+void PublishStaticWalkPlans(uint8_t* base,uint32_t owner) {
+  if(!NativeStaticWalkPlansEnabled()) return;
+  auto& state=State();
+  const auto epoch=TreePublications().Epoch();
+  std::lock_guard lock(state.mutex);
+  try {
+    const GuestReader reader(base);
+    const auto& sources=state.scene_sources;
+    state.static_walk_plans.Publish(reader,owner,epoch,sources.CandidateRevision(),
+      [&](uint32_t object) { return sources.FindCandidate(object); });
+    const auto& stats=state.static_walk_plans.stats();
+    if(stats.publications<=4 || stats.publications%1000==0)
+      REXLOG_INFO("Native static walk plan: owner={:#x} publications={} collections={} builds={} reuses={} refreshes={} touches={} lists={} nodes={}",
+        owner,stats.publications,stats.collections,stats.builds,stats.reuses,stats.refreshes,stats.touches,
+        state.static_walk_plans.lists(),state.static_walk_plans.nodes());
+  } catch(const std::exception& error) {
+    state.static_walk_plans.Retire(owner);
+    static std::set<std::string> reported;
+    if(reported.insert(error.what()).second) REXLOG_INFO("Native static walk plan deferred: {}",error.what());
+  }
+}
 }
 #define EDF_TREE_MUTATION(address) \
   REX_EXTERN(__imp__sub_##address); \
@@ -3423,6 +3471,7 @@ REX_EXTERN(__imp__sub_820B5F38);
 REX_HOOK_RAW(sub_820B5F38) {
   edf::native::TreePublications().Retire(ctx.r3.u32);
   edf::native::RetireGroupOrder(ctx.r3.u32);
+  edf::native::RetireStaticWalkPlans(ctx.r3.u32);
   __imp__sub_820B5F38(ctx,base);
 }
 REX_EXTERN(__imp__sub_821C61D8);
@@ -3524,6 +3573,7 @@ REX_HOOK_RAW(sub_820B4250) {
       if(reported.insert(error.what()).second) REXLOG_INFO("Native tree publication deferred: {}",error.what());
     }
   }
+  edf::native::PublishStaticWalkPlans(base,owner);
   if(REXCVAR_GET(edf_native_scene_group_order) || REXCVAR_GET(edf_native_scene_group_order_audit)) {
     static thread_local std::vector<uint32_t> order;
     try {
@@ -3618,6 +3668,7 @@ REX_HOOK_RAW(sub_820B5FA8) {
     std::lock_guard lock(state.mutex);
     state.scene_adapter.RetireWorldAnimation(ctx.r3.u32);
     state.scene_adapter.RetireGroupOrder(ctx.r3.u32);
+    state.static_walk_plans.Retire(ctx.r3.u32);
   }
   __imp__sub_820B5FA8(ctx,base);
 }
@@ -4380,31 +4431,44 @@ REX_EXTERN(__imp__sub_821C0C00);
 // Per-object tail of sub_821C0C00. Only sort modes 1/2 are native; hidden,
 // mode 0 (virtual render) and unknown modes (uninitialized stack key) remain
 // the original routine. Shared by the hook and the native visibility walk.
-static void DispatchNativeBucketObject(PPCContext& ctx,uint8_t* base) {
-  const bool audit=REXCVAR_GET(edf_native_bucket_dispatch_audit),native=REXCVAR_GET(edf_native_bucket_dispatch);
-  if(!audit && !native) { __imp__sub_821C0C00(ctx,base); return; }
+// True when a sort-mode 1/2 object was inserted natively and no guest code
+// ran; false leaves the object to the original routine.
+static bool TryNativeBucketInsert(PPCContext& ctx,uint8_t* base) {
+  if(!REXCVAR_GET(edf_native_bucket_dispatch) || REXCVAR_GET(edf_native_bucket_dispatch_audit)) return false;
   using namespace edf::native;
   const GuestReader reader(base);
   const auto object=ctx.r3.u32,context=ctx.r4.u32;
-  static std::atomic<uint64_t> checks=0,mismatches=0,inserts=0,failures=0;
+  static std::atomic<uint64_t> inserts=0,failures=0;
+  NativeBucketDispatch kind=NativeBucketDispatch::Unknown;
+  try { kind=ClassifyNativeBucket(reader,object); } catch(const std::exception&) {}
+  if(kind!=NativeBucketDispatch::Bucket) return false;
+  // The original clears flush-to-zero before its first lfs.
+  ctx.fpscr.disableFlushMode();
+  try {
+    InsertNativeBucket(reader,context,object);
+    const auto count=++inserts;
+    if(count==1 || count%1000000==0) REXLOG_INFO("Native bucket dispatch: inserts={} failures={}",count,failures.load());
+    return true;
+  } catch(const std::exception& e) {
+    // Every read precedes the first store and the stores are the original's
+    // own values in its order, so the original can redo a partial insert.
+    if(++failures<=8) REXLOG_ERROR("Native bucket dispatch fell back: object={:#x} error={}",object,e.what());
+  }
+  return false;
+}
+static void DispatchNativeBucketObject(PPCContext& ctx,uint8_t* base) {
+  const bool audit=REXCVAR_GET(edf_native_bucket_dispatch_audit),native=REXCVAR_GET(edf_native_bucket_dispatch);
+  if(!audit && !native) { __imp__sub_821C0C00(ctx,base); return; }
+  if(!audit) { if(!TryNativeBucketInsert(ctx,base)) __imp__sub_821C0C00(ctx,base); return; }
+  using namespace edf::native;
+  const GuestReader reader(base);
+  const auto object=ctx.r3.u32,context=ctx.r4.u32;
+  static std::atomic<uint64_t> checks=0,mismatches=0,failures=0;
   NativeBucketDispatch kind=NativeBucketDispatch::Unknown;
   try { kind=ClassifyNativeBucket(reader,object); } catch(const std::exception&) {}
   if(kind!=NativeBucketDispatch::Bucket) { __imp__sub_821C0C00(ctx,base); return; }
   // The original clears flush-to-zero before its first lfs.
   ctx.fpscr.disableFlushMode();
-  if(native && !audit) {
-    try {
-      InsertNativeBucket(reader,context,object);
-      const auto count=++inserts;
-      if(count==1 || count%1000000==0) REXLOG_INFO("Native bucket dispatch: inserts={} failures={}",count,failures.load());
-      return;
-    } catch(const std::exception& e) {
-      // Every read precedes the first store and the stores are the original's
-      // own values in its order, so the original can redo a partial insert.
-      if(++failures<=8) REXLOG_ERROR("Native bucket dispatch fell back: object={:#x} error={}",object,e.what());
-    }
-    __imp__sub_821C0C00(ctx,base); return;
-  }
   // Audit: shadow the native plan, run the original, compare what it wrote.
   std::optional<NativeBucketInsert> shadow;
   try { shadow=PlanNativeBucket(reader,context,object); }
@@ -4453,6 +4517,7 @@ REX_HOOK_RAW(sub_821C4EB8) {
   edf::native::TreePublications().Invalidate();
   const auto node=ctx.r3.u32;
   __imp__sub_821C4EB8(ctx,base);
+  edf::native::TouchStaticWalkPlans({node+120});
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     state.scene_membership.Born(node+120); ++state.scene_membership_events;
@@ -4463,6 +4528,7 @@ REX_HOOK_RAW(sub_821C5D28) {
   edf::native::TreePublications().Invalidate();
   const auto node=ctx.r3.u32;
   __imp__sub_821C5D28(ctx,base);
+  edf::native::TouchStaticWalkPlans({node+120});
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     state.scene_membership.Born(node+120,edf::native::GuestReader(base).Word(node+132));
@@ -4478,6 +4544,8 @@ REX_HOOK_RAW(sub_821A1628) {
   }
   const auto anchor=ctx.r3.u32,node=ctx.r4.u32;
   __imp__sub_821A1628(ctx,base);
+  // After the link: the destination by its anchor, the source list by the node.
+  edf::native::TouchStaticWalkPlans({anchor,node});
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     if(state.scene_membership.HasAnchor(anchor)) {
@@ -4494,6 +4562,7 @@ REX_HOOK_RAW(sub_821A1678) {
   }
   const auto node=ctx.r3.u32;
   __imp__sub_821A1678(ctx,base);
+  edf::native::TouchStaticWalkPlans({node});
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     if(state.scene_membership.Remove(node)) ++state.scene_membership_events;
@@ -4586,17 +4655,53 @@ REX_HOOK_RAW(sub_820B4038) {
   size_t member_index=0;
   if(membership) cursor=membership->members.empty()?end:membership->members.front().node;
   pass_sources=PublishedNativeSceneSourcesForPass(state);
+  // The step's static walk plan for this list (native_scene_static_walk.h).
+  // Driving: membership, the vtable+16 test and source candidates come from
+  // the plan; the header words stay live. Audit: the walk stays live and the
+  // plan's classification is compared with it.
+  const bool static_walk=REXCVAR_GET(edf_native_scene_static_walk),static_audit=REXCVAR_GET(edf_native_scene_static_walk_audit);
+  std::shared_ptr<const NativeStaticWalkList> plan;
+  bool plan_drives=false,plan_sources=false;
+  size_t plan_index=0;
+  uint64_t plan_touches=0,plan_members=0,direct_reuses=0,source_reuses=0,bucket_native=0,plan_abandoned=0;
+  NativeStaticWalkAudit plan_audit;
+  if(static_walk || static_audit) {
+    bridge->Hold();
+    plan_touches=state.static_walk_plans.Touches();
+    plan=state.static_walk_plans.Acquire(ctx.r4.u32);
+    // A list header rewritten outside the membership hooks drops the plan.
+    if(plan && (plan->world!=ctx.r3.u32 || plan->Head()!=cpu.Word(ctx.r4.u32) || plan->end!=cpu.Word(reader.Add(ctx.r4.u32,12)))) {
+      ++state.static_walk_stale; plan.reset();
+    }
+    if(plan) {
+      ++state.static_walk_lists;
+      plan_sources=plan->sources_revision==(pass_sources?pass_sources->CandidateRevision():state.scene_sources.CandidateRevision());
+      plan_drives=static_walk && !static_audit;
+      if(plan_drives) { membership.reset(); cursor=plan->Head(); end=plan->end; }
+      else ++plan_audit.lists;
+    } else ++state.static_walk_misses;
+  }
   uint64_t candidates=0,retained=0,selected=0,checks=0,mismatches=0;
   uint64_t native_members=0;
   size_t visited=0;
   while(cursor!=end) {
     if(++visited>1000000) throw std::runtime_error("native visibility list cycle");
     std::array<uint32_t,3> node;
-    if(membership) {
+    const NativeStaticWalkMember* planned=nullptr;
+    if(plan_drives) {
+      planned=&plan->members.at(plan_index);
+      node={plan->Next(plan_index),0,planned->owner}; ++plan_index; ++plan_members;
+    } else if(membership) {
       const auto& member=membership->members.at(member_index++);
       node={member_index<membership->members.size()?membership->members[member_index].node:end,0,member.owner};
       ++native_members;
     } else node=ReadGuestWords<3>(cpu,cursor);
+    // Audit: the plan's member at the same position against the live node.
+    if(plan && !plan_drives) {
+      if(AuditNativeStaticWalkMember(*plan,plan_index,cursor,node[0],node[2],plan_audit)) planned=&plan->members[plan_index];
+      else plan.reset();  // Positions no longer align; later members are not comparable.
+      ++plan_index;
+    }
     const auto owner=node[2];
     bool callback=false;
     uint32_t hidden=0,mode=0,table=0;
@@ -4612,9 +4717,22 @@ REX_HOOK_RAW(sub_820B4038) {
       }
     }
     if(unseen) {
-      NativeSceneSources::Candidate source;
-      if(pass_sources) source=pass_sources->FindCandidate(owner);
-      else { bridge->Hold(); source=state.scene_sources.FindCandidate(owner); }
+      NativeSceneSources::Candidate looked_up;
+      const NativeSceneSources::Candidate* found=&looked_up;
+      if(planned && plan_drives && plan_sources) { found=&planned->source; ++source_reuses; }
+      else if(pass_sources) looked_up=pass_sources->FindCandidate(owner);
+      else { bridge->Hold(); looked_up=state.scene_sources.FindCandidate(owner); }
+      const auto& source=*found;
+      if(planned && !plan_drives) {
+        const bool live_direct=!hidden && !mode && cpu.Word(reader.Add(table,16))==kNativeStaticDirectRender;
+        AuditNativeStaticWalkClassification(*planned,table,mode,hidden,live_direct,plan_sources?&source:nullptr,plan_audit);
+      }
+      // vtable+16 from the plan while the live vtable is the one it was read
+      // through (vtables are image data); otherwise the live slot.
+      const auto direct=[&] {
+        if(planned && plan_drives && planned->vtable==table) { ++direct_reuses; return planned->direct; }
+        return cpu.Word(reader.Add(table,16))==kNativeStaticDirectRender;
+      };
       const auto& published=source.visibility;
       const auto read_live=[&](bool lods) {
         const GuestReadWindow window(cpu,owner,lods?540:356);
@@ -4686,7 +4804,7 @@ REX_HOOK_RAW(sub_820B4038) {
       // Preserve the guest hidden flag and nonzero sorting modes. Only the
       // audited static direct-dispatch method may bypass the virtual callback.
       if(visible && published && object.lod_count && queues->enabled &&
-         hidden==0 && mode==0 && cpu.Word(reader.Add(table,16))==0x820B2670) {
+         hidden==0 && mode==0 && direct()) {
         const auto parts=source.Lod(NativeVisibilityLod(object,depth));
         native_selected=parts.has_value();
         if(parts) for(const auto& part:*parts) {
@@ -4698,7 +4816,15 @@ REX_HOOK_RAW(sub_820B4038) {
           ++selected;
         }
       }
-      if(visible && !native_selected) {
+      bool bucket_inserted=false;
+      if(visible && !native_selected && static_walk && hidden==0 && (int32_t(mode)==1 || int32_t(mode)==2)) {
+        // Sort modes 1/2 through the native bucket insert when it is enabled:
+        // no guest code runs, so membership, the view and the plan stay valid.
+        work.r3.u64=owner; work.r4.u64=context; work.lr=0x820B410C;
+        bucket_inserted=TryNativeBucketInsert(work,base);
+        bucket_native+=bucket_inserted;
+      }
+      if(visible && !native_selected && !bucket_inserted) {
         // Unported callbacks may change membership or node values. Continue
         // from the original post-callback link rather than an older snapshot.
         membership.reset();
@@ -4717,9 +4843,42 @@ REX_HOOK_RAW(sub_820B4038) {
     }
     // Pure native math/queue selection cannot mutate membership. A remaining
     // guest dispatcher can, so only that route must reacquire the next link.
-    cursor=callback?cpu.Word(cursor):node[0];
+    if(callback && plan && state.static_walk_plans.Touches()!=plan_touches) {
+      // A hook touched some plan during the callback: keep this one only while
+      // its membership is still the list's.
+      bridge->Hold();
+      plan_touches=state.static_walk_plans.Touches();
+      if(!state.static_walk_plans.Current(ctx.r4.u32,*plan)) { plan.reset(); plan_drives=false; ++plan_abandoned; }
+    }
+    if(callback) {
+      const auto next=cpu.Word(cursor);
+      // A driving plan continues only onto the node it expects next.
+      if(plan_drives && next!=node[0]) { plan.reset(); plan_drives=false; ++plan_abandoned; }
+      cursor=next;
+    } else cursor=node[0];
   }
+  if(plan && !plan_drives && plan_index!=plan->members.size()) ++plan_audit.membership;  // The plan holds more members.
   bridge->Hold();
+  if(static_walk || static_audit) {
+    state.static_walk_members+=plan_members; state.static_walk_direct_reuses+=direct_reuses;
+    state.static_walk_source_reuses+=source_reuses; state.static_walk_abandoned+=plan_abandoned;
+    state.static_walk_bucket_native+=bucket_native;
+    auto& total=state.static_walk_audit;
+    total.lists+=plan_audit.lists; total.members+=plan_audit.members; total.classified+=plan_audit.classified;
+    total.membership+=plan_audit.membership; total.routes+=plan_audit.routes; total.sources+=plan_audit.sources;
+    total.drift+=plan_audit.drift; total.abandoned+=static_audit?plan_abandoned:0;
+    if(plan_audit.mismatches()) {
+      static uint64_t reports=0;
+      if(++reports<=16) REXLOG_ERROR("Native static walk audit mismatch: list={:#x} membership={} routes={} sources={}",
+        ctx.r4.u32,plan_audit.membership,plan_audit.routes,plan_audit.sources);
+    }
+    static uint64_t walks=0;
+    if(++walks<=4 || walks%100000==0)
+      REXLOG_INFO("Native static walk: lists={} misses={} stale={} members={} direct_reuses={} source_reuses={} abandoned={} bucket_native={} audit_lists={} audit_members={} audit_classified={} mismatches={} (membership={} routes={} sources={}) drift={}",
+        state.static_walk_lists,state.static_walk_misses,state.static_walk_stale,state.static_walk_members,
+        state.static_walk_direct_reuses,state.static_walk_source_reuses,state.static_walk_abandoned,state.static_walk_bucket_native,
+        total.lists,total.members,total.classified,total.mismatches(),total.membership,total.routes,total.sources,total.drift);
+  }
   const auto previous=state.scene_visibility_candidates;
   state.scene_visibility_candidates+=candidates; state.scene_visibility_retained+=retained;
   state.scene_visibility_selected+=selected; state.scene_visibility_checks+=checks;
