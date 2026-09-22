@@ -12,3 +12,6 @@ LICENSES/** whitespace=-blank-at-eol,-blank-at-eof
 
 # Screenshots and capture clips must never go through EOL conversion.
 docs/media/** binary
+
+# Hash-pinned fixtures: byte-exact, never line-ending converted.
+tests/fixtures/** -text

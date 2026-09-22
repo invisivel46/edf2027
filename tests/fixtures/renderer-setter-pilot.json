@@ -3,7 +3,7 @@
   "scope": "87 store-bearing functions selected from the frozen scalar getter-unsupported population before setter rule development",
   "selection": "status unsupported under renderer_scalar_analysis.classify and natural Ghidra high_pcode contains STORE",
   "source_manifest": "tests/fixtures/renderer-scalar-pilot.json",
-  "source_manifest_sha256": "65707546ef7606cc45fa77a3481637072c0849dc4c04f80b10c0fb2f5edf4bf2",
+  "source_manifest_sha256": "d2b76582fd7cd573e426c2e5f5ed0ea3e6a9f1f4edc63749fecf907aa7c23315",
   "source_function_count": 170,
   "excluded_getter_count": 59,
   "getter_unsupported_count": 111,
