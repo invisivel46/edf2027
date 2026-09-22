@@ -12248,14 +12248,21 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
   const auto source_of=[&](const NativeModelDraw& draw) {
     const auto& batch=batch_of(draw);
     return NativeSceneGeometrySource{batch.vertex.owner,batch.index.owner,batch.declaration,batch.stride,batch.draw_count,
-      draw.pass,reader.Word(reader.Word(reader.Add(draw.pass,108)))};
+      // As native_scene_geometry.h: pass=*(material+108), shader=**pass.
+      draw.pass,reader.Word(reader.Word(reader.Word(reader.Add(draw.pass,108))))};
   };
   // Static-group eligibility per pass: the same descriptor shape and CPU
   // activation contract. Guest reads only.
   try {
     for(const auto& draw:plan)
-      if(AssessNativeStaticGroup(reader,device,stack,source_of(draw))!=NativeStaticGroupEligibility::Supported)
+      if(const auto result=AssessNativeStaticGroup(reader,device,stack,source_of(draw));
+         result!=NativeStaticGroupEligibility::Supported) {
+        static std::array<std::atomic<uint64_t>,8> reasons{};
+        const auto count=++reasons.at(size_t(result)&7);
+        if(count<=4 || !(count&(count-1)))
+          REXLOG_INFO("Native model pass eligibility: reason={} occurrences={}",uint32_t(result),count);
         return decline(D::Eligibility);
+      }
   } catch(const std::exception& error) { report(error.what()); return decline(D::Eligibility); }
   // Pass inputs at object entry: nothing runs between here and the original's
   // first activation, and each pass chains the state its predecessor left.
