@@ -6320,6 +6320,20 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     viewport.height=(std::min)(extent(rect[3],height),height-viewport.y);
     viewport.min_depth=std::bit_cast<float>(reader_.Word(0x820008cc));
     viewport.max_depth=std::bit_cast<float>(reader_.Word(0x820009a4));
+    // An empty rectangle would clip every native draw away; the scene's
+    // viewport is the full surface in practice (8219C828's contract).
+    if(!viewport.width || !viewport.height) {
+      static std::atomic<uint64_t> empty=0;
+      if(const auto count=++empty;count<=4 || !(count&(count-1)))
+        REXLOG_WARN("Native full frame view viewport empty: scene={:#x} rect={:#x},{:#x},{:#x},{:#x}; using {}x{} (count={})",
+          scene,rect[0],rect[1],rect[2],rect[3],width,height,count);
+      viewport.x=0; viewport.y=0; viewport.width=width; viewport.height=height;
+    }
+    static std::atomic<uint64_t> views=0;
+    if(const auto count=++views;count<=4 || count%10000==0)
+      REXLOG_INFO("Native full frame view: scene={:#x} viewport={},{} {}x{} depth={}..{} surface={}x{} index={} (count={})",
+        scene,viewport.x,viewport.y,viewport.width,viewport.height,viewport.min_depth,viewport.max_depth,width,height,
+        context.view.index,count);
     if(context.view.index) {
       edf::native::HookTiming clear_timing(edf::native::HookPhase::SceneClear);
       edf::native::ClearNativeDepthTarget(edf::native::SceneRecorderLocked(state),native_scene->second.depth,true,true,

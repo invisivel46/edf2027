@@ -27,10 +27,17 @@ struct NativeFullFramePassTargets {
 // visible before it this frame, and chaining from the mirrors needs guest
 // state. 821BE8D0 (scene begin) forwards the scene's viewport and clears,
 // uploads the camera and calls 82135530(device,1) - operation 0x28, depth
-// enable - and sets nothing else. The rest is the Xbox 360 D3D device default
-// state, written as the operations that produce it:
+// enable - and sets nothing else. The renderer's initializer 8219E3B8 sets the
+// only other non-default states, once: 82134EB8(device,2) (0x38 cull
+// D3DCULL_CW) and 821355A8(device,6) (0x2c depth func GREATER_EQUAL; no other
+// caller of 821355A8 exists). The scene is reverse-depth: viewport depth range
+// 820008CC..820009A4 = 1..0, depth cleared to 0.0 (820009A4) by 8219C7A8, and
+// the native reversed vertex variant (z = w - z) keeps the guest's depth
+// values, so the guest's GREATER_EQUAL is the test that passes nearer
+// fragments. The rest is the Xbox 360 D3D device default state, written as the
+// operations that produce it:
 //   0x28=1 depth test on (scene begin)     0x30=1 depth write on
-//   0x2c=3 depth func LESS_EQUAL           0x38=6 cull D3DCULL_CCW (back faces, CW front)
+//   0x2c=6 depth func GREATER_EQUAL (init) 0x38=2 cull D3DCULL_CW (init: CCW front, CW culled)
 //   0x3c=0 blend off (words[0]=0x10001)    0x48=1/0x4c=0 ONE/ZERO
 //   0x60=0 alpha test off                  0xd4..0xe0=15 color writes on
 //   stencil and scissor off
@@ -41,7 +48,7 @@ struct NativeFullFramePassTargets {
 // relied on an inherited state it does not set shows up as a draw-local
 // difference in the image A/B against the guest path, which validates this.
 inline constexpr std::array<std::array<uint32_t,2>,12> kNativeFullFrameBaseOperations{{
-  {0x28,1},{0x30,1},{0x2c,3},{0x38,6},{0x3c,0},{0x48,1},{0x4c,0},{0x60,0},{0xd4,15},{0xd8,15},{0xdc,15},{0xe0,15}}};
+  {0x28,1},{0x30,1},{0x2c,6},{0x38,2},{0x3c,0},{0x48,1},{0x4c,0},{0x60,0},{0xd4,15},{0xd8,15},{0xdc,15},{0xe0,15}}};
 inline NativeSceneMaterialPassState NativeFullFrameBaseState(const NativeFullFramePassTargets& targets) {
   if(targets.count>4) throw std::runtime_error("native full-frame pass has more than four color targets");
   NativeSceneMaterialPassState state;

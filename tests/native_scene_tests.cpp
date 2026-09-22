@@ -1218,9 +1218,10 @@ void FullFrameStaticWorld() {
   pass.targets.dsv_format=DXGI_FORMAT_D24_UNORM_S8_UINT; pass.targets.rtv_format[0]=DXGI_FORMAT_R8G8B8A8_UNORM;
   const auto base=NativeFullFrameStaticBaseState(pass.targets);
   const auto decoded=DecodeNativeRenderState(base.render.words);
-  Require(decoded.depth_enable && decoded.depth_write && decoded.depth_func==4 && !decoded.blend_enable &&
-    decoded.write_mask==15 && decoded.cull==kNativeCullBack && !decoded.front_counter_clockwise && !decoded.scissor,
-    "full-frame static base state is not opaque depth-tested LESS_EQUAL with back-face culling");
+  // Reverse depth (GREATER_EQUAL, D3D11 7) and D3DCULL_CW (CCW front), as 8219E3B8 sets them.
+  Require(decoded.depth_enable && decoded.depth_write && decoded.depth_func==7 && !decoded.blend_enable &&
+    decoded.write_mask==15 && decoded.cull==kNativeCullBack && decoded.front_counter_clockwise && !decoded.scissor,
+    "full-frame static base state is not opaque depth-tested GREATER_EQUAL with CW culling");
   std::vector<uint32_t> resolved;
   const auto resolve=[&](const NativeSceneGroupMaterial& group,const auto&,const NativeSceneMaterialPassState& state,auto) {
     Require(state==base,"full-frame material resolved against a chained state");
