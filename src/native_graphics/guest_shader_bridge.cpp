@@ -351,6 +351,7 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        RenderList, RenderSceneBegin, RenderChildren, RenderWorld,
                        RenderListener, RenderUiListener,
                        RenderQueued, RenderMaterialGroup,
+                       RenderGatherClassify, RenderGatherVisibility, RenderGatherLod, RenderGatherPush, RenderGatherGuest,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
@@ -404,6 +405,7 @@ class HookTiming {
       "render.list","render.scene_begin","render.children","render.world",
       "render.listener","render.ui_listener",
       "render.queued","render.material_group",
+      "render.gather.classify","render.gather.visibility","render.gather.lod","render.gather.push","render.gather.guest_dispatch",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
       "load.shader.registration","load.shader.lock","load.shader.entry",
       "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
@@ -537,6 +539,18 @@ class GuestReader {
   const uint8_t* WritableBytes(uint32_t address,size_t size,size_t alignment) const {
     if(!size || (alignment!=4 && alignment!=8))
       throw std::runtime_error("invalid native guest write extent/alignment");
+    // The SDK writable proof (committed, read and write access) implies the
+    // readable one Bytes would query first: one region query, not two. Each
+    // query locks the heap and scans its region's page entries. Anything the
+    // proof does not cover takes the full path below, which throws as before.
+    if(REXCVAR_GET(edf_native_guest_heap_reads) && address && size<=0x100000000ull-address && !(address&(alignment-1))) {
+      const auto last=address+uint32_t(size-1);
+      auto* heap=memory_->LookupHeap(address);
+      auto* start=memory_->TranslateVirtual(address);
+      if(heap && heap==memory_->LookupHeap(last) && memory_->TranslateVirtual(last)==start+size-1 &&
+         !(reinterpret_cast<uintptr_t>(start)&(alignment-1)) && GuestVirtualHeapCommittedWritable(*heap,address,size))
+        return start;
+    }
     const auto* data=Bytes(address,size);
     if((address&(alignment-1)) || (reinterpret_cast<uintptr_t>(data)&(alignment-1)))
       throw std::runtime_error("native guest write destination is not aligned");
@@ -1182,6 +1196,9 @@ using BridgeGuestCall=NativeWalkGuestCall<std::mutex>;
 struct BridgeWalkView {
   const BridgeWalkLock* scope; uint32_t context;
   NativeGuestCallCached<NativeSceneVisibilityView> view;
+  // The walk's page admissions, shared by its node reads and every list's
+  // gather. Keyed to this thread's guest call count: a guest call drops them.
+  const NativeSceneCpuWindow<GuestReader>* window=nullptr;
 };
 inline thread_local BridgeWalkView* bridge_walk_view=nullptr;
 // Defined below, next to the selection it mirrors; declared here because
@@ -3904,15 +3921,21 @@ REX_HOOK_RAW(sub_821C61D8) {
       if(found!=trees.end()) hierarchy=found->second;
     } else hierarchy=publications.Acquire(manager);
   }
-  edf::native::NativeSceneTreeReader tree_reader(reader,publications,std::move(hierarchy),
-    REXCVAR_GET(edf_native_scene_visibility_audit));
+  const bool audit=REXCVAR_GET(edf_native_scene_visibility_audit);
+  // Live node reads, the manager+100 counter and every gather's owner headers
+  // go through one page window for the walk. Each admission is an SDK region
+  // query (heap lock plus a scan of the region's page entries), so a word read
+  // through the bare reader costs one; admissions stay valid until this thread
+  // makes a guest call, which drops them all.
+  const edf::native::NativeSceneCpuWindow window(reader,&edf::native::BridgeWalkLock::guest_calls);
+  edf::native::NativeSceneTreeReader tree_reader(window,publications,std::move(hierarchy),audit);
   // One bridge lock scope for the walk: each leaf list's gather reuses it,
   // every guest call below releases it and so does the end of every list, so
   // the hold never spans the traversal. The view is read once and again only
   // after a guest call, which alone can change camera data; the gathers share
   // it, and releasing the lock does not invalidate it.
   edf::native::BridgeWalkLock walk_lock(edf::native::State().mutex);
-  edf::native::BridgeWalkView walk_view{&walk_lock,context,{}};
+  edf::native::BridgeWalkView walk_view{&walk_lock,context,{},&window};
   const auto outer_view=std::exchange(edf::native::bridge_walk_view,&walk_view);
   struct RestoreWalkView {
     edf::native::BridgeWalkView* outer;
@@ -3920,14 +3943,14 @@ REX_HOOK_RAW(sub_821C61D8) {
   } restore_view{outer_view};
   edf::native::TraverseNativeSceneTree(tree_reader,manager,[&](uint32_t node) {
     const auto& view=walk_view.view.Get(edf::native::BridgeWalkLock::guest_calls,
-      [&] { return edf::native::ReadNativeSceneVisibilityView(reader,context); });
+      [&] { return edf::native::ReadNativeSceneVisibilityView(window,context); });
     const auto center=edf::native::ReadNativeVisibilityFloats<4>(tree_reader,reader.Add(node,32));
     const auto transformed=edf::native::NativeVisibilityTransform(center,view.matrix);
     const auto radius=std::bit_cast<float>(tree_reader.Word(reader.Add(node,64)));
     const auto sphere=edf::native::NativeVisibilitySphere(view,transformed,radius);
     const auto result=sphere==2?edf::native::NativeVisibilityAabb(view,center,
       edf::native::ReadNativeVisibilityFloats<4>(tree_reader,reader.Add(node,48))):sphere;
-    if(REXCVAR_GET(edf_native_scene_visibility_audit)) {
+    if(audit) {
       const auto camera=reader.Word(reader.Add(context,16));
       for(uint32_t i=0;i<4;++i) reader.StoreWord(reader.Add(stack,80+i*4),std::bit_cast<uint32_t>(transformed[i]));
       work.r3.u64=reader.Add(camera,288); work.r4.u64=reader.Add(stack,80); work.f1.f64=radius;
@@ -5091,23 +5114,34 @@ REX_HOOK_RAW(sub_820B4038) {
   if(!bridge) bridge=&own_lock.emplace(State().mutex);
   auto& state=State();
   const GuestReader reader(base);
-  NativeSceneCpuWindow cpu(reader);
   const auto context=ctx.r5.u32;
-  uint32_t end=0;
-  const auto generation=reader.Word(reader.Add(context,12));
-  uint32_t cursor=0;
-  // The walk's view when this list runs under the walk's own scope.
+  // The walk's view and page window when this list runs under the walk's own
+  // scope; a standalone gather has its own. Every guest word below (context,
+  // stack, list header, owner headers, vtable slots, group links) goes through
+  // the window: one SDK region query per page per guest-call epoch instead of
+  // one per word, and none per list for the pages the walk already admitted.
   auto* walk_view=bridge_walk_view && bridge_walk_view->scope==bridge && bridge_walk_view->context==context?bridge_walk_view:nullptr;
-  const auto read_view=[&] {
-    const auto read=[&] { return ReadNativeSceneVisibilityView(cpu,context); };
-    return walk_view?walk_view->view.Get(BridgeWalkLock::guest_calls,read):read();
+  std::optional<NativeSceneCpuWindow<GuestReader>> own_window;
+  const auto& cpu=walk_view && walk_view->window?*walk_view->window:own_window.emplace(reader,&BridgeWalkLock::guest_calls);
+  // Per-candidate sub-phases (render.gather.*): read once per list, and free
+  // when timings are off.
+  const bool phase_timing=REXCVAR_GET(edf_native_hook_timings);
+  uint32_t end=0;
+  const auto generation=cpu.Word(cpu.Add(context,12));
+  uint32_t cursor=0;
+  // The camera view is current until this thread makes a guest call; after a
+  // callback it is re-read at the next candidate that needs it, not eagerly.
+  NativeGuestCallCached<NativeSceneVisibilityView> own_view;
+  auto& view_cache=walk_view?walk_view->view:own_view;
+  const auto current_view=[&]() -> const NativeSceneVisibilityView& {
+    return view_cache.Get(BridgeWalkLock::guest_calls,[&] { return ReadNativeSceneVisibilityView(cpu,context); });
   };
-  auto view=read_view();
-  auto* center_destination=const_cast<uint8_t*>(cpu.WritableBytes(reader.Add(context,32),16,4));
+  current_view();
+  auto* center_destination=const_cast<uint8_t*>(cpu.WritableBytes(cpu.Add(context,32),16,4));
   auto work=ctx;
   if(work.r1.u32<160) throw std::runtime_error("invalid native visibility stack");
   work.r1.u64=work.r1.u32-160;
-  reader.StoreWord(work.r1.u32,ctx.r1.u32);
+  cpu.StoreWord(work.r1.u32,ctx.r1.u32);
   const bool audit=REXCVAR_GET(edf_native_scene_visibility_audit);
   std::shared_ptr<const NativeSceneMembership::Snapshot> membership;
   // Resolve the pass's source generation once per list, not per candidate:
@@ -5136,7 +5170,7 @@ REX_HOOK_RAW(sub_820B4038) {
         REXLOG_INFO("Native published membership: lists={} revision={}",reads,native_scene_publication->membership->revision);
     } else membership=state.scene_membership.Acquire(ctx.r4.u32);
     if(!published || audit) {
-      end=reader.Word(reader.Add(ctx.r4.u32,12)); cursor=reader.Word(ctx.r4.u32);
+      end=cpu.Word(cpu.Add(ctx.r4.u32,12)); cursor=cpu.Word(ctx.r4.u32);
     }
     if(membership && !published && !audit && (membership->end!=end ||
        (membership->members.empty()?end:membership->members.front().node)!=cursor)) {
@@ -5196,6 +5230,9 @@ REX_HOOK_RAW(sub_820B4038) {
   size_t visited=0;
   while(cursor!=end) {
     if(++visited>1000000) throw std::runtime_error("native visibility list cycle");
+    // classify: the next member, the header (+48 marker, route words) and the
+    // source candidate. Ends before any visibility math.
+    HookTiming classify_timing(HookPhase::RenderGatherClassify,phase_timing);
     std::array<uint32_t,3> node;
     const NativeStaticWalkMember* planned=nullptr;
     if(plan_drives) {
@@ -5227,29 +5264,36 @@ REX_HOOK_RAW(sub_820B4038) {
       }
     }
     if(unseen) {
+      // A view of the candidate, not a retaining copy: a published generation
+      // is immutable and held by pass_sources for the whole list, the plan by
+      // `plan` until after the last use below, and the producer's answer by
+      // `looked_up`.
       NativeSceneSources::Candidate looked_up;
-      const NativeSceneSources::Candidate* found=&looked_up;
-      if(planned && plan_drives && plan_sources) { found=&planned->source; ++source_reuses; }
-      else if(pass_sources) looked_up=pass_sources->FindCandidate(owner);
-      else { bridge->Hold(); looked_up=state.scene_sources.FindCandidate(owner); }
-      const auto& source=*found;
+      NativeSceneSources::CandidateView source;
+      if(planned && plan_drives && plan_sources) { source=NativeSceneSources::View(planned->source); ++source_reuses; }
+      else if(pass_sources) source=pass_sources->FindCandidateView(owner);
+      else { bridge->Hold(); looked_up=state.scene_sources.FindCandidate(owner); source=NativeSceneSources::View(looked_up); }
       if(planned && !plan_drives) {
-        const bool live_direct=!hidden && !mode && cpu.Word(reader.Add(table,16))==kNativeStaticDirectRender;
+        const bool live_direct=!hidden && !mode && cpu.Word(cpu.Add(table,16))==kNativeStaticDirectRender;
         AuditNativeStaticWalkClassification(*planned,table,mode,hidden,live_direct,plan_sources?&source:nullptr,plan_audit);
       }
       // vtable+16 from the plan while the live vtable is the one it was read
       // through (vtables are image data); otherwise the live slot.
       const auto direct=[&] {
         if(planned && plan_drives && planned->vtable==table) { ++direct_reuses; return planned->direct; }
-        return cpu.Word(reader.Add(table,16))==kNativeStaticDirectRender;
+        return cpu.Word(cpu.Add(table,16))==kNativeStaticDirectRender;
       };
-      const auto& published=source.visibility;
+      const auto* published=source.visibility;
       const auto read_live=[&](bool lods) {
         const GuestReadWindow window(cpu,owner,lods?540:356);
         return ReadNativeSceneVisibility(window,owner,lods);
       };
       auto object=published?*published:read_live(false);
       ++candidates; retained+=bool(published);
+      classify_timing.Finish();
+      // visibility: transform, the context+32 center store, depth, sphere/box.
+      HookTiming visibility_timing(HookPhase::RenderGatherVisibility,phase_timing);
+      const auto& view=current_view();
       if(audit && published) {
         const auto live=read_live(true);
         if(live!=object) {
@@ -5282,6 +5326,8 @@ REX_HOOK_RAW(sub_820B4038) {
       }
       std::array<uint32_t,4> encoded_center;
       for(size_t i=0;i<4;++i) encoded_center[i]=std::bit_cast<uint32_t>(center[i]);
+      // Re-admitted here, not after the callback that dropped it.
+      if(!center_destination) center_destination=const_cast<uint8_t*>(cpu.WritableBytes(cpu.Add(context,32),16,4));
       StoreGuestCpuWords(std::span<uint8_t>{center_destination,16},encoded_center);
       const float depth=-float(center[2]*view.depth_scale);
       bool visible=!(depth>object.distance);
@@ -5310,23 +5356,33 @@ REX_HOOK_RAW(sub_820B4038) {
         }
         visible=box!=0;
       }
+      visibility_timing.Finish();
       bool native_selected=false;
       // Preserve the guest hidden flag and nonzero sorting modes. Only the
       // audited static direct-dispatch method may bypass the virtual callback.
       if(visible && published && object.lod_count && queues->enabled &&
-         hidden==0 && mode==0 && direct()) {
-        const auto parts=source.Lod(NativeVisibilityLod(object,depth));
-        native_selected=parts.has_value();
-        if(parts) for(const auto& part:*parts) {
-          if(!part.group || (!queues->Contains(part.group) &&
-             cpu.Word(reader.Add(part.group,4))!=cpu.Word(reader.Add(part.group,8)))) { native_selected=false; break; }
-        }
-        if(native_selected) {
-          for(const auto& part:*parts) queues->Push(part.group,part.instance);
-          ++selected;
+         hidden==0 && mode==0) {
+        // lod: the direct-render test, the LOD's parts and their groups.
+        HookTiming lod_timing(HookPhase::RenderGatherLod,phase_timing);
+        if(direct()) {
+          const auto parts=source.Lod(NativeVisibilityLod(object,depth));
+          native_selected=parts.has_value();
+          if(parts) for(const auto& part:*parts) {
+            if(!part.group || (!queues->Contains(part.group) &&
+               cpu.Word(cpu.Add(part.group,4))!=cpu.Word(cpu.Add(part.group,8)))) { native_selected=false; break; }
+          }
+          lod_timing.Finish();
+          if(native_selected) {
+            HookTiming push_timing(HookPhase::RenderGatherPush,phase_timing);
+            for(const auto& part:*parts) queues->Push(part.group,part.instance);
+            ++selected;
+          }
         }
       }
       if(visible && !native_selected) {
+        // guest_dispatch: the bucket route, including any original routine it
+        // runs (inclusive of guest time).
+        HookTiming guest_timing(HookPhase::RenderGatherGuest,phase_timing);
         // Classify first. Sort modes 1/2 go through the native bucket insert
         // when it is enabled: it touches guest memory only, so it is not a
         // guest call, keeps the hold, and membership, the view and the plan
@@ -5337,6 +5393,9 @@ REX_HOOK_RAW(sub_820B4038) {
           // Unported callbacks may change membership or node values. Continue
           // from the original post-callback link rather than an older snapshot.
           membership.reset();
+          // No page admission, center pointer or view survives the call: the
+          // window and view are keyed to the guest call count, and the center
+          // is re-admitted at the next candidate that stores one.
           cpu.Invalidate(); center_destination=nullptr;
           // Hierarchy writer hooks invalidate tree images if this callback
           // changes membership, bounds or topology. Unrelated callback activity
@@ -5344,12 +5403,6 @@ REX_HOOK_RAW(sub_820B4038) {
           DispatchNativeBucketObject(work,base,try_native);
         });
         bucket_native+=try_native && !callback;
-        if(callback) {
-          // A remaining callback can update camera data; no live read window or
-          // registry span survives it.
-          view=read_view();
-          center_destination=const_cast<uint8_t*>(cpu.WritableBytes(reader.Add(context,32),16,4));
-        }
       }
     }
     // Pure native math/queue selection cannot mutate membership. A remaining

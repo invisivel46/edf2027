@@ -1,5 +1,6 @@
 #pragma once
 #include "guest_block.h"
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <map>
@@ -16,15 +17,24 @@ struct NativeSceneTreeImage {
   using Regions=std::map<uint32_t,std::vector<uint8_t>>;
   // Shared so a restamp for a newer epoch never copies or mutates captured bytes.
   std::shared_ptr<const Regions> regions;
-  const uint8_t* Find(uint32_t address,size_t bytes) const {
-    if(!regions) return nullptr;
-    auto found=regions->upper_bound(address);
-    if(found==regions->begin()) return nullptr;
-    --found;
-    const auto offset=uint64_t(address)-found->first;
-    if(offset>found->second.size() || bytes>found->second.size()-offset) return nullptr;
-    return found->second.data()+offset;
+  // The region Find answers from for every address in [base,limit): the last
+  // one starting at or below it, and where the next one starts.
+  struct Region { uint32_t base=0; uint64_t limit=0; const std::vector<uint8_t>* bytes=nullptr; };
+  Region Locate(uint32_t address) const {
+    if(!regions) return {};
+    auto next=regions->upper_bound(address);
+    if(next==regions->begin()) return {};
+    const uint64_t limit=next==regions->end()?(uint64_t(1)<<32):next->first;
+    --next;
+    return {next->first,limit,&next->second};
   }
+  static const uint8_t* Within(const Region& region,uint32_t address,size_t bytes) {
+    if(!region.bytes || address<region.base || address>=region.limit) return nullptr;
+    const auto offset=uint64_t(address)-region.base;
+    if(offset>region.bytes->size() || bytes>region.bytes->size()-offset) return nullptr;
+    return region.bytes->data()+offset;
+  }
+  const uint8_t* Find(uint32_t address,size_t bytes) const { return Within(Locate(address),address,bytes); }
 };
 template<class Reader>
 std::shared_ptr<NativeSceneTreeImage> CaptureNativeSceneTree(const Reader& reader,uint32_t owner) {
@@ -126,7 +136,7 @@ class NativeSceneTreeReader {
       : backing_(backing),publications_(publications),image_(std::move(image)),audit_(audit) {}
   uint32_t Add(uint32_t address,size_t size) const { return backing_.Add(address,size); }
   const uint8_t* Bytes(uint32_t address,size_t size) const {
-    if(image_ && publications_.Current(*image_)) if(const auto* bytes=image_->Find(address,size)) {
+    if(image_ && publications_.Current(*image_)) if(const auto* bytes=Owned(address,size)) {
       if(audit_ && std::memcmp(bytes,backing_.Bytes(address,size),size))
         throw std::runtime_error("native tree publication differs from live hierarchy");
       ++owned_reads; return bytes;
@@ -137,9 +147,22 @@ class NativeSceneTreeReader {
   void StoreWord(uint32_t address,uint32_t value) const { backing_.StoreWord(address,value); }
   mutable uint64_t owned_reads=0,live_reads=0;
  private:
+  // image_->Find through the last two regions it answered from: a node's
+  // reads (+32 bounds, +64 radius, +84 children, +116 occupancy) fall in two
+  // captured regions, so most reads skip the map search. A hit is exactly
+  // Find's answer: the address lies below the next region's start.
+  const uint8_t* Owned(uint32_t address,size_t size) const {
+    for(const auto& hit:hits_)
+      if(hit.bytes && address>=hit.base && address<hit.limit) return NativeSceneTreeImage::Within(hit,address,size);
+    const auto region=image_->Locate(address);
+    if(region.bytes) { hits_[next_hit_]=region; next_hit_^=1; }
+    return NativeSceneTreeImage::Within(region,address,size);
+  }
   const Reader& backing_;
   const NativeSceneTreePublications& publications_;
   std::shared_ptr<const NativeSceneTreeImage> image_;
   bool audit_=false;
+  mutable std::array<NativeSceneTreeImage::Region,2> hits_{};
+  mutable size_t next_hit_=0;
 };
 }

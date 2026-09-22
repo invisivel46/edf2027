@@ -138,6 +138,30 @@ class NativeSceneSources {
     for(size_t lod=0;lod<3;++lod) result.lods[lod]=found->parts->lod[lod];
     return result;
   }
+  // A Candidate's answer without its retaining copies (no reference-count
+  // traffic per object): valid while what it was taken from is alive and
+  // unchanged, i.e. an immutable published generation or a Candidate the
+  // caller keeps.
+  struct CandidateView {
+    bool registered=false;
+    const NativeSceneVisibility* visibility=nullptr;
+    std::array<std::span<const Part>,3> lods;
+    std::optional<std::span<const Part>> Lod(uint32_t lod) const {
+      if(!registered || lod>=lods.size()) return {};
+      return lods[lod];
+    }
+  };
+  static CandidateView View(const Candidate& candidate) {
+    return {candidate.registered,candidate.visibility.get(),candidate.lods};
+  }
+  CandidateView FindCandidateView(uint32_t owner) const {
+    CandidateView result;
+    const auto* found=owners_.Find(owner);
+    if(!found) return result;
+    result.registered=true; result.visibility=found->visibility.get();
+    for(size_t lod=0;lod<3;++lod) result.lods[lod]=found->parts->lod[lod];
+    return result;
+  }
   using World=std::array<uint8_t,64>;
   bool PublishVisibility(uint32_t owner,const NativeSceneVisibility& visibility) {
     const auto* found=owners_.Find(owner);

@@ -1303,6 +1303,24 @@ void Visibility() {
   window.Bytes(8190,4);
   Require(memory.reads==before_reads+1,"cross-page access bypassed the backing validator");
   Reject([&] { window.Bytes(12287,2); });
+  {
+    // A walk's window is keyed to the guest call count: admissions survive
+    // native work and are dropped on the first access after a call.
+    uint64_t guest_calls=0;
+    const NativeSceneCpuWindow walk(memory,&guest_calls);
+    const auto reads=memory.reads;
+    walk.Word(4096); walk.Word(4200); walk.Word(8192); walk.Word(4104);
+    Require(memory.reads==reads+2,"walk window readmitted a page without a guest call");
+    ++guest_calls; walk.Word(4096);
+    Require(memory.reads==reads+3,"walk window kept an admission across a guest call");
+    const auto writes=memory.writes;
+    walk.StoreWord(4108,0x01020304); walk.StoreWord(4112,5);
+    Require(memory.writes==writes+1 && memory.bytes[4108]==1 && memory.bytes[4111]==4 && walk.Word(4112)==5,
+      "window word store was not a big-endian store through one writable admission");
+    memory.writable=false; ++guest_calls;
+    Reject([&] { walk.StoreWord(4108,0); });
+    memory.writable=true;
+  }
   NativeSceneVisibilityView view;
   view.matrix=kNativeSceneIdentity; view.depth_scale=-1;
   const float n=std::sqrt(.5f);
@@ -1459,6 +1477,17 @@ void QueuedGuestState() {
     reader.Word(other_group+4)==second && reader.Word(second+4)==sentinel,
     "native queue fallback did not restore original head-insertion order");
   Reject([&] { queues.Push(group,first); });
+  {
+    // The last-group lookup never outlives its group or crosses a copy.
+    NativeSceneQueues cached;
+    cached.Push(group,first);
+    Require(cached.Contains(group) && !cached.Contains(other_group) && cached.Contains(group),"queue lookup lost a group");
+    auto copy=cached; copy.Push(group,last);
+    Require(cached.Take(group)==std::vector<uint32_t>{first} && !cached.Contains(group),"queue copy shared its groups");
+    cached.Push(group,second);
+    Require(copy.Take(group)==std::vector<uint32_t>{last,first} && cached.Take(group)==std::vector<uint32_t>{second},
+      "queue lookup appended to a taken or copied group");
+  }
   constexpr uint32_t owner=8192;
   NativeSceneSources sources;
   Require(!sources.HasOwner(owner),"unconstructed static owner exists");
@@ -1481,6 +1510,10 @@ void QueuedGuestState() {
       candidate.Lod(0)->data()==sources.LodParts(owner+408)->data(),"visibility candidate disagreed with LOD lookup");
     Require(!sources.FindCandidate(30000).registered && !sources.FindCandidate(30000).Lod(0),
       "unregistered visibility candidate resolved parts");
+    const auto view=sources.FindCandidateView(owner);
+    Require(view.registered && !view.visibility && view.Lod(0)->data()==candidate.Lod(0)->data() &&
+      view.Lod(1)->size()==1 && !view.Lod(3) && !sources.FindCandidateView(30000).Lod(0) &&
+      SameNativeSceneCandidate(view,NativeSceneSources::View(candidate)),"candidate view disagreed with the retaining lookup");
     const std::array<NativeSceneSources::Part,1> moved{{{19500,0,0}}};
     sources.Observe(owner,moved);
     Require(sources.FindCandidate(owner).Lod(0)->front().instance==19500 &&

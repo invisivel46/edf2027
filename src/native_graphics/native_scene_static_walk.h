@@ -59,12 +59,15 @@ template<class ReadMethod>
 bool PlannedNativeStaticDirect(const NativeStaticWalkMember& member,uint32_t vtable,ReadMethod&& read_method) {
   return member.vtable==vtable?member.direct:read_method(vtable)==kNativeStaticDirectRender;
 }
-inline bool SameNativeSceneCandidate(const NativeSceneSources::Candidate& a,const NativeSceneSources::Candidate& b) {
+inline bool SameNativeSceneCandidate(const NativeSceneSources::CandidateView& a,const NativeSceneSources::CandidateView& b) {
   if(a.registered!=b.registered || bool(a.visibility)!=bool(b.visibility)) return false;
   if(a.visibility && a.visibility!=b.visibility && *a.visibility!=*b.visibility) return false;
   for(size_t lod=0;lod<a.lods.size();++lod)
     if(!std::equal(a.lods[lod].begin(),a.lods[lod].end(),b.lods[lod].begin(),b.lods[lod].end())) return false;
   return true;
+}
+inline bool SameNativeSceneCandidate(const NativeSceneSources::Candidate& a,const NativeSceneSources::Candidate& b) {
+  return SameNativeSceneCandidate(NativeSceneSources::View(a),NativeSceneSources::View(b));
 }
 // Every occupied leaf's list (node+120) of the tree 821C61D8 walks, in walk
 // order, with every node accepted. Reads only; no counters are written.
@@ -216,11 +219,16 @@ inline bool AuditNativeStaticWalkMember(const NativeStaticWalkList& plan,size_t 
   return true;
 }
 inline void AuditNativeStaticWalkClassification(const NativeStaticWalkMember& planned,uint32_t vtable,uint32_t mode,
-    uint32_t hidden,bool live_direct,const NativeSceneSources::Candidate* live_source,NativeStaticWalkAudit& audit) {
+    uint32_t hidden,bool live_direct,const NativeSceneSources::CandidateView* live_source,NativeStaticWalkAudit& audit) {
   ++audit.classified;
   if(planned.vtable!=vtable || planned.mode!=mode || planned.hidden!=hidden) ++audit.drift;
   const bool direct=planned.vtable==vtable?planned.direct:live_direct;
   if(ClassifyNativeStaticWalk(hidden,mode,direct)!=ClassifyNativeStaticWalk(hidden,mode,live_direct)) ++audit.routes;
-  if(live_source && !SameNativeSceneCandidate(planned.source,*live_source)) ++audit.sources;
+  if(live_source && !SameNativeSceneCandidate(NativeSceneSources::View(planned.source),*live_source)) ++audit.sources;
+}
+inline void AuditNativeStaticWalkClassification(const NativeStaticWalkMember& planned,uint32_t vtable,uint32_t mode,
+    uint32_t hidden,bool live_direct,const NativeSceneSources::Candidate* live_source,NativeStaticWalkAudit& audit) {
+  const auto view=live_source?std::optional(NativeSceneSources::View(*live_source)):std::nullopt;
+  AuditNativeStaticWalkClassification(planned,vtable,mode,hidden,live_direct,view?&*view:nullptr,audit);
 }
 }

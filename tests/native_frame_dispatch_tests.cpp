@@ -43,6 +43,15 @@ void TestTreePublication() {
   NativeSceneTreeReader owned(r,publications,first,false);
   r.StoreWord(node+32,19);
   Require(owned.Word(node+32)==17 && owned.owned_reads==1,"tree image borrowed mutable memory");
+  {
+    // Region hits answer exactly as the image's Find: inside a cached region,
+    // a range running past its end still reads live.
+    NativeSceneTreeReader cached(r,publications,first,false);
+    Require(cached.Word(node+116)==1 && cached.Word(node+32)==17 && cached.Word(node+116)==1 &&
+      cached.Word(node+64)==0 && cached.owned_reads==4 && !cached.live_reads,"tree region cache missed or changed a read");
+    cached.Bytes(node+64,8);
+    Require(cached.live_reads==1 && first->Find(node+64,8)==nullptr,"tree region cache served a range past its region");
+  }
   NativeSceneTreeReader audited(r,publications,first,true);
   bool mismatch=false;
   try { audited.Word(node+32); } catch(const std::exception&) { mismatch=true; }

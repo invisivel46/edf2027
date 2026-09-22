@@ -13,18 +13,21 @@ namespace edf::native {
 class NativeSceneQueues {
  public:
   bool enabled=true;
-  bool Contains(uint32_t group) const { return groups_.contains(group); }
+  bool Contains(uint32_t group) const { return Slot(group)!=nullptr; }
   bool empty() const { return groups_.empty(); }
   template<class Contains> bool Within(Contains&& contains) const {
     return std::ranges::all_of(groups_,[&](const auto& entry) { return contains(entry.first); });
   }
   void Push(uint32_t group,uint32_t instance) {
     if(!enabled || !group || !instance) throw std::runtime_error("invalid native scene queue append");
-    groups_[group].push_back(instance);
+    if(auto* instances=Slot(group)) { instances->push_back(instance); return; }
+    const auto at=groups_.try_emplace(group).first;
+    last_.entry=&*at; at->second.push_back(instance);
   }
   std::vector<uint32_t> Take(uint32_t group) {
     const auto found=groups_.find(group);
     if(found==groups_.end()) return {};
+    if(last_.entry==&*found) last_.entry=nullptr;
     auto result=std::move(found->second); groups_.erase(found);
     std::reverse(result.begin(),result.end()); return result;
   }
@@ -35,10 +38,27 @@ class NativeSceneQueues {
       reader.StoreWord(reader.Add(instance,4),head);
       reader.StoreWord(reader.Add(group,4),instance);
     }
-    groups_.clear(); enabled=false;
+    groups_.clear(); last_.entry=nullptr; enabled=false;
   }
  private:
-  std::map<uint32_t,std::vector<uint32_t>> groups_;
+  using Groups=std::map<uint32_t,std::vector<uint32_t>>;
+  // The group the last lookup found: a selected object's check and its pushes
+  // hit the same group in a row. Map nodes are stable until erased; a copy or
+  // move of the queues starts without one.
+  struct LastGroup {
+    Groups::value_type* entry=nullptr;
+    LastGroup()=default;
+    LastGroup(const LastGroup&) {}
+    LastGroup& operator=(const LastGroup&) { entry=nullptr; return *this; }
+  };
+  std::vector<uint32_t>* Slot(uint32_t group) const {
+    if(last_.entry && last_.entry->first==group) return &last_.entry->second;
+    const auto found=groups_.find(group);
+    if(found==groups_.end()) return nullptr;
+    last_.entry=&*found; return &found->second;
+  }
+  mutable Groups groups_;
+  mutable LastGroup last_;
 };
 template<class Reader>
 bool NativeQueuedConstantsClean(const Reader& reader,uint32_t device) {
