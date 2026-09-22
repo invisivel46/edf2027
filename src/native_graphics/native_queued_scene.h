@@ -15,6 +15,9 @@ class NativeSceneQueues {
   bool enabled=true;
   bool Contains(uint32_t group) const { return groups_.contains(group); }
   bool empty() const { return groups_.empty(); }
+  template<class Contains> bool Within(Contains&& contains) const {
+    return std::ranges::all_of(groups_,[&](const auto& entry) { return contains(entry.first); });
+  }
   void Push(uint32_t group,uint32_t instance) {
     if(!enabled || !group || !instance) throw std::runtime_error("invalid native scene queue append");
     groups_[group].push_back(instance);

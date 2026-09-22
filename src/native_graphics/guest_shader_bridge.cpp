@@ -23,6 +23,7 @@
 #include "native_scene_world_restore.h"
 #include "native_static_group_eligibility.h"
 #include "native_static_world_resolve.h"
+#include "native_static_world_pass.h"
 #include "native_queued_scene.h"
 #include "native_decode_workers.h"
 #include "native_d3d12_preview.h"
@@ -3326,6 +3327,10 @@ REX_HOOK_RAW(sub_820B4250) {
 REX_EXTERN(__imp__sub_820B4310);
 REX_EXTERN(sub_821C61D8);
 REX_EXTERN(sub_821C3BB8);
+namespace edf::native {
+bool NativeStaticWorldPassEnabled();
+void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner);
+}
 REX_HOOK_RAW(sub_820B4310) {
   if(REXCVAR_GET(edf_native_scene_group_order_audit)) {
     static thread_local std::vector<uint32_t> live;
@@ -3371,7 +3376,10 @@ REX_HOOK_RAW(sub_820B4310) {
     work.r3.u64=owner; work.r4.u64=reader.Add(owner,372); work.r5.u64=context;
     work.lr=0x820B4338; sub_820B4038(work,base);
     work.r3.u64=owner; work.r4.u64=context; work.lr=0x820B4344; sub_821C61D8(work,base);
-    work.r3.u64=reader.Add(owner,240); work.lr=0x820B434C; sub_821C3BB8(work,base);
+    // The static opaque world pass: native groups in published order, guest
+    // 821D96D8 per unsupported group, original 821C3BB8 when no order applies.
+    if(edf::native::NativeStaticWorldPassEnabled()) edf::native::RenderNativeStaticWorldPass(work,base,owner);
+    else { work.r3.u64=reader.Add(owner,240); work.lr=0x820B434C; sub_821C3BB8(work,base); }
   } else __imp__sub_820B4310(ctx,base);
 }
 REX_EXTERN(__imp__sub_820B5FA8);
@@ -10510,4 +10518,244 @@ REX_HOOK_RAW(sub_8213DDA0) {
   static thread_local uint64_t removed=0;
   if(++removed<=3)
     REXLOG_INFO("Native fetch ownership: omitted Xbox descriptor packet encoding, dirty={:#x}",ctx.r4.u64);
+}
+
+REXCVAR_DEFINE_BOOL(edf_native_static_world_pass,false,"EDF2027",
+  "Draw the static opaque world pass natively in published group order; unsupported groups run their guest group callback (development)");
+namespace edf::native {
+bool NativeStaticWorldPassEnabled() {
+  if(!REXCVAR_GET(edf_native_static_world_pass)) return false;
+  const std::pair<const char*,bool> required[]{
+    {"edf_native_frame_dispatch",REXCVAR_GET(edf_native_frame_dispatch)},
+    {"edf_native_scene_tree",REXCVAR_GET(edf_native_scene_tree)},
+    {"edf_native_scene_tree_published",REXCVAR_GET(edf_native_scene_tree_published)},
+    {"edf_native_scene_queued",REXCVAR_GET(edf_native_scene_queued)},
+    {"edf_native_scene_visibility",REXCVAR_GET(edf_native_scene_visibility)},
+    {"edf_native_scene_sources_owned",REXCVAR_GET(edf_native_scene_sources_owned)},
+    {"edf_native_scene_membership_owned",REXCVAR_GET(edf_native_scene_membership_owned)},
+    {"edf_native_scene_selection_owned",REXCVAR_GET(edf_native_scene_selection_owned)},
+    {"edf_native_scene_camera_owned",REXCVAR_GET(edf_native_scene_camera_owned)},
+    {"edf_native_scene_geometry_owned",REXCVAR_GET(edf_native_scene_geometry_owned)},
+    {"edf_native_scene_material_owned",REXCVAR_GET(edf_native_scene_material_owned)},
+    {"edf_native_scene_preload",REXCVAR_GET(edf_native_scene_preload)},
+    {"edf_native_scene_group_order",REXCVAR_GET(edf_native_scene_group_order)}};
+  for(const auto& [name,enabled]:required) if(!enabled) {
+    static std::atomic<bool> reported=false;
+    if(!reported.exchange(true))
+      REXLOG_INFO("Native static world pass disabled: requires {} (original group traversal retained)",name);
+    return false;
+  }
+  return true;
+}
+namespace {
+void LogNativeStaticWorldGroup(uint32_t group,uint64_t recorded) {
+  // Same line and sampling as the guest group hook; a native group enters no boundary.
+  static std::atomic<uint64_t> shapes=0;
+  const auto count=++shapes;
+  if(count<=4 || !(count&(count-1)))
+    REXLOG_INFO("Native static group execution: group={:#x} completed=true recorded_batches={} compatibility_calls=0 boundary_mask={:#x} occurrences={}",
+      group,recorded,0u,count);
+}
+}
+// Replaces 821C3BB8(owner+240) for one world owner. Native groups draw from the
+// scene publication with explicit pass inputs; the device state they owe is
+// handed off before any guest group and at the end, so later stages inherit
+// what the sequential guest groups would have left. Guest calls run unlocked.
+void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
+  const GuestReader reader(base);
+  static NativeStaticWorldPassCounters counters;
+  const auto publication=native_scene_publication;
+  auto* queues=native_scene_queues;
+  const auto order=native_scene_pass_camera?NativeStaticWorldOrder(publication.get(),owner,queues):nullptr;
+  if(!order) {
+    const auto count=++counters.original;
+    if(count<=4 || count%1000==0)
+      REXLOG_INFO("Native static world pass: original traversal owner={:#x} count={} (no publication, group order, camera or native queues)",owner,count);
+    auto work=ctx; work.r3.u64=reader.Add(owner,240); work.lr=0x820B434C; sub_821C3BB8(work,base);
+    return;
+  }
+  HookTiming timing(HookPhase::RenderQueued);
+  auto frame=ctx;
+  if(frame.r1.u32<112) throw std::runtime_error("invalid native static world pass stack");
+  frame.r1.u64=frame.r1.u32-112;
+  reader.StoreWord(frame.r1.u32,ctx.r1.u32);
+  const auto device=reader.Word(reader.Add(reader.Word(0x8257BFB4),8));
+  auto& state=State();
+  // Pass state and view come from the device once per pass and again after
+  // each guest group; native groups chain it and never read bound state.
+  NativeScenePassCursorState cursor;
+  const auto load_pass=[&] {
+    NativeSceneMaterialPassState pass;
+    pass.render=ReadNativeMaterialRenderPass(reader,device);
+    for(uint32_t slot=0;slot<16;++slot) pass.samplers[slot]=ReadNativeMaterialSamplerPass(reader,device,slot);
+    std::lock_guard lock(state.mutex);
+    cursor=NativeScenePassCursorState{device,pass.Inputs(),ReadNativeDrawViewportWords(reader,device),ActiveTargetsLocked(state)};
+  };
+  load_pass();
+  struct Owed { uint32_t material; std::shared_ptr<const NativeSceneMaterialProgram> program; };
+  struct World { uint32_t vertex; VertexParameterRange parameter; std::array<uint8_t,64> bytes; };
+  std::vector<Owed> owed;
+  std::optional<World> world;
+  NativeMaterialRenderPass owed_start;
+  const auto handoff=[&] {
+    if(owed.empty()) return;
+    std::vector<NativeStaticWorldHandoffGroup> groups;
+    groups.reserve(owed.size());
+    for(const auto& group:owed) {
+      uint32_t slots=0;
+      for(const auto& operation:group.program->sampler_operations) slots|=1u<<operation.slot;
+      groups.push_back({group.program->inputs.state_overrides,slots});
+    }
+    auto work=frame;
+    const auto writes=HandOffNativeStaticWorld(reader,device,owed_start,cursor.material.samplers,groups,[&](size_t index) {
+      // 821B94E8 through the activation hook: CPU program, host shader
+      // bindings and setter publications, exactly as the guest group would.
+      work.r3.u64=owed[index].material; work.lr=0x821D979C; sub_821B94E8(work,base);
+      ++counters.replays;
+    });
+    if(writes.render!=cursor.material.render) throw std::runtime_error("native static world handoff diverged from the pass cursor");
+    for(const auto offset:writes.operations) {
+      const auto setter=NativeMaterialStateSetter(offset);
+      if(offset==0x44) {
+        std::lock_guard lock(state.mutex);
+        state.render_state_snapshots.PublishBlend(device,ReadGuestWords<4>(reader,reader.Add(device,10336)),setter);
+      } else if(offset!=0x64) PublishNativeRenderState(base,device,setter);
+    }
+    {
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      if(world) {
+        // The last group's final instance owns g_mWorld after its activation defaults.
+        auto& shader=state.shaders.at(world->vertex);
+        RestoreNativeSceneWorld(reader,device,world->parameter.first,world->bytes,[&](const auto& restored) {
+          shader.bindings->PatchGuestFloatRegisters(world->parameter.normal,0,restored);
+          if(!shader.reversed_mirrors) shader.reversed_bindings->PatchGuestFloatRegisters(world->parameter.reversed,0,restored);
+        });
+      }
+      state.recorded={}; ++state.bind_generation;
+    }
+    if(REXCVAR_GET(edf_native_material_state_audit) || REXCVAR_GET(edf_native_material_sampler_audit)) {
+      NativeSceneMaterialPassState actual;
+      actual.render=ReadNativeMaterialRenderPass(reader,device);
+      for(uint32_t slot=0;slot<16;++slot) actual.samplers[slot]=ReadNativeMaterialSamplerPass(reader,device,slot);
+      actual=actual.Inputs();
+      if(actual!=cursor.material) {
+        REXLOG_ERROR("Native static world handoff mismatch: owner={:#x} render_equal={} samplers_equal={}",
+          owner,actual.render==cursor.material.render,actual.samplers==cursor.material.samplers);
+        throw std::runtime_error("native static world handoff differs from the pass cursor");
+      }
+    }
+    owed.clear(); world.reset(); ++counters.handoffs;
+  };
+  const auto report=[](const std::string& reason) {
+    static std::set<std::string> reported;
+    if(reported.size()<32 && reported.insert(reason).second) REXLOG_INFO("Native static world group declined: {}",reason);
+  };
+  const auto native=[&](uint32_t group) -> std::optional<NativeStaticWorldFallback> {
+    using F=NativeStaticWorldFallback;
+    // 821D96D8 drains a non-empty guest queue; an empty one draws nothing.
+    if(reader.Word(reader.Add(group,4))!=reader.Word(reader.Add(group,8))) return F::GuestQueue;
+    if(!queues->Contains(group)) { ++counters.empty_groups; LogNativeStaticWorldGroup(group,0); return {}; }
+    std::shared_ptr<const NativeSceneGroupMaterial> material;
+    std::optional<NativeSceneGeometrySource> setup;
+    {
+      std::lock_guard lock(state.mutex);
+      for(const auto& published:publication->group_materials) if(published->group==group) { material=published; break; }
+      if(const auto* source=NativeSceneSourcesForPass(state).FindGroup(group)) {
+        const auto latest=state.scene_adapter.GroupGeometry(group,source->revision);
+        for(const auto& published:publication->group_geometry)
+          if(published==latest && published->group==group && published->setup &&
+             published->geometry->backend()==state.scene_backend.get()) { setup=published->setup; break; }
+      }
+    }
+    if(!material || !material->program || !setup) return F::Program;
+    const auto& program=*material->program;
+    if(!program.CanDeferCpuActivation()) return F::Scissor;
+    if(AssessNativeStaticGroup(reader,device,frame.r1.u32,*setup)!=NativeStaticGroupEligibility::Supported) return F::Eligibility;
+    NativeSceneMaterialPassState next;
+    auto constants=material->constants;
+    try {
+      next=cursor.material.After(program);
+      DecodeNativeRenderState(next.render.words);
+      for(auto& constant:constants) {
+        if(native_scene_pass_camera->Apply(constant) || !constant.global ||
+           (constant.name!="m_WaterTime" && constant.name!="g_SignalBrightness")) continue;
+        if(!native_scene_pass_animation) throw std::runtime_error("missing native animation pass");
+        native_scene_pass_animation->Apply(constant);
+      }
+    } catch(const std::exception& error) { report(error.what()); return F::PassState; }
+    // Resolve every instance before recording: a decline returns the whole
+    // group, with its selections restored, to the guest callback.
+    const auto instances=queues->Take(group);
+    uint64_t batches=0;
+    {
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      std::vector<NativeStaticInstanceResolution> resolved;
+      resolved.reserve(instances.size());
+      const NativeStaticPassInputs pass{device,constants,cursor.material.render,cursor.material.samplers,
+        NativeStaticPassView{*cursor.viewport,cursor.targets}};
+      try {
+        for(const auto instance:instances) {
+          auto result=ResolveNativePublishedStaticInstanceLocked(state,reader,*publication,
+            {group,setup->count,material,setup},instance,pass);
+          if(!result) {
+            if(const auto* reason=NativeStaticWorldDeclineReason(result.decline)) report(reason);
+            break;
+          }
+          resolved.push_back(std::move(result));
+        }
+      } catch(const std::exception& error) { report(error.what()); resolved.clear(); }
+      if(resolved.size()!=instances.size()) {
+        for(auto at=instances.rbegin();at!=instances.rend();++at) queues->Push(group,*at);
+        return F::Instance;
+      }
+      NativeQueuedSceneGroup batch;
+      batch.targets=cursor.targets;
+      const auto draws=state.scene_native_draws;
+      for(auto& result:resolved) {
+        if(!batch.objects.empty() && (batch.view.view!=result.view.view || batch.view.projection!=result.view.projection ||
+           batch.view.view_projection!=result.view.view_projection)) FlushNativeQueuedSceneLocked(state,batch);
+        batch.view=result.view; batch.objects.push_back(std::move(result.object));
+      }
+      FlushNativeQueuedSceneLocked(state,batch);
+      ++state.bind_generation;
+      batches=batch.execution.recordings();
+      counters.draws+=state.scene_native_draws-draws;
+      // Keep the guest path's lookup hint current with what this frame drew.
+      state.scene_adapter.RememberGroupMaterial(group,resolved.back().material);
+      world=World{resolved.back().vertex,*resolved.back().world_parameter,resolved.back().world};
+    }
+    if(owed.empty()) owed_start=cursor.material.render;
+    owed.push_back({setup->material,material->program});
+    cursor.material=std::move(next);
+    ++counters.native_groups; counters.instances+=instances.size(); counters.batches+=batches;
+    LogNativeStaticWorldGroup(group,batches);
+    return {};
+  };
+  const auto fallback=[&](uint32_t group,NativeStaticWorldFallback reason) {
+    const auto count=++counters.fallbacks[size_t(reason)];
+    if(count<=4 || !(count&(count-1)))
+      REXLOG_INFO("Native static world fallback: group={:#x} reason={} count={}",group,kNativeStaticWorldFallbackNames[size_t(reason)],count);
+    NativeMaterialPassCursor guest;
+    struct RestoreMaterialPass {
+      NativeMaterialPassCursor* previous=native_material_pass_cursor;
+      ~RestoreMaterialPass() { native_material_pass_cursor=previous; }
+    } restore;
+    native_material_pass_cursor=REXCVAR_GET(edf_native_scene_pass_owned)?&guest:nullptr;
+    auto work=frame; work.r3.u64=group; work.lr=0x821C3C04; sub_821D96D8(work,base);
+    load_pass();
+  };
+  WalkNativeStaticWorld(*order,native,fallback,handoff);
+  const auto passes=++counters.passes;
+  if(passes<=4 || passes%1000==0) {
+    uint64_t fallbacks=0;
+    for(const auto count:counters.fallbacks) fallbacks+=count;
+    const auto& f=counters.fallbacks;
+    REXLOG_INFO("Native static world pass: passes={} native_groups={} empty_groups={} instances={} draws={} batches={} fallback_groups={} "
+      "guest_queue={} program={} scissor={} eligibility={} pass_state={} instance={} handoffs={} replays={} original={}",
+      passes,counters.native_groups,counters.empty_groups,counters.instances,counters.draws,counters.batches,fallbacks,
+      f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.original);
+  }
+}
 }
