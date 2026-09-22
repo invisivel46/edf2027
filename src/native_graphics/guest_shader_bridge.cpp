@@ -885,7 +885,7 @@ struct Bridge {
   uint64_t scene_material_loaded=0,scene_material_reused=0,scene_material_deferred=0;
   uint64_t scene_material_constructed=0,scene_material_rejected=0;
   uint64_t scene_material_binding_bypasses=0;
-  uint64_t scene_geometry_draw_bypasses=0;
+  uint64_t scene_geometry_draw_bypasses=0,scene_geometry_draw_verified=0;
   std::set<std::string> scene_material_reasons;
   uint64_t scene_visibility_candidates=0,scene_visibility_retained=0,scene_visibility_selected=0;
   uint64_t scene_visibility_checks=0,scene_visibility_mismatches=0;
@@ -1890,6 +1890,9 @@ void FlushNativeQueuedSceneLocked(Bridge& state,NativeQueuedSceneGroup& group) {
   });
   state.scene_native_objects+=statistics.visible; state.scene_native_draws+=statistics.draws;
   group.objects.clear();
+  // The batch bound its own targets and pipelines, like a resolve: neither the
+  // recorder cache nor the indexed skip may compare against what came before.
+  ++state.bind_generation;
   state.recorded={};
 }
 // Everything a recorded draw needs before its geometry.
@@ -2602,6 +2605,7 @@ void SubmitSceneFrameLocked(Bridge& state) {
   // Nothing survives a frame boundary: the recorder's own tracked state is
   // reset when the next frame opens, so what this believed was still bound is
   // no longer true.
+  ++state.bind_generation;
   state.recorded={};
   try {
     state.scene_backend->Submit();
@@ -5224,9 +5228,26 @@ NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge
   const auto versions=BufferWrites().TryValidateObservedSet(std::array<Identity,2>{{
     {source_geometry.vertex,*vb->physical,vb->bytes,&vb->vertex_contents},
     {source_geometry.index,*ib->physical,ib->bytes,&index_contents}}},policy);
-  if(!versions) return decline(D::VersionsUnavailable);
-  for(size_t i=0;i<2;++i) if((*versions)[i].lifetime!=cached->second.versions[i].lifetime ||
-    (*versions)[i].revision!=cached->second.versions[i].revision) return decline(D::VersionChanged);
+  if(versions) {
+    for(size_t i=0;i<2;++i) if((*versions)[i].lifetime!=cached->second.versions[i].lifetime ||
+      (*versions)[i].revision!=cached->second.versions[i].revision) return decline(D::VersionChanged);
+  } else {
+    // A due sampled comparison runs here, bounded to this group's VB and IB,
+    // rather than turning the group back to the guest path until the next
+    // preload tick. It consumes the due observation, so the preload then finds
+    // the group unchanged; anything but an exact match leaves the re-load to it.
+    using C=NativeStaticComparison;
+    using Source=NativeBufferWrites::SnapshotSource;
+    const auto compared=CompareNativeStaticGeometry(BufferWrites(),std::array<Source,2>{{
+      {source_geometry.vertex,*vb->physical,{reader.Bytes(vb->address,vb->bytes),vb->bytes},vb->vertex_contents},
+      {source_geometry.index,*ib->physical,{reader.Bytes(ib->address,ib->bytes),ib->bytes},index_contents}}},
+      cached->second.versions,policy);
+    if(compared==C::UnreportedChange)
+      REXLOG_WARN("Native published geometry draw detected an unreported geometry write: group={:#x}; the preload re-loads it",group.address);
+    if(compared==C::Unavailable) return decline(D::VersionsUnavailable);
+    if(compared!=C::Confirmed) return decline(D::ComparisonChanged);
+    ++state.scene_geometry_draw_verified;
+  }
   const auto& program=*group.material->program;
   if(draw && draw->program && !draw->program(program.inputs.vertex,program.inputs.pixel)) return decline(D::ProgramBinding);
   if(pass.view) {
@@ -5339,7 +5360,8 @@ bool TryAppendPublishedNativeSceneInstance(uint8_t* base,uint32_t device,uint32_
     group.instance=instance;
     group.constants_clean=group.geometry_handoff.pending().has_value();
     if(++state.scene_geometry_draw_bypasses<=4 || state.scene_geometry_draw_bypasses%10000==0)
-      REXLOG_INFO("Native scene published geometry draws: bypassed={} (no instance callback, indexed mesh acquisition or live binding setup)",state.scene_geometry_draw_bypasses);
+      REXLOG_INFO("Native scene published geometry draws: bypassed={} draw_verified={} (no instance callback, indexed mesh acquisition or live binding setup)",
+        state.scene_geometry_draw_bypasses,state.scene_geometry_draw_verified);
     return true;
   } catch(const std::exception& error) {
     if(state.scene_native_reasons.size()<32 && state.scene_native_reasons.insert(error.what()).second)

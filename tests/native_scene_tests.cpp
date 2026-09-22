@@ -291,7 +291,8 @@ void StaticWorldResolve() {
     {D::GeometryPublication,"retained geometry publication"},{D::GeometryCount,"geometry count"},
     {D::DeferredGeometry,"deferred geometry identity"},{D::GeometryBinding,"geometry binding identity"},
     {D::BufferGeneration,"model buffer generation"},{D::VersionsUnavailable,"observed resource versions unavailable"},
-    {D::VersionChanged,"observed resource revision changed"},{D::Lifetime,"instance lifetime not in scene publication"}};
+    {D::VersionChanged,"observed resource revision changed"},{D::Lifetime,"instance lifetime not in scene publication"},
+    {D::ComparisonChanged,"due geometry comparison found a change"}};
   for(const auto& [decline,reason]:reasons) {
     const auto* actual=NativeStaticWorldDeclineReason(decline);
     Require(actual && std::string(actual)==reason,"static world decline reason changed");
@@ -335,10 +336,65 @@ void StaticWorldResolve() {
       view.scissor_enabled==scissor,"static instance scissor");
   }
 }
+// A published draw whose sampled comparison falls due runs it rather than
+// declining, and keeps the retained geometry only on an exact match.
+void StaticGeometryComparison() {
+  using C=NativeStaticComparison;
+  using Source=NativeBufferWrites::SnapshotSource;
+  using View=NativeBufferWrites::SnapshotIdentityView;
+  NativeBufferWrites::SnapshotPolicy policy{};
+  policy.verify_initial=1; policy.verify_interval=4;
+  std::vector<uint8_t> vertex_bytes(64,1),index_bytes(32,2);
+  const auto vertex=std::make_shared<const std::vector<uint8_t>>(vertex_bytes);
+  const auto index=std::make_shared<const std::vector<uint8_t>>(index_bytes);
+  const std::array<Source,2> sources{{{1,0x1000,vertex_bytes,vertex},{2,0x2000,index_bytes,index}}};
+  const std::array<View,2> views{{{1,0x1000,64,&vertex},{2,0x2000,32,&index}}};
+  const auto load=[&](NativeBufferWrites& writes) {
+    writes.Subscribe(1,0x1000,64); writes.Subscribe(2,0x2000,32);
+    const auto first=writes.CopyObservedSet(sources,nullptr,policy);
+    Require(first && (*first)[0].contents==vertex && (*first)[1].contents==index,"comparison test load copied");
+    size_t accepted=0;
+    while(writes.TryValidateObservedSet(views,policy)) ++accepted;
+    Require(accepted==3,"comparison test did not reach a due comparison");
+    return std::array<NativeBufferWrites::ObservedVersion,2>{(*first)[0].version,(*first)[1].version};
+  };
+  {
+    NativeBufferWrites writes;
+    const auto loaded=load(writes);
+    // Audit and compare-every-observation policies stay with the preload.
+    NativeBufferWrites::SnapshotPolicy audit=policy; audit.audit_revisions=true;
+    Require(CompareNativeStaticGeometry(writes,sources,loaded,audit)==C::Unavailable &&
+      CompareNativeStaticGeometry(writes,sources,loaded,NativeBufferWrites::SnapshotPolicy{})==C::Unavailable,
+      "draw comparison ran under an audit policy");
+    {
+      NativeBufferWrites::WriterScope active(&writes,NativeBufferWrites::Range{0x2004,4});
+      Require(CompareNativeStaticGeometry(writes,sources,loaded,policy)==C::Unavailable,"draw comparison ignored an overlapping writer");
+    }
+    Require(!writes.TryValidateObservedSet(views,policy),"refused comparison consumed the due observation");
+    const auto verified=writes.Trust().verified;
+    Require(CompareNativeStaticGeometry(writes,sources,loaded,policy)==C::Confirmed &&
+      writes.Trust().verified==verified+2,"due draw comparison did not confirm unchanged geometry");
+    // The due observation is consumed: later draws and the preload trust it again.
+    Require(writes.TryValidateObservedSet(views,policy) && writes.Unchanged(views,loaded,policy),
+      "confirmed draw comparison left the observation due");
+    writes.Record(0x2010,4);
+    Require(CompareNativeStaticGeometry(writes,sources,loaded,policy)==C::Changed,"tracked write kept the published geometry");
+    Require(!writes.Trust().revoked,"tracked write revoked trust");
+  }
+  {
+    NativeBufferWrites writes;
+    const auto loaded=load(writes);
+    vertex_bytes[7]=9; // An untracked store the revision never saw.
+    Require(CompareNativeStaticGeometry(writes,sources,loaded,policy)==C::UnreportedChange && writes.Trust().revoked,
+      "stale published geometry survived a due comparison");
+    Require(CompareNativeStaticGeometry(writes,sources,loaded,policy)!=C::Confirmed,"revoked trust confirmed stale geometry");
+  }
+}
 void PassCamera() {
   GeometryPublicationRetry();
   StaticGroupEligibility();
   StaticWorldResolve();
+  StaticGeometryComparison();
   {
     NativeSceneExecution run;
     Require(!run.complete() && !run.Total() && !run.recordings(),"new group inherited execution evidence");
