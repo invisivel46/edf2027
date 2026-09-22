@@ -2241,6 +2241,26 @@ void EndRenderTarget(uint32_t owner) {
     REXLOG_INFO("Native render target: begins={}, valid_resolves={}, unwritten={}",
                 state.target_begins,state.target_resolves,state.target_unwritten);
 }
+// The live value of each global g_mWorld of published's constants, as 821B94E8
+// would upload it now. The preload keeps the published copy stable
+// (NativeSceneObjectWorldConstant); the guest path's pass constants, which its
+// published activation binds to the live shader bindings, take it from here.
+// Throws when the group's load no longer matches the publication's program.
+void ReadNativeSceneLiveWorldLocked(Bridge& state,const GuestReader& reader,const NativeSceneGroupMaterial& published,
+    std::vector<NativeSceneMaterialInputs::Constant>& constants) {
+  const auto found=state.scene_material_loads.find(published.group);
+  if(found==state.scene_material_loads.end() || !found->second.published || !found->second.schema ||
+     found->second.published->program!=published.program || found->second.constants.size()!=constants.size())
+    throw std::runtime_error("native scene material load does not match its publication");
+  const auto& load=found->second;
+  for(size_t i=0;i<constants.size();++i) {
+    const auto& slot=load.constants[i];
+    if(!slot.object_world) continue;
+    if(!constants[i].global || constants[i].name!="g_mWorld") throw std::runtime_error("native scene material world slot moved");
+    const auto* data=ReadNativeSceneMaterialConstant(reader,*load.schema,slot);
+    constants[i].registers.assign(data,data+slot.bytes);
+  }
+}
 bool ObservePublishedActivation(uint32_t instance) {
   auto* group=native_queued_scene_group;
   if(!group || group->activation_instance!=instance || !group->published_material || !group->material_pass)
@@ -4423,6 +4443,12 @@ REX_HOOK_RAW(sub_821D96D8) {
           try {
           if(!edf::native::native_scene_pass_camera) throw std::runtime_error("native material pass has no camera");
           group.pass_constants=group.published_material->constants;
+          {
+            // The published g_mWorld is not refreshed; the activation binds the live one.
+            auto& state=edf::native::State();
+            std::lock_guard lock(state.mutex);
+            edf::native::ReadNativeSceneLiveWorldLocked(state,reader,*group.published_material,group.pass_constants);
+          }
           for(auto& constant:group.pass_constants) {
             if(edf::native::native_scene_pass_camera->Apply(constant)) continue;
             if(!constant.global || (constant.name!="m_WaterTime" && constant.name!="g_SignalBrightness")) continue;
@@ -4866,6 +4892,14 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
             if(reported.size()<16 && reported.insert(*changed).second)
               REXLOG_INFO("Native scene material program bytes changed without a program change: group={:#x} material={:#x} address={:#x}",
                 address,material,*changed);
+          }
+        // Same program: keep the published object world (never observed, see
+        // NativeSceneObjectWorldConstant) so equal other constants republish nothing.
+        if(previous->constants.size()==build.constants.size() && build.layout.size()==build.constants.size())
+          for(size_t i=0;i<build.constants.size();++i) {
+            auto& fresh=build.constants[i]; const auto& old=previous->constants[i];
+            if(build.layout[i].object_world && old.name==fresh.name && old.pixel==fresh.pixel && old.global==fresh.global &&
+               old.registers.size()==fresh.registers.size() && !NativeSceneWorldHasNaN(old.registers)) fresh.registers=old.registers;
           }
         state.scene_adapter.PublishGroupMaterial(address,group.revision,previous->program,std::move(build.constants));
         ++state.scene_material_reused;

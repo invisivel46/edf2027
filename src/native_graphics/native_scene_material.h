@@ -4,7 +4,9 @@
 #include "native_material_sampler.h"
 #include "native_material_render_state.h"
 #include <algorithm>
+#include <bit>
 #include <optional>
+#include <span>
 #include <string_view>
 
 namespace edf::native {
@@ -63,11 +65,35 @@ inline bool NativeScenePassOwnedConstant(bool global,std::string_view name) {
   return global && (name=="g_mProjection" || name=="g_mView" || name=="g_mViewTranspose" ||
     name=="g_mViewProjection" || name=="m_WaterTime" || name=="g_SignalBrightness");
 }
+// The global g_mWorld: whatever object the guest drew last (821A17D8 and the
+// instance loops store it), so its value moves every tick. Every consumer of a
+// published static group material replaces it before it is observable:
+// - the world pass and TryAppendPublishedNativeSceneInstance resolve only
+//   groups whose capture binds exactly one vertex world matrix
+//   (ConfigureNativeQueuedWorldLocked, else WorldParameter), which
+//   CaptureNativeSceneMaterial zeroes from the image, and apply each
+//   instance's own published world;
+// - the guest path's published activation (ObservePublishedActivation) binds
+//   constants to the live shader bindings, so it re-reads this value live
+//   (ReadNativeSceneLiveWorldLocked) as 821B94E8 would upload it;
+// - the model pass keeps its own loads and supplies each record's world.
+// Its only value dependence is the capture's self-comparison, which throws on
+// a NaN: a published NaN is refreshed like any other constant.
+inline bool NativeSceneObjectWorldConstant(bool global,std::string_view name) { return global && name=="g_mWorld"; }
+// Whether the first 64 bytes (16 big-endian floats, as the capture reads a
+// 4x4 back) of a world constant hold a NaN.
+inline bool NativeSceneWorldHasNaN(std::span<const uint8_t> registers) {
+  for(size_t i=0;i+4<=64 && i+4<=registers.size();i+=4) {
+    const auto value=std::bit_cast<float>(uint32_t(registers[i])<<24|uint32_t(registers[i+1])<<16|uint32_t(registers[i+2])<<8|registers[i+3]);
+    if(value!=value) return true;
+  }
+  return false;
+}
 // Which schema parameters a program uploads, and their extents. A function of
 // the schema and native reflection only: it stays valid while both do.
 struct NativeSceneMaterialConstantSlot {
   uint32_t group=0,parameter=0,bytes=0;
-  bool pass_owned=false;
+  bool pass_owned=false,object_world=false;
   bool operator==(const NativeSceneMaterialConstantSlot&) const=default;
 };
 using NativeSceneMaterialConstantLayout=std::vector<NativeSceneMaterialConstantSlot>;
@@ -86,7 +112,8 @@ NativeSceneMaterialConstantLayout ResolveNativeSceneMaterialConstants(
     // Locals follow the ordinary bridge's exact descriptor-sized upload.
     if(bytes%16 || bytes>UINT32_MAX || (!global && bytes!=size_t(parameter.registers)*16))
       throw std::runtime_error("native scene material parameter extent mismatch: "+parameter.name);
-    layout.push_back({group,index,uint32_t(bytes),NativeScenePassOwnedConstant(global,parameter.name)});
+    layout.push_back({group,index,uint32_t(bytes),NativeScenePassOwnedConstant(global,parameter.name),
+      NativeSceneObjectWorldConstant(global,parameter.name)});
   }
   return layout;
 }
@@ -113,8 +140,9 @@ std::vector<NativeSceneMaterialInputs::Constant> ReadNativeSceneMaterialConstant
   return result;
 }
 // Per-tick refresh of an unchanged program: reads only the constant values and
-// allocates only when one differs. Pass-owned slots are not read. Returns the
-// replacement constants, or nothing when `published` is still current.
+// allocates only when one differs. Pass-owned slots are not read, nor is the
+// object world unless its published value is a NaN (NativeSceneObjectWorldConstant).
+// Returns the replacement constants, or nothing when `published` is still current.
 template<class Reader>
 std::optional<std::vector<NativeSceneMaterialInputs::Constant>> RefreshNativeSceneMaterialConstants(const Reader& reader,
     const NativeMaterialParameters::Groups& schema,const NativeSceneMaterialConstantLayout& layout,
@@ -123,6 +151,8 @@ std::optional<std::vector<NativeSceneMaterialInputs::Constant>> RefreshNativeSce
   std::optional<std::vector<NativeSceneMaterialInputs::Constant>> result;
   for(size_t i=0;i<layout.size();++i) {
     if(layout[i].pass_owned) continue;
+    if(layout[i].object_world && published[i].registers.size()==layout[i].bytes &&
+       !NativeSceneWorldHasNaN(published[i].registers)) continue;
     const auto* data=ReadNativeSceneMaterialConstant(reader,schema,layout[i]);
     const auto& old=published[i].registers;
     if(old.size()==layout[i].bytes && std::equal(old.begin(),old.end(),data)) continue;

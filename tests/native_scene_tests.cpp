@@ -1967,6 +1967,36 @@ void PreloadChangeSignals() {
   Require(load_program(reprogram).state_overrides[0][1]==8 && reprogram.Unchanged(reader),"changed material program was not re-read");
   reader.StoreWord(30604,7);
   Require(program.Unchanged(reader),"restored material program was not recognized");
+  {
+    // The global g_mWorld holds the last drawn object's world and moves every
+    // tick; every consumer replaces it before it is observable, so it never
+    // republishes the group, unless its published value is a NaN.
+    auto world_schema=schema;
+    world_schema[1].push_back({"g_mWorld",32000,4,12});
+    reader.StoreWord(32000,32100); reader.StoreWord(32100,32200); reader.StoreWord(32108,4);
+    reader.StoreWord(32200,0x3f800000);
+    const auto world_required=[](bool,const std::string& name) { return name=="g_mView" || name=="g_mWorld"?size_t(64):size_t(16); };
+    const auto world_layout=ResolveNativeSceneMaterialConstants(world_schema,world_required);
+    Require(world_layout.size()==4 && world_layout[3].object_world && !world_layout[3].pass_owned &&
+      !world_layout[0].object_world && !world_layout[1].object_world && !world_layout[2].object_world,
+      "object world slot was not identified");
+    const auto published=ReadNativeSceneMaterialConstants(reader,world_schema,world_layout);
+    reader.StoreWord(32200,0x40000000); reader.StoreWord(32220,0x3f000000);
+    CountingReader world_reads{reader};
+    Require(!RefreshNativeSceneMaterialConstants(world_reads,world_schema,world_layout,published) && world_reads.reads==5,
+      "moved object world was read or republished the group");
+    const auto previous=GuestBlockWord(reader.Bytes(31300,4));
+    reader.StoreWord(31300,0x40a00000);
+    const auto other=RefreshNativeSceneMaterialConstants(reader,world_schema,world_layout,published);
+    Require(other && (*other)[3]==published[3] && GuestBlockWord((*other)[1].registers.data())==0x40a00000,
+      "another constant's refresh carried the moved object world");
+    reader.StoreWord(31300,previous);
+    auto invalid=published; Word(invalid[3].registers,4,0x7fc00000);
+    const auto repaired=RefreshNativeSceneMaterialConstants(reader,world_schema,world_layout,invalid);
+    Require(repaired && GuestBlockWord((*repaired)[3].registers.data())==0x40000000 &&
+      !NativeSceneWorldHasNaN((*repaired)[3].registers) && NativeSceneWorldHasNaN(invalid[3].registers),
+      "NaN published object world was not refreshed");
+  }
 
   // Membership: identical observations keep the prune revision; erasing a group advances it.
   NativeSceneSources sources;

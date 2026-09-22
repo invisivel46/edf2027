@@ -147,16 +147,8 @@ uint32_t NativeStaticWorldKeyDifferences(const NativeStaticWorldGroupKey<View>& 
   differ(!(a.view==b.view),M::View); differ(a.filtering!=b.filtering,M::Filtering); differ(a.shaders!=b.shaders,M::Shaders);
   return mask;
 }
-// The first 64 bytes of a g_mWorld constant as the capture reads them back:
-// whether any of its 16 big-endian floats is NaN (CaptureNativeSceneMaterial's
-// `*value!=result.world` would then throw).
-inline bool NativeStaticWorldHasNaN(std::span<const uint8_t> registers) {
-  for(size_t i=0;i+4<=64 && i+4<=registers.size();i+=4) {
-    const auto value=std::bit_cast<float>(uint32_t(registers[i])<<24|uint32_t(registers[i+1])<<16|uint32_t(registers[i+2])<<8|registers[i+3]);
-    if(value!=value) return true;
-  }
-  return false;
-}
+// A NaN world makes CaptureNativeSceneMaterial's `*value!=result.world` throw.
+inline bool NativeStaticWorldHasNaN(std::span<const uint8_t> registers) { return NativeSceneWorldHasNaN(registers); }
 // Diagnostic observations of a stored resolve; never compared for reuse.
 struct NativeStaticWorldObserved {
   uint32_t stack=0;
