@@ -145,6 +145,9 @@ class NativeSceneAdapter {
   NativeSceneSnapshot Select(std::span<const uint64_t> ids) { return scene_.Select(ids); }
   std::shared_ptr<const NativeSceneInstance> SelectOne(uint64_t id) { return scene_.SelectOne(id); }
   size_t objects() const { return objects_.size(); }
+  // Returns the retained material equivalent to this one, registering it if
+  // there is none, so that equal materials share one object.
+  std::shared_ptr<const NativeSceneMaterial> InternMaterial(std::shared_ptr<const NativeSceneMaterial> material);
  private:
   using Key=std::array<uint64_t,4>;
   using GeometryKey=std::array<uint64_t,6>;
@@ -182,8 +185,5 @@ class NativeSceneAdapter {
   uint64_t observations_=0;
   size_t retired_=0,retire_checks_=0;
   void Prune();
-  // Returns the retained material equivalent to this one, registering it if
-  // there is none, so that equal materials share one object.
-  std::shared_ptr<const NativeSceneMaterial> InternMaterial(std::shared_ptr<const NativeSceneMaterial> material);
 };
 }

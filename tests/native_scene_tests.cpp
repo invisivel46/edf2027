@@ -1839,6 +1839,54 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
     "adapter did not intern independently captured equivalent materials");
   stats=render(selected);
   Require(stats.instanced_draws==1 && pixel(16,0)==255 && pixel(48,0)==255,"adapter did not render selected native objects");
+  {
+    // A native static world group: its instances share retained geometry, the
+    // material program and the pass inputs, and differ only in g_mWorld. A
+    // Resolve per instance gives every object its own material and so its own
+    // draw; one interned Resolve per group shares it and records one instanced draw.
+    constexpr size_t kGroupInstances=8;
+    NativeSceneAdapter group_adapter;
+    std::vector<NativeSceneSources::Source> group_sources;
+    std::vector<std::array<uint8_t,64>> group_worlds;
+    std::vector<uint64_t> group_ids;
+    for(size_t i=0;i<kGroupInstances;++i) {
+      NativeSceneSources::Source source; source.generation=1; source.owner=uint32_t(700+i);
+      auto world=kNativeSceneIdentity; world[12]=-.875f+.25f*float(i);
+      std::array<uint8_t,64> registers{};
+      for(size_t row=0;row<4;++row) for(size_t col=0;col<4;++col) {
+        const auto bits=std::bit_cast<uint32_t>(world[row*4+col]);
+        const auto offset=(column_major?col*4+row:row*4+col)*4;
+        for(size_t b=0;b<4;++b) registers[offset+b]=uint8_t(bits>>(24-b*8));
+      }
+      auto capture=resolved.capture; capture.world=world;
+      group_ids.push_back(group_adapter.Observe(source,geometry,capture));
+      group_sources.push_back(source); group_worlds.push_back(registers);
+    }
+    const auto group_publication=group_adapter.Publish(1);
+    const auto resolve=[&] { return material_program->Resolve(material_desc,false,program_constants,pass_state,pass_samplers); };
+    const auto instance=[&](size_t i,NativeSceneMaterialCapture capture) {
+      ApplyNativeScenePublishedWorld(capture,std::span<const uint8_t,64>(group_worlds[i]));
+      auto object=group_publication->Resolve(group_sources[i],geometry,capture);
+      Require(object && object->object.world[12]==-.875f+.25f*float(i),"static group instance lost its lifetime or world");
+      return object;
+    };
+    std::vector<std::shared_ptr<const NativeSceneInstance>> separate,grouped;
+    for(size_t i=0;i<kGroupInstances;++i) separate.push_back(instance(i,resolve().capture));
+    Require(separate[0]->object.material!=separate[1]->object.material,"per-instance resolves unexpectedly shared a material");
+    stats=render(NativeSceneSnapshot{0,separate});
+    Require(stats.visible==kGroupInstances && stats.draws==kGroupInstances && !stats.instanced_draws,
+      "per-instance materials were instanced");
+    auto shared=resolve().capture;
+    shared.material=group_adapter.InternMaterial(std::move(shared.material));
+    for(size_t i=0;i<kGroupInstances;++i) {
+      grouped.push_back(instance(i,shared));
+      Require(grouped[i]->object.material==shared.material && grouped[i]==group_publication->Find(group_ids[i]),
+        "static group instances did not share the interned group material or rebuilt a retained instance");
+    }
+    stats=render(NativeSceneSnapshot{0,grouped});
+    Require(stats.visible==kGroupInstances && stats.draws==1 && stats.instanced_draws==1 &&
+      pixel(4,0)==255 && pixel(60,0)==255 && pixel(4,2)==0,"static group instances were not one instanced draw");
+  }
   const auto publication=adapter.Publish(1);
   Require(adapter.AcquirePublication()==publication && publication->Find(adapter_left) &&
     !publication->Find(UINT64_MAX),"native publication lookup failed");
