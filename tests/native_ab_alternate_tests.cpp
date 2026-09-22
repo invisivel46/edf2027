@@ -72,7 +72,10 @@ int main() {
     for (auto flag : full_only) expected_full |= NativeRendererFlagBit(flag);
     check(world == expected_world && full == expected_full);
     for (auto flag : full_only) check(!(world & NativeRendererFlagBit(flag)));
-    check(edf::native::kNativeRendererFlagNames.back() == "post_finish" && edf::native::kNativeRendererFlagNames[17] == "static_world_pass");
+    check(edf::native::kNativeRendererFlagNames.back() == "full_frame" && edf::native::kNativeRendererFlagNames[17] == "static_world_pass");
+    check(ParseNativeRendererPreset("native") == NativeRendererPreset::native);
+    check(NativeRendererPresetMask(NativeRendererPreset::native) == (full | NativeRendererFlagBit(NativeRendererFlag::full_frame)));
+    check(!(full & NativeRendererFlagBit(NativeRendererFlag::full_frame)));
     // Individual cvars only add: the effective value is individual OR preset.
     edf::native::native_renderer_preset_mask = 0;
     check(!edf::native::NativeFlag(NativeRendererFlag::model_pass, false) && edf::native::NativeFlag(NativeRendererFlag::model_pass, true));

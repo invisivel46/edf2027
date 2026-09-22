@@ -70,7 +70,12 @@ PHASES = ('engine.render_helper', 'render.queued', 'render.material_group', 'ren
           # miss, and the handoff binds and replays inside handoff.
           'render.queued.eligibility', 'render.queued.resolve', 'render.queued.instances',
           'render.queued.record', 'render.queued.handoff', 'render.queued.handoff_binds',
-          'render.queued.handoff_replays')
+          'render.queued.handoff_replays',
+          # The full-frame renderer (edf_native_full_frame): the whole native
+          # frame, its per-view scene begin, each pass in order, and its end.
+          'frame.native', 'frame.native.begin', 'frame.native.static_world', 'frame.native.models',
+          'frame.native.sky', 'frame.native.effects', 'frame.native.transparent', 'frame.native.post',
+          'frame.native.end')
 # The first scene draw after the loading screen. Loading takes anywhere from
 # seconds to minutes, so windows are measured from here, not from launch.
 ENTRY = 'Native indexed input: draw=1,'

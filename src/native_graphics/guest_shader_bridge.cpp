@@ -48,6 +48,7 @@
 #include "native_shader_state.h"
 #include "native_shader_binding.h"
 #include "native_frame_dispatch.h"
+#include "native_full_frame.h"
 #include "native_bucket_dispatch.h"
 #include "native_map_effects.h"
 #include "native_scene_tree.h"
@@ -355,6 +356,9 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        RenderGatherClassify, RenderGatherVisibility, RenderGatherLod, RenderGatherPush, RenderGatherGuest,
                        QueuedEligibility, QueuedResolve, QueuedInstances, QueuedRecord,
                        QueuedHandoff, QueuedHandoffBinds, QueuedHandoffReplays,
+                       FrameNative, FrameNativeBegin, FrameNativeStaticWorld, FrameNativeModels,
+                       FrameNativeSky, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
+                       FrameNativeEnd,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
@@ -411,6 +415,9 @@ class HookTiming {
       "render.gather.classify","render.gather.visibility","render.gather.lod","render.gather.push","render.gather.guest_dispatch",
       "render.queued.eligibility","render.queued.resolve","render.queued.instances","render.queued.record",
       "render.queued.handoff","render.queued.handoff_binds","render.queued.handoff_replays",
+      "frame.native","frame.native.begin","frame.native.static_world","frame.native.models",
+      "frame.native.sky","frame.native.effects","frame.native.transparent","frame.native.post",
+      "frame.native.end",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
       "load.shader.registration","load.shader.lock","load.shader.entry",
       "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
@@ -5537,6 +5544,147 @@ REX_HOOK_RAW(sub_821C0C00) {
 }
 REXCVAR_DEFINE_BOOL(edf_native_frame_dispatch,false,"EDF2027",
   "Own outer render phase dispatch in native code; remaining phase callbacks are retained.");
+REXCVAR_DEFINE_BOOL(edf_native_full_frame,false,"EDF2027",
+  "Full-frame native renderer: the render helper 821A5080 runs a native frame (inputs, scene begin, ordered native passes, end) instead of the guest helper and its callbacks. Needs edf_native_host and edf_native_shader_bridge; edf_native_ab_alternate guest-side frames keep the guest helper (development)");
+namespace {
+// NativeFullFrame's view of the bridge for one render helper call. It reads
+// guest memory and writes only owner+136; it never calls guest code. See
+// native_full_frame.h for where the frame sits between 8219C7A8 and 8219C840.
+class NativeFullFrameHost final : public edf::native::NativeFrameHost {
+ public:
+  NativeFullFrameHost(uint8_t* base,uint32_t owner):reader_(base),owner_(owner) {}
+  // (a) One generation of publication, published cameras and world animations
+  // under the producer lock, as the hook acquires them; the motion budget and
+  // its publication were already acquired by the hook, which restores all of
+  // them on exit. The thread-locals are the ones existing native pass code reads.
+  edf::native::NativeFrameInputs AcquireInputs() override {
+    auto& state=edf::native::State();
+    {
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      edf::native::native_scene_publication=state.scene_adapter.AcquirePublication();
+      edf::native::native_scene_pass_cameras=EDF_NATIVE_FLAG(scene_camera_owned)?state.scene_adapter.AcquireCameras():nullptr;
+      edf::native::native_scene_pass_animations=state.scene_adapter.AcquireWorldAnimations();
+    }
+    return {edf::native::native_scene_publication,edf::native::native_scene_pass_cameras,
+      edf::native::native_scene_pass_animations,native_render_publication};
+  }
+  // The helper's view loop condition and list (owner+0..owner+12, view at node+8).
+  std::vector<uint32_t> Views() override {
+    const auto flag=[&](uint32_t offset) { return *reader_.Bytes(reader_.Add(owner_,offset),1)!=0; };
+    std::vector<uint32_t> views;
+    if(flag(2261) || flag(2262) || !(flag(2216) || flag(2217))) return views;
+    const auto end=Word(12);
+    for(auto node=Word(0);node!=end;node=reader_.Word(node)) {
+      if(views.size()>=256) throw std::runtime_error("native full frame view list is cyclic or excessive");
+      views.push_back(reader_.Word(reader_.Add(node,8)));
+    }
+    return views;
+  }
+  // Helper side effect kept: the frame serial owner+136, advanced once per
+  // view as 821A5080 and DispatchNativeFrame advance it.
+  uint32_t AdvanceSerial() override {
+    const auto serial=Word(136);
+    reader_.StoreWord(reader_.Add(owner_,136),serial+1);
+    return serial;
+  }
+  // (b) The native half of 821BE8D0 (clSgsCoreRender +4) on the scene 8219C7A8
+  // opened: pass camera (published, else read as the 821BE8D0 hook does),
+  // viewport from scene+480 with the retail depth range words 820008CC and
+  // 820009A4 (reversed), and the depth/stencil clear it issues for every view
+  // but the first (8219C7A8 already cleared color and depth). Not replicated:
+  // the guest view/projection globals (821A17F8/821A19F0 on 8257C02C) and
+  // 82135530(device,1), which only guest draws read; native passes take the
+  // pass camera and context.viewport.
+  bool BeginView(edf::native::NativeFrameContext& context) override {
+    edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeBegin);
+    const auto scene=context.view.scene;
+    const auto& cameras=context.inputs.cameras;
+    const auto found=cameras?cameras->find(scene):edf::native::NativeScenePassCameras::const_iterator{};
+    if(cameras && found!=cameras->end()) edf::native::native_scene_pass_camera=found->second;
+    else edf::native::native_scene_pass_camera=edf::native::ReadNativeScenePassCamera(reader_,scene);
+    auto& state=edf::native::State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto renderer=reader_.Word(kRenderer);
+    const auto native_scene=state.scenes.find(renderer);
+    if(!renderer || state.active_scene!=renderer || native_scene==state.scenes.end()) {
+      static uint64_t skipped=0;
+      if(++skipped<=4 || !(skipped&(skipped-1)))
+        REXLOG_INFO("Native full frame view skipped: renderer={:#x} active_scene={:#x} skipped={} (no scene from 8219C7A8)",
+          renderer,state.active_scene,skipped);
+      return false;
+    }
+    context.renderer=renderer;
+    const auto width=reader_.Word(reader_.Add(renderer,84)),height=reader_.Word(reader_.Add(renderer,88));
+    const auto rect=edf::native::ReadGuestWords<4>(reader_,reader_.Add(scene,480));
+    const auto extent=[](uint32_t word,uint32_t limit) {
+      const float value=std::bit_cast<float>(word);  // fctidz truncates; clamp to the surface.
+      return value>0?uint32_t((std::min)(double(value),double(limit))):0u;
+    };
+    auto& viewport=context.viewport;
+    viewport.x=extent(rect[0],width); viewport.y=extent(rect[1],height);
+    viewport.width=(std::min)(extent(rect[2],width),width-viewport.x);
+    viewport.height=(std::min)(extent(rect[3],height),height-viewport.y);
+    viewport.min_depth=std::bit_cast<float>(reader_.Word(0x820008cc));
+    viewport.max_depth=std::bit_cast<float>(reader_.Word(0x820009a4));
+    if(context.view.index) {
+      edf::native::HookTiming clear_timing(edf::native::HookPhase::SceneClear);
+      edf::native::ClearNativeDepthTarget(edf::native::SceneRecorderLocked(state),native_scene->second.depth,true,true,
+        viewport.max_depth,0);
+    }
+    edf::native::BindActiveTarget(state);
+    if(state.context) edf::native::MakeNativeDrawViewport(viewport.x,viewport.y,viewport.width,viewport.height,
+      viewport.min_depth,viewport.max_depth,false,{}).Bind(*state.context.Get());
+    return true;
+  }
+  // (c) Per-pass timing: frame.native.<name>, in kNativeFramePassOrder order.
+  void RunPass(size_t index,edf::native::NativeFramePass& pass,edf::native::NativeFrameContext& context) override {
+    constexpr auto first=size_t(edf::native::HookPhase::FrameNativeStaticWorld);
+    constexpr auto count=size_t(edf::native::HookPhase::FrameNativeEnd)-first;
+    static_assert(count==std::size(edf::native::kNativeFramePassOrder));
+    edf::native::HookTiming timing(index<count?edf::native::HookPhase(first+index):edf::native::HookPhase::FrameNative,index<count);
+    pass.Record(context);
+  }
+  // HOOK POINT: helper side effects other code relies on, to be filled from
+  // the ongoing side-effect research. Known and not replicated yet: per view
+  // the helper zeroes the bucket heads owner+168..+2215, refills them from the
+  // world callbacks (vtable +8) and drains them in 821A3BA0; the guest frame
+  // context at stack+80 (near/far, view+400, serial, view); the post stage
+  // 820B0B80 (8219C930 resolve, 82135530, the 2D scope); the overlay and
+  // phase callbacks (owner+2232 list, phases owner+140..+144).
+  void SideEffects(const edf::native::NativeFrameInputs&) override {}
+  // (d) The scene stays open for the engine's end frame: after this helper
+  // returns, 821A6508 calls clSgsCoreRender +20 (821BE9F0 -> 8219C840), whose
+  // hook resolves the active scene to the frame buffer and publishes it to the
+  // presentation queue; the next +24 (821BEA00 -> 8219C1F8 -> 82151460) reaches
+  // edf_native_swap_wait, which submits the scene recorder and paces.
+  void EndScene(const edf::native::NativeFrameInputs&,bool output_ready) override {
+    edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeEnd);
+    if(output_ready) throw std::runtime_error("native full frame post output has no end-scene route yet");
+    auto& state=edf::native::State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto renderer=reader_.Word(kRenderer);
+    const bool open=renderer && state.active_scene==renderer;
+    if(open) edf::native::BindActiveTarget(state);
+    static uint64_t frames=0;
+    if(++frames<=4 || frames%1000==0)
+      REXLOG_INFO("Native full frame end: frames={} renderer={:#x} scene_open={} (8219C840 publishes, swap presents)",frames,renderer,open);
+  }
+  void Unimplemented(const char* pass) override {
+    static std::mutex mutex;
+    static std::set<std::string> logged;
+    std::lock_guard lock(mutex);
+    if(logged.emplace(pass).second) REXLOG_WARN("Native full frame pass unimplemented: {} (records nothing)",pass);
+  }
+ private:
+  static constexpr uint32_t kRenderer=0x8257bfb4;  // Renderer global: +8 device, +84/+88 extent.
+  uint32_t Word(uint32_t offset) const { return reader_.Word(reader_.Add(owner_,offset)); }
+  const edf::native::GuestReader reader_;
+  uint32_t owner_;
+};
+}
 REXCVAR_DEFINE_INT32(edf_native_ab_alternate,0,"EDF2027",
   "A/B diagnostics: alternate guest and native passes in runs of N indexed output frames from the capture start frame; odd runs are native, 0 off (development)").range(0,1000);
 REX_HOOK_RAW(sub_821A5080) {
@@ -5609,7 +5757,28 @@ REX_HOOK_RAW(sub_821A5080) {
   NativeLoopTrace trace("helper_dispatch",ctx.r3.u32,ctx.lr);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceHelper);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::RenderHelper);
-  if(EDF_NATIVE_FLAG(frame_dispatch) && EDF_NATIVE_FLAG(shader_bridge)) {
+  // A/B guest-side frames take today's path (frame dispatch or the guest helper).
+  const auto route=edf::native::SelectNativeFrameRoute(EDF_NATIVE_FLAG(full_frame),EDF_NATIVE_FLAG(frame_dispatch),
+    EDF_NATIVE_FLAG(shader_bridge),EDF_NATIVE_FLAG(host),ab_native);
+  if(ab_native && EDF_NATIVE_FLAG(full_frame) && route!=edf::native::NativeFrameRoute::full_frame) {
+    static std::atomic<bool> reported=false;
+    if(!reported.exchange(true))
+      REXLOG_WARN("Native full frame disabled: requires edf_native_host and edf_native_shader_bridge (guest helper retained)");
+  }
+  if(route==edf::native::NativeFrameRoute::full_frame) {
+    // No guest helper and no guest callbacks: the frame is native end to end.
+    // 821A6508 joins each helper call (821A53A8) before the next, so the
+    // single instance is never run concurrently.
+    static edf::native::NativeFullFrame full_frame;
+    NativeFullFrameHost host(base,ctx.r3.u32);
+    {
+      edf::native::HookTiming frame_timing(edf::native::HookPhase::FrameNative);
+      full_frame.Run(host);
+    }
+    const auto frames=full_frame.frames();
+    if(frames<=4 || frames%1000==0)
+      REXLOG_INFO("Native full frame dispatch: frames={} passes={} (guest helper not called)",frames,full_frame.passes().size());
+  } else if(route==edf::native::NativeFrameRoute::frame_dispatch) {
     const edf::native::GuestReader reader(base);
     auto work=ctx;
     if(work.r1.u32<224) throw std::runtime_error("invalid native frame dispatch stack");
@@ -11962,12 +12131,12 @@ bool NativeModelPassEnabled() {
 }
 }
 REXCVAR_DEFINE_STRING(edf_native_renderer,"off","EDF2027",
-  "Native renderer preset: off, world (static world pass and every scene flag it requires) or full (world plus model publication, the rigid model pass and the native post finish). Adds to the individual edf_native_* cvars and never turns one off; read once at startup");
+  "Native renderer preset: off, world (static world pass and every scene flag it requires), full (world plus model publication, the rigid model pass and the native post finish) or native (full plus the full-frame renderer, edf_native_full_frame). Adds to the individual edf_native_* cvars and never turns one off; read once at startup");
 namespace edf::native {
 void ResolveNativeRendererPreset() {
   const auto& name=REXCVAR_GET(edf_native_renderer);
   const auto preset=ParseNativeRendererPreset(name);
-  if(!preset) throw std::runtime_error("edf_native_renderer must be off, world or full, not '"+std::string(name)+"'");
+  if(!preset) throw std::runtime_error("edf_native_renderer must be off, world, full or native, not '"+std::string(name)+"'");
   native_renderer_preset_mask.store(NativeRendererPresetMask(*preset),std::memory_order_relaxed);
   // Effective values, in NativeRendererFlag order.
   const bool effective[kNativeRendererFlagCount]{
@@ -11978,7 +12147,8 @@ void ResolveNativeRendererPreset() {
     EDF_NATIVE_FLAG(scene_geometry_owned),EDF_NATIVE_FLAG(scene_material_owned),
     EDF_NATIVE_FLAG(scene_tree),EDF_NATIVE_FLAG(scene_tree_published),EDF_NATIVE_FLAG(scene_visibility),
     EDF_NATIVE_FLAG(frame_dispatch),EDF_NATIVE_FLAG(scene_group_order),EDF_NATIVE_FLAG(static_world_pass),
-    EDF_NATIVE_FLAG(model_publication),EDF_NATIVE_FLAG(model_pass),EDF_NATIVE_FLAG(post_finish)};
+    EDF_NATIVE_FLAG(model_publication),EDF_NATIVE_FLAG(model_pass),EDF_NATIVE_FLAG(post_finish),
+    EDF_NATIVE_FLAG(full_frame)};
   std::string on,off;
   for(uint32_t i=0;i<kNativeRendererFlagCount;++i) {
     auto& list=effective[i]?on:off;

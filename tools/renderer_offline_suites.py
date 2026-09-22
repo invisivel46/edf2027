@@ -9,6 +9,7 @@ edf_native_backend_tests edf_native_upload_ring_tests edf_native_decode_worker_t
 edf_native_effect_tests edf_native_display_gamma_tests
 edf_native_worker_callback_audit_tests edf_native_model_constructor_tests
 edf_native_bucket_dispatch_tests edf_native_map_effect_tests edf_native_ab_alternate_tests
+edf_native_full_frame_tests
 edf_renderer_runtime_gate_tests edf_renderer_image_compare_tests
 edf_renderer_ab_capture_tests edf_renderer_ab_postprocess_tests""".split()
 RENDER = """edf_native_scene_tests edf_native_backend_completion_tests
@@ -45,6 +46,7 @@ SOURCES = {
     'edf_native_bucket_dispatch_tests': ['tests/native_bucket_dispatch_tests.cpp'],
     'edf_native_map_effect_tests': ['tests/native_map_effect_tests.cpp'],
     'edf_native_ab_alternate_tests': ['tests/native_ab_alternate_tests.cpp'],
+    'edf_native_full_frame_tests': ['tests/native_full_frame_tests.cpp'],
     'edf_renderer_runtime_gate_tests': ['tests/test_renderer_runtime_gate.py', 'tools/renderer-runtime-gate.py'],
     'edf_renderer_image_compare_tests': ['tests/test_compare_renderer_images.py', 'tools/compare-renderer-images.py'],
     'edf_renderer_ab_capture_tests': ['tools/test_compare_renderer_ab_captures.py', 'tools/compare-renderer-ab-captures.py'],
