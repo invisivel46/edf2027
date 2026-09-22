@@ -7,6 +7,7 @@
 #include "native_graphics/native_material_parameters.h"
 #include "native_graphics/guest_draw_state.h"
 #include "native_graphics/guest_readable_range.h"
+#include "native_graphics/guest_page_table.h"
 #include "native_graphics/triangle_strip.h"
 #include "native_graphics/guest_fence.h"
 #include "native_graphics/native_constant_ownership.h"
@@ -15,6 +16,7 @@
 #include <stdexcept>
 #include <algorithm>
 #include <thread>
+#include <vector>
 
 namespace {
 int failures = 0;
@@ -156,6 +158,44 @@ int main() {
       {0x1000,0,true,true},{0,0x1000,true,true},{0x1000,0x100000000ull,true,true}}})
     Check(!GuestRangeCommittedReadable(0x1000,1,[&](uint32_t){return malformed;}),
       "malformed region must not advance or overrun guest range");
+  {
+    // Page-table admission: per page touched, independent of region extent.
+    using edf::native::GuestPageState;
+    using edf::native::GuestPagesAdmit;
+    constexpr uint32_t kRead=1,kWrite=2;
+    std::vector<GuestPageState> table(64,GuestPageState{true,kRead|kWrite});
+    size_t probes=0;
+    auto page=[&](uint32_t index) { ++probes; return table.at(index); };
+    const auto admit=[&](uint32_t base,uint32_t shift,uint32_t address,size_t size,uint32_t required) {
+      probes=0; return GuestPagesAdmit(base,uint64_t(table.size())<<shift,shift,table.size(),address,size,required,page);
+    };
+    Check(admit(0x40000000,12,0x40001ffe,4,kRead) && probes==2,"4 KiB cross-page read probes both pages only");
+    Check(admit(0x40000000,12,0x40000000,4,kRead|kWrite) && probes==1,"one-page write probes one entry, not the region");
+    Check(admit(0x40000000,16,0x4001fffc,8,kRead) && probes==2,"64 KiB page geometry");
+    Check(admit(0x40000000,12,0x40000000,64*4096,kRead) && probes==64,"whole heap");
+    table[1].committed=false;
+    Check(!admit(0x40000000,12,0x40000ffe,0x1004,kRead),"decommitted middle page rejects retained protection");
+    Check(admit(0x40000000,12,0x40000ffc,4,kRead) && admit(0x40000000,12,0x40002000,4,kRead),"neighbours of a decommitted page");
+    table[1]={true,kRead};
+    Check(admit(0x40000000,12,0x40001000,4,kRead) && !admit(0x40000000,12,0x40001000,4,kRead|kWrite),
+      "read-only page admits reads but not writes");
+    table[1]={true,0};
+    Check(!admit(0x40000000,12,0x40001000,1,kRead),"no-access page");
+    table[1]={true,kRead|kWrite};
+    Check(!admit(0x40000000,12,0x40000000+64*4096-2,4,kRead) && !admit(0x40000000,12,0x3ffffffe,4,kRead),
+      "ranges crossing either heap bound");
+    Check(!admit(0x40000000,12,0,1,kRead) && !admit(0x40000000,12,0x40000000,0,kRead) &&
+      !admit(0,12,UINT32_MAX,2,kRead),"null, empty and wrapping ranges");
+    Check(!GuestPagesAdmit(0x40000000,64*4096,12,63,0x4003f000,4,kRead,page),"page index beyond the table");
+    Check(!GuestPagesAdmit(0x40000000,64*4096,32,64,0x40000000,4,kRead,page),"invalid page shift");
+    probes=0;
+    Check(GuestPagesAdmit(0xfffff000,0x1000,12,1,UINT32_MAX,1,kRead,[&](uint32_t index) {
+      ++probes; return GuestPageState{index==0,kRead};
+    }) && probes==1,"last guest byte uses nonwrapping end");
+    // Changes are visible on the next call: nothing is retained between calls.
+    table.assign(64,GuestPageState{});
+    Check(!admit(0x40000000,12,0x40001ffe,4,kRead),"released pages reject immediately");
+  }
   ParameterReader window_backing;
   window_backing.Put(64,0x12345678);
   const edf::native::GuestReadWindow window(window_backing,64,32);

@@ -13,6 +13,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <atomic>
 #include "native_graphics/native_render_state_snapshot.h"
 
 namespace {
@@ -29,6 +30,19 @@ bool HostReadable(const uint8_t* at,size_t size,bool require_write=false) {
     at+=count; size-=count;
   }
   return true;
+}
+// The locked SDK region query the page-table probe replaced: the reference
+// answer it must reproduce after every allocation, protection and release.
+bool QueriedHeapAdmits(rex::memory::BaseHeap& heap,uint32_t address,size_t size,uint32_t required) {
+  if(!address || !size || address<heap.heap_base() || size>0x100000000ull-address ||
+     uint64_t(address)-heap.heap_base()+size>heap.heap_size()) return false;
+  return edf::native::GuestRangeCommittedReadable(address,size,[&](uint32_t at) {
+    const uint32_t page=heap.heap_base()+((at-heap.heap_base())/heap.page_size())*heap.page_size();
+    rex::memory::HeapAllocationInfo info{};
+    if(!heap.QueryRegionInfo(page,&info)) return edf::native::GuestReadableRegion{};
+    return edf::native::GuestReadableRegion{info.base_address,info.region_size,
+      (info.state&rex::memory::kMemoryAllocationCommit)!=0,(info.protect&required)==required};
+  });
 }
 void CheckPhysicalWriteWatch(rex::memory::Memory& memory,uint32_t address,uint32_t size) {
   struct Probe { unsigned calls=0; uint32_t start=0,length=0; bool exact=false; } probe;
@@ -1549,6 +1563,12 @@ int main() {
       auto check=[&](uint32_t at,size_t size,bool expected) {
         const bool readable=GuestHeapCommittedReadable(*heap,at,size);
         Require(readable==expected,"unexpected SDK committed/readable range");
+        Require(readable==QueriedHeapAdmits(*heap,at,size,kMemoryProtectRead),
+          "page-table read probe disagrees with QueryRegionInfo");
+        if(heap->heap_type()==HeapType::kGuestVirtual)
+          Require(GuestVirtualHeapCommittedWritable(*heap,at,size)==
+            QueriedHeapAdmits(*heap,at,size,kMemoryProtectRead|kMemoryProtectWrite),
+            "page-table write probe disagrees with QueryRegionInfo");
         if(readable) Require(HostReadable(memory.TranslateVirtual(at),size),
           "SDK fast read admitted a host-inaccessible range");
       };
@@ -1618,6 +1638,32 @@ int main() {
       check(address,1,false);
       Require(!GuestVirtualHeapCommittedWritable(*heap,address,1),"reserve-only read/write page admitted");
       Require(heap->Release(address),"release reserved page");
+      {
+        // Unlocked probes racing Protect/Decommit/AllocFixed on another thread
+        // see the page before or after each change, never a torn state.
+        Require(heap->Alloc(page*2,page,kMemoryAllocationReserve|kMemoryAllocationCommit,
+          kMemoryProtectRead|kMemoryProtectWrite,false,&address),"allocate race pages");
+        std::atomic<bool> done{false};
+        std::thread mutator([&] {
+          for(int i=0;i<400;++i) {
+            heap->Protect(address+page,page,i&1?kMemoryProtectRead:kMemoryProtectNoAccess);
+            if(!(i%16)) {
+              heap->Decommit(address+page,page);
+              heap->AllocFixed(address+page,page,page,kMemoryAllocationCommit,kMemoryProtectRead|kMemoryProtectWrite);
+            }
+          }
+          done=true;
+        });
+        uint64_t admitted=0,rejected=0;
+        while(!done) {
+          Require(GuestHeapCommittedReadable(*heap,address,page),"untouched first page rejected during race");
+          (GuestHeapCommittedReadable(*heap,address+page,1)?admitted:rejected)++;
+        }
+        mutator.join();
+        Require(heap->Release(address),"release race pages");
+        Require(!GuestHeapCommittedReadable(*heap,address,1),"released race page admitted");
+        std::cout<<"heap "<<std::hex<<probe<<" race probes admitted="<<std::dec<<admitted<<" rejected="<<rejected<<'\n';
+      }
       Require(!GuestHeapCommittedReadable(*heap,heap->heap_base()+heap->heap_size()-1,2),
         "cross-heap range admitted");
       Require(!GuestVirtualHeapCommittedWritable(*heap,heap->heap_base()+heap->heap_size()-1,2) &&

@@ -487,7 +487,8 @@ class GuestReader {
       const uint32_t last=address+static_cast<uint32_t>(size-1);
       auto* heap=memory_->LookupHeap(address);
       // QueryRangeAccess alone ignores commitment (Decommit retains protect).
-      // QueryRegionInfo checks both state and access under the heap mutex.
+      // The heap's page entries hold both state and access; read per page
+      // touched, lock-free, never cached (guest_sdk_readable_range.h).
       // Require containment; retain TranslateVirtual's alias offset.
       // Loader/untracked/cross-heap ranges keep the original OS validation.
       if(heap && heap==memory_->LookupHeap(last) && address>=heap->heap_base() &&
@@ -545,9 +546,9 @@ class GuestReader {
     if(!size || (alignment!=4 && alignment!=8))
       throw std::runtime_error("invalid native guest write extent/alignment");
     // The SDK writable proof (committed, read and write access) implies the
-    // readable one Bytes would query first: one region query, not two. Each
-    // query locks the heap and scans its region's page entries. Anything the
-    // proof does not cover takes the full path below, which throws as before.
+    // readable one Bytes would check first: one page-table probe, not two.
+    // Anything the proof does not cover takes the full path below, which
+    // throws as before.
     if(REXCVAR_GET(edf_native_guest_heap_reads) && address && size<=0x100000000ull-address && !(address&(alignment-1))) {
       const auto last=address+uint32_t(size-1);
       auto* heap=memory_->LookupHeap(address);
