@@ -3,6 +3,7 @@
 #include "native_graphics/native_scene_sources.h"
 #include "native_graphics/native_scene_adapter.h"
 #include "native_graphics/native_scene_tree.h"
+#include "native_graphics/native_scene_walk_lock.h"
 #include "native_graphics/native_scene_pass_inputs.h"
 #include "native_graphics/native_queued_scene.h"
 #include "native_graphics/native_scene_cpu_window.h"
@@ -414,6 +415,57 @@ void StaticGroupEligibility() {
   auto invalid=input; invalid.count=0;
   Require(AssessNativeStaticGroup(reader,device,stack,invalid)==Result::Geometry,"zero geometry count admitted");
   Require(AssessNativeStaticGroup(reader,device+1,stack,input)==Result::Alignment,"unaligned device admitted");
+}
+// A BasicLockable that records every acquisition, so tests can count them.
+struct CountingMutex {
+  bool locked=false; uint64_t locks=0;
+  void lock() { Require(!locked,"walk lock reacquired a held non-recursive mutex"); locked=true; ++locks; }
+  void unlock() { Require(locked,"walk lock released an unheld mutex"); locked=false; }
+};
+void WalkLock() {
+  using Scope=NativeWalkLockScope<CountingMutex>;
+  using GuestCall=NativeWalkGuestCall<CountingMutex>;
+  CountingMutex mutex;
+  NativeSceneQueues queues,reference;
+  // Two candidates' parts, gathered as the per-object pushes would be.
+  const std::vector<std::pair<uint32_t,uint32_t>> parts{{0x500,0x1000},{0x600,0x1100},{0x500,0x1200},{0x600,0x1300}};
+  for(const auto& [group,instance]:parts) reference.Push(group,instance);
+  NativeGuestCallCached<uint32_t> view;
+  uint32_t camera=7;
+  {
+    Scope walk(mutex);
+    Require(Scope::current==&walk && !mutex.locked,"walk scope locked before first need");
+    // One list: membership, sources, candidates and counters share one hold.
+    for(const auto& [group,instance]:parts) { walk.Hold(); queues.Push(group,instance); }
+    walk.Hold();
+    Require(mutex.locks==1 && walk.acquisitions==1,"walk lock taken more than once between guest calls");
+    Require(view.Get(Scope::guest_calls,[&] { return camera; })==7 &&
+            view.Get(Scope::guest_calls,[&] { return camera+1; })==7 && view.reads==1,"view reread without a guest call");
+    {
+      GuestCall guest;
+      Require(!mutex.locked && !Scope::current,"guest call ran under the walk lock");
+      camera=9;
+      // A hook re-entered from guest code owns its own scope and leaves the
+      // mutex released when it returns to the guest.
+      {
+        Scope nested(mutex); nested.Hold();
+        Require(Scope::current==&nested && mutex.locked,"nested gather did not take the lock");
+        { GuestCall inner; Require(!mutex.locked,"nested guest call ran under the lock"); }
+        Require(Scope::current==&nested && !mutex.locked,"nested guest call did not restore its scope");
+      }
+      Require(!Scope::current && !mutex.locked,"nested scope leaked into guest code");
+    }
+    Require(Scope::current==&walk && !mutex.locked,"guest call did not restore the walk scope");
+    Require(view.Get(Scope::guest_calls,[&] { return camera; })==9 && view.reads==2,"view not reread after a guest call");
+    walk.Hold(); walk.Hold();
+    Require(walk.acquisitions==2 && mutex.locks==3,"walk lock not taken once after the guest call");
+  }
+  Require(!Scope::current && !mutex.locked,"walk scope did not release the lock");
+  for(const uint32_t group:{0x500u,0x600u})
+    Require(queues.Take(group)==reference.Take(group),"walk-locked queue order differs from per-object pushes");
+  // Exceptions unwind through the scope without leaving the mutex held.
+  Reject([&] { Scope walk(mutex); walk.Hold(); throw std::runtime_error("walk failed"); });
+  Require(!Scope::current && !mutex.locked,"failed walk left the lock held");
 }
 void GroupOrder() {
   std::vector<uint8_t> memory(0x1000);
@@ -1774,7 +1826,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
-    GroupOrder(); StaticWorldPass();
+    GroupOrder(); StaticWorldPass(); WalkLock();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

@@ -46,6 +46,7 @@
 #include "native_shader_binding.h"
 #include "native_frame_dispatch.h"
 #include "native_scene_tree.h"
+#include "native_scene_walk_lock.h"
 #include "native_scene_tree_publication.h"
 #include "native_texture_binding.h"
 #include "native_render_state_snapshot.h"
@@ -1120,6 +1121,9 @@ struct Bridge {
   uint64_t activations = 0, misses = 0, parameter_uploads = 0, optimized_out = 0, parameter_errors = 0;
 };
 Bridge& State() { static Bridge state; return state; }
+// State().mutex for one visibility walk; see native_scene_walk_lock.h.
+using BridgeWalkLock=NativeWalkLockScope<std::mutex>;
+using BridgeGuestCall=NativeWalkGuestCall<std::mutex>;
 // Defined below, next to the selection it mirrors; declared here because
 // the texture hook, further up, is the first thing to create a scene resource.
 edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state);
@@ -3238,8 +3242,14 @@ REX_HOOK_RAW(sub_821C61D8) {
   }
   edf::native::NativeSceneTreeReader tree_reader(reader,publications,std::move(hierarchy),
     REXCVAR_GET(edf_native_scene_visibility_audit));
+  // One bridge lock scope for the walk: each leaf list's gather reuses it and
+  // every guest call below releases it. The view is read once and again only
+  // after a guest call, which alone can change camera data.
+  edf::native::BridgeWalkLock walk_lock(edf::native::State().mutex);
+  edf::native::NativeGuestCallCached<edf::native::NativeSceneVisibilityView> walk_view;
   edf::native::TraverseNativeSceneTree(tree_reader,manager,[&](uint32_t node) {
-    const auto view=edf::native::ReadNativeSceneVisibilityView(reader,context);
+    const auto& view=walk_view.Get(edf::native::BridgeWalkLock::guest_calls,
+      [&] { return edf::native::ReadNativeSceneVisibilityView(reader,context); });
     const auto center=edf::native::ReadNativeVisibilityFloats<4>(tree_reader,reader.Add(node,32));
     const auto transformed=edf::native::NativeVisibilityTransform(center,view.matrix);
     const auto radius=std::bit_cast<float>(tree_reader.Word(reader.Add(node,64)));
@@ -3250,13 +3260,16 @@ REX_HOOK_RAW(sub_821C61D8) {
       const auto camera=reader.Word(reader.Add(context,16));
       for(uint32_t i=0;i<4;++i) reader.StoreWord(reader.Add(stack,80+i*4),std::bit_cast<uint32_t>(transformed[i]));
       work.r3.u64=reader.Add(camera,288); work.r4.u64=reader.Add(stack,80); work.f1.f64=radius;
-      work.lr=0x821C6024; __imp__sub_821C3070(work,base);
+      work.lr=0x821C6024;
+      { edf::native::BridgeGuestCall guest; __imp__sub_821C3070(work,base); }
       const auto original_sphere=work.r3.u32;
       auto original=original_sphere;
       if(original_sphere==2) {
         work.r3.u64=reader.Add(camera,288); work.r4.u64=reader.Add(camera,96);
         work.r5.u64=reader.Add(node,32); work.r6.u64=reader.Add(node,48);
-        work.lr=0x821C605C; __imp__sub_821C3178(work,base); original=work.r3.u32;
+        work.lr=0x821C605C;
+        { edf::native::BridgeGuestCall guest; __imp__sub_821C3178(work,base); }
+        original=work.r3.u32;
       }
       if(sphere!=original_sphere || result!=original) throw std::runtime_error("native tree classification differs from original");
       ++checks;
@@ -3266,6 +3279,7 @@ REX_HOOK_RAW(sub_821C61D8) {
     work.r3.u64=manager; work.r4.u64=list; work.r5.u64=context; work.lr=0x821C56F8;
     sub_820B4038(work,base);
   });
+  walk_lock.Release();
   static std::atomic<uint64_t> traversals=0,audited=0,owned_reads=0,live_reads=0;
   audited+=checks;
   owned_reads+=tree_reader.owned_reads; live_reads+=tree_reader.live_reads;
@@ -4162,9 +4176,17 @@ REX_HOOK_RAW(sub_820B4038) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderGather);
   auto* queues=edf::native::native_scene_queues;
   if(!queues || !queues->enabled || !REXCVAR_GET(edf_native_scene_visibility)) {
-    __imp__sub_820B4038(ctx,base); return;
+    edf::native::BridgeGuestCall guest; __imp__sub_820B4038(ctx,base); return;
   }
   using namespace edf::native;
+  // Inside a tree walk (821C61D8) the walk's lock scope is current and stays
+  // held across lists; standalone gathers own a scope for this list. Either
+  // way the bridge lock is taken at most once between guest calls, and every
+  // guest call below releases it.
+  std::optional<BridgeWalkLock> own_lock;
+  auto* bridge=BridgeWalkLock::current;
+  if(!bridge) bridge=&own_lock.emplace(State().mutex);
+  auto& state=State();
   const GuestReader reader(base);
   NativeSceneCpuWindow cpu(reader);
   const auto context=ctx.r5.u32;
@@ -4179,8 +4201,11 @@ REX_HOOK_RAW(sub_820B4038) {
   reader.StoreWord(work.r1.u32,ctx.r1.u32);
   const bool audit=REXCVAR_GET(edf_native_scene_visibility_audit);
   std::shared_ptr<const NativeSceneMembership::Snapshot> membership;
+  // Resolve the pass's source generation once per list, not per candidate:
+  // each candidate then costs one owner lookup and no further lock.
+  std::shared_ptr<const NativeSceneSources> pass_sources;
   {
-    auto& state=State(); std::lock_guard lock(state.mutex);
+    bridge->Hold();
     bool published=false;
     if(REXCVAR_GET(edf_native_scene_membership_owned) && native_scene_publication && native_scene_publication->membership) {
       const auto& lists=*native_scene_publication->membership;
@@ -4230,13 +4255,7 @@ REX_HOOK_RAW(sub_820B4038) {
   }
   size_t member_index=0;
   if(membership) cursor=membership->members.empty()?end:membership->members.front().node;
-  // Resolve the pass's source generation once per walk, not per candidate:
-  // each candidate then costs one owner lookup and no bridge lock.
-  std::shared_ptr<const NativeSceneSources> pass_sources;
-  {
-    auto& state=State(); std::lock_guard lock(state.mutex);
-    pass_sources=PublishedNativeSceneSourcesForPass(state);
-  }
+  pass_sources=PublishedNativeSceneSourcesForPass(state);
   uint64_t candidates=0,retained=0,selected=0,checks=0,mismatches=0;
   uint64_t native_members=0;
   size_t visited=0;
@@ -4265,7 +4284,7 @@ REX_HOOK_RAW(sub_820B4038) {
     if(unseen) {
       NativeSceneSources::Candidate source;
       if(pass_sources) source=pass_sources->FindCandidate(owner);
-      else { auto& state=State(); std::lock_guard lock(state.mutex); source=state.scene_sources.FindCandidate(owner); }
+      else { bridge->Hold(); source=state.scene_sources.FindCandidate(owner); }
       const auto& published=source.visibility;
       const auto read_live=[&](bool lods) {
         const GuestReadWindow window(cpu,owner,lods?540:356);
@@ -4287,7 +4306,8 @@ REX_HOOK_RAW(sub_820B4038) {
       if(audit) {
         const auto camera=reader.Word(reader.Add(context,16));
         work.r3.u64=work.r1.u32+80; work.r4.u64=reader.Add(owner,288); work.r5.u64=reader.Add(camera,96);
-        work.lr=0x820B40AC; __imp__sub_821B0198(work,base);
+        work.lr=0x820B40AC;
+        { BridgeGuestCall guest; __imp__sub_821B0198(work,base); }
         const auto original=ReadNativeVisibilityFloats<4>(reader,work.r1.u32+80);
         if(!NativeVisibilityBitsEqual(original,center)) {
           static std::atomic<uint32_t> reports=0;
@@ -4313,12 +4333,15 @@ REX_HOOK_RAW(sub_820B4038) {
         if(audit) {
           const auto camera=reader.Word(reader.Add(context,16));
           work.r3.u64=reader.Add(camera,288); work.r4.u64=reader.Add(context,32); work.f1.f64=object.radius;
-          work.lr=0x820B40D8; __imp__sub_821C3070(work,base);
+          work.lr=0x820B40D8;
+          { BridgeGuestCall guest; __imp__sub_821C3070(work,base); }
           const auto original_sphere=work.r3.u32;
           uint32_t original_box=original_sphere;
           if(original_sphere==2) {
             work.r3.u64=reader.Add(camera,288); work.r4.u64=reader.Add(camera,96); work.r5.u64=reader.Add(owner,288);
-            work.lr=0x820B40F8; __imp__sub_821C33E8(work,base); original_box=work.r3.u32;
+            work.lr=0x820B40F8;
+            { BridgeGuestCall guest; __imp__sub_821C33E8(work,base); }
+            original_box=work.r3.u32;
           }
           ++checks;
           if(sphere!=original_sphere || box!=original_box) {
@@ -4354,7 +4377,7 @@ REX_HOOK_RAW(sub_820B4038) {
         // Hierarchy writer hooks invalidate tree images if this callback
         // changes membership, bounds or topology. Unrelated callback activity
         // must not discard every completed producer publication.
-        __imp__sub_821C0C00(work,base);
+        { BridgeGuestCall guest; __imp__sub_821C0C00(work,base); }
         callback=true;
         // A remaining callback can update camera data; no live read window or
         // registry span survives it.
@@ -4366,7 +4389,7 @@ REX_HOOK_RAW(sub_820B4038) {
     // guest dispatcher can, so only that route must reacquire the next link.
     cursor=callback?cpu.Word(cursor):node[0];
   }
-  auto& state=State(); std::lock_guard lock(state.mutex);
+  bridge->Hold();
   const auto previous=state.scene_visibility_candidates;
   state.scene_visibility_candidates+=candidates; state.scene_visibility_retained+=retained;
   state.scene_visibility_selected+=selected; state.scene_visibility_checks+=checks;
