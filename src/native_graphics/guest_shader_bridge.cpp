@@ -45,6 +45,7 @@
 #include "native_shader_state.h"
 #include "native_shader_binding.h"
 #include "native_frame_dispatch.h"
+#include "native_bucket_dispatch.h"
 #include "native_scene_tree.h"
 #include "native_scene_walk_lock.h"
 #include "native_scene_tree_publication.h"
@@ -201,6 +202,10 @@ REXCVAR_DEFINE_BOOL(edf_native_scene_visibility,false,"EDF2027",
                    "Use native visibility and static LOD selection within the opt-in native scene path (development)");
 REXCVAR_DEFINE_BOOL(edf_native_scene_visibility_audit,false,"EDF2027",
                    "Compare native visibility against original culling routines and live bounds (development)");
+REXCVAR_DEFINE_BOOL(edf_native_bucket_dispatch_audit,false,"EDF2027",
+                   "Compare the native sort-mode 1/2 bucket key and insert with sub_821C0C00 (development)");
+REXCVAR_DEFINE_BOOL(edf_native_bucket_dispatch,false,"EDF2027",
+                   "Insert sort-mode 1/2 objects into the guest depth buckets natively instead of sub_821C0C00 (development)");
 REXCVAR_DEFINE_BOOL(edf_native_unlock_framerate,false,"EDF2027",
                    "Experimental independent render loop with 60 Hz step dispatch; motion interpolation and timing validation are in progress");
 REXCVAR_DEFINE_BOOL(edf_native_camera_interpolation,true,"EDF2027",
@@ -4094,6 +4099,53 @@ REX_HOOK_RAW(sub_820B2DF8) {
   }
 }
 REX_EXTERN(__imp__sub_821C0C00);
+// Per-object tail of sub_821C0C00. Only sort modes 1/2 are native; hidden,
+// mode 0 (virtual render) and unknown modes (uninitialized stack key) remain
+// the original routine. Shared by the hook and the native visibility walk.
+static void DispatchNativeBucketObject(PPCContext& ctx,uint8_t* base) {
+  const bool audit=REXCVAR_GET(edf_native_bucket_dispatch_audit),native=REXCVAR_GET(edf_native_bucket_dispatch);
+  if(!audit && !native) { __imp__sub_821C0C00(ctx,base); return; }
+  using namespace edf::native;
+  const GuestReader reader(base);
+  const auto object=ctx.r3.u32,context=ctx.r4.u32;
+  static std::atomic<uint64_t> checks=0,mismatches=0,inserts=0,failures=0;
+  NativeBucketDispatch kind=NativeBucketDispatch::Unknown;
+  try { kind=ClassifyNativeBucket(reader,object); } catch(const std::exception&) {}
+  if(kind!=NativeBucketDispatch::Bucket) { __imp__sub_821C0C00(ctx,base); return; }
+  // The original clears flush-to-zero before its first lfs.
+  ctx.fpscr.disableFlushMode();
+  if(native && !audit) {
+    try {
+      InsertNativeBucket(reader,context,object);
+      const auto count=++inserts;
+      if(count==1 || count%1000000==0) REXLOG_INFO("Native bucket dispatch: inserts={} failures={}",count,failures.load());
+      return;
+    } catch(const std::exception& e) {
+      // Every read precedes the first store and the stores are the original's
+      // own values in its order, so the original can redo a partial insert.
+      if(++failures<=8) REXLOG_ERROR("Native bucket dispatch fell back: object={:#x} error={}",object,e.what());
+    }
+    __imp__sub_821C0C00(ctx,base); return;
+  }
+  // Audit: shadow the native plan, run the original, compare what it wrote.
+  std::optional<NativeBucketInsert> shadow;
+  try { shadow=PlanNativeBucket(reader,context,object); }
+  catch(const std::exception& e) { if(++failures<=8) REXLOG_ERROR("Native bucket audit plan failed: object={:#x} error={}",object,e.what()); }
+  __imp__sub_821C0C00(ctx,base);
+  if(!shadow) return;
+  const auto* bytes=reader.Bytes(reader.Add(object,40),2);
+  const uint8_t low=bytes[0],high=bytes[1];
+  const auto depth=reader.Word(reader.Add(object,44)),link=reader.Word(reader.Add(object,60));
+  const auto head=reader.Word(shadow->slot);
+  const auto count=++checks;
+  if(low!=shadow->key.low || high!=shadow->key.high || depth!=shadow->key.depth_bits ||
+     link!=shadow->previous || head!=object) {
+    if(++mismatches<=16) REXLOG_ERROR("Native bucket mismatch: object={:#x} mode={} key={:#x} bytes={:#x},{:#x}/{:#x},{:#x} depth={:#x}/{:#x} link={:#x}/{:#x} slot={:#x} head={:#x}/{:#x}",
+      object,reader.Word(reader.Add(object,52)),shadow->key.key,shadow->key.low,shadow->key.high,low,high,
+      shadow->key.depth_bits,depth,shadow->previous,link,shadow->slot,object,head);
+  }
+  if(count==1 || count%1000000==0) REXLOG_INFO("Native bucket audit: checks={} mismatches={}",count,mismatches.load());
+}
 REX_EXTERN(__imp__sub_821C0B88);
 REX_HOOK_RAW(sub_821C0B88) {
   const auto owner=ctx.r3.u32;
@@ -4377,7 +4429,7 @@ REX_HOOK_RAW(sub_820B4038) {
         // Hierarchy writer hooks invalidate tree images if this callback
         // changes membership, bounds or topology. Unrelated callback activity
         // must not discard every completed producer publication.
-        { BridgeGuestCall guest; __imp__sub_821C0C00(work,base); }
+        { BridgeGuestCall guest; DispatchNativeBucketObject(work,base); }
         callback=true;
         // A remaining callback can update camera data; no live read window or
         // registry span survives it.
@@ -4423,7 +4475,7 @@ REX_HOOK_RAW(sub_821C0C00) {
       }
     }
   }
-  __imp__sub_821C0C00(ctx,base);
+  DispatchNativeBucketObject(ctx,base);
 }
 REXCVAR_DEFINE_BOOL(edf_native_frame_dispatch,false,"EDF2027",
   "Own outer render phase dispatch in native code; remaining phase callbacks are retained.");
