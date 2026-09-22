@@ -218,6 +218,22 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
     add_test(NAME edf_renderer_setter_analysis_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_setter_analysis)
     set_tests_properties(edf_renderer_setter_analysis_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    # Offline Python tool tests: synthetic logs/images only, no game or game data.
+    add_custom_target(edf_renderer_runtime_gate_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_runtime_gate
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_renderer_runtime_gate_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_runtime_gate)
+    set_tests_properties(edf_renderer_runtime_gate_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_custom_target(edf_renderer_image_compare_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_compare_renderer_images
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_renderer_image_compare_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_compare_renderer_images)
+    set_tests_properties(edf_renderer_image_compare_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_custom_target(edf_renderer_ab_capture_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tools.test_compare_renderer_ab_captures
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_renderer_ab_capture_tests COMMAND ${Python3_EXECUTABLE} -m unittest tools.test_compare_renderer_ab_captures)
+    set_tests_properties(edf_renderer_ab_capture_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME edf_native_hook_boundary_audit
       COMMAND ${CMAKE_COMMAND}
         -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/guest_shader_bridge.cpp

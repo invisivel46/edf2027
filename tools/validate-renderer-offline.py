@@ -10,9 +10,18 @@ import sys
 import time
 import xml.etree.ElementTree as ET
 from renderer_dispatch import digest, source_manifest
-from renderer_offline_suites import CPU, RENDER
+from renderer_offline_suites import CPU, RENDER, quick_select
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def changed_since(ref):
+    """Paths changed between REF and the working tree, plus untracked files."""
+    def git(*command):
+        return subprocess.check_output(['git', *command], cwd=ROOT, text=True).split('\0')
+    names = git('diff', '--name-only', '-z', ref, '--')
+    names += git('ls-files', '--others', '--exclude-standard', '-z')
+    return sorted(set(filter(None, names)))
 
 
 def main():
@@ -20,16 +29,34 @@ def main():
     parser.add_argument('--build-dir', type=Path, default=ROOT / 'out/build/win-amd64-release')
     parser.add_argument('--suite', choices=['all', 'cpu', 'render'], default='all')
     parser.add_argument('--jobs', type=int, default=2)
+    parser.add_argument('--quick', action='store_true',
+                        help='Run only suites whose mapped sources changed since --since (not an acceptance gate)')
+    parser.add_argument('--since', metavar='REF', help='Git ref for --quick; working-tree and untracked changes count')
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error('--jobs must be positive')
+    if args.quick != bool(args.since):
+        parser.error('--quick and --since REF must be used together')
     build = args.build_dir.resolve()
     selected = (CPU if args.suite != 'render' else []) + (RENDER if args.suite != 'cpu' else [])
+    changed = None
+    if args.quick:
+        try:
+            changed = changed_since(args.since)
+        except (OSError, subprocess.CalledProcessError):
+            parser.error(f'cannot diff against git ref {args.since!r}')
+        selected = [name for name in quick_select(changed) if name in selected]
+        print(f'--quick: {len(changed)} changed file(s) since {args.since}; {len(selected)} suite(s) selected', flush=True)
+        if not selected:
+            print('Nothing to validate.')
+            return 0
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
     output = ROOT / 'out/renderer-offline' / stamp
     output.mkdir(parents=True)
-    report = dict(passed=False, suite=args.suite, selected=selected, build_dir=str(build),
+    report = dict(passed=False, suite='quick' if args.quick else args.suite, selected=selected, build_dir=str(build),
                   commands=[], game_booted=False, scope='Synthetic contracts and offscreen WARP; not gameplay parity')
+    if args.quick:
+        report.update(since=args.since, changed_files=changed, base_suite=args.suite)
     started = time.monotonic()
 
     def run(command, name, quiet=False):

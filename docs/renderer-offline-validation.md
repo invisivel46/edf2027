@@ -8,7 +8,7 @@ From the repository root in PowerShell:
 
 This is the default regression gate for renderer changes. It initializes the
 Visual Studio compiler environment, reconfigures the **existing** CMake cache,
-incrementally builds 27 test targets, and runs them serially. It preserves the
+incrementally builds 33 test targets, and runs them serially. It preserves the
 configured SDK. It does not build or launch `edf2027`, open a game window, read
 disc data, or require a save game. D3D11/D3D12 WARP and the Windows graphics
 development environment are required for the offscreen tests. Missing graphics
@@ -34,13 +34,15 @@ is the evidence to attach to a task. Build failures also produce a failed report
 
 ## Existing suites wrapped
 
-`--suite cpu` runs 20 suites: scalar effect rules, three-way scalar execution,
+`--suite cpu` runs 26 suites: scalar effect rules, three-way scalar execution,
 scalar analysis rules, original scalar getter contracts,
 setter analysis rules, original scalar setter contracts,
 frame dispatch, shader binding, material render
 state, material samplers, capture policy, pacing, scripted input reload, backend
 abstraction, upload ring, decode workers, effects, display gamma, worker callback
-audit and model constructor orchestration. Some use extracted production code
+audit, model constructor orchestration, bucket dispatch, map effects, A/B
+alternation, and the Python runtime-gate, image-compare and A/B-capture tool
+tests (CTest wrappers over synthetic logs/images). Some use extracted production code
 with synthetic/stub dependencies; they do not execute retail callbacks.
 
 `--suite render` runs seven suites: native scene, backend completion, backend UI,
@@ -53,6 +55,15 @@ Focused groups are useful while iterating; their reports explicitly identify the
 reduced scope. The allowlist lives in `tools/renderer_offline_suites.py`, shared
 with dispatch acceptance. Reports bind source content before and after validation;
 the gate fails if source changes during its run.
+
+For iteration, `--quick --since <git-ref>` runs only the suites whose mapped
+files (`SOURCES` in `tools/renderer_offline_suites.py`: each suite's test source
+and the tool or fixture it alone exercises) changed between the ref and the
+working tree, untracked files included. Changes under `docs/`, `knowledge/` or to
+`.md` files select nothing; any other unmapped change (shared `src/`, CMake,
+generated code, shared fixtures) selects every suite. The report records
+`suite: "quick"` and the changed files, so dispatch acceptance still rejects it;
+run the full gate before submitting.
 
 Window/presentation tests, SDK-host integration, guest-memory and extracted
 immediate/present-tail suites, asset checkers and other legacy render tests are
