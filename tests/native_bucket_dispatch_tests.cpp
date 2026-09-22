@@ -150,7 +150,7 @@ void TestKeys() {
   Require(Check(1,1.0f,1.0f,0.0f,100.25f,"mode1 plain")==100,"mode1 plain key");
   Require(Check(1,1.0f,1.0f,0.0f,255.9f,"mode1 low byte")==255,"low byte");
   Require(Check(1,1.0f,1.0f,0.0f,256.0f,"mode1 high byte")==256,"high byte");
-  Require(Check(1,2.0f,100.0f,5.0f,300.0f,"mode1 clamp high")==65535,"upper clamp");
+  Require(Check(1,2.0f,100.0f,5.0f,400.0f,"mode1 clamp high")==65535,"upper clamp"); // (400*100+5)*2=80010
   Require(Check(1,1.0f,1.0f,0.0f,65535.0f,"mode1 at maximum")==65535,"maximum passes");
   Require(Check(1,1.0f,1.0f,0.0f,65534.996f,"mode1 below maximum")==65534,"truncation below maximum");
   Require(Check(1,1.0f,1.0f,0.0f,-1.0f,"mode1 negative")==0,"negative depth");

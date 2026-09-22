@@ -4252,8 +4252,11 @@ REX_HOOK_RAW(sub_821D96D8) {
   } restore{group,group_address};
   edf::native::native_queued_scene_group=&group;
   if(!REXCVAR_GET(edf_native_scene_queued)) {
+    // No queued group without the queued scene: the indexed draw hook treats a
+    // set group as a queued instance, and every guest draw then threw and
+    // recorded its setup twice (about 7 ms/frame in Mission 1 gameplay).
+    edf::native::native_queued_scene_group=nullptr;
     if(edf::native::native_material_pass_cursor) edf::native::native_material_pass_cursor->reset();
-    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::OriginalGroup);
     __imp__sub_821D96D8(ctx,base); group.execution.Complete(); return;
   }
   size_t native_queue_size=0;
