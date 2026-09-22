@@ -3993,12 +3993,10 @@ REX_HOOK_RAW(sub_821C61D8) {
   edf::native::TraverseNativeSceneTree(tree_reader,manager,[&](uint32_t node) {
     const auto& view=walk_view.view.Get(edf::native::BridgeWalkLock::guest_calls,
       [&] { return edf::native::ReadNativeSceneVisibilityView(window,context); });
-    const auto center=edf::native::ReadNativeVisibilityFloats<4>(tree_reader,reader.Add(node,32));
-    const auto transformed=edf::native::NativeVisibilityTransform(center,view.matrix);
-    const auto radius=std::bit_cast<float>(tree_reader.Word(reader.Add(node,64)));
-    const auto sphere=edf::native::NativeVisibilitySphere(view,transformed,radius);
-    const auto result=sphere==2?edf::native::NativeVisibilityAabb(view,center,
-      edf::native::ReadNativeVisibilityFloats<4>(tree_reader,reader.Add(node,48))):sphere;
+    const auto node_class=edf::native::ClassifyNativeSceneTreeNode(tree_reader,node,view);
+    const auto& transformed=node_class.transformed;
+    const auto radius=node_class.radius;
+    const auto sphere=node_class.sphere,result=node_class.result;
     if(audit) {
       const auto camera=reader.Word(reader.Add(context,16));
       for(uint32_t i=0;i<4;++i) reader.StoreWord(reader.Add(stack,80+i*4),std::bit_cast<uint32_t>(transformed[i]));
@@ -5367,7 +5365,7 @@ REX_HOOK_RAW(sub_820B4038) {
           ++mismatches; object=live;
         }
       }
-      auto center=NativeVisibilityTransform({object.box[0],object.box[1],object.box[2],object.box[3]},view.matrix);
+      auto center=NativeVisibilityCenter(view,object);
       if(audit) {
         const auto camera=reader.Word(reader.Add(context,16));
         work.r3.u64=work.r1.u32+80; work.r4.u64=reader.Add(owner,288); work.r5.u64=reader.Add(camera,96);
@@ -5392,11 +5390,13 @@ REX_HOOK_RAW(sub_820B4038) {
       // Re-admitted here, not after the callback that dropped it.
       if(!center_destination) center_destination=const_cast<uint8_t*>(cpu.WritableBytes(cpu.Add(context,32),16,4));
       StoreGuestCpuWords(std::span<uint8_t>{center_destination,16},encoded_center);
-      const float depth=-float(center[2]*view.depth_scale);
-      bool visible=!(depth>object.distance);
+      // The shared decision (native_scene_visibility.h); the audit below may
+      // still replace its classification with the original's.
+      const auto selection=SelectNativeVisibility(view,object,center);
+      bool visible=selection.in_range;
       if(visible) {
-        auto sphere=NativeVisibilitySphere(view,center,object.radius);
-        auto box=sphere==2?NativeVisibilityBox(view,object.box):sphere;
+        auto sphere=selection.sphere;
+        auto box=selection.box;
         if(audit) {
           const auto camera=reader.Word(reader.Add(context,16));
           work.r3.u64=reader.Add(camera,288); work.r4.u64=reader.Add(context,32); work.f1.f64=object.radius;
@@ -5428,7 +5428,7 @@ REX_HOOK_RAW(sub_820B4038) {
         // lod: the direct-render test, the LOD's parts and their groups.
         HookTiming lod_timing(HookPhase::RenderGatherLod,phase_timing);
         if(direct()) {
-          const auto parts=source.Lod(NativeVisibilityLod(object,depth));
+          const auto parts=source.Lod(selection.lod);
           native_selected=parts.has_value();
           if(parts) for(const auto& part:*parts) {
             if(!part.group || (!queues->Contains(part.group) &&

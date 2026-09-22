@@ -20,6 +20,7 @@
 #include "native_graphics/native_static_world_resolve.h"
 #include "native_graphics/native_static_world_pass.h"
 #include "native_graphics/native_static_world_cache.h"
+#include "native_graphics/native_full_frame_static_world.h"
 #include "native_graphics/native_texture_binding.h"
 #include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d12_backend.h"
@@ -1096,6 +1097,158 @@ void StaticWalkPlan() {
   // A torn list is rejected, not planned.
   r.StoreWord(owner+372,0);
   Reject([&] { plans.Publish(r,owner,4,sources.CandidateRevision(),find); });
+}
+// The full-frame static world from published data only. Octree: root0 an
+// inside leaf, root1 a leaf behind the camera, root2 an intersecting internal
+// node whose child 0 is inside and child 1 outside. Frustum: |x|<z, |y|<z,
+// 1<=z<=1000, identity view, depth = z.
+void FullFrameStaticWorld() {
+  std::vector<uint8_t> memory(0x10000);
+  const GeometryRetryReader r{memory};
+  const auto store=[&](uint32_t at,std::initializer_list<float> values) {
+    for(const auto value:values) { r.StoreWord(at,std::bit_cast<uint32_t>(value)); at+=4; }
+  };
+  constexpr uint32_t world=0x1000,levels=0x2000,root0=0x3000,root1=root0+144,root2=root1+144,children=0x4000;
+  constexpr uint32_t child_a=children,child_b=children+144;
+  r.StoreWord(world+52,levels); r.StoreWord(world+56,levels+32);
+  r.StoreWord(levels+20,root0); r.StoreWord(levels+24,root2+144);
+  const auto node=[&](uint32_t at,std::array<float,3> center,float extent,float radius) {
+    r.StoreWord(at+116,1); store(at+32,{center[0],center[1],center[2],1,extent,extent,extent,0,radius});
+  };
+  node(root0,{0,0,50},5,5); node(root1,{0,0,-50},5,5); node(root2,{30,0,50},30,30);
+  for(uint32_t i=0;i<8;++i) r.StoreWord(root2+84+i*4,children+i*144);
+  node(child_a,{0,0,50},1,1); node(child_b,{60,0,20},1,1);
+  const std::shared_ptr<const NativeSceneTreeImage> image=CaptureNativeSceneTree(r,world);
+  // Objects: A near (LOD 0), B far (LOD 1), C beyond its distance, D outside the
+  // frustum, E bucket mode, F hidden, G a second leaf, H only in the culled
+  // leaf, I in world+372 with a group outside the order, J without route words.
+  constexpr uint32_t A=0x6000,B=0x6100,C=0x6200,D=0x6300,E=0x6400,F=0x6500,G=0x6600,H=0x6700,I=0x6800,J=0x6900;
+  constexpr uint32_t G1=0x8100,G2=0x8200,G3=0x8300;
+  NativeSceneSources sources;
+  NativeFullFrameStaticRoutes routes;
+  std::map<uint32_t,NativeSceneVisibility> records;
+  // Each owner's world: identity with its own x translation (row-major registers).
+  const auto translation=[](uint32_t owner) { return float(owner>>8); };
+  const auto object=[&](uint32_t owner,std::array<float,3> center,float distance,uint32_t lods,
+      std::vector<NativeSceneSources::Part> parts,std::optional<NativeFullFrameStaticRoute> route=NativeFullFrameStaticRoute{true,0,0}) {
+    sources.Born(owner);
+    for(auto& part:parts) { part.world_data=owner+0x80; part.world_first=0; }
+    Require(sources.Observe(owner,parts),"full-frame fixture parts");
+    NativeSceneVisibility visibility;
+    visibility.box={center[0],center[1],center[2],1, 1,0,0,0, 0,1,0,0, 0,0,1,0};
+    visibility.radius=1.7f; visibility.distance=distance; visibility.lod_count=lods; visibility.lod_thresholds={100,0};
+    sources.PublishVisibility(owner,visibility); records[owner]=visibility;
+    NativeSceneSources::World registers{};
+    auto matrix=kNativeSceneIdentity; matrix[12]=translation(owner);
+    for(size_t i=0;i<16;++i) for(size_t byte=0;byte<4;++byte)
+      registers[i*4+byte]=uint8_t(std::bit_cast<uint32_t>(matrix[i])>>(24-byte*8));
+    sources.PublishWorld(owner,registers);
+    if(route) routes[owner]=*route;
+  };
+  using P=NativeSceneSources::Part;
+  object(A,{0,0,50},1000,2,{P{0x7000,0,0,0,G1},P{0x7100,1,0,0,G1}});
+  object(B,{0,0,300},1000,2,{P{0x7200,0,0,0,G2},P{0x7300,1,0,0,G1}});
+  object(C,{0,0,500},400,1,{P{0x7700,0,0,0,G1}});
+  object(D,{100,0,50},1000,1,{P{0x7800,0,0,0,G1}});
+  object(E,{0,0,50},1000,1,{P{0x7900,0,0,0,G1}},NativeFullFrameStaticRoute{true,1,0});
+  object(F,{0,0,50},1000,1,{P{0x7a00,0,0,0,G1}},NativeFullFrameStaticRoute{true,0,1});
+  object(G,{0,5,60},1000,1,{P{0x7400,0,0,0,G2},P{0x7500,0,1,0,G1}});
+  object(H,{0,0,50},1000,1,{P{0x7b00,0,0,0,G1}});
+  object(I,{0,0,40},1000,1,{P{0x7600,0,0,0,G3}});
+  object(J,{0,0,50},1000,1,{P{0x7c00,0,0,0,G1}},std::nullopt);
+  auto lists=std::make_shared<NativeSceneMembership::Publication>();
+  const auto list=[&](uint32_t address,std::vector<uint32_t> owners) {
+    auto snapshot=std::make_shared<NativeSceneMembership::Snapshot>(); snapshot->end=address+8;
+    for(const auto owner:owners) snapshot->members.push_back({owner+0x10,owner});
+    lists->lists[address]=std::move(snapshot);
+  };
+  list(root0+120,{A,B,C,D,E,F}); list(root1+120,{H}); list(child_a+120,{A,G}); list(world+372,{I,J});
+  NativeScenePublication publication;
+  publication.sources=sources.AcquireSnapshot(); publication.membership=lists;
+  publication.trees[world]=image;
+  publication.group_order.Set(world,std::make_shared<const NativeSceneGroupOrder>(NativeSceneGroupOrder{G2,G1}));
+  NativeFullFrameStaticCamera camera;
+  camera.visibility.matrix=kNativeSceneIdentity; camera.visibility.depth_scale=-1;
+  auto& f=camera.visibility.frustum;
+  f[8]=1; f[10]=-1; f[12]=-1; f[14]=-1; f[17]=1; f[18]=-1; f[21]=-1; f[22]=-1; f[24]=1; f[25]=1000;
+  // No guest reads: the arena is gone before the frame is selected, and a
+  // read outside the published image throws instead of reaching memory.
+  std::fill(memory.begin(),memory.end(),uint8_t(0xcd));
+  const NativeSceneTreeImageReader image_reader(*image);
+  Reject([&] { image_reader.Word(root1+120); });
+  Reject([&] { image_reader.Word(world+100); });
+  const auto selection=SelectNativeFullFrameStaticWorld(publication,camera,routes);
+  const auto& s=selection.stats;
+  Require(s.worlds==1 && s.nodes_classified==5 && s.lists==3 && !s.missing_lists && s.members==10 && s.duplicates==1 &&
+    s.unrouted==1 && s.not_direct==2 && s.culled_distance==1 && s.culled_frustum==1 && s.visible==4 && s.selected==4 &&
+    s.parts==5 && s.unordered_groups==1 && s.unordered_parts==1 && s.tree_reads>0,"full-frame traversal or culling statistics");
+  using Object=NativeFullFrameStaticSelection::Object;
+  Require(selection.objects==std::vector<Object>{{A,0},{B,1},{G,0},{I,0}},"full-frame traversal selected other objects");
+  Require(selection.owners.size()==1 && selection.owners[0].owner==world && selection.owners[0].groups.size()==2 &&
+    selection.owners[0].groups[0].group==G2 && selection.owners[0].groups[0].instances==std::vector<uint32_t>{0x7400} &&
+    selection.owners[0].groups[1].group==G1 && selection.owners[0].groups[1].instances==std::vector<uint32_t>{0x7500,0x7300,0x7000},
+    "full-frame selection lost the published group order or the queue order");
+  // The LOD is the one the existing selection computes from the view depth.
+  for(const auto& chosen:selection.objects) {
+    const auto& record=records.at(chosen.owner);
+    const auto center=NativeVisibilityTransform({record.box[0],record.box[1],record.box[2],record.box[3]},camera.visibility.matrix);
+    Require(chosen.lod==NativeVisibilityLod(record,-float(center[2]*camera.visibility.depth_scale)),"full-frame LOD differs from NativeVisibilityLod");
+  }
+  // A camera with three times the depth scale: A (150) switches to LOD 1, B
+  // (900) stays at LOD 1 inside its distance, the frustum set is unchanged.
+  auto near_camera=camera;
+  near_camera.visibility.depth_scale=-3;
+  const auto moved=SelectNativeFullFrameStaticWorld(publication,near_camera,routes);
+  Require(moved.objects==std::vector<Object>{{A,1},{B,1},{G,0},{I,0}} &&
+    moved.owners.at(0).groups.at(1).instances==std::vector<uint32_t>{0x7500,0x7300,0x7100},
+    "full-frame LOD ignored the camera depth");
+  // Draws: one instanced draw per group, in the published order, each group's
+  // material resolved once and cached across frames.
+  auto program=std::make_shared<NativeSceneMaterialProgram>();
+  program->inputs.vertex=0x9100; program->inputs.pixel=0x9200;
+  program->inputs.vertex_registers.push_back({"g_mWorld",0,4});
+  for(const auto group:{G1,G2,G3}) {
+    const auto revision=publication.sources->FindGroup(group)->revision;
+    auto material=std::make_shared<NativeSceneGroupMaterial>(); material->group=group; material->revision=revision; material->program=program;
+    publication.group_materials.push_back(material);
+    auto geometry=std::make_shared<NativeSceneGroupGeometry>(); geometry->group=group; geometry->revision=revision;
+    publication.group_geometry.push_back(geometry);
+  }
+  NativeFullFrameStaticPass pass;
+  pass.targets.dsv_format=DXGI_FORMAT_D24_UNORM_S8_UINT; pass.targets.rtv_format[0]=DXGI_FORMAT_R8G8B8A8_UNORM;
+  const auto base=NativeFullFrameStaticBaseState(pass.targets);
+  const auto decoded=DecodeNativeRenderState(base.render.words);
+  Require(decoded.depth_enable && decoded.depth_write && decoded.depth_func==4 && !decoded.blend_enable &&
+    decoded.write_mask==15 && decoded.cull==kNativeCullBack && !decoded.front_counter_clockwise && !decoded.scissor,
+    "full-frame static base state is not opaque depth-tested LESS_EQUAL with back-face culling");
+  std::vector<uint32_t> resolved;
+  const auto resolve=[&](const NativeSceneGroupMaterial& group,const auto&,const NativeSceneMaterialPassState& state,auto) {
+    Require(state==base,"full-frame material resolved against a chained state");
+    resolved.push_back(group.group);
+    NativeFullFrameStaticMaterial result; result.render=state.render.words;
+    return result;
+  };
+  NativeFullFrameStaticWorld pass_world;
+  const auto frame=pass_world.Build(publication,camera,routes,pass,resolve);
+  Require(resolved==std::vector<uint32_t>{G2,G1} && frame.stats.resolves==2 && !frame.stats.cache_hits &&
+    frame.draws.size()==2 && frame.stats.instances==4 && frame.stats.fresh_objects==4 && !frame.stats.world_declines,
+    "full-frame draws were not one resolve and one draw per group");
+  const auto& g2=frame.draws[0]; const auto& g1=frame.draws[1];
+  Require(g2.group==G2 && g2.instances.size()==1 && g1.group==G1 && g1.instances.size()==3,"full-frame draws lost the group order");
+  const std::array<uint32_t,3> g1_owners{G,B,A};
+  for(size_t i=0;i<g1.instances.size();++i) {
+    const auto& instance=*g1.instances[i];
+    Require(instance.object.geometry==g1.geometry && instance.object.material==g1.material &&
+      instance.object.world[12]==translation(g1_owners[i]) && instance.previous==instance.object.world,
+      "full-frame instance does not share its group's draw or lost its published world");
+  }
+  Require(g1.Snapshot().instances.size()==3,"full-frame draw snapshot");
+  const auto again=pass_world.Build(publication,near_camera,routes,pass,resolve);
+  Require(resolved.size()==2 && again.stats.cache_hits==again.stats.groups-again.stats.missing_group && !again.stats.resolves,
+    "a moved camera re-resolved cached group materials");
+  auto other=pass; other.targets.reverse_depth=true;
+  pass_world.Build(publication,camera,routes,other,resolve);
+  Require(resolved.size()==4,"changed targets reused a cached material");
 }
 void GroupOrder() {
   std::vector<uint8_t> memory(0x1000);
@@ -2681,7 +2834,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
-    GroupOrder(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
+    GroupOrder(); FullFrameStaticWorld(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

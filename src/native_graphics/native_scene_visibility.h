@@ -106,6 +106,34 @@ inline uint32_t NativeVisibilityLod(const NativeSceneVisibility& object,float de
     if(depth>object.lod_thresholds[next-1]) lod=next;
   return lod;
 }
+// One static object's per-frame visibility and LOD, as 820B4038 decides it
+// (the native path of its hook): the box center in view space, the view
+// depth, the distance cull, sphere then box classification, and the LOD the
+// depth selects. The hook and the full-frame static world both call these, so
+// the two cannot drift. The center is its own step because the hook's audit
+// may replace it with the original's before the rest runs.
+inline std::array<float,4> NativeVisibilityCenter(const NativeSceneVisibilityView& view,const NativeSceneVisibility& object) {
+  return NativeVisibilityTransform({object.box[0],object.box[1],object.box[2],object.box[3]},view.matrix);
+}
+struct NativeVisibilitySelection {
+  float depth=0;
+  bool in_range=false;      // Not beyond the object's cull distance.
+  uint32_t sphere=0,box=0;  // Classifications (0 outside); computed only in range.
+  uint32_t lod=0;
+  bool visible() const { return in_range && box!=0; }
+};
+inline NativeVisibilitySelection SelectNativeVisibility(const NativeSceneVisibilityView& view,
+    const NativeSceneVisibility& object,const std::array<float,4>& center) {
+  NativeVisibilitySelection result;
+  result.depth=-float(center[2]*view.depth_scale);
+  result.in_range=!(result.depth>object.distance);
+  if(result.in_range) {
+    result.sphere=NativeVisibilitySphere(view,center,object.radius);
+    result.box=result.sphere==2?NativeVisibilityBox(view,object.box):result.sphere;
+  }
+  result.lod=NativeVisibilityLod(object,result.depth);
+  return result;
+}
 template<size_t N,class Reader>
 std::array<float,N> ReadNativeVisibilityFloats(const Reader& reader,uint32_t address) {
   const auto words=ReadGuestWords<N>(reader,address);

@@ -63,12 +63,33 @@ inline uint32_t NativeVisibilityAabb(const NativeSceneVisibilityView& view,
   return 2;
 }
 
-// Reads remain at callback boundaries until hierarchy publication is migrated.
-// Classify returns outside/inside/intersecting, and visit consumes a leaf list.
+// One octree node's classification as 821C61D8 makes it: the bounding sphere
+// (center node+32 in view space, radius node+64), then the AABB (node+32
+// center, node+48 half extents) when the sphere intersects. Reads only the
+// bytes a tree image captures. transformed and radius are kept for audits.
+struct NativeSceneTreeNodeClass {
+  std::array<float,4> center{},transformed{};
+  float radius=0;
+  uint32_t sphere=0,result=0;
+};
+template<class Reader>
+NativeSceneTreeNodeClass ClassifyNativeSceneTreeNode(const Reader& reader,uint32_t node,const NativeSceneVisibilityView& view) {
+  NativeSceneTreeNodeClass value;
+  value.center=ReadNativeVisibilityFloats<4>(reader,reader.Add(node,32));
+  value.transformed=NativeVisibilityTransform(value.center,view.matrix);
+  value.radius=std::bit_cast<float>(reader.Word(reader.Add(node,64)));
+  value.sphere=NativeVisibilitySphere(view,value.transformed,value.radius);
+  value.result=value.sphere==2?NativeVisibilityAabb(view,value.center,ReadNativeVisibilityFloats<4>(reader,reader.Add(node,48))):value.sphere;
+  return value;
+}
+// The walk of 821C61D8 without its manager+100/+104 counter stores: reads
+// only owner+52 (levels), the root extent at levels+20 and, per node, +116
+// occupancy, +84 children and what classify reads - all bytes a
+// NativeSceneTreeImage captures. classify runs for each occupied node not
+// already accepted by an inside ancestor (0 outside, 1 inside, 2 intersecting);
+// visit receives each accepted occupied leaf's list (node+120).
 template<class Reader,class Classify,class Visit>
-void TraverseNativeSceneTree(const Reader& reader,uint32_t manager,Classify classify,Visit visit) {
-  reader.StoreWord(reader.Add(manager,100),0);
-  reader.StoreWord(reader.Add(manager,104),0);
+void WalkNativeSceneTree(const Reader& reader,uint32_t manager,Classify&& classify,Visit&& visit) {
   const auto levels=reader.Word(reader.Add(manager,52));
   const auto level_end=reader.Word(reader.Add(manager,56));
   if(!levels || level_end<levels || level_end-levels<32)
@@ -81,8 +102,6 @@ void TraverseNativeSceneTree(const Reader& reader,uint32_t manager,Classify clas
     if(depth>128) throw std::runtime_error("native scene tree depth exceeds limit");
     if(!reader.Word(reader.Add(node,116))) return;
     if(!accepted) {
-      const auto count=reader.Add(manager,100);
-      reader.StoreWord(count,reader.Word(count)+1);
       const auto result=classify(node);
       if(!result) return;
       accepted=result==1;
@@ -98,5 +117,19 @@ void TraverseNativeSceneTree(const Reader& reader,uint32_t manager,Classify clas
     if(root>=reader.Word(reader.Add(roots,8))) throw std::runtime_error("native scene root iterator invalidated");
     root=reader.Add(root,144);
   }
+}
+// Reads remain at callback boundaries until hierarchy publication is migrated.
+// Classify returns outside/inside/intersecting, and visit consumes a leaf list.
+// The guest walk: zeroes manager+100/+104 and counts each classification in
+// manager+100, before classify runs, as 821C61D8 does.
+template<class Reader,class Classify,class Visit>
+void TraverseNativeSceneTree(const Reader& reader,uint32_t manager,Classify classify,Visit visit) {
+  reader.StoreWord(reader.Add(manager,100),0);
+  reader.StoreWord(reader.Add(manager,104),0);
+  WalkNativeSceneTree(reader,manager,[&](uint32_t node) {
+    const auto count=reader.Add(manager,100);
+    reader.StoreWord(count,reader.Word(count)+1);
+    return classify(node);
+  },visit);
 }
 }
