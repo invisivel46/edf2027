@@ -46,6 +46,7 @@
 #include "native_shader_binding.h"
 #include "native_frame_dispatch.h"
 #include "native_bucket_dispatch.h"
+#include "native_map_effects.h"
 #include "native_scene_tree.h"
 #include "native_scene_walk_lock.h"
 #include "native_scene_tree_publication.h"
@@ -3184,7 +3185,6 @@ EDF_RENDER_PHASE(820D3FD0, RenderOverlay)
 EDF_RENDER_PHASE(821BE9D8, RenderSceneEnd)
 EDF_RENDER_PHASE(820B0B80, RenderFinish)
 EDF_RENDER_PHASE(821C9478, RenderPose)
-EDF_RENDER_PHASE(820B35A0, RenderList)
 REXCVAR_DEFINE_BOOL(edf_native_scene_tree,false,"EDF2027",
   "Use native spatial tree traversal and culling; leaf callbacks remain explicit.");
 REXCVAR_DEFINE_BOOL(edf_native_scene_tree_published,false,"EDF2027",
@@ -3440,6 +3440,78 @@ REX_HOOK_RAW(sub_821C3BB8) {
   });
 }
 #undef EDF_RENDER_PHASE
+REXCVAR_DEFINE_BOOL(edf_native_map_effect_census,false,"EDF2027",
+  "Tally map-effect objects by (vtable, mode, slot-4 method) before each map-effect walk; log the top classes every 600 frames.");
+REXCVAR_DEFINE_BOOL(edf_native_map_effect_list,false,"EDF2027",
+  "Walk the map-effect list (sub_820B35A0) natively; each object still goes through the hooked sub_821C0C00.");
+namespace {
+// Render helper entries (sub_821A5080), one per frame; census periods count these.
+std::atomic<uint64_t> native_render_frames{0};
+// Unvalidated big-endian words at the same host address REX_LOAD_U32 and
+// REX_STORE_U32 use, so the native walk faults exactly where the guest would.
+struct NativeRawGuestWords {
+  uint8_t* base;
+  static uint32_t Add(uint32_t address,uint32_t offset) { return address+offset; }
+  uint8_t* Host(uint32_t address) const { return base+address+(address>=0xE0000000u?0x1000u:0u); }
+  uint32_t Word(uint32_t address) const { return edf::native::GuestBlockWord(Host(address)); }
+  void StoreWord(uint32_t address,uint32_t value) const {
+    auto* p=Host(address); for(uint32_t i=0;i<4;++i) p[i]=uint8_t(value>>(24-i*8));
+  }
+};
+void RecordNativeMapEffectCensus(uint8_t* base,uint32_t list) {
+  constexpr uint64_t period=600;
+  static std::mutex mutex;
+  static edf::native::NativeMapEffectCensus census;
+  static uint64_t first_frame=0,failures=0;
+  const auto frame=native_render_frames.load(std::memory_order_relaxed);
+  std::lock_guard lock(mutex);
+  if(!census.walks()) first_frame=frame;
+  try {
+    const edf::native::GuestReader reader(base);
+    const edf::native::NativeSceneCpuWindow window(reader);
+    census.Record(window,list);
+  } catch(const std::exception& error) {
+    if(failures++<8) REXLOG_ERROR("Native map-effect census: walk failed list={:#x}: {}",list,error.what());
+  }
+  const auto frames=frame-first_frame;
+  if(frames<period) return;
+  REXLOG_INFO("Native map-effect census: frames={} walks={} objects={} per_frame={:.1f} classes={} truncated={} failures={}",
+    frames,census.walks(),census.objects(),double(census.objects())/double(frames),census.classes(),census.truncated(),failures);
+  uint32_t rank=0;
+  for(const auto& row:census.Top(16)) {
+    const auto* name=edf::native::NativeMapEffectClassName(row.key.vtable);
+    REXLOG_INFO("Native map-effect census: #{} vtable={:#x} class={} mode={} render={:#x} count={} share={:.2f}% hidden={}",
+      ++rank,row.key.vtable,name?name:"?",row.key.mode,row.key.render,row.count,row.percent,row.hidden);
+  }
+  census.Reset();
+}
+}
+REX_EXTERN(__imp__sub_820B35A0);
+REX_EXTERN(sub_821C0C00);
+// clMapEffectManager slot 2 (sub_820B3610 tail-calls with r4=manager+48,
+// r5=context). The native walk replaces only the loop: same frame size and
+// back chain, same object/context registers and return address per call, next
+// link read after each callback, and nonvolatile/stack/lr state restored as
+// __restgprlr_29 does. Volatile registers are left as the last callee left them.
+REX_HOOK_RAW(sub_820B35A0) {
+  edf::native::HookTiming timing(edf::native::HookPhase::RenderList);
+  if(REXCVAR_GET(edf_native_map_effect_census)) RecordNativeMapEffectCensus(base,ctx.r4.u32);
+  if(!REXCVAR_GET(edf_native_map_effect_list)) { __imp__sub_820B35A0(ctx,base); return; }
+  const NativeRawGuestWords words{base};
+  auto work=ctx;
+  const auto stack=work.r1.u32-112;
+  words.StoreWord(stack,work.r1.u32); work.r1.u64=stack;
+  const auto context=ctx.r5.u64;
+  edf::native::WalkNativeMapEffects(words,ctx.r4.u32,[&](uint32_t object) {
+    work.r4.u64=context; work.r3.u64=object; work.lr=0x820B35E4;
+    // Single per-object call site. The mode-1/2 bucket port
+    // (native_bucket_dispatch.h) takes over here; everything else stays guest.
+    sub_821C0C00(work,base);
+  });
+  work.r11.u64=0; work.cr6.compare<uint32_t>(work.r11.u32,0,work.xer);
+  work.r1=ctx.r1; work.lr=ctx.lr; work.r29=ctx.r29; work.r30=ctx.r30; work.r31=ctx.r31;
+  ctx=work;
+}
 REX_EXTERN(__imp__sub_821D96D8);
 REX_EXTERN(__imp__sub_821BEE68);
 REX_HOOK_RAW(sub_821BEE68) {
@@ -4497,6 +4569,7 @@ REX_HOOK_RAW(sub_821A5080) {
       REXLOG_INFO("ab_alternate frame={} native={}",frame,ab_native?1:0);
   }
   const edf::native::NativeAbSideLatch ab_latch(ab_native);
+  native_render_frames.fetch_add(1,std::memory_order_relaxed);
   edf::native::NativeSceneQueues queues;
   struct RestoreSceneQueues {
     uint32_t animation_owner=edf::native::native_scene_animation_owner;
