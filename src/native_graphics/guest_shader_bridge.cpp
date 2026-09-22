@@ -3379,7 +3379,9 @@ REX_HOOK_RAW(sub_820B4310) {
     work.r3.u64=owner; work.r4.u64=context; work.lr=0x820B4344; sub_821C61D8(work,base);
     // The static opaque world pass: native groups in published order, guest
     // 821D96D8 per unsupported group, original 821C3BB8 when no order applies.
-    if(edf::native::NativeStaticWorldPassEnabled()) edf::native::RenderNativeStaticWorldPass(work,base,owner);
+    // edf_native_ab_alternate latches a guest side on alternate frames for image A/B.
+    if(edf::native::NativeStaticWorldPassEnabled() && edf::native::NativeAbNativeSide())
+      edf::native::RenderNativeStaticWorldPass(work,base,owner);
     else { work.r3.u64=reader.Add(owner,240); work.lr=0x820B434C; sub_821C3BB8(work,base); }
   } else __imp__sub_820B4310(ctx,base);
 }
