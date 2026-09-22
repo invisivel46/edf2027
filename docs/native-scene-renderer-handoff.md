@@ -689,6 +689,8 @@ Remaining milestones (material programs, explicit sampler/state resolution and o
 
 `820B4250` (RenderWorld) increments object+364 and advances float+356 before effect parameters. The whole helper is not side-effect-free; move/preserve simulation effects before bypassing it.
 
+*Corrected 2026-09-22: see [renderer-status.md](renderer-status.md).*
+
 ## Audited data layouts and traps
 
 ### Static group geometry
@@ -728,6 +730,8 @@ Visibility preserves audited PPC rounding, sphere/OBB behavior, LOD, bounds, hid
 For the next tree audit: manager+48 level vector, begin+52/end+56, 32-byte records. Nodes are 144 bytes: center+32, half-extents+48, radius+64, eight children+84..112, occupancy+116, list header+120/end+132. Relevant functions: root walk `821C61D8`, recursive cull `821C5FC8`, accepted subtree `821C56C0`, manager construction/rebuild `821C7740`, spatial update `821C5730`, bounds recompute `821C5488`, hierarchy initializer `821C4F80`, AABB classifier `821C3178` using transform `821B0258`. Preserve debug manager+108 behavior calling vtable+24 or fall back.
 
 **`821C75D0` is a level-vector resize helper, not a manager destructor.** Actual manager lifetimes/writers still need auditing. Nonhierarchy lists at world+372 and overlay+48 are not all tracked.
+
+*Corrected 2026-09-22: see [renderer-status.md](renderer-status.md).*
 
 ## Build, test and gameplay workflow
 

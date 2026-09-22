@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Scalar automation pilot
 
 Implemented 2026-09-22: one batch extracts facts for 170 scalar functions and

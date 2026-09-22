@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Automating renderer reverse engineering
 
 Research date: 2026-09-22. Epistemic session: `session-20260922161343-da2e649e`.

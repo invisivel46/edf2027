@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # First implementation packet: one complete retained static group
 
 Execution update: see [current completion evidence](renderer-static-group-completion-progress.md).

@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Renderer task execution guide
 
 Generated from the authored playbooks. Read [the common workflow](renderer-task-workflow.md) before executing a task. The audit status and task IDs are preserved; detailed instructions are not new implementation evidence.

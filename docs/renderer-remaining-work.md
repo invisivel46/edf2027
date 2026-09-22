@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Renderer remaining-work ledger
 
 2026-09-22. Package index derived from [the evidence inventory](renderer-completion-inventory.md)

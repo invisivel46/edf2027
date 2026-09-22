@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Renderer coverage audit
 
 2026-09-22, `6e9c94b` plus the existing renderer worktree. This supersedes the provisional coverage checklist in `renderer-remaining-work.md`; R01–R10 remain package identifiers.

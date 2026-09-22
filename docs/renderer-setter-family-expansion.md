@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Setter family expansion
 
 The previous batch's 24 tested setter contracts are accepted as partial local

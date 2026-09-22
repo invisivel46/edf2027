@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Scalar setter automation pilot
 
 This batch extends the scalar getter pipeline with bounded integer setters. Run

@@ -279,6 +279,8 @@ and membership mutation must be accounted for when replacing this boundary.
 There are additional direct leaf lists at world+372 and overlay-object+48, so
 the registered static-owner catalog alone is not an authoritative pass list.
 
+*Corrected 2026-09-22: see [renderer-status.md](renderer-status.md).*
+
 The initial gameplay audit compared 11,025,360 sphere/box results with zero
 mismatches; it also checked retained metadata and center transforms. It consumed
 23,574,735 retained bounds and directly selected 4,497,829 static objects. Queue
@@ -663,3 +665,5 @@ helper wholesale would drop those updates. Their ownership/cadence must be
 resolved as part of migration rather than treating every render callback as
 side-effect-free. `820B2510` is a deallocation wrapper (counter decrement then
 tail call to `821E8CE8`), not proof of a specific scene-object destructor.
+
+*Corrected 2026-09-22: see [renderer-status.md](renderer-status.md).*

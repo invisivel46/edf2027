@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Renderer critical-path replacement backlog
 
 Generated from the source-verified atlas and coverage catalog. Counts are planning reach, not missing-function totals or completion percentages.

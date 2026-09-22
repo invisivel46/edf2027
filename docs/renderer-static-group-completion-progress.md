@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Static-group completion: current implementation evidence
 
 The full supported static-group goal remains active. This report updates the

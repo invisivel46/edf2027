@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Renderer coverage runtime audit
 
 2026-09-22. Two isolated D3D12 runs used the existing post-shader-ordering-fix

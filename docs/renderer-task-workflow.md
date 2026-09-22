@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Working instructions for a renderer task
 
 Work from `D:/roms2/edf2027` in PowerShell. The project is a Windows native

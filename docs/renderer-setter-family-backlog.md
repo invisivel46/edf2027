@@ -1,3 +1,5 @@
+> Historical as of 2026-09-22; current status in [renderer-status.md](renderer-status.md).
+
 # Remaining setter families
 
 Priority is a heuristic: straight-line integer first, then conditional, floating-point, transitive; coverage descending within each tier. Mnemonic similarity is not semantic equivalence or promised rule yield.
