@@ -53,6 +53,20 @@ struct GeometryFixtureReader {
   void StoreDoubleWord(uint32_t address,uint64_t value) const { REX_STORE_U64(address,value); }
   void StoreByte(uint32_t address,uint8_t value) const { REX_STORE_U8(address,value); }
 };
+// Eligibility traces the pass readers' retail image constants; a 1 MB arena
+// has no image, so serve 0x82000000+ from a small separate block.
+struct ImageBackedFixtureReader {
+  GeometryFixtureReader arena;
+  const std::vector<uint8_t>& image;
+  uint32_t Add(uint32_t address,uint32_t offset) const { return address+offset; }
+  const uint8_t* Bytes(uint32_t address,size_t bytes) const {
+    if(address<0x82000000u) return arena.Bytes(address,bytes);
+    const auto at=address-0x82000000u;
+    if(at>image.size() || bytes>image.size()-at) throw std::runtime_error("image fixture range");
+    return image.data()+at;
+  }
+  uint32_t Word(uint32_t address) const { return edf::native::GuestBlockWord(Bytes(address,4)); }
+};
 static void TestObservedVector(uint8_t* base,simde__m128i* destination,simde__m128i value) {
   simde_mm_store_si128(destination,value);
 }
@@ -2060,7 +2074,11 @@ int main() {
       NativeStaticGroupGpuInputs gpu;
       {
         const GeometryFixtureReader reader{actual->bytes.data()};
-        Require(AssessNativeStaticGroup(reader,device,0xf0000,setup)==NativeStaticGroupEligibility::Supported,
+        std::vector<uint8_t> image(0xa000);
+        for(const auto& [at,word]:{std::pair{0x3198u,0x42000000u},std::pair{0x964cu,0x3b808081u}})
+          for(unsigned i=0;i<4;++i) image[at+i]=uint8_t(word>>(24-i*8));
+        Require(AssessNativeStaticGroup(ImageBackedFixtureReader{reader,image},device,0xf0000,setup)==
+          NativeStaticGroupEligibility::Supported,
           "integrated static group no longer satisfies production eligibility");
         const auto capture=[&](uint32_t address,size_t bytes) {
           const auto* begin=reader.Bytes(address,bytes); return std::vector<uint8_t>(begin,begin+bytes);

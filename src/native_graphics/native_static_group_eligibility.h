@@ -15,12 +15,13 @@ template<class Reader> struct NativeStaticReadTrace {
   std::vector<NativeStaticReadRange>& reads;
   NativeStaticReadRange untraced{0,0};
   uint32_t Add(uint32_t address,uint32_t offset) const { return backing.Add(address,offset); }
-  uint32_t Word(uint32_t address) const {
-    if(uint64_t(address)-untraced.address>=untraced.bytes) reads.push_back({address,4});
-    return backing.Word(address);
+  void Record(uint32_t address,size_t bytes) const {
+    const auto at=uint64_t(address)-untraced.address;
+    if(at>=untraced.bytes || bytes>untraced.bytes-at) reads.push_back({address,bytes});
   }
+  uint32_t Word(uint32_t address) const { Record(address,4); return backing.Word(address); }
   const uint8_t* Bytes(uint32_t address,size_t bytes) const {
-    reads.push_back({address,bytes}); return backing.Bytes(address,bytes);
+    Record(address,bytes); return backing.Bytes(address,bytes);
   }
 };
 // Deferred-group contract: retained indexed geometry, the native constant,
@@ -48,7 +49,21 @@ NativeStaticGroupEligibility AssessNativeStaticGroup(const Reader& reader,uint32
   if(!program.vertex || !program.pixel || program.vertex!=geometry.shader) return Result::Geometry;
   const auto word=[&](uint32_t offset) { return reader.Word(reader.Add(device,offset)); };
   std::vector<NativeStaticReadRange> writes;
-  auto pass=ReadNativeMaterialRenderPassMirrors(reader,device);
+  // Pass inputs through the same readers prepare and the state/texture
+  // executors run: the live render pass (8200964C color scale check) and every
+  // slot's sampler pass (bias scale 82003198, the anisotropy table entry the
+  // slot's device byte selects). Device mirrors among them are the modeled
+  // pass; state/sampler operations replay their own writes, so only shader
+  // defaults can change them unmodeled. Reads outside the device join the
+  // alias preflight like the program's own tables.
+  std::vector<NativeStaticReadRange> pass_reads,mirrors;
+  const NativeStaticReadTrace<Reader> pass_trace{reader,pass_reads};
+  NativeMaterialRenderPass pass;
+  try { pass=ReadNativeMaterialRenderPass(pass_trace,device); }
+  catch(const std::exception&) { return Result::PassState; }
+  try { for(uint32_t slot=0;slot<16;++slot) ReadNativeMaterialSamplerPass(pass_trace,device,slot); }
+  catch(const std::exception&) { return Result::TextureOrState; }
+  for(const auto& read:pass_reads) (uint64_t(read.address)-device<13520?mirrors:reads).push_back(read);
   for(const auto& state:program.states) {
     const auto cpu=NativeMaterialStateCpuWrites(pass,state.offset,state.value,0,0);
     if(!cpu) return Result::TextureOrState; // Scissor rectangle owner remains a callback.
@@ -64,8 +79,9 @@ NativeStaticGroupEligibility AssessNativeStaticGroup(const Reader& reader,uint32
     const auto defaults=ReadNativeShaderDefaults(trace,pixel?program.pixel:program.vertex,pixel);
     for(const auto& value:defaults.words) {
       const auto offset=1024+value.offset;
-      for(uint32_t pass_offset:{10424u,10420u,10440u,10428u,10332u,11584u})
-        if(offset==pass_offset) return Result::PassState;
+      const auto at=uint64_t(device)+offset;
+      for(const auto& mirror:mirrors)
+        if(uint64_t(mirror.address)<at+4 && at<uint64_t(mirror.address)+mirror.bytes) return Result::PassState;
       device_extent=(std::max)(device_extent,offset+4);
     }
   }

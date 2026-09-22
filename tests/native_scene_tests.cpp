@@ -49,6 +49,15 @@ struct GeometryRetryReader {
   void StoreDoubleWord(uint32_t at,uint64_t value) const { StoreWord(at,uint32_t(value>>32)); StoreWord(at+4,uint32_t(value)); }
   void StoreByte(uint32_t at,uint8_t value) const { bytes.at(at)=value; }
 };
+// Retail image constants (0x82000000+) mapped past the test heap at 0x40000.
+struct ImageMappedReader {
+  GeometryRetryReader heap;
+  static uint32_t Map(uint32_t at) { return at>=0x82000000u?at-0x82000000u+0x40000u:at; }
+  uint32_t Add(uint32_t address,uint32_t offset) const { return address+offset; }
+  uint32_t Word(uint32_t at) const { return heap.Word(Map(at)); }
+  const uint8_t* Bytes(uint32_t at,size_t size) const { return heap.Bytes(Map(at),size); }
+  void StoreWord(uint32_t at,uint32_t value) const { heap.StoreWord(Map(at),value); }
+};
 void TreePublicationReuse() {
   std::vector<uint8_t> memory(0x10000);
   const GeometryRetryReader reader{memory};
@@ -327,8 +336,10 @@ void StaticGroupEligibility() {
   using Result=NativeStaticGroupEligibility;
   constexpr uint32_t device=0x1000,stack=0x38000,material=0x24000,pass=0x25000,record=0x26000,payload=0x27000;
   const NativeSceneGeometrySource input{0x10000,0x10100,0x12000,28,6,material,0x20000};
-  std::vector<uint8_t> memory(0x40000);
-  const GeometryRetryReader reader{memory};
+  std::vector<uint8_t> memory(0x50000);
+  const ImageMappedReader reader{{memory}};
+  constexpr uint32_t bias_scale=0x82003198,anisotropy=0x82009608,color_scale=0x8200964c;
+  reader.StoreWord(bias_scale,0x42000000); reader.StoreWord(color_scale,0x3b808081);
   reader.StoreWord(device+10424,0x10001);
   reader.StoreWord(material+108,pass);
   reader.StoreWord(pass,pass+32); reader.StoreWord(pass+4,pass+64);
@@ -357,6 +368,16 @@ void StaticGroupEligibility() {
   check(Result::AliasedInput);
   memory=seed; reader.StoreWord(device+10780,200); reader.StoreWord(device+12164,record-8);
   check(Result::AliasedInput); // Old resource fence would overwrite a captured operation.
+  // Pass readers' image inputs: a retirement fence store onto any of them aliases.
+  memory=seed; reader.StoreWord(device+10780,200); reader.StoreWord(device+12188,bias_scale-8);
+  check(Result::AliasedInput); // Sampler bias scale.
+  memory=seed; reader.StoreWord(device+10780,200); reader.StoreWord(device+12188,color_scale-8);
+  check(Result::AliasedInput); // Render-state color scale.
+  memory=seed; reader.StoreWord(device+10780,200); reader.StoreWord(device+12188,anisotropy+20-8);
+  check(Result::Supported); // No slot selects anisotropy entry 5.
+  memory[device+11652+3]=5; check(Result::AliasedInput); // Slot 3 selects it.
+  memory=seed; reader.StoreWord(bias_scale,0); check(Result::TextureOrState);
+  memory=seed; reader.StoreWord(color_scale,0); check(Result::PassState);
   // Captured live shape: 3 local + 1 global texture and the same 5 state operations.
   constexpr uint32_t textures=0x29000,globals=0x2a000,global_source=0x2a100,states=0x2b000,objects=0x2c000;
   const auto operations=[&](std::initializer_list<std::array<uint32_t,2>> list) {
@@ -411,6 +432,18 @@ void StaticGroupEligibility() {
   reader.StoreWord(defaults+36,0xfc000001); reader.StoreWord(defaults+40,0xdeadbeef);
   reader.StoreWord(record+4,0x11000); // Default destination extends beyond the normal device mirror.
   check(Result::AliasedInput);
+  // Defaults landing on any traced pass mirror: sampler words, sampler bytes,
+  // render-state words outside the decoded six.
+  const auto default_word=[&](uint32_t offset) {
+    memory=seed;
+    reader.StoreWord(header+20,defaults-header);
+    reader.StoreWord(defaults+24,20);
+    reader.StoreWord(defaults+36,(offset<<16)|1); reader.StoreWord(defaults+40,0xdeadbeef);
+  };
+  default_word(1024); check(Result::Supported); // Fetch constant beyond the pixel samplers.
+  default_word(3*24+12); check(Result::PassState); // Slot 3 sampler word.
+  default_word(11652+4-1024); check(Result::PassState); // Anisotropy indices, slots 4-7.
+  default_word(11580-1024); check(Result::PassState); // Blend control.
   memory=seed;
   auto invalid=input; invalid.count=0;
   Require(AssessNativeStaticGroup(reader,device,stack,invalid)==Result::Geometry,"zero geometry count admitted");
