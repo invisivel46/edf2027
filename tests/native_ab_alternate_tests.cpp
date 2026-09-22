@@ -1,4 +1,5 @@
 #include "native_graphics/native_ab_alternate.h"
+#include "native_graphics/native_renderer_preset.h"
 #include <iostream>
 #include <thread>
 
@@ -44,6 +45,44 @@ int main() {
     check(other_latched && !edf::native::NativeAbNativeSide());
   }
   check(edf::native::NativeAbNativeSide());
+  {
+    // edf_native_renderer preset -> flag mapping.
+    using edf::native::NativeRendererFlag; using edf::native::NativeRendererPreset;
+    using edf::native::NativeRendererPresetMask; using edf::native::NativeRendererFlagBit;
+    using edf::native::ParseNativeRendererPreset;
+    check(ParseNativeRendererPreset("off") == NativeRendererPreset::off);
+    check(ParseNativeRendererPreset("") == NativeRendererPreset::off);
+    check(ParseNativeRendererPreset("world") == NativeRendererPreset::world);
+    check(ParseNativeRendererPreset("full") == NativeRendererPreset::full);
+    check(!ParseNativeRendererPreset("Full") && !ParseNativeRendererPreset("on") && !ParseNativeRendererPreset("world "));
+    check(NativeRendererPresetMask(NativeRendererPreset::off) == 0);
+    const uint32_t world = NativeRendererPresetMask(NativeRendererPreset::world), full = NativeRendererPresetMask(NativeRendererPreset::full);
+    const NativeRendererFlag world_flags[] {
+      NativeRendererFlag::host, NativeRendererFlag::shader_bridge, NativeRendererFlag::seam_draws,
+      NativeRendererFlag::material_activation, NativeRendererFlag::scene_queued, NativeRendererFlag::scene_preload,
+      NativeRendererFlag::scene_sources_owned, NativeRendererFlag::scene_membership_owned,
+      NativeRendererFlag::scene_selection_owned, NativeRendererFlag::scene_camera_owned,
+      NativeRendererFlag::scene_geometry_owned, NativeRendererFlag::scene_material_owned,
+      NativeRendererFlag::scene_tree, NativeRendererFlag::scene_tree_published, NativeRendererFlag::scene_visibility,
+      NativeRendererFlag::frame_dispatch, NativeRendererFlag::scene_group_order, NativeRendererFlag::static_world_pass };
+    const NativeRendererFlag full_only[] { NativeRendererFlag::model_publication, NativeRendererFlag::model_pass, NativeRendererFlag::post_finish };
+    uint32_t expected_world = 0, expected_full = 0;
+    for (auto flag : world_flags) expected_world |= NativeRendererFlagBit(flag);
+    expected_full = expected_world;
+    for (auto flag : full_only) expected_full |= NativeRendererFlagBit(flag);
+    check(world == expected_world && full == expected_full);
+    for (auto flag : full_only) check(!(world & NativeRendererFlagBit(flag)));
+    check(edf::native::kNativeRendererFlagNames.back() == "post_finish" && edf::native::kNativeRendererFlagNames[17] == "static_world_pass");
+    // Individual cvars only add: the effective value is individual OR preset.
+    edf::native::native_renderer_preset_mask = 0;
+    check(!edf::native::NativeFlag(NativeRendererFlag::model_pass, false) && edf::native::NativeFlag(NativeRendererFlag::model_pass, true));
+    edf::native::native_renderer_preset_mask = world;
+    check(edf::native::NativeFlag(NativeRendererFlag::static_world_pass, false));
+    check(!edf::native::NativeFlag(NativeRendererFlag::post_finish, false) && edf::native::NativeFlag(NativeRendererFlag::post_finish, true));
+    edf::native::native_renderer_preset_mask = full;
+    check(edf::native::NativeFlag(NativeRendererFlag::post_finish, false));
+    edf::native::native_renderer_preset_mask = 0;
+  }
   if (failures) std::cerr << failures << " native A/B alternate checks failed\n";
   return failures ? 1 : 0;
 }

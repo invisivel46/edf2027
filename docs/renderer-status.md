@@ -7,6 +7,32 @@ This is the one current statement of the native renderer effort. Where another
 `docs/renderer-*.md` or `docs/native-scene-renderer*.md` file disagrees with it,
 this file wins. Those files are kept as history (see the last section).
 
+## How to enable
+
+One switch, `--edf_native_renderer=off|world|full` (default `off`), replaces
+setting the individual cvars in section 5:
+
+- `world`: `edf_native_host`, `shader_bridge`, `seam_draws`,
+  `material_activation`, `scene_queued`, `scene_preload`, the six
+  `scene_*_owned` flags the static world pass requires (sources, membership,
+  selection, camera, geometry, material), `scene_tree`,
+  `scene_tree_published`, `scene_visibility`, `frame_dispatch`,
+  `scene_group_order` and `static_world_pass`.
+- `full`: `world` plus `model_publication`, `model_pass` (the rigid model
+  pass) and `post_finish`.
+
+Not in any preset: every audit, `bucket_dispatch` and `map_effect_list` (their
+in-game audit and census have not been run), and the optional
+`scene_activation_owned`, `scene_instance_owned`, `scene_pass_owned`,
+`scene_view_owned` and the deferred flags. Turn those on individually.
+
+Rules (`src/native_graphics/native_renderer_preset.h`): a flag is on when its
+own cvar is on or the preset includes it. An individual cvar can only add a
+flag, never remove one the preset turns on; to drop one, use the smaller preset
+and add the rest by hand. The preset is read once at startup (restart to change
+it; an unknown name stops startup), and one line
+`Native renderer: preset=... on=[...] off=[...]` logs the effective flags.
+
 ## 1. Goal
 
 "Native renderer" means one concrete thing: during a frame, the guest render

@@ -2,6 +2,7 @@
 #define NOMINMAX
 #endif
 #include "guest_shader_bridge.h"
+#include "native_renderer_preset.h"
 #include "../scripted_input_logic.h"
 #include "native_backend_frame.h"
 #include "native_backend_frame_queue.h"
@@ -1336,7 +1337,7 @@ void ForgetOwner(uint32_t owner) {
 
 template<class Original>
 void ImportTexture(PPCContext& ctx, uint8_t* base, Original original) {
-  if (!REXCVAR_GET(edf_native_shader_bridge)) { original(ctx, base); return; }
+  if (!EDF_NATIVE_FLAG(shader_bridge)) { original(ctx, base); return; }
   const GuestReader reader(base);
   uint32_t output = 0;
   std::vector<uint8_t> image;
@@ -1861,7 +1862,7 @@ thread_local std::optional<NativeScenePassAnimation> native_scene_pass_animation
 thread_local std::shared_ptr<const NativeSceneAdapter::WorldAnimations> native_scene_pass_animations;
 thread_local uint32_t native_scene_animation_owner=0;
 const NativeSceneSources& NativeSceneSourcesForPass(const Bridge& state) {
-  if(REXCVAR_GET(edf_native_scene_sources_owned) && native_scene_publication && native_scene_publication->sources) {
+  if(EDF_NATIVE_FLAG(scene_sources_owned) && native_scene_publication && native_scene_publication->sources) {
     static uint64_t reads=0;
     if(++reads<=4 || reads%100000==0)
       REXLOG_INFO("Native published source reads: count={} tick={}",reads,native_scene_publication->snapshot->tick);
@@ -1873,7 +1874,7 @@ const NativeSceneSources& NativeSceneSourcesForPass(const Bridge& state) {
 // the producer's current sources (under state.mutex) instead. Taken once per
 // walk: a published generation needs no lock, and cannot change within a pass.
 std::shared_ptr<const NativeSceneSources> PublishedNativeSceneSourcesForPass(const Bridge& state) {
-  if(!REXCVAR_GET(edf_native_scene_sources_owned) || !native_scene_publication || !native_scene_publication->sources) return {};
+  if(!EDF_NATIVE_FLAG(scene_sources_owned) || !native_scene_publication || !native_scene_publication->sources) return {};
   NativeSceneSourcesForPass(state);
   return native_scene_publication->sources;
 }
@@ -2442,7 +2443,7 @@ std::array<float,4> ResolveBlendFactorForDraw(uint32_t device,
 }
 void PublishNativeRenderState(uint8_t* base,uint32_t device,uint32_t producer) {
   if((!REXCVAR_GET(edf_native_render_state_audit) && !REXCVAR_GET(edf_native_owned_render_state)) ||
-      !REXCVAR_GET(edf_native_shader_bridge)) return;
+      !EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=State();
   std::lock_guard lock(state.mutex);
   try {
@@ -2760,20 +2761,20 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
     REXCVAR_GET(edf_native_owned_render_state),REXCVAR_GET(edf_native_render_state_audit));
   if(REXCVAR_GET(edf_native_preview_window) && !REXCVAR_GET(edf_native_publish_frames))
     throw std::runtime_error("native preview requires native frame publication");
-  if(REXCVAR_GET(edf_native_publish_frames) && !REXCVAR_GET(edf_native_shader_bridge))
+  if(REXCVAR_GET(edf_native_publish_frames) && !EDF_NATIVE_FLAG(shader_bridge))
     throw std::runtime_error("native frame publication requires native shader bridge");
   // Said here rather than discovered per draw. A scene on its own device with
   // the direct path still in use fails at the first mesh - "this mesh is not
   // on a D3D11 backend and cannot be drawn through a context" - once per draw,
   // for the rest of the run, which is a worse way to learn it.
-  if(REXCVAR_GET(edf_native_scene_backend)!="d3d11" && !REXCVAR_GET(edf_native_seam_draws))
+  if(REXCVAR_GET(edf_native_scene_backend)!="d3d11" && !EDF_NATIVE_FLAG(seam_draws))
     throw std::runtime_error("--edf_native_scene_backend="+REXCVAR_GET(edf_native_scene_backend)+
       " needs --edf_native_seam_draws=true: a draw issued straight to the D3D11 context cannot "
       "bind a resource that lives on another device");
   if(REXCVAR_GET(edf_native_validate_wait) &&
-     (!REXCVAR_GET(edf_native_shader_bridge) || !REXCVAR_GET(edf_native_fence_probe)))
+     (!EDF_NATIVE_FLAG(shader_bridge) || !REXCVAR_GET(edf_native_fence_probe)))
     throw std::runtime_error("native wait validation requires native shader bridge and fence probe");
-  if (!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if (!EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state = State();
   std::lock_guard lock(state.mutex);
   state.root = game_root;
@@ -3603,9 +3604,9 @@ bool IssueNativePostBloom(PPCContext& ctx,uint8_t* base,PostFinishNativeRun& run
 REX_EXTERN(__imp__sub_820B0B80);
 REX_HOOK_RAW(sub_820B0B80) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderFinish);
-  const bool audit=REXCVAR_GET(edf_native_post_finish_audit),native=REXCVAR_GET(edf_native_post_finish);
-  if((!native && !audit) || !REXCVAR_GET(edf_native_host) ||
-     !REXCVAR_GET(edf_native_shader_bridge) || !REXCVAR_GET(edf_native_seam_draws) ||
+  const bool audit=REXCVAR_GET(edf_native_post_finish_audit),native=EDF_NATIVE_FLAG(post_finish);
+  if((!native && !audit) || !EDF_NATIVE_FLAG(host) ||
+     !EDF_NATIVE_FLAG(shader_bridge) || !EDF_NATIVE_FLAG(seam_draws) ||
      edf::native::post_finish_recorder || edf::native::post_finish_native_run) {
     __imp__sub_820B0B80(ctx,base); return;
   }
@@ -3812,7 +3813,7 @@ REXCVAR_DEFINE_BOOL(edf_native_scene_group_order_audit,false,"EDF2027",
 namespace edf::native {
 void RetireGroupOrder(uint32_t owner) {
   // Destructor path of every world: stay off the bridge lock unless orders exist.
-  if(!REXCVAR_GET(edf_native_scene_group_order) && !REXCVAR_GET(edf_native_scene_group_order_audit)) return;
+  if(!EDF_NATIVE_FLAG(scene_group_order) && !REXCVAR_GET(edf_native_scene_group_order_audit)) return;
   auto& state=State();
   std::lock_guard lock(state.mutex);
   state.scene_adapter.RetireGroupOrder(owner);
@@ -3883,7 +3884,7 @@ REX_HOOK_RAW(sub_821C61D8) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderChildren);
   const edf::native::GuestReader reader(base);
   const auto manager=ctx.r3.u32,context=ctx.r4.u32;
-  if(!REXCVAR_GET(edf_native_scene_tree) || !REXCVAR_GET(edf_native_shader_bridge) ||
+  if(!EDF_NATIVE_FLAG(scene_tree) || !EDF_NATIVE_FLAG(shader_bridge) ||
      *reader.Bytes(reader.Add(manager,108),1)) {
     __imp__sub_821C61D8(ctx,base); return;
   }
@@ -3894,8 +3895,8 @@ REX_HOOK_RAW(sub_821C61D8) {
   uint64_t checks=0;
   auto& publications=edf::native::TreePublications();
   std::shared_ptr<const edf::native::NativeSceneTreeImage> hierarchy;
-  if(REXCVAR_GET(edf_native_scene_tree_published)) {
-    if(REXCVAR_GET(edf_native_scene_membership_owned) && edf::native::native_scene_publication) {
+  if(EDF_NATIVE_FLAG(scene_tree_published)) {
+    if(EDF_NATIVE_FLAG(scene_membership_owned) && edf::native::native_scene_publication) {
       const auto& trees=edf::native::native_scene_publication->trees;
       const auto found=trees.find(manager);
       if(found!=trees.end()) hierarchy=found->second;
@@ -3961,13 +3962,13 @@ REX_HOOK_RAW(sub_820B4250) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderWorld);
   const auto owner=ctx.r3.u32;
   std::optional<edf::native::NativeScenePassAnimation> published;
-  if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
+  if(REXCVAR_GET(edf_native_scene_material_audit) || EDF_NATIVE_FLAG(scene_material_owned)) {
     const edf::native::GuestReader reader(base);
     published=edf::native::NativeScenePassAnimation{
       reader.Word(reader.Add(owner,356)),reader.Word(reader.Add(owner,364))};
   }
   __imp__sub_820B4250(ctx,base);
-  if(REXCVAR_GET(edf_native_scene_tree_published)) {
+  if(EDF_NATIVE_FLAG(scene_tree_published)) {
     try {
       if(edf::native::TreePublications().Publish(edf::native::GuestReader(base),owner)) {
         static std::atomic<uint64_t> publications=0;
@@ -3983,7 +3984,7 @@ REX_HOOK_RAW(sub_820B4250) {
     }
   }
   edf::native::PublishStaticWalkPlans(base,owner);
-  if(REXCVAR_GET(edf_native_scene_group_order) || REXCVAR_GET(edf_native_scene_group_order_audit)) {
+  if(EDF_NATIVE_FLAG(scene_group_order) || REXCVAR_GET(edf_native_scene_group_order_audit)) {
     static thread_local std::vector<uint32_t> order;
     try {
       const edf::native::GuestReader reader(base);
@@ -4041,7 +4042,7 @@ REX_HOOK_RAW(sub_820B4310) {
         ctx.r3.u32,live.size(),audit.checks,audit.mismatches,audit.missing);
     }
   }
-  if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
+  if(REXCVAR_GET(edf_native_scene_material_audit) || EDF_NATIVE_FLAG(scene_material_owned)) {
     edf::native::native_scene_animation_owner=ctx.r3.u32;
     edf::native::native_scene_pass_animation.reset();
     // Select completed producer inputs at world-pass entry. The outer helper
@@ -4054,7 +4055,7 @@ REX_HOOK_RAW(sub_820B4310) {
       if(found!=publication->end()) edf::native::native_scene_pass_animation=found->second;
     }
   }
-  if(REXCVAR_GET(edf_native_scene_tree) && REXCVAR_GET(edf_native_shader_bridge)) {
+  if(EDF_NATIVE_FLAG(scene_tree) && EDF_NATIVE_FLAG(shader_bridge)) {
     const edf::native::GuestReader reader(base);
     const auto owner=ctx.r3.u32,context=ctx.r4.u32;
     auto work=ctx;
@@ -4100,7 +4101,7 @@ REX_EXTERN(__imp__sub_821C3BB8);
 REX_EXTERN(sub_821D96D8);
 REX_HOOK_RAW(sub_821C3BB8) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderQueued);
-  if(!REXCVAR_GET(edf_native_scene_tree) || !REXCVAR_GET(edf_native_shader_bridge)) {
+  if(!EDF_NATIVE_FLAG(scene_tree) || !EDF_NATIVE_FLAG(shader_bridge)) {
     __imp__sub_821C3BB8(ctx,base); return;
   }
   const edf::native::GuestReader reader(base);
@@ -4251,7 +4252,7 @@ REX_HOOK_RAW(sub_821D96D8) {
     }
   } restore{group,group_address};
   edf::native::native_queued_scene_group=&group;
-  if(!REXCVAR_GET(edf_native_scene_queued)) {
+  if(!EDF_NATIVE_FLAG(scene_queued)) {
     // No queued group without the queued scene: the indexed draw hook treats a
     // set group as a queued instance, and every guest draw then threw and
     // recorded its setup twice (about 7 ms/frame in Mission 1 gameplay).
@@ -4261,7 +4262,7 @@ REX_HOOK_RAW(sub_821D96D8) {
   }
   size_t native_queue_size=0;
   uint32_t group_device=0;
-  if(REXCVAR_GET(edf_native_host) && REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_seam_draws)) {
+  if(EDF_NATIVE_FLAG(host) && EDF_NATIVE_FLAG(shader_bridge) && EDF_NATIVE_FLAG(seam_draws)) {
     const edf::native::GuestReader reader(base);
     const auto address=ctx.r3.u32;
     auto instances=edf::native::native_scene_queues?edf::native::native_scene_queues->Take(address):std::vector<uint32_t>{};
@@ -4313,7 +4314,7 @@ REX_HOOK_RAW(sub_821D96D8) {
         auto& state=edf::native::State();
         std::lock_guard lock(state.mutex);
         group.material=state.scene_adapter.PreviousGroupMaterial(group_address);
-        if(REXCVAR_GET(edf_native_scene_geometry_owned) && edf::native::native_scene_publication) {
+        if(EDF_NATIVE_FLAG(scene_geometry_owned) && edf::native::native_scene_publication) {
           const auto* source=edf::native::NativeSceneSourcesForPass(state).FindGroup(group_address);
           if(source) {
             const auto latest=state.scene_adapter.GroupGeometry(group_address,source->revision);
@@ -4339,7 +4340,7 @@ REX_HOOK_RAW(sub_821D96D8) {
             REXLOG_INFO("Native static group compatibility eligibility: reason={} count={}",unsigned(eligibility),count);
         }
         if(native_queue_size && REXCVAR_GET(edf_native_scene_geometry_deferred) &&
-           REXCVAR_GET(edf_native_scene_activation_owned) && REXCVAR_GET(edf_native_scene_material_owned) &&
+           REXCVAR_GET(edf_native_scene_activation_owned) && EDF_NATIVE_FLAG(scene_material_owned) &&
            !REXCVAR_GET(edf_native_scene_material_audit) && !group.material_compatibility_only) group.geometry_handoff.Defer(input);
         else install_geometry(input);
         index_count=input.count; work.r3.u64=input.material;
@@ -4367,7 +4368,7 @@ REX_HOOK_RAW(sub_821D96D8) {
       work.r3.u64=reader.Word(reader.Add(reader.Word(descriptor),16));
       }
       group.activation_instance=work.r3.u32;
-      if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
+      if(REXCVAR_GET(edf_native_scene_material_audit) || EDF_NATIVE_FLAG(scene_material_owned)) {
         const auto publication=edf::native::native_scene_publication;
         if(publication) for(const auto& published:publication->group_materials)
           if(published->group==group_address) { group.published_material=published; break; }
@@ -4857,7 +4858,7 @@ void PublishStaticScenePartsLocked(Bridge& state,const GuestReader& reader,uint3
 REX_EXTERN(__imp__sub_820B33B0);
 REX_HOOK_RAW(sub_820B33B0) {
   const auto object=ctx.r3.u32;
-  const bool scene=REXCVAR_GET(edf_native_scene_adapter_audit) || REXCVAR_GET(edf_native_scene_queued);
+  const bool scene=REXCVAR_GET(edf_native_scene_adapter_audit) || EDF_NATIVE_FLAG(scene_queued);
   if(scene) {
     auto& state=edf::native::State();
     // The destructor hook normally retired this address already. Only this
@@ -4884,7 +4885,7 @@ REX_HOOK_RAW(sub_820B33B0) {
 }
 REX_EXTERN(__imp__sub_820B2870);
 REX_HOOK_RAW(sub_820B2870) {
-  if(REXCVAR_GET(edf_native_scene_adapter_audit) || REXCVAR_GET(edf_native_scene_queued)) {
+  if(REXCVAR_GET(edf_native_scene_adapter_audit) || EDF_NATIVE_FLAG(scene_queued)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -4897,7 +4898,7 @@ REX_EXTERN(__imp__sub_820B2AC0);
 REX_HOOK_RAW(sub_820B2AC0) {
   const auto owner=ctx.r3.u32;
   __imp__sub_820B2AC0(ctx,base);
-  if(REXCVAR_GET(edf_native_scene_adapter_audit) || REXCVAR_GET(edf_native_scene_queued)) {
+  if(REXCVAR_GET(edf_native_scene_adapter_audit) || EDF_NATIVE_FLAG(scene_queued)) {
     auto& state=edf::native::State();
     // Nested in construction the owner is not yet born and cannot become so
     // on another thread; skip the submission wait for a publication of nothing.
@@ -4911,7 +4912,7 @@ REX_EXTERN(__imp__sub_820B2DF8);
 REX_HOOK_RAW(sub_820B2DF8) {
   const auto owner=ctx.r3.u32;
   __imp__sub_820B2DF8(ctx,base);
-  if(REXCVAR_GET(edf_native_scene_queued)) {
+  if(EDF_NATIVE_FLAG(scene_queued)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -4993,7 +4994,7 @@ REX_EXTERN(__imp__sub_821C0B88);
 REX_HOOK_RAW(sub_821C0B88) {
   const auto owner=ctx.r3.u32;
   __imp__sub_821C0B88(ctx,base);
-  if(REXCVAR_GET(edf_native_scene_queued)) {
+  if(EDF_NATIVE_FLAG(scene_queued)) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     if(state.scene_sources.HasOwner(owner)) state.scene_sources.PublishVisibility(owner,
@@ -5004,7 +5005,7 @@ REX_EXTERN(__imp__sub_821BEF10);
 REX_HOOK_RAW(sub_821BEF10) {
   const auto destination=ctx.r4.u32;
   __imp__sub_821BEF10(ctx,base);
-  if(REXCVAR_GET(edf_native_scene_queued) && destination>=288) {
+  if(EDF_NATIVE_FLAG(scene_queued) && destination>=288) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     const auto owner=destination-288;
@@ -5019,7 +5020,7 @@ REX_HOOK_RAW(sub_821C4EB8) {
   const auto node=ctx.r3.u32;
   __imp__sub_821C4EB8(ctx,base);
   edf::native::TouchStaticWalkPlans({node+120});
-  if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
+  if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     state.scene_membership.Born(node+120); ++state.scene_membership_events;
   }
@@ -5030,7 +5031,7 @@ REX_HOOK_RAW(sub_821C5D28) {
   const auto node=ctx.r3.u32;
   __imp__sub_821C5D28(ctx,base);
   edf::native::TouchStaticWalkPlans({node+120});
-  if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
+  if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     state.scene_membership.Born(node+120,edf::native::GuestReader(base).Word(node+132));
     ++state.scene_membership_events;
@@ -5038,7 +5039,7 @@ REX_HOOK_RAW(sub_821C5D28) {
 }
 REX_EXTERN(__imp__sub_821A1628);
 REX_HOOK_RAW(sub_821A1628) {
-  if(REXCVAR_GET(edf_native_scene_tree_published)) {
+  if(EDF_NATIVE_FLAG(scene_tree_published)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     if(state.scene_membership.HasAnchor(ctx.r3.u32) || state.scene_membership.HasAnchor(ctx.r4.u32))
       edf::native::TreePublications().Invalidate();
@@ -5047,7 +5048,7 @@ REX_HOOK_RAW(sub_821A1628) {
   __imp__sub_821A1628(ctx,base);
   // After the link: the destination by its anchor, the source list by the node.
   edf::native::TouchStaticWalkPlans({anchor,node});
-  if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
+  if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     if(state.scene_membership.HasAnchor(anchor)) {
       state.scene_membership.InsertAfter(anchor,node,edf::native::GuestReader(base).Word(node+8));
@@ -5057,14 +5058,14 @@ REX_HOOK_RAW(sub_821A1628) {
 }
 REX_EXTERN(__imp__sub_821A1678);
 REX_HOOK_RAW(sub_821A1678) {
-  if(REXCVAR_GET(edf_native_scene_tree_published)) {
+  if(EDF_NATIVE_FLAG(scene_tree_published)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     if(state.scene_membership.HasAnchor(ctx.r3.u32)) edf::native::TreePublications().Invalidate();
   }
   const auto node=ctx.r3.u32;
   __imp__sub_821A1678(ctx,base);
   edf::native::TouchStaticWalkPlans({node});
-  if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
+  if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     if(state.scene_membership.Remove(node)) ++state.scene_membership_events;
   }
@@ -5075,7 +5076,7 @@ REX_EXTERN(__imp__sub_821C33E8);
 REX_HOOK_RAW(sub_820B4038) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderGather);
   auto* queues=edf::native::native_scene_queues;
-  if(!queues || !queues->enabled || !REXCVAR_GET(edf_native_scene_visibility)) {
+  if(!queues || !queues->enabled || !EDF_NATIVE_FLAG(scene_visibility)) {
     edf::native::BridgeGuestCall guest; __imp__sub_820B4038(ctx,base); return;
   }
   using namespace edf::native;
@@ -5113,7 +5114,7 @@ REX_HOOK_RAW(sub_820B4038) {
   {
     bridge->Hold();
     bool published=false;
-    if(REXCVAR_GET(edf_native_scene_membership_owned) && native_scene_publication && native_scene_publication->membership) {
+    if(EDF_NATIVE_FLAG(scene_membership_owned) && native_scene_publication && native_scene_publication->membership) {
       const auto& lists=*native_scene_publication->membership;
       if(state.scene_membership.Current(lists)) {
         const auto found=lists.lists.find(ctx.r4.u32);
@@ -5472,14 +5473,14 @@ REX_HOOK_RAW(sub_821A5080) {
   edf::native::native_scene_pass_animation.reset();
   edf::native::native_scene_pass_animations.reset();
   edf::native::native_scene_animation_owner=0;
-  if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_host) &&
-     REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_seam_draws)) {
+  if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(host) &&
+     EDF_NATIVE_FLAG(shader_bridge) && EDF_NATIVE_FLAG(seam_draws)) {
     edf::native::native_scene_queues=&queues;
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
     edf::native::native_scene_publication=state.scene_adapter.AcquirePublication();
-    if(REXCVAR_GET(edf_native_scene_camera_owned))
+    if(EDF_NATIVE_FLAG(scene_camera_owned))
       edf::native::native_scene_pass_cameras=state.scene_adapter.AcquireCameras();
     edf::native::native_scene_pass_animations=state.scene_adapter.AcquireWorldAnimations();
   }
@@ -5497,7 +5498,7 @@ REX_HOOK_RAW(sub_821A5080) {
   NativeLoopTrace trace("helper_dispatch",ctx.r3.u32,ctx.lr);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceHelper);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::RenderHelper);
-  if(REXCVAR_GET(edf_native_frame_dispatch) && REXCVAR_GET(edf_native_shader_bridge)) {
+  if(EDF_NATIVE_FLAG(frame_dispatch) && EDF_NATIVE_FLAG(shader_bridge)) {
     const edf::native::GuestReader reader(base);
     auto work=ctx;
     if(work.r1.u32<224) throw std::runtime_error("invalid native frame dispatch stack");
@@ -5638,7 +5639,7 @@ bool TryNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<edf::nat
 REX_EXTERN(__imp__sub_821C9C20);
 REX_HOOK_RAW(sub_821C9C20) {
   edf::native::HookTiming model_timing(edf::native::HookPhase::RenderModel);
-  if(REXCVAR_GET(edf_native_model_publication)) ObserveNativeModelPublication(base,ctx.r3.u32,ctx.r4.u32);
+  if(EDF_NATIVE_FLAG(model_publication)) ObserveNativeModelPublication(base,ctx.r3.u32,ctx.r4.u32);
   // The native model pass takes the object only on the native A/B side; it
   // draws the poses the original would upload (interpolated when unlocked).
   const bool model_pass=edf::native::NativeModelPassEnabled() && edf::native::NativeAbNativeSide();
@@ -5755,7 +5756,7 @@ REX_HOOK_RAW(sub_821A17D8) {
 REX_EXTERN(__imp__sub_821BE8D0);
 REX_HOOK_RAW(sub_821BE8D0) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderSceneBegin);
-  if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
+  if(REXCVAR_GET(edf_native_scene_material_audit) || EDF_NATIVE_FLAG(scene_material_owned)) {
     const edf::native::GuestReader reader(base);
     const auto scene=ctx.r4.u32;
     const auto& cameras=edf::native::native_scene_pass_cameras;
@@ -5898,7 +5899,7 @@ REX_HOOK_RAW(sub_821A4DE8) {
                       manager,actual,desired);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceTransition,edge);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::FrameTransition);
-  const bool model_publication=REXCVAR_GET(edf_native_model_publication);
+  const bool model_publication=EDF_NATIVE_FLAG(model_publication);
   std::vector<uint32_t> dirty_poses;
   {
     struct Scope {
@@ -5908,7 +5909,7 @@ REX_HOOK_RAW(sub_821A4DE8) {
     native_model_dirty_poses=model_publication?&dirty_poses:nullptr;
     __imp__sub_821A4DE8(ctx,base);
   }
-  if(REXCVAR_GET(edf_native_scene_camera_owned)) {
+  if(EDF_NATIVE_FLAG(scene_camera_owned)) {
     auto cameras=edf::native::ReadNativeScenePassCameras(edf::native::GuestReader(base),manager);
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
@@ -5921,13 +5922,13 @@ REX_HOOK_RAW(sub_821A4DE8) {
     ++motion.publication;
     if(!native_loop_budget.unlocked) motion.Clear();
   }
-  if(REXCVAR_GET(edf_native_scene_queued) && (!native_loop_budget.unlocked || native_loop_budget.steps)) {
+  if(EDF_NATIVE_FLAG(scene_queued) && (!native_loop_budget.unlocked || native_loop_budget.steps)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
     state.scene_publication_tick+=std::max(1u,native_loop_budget.steps);
-    if(REXCVAR_GET(edf_native_scene_visibility)) state.scene_membership.Publish();
-    if(REXCVAR_GET(edf_native_scene_tree_published)) {
+    if(EDF_NATIVE_FLAG(scene_visibility)) state.scene_membership.Publish();
+    if(EDF_NATIVE_FLAG(scene_tree_published)) {
       auto& trees=edf::native::TreePublications();
       const edf::native::GuestReader reader(base);
       for(const auto owner:trees.Owners()) {
@@ -5935,16 +5936,16 @@ REX_HOOK_RAW(sub_821A4DE8) {
         catch(const std::exception&) { trees.Retire(owner); }
       }
     }
-    if(REXCVAR_GET(edf_native_scene_preload)) {
+    if(EDF_NATIVE_FLAG(scene_preload)) {
       const edf::native::GuestReader reader(base);
       edf::native::PreloadStaticSceneGeometryLocked(state,reader);
       edf::native::PreloadStaticSceneMaterialsLocked(state,reader);
     }
     if(state.scene_adapter.objects() || state.scene_adapter.geometry_groups() || state.scene_adapter.AcquirePublication())
       state.scene_adapter.Publish(state.scene_publication_tick,
-        REXCVAR_GET(edf_native_scene_sources_owned)?state.scene_sources.AcquireSnapshot():nullptr,
-        REXCVAR_GET(edf_native_scene_membership_owned)?state.scene_membership.AcquirePublication():nullptr,
-        REXCVAR_GET(edf_native_scene_membership_owned)?edf::native::TreePublications().AcquireAll():edf::native::NativeSceneTreePublications::Images{});
+        EDF_NATIVE_FLAG(scene_sources_owned)?state.scene_sources.AcquireSnapshot():nullptr,
+        EDF_NATIVE_FLAG(scene_membership_owned)?state.scene_membership.AcquirePublication():nullptr,
+        EDF_NATIVE_FLAG(scene_membership_owned)?edf::native::TreePublications().AcquireAll():edf::native::NativeSceneTreePublications::Images{});
   }
   // Pose generation for this tick, beside the scene publication: only vectors
   // the dirty walk rebuilt (and first-sight seeds) are read from guest memory.
@@ -5988,7 +5989,7 @@ void CaptureNativeDisplayGamma(uint8_t* base,uint32_t device,uint32_t address,
 }
 }
 REX_HOOK_RAW(sub_82142050) {
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     CaptureNativeDisplayGamma(base,ctx.r3.u32,ctx.r4.u32,edf::native::NativeDisplayGamma::Mode::Table256);
     __imp__edf_native_gamma_table_cpu_tail(ctx,base);
     return;
@@ -5996,7 +5997,7 @@ REX_HOOK_RAW(sub_82142050) {
   __imp__sub_82142050(ctx,base);
 }
 REX_HOOK_RAW(sub_82142130) {
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     CaptureNativeDisplayGamma(base,ctx.r3.u32,ctx.r4.u32,edf::native::NativeDisplayGamma::Mode::Piecewise128);
     __imp__edf_native_gamma_pwl_cpu_tail(ctx,base);
     return;
@@ -6005,7 +6006,7 @@ REX_HOOK_RAW(sub_82142130) {
 }
 REX_EXTERN(__imp__sub_821B6880);
 REX_HOOK_RAW(sub_821B6880) {
-  if (!REXCVAR_GET(edf_native_shader_bridge)) { __imp__sub_821B6880(ctx, base); return; }
+  if (!EDF_NATIVE_FLAG(shader_bridge)) { __imp__sub_821B6880(ctx, base); return; }
   const uint32_t owner = ctx.r3.u32;
   edf::native::ForgetOwner(owner);
   edf::native::Effect effect;
@@ -6157,7 +6158,7 @@ void RestoreNativeStaticMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance
   // Called only while the group's activation is pending. The activation hook
   // would skip ObserveActivation in this state; retain its audit path when asked.
   static std::atomic<uint64_t> native_count=0,fallback_count=0;
-  if(REXCVAR_GET(edf_native_material_activation) && !REXCVAR_GET(edf_native_material_state_audit) &&
+  if(EDF_NATIVE_FLAG(material_activation) && !REXCVAR_GET(edf_native_material_state_audit) &&
      !REXCVAR_GET(edf_native_material_sampler_audit)) {
     ActivateNativeMaterial(ctx,base,instance,device);
     ++native_count;
@@ -6210,7 +6211,7 @@ REX_HOOK_RAW(sub_821B8E48) {
   }
   {
     edf::native::HookTiming timing(edf::native::HookPhase::ActivationGuest);
-    if(REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_material_activation) &&
+    if(EDF_NATIVE_FLAG(shader_bridge) && EDF_NATIVE_FLAG(material_activation) &&
        (!edf::native::native_queued_scene_group || !edf::native::native_queued_scene_group->material_compatibility_only))
       ActivateNativeMaterial(ctx,base,instance,device);
     else {
@@ -6246,12 +6247,12 @@ REX_HOOK_RAW(sub_821B8E48) {
         REXLOG_INFO("Native material sampler audit: checked={} mismatches=0",count);
     }
   }
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     edf::native::HookTiming timing(edf::native::HookPhase::ActivationNative);
     if(const auto* group=edf::native::native_queued_scene_group;
        group && group->material_handoff.activation_pending() && group->activation_instance==instance) return;
     try {
-      if(!REXCVAR_GET(edf_native_scene_activation_owned) || !REXCVAR_GET(edf_native_scene_material_owned) ||
+      if(!REXCVAR_GET(edf_native_scene_activation_owned) || !EDF_NATIVE_FLAG(scene_material_owned) ||
          REXCVAR_GET(edf_native_scene_material_audit) || !edf::native::ObservePublishedActivation(instance))
         edf::native::ObserveActivation(edf::native::GuestReader(base), instance, device);
     }
@@ -6520,7 +6521,7 @@ NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge
   if(!source) return decline(D::Source);
   const auto world=sources.WorldRegisters(*source,source->world_data);
   if(!world) return decline(D::WorldRegisters);
-  if(REXCVAR_GET(edf_native_scene_sources_owned) && REXCVAR_GET(edf_native_scene_transform_audit)) {
+  if(EDF_NATIVE_FLAG(scene_sources_owned) && REXCVAR_GET(edf_native_scene_transform_audit)) {
     ++state.scene_world_checks;
     if(std::memcmp(world->data(),reader.Bytes(source->world_data,64),64)) {
       ++state.scene_world_mismatches;
@@ -6532,7 +6533,7 @@ NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge
   auto capture=material.resolved.capture;
   ApplyNativeScenePublishedWorld(capture,*world);
   result.view=NativeStaticInstanceView(capture.camera,viewport,material.resolved.render.words[5]!=0);
-  if(REXCVAR_GET(edf_native_scene_selection_owned)) {
+  if(EDF_NATIVE_FLAG(scene_selection_owned)) {
     result.object=publication.Resolve(*source,geometry,capture);
     if(!result.object) return decline(D::Lifetime);
   } else {
@@ -6547,7 +6548,7 @@ NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge
   return result;
 }
 bool TryAppendPublishedNativeSceneInstance(uint8_t* base,uint32_t device,uint32_t address,uint32_t instance,uint32_t count,NativeQueuedSceneGroup& group) {
-  if(!REXCVAR_GET(edf_native_scene_geometry_owned) || !REXCVAR_GET(edf_native_scene_material_owned) ||
+  if(!EDF_NATIVE_FLAG(scene_geometry_owned) || !EDF_NATIVE_FLAG(scene_material_owned) ||
      REXCVAR_GET(edf_native_scene_material_audit) || group.geometry || !group.objects.empty() ||
      !group.published_material || !group.material_pass || !native_scene_publication) return false;
   auto& state=State();
@@ -6667,7 +6668,7 @@ bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t i
       capture=CaptureNativeSceneMaterial(state.scene_backend,*group.material->pipeline(),vertex,
         *state.shaders.at(group.pixel).bindings,group.material->blend_factor(),group.material);
     }
-    if(REXCVAR_GET(edf_native_scene_selection_owned) && world_only && native_scene_publication) {
+    if(EDF_NATIVE_FLAG(scene_selection_owned) && world_only && native_scene_publication) {
       published_selection=native_scene_publication->Resolve(*source,group.geometry,*capture);
       if(!published_selection) return false;
       static uint64_t selections=0;
@@ -6708,7 +6709,7 @@ REX_HOOK_RAW(sub_821D9600) {
     edf::native::HookTiming timing(edf::native::HookPhase::InstanceGuest);
     __imp__sub_821D9600(ctx,base);
   }
-  if(!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge)) return;
   edf::native::HookTiming timing(edf::native::HookPhase::InstanceNative);
   auto& state=edf::native::State();
   std::lock_guard submission(state.submissions);
@@ -6736,7 +6737,7 @@ REX_HOOK_RAW(sub_821D9600) {
 REX_EXTERN(__imp__sub_8213C788);
 REX_HOOK_RAW(sub_8213C788) {
   const auto device=ctx.r3.u32;
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     const edf::native::GuestReader reader(base);
@@ -6759,7 +6760,7 @@ REX_HOOK_RAW(sub_8213C788) {
       REXLOG_INFO("Native fence ownership: captured={}, cursor={:#x}, device={:#x}; awaits actual submission, no GPU packet emitted",issued,cursor|(flags&3),device);
     return;
   }
-  const bool probe=REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_fence_probe);
+  const bool probe=EDF_NATIVE_FLAG(shader_bridge) && REXCVAR_GET(edf_native_fence_probe);
   std::optional<uint32_t> issued;
   if(probe) {
     try {
@@ -6974,12 +6975,12 @@ REX_HOOK_RAW(sub_8213C9F0) {
   // The port has no Xbox command consumer. Unknown callbacks must not silently
   // emit a GPU interrupt packet and leave their CPU waiter permanently pending.
   // The former 51248 caller is replaced at 512D8 by native swap pacing.
-  if(REXCVAR_GET(edf_native_host) && callback!=0x8214EBA0) {
+  if(EDF_NATIVE_FLAG(host) && callback!=0x8214EBA0) {
     REXLOG_ERROR("Unsupported native signal callback: caller={:#x}, callback={:#x}, device={:#x}, argument={:#x}; no Xbox packet fallback",
       uint32_t(ctx.lr),callback,device,argument);
     throw std::runtime_error("native signal callback has no CPU completion implementation");
   }
-  if(REXCVAR_GET(edf_native_host) && REXCVAR_GET(edf_native_hook_timings)) {
+  if(EDF_NATIVE_FLAG(host) && REXCVAR_GET(edf_native_hook_timings)) {
     const auto caller=uint32_t(ctx.lr);
     const size_t bucket=caller==0x8213D288?0:caller==0x8214ED64?1:caller==0x821513F4?2:3;
     static std::array<std::atomic<uint64_t>,4> calls{};
@@ -6991,10 +6992,10 @@ REX_HOOK_RAW(sub_8213C9F0) {
         count,uint32_t(ctx.lr),ctx.r3.u32,ctx.r5.u32,ctx.r6.u32,ctx.r7.u32,ctx.r13.u32);
     }
   }
-  if(REXCVAR_GET(edf_native_host) && callback==0x8214EBA0)
+  if(EDF_NATIVE_FLAG(host) && callback==0x8214EBA0)
     __imp__edf_native_worker_signal_cpu_tail(ctx,base);
   else __imp__sub_8213C9F0(ctx,base);
-  if(REXCVAR_GET(edf_native_host) && callback==0x8214EBA0) {
+  if(EDF_NATIVE_FLAG(host) && callback==0x8214EBA0) {
     const uint32_t bytes=ctx.r3.u32-begin;
     const auto physical=edf::native::NativeSignalCommandAddress(begin+4);
     if(uint64_t(begin)+bytes+4>(uint64_t(1)<<32) || !bytes)
@@ -7074,7 +7075,7 @@ REX_EXTERN(edf_native_null_worker_job) {
 }
 REX_HOOK_RAW(sub_8214E8E0) {
   const auto worker_arg=ctx.r3.u32;
-  const bool audit=REXCVAR_GET(edf_native_host) && REXCVAR_GET(edf_native_hook_timings);
+  const bool audit=EDF_NATIVE_FLAG(host) && REXCVAR_GET(edf_native_hook_timings);
   static std::atomic<uint64_t> calls{0};
   const auto count=audit?calls.fetch_add(1,std::memory_order_relaxed)+1:0;
   const bool sample=count && (count<=8 || !(count&(count-1)));
@@ -7083,9 +7084,9 @@ REX_HOOK_RAW(sub_8214E8E0) {
   if(sample)
     REXLOG_INFO("Native CPU worker entered: count={}, worker={:#x}, CPU={}, busy={}, nesting={}, argument={:#x}, continuation={:#x}",
       count,worker,reader.Word(worker_arg+4),reader.Word(worker+56),reader.Word(worker+48),reader.Word(worker+88),reader.Word(worker+80));
-  if(REXCVAR_GET(edf_native_host)) __imp__edf_native_worker_audit(ctx,base);
+  if(EDF_NATIVE_FLAG(host)) __imp__edf_native_worker_audit(ctx,base);
   else __imp__sub_8214E8E0(ctx,base);
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     const auto actual_worker=reader.Word(worker_arg);
     edf::native::HookTiming service_timing(edf::native::HookPhase::WorkerService);
     const auto device=actual_worker-10812;
@@ -7122,7 +7123,7 @@ REX_EXTERN(__imp__KfReleaseSpinLock);
 REX_EXTERN(sub_8213C018);
 REX_HOOK_RAW(sub_8213C868) {
   const auto device=ctx.r3.u32;
-  if(REXCVAR_GET(edf_native_host) && REXCVAR_GET(edf_native_hook_timings)) {
+  if(EDF_NATIVE_FLAG(host) && REXCVAR_GET(edf_native_hook_timings)) {
     const auto caller=uint32_t(ctx.lr);
     const size_t path=caller==0x8213CEF8?0:caller==0x8213CFD8?1:caller==0x8214EDF8?2:caller==0x8214EE44?3:4;
     static std::array<std::atomic<uint64_t>,10> calls{};
@@ -7139,7 +7140,7 @@ REX_HOOK_RAW(sub_8213C868) {
       }
     }
   }
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     {
       edf::native::NativeSignalSubmissionScope submission(device);
       const edf::native::GuestReader reader(base);
@@ -7267,13 +7268,13 @@ REX_HOOK_RAW(sub_8213C5F0) {
   // following CDC0 native fence submission and optional CPU wait still run.
   // ECD8 consumes the reserved address as fallback CPU storage: retain its
   // reservation/failure contract, but do not encode or enqueue cache packets.
-  if(REXCVAR_GET(edf_native_host) && uint32_t(ctx.lr)==0x8213CF9C) {
+  if(EDF_NATIVE_FLAG(host) && uint32_t(ctx.lr)==0x8213CF9C) {
     __imp__edf_native_cache_range_cpu_tail(ctx,base); return;
   }
-  if(REXCVAR_GET(edf_native_host) && uint32_t(ctx.lr)==0x8214ED04) {
+  if(EDF_NATIVE_FLAG(host) && uint32_t(ctx.lr)==0x8214ED04) {
     __imp__edf_native_cache_reservation_cpu_tail(ctx,base); return;
   }
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     REXLOG_ERROR("Unsupported native cache-range caller={:#x}; no Xbox packet fallback",uint32_t(ctx.lr));
     throw std::runtime_error("native cache range caller has no CPU reservation contract");
   }
@@ -7283,7 +7284,7 @@ REX_EXTERN(__imp__edf_native_device_reset);
 REX_EXTERN(__imp__sub_8213D1C8);
 REX_EXTERN(__imp__edf_native_device_drain);
 REX_HOOK_RAW(sub_8213D1C8) {
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     __imp__edf_native_device_drain(ctx,base); return;
   }
   __imp__sub_8213D1C8(ctx,base);
@@ -7342,7 +7343,7 @@ REX_EXTERN(edf_native_drain_worker_signals) {
   if(reader.Word(reader.Add(device,10868))) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 REX_HOOK_RAW(sub_8213D298) {
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     const auto device=ctx.r3.u32,configuration=ctx.r4.u32;
     __imp__edf_native_device_reset(ctx,base);
     if(configuration && ctx.r3.u32==0) {
@@ -7354,7 +7355,7 @@ REX_HOOK_RAW(sub_8213D298) {
     }
     return;
   }
-  if(REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_fence_probe)) {
+  if(EDF_NATIVE_FLAG(shader_bridge) && REXCVAR_GET(edf_native_fence_probe)) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     state.completion_queues.erase(ctx.r3.u32);
@@ -7390,7 +7391,7 @@ REX_HOOK_RAW(sub_82139638) {
   __imp__sub_82139638(ctx,base);
   if(device_allocation && ctx.r3.u32 &&
       (REXCVAR_GET(edf_native_render_state_audit) || REXCVAR_GET(edf_native_owned_render_state)) &&
-      REXCVAR_GET(edf_native_shader_bridge)) {
+      EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     state.render_state_snapshots.Retire(ctx.r3.u32);
@@ -7402,7 +7403,7 @@ REX_HOOK_RAW(sub_82139638) {
 REX_EXTERN(__imp__sub_82139760);
 REX_HOOK_RAW(sub_82139760) {
   if((REXCVAR_GET(edf_native_render_state_audit) || REXCVAR_GET(edf_native_owned_render_state)) &&
-      REXCVAR_GET(edf_native_shader_bridge)) {
+      EDF_NATIVE_FLAG(shader_bridge)) {
     const edf::native::GuestReader reader(base);
     // Final Release invokes destruction/free; non-final Release keeps ownership.
     if(reader.Word(reader.Add(ctx.r3.u32,52))==1) {
@@ -7419,7 +7420,7 @@ REX_HOOK_RAW(sub_82135418) {
   const auto device=ctx.r3.u32;
   __imp__sub_82135418(ctx,base);
   if((REXCVAR_GET(edf_native_owned_render_state) || REXCVAR_GET(edf_native_render_state_audit)) &&
-      REXCVAR_GET(edf_native_shader_bridge)) {
+      EDF_NATIVE_FLAG(shader_bridge)) {
     const edf::native::GuestReader reader(base);
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
@@ -7479,7 +7480,7 @@ EDF_RENDER_STATE_SETTER(sub_82137988,0x82137988)
 // Replace the two present profiling packets with native timestamp markers.
 REX_EXTERN(__imp__sub_821390B8);
 REX_HOOK_RAW(sub_821390B8) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_821390B8(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_821390B8(ctx,base); return; }
   const bool finish=ctx.lr==0x8215162C;
   if(!finish && ctx.lr!=0x82151544) throw std::runtime_error("unknown native profiling marker caller");
   const edf::native::GuestReader reader(base);
@@ -7501,7 +7502,7 @@ REX_HOOK_RAW(sub_821390B8) {
 }
 REX_EXTERN(__imp__sub_82138158);
 REX_HOOK_RAW(sub_82138158) {
-  if(!REXCVAR_GET(edf_native_host) || ctx.r4.u32!=6) { __imp__sub_82138158(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host) || ctx.r4.u32!=6) { __imp__sub_82138158(ctx,base); return; }
   // Retail's 0x7fffffff float is its unavailable-sample sentinel, not zero.
   ctx.f1.f64=edf::native::NativeProfileResult(std::nullopt,0,0);
   const edf::native::GuestReader reader(base);
@@ -7525,7 +7526,7 @@ REX_HOOK_RAW(sub_82138158) {
 REX_EXTERN(__imp__sub_82138E00);
 REX_HOOK_RAW(sub_82138E00) {
   uint32_t reset_device=0;
-  if(REXCVAR_GET(edf_native_host) && (ctx.r3.u32==0 ||
+  if(EDF_NATIVE_FLAG(host) && (ctx.r3.u32==0 ||
       ((ctx.r3.u32==16 || ctx.r3.u32==17) && ctx.r4.u32==6))) {
     const edf::native::GuestReader reader(base);
     const auto device=reader.Word(reader.Word(0x82000720));
@@ -7563,7 +7564,7 @@ void AuditNativeFenceRecord(const Reader& reader,uint32_t record,
 }
 REX_EXTERN(__imp__sub_821394D8);
 REX_HOOK_RAW(sub_821394D8) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_821394D8(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_821394D8(ctx,base); return; }
   const edf::native::GuestReader guest(base);
   edf::native::NativeFenceRecord owned{};
   const edf::native::NativeFenceRecordAccess reader(guest,ctx.r3.u32,owned);
@@ -7576,7 +7577,7 @@ edf::native::NativeBufferWrites::WriterScope edf_native_begin_fence_counter_writ
 void edf_native_complete_fence_counter_write(uint8_t*,uint32_t);
 REX_EXTERN(__imp__sub_82139508);
 REX_HOOK_RAW(sub_82139508) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_82139508(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_82139508(ctx,base); return; }
   const edf::native::GuestReader guest(base);
   const auto record=ctx.r3.u32;
   // Detach before accounting/callbacks, allowing reentrant reuse without a
@@ -7613,7 +7614,7 @@ REX_HOOK_RAW(sub_82139508) {
 REX_EXTERN(__imp__sub_82139688);
 REX_HOOK_RAW(sub_82139688) {
   edf::native::HookTiming poll_timing(edf::native::HookPhase::CompletionPoll);
-  const bool native=REXCVAR_GET(edf_native_host);
+  const bool native=EDF_NATIVE_FLAG(host);
   if(native) {
     const auto record_token=ctx.r3.u32,tls=ctx.r13.u32;
     try {
@@ -7657,7 +7658,7 @@ REX_HOOK_RAW(sub_82139688) {
 // not the retail GPU interrupt handler (which reads Xenos MMIO).
 REX_EXTERN(__imp__sub_821BEBF0);
 REX_HOOK_RAW(sub_821BEBF0) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_821BEBF0(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_821BEBF0(ctx,base); return; }
   const edf::native::GuestReader reader(base);
   const auto object=ctx.r3.u32, divisor=ctx.r4.u32;
   (void)edf::native::NativePacingSteps(0,0,divisor);
@@ -7674,7 +7675,7 @@ REX_HOOK_RAW(sub_821BEBF0) {
 REX_EXTERN(__imp__sub_821BEAB0);
 REX_EXTERN(sub_821FAC28);
 REX_HOOK_RAW(sub_821BEAB0) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_821BEAB0(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_821BEAB0(ctx,base); return; }
   NativeLoopTrace loop_trace("heartbeat",ctx.r3.u32,ctx.lr);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::EngineWait);
   const edf::native::GuestReader reader(base);
@@ -7718,7 +7719,7 @@ REX_HOOK_RAW(sub_821BEAB0) {
 
 REX_EXTERN(__imp__sub_821BEB38);
 REX_HOOK_RAW(sub_821BEB38) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_821BEB38(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_821BEB38(ctx,base); return; }
   auto& state=edf::native::PacingState();
   std::lock_guard lock(state.mutex);
   const edf::native::GuestReader reader(base);
@@ -7734,7 +7735,7 @@ REX_EXTERN(sub_8213CDC0);
 REX_EXTERN(sub_8213C928);
 REX_HOOK_RAW(sub_8213CF60) {
   edf::native::HookTiming timing(edf::native::HookPhase::SubmissionFlush);
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_8213CF60(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_8213CF60(ctx,base); return; }
   const edf::native::GuestReader reader(base);
   const auto device=ctx.r3.u32;
   auto work=ctx;
@@ -7761,7 +7762,7 @@ REX_EXTERN(sub_8213C868);
 REX_EXTERN(sub_8213CC20);
 REX_HOOK_RAW(sub_8213CDC0) {
   edf::native::HookTiming timing(edf::native::HookPhase::DescriptorSubmit);
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_8213CDC0(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_8213CDC0(ctx,base); return; }
   const edf::native::GuestReader reader(base);
   const auto device=ctx.r3.u32;
   auto work=ctx;
@@ -7814,18 +7815,18 @@ void RunNativeAllocatorWait(PPCContext& ctx,uint8_t* base,bool generation) {
 }
 REX_EXTERN(__imp__sub_8213BC48);
 REX_HOOK_RAW(sub_8213BC48) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_8213BC48(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_8213BC48(ctx,base); return; }
   RunNativeAllocatorWait(ctx,base,true);
 }
 REX_EXTERN(__imp__sub_8213BCE0);
 REX_HOOK_RAW(sub_8213BCE0) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_8213BCE0(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_8213BCE0(ctx,base); return; }
   RunNativeAllocatorWait(ctx,base,false);
 }
 REX_EXTERN(__imp__sub_8213C928);
 REX_EXTERN(__imp__sub_8214E5B8);
 REX_HOOK_RAW(sub_8214E5B8) {
-  if(!REXCVAR_GET(edf_native_host)) { __imp__sub_8214E5B8(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(host)) { __imp__sub_8214E5B8(ctx,base); return; }
   const edf::native::GuestReader reader(base);
   const auto device=reader.Word(reader.Word(0x82000720));
   auto work=ctx;
@@ -7849,7 +7850,7 @@ REX_EXTERN(sub_82139508);
 REX_HOOK_RAW(sub_8213C928) {
   edf::native::HookTiming wait_timing(edf::native::HookPhase::FenceWait);
   const auto device=ctx.r3.u32,target=ctx.r4.u32;
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     const edf::native::GuestReader reader(base);
     const auto wait_device=ctx.r3.u32,target=ctx.r4.u32,kind=ctx.r5.u32;
     auto work=ctx;
@@ -7869,7 +7870,7 @@ REX_HOOK_RAW(sub_8213C928) {
     __imp__sub_8213C928(ctx,base);
   }
   wait_timing.Finish(); // Exclude optional post-wait diagnostic validation.
-  if(!REXCVAR_GET(edf_native_shader_bridge) || !REXCVAR_GET(edf_native_fence_probe)) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge) || !REXCVAR_GET(edf_native_fence_probe)) return;
   auto& state=edf::native::State();
   std::lock_guard lock(state.mutex);
   if(state.completion_faults.contains(device)) return;
@@ -7917,7 +7918,7 @@ REX_HOOK_RAW(sub_8213C928) {
 // pointer/count/capacity. Native resources must not outlive that ownership.
 REX_EXTERN(__imp__sub_820AB2F8);
 REX_HOOK_RAW(sub_820AB2F8) {
-  if (REXCVAR_GET(edf_native_shader_bridge)) edf::native::ForgetOwner(ctx.r3.u32);
+  if (EDF_NATIVE_FLAG(shader_bridge)) edf::native::ForgetOwner(ctx.r3.u32);
   __imp__sub_820AB2F8(ctx, base);
 }
 
@@ -7945,7 +7946,7 @@ REX_HOOK_RAW(sub_822009B0) {
 // reference count to zero. Remove the mapping before the address can be reused.
 REX_EXTERN(__imp__sub_82134220);
 REX_HOOK_RAW(sub_82134220) {
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state = edf::native::State();
     // Registry retirement issues no context commands. Submitted D3D work owns
     // its resource references; registry users are serialized by state.mutex.
@@ -7983,7 +7984,7 @@ REX_EXTERN(sub_821375C0);
 REX_EXTERN(sub_821D3EA0);
 namespace {
 void RetireNativeModelBuffer(uint32_t resource) {
-  if (!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if (!EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=edf::native::State();
   // Registry/cache retirement has no immediate-context work. Keep it atomic
   // with draws using the state lock, without waiting for refresh pacing.
@@ -8025,12 +8026,12 @@ void CleanupNativeModelBuffer(PPCContext& ctx,uint8_t* base,bool index) {
 }
 REX_HOOK_RAW(sub_821D7468) {
   RetireNativeModelBuffer(ctx.r3.u32);
-  if(REXCVAR_GET(edf_native_shader_bridge)) { CleanupNativeModelBuffer(ctx,base,false); return; }
+  if(EDF_NATIVE_FLAG(shader_bridge)) { CleanupNativeModelBuffer(ctx,base,false); return; }
   __imp__sub_821D7468(ctx,base);
 }
 REX_HOOK_RAW(sub_821D75F8) {
   RetireNativeModelBuffer(ctx.r3.u32);
-  if(REXCVAR_GET(edf_native_shader_bridge)) { CleanupNativeModelBuffer(ctx,base,true); return; }
+  if(EDF_NATIVE_FLAG(shader_bridge)) { CleanupNativeModelBuffer(ctx,base,true); return; }
   __imp__sub_821D75F8(ctx,base);
 }
 
@@ -8038,7 +8039,7 @@ REX_HOOK_RAW(sub_821D75F8) {
 // its own guest critical section and before the pool makes these bytes reusable.
 REX_EXTERN(__imp__sub_821D3DC8);
 REX_HOOK_RAW(sub_821D3DC8) {
-  if(REXCVAR_GET(edf_native_shader_bridge)) {
+  if(EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     // Allocation ownership retirement is metadata-only, as above.
     std::lock_guard lock(state.mutex);
@@ -8054,7 +8055,7 @@ REX_HOOK_RAW(sub_821D3748) {
   // This audited edge runs under the guest pool lock. Retire by actual block
   // extent even if its original model wrapper has already left the registry.
   // Keep pool -> renderer ordering; no renderer lock spans the guest helper.
-  if(REXCVAR_GET(edf_native_shader_bridge) && uint32_t(ctx.lr)==0x821D3E30) {
+  if(EDF_NATIVE_FLAG(shader_bridge) && uint32_t(ctx.lr)==0x821D3E30) {
     const auto block=edf::native::ReadNativePoolBlock(edf::native::GuestReader(base),ctx.r3.u32,ctx.r4.u64);
     auto* memory=REX_KERNEL_MEMORY();
     if(!memory || memory->virtual_membase()!=base)
@@ -8126,7 +8127,7 @@ namespace {
 REX_EXTERN(__imp__sub_821D3A40);
 REX_HOOK_RAW(sub_821D3A40) {
   edf::native::NativeBufferWrites::ReleaseScopes release_scopes;
-  if(REXCVAR_GET(edf_native_shader_bridge)) {
+  if(EDF_NATIVE_FLAG(shader_bridge)) {
     const auto backings=edf::native::ReadNativePoolBackings(edf::native::GuestReader(base),ctx.r3.u32);
     release_scopes=RetireNativePoolBackings(base,backings);
   }
@@ -8143,7 +8144,7 @@ REX_HOOK_RAW(sub_8212FC28) {
   // unreachable from the temporary's initial zero value. Other callers keep
   // their prior policy.
   const auto caller=uint32_t(ctx.lr);
-  if(REXCVAR_GET(edf_native_shader_bridge) &&
+  if(EDF_NATIVE_FLAG(shader_bridge) &&
      (caller==0x821D3BEC || caller==0x821D18B4 || caller==0x821D190C || caller==0x821D4404)) {
     const std::array<uint32_t,1> backings{ctx.r3.u32};
     release_scopes=RetireNativePoolBackings(base,backings);
@@ -8157,7 +8158,7 @@ REX_HOOK_RAW(sub_8212F4B8) {
   // Preserve the retail selector: only low-word bit31 denotes physical
   // memory, and its null case is a no-op. CPU-heap releases are untouched.
   // Resolve/retire before forwarding, with no bridge lock spanning guest code.
-  if(REXCVAR_GET(edf_native_shader_bridge) && (ctx.r4.u32&0x80000000u) && ctx.r3.u32) {
+  if(EDF_NATIVE_FLAG(shader_bridge) && (ctx.r4.u32&0x80000000u) && ctx.r3.u32) {
     const std::array<uint32_t,1> backings{ctx.r3.u32};
     release_scopes=RetireNativePoolBackings(base,backings);
   }
@@ -8169,7 +8170,7 @@ REX_HOOK_RAW(sub_8212F4B8) {
 namespace {
 void PublishNativeModelBuffer(uint8_t* base,uint32_t owner,edf::native::NativeModelBuffers::Kind kind,
                               uint32_t stride,uint32_t count) {
-  if(!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=edf::native::State();
   // Drain/apply write notifications and publish the generation atomically.
   // NativeIndexBuffer creates an immutable device resource with initial data;
@@ -8296,14 +8297,14 @@ void ConstructNativeModelBuffer(PPCContext& ctx,uint8_t* base,bool index) {
 }
 }
 REX_HOOK_RAW(sub_821D7530) {
-  if(REXCVAR_GET(edf_native_shader_bridge)) { ConstructNativeModelBuffer(ctx,base,false); return; }
+  if(EDF_NATIVE_FLAG(shader_bridge)) { ConstructNativeModelBuffer(ctx,base,false); return; }
   const auto owner=ctx.r3.u32,stride=ctx.r5.u32,count=ctx.r6.u32;
   __imp__sub_821D7530(ctx,base);
   if(ctx.r3.u32) PublishNativeModelBuffer(base,owner,edf::native::NativeModelBuffers::Kind::Vertex,stride,count);
 }
 REX_EXTERN(__imp__sub_821D76A8);
 REX_HOOK_RAW(sub_821D76A8) {
-  if(REXCVAR_GET(edf_native_shader_bridge)) { ConstructNativeModelBuffer(ctx,base,true); return; }
+  if(EDF_NATIVE_FLAG(shader_bridge)) { ConstructNativeModelBuffer(ctx,base,true); return; }
   const auto owner=ctx.r3.u32,count=ctx.r5.u32;
   __imp__sub_821D76A8(ctx,base);
   if(ctx.r3.u32) PublishNativeModelBuffer(base,owner,edf::native::NativeModelBuffers::Kind::Index,2,count);
@@ -8317,7 +8318,7 @@ edf::native::NativeBufferWrites* NativeBufferWriteQueue(uint8_t* base,uint32_t d
     std::optional<edf::native::NativeBufferWrites::Range>* range=nullptr) {
   if(range) range->reset();
   auto* memory=REX_KERNEL_MEMORY();
-  if(!REXCVAR_GET(edf_native_shader_bridge) || !memory || memory->virtual_membase()!=base) return nullptr;
+  if(!EDF_NATIVE_FLAG(shader_bridge) || !memory || memory->virtual_membase()!=base) return nullptr;
   const auto extent=edf::native::MapCompletedNativePhysicalWrite(*memory,destination,bytes);
   if(!extent) return nullptr;
   if(range && !extent->all) *range=edf::native::NativeBufferWrites::Range{extent->address,extent->bytes};
@@ -8331,7 +8332,7 @@ edf::native::NativeBufferWrites::WriterScope BeginNativeBufferWrite(uint8_t* bas
 }
 void NotifyCompletedNativeBufferWrite(uint8_t* base,uint32_t destination,uint32_t bytes,bool notify_versions=false,bool generated=false,
     edf::native::NativeBufferWrites::WriterSite site={nullptr,0}) {
-  if(!REXCVAR_GET(edf_native_shader_bridge) || !bytes || destination<0xa0000000u) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge) || !bytes || destination<0xa0000000u) return;
   auto* memory=REX_KERNEL_MEMORY();
   if(!memory || memory->virtual_membase()!=base) return;
   const auto extent=edf::native::MapCompletedNativePhysicalWrite(*memory,destination,bytes);
@@ -8371,7 +8372,7 @@ void edf_native_counter_store_word(uint8_t* base,uint32_t address,uint32_t value
 REX_EXTERN(__imp__sub_82139228);
 REX_EXTERN(__imp__sub_82138858);
 REX_HOOK_RAW(sub_82138858) {
-  if(REXCVAR_GET(edf_native_host)) {
+  if(EDF_NATIVE_FLAG(host)) {
     const edf::native::GuestReader reader(base);
     if(edf::native::RunNativePixIdle(ctx,reader,[&](uint32_t callback,auto& work) {
       rex::runtime::ResolveIndirectFunction(callback)(work,base);
@@ -8381,7 +8382,7 @@ REX_HOOK_RAW(sub_82138858) {
 }
 REX_EXTERN(__imp__edf_native_counter_reset_cpu_tail);
 REX_HOOK_RAW(sub_82139228) {
-  if(REXCVAR_GET(edf_native_host)) __imp__edf_native_counter_reset_cpu_tail(ctx,base);
+  if(EDF_NATIVE_FLAG(host)) __imp__edf_native_counter_reset_cpu_tail(ctx,base);
   else __imp__sub_82139228(ctx,base);
 }
 // Optional generated-store endpoint (scalar, SIMD, atomic and inline zero).
@@ -8487,7 +8488,7 @@ REX_HOOK_RAW(sub_82134408) {
   // 14; the extracted helper preserves parent fences, both dirty ranges and
   // the returned CPU alias, omitting only the Xbox cache packet block.
   const bool texture_lock=ctx.r4.u32==14 && uint32_t(ctx.lr)==0x8213ae24;
-  if(REXCVAR_GET(edf_native_shader_bridge) && (ctx.r4.u32==10 || ctx.r4.u32==12 || texture_lock)) {
+  if(EDF_NATIVE_FLAG(shader_bridge) && (ctx.r4.u32==10 || ctx.r4.u32==12 || texture_lock)) {
     __imp__edf_native_buffer_lock_cpu_tail(ctx,base);
     if(texture_lock) {
       static thread_local uint64_t completed=0;
@@ -8497,7 +8498,7 @@ REX_HOOK_RAW(sub_82134408) {
 }
 namespace {
 void NotifyNativeBufferUpdate(uint8_t* base,uint32_t owner,bool index_buffer) {
-  if(!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=edf::native::State();
   // Invalidate CPU ownership/cache snapshots under the registry lock. No GPU
   // commands are issued, so completed CPU writes need not wait for refresh.
@@ -8522,7 +8523,7 @@ void NotifyNativeBufferUpdate(uint8_t* base,uint32_t owner,bool index_buffer) {
 }
 REX_EXTERN(__imp__sub_82141AB8);
 REX_HOOK_RAW(sub_82141AB8) {
-  if(REXCVAR_GET(edf_native_shader_bridge)) {
+  if(EDF_NATIVE_FLAG(shader_bridge)) {
     edf::native::NativeCacheFlushCpu(ctx,edf::native::GuestReader(base));
     return;
   }
@@ -8536,7 +8537,7 @@ REX_HOOK_RAW(sub_821349B8) {
     // VB unlock passes r5=0 to 82134640, so its non-stack outputs are
     // header word 0 and conditional word +20, never word +24. Payload
     // copies have their own producer scopes; release this before state.mutex.
-    const auto bytes=REXCVAR_GET(edf_native_shader_bridge)?24u:0u;
+    const auto bytes=EDF_NATIVE_FLAG(shader_bridge)?24u:0u;
     const auto header_writer=BeginNativeBufferWrite(base,owner,bytes,true);
     if(bytes) __imp__edf_native_unlock_821349B8(ctx,base);
     else __imp__sub_821349B8(ctx,base);
@@ -8548,14 +8549,14 @@ REX_EXTERN(__imp__sub_82134AD8);
 REX_EXTERN(__imp__edf_native_unlock_82134AD8);
 REX_HOOK_RAW(sub_82134AD8) {
   const auto owner=ctx.r3.u32;
-  const bool inline_indices=REXCVAR_GET(edf_native_shader_bridge) && uint32_t(ctx.lr)==0x8242D3DC;
+  const bool inline_indices=EDF_NATIVE_FLAG(shader_bridge) && uint32_t(ctx.lr)==0x8242D3DC;
   if(inline_indices) edf::native::NativeBufferWriteFrame::Current().RequireOwner(owner);
   {
     // Index unlock tail-calls 82134640 with r5=0: header word 0 and
     // conditional word +0x14 are its guest header outputs, not +0x18.
     // This header contract holds for every caller, independently of the
     // special twelve-byte inline payload and its physical mapping.
-    const auto bytes=REXCVAR_GET(edf_native_shader_bridge)?24u:0u;
+    const auto bytes=EDF_NATIVE_FLAG(shader_bridge)?24u:0u;
     const auto header_writer=BeginNativeBufferWrite(base,owner,bytes,true,
       edf::native::NativeBufferWrites::WriterKind::InlineIndices);
     if(bytes) __imp__edf_native_unlock_82134AD8(ctx,base);
@@ -8574,7 +8575,7 @@ REX_HOOK_RAW(sub_82134AD8) {
 // extent to arbitrary index locks, saved aliases, or other producer callbacks.
 REX_EXTERN(__imp__sub_8242D2B0);
 REX_HOOK_RAW(sub_8242D2B0) {
-  if(!REXCVAR_GET(edf_native_shader_bridge)) { __imp__sub_8242D2B0(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(shader_bridge)) { __imp__sub_8242D2B0(ctx,base); return; }
   edf::native::NativeBufferWriteFrame frame;
   __imp__sub_8242D2B0(ctx,base);
   frame.RequireFinished();
@@ -8584,13 +8585,13 @@ REX_EXTERN(__imp__edf_native_lock_82134A78);
 REX_EXTERN(__imp__sub_82134958);
 REX_EXTERN(__imp__edf_native_lock_82134958);
 REX_HOOK_RAW(sub_82134958) {
-  if(REXCVAR_GET(edf_native_shader_bridge)) __imp__edf_native_lock_82134958(ctx,base);
+  if(EDF_NATIVE_FLAG(shader_bridge)) __imp__edf_native_lock_82134958(ctx,base);
   else __imp__sub_82134958(ctx,base);
 }
 REX_HOOK_RAW(sub_82134A78) {
   const auto owner=ctx.r3.u32;
-  const bool inline_indices=REXCVAR_GET(edf_native_shader_bridge) && uint32_t(ctx.lr)==0x8242D3A8;
-  if(REXCVAR_GET(edf_native_shader_bridge)) __imp__edf_native_lock_82134A78(ctx,base);
+  const bool inline_indices=EDF_NATIVE_FLAG(shader_bridge) && uint32_t(ctx.lr)==0x8242D3A8;
+  if(EDF_NATIVE_FLAG(shader_bridge)) __imp__edf_native_lock_82134A78(ctx,base);
   else __imp__sub_82134A78(ctx,base);
   if(inline_indices) {
     // Fence callbacks and lock-entry writes have already returned. The six
@@ -8608,7 +8609,7 @@ REX_EXTERN(__imp__sub_8213B850);
 REX_HOOK_RAW(sub_8213B850) {
   const auto width=ctx.r3.u32,height=ctx.r4.u32,format=ctx.r5.u32,msaa=ctx.r6.u32;
   __imp__sub_8213B850(ctx,base);
-  if (REXCVAR_GET(edf_native_shader_bridge) && ctx.r3.u32) {
+  if (EDF_NATIVE_FLAG(shader_bridge) && ctx.r3.u32) {
     auto& state=edf::native::State();
     // Device-only creation/registry replacement; no context submission here.
     std::lock_guard lock(state.mutex);
@@ -8632,7 +8633,7 @@ REX_HOOK_RAW(sub_8213B850) {
 // stencil (verified in 821334E8), not desktop D3D9's 1/2/4 flag values.
 REX_EXTERN(__imp__sub_821340D0);
 REX_HOOK_RAW(sub_821340D0) {
-  if (REXCVAR_GET(edf_native_shader_bridge) && (ctx.r6.u32&15)) {
+  if (EDF_NATIVE_FLAG(shader_bridge) && (ctx.r6.u32&15)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -8668,7 +8669,7 @@ REX_HOOK_RAW(sub_821340D0) {
       REXLOG_ERROR("Native color clear: {}",error.what());
     }
   }
-  if (REXCVAR_GET(edf_native_shader_bridge) && (ctx.r6.u32&0x30)) {
+  if (EDF_NATIVE_FLAG(shader_bridge) && (ctx.r6.u32&0x30)) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     try {
@@ -8712,7 +8713,7 @@ REX_HOOK_RAW(sub_821371D0) {
   edf::native::HookTiming hook_timing(edf::native::HookPhase::ViewportHook);
   const auto device=ctx.r3.u32;
   const auto caller=uint32_t(ctx.lr);
-  const bool audit=REXCVAR_GET(edf_native_host);
+  const bool audit=EDF_NATIVE_FLAG(host);
   std::array<uint32_t,6> requested{};
   if(audit) requested=edf::native::ReadGuestWords<6>(edf::native::GuestReader(base),ctx.r4.u32);
   if(audit) {
@@ -8849,7 +8850,7 @@ REX_HOOK_RAW(sub_8219C7A8) {
     __imp__sub_8219C7A8(ctx,base);
   }
   edf::native::HookTiming native_timing(edf::native::HookPhase::SceneSetupNative);
-  if (REXCVAR_GET(edf_native_shader_bridge) && ctx.r3.u32) {
+  if (EDF_NATIVE_FLAG(shader_bridge) && ctx.r3.u32) {
     auto& state=edf::native::State();
     edf::native::HookTiming lock_timing(edf::native::HookPhase::SceneSetupLock);
     std::lock_guard submission(state.submissions);
@@ -8937,7 +8938,7 @@ REX_HOOK_RAW(sub_8219C7A8) {
 REX_EXTERN(__imp__sub_8219C930);
 REX_HOOK_RAW(sub_8219C930) {
   const auto output_owner=ctx.r3.u32;
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -8968,7 +8969,7 @@ REX_HOOK_RAW(sub_8219C930) {
     }
   }
   __imp__sub_8219C930(ctx,base);
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     state.active_output=0;
@@ -8999,7 +9000,7 @@ REX_HOOK_RAW(sub_8219C930) {
 // resolve. Close that native scope too, before any following UI/frame work.
 REX_EXTERN(__imp__sub_8219C840);
 REX_HOOK_RAW(sub_8219C840) {
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -9131,7 +9132,7 @@ REX_HOOK_RAW(sub_8219C840) {
 // tile resources. Clear the active scope before releasing its attachments.
 REX_EXTERN(__imp__sub_8219E140);
 REX_HOOK_RAW(sub_8219E140) {
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -9146,7 +9147,7 @@ REX_EXTERN(__imp__sub_821B8C30);
 REX_HOOK_RAW(sub_821B8C30) {
   const auto owner = ctx.r3.u32;
   __imp__sub_821B8C30(ctx,base);
-  if (REXCVAR_GET(edf_native_shader_bridge) && ctx.r3.u8) {
+  if (EDF_NATIVE_FLAG(shader_bridge) && ctx.r3.u8) {
     try { edf::native::RegisterRenderTarget(edf::native::GuestReader(base),owner); }
     catch (const std::exception& error) { REXLOG_ERROR("Native render target: {}",error.what()); }
   }
@@ -9157,14 +9158,14 @@ REX_HOOK_RAW(sub_821B8828) {
   if(auto* recorder=edf::native::post_finish_recorder; recorder && recorder->targets.contains(owner))
     recorder->seen.BeginTarget(owner);
   __imp__sub_821B8828(ctx,base);
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     try { edf::native::BeginRenderTarget(owner); }
     catch (const std::exception& error) { REXLOG_ERROR("Native render target begin: {}",error.what()); }
   }
 }
 REX_EXTERN(__imp__sub_821B88B0);
 REX_HOOK_RAW(sub_821B88B0) {
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     try {
       const edf::native::GuestReader reader(base);
       if (*reader.Bytes(reader.Add(ctx.r3.u32,40),1)) edf::native::EndRenderTarget(ctx.r3.u32);
@@ -9177,7 +9178,7 @@ REX_HOOK_RAW(sub_821B88B0) {
 // format r8, pool r9, resource type r10; returns the new resource pointer.
 REX_EXTERN(__imp__sub_8213B730);
 REX_HOOK_RAW(sub_8213B730) {
-  if (!REXCVAR_GET(edf_native_shader_bridge)) { __imp__sub_8213B730(ctx, base); return; }
+  if (!EDF_NATIVE_FLAG(shader_bridge)) { __imp__sub_8213B730(ctx, base); return; }
   const edf::native::TextureCreation creation{ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
     ctx.r6.u32, ctx.r7.u32, ctx.r8.u32, ctx.r9.u32, ctx.r10.u32, uint32_t(ctx.lr)};
   {
@@ -9253,7 +9254,7 @@ void InstallNativeStaticGeometry(PPCContext& ctx,uint8_t* base,uint32_t device,
 REX_HOOK_RAW(sub_82137410) {
   const auto device=ctx.r3.u32, stream=ctx.r4.u32;
   const edf::native::GuestStream binding{ctx.r5.u32,ctx.r6.u32,ctx.r7.u32};
-  if(!REXCVAR_GET(edf_native_shader_bridge)) { __imp__sub_82137410(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(shader_bridge)) { __imp__sub_82137410(ctx,base); return; }
   const edf::native::GuestReader reader(base);
   edf::native::SetNativeStreamResource(reader,device,stream,binding.resource,binding.offset,binding.stride,ctx.r8.u64,
     [&] {
@@ -9270,7 +9271,7 @@ REX_HOOK_RAW(sub_82137410) {
     },[&](auto path,uint32_t previous,uint32_t value,uint32_t cursor) {
       AuditNativeRetirement(reader,device,false,path,previous,value,cursor);
     });
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -9285,7 +9286,7 @@ REX_EXTERN(__imp__sub_821375C0);
 REX_EXTERN(sub_82141440);
 REX_HOOK_RAW(sub_821375C0) {
   const auto device=ctx.r3.u32,resource=ctx.r4.u32;
-  if(!REXCVAR_GET(edf_native_shader_bridge)) { __imp__sub_821375C0(ctx,base); return; }
+  if(!EDF_NATIVE_FLAG(shader_bridge)) { __imp__sub_821375C0(ctx,base); return; }
   const edf::native::GuestReader reader(base);
   edf::native::SetNativeIndexResource(reader,device,resource,
     [&] {
@@ -9304,7 +9305,7 @@ REX_HOOK_RAW(sub_821375C0) {
     },[&](auto path,uint32_t previous,uint32_t value,uint32_t cursor) {
       AuditNativeRetirement(reader,device,true,path,previous,value,cursor);
     });
-  if(REXCVAR_GET(edf_native_shader_bridge)) {
+  if(EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -9330,21 +9331,21 @@ void BindNativeShaderResource(PPCContext& ctx,uint8_t* base,bool pixel) {
   });
 }
 void PublishNativeShaderBinding(uint32_t device,uint32_t shader,bool pixel) {
-  if(!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=edf::native::State();
   std::lock_guard submission(state.submissions);
   std::lock_guard lock(state.mutex);
   state.shader_bindings.Set(device,shader,pixel);
 }
 void PublishNativeMaterialParameters(uint8_t* base,uint32_t instance) {
-  if(!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=edf::native::State();
   // CPU-owned metadata publication is serialized by the registry mutex.
   std::lock_guard lock(state.mutex);
   state.material_parameters.Publish(edf::native::GuestReader(base),instance);
 }
 void RetireNativeMaterialParameters(uint8_t* base,uint32_t instance,bool array) {
-  if(!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=edf::native::State();
   // Retained metadata snapshots keep their lifetime independently of this map.
   std::lock_guard lock(state.mutex);
@@ -9355,7 +9356,7 @@ void RetireNativeMaterialParameters(uint8_t* base,uint32_t instance,bool array) 
   } else state.material_parameters.Retire(instance);
 }
 void PublishNativeDeclarationContents(uint8_t* base,uint32_t handle) {
-  if(!REXCVAR_GET(edf_native_shader_bridge) || !handle) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge) || !handle) return;
   auto& state=edf::native::State();
   // Immutable declaration snapshots issue no immediate-context commands.
   std::lock_guard lock(state.mutex);
@@ -9367,7 +9368,7 @@ void PublishNativeDeclarationContents(uint8_t* base,uint32_t handle) {
     std::span<const uint8_t>{});
 }
 void PublishNativeDeclarationBinding(uint32_t device,uint32_t declaration) {
-  if(!REXCVAR_GET(edf_native_shader_bridge)) return;
+  if(!EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=edf::native::State();
   std::lock_guard submission(state.submissions);
   std::lock_guard lock(state.mutex);
@@ -9412,7 +9413,7 @@ REX_HOOK_RAW(sub_82147BA0) {
 REX_EXTERN(__imp__sub_821498C8);
 REX_EXTERN(__imp__sub_8213BA98);
 REX_HOOK_RAW(sub_8213BA98) {
-  if(!REXCVAR_GET(edf_native_shader_bridge) || !REXCVAR_GET(edf_native_material_activation) ||
+  if(!EDF_NATIVE_FLAG(shader_bridge) || !EDF_NATIVE_FLAG(material_activation) ||
      (edf::native::native_queued_scene_group && edf::native::native_queued_scene_group->material_compatibility_only)) {
     edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::TextureBinding);
     __imp__sub_8213BA98(ctx,base); return;
@@ -9432,7 +9433,7 @@ REX_HOOK_RAW(sub_8213BA98) {
 }
 REX_HOOK_RAW(sub_821498C8) {
   const auto device=ctx.r3.u32,shader=ctx.r4.u32;
-  if(REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_material_activation) &&
+  if(EDF_NATIVE_FLAG(shader_bridge) && EDF_NATIVE_FLAG(material_activation) &&
      (!edf::native::native_queued_scene_group || !edf::native::native_queued_scene_group->material_compatibility_only)) BindNativeShaderResource(ctx,base,false);
   else {
     edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::ShaderBinding);
@@ -9443,7 +9444,7 @@ REX_HOOK_RAW(sub_821498C8) {
 REX_EXTERN(__imp__sub_82149608);
 REX_HOOK_RAW(sub_82149608) {
   const auto device=ctx.r3.u32,shader=ctx.r4.u32;
-  if(REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_material_activation) &&
+  if(EDF_NATIVE_FLAG(shader_bridge) && EDF_NATIVE_FLAG(material_activation) &&
      (!edf::native::native_queued_scene_group || !edf::native::native_queued_scene_group->material_compatibility_only)) BindNativeShaderResource(ctx,base,true);
   else {
     edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::ShaderBinding);
@@ -9458,7 +9459,7 @@ REX_HOOK_RAW(sub_82149608) {
 REX_EXTERN(__imp__sub_82149A90);
 REX_HOOK_RAW(sub_82149A90) {
   const auto device=ctx.r3.u32,declaration=ctx.r4.u32;
-  if(REXCVAR_GET(edf_native_shader_bridge)) {
+  if(EDF_NATIVE_FLAG(shader_bridge)) {
     const edf::native::GuestReader reader(base);
     reader.StoreWord(reader.Add(device,11536),declaration);
     ctx.r12.u64=uint64_t(1)<<51;
@@ -9490,7 +9491,7 @@ REX_HOOK_RAW(sub_821FE358) {
   // drawn with. Resolved inside the draw, reported after it.
   uint32_t drawn_stride=0,drawn_index_width=0;
   edf::native::HookTiming native_timing(edf::native::HookPhase::IndexedNative);
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state=edf::native::State();
     edf::native::HookTiming submission_wait(edf::native::HookPhase::IndexedSubmissionWait);
     std::lock_guard submission(state.submissions);
@@ -9586,7 +9587,7 @@ REX_HOOK_RAW(sub_821FE358) {
         std::optional<GeometrySnapshots> observed_geometry;
         auto vertex_contents=native_vb?native_vb->vertex_contents:nullptr;
         const bool prepare_queued=REXCVAR_GET(edf_native_prepared_geometry) &&
-          REXCVAR_GET(edf_native_seam_draws) && uint32_t(ctx.lr)==0x821D97E8;
+          EDF_NATIVE_FLAG(seam_draws) && uint32_t(ctx.lr)==0x821D97E8;
         edf::native::NativeIndexedMesh* preacquired_mesh=nullptr;
         const edf::native::NativeIndexedMesh::PreparedDraw* prepared_draw=nullptr;
         bool prepared_geometry=false;
@@ -9826,7 +9827,7 @@ REX_HOOK_RAW(sub_821FE358) {
           // Recorded draws set all of this per draw through the pipeline and
           // the recorder, so the context bindings below are not merely
           // redundant, they describe a draw that is not going to happen.
-          const bool seam_draws=REXCVAR_GET(edf_native_seam_draws);
+          const bool seam_draws=EDF_NATIVE_FLAG(seam_draws);
           if(seam_draws) { /* bound per draw below */ }
           else if(same_binding) ++state.indexed_binds_skipped;
           else {
@@ -10001,7 +10002,7 @@ REX_HOOK_RAW(sub_821FE358) {
                 REXCVAR_GET(edf_native_world_instancing) && uint32_t(ctx.lr)==0x821D97E8}); };
               auto* group=edf::native::native_queued_scene_group;
               const bool native_material_setup=group && uint32_t(ctx.lr)==0x821D97E8 &&
-                REXCVAR_GET(edf_native_scene_material_owned) && !REXCVAR_GET(edf_native_scene_material_audit);
+                EDF_NATIVE_FLAG(scene_material_owned) && !REXCVAR_GET(edf_native_scene_material_audit);
               // Native scene rendering binds its own pipeline, resources and
               // constants. Only audit/fallback draws need the live bindings.
               auto& recorder=native_material_setup?edf::native::SceneRecorderLocked(state):setup();
@@ -10014,7 +10015,7 @@ REX_HOOK_RAW(sub_821FE358) {
                 try {
                   const auto* source=state.scene_sources.Find(group->instance);
                   if(!source) throw std::runtime_error("queued instance has no audited scene lifetime");
-                  const bool owned=REXCVAR_GET(edf_native_scene_material_owned);
+                  const bool owned=EDF_NATIVE_FLAG(scene_material_owned);
                   const bool audit=REXCVAR_GET(edf_native_scene_material_audit) && !group->material_audited;
                   if(!owned || audit)
                     captured=edf::native::CaptureNativeSceneMaterial(state.scene_backend,*state.recorded.pipeline,
@@ -10160,7 +10161,7 @@ REX_HOOK_RAW(sub_821FE358) {
                   object=state.scene_adapter.Observe(*source,state.scene_backend,mesh,ctx.r6.u32,ctx.r7.u32,ctx.r5.s32,*captured);
                 } catch(const std::exception& error) {
                   captured.reset(); ++state.scene_native_fallbacks;
-                  if(REXCVAR_GET(edf_native_scene_material_owned) &&
+                  if(EDF_NATIVE_FLAG(scene_material_owned) &&
                      (++state.scene_material_rejected<=4 || state.scene_material_rejected%10000==0))
                     REXLOG_INFO("Native scene owned material rejected: count={} reason={}",state.scene_material_rejected,error.what());
                   if(state.scene_native_reasons.size()<32 && state.scene_native_reasons.insert(error.what()).second)
@@ -10195,7 +10196,7 @@ REX_HOOK_RAW(sub_821FE358) {
                 if(prepared_draw) prepared_draw->Draw(recorder);
                 else mesh.Draw(recorder,ctx.r6.u32,ctx.r7.u32,ctx.r5.s32);
               }
-              if(REXCVAR_GET(edf_native_scene_queued) && state.indexed_submitted%100000==0)
+              if(EDF_NATIVE_FLAG(scene_queued) && state.indexed_submitted%100000==0)
                 REXLOG_INFO("Native scene queued: objects={} rendered={} draws={} fallback={}",state.scene_adapter.objects(),
                   state.scene_native_objects,state.scene_native_draws,state.scene_native_fallbacks);
             } else mesh.Draw(*state.context.Get(),ctx.r6.u32,ctx.r7.u32,ctx.r5.s32);
@@ -10473,7 +10474,7 @@ REX_HOOK_RAW(sub_821FE358) {
   edf::native::HookTiming guest_timing(edf::native::HookPhase::IndexedGuest);
   // The native CPU chain calls native implementations directly; it needs no
   // thread-local packet-routing scope. Mask inherited ownership only for legacy.
-  const bool native_host=REXCVAR_GET(edf_native_host);
+  const bool native_host=EDF_NATIVE_FLAG(host);
   std::optional<edf::native::NativeConstantOwnership> legacy_scope;
   if(!native_host) legacy_scope.emplace(0);
   if(native_host) {
@@ -10497,7 +10498,7 @@ REX_EXTERN(__imp__sub_8241E180);
 REX_HOOK_RAW(sub_8241E180) {
   const auto source=ctx.r4.u32,output=ctx.r5.u32,caller=uint32_t(ctx.lr);
   __imp__sub_8241E180(ctx,base);
-  if (REXCVAR_GET(edf_native_shader_bridge) && ctx.r3.s32>=0) {
+  if (EDF_NATIVE_FLAG(shader_bridge) && ctx.r3.s32>=0) {
     try { edf::native::RecordEmbeddedShader(edf::native::GuestReader(base),output,source,false,caller); }
     catch (const std::exception& error) { REXLOG_ERROR("Native middleware VS identity: {}",error.what()); }
   }
@@ -10506,7 +10507,7 @@ REX_EXTERN(__imp__sub_8241E1D0);
 REX_HOOK_RAW(sub_8241E1D0) {
   const auto source=ctx.r4.u32,output=ctx.r5.u32,caller=uint32_t(ctx.lr);
   __imp__sub_8241E1D0(ctx,base);
-  if (REXCVAR_GET(edf_native_shader_bridge) && ctx.r3.s32>=0) {
+  if (EDF_NATIVE_FLAG(shader_bridge) && ctx.r3.s32>=0) {
     try { edf::native::RecordEmbeddedShader(edf::native::GuestReader(base),output,source,true,caller); }
     catch (const std::exception& error) { REXLOG_ERROR("Native middleware PS identity: {}",error.what()); }
   }
@@ -10528,7 +10529,7 @@ REX_HOOK_RAW(sub_8213B5A0) {
 }
 REX_EXTERN(__imp__sub_8242AF30);
 REX_HOOK_RAW(sub_8242AF30) {
-  if (!REXCVAR_GET(edf_native_shader_bridge)) { __imp__sub_8242AF30(ctx,base); return; }
+  if (!EDF_NATIVE_FLAG(shader_bridge)) { __imp__sub_8242AF30(ctx,base); return; }
   const auto owner=ctx.r3.u32;
   edf::native::MovieDecodeLocks capture;
   struct CaptureScope {
@@ -10598,7 +10599,7 @@ REX_EXTERN(__imp__edf_native_immediate_cpu_tail);
 REX_HOOK_RAW(sub_821FD8F8) {
   edf::native::HookTiming native_timing(edf::native::HookPhase::ImmediateNative);
   bool native_submitted=false;
-  if (REXCVAR_GET(edf_native_shader_bridge)) {
+  if (EDF_NATIVE_FLAG(shader_bridge)) {
     auto& state = edf::native::State();
     edf::native::HookTiming submission_wait(edf::native::HookPhase::ImmediateSubmissionWait);
     std::lock_guard submission(state.submissions);
@@ -10682,7 +10683,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         if ((key[1]&3)!=0) throw std::runtime_error("movie requires an unbound depth/stencil surface");
         auto render=state.render_states.find(key);
         if(render==state.render_states.end()) render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(state.device.Get(),key)).first;
-        if(REXCVAR_GET(edf_native_seam_draws)) {
+        if(EDF_NATIVE_FLAG(seam_draws)) {
           auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
             *state.movie_vertex,movie_pixel,viewport,key,
             edf::native::QuadStream::Layout(),edf::native::kNativeQuadLayoutId,
@@ -10882,7 +10883,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         auto render=state.render_states.find(key);
         if(render==state.render_states.end())
           render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(state.device.Get(),key)).first;
-        const bool xui_seam=REXCVAR_GET(edf_native_seam_draws);
+        const bool xui_seam=EDF_NATIVE_FLAG(seam_draws);
         if(!xui_seam) {
           edf::native::BindActiveTarget(state);
           edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
@@ -10991,7 +10992,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         if(render==state.render_states.end())
           render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(state.device.Get(),key)).first;
         const size_t bytes=size_t(ctx.r5.u32)*16;
-        if(REXCVAR_GET(edf_native_seam_draws)) {
+        if(EDF_NATIVE_FLAG(seam_draws)) {
           auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
             *state.font_vertex,*state.font_pixel,viewport,key,
             edf::native::QuadStream::Layout(),edf::native::kNativeQuadLayoutId,
@@ -11092,13 +11093,13 @@ REX_HOOK_RAW(sub_821FD8F8) {
             vertices,indices,2,owned_declaration,owned_indices,{},{},{},{},0,{},
             // Where this mesh's dynamic vertices are rewritten when the draw
             // is recorded; the immediate context does it otherwise.
-            REXCVAR_GET(edf_native_seam_draws)?&edf::native::SceneRecorderLocked(state):nullptr);
+            EDF_NATIVE_FLAG(seam_draws)?&edf::native::SceneRecorderLocked(state):nullptr);
           acquire_timing.Finish();
           const auto key=edf::native::ReadAuditedRenderStateWords(reader,ctx.r3.u32);
           auto render=state.render_states.find(key);
           if(render==state.render_states.end()) render=state.render_states.emplace(key,
             edf::native::CreateNativeRenderState(state.device.Get(),key)).first;
-          if(REXCVAR_GET(edf_native_seam_draws)) {
+          if(EDF_NATIVE_FLAG(seam_draws)) {
             edf::native::HookTiming record_timing(edf::native::HookPhase::ImmediateRecord);
             auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
               bindings,ps,viewport,key,
@@ -11189,11 +11190,11 @@ REX_HOOK_RAW(sub_821FD8F8) {
             vertices,indices,2,native_declaration,owned_indices,{},{},{},{},0,{},
             // Where this mesh's dynamic vertices are rewritten when the draw
             // is recorded; the immediate context does it otherwise.
-            REXCVAR_GET(edf_native_seam_draws)?&edf::native::SceneRecorderLocked(state):nullptr);
+            EDF_NATIVE_FLAG(seam_draws)?&edf::native::SceneRecorderLocked(state):nullptr);
           auto render=state.render_states.find(snapshot.render);
           if(render==state.render_states.end())
             render=state.render_states.emplace(snapshot.render,edf::native::CreateNativeRenderState(state.device.Get(),snapshot.render)).first;
-          if(REXCVAR_GET(edf_native_seam_draws)) {
+          if(EDF_NATIVE_FLAG(seam_draws)) {
             auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
               bindings,ps,viewport,snapshot.render,
               mesh.input_layout().elements(),mesh.input_layout().fingerprint(),
@@ -11311,7 +11312,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           REXLOG_INFO("Native render state: cached={}, blend={:#x}, depth={:#x}, raster={:#x}, alpha={:#x}, write_mask={}, scissor={}",
                       state.render_states.size(),render_key[0],render_key[1],render_key[2],render_key[3],render_key[4],render_key[5]);
         }
-        const bool post_seam=REXCVAR_GET(edf_native_seam_draws);
+        const bool post_seam=EDF_NATIVE_FLAG(seam_draws);
         if(!post_seam)
           edf::native::BindGuestRenderState(render_state->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation);
         const auto viewport=edf::native::ReadNativeDrawViewport(reader,ctx.r3.u32);
@@ -11579,7 +11580,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         state.immediate_meshes.entries(),state.immediate_meshes.entry_evictions(),state.immediate_meshes.budget_evictions());
     }
   }
-  const bool native_host=REXCVAR_GET(edf_native_host);
+  const bool native_host=EDF_NATIVE_FLAG(host);
   std::optional<edf::native::NativeConstantOwnership> legacy_scope;
   if(!native_host) legacy_scope.emplace(0);
   native_timing.Finish();
@@ -11749,25 +11750,25 @@ namespace {
 // drawing published scene state depends on; the first one off, or null.
 const char* NativeScenePassMissingFlag() {
   const std::pair<const char*,bool> required[]{
-    {"edf_native_frame_dispatch",REXCVAR_GET(edf_native_frame_dispatch)},
-    {"edf_native_scene_tree",REXCVAR_GET(edf_native_scene_tree)},
-    {"edf_native_scene_tree_published",REXCVAR_GET(edf_native_scene_tree_published)},
-    {"edf_native_scene_queued",REXCVAR_GET(edf_native_scene_queued)},
-    {"edf_native_scene_visibility",REXCVAR_GET(edf_native_scene_visibility)},
-    {"edf_native_scene_sources_owned",REXCVAR_GET(edf_native_scene_sources_owned)},
-    {"edf_native_scene_membership_owned",REXCVAR_GET(edf_native_scene_membership_owned)},
-    {"edf_native_scene_selection_owned",REXCVAR_GET(edf_native_scene_selection_owned)},
-    {"edf_native_scene_camera_owned",REXCVAR_GET(edf_native_scene_camera_owned)},
-    {"edf_native_scene_geometry_owned",REXCVAR_GET(edf_native_scene_geometry_owned)},
-    {"edf_native_scene_material_owned",REXCVAR_GET(edf_native_scene_material_owned)},
-    {"edf_native_scene_preload",REXCVAR_GET(edf_native_scene_preload)},
-    {"edf_native_scene_group_order",REXCVAR_GET(edf_native_scene_group_order)}};
+    {"edf_native_frame_dispatch",EDF_NATIVE_FLAG(frame_dispatch)},
+    {"edf_native_scene_tree",EDF_NATIVE_FLAG(scene_tree)},
+    {"edf_native_scene_tree_published",EDF_NATIVE_FLAG(scene_tree_published)},
+    {"edf_native_scene_queued",EDF_NATIVE_FLAG(scene_queued)},
+    {"edf_native_scene_visibility",EDF_NATIVE_FLAG(scene_visibility)},
+    {"edf_native_scene_sources_owned",EDF_NATIVE_FLAG(scene_sources_owned)},
+    {"edf_native_scene_membership_owned",EDF_NATIVE_FLAG(scene_membership_owned)},
+    {"edf_native_scene_selection_owned",EDF_NATIVE_FLAG(scene_selection_owned)},
+    {"edf_native_scene_camera_owned",EDF_NATIVE_FLAG(scene_camera_owned)},
+    {"edf_native_scene_geometry_owned",EDF_NATIVE_FLAG(scene_geometry_owned)},
+    {"edf_native_scene_material_owned",EDF_NATIVE_FLAG(scene_material_owned)},
+    {"edf_native_scene_preload",EDF_NATIVE_FLAG(scene_preload)},
+    {"edf_native_scene_group_order",EDF_NATIVE_FLAG(scene_group_order)}};
   for(const auto& [name,enabled]:required) if(!enabled) return name;
   return nullptr;
 }
 }
 bool NativeStaticWorldPassEnabled() {
-  if(!REXCVAR_GET(edf_native_static_world_pass)) return false;
+  if(!EDF_NATIVE_FLAG(static_world_pass)) return false;
   if(const auto* name=NativeScenePassMissingFlag()) {
     static std::atomic<bool> reported=false;
     if(!reported.exchange(true))
@@ -11777,9 +11778,9 @@ bool NativeStaticWorldPassEnabled() {
   return true;
 }
 bool NativeModelPassEnabled() {
-  if(!REXCVAR_GET(edf_native_model_pass)) return false;
-  const char* name=!REXCVAR_GET(edf_native_model_publication)?"edf_native_model_publication":
-    !REXCVAR_GET(edf_native_shader_bridge)?"edf_native_shader_bridge":NativeScenePassMissingFlag();
+  if(!EDF_NATIVE_FLAG(model_pass)) return false;
+  const char* name=!EDF_NATIVE_FLAG(model_publication)?"edf_native_model_publication":
+    !EDF_NATIVE_FLAG(shader_bridge)?"edf_native_shader_bridge":NativeScenePassMissingFlag();
   if(name) {
     static std::atomic<bool> reported=false;
     if(!reported.exchange(true))
@@ -11787,6 +11788,33 @@ bool NativeModelPassEnabled() {
     return false;
   }
   return true;
+}
+}
+REXCVAR_DEFINE_STRING(edf_native_renderer,"off","EDF2027",
+  "Native renderer preset: off, world (static world pass and every scene flag it requires) or full (world plus model publication, the rigid model pass and the native post finish). Adds to the individual edf_native_* cvars and never turns one off; read once at startup");
+namespace edf::native {
+void ResolveNativeRendererPreset() {
+  const auto& name=REXCVAR_GET(edf_native_renderer);
+  const auto preset=ParseNativeRendererPreset(name);
+  if(!preset) throw std::runtime_error("edf_native_renderer must be off, world or full, not '"+std::string(name)+"'");
+  native_renderer_preset_mask.store(NativeRendererPresetMask(*preset),std::memory_order_relaxed);
+  // Effective values, in NativeRendererFlag order.
+  const bool effective[kNativeRendererFlagCount]{
+    EDF_NATIVE_FLAG(host),EDF_NATIVE_FLAG(shader_bridge),EDF_NATIVE_FLAG(seam_draws),
+    EDF_NATIVE_FLAG(material_activation),EDF_NATIVE_FLAG(scene_queued),EDF_NATIVE_FLAG(scene_preload),
+    EDF_NATIVE_FLAG(scene_sources_owned),EDF_NATIVE_FLAG(scene_membership_owned),
+    EDF_NATIVE_FLAG(scene_selection_owned),EDF_NATIVE_FLAG(scene_camera_owned),
+    EDF_NATIVE_FLAG(scene_geometry_owned),EDF_NATIVE_FLAG(scene_material_owned),
+    EDF_NATIVE_FLAG(scene_tree),EDF_NATIVE_FLAG(scene_tree_published),EDF_NATIVE_FLAG(scene_visibility),
+    EDF_NATIVE_FLAG(frame_dispatch),EDF_NATIVE_FLAG(scene_group_order),EDF_NATIVE_FLAG(static_world_pass),
+    EDF_NATIVE_FLAG(model_publication),EDF_NATIVE_FLAG(model_pass),EDF_NATIVE_FLAG(post_finish)};
+  std::string on,off;
+  for(uint32_t i=0;i<kNativeRendererFlagCount;++i) {
+    auto& list=effective[i]?on:off;
+    if(!list.empty()) list+=',';
+    list+=kNativeRendererFlagNames[i];
+  }
+  REXLOG_INFO("Native renderer: preset={} on=[{}] off=[{}]",name.empty()?std::string("off"):std::string(name),on,off);
 }
 namespace {
 void LogNativeStaticWorldGroup(uint32_t group,uint64_t recorded) {

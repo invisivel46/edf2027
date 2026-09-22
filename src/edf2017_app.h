@@ -17,6 +17,7 @@
 #include "setup_dialog.h"
 #if defined(_WIN32)
 #include "native_graphics/guest_shader_bridge.h"
+#include "native_graphics/native_renderer_preset.h"
 #include "native_graphics/guest_mesh_watch_audit.h"
 #include "native_graphics/native_preview_window.h"
 #include "native_graphics/native_host_surface.h"
@@ -75,6 +76,7 @@ class Edf2017App : public rex::ReXApp {
     if(REXCVAR_GET(edf_native_preview_window)) throw std::runtime_error("native host and preview modes are mutually exclusive");
     rex::cvar::SetFlagByName("edf_native_shader_bridge","true");
     rex::cvar::SetFlagByName("edf_native_publish_frames","true");
+    edf::native::ResolveNativeRendererPreset();  // once, after the migrations above; logs the effective flags
 #endif
     config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
     config.input_factory = REX_INPUT_BACKEND(CreateEdfInputSystem);  // SDL + NOP + optional scripted pad (EDF_INPUT_SCRIPT)
@@ -82,7 +84,7 @@ class Edf2017App : public rex::ReXApp {
 
   std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
 #if defined(_WIN32)
-    if(REXCVAR_GET(edf_native_host)) {
+    if(EDF_NATIVE_FLAG(host)) {
       edf::native::InitializeGuestShaderBridge({});
       if(REXCVAR_GET(edf_native_scene_backend).starts_with("d3d12")) {
         edf::native::RegisterNativeD3D12Backend();
