@@ -515,6 +515,203 @@ void StaticGroupEligibility() {
   Require(AssessNativeStaticGroup(reader,device+1,stack,input)==Result::Alignment,"unaligned device admitted");
 }
 // A BasicLockable that records every acquisition, so tests can count them.
+// The composed handoff against sequential guest groups that also bind shaders
+// (with defaults over registers and a sampler record) and read a global
+// constant and a global texture: no group outside the replay plan reaches the
+// bind callback (ActivateNativeMaterial in production) unless it has no
+// effects, and the device block and every touched page match sequential
+// groups, with a live fence and with the deferred queue.
+void StaticWorldComposedBinds() {
+  constexpr uint32_t device=0x10000,queue=0x30000,common=0x100;
+  using Pages=std::map<uint32_t,std::array<uint8_t,4096>>;
+  struct Group {
+    NativeStaticWorldBindEffects effects;
+    std::vector<std::array<uint32_t,2>> states;
+    NativeSceneMaterialProgram program;
+  };
+  const auto run=[&](uint32_t fence,bool fallback) {
+    Pages initial;
+    const SparseReader setup{initial};
+    setup.StoreWord(0x8200964c,0x3b808081u); setup.StoreWord(0x82003198,0x42000000u);
+    for(uint32_t i=0;i<6;++i) setup.StoreWord(0x82009608+i*4,i*2);
+    setup.StoreWord(device+10780,fence); setup.StoreWord(device+10784,common);
+    setup.StoreWord(device+13148,queue); setup.StoreWord(device+13152,queue+8*32);
+    setup.StoreWord(device+12184,1); setup.StoreWord(device+12168,1);
+    for(uint32_t offset:{10424u,10456u,10460u,10464u}) setup.StoreWord(device+offset,0x10001);
+    setup.StoreWord(device+10420,0x70); setup.StoreWord(device+10440,0x5); setup.StoreWord(device+10428,0x80000007);
+    setup.StoreWord(device+10332,15); setup.StoreWord(device+11576,0x10001); setup.StoreWord(device+11580,0);
+    setup.StoreWord(device+11588,15); setup.StoreByte(device+10810,0xc1);
+    for(uint32_t slot=0;slot<16;++slot) {
+      for(uint32_t i=0;i<6;++i) setup.StoreWord(device+1024+slot*24+i*4,0x9e3779b9u*(slot*6+i+1));
+      setup.StoreWord(device+12272+slot*4,0x40000+slot*0x100); setup.StoreWord(0x40000+slot*0x100,common);
+      setup.StoreByte(device+11652+slot,uint8_t(slot%5)); setup.StoreByte(device+11678+slot,uint8_t(slot%3));
+      setup.StoreByte(device+11704+slot,uint8_t(15-slot%4)); setup.StoreByte(device+11730+slot,uint8_t(slot%2?5:0));
+    }
+    for(uint32_t i=0;i<256;++i) setup.StoreWord(0x60000+i*4,0x3f800000u+i*0x1001u);
+    for(uint32_t i=0;i<8;++i) setup.StoreWord(device+i*4,0x5a5a5a5au^(i*0x01010101u));
+    // Bound shaders 0x49000 (vertex) and 0x48000 (pixel). Vertex A and pixel C
+    // carry defaults: A copies vertex c20's first two words and masks slot 1's
+    // record word +4; C copies pixel c5. B and D have none.
+    constexpr uint32_t A=0x4a000,B=0x4b000,C=0x4c000,D=0x4d000;
+    setup.StoreWord(device+12420,0x49000); setup.StoreWord(device+12416,0x48000);
+    for(const uint32_t shader:{0x48000u,0x49000u,A,B,C,D}) setup.StoreWord(shader,common);
+    const auto defaults=[&](uint32_t shader,bool pixel,uint64_t clear,bool shared,const std::vector<uint32_t>& entries) {
+      const auto header=shader+(pixel?40:872),data=header+64;
+      setup.StoreWord(header+20,64);
+      setup.StoreDoubleWord(data,clear); setup.StoreDoubleWord(data+8,shared?1:0);
+      setup.StoreWord(data+24,uint32_t(entries.size()*4));
+      for(size_t i=0;i<entries.size();++i) setup.StoreWord(data+32+uint32_t(i)*4,entries[i]);
+    };
+    defaults(A,false,0xffff000000000000ull,true,{0,(1088u<<16)|2,0x11111111,0x22222222,0,(28u<<16)|2,0xffff0000u,0x1234,0});
+    defaults(C,true,0x00000000ffffffffull,false,{0,(4944u<<16)|4,1,2,3,4,0,0});
+    const auto half=std::bit_cast<uint32_t>(.5f),quarter=std::bit_cast<uint32_t>(-.25f);
+    const auto header=[&](uint32_t handle) {
+      setup.StoreWord(handle,common);
+      for(uint32_t i=0;i<6;++i) setup.StoreWord(handle+28+i*4,(0x85ebca6bu*(i+1))^(handle<<3));
+    };
+    // Resolved as the pass cursor sees it: a null handle binds nothing.
+    const auto sampler=[&](uint32_t slot,uint32_t handle,std::array<uint32_t,4> settings) {
+      NativeMaterialSamplerOperation result; result.slot=slot; result.settings=settings;
+      if(!handle) return result;
+      header(handle);
+      result.texture_filter_high=setup.Word(handle+40)&0x80000000u;
+      result.texture_lod=setup.Word(handle+44)&0x3fcu;
+      return result;
+    };
+    const auto local=[&](uint32_t slot,uint32_t handle,std::array<uint32_t,4> settings) {
+      NativeStaticWorldBindEffects::Texture result{false,slot,handle,{}};
+      result.sampler.slot=slot; result.sampler.settings=settings;
+      return result;
+    };
+    const auto constant=[](bool pixel,uint32_t first,uint32_t count,uint32_t data,bool global=false) {
+      const auto low=first/4,high=(first+count-1)/4;
+      return NativeStaticWorldBindEffects::Constant{pixel,global,first,count,data,(~uint64_t(0)>>low)&(~uint64_t(0)<<(63-high))};
+    };
+    // G1's pixel c5 is a global (storage through record 0x5f200) and its slot
+    // 2 texture a global (source through record 0x5f000).
+    setup.StoreWord(0x5f200,0x60340);
+    setup.StoreWord(0x5f000,0x5f100); setup.StoreWord(0x5f100+28,0x52000);
+    const std::array<uint32_t,4> global_settings{half,1,0,1};
+    for(uint32_t i=0;i<4;++i) setup.StoreWord(0x5f100+32+i*4,global_settings[i]);
+    const auto group=[&](uint32_t vertex,uint32_t pixel,std::vector<std::array<uint32_t,2>> states,
+                         std::vector<NativeStaticWorldBindEffects::Constant> constants,
+                         std::vector<std::pair<NativeStaticWorldBindEffects::Texture,NativeMaterialSamplerOperation>> textures) {
+      Group result;
+      result.effects.shaders={vertex,pixel};
+      result.effects.defaults={ReadNativeShaderDefaults(setup,vertex,false),ReadNativeShaderDefaults(setup,pixel,true)};
+      result.effects.constants=std::move(constants);
+      result.states=std::move(states);
+      result.program.inputs.state_overrides=result.states;
+      for(auto& [texture,operation]:textures) {
+        result.effects.textures.push_back(texture); result.program.sampler_operations.push_back(operation);
+      }
+      return result;
+    };
+    // Only G3, the last group and every slot's last binder, is replayed:
+    // slot 0 binds 50000, 53000, 54000; slot 1 51000, 57000, then null.
+    std::vector<Group> groups;
+    groups.push_back(group(A,C,{{0x3c,1}},{constant(false,20,2,0x60000)},
+      {{local(0,0x50000,{half,1,1,1}),sampler(0,0x50000,{half,1,1,1})},{local(1,0x51000,{quarter,2,0,1}),sampler(1,0x51000,{quarter,2,0,1})}}));
+    NativeStaticWorldBindEffects::Texture global_texture{true,2,0x5f000,{}};
+    global_texture.sampler.slot=2;
+    groups.push_back(group(B,C,{{0x48,6}},{constant(true,5,1,0x5f200,true)},
+      {{global_texture,sampler(2,0x52000,global_settings)}}));
+    groups.push_back(group(A,D,{{0x34,2}},{constant(false,22,1,0x60200)},
+      {{local(0,0x53000,{0,1,1,0}),sampler(0,0x53000,{0,1,1,0})},{local(1,0x57000,{half,0,1,1}),sampler(1,0x57000,{half,0,1,1})}}));
+    groups.push_back(group(B,D,{{0x4c,7}},{constant(true,6,2,0x60300)},
+      {{local(0,0x54000,{quarter,1,0,1}),sampler(0,0x54000,{quarter,1,0,1})},{local(1,0,{half,1,0,1}),sampler(1,0,{half,1,0,1})},
+       {local(2,0x55000,{0,1,1,1}),sampler(2,0x55000,{0,1,1,1})}}));
+    const auto reserve=[]()->uint32_t { throw std::runtime_error("unexpected retirement allocation"); };
+    const auto tag=[]()->uint32_t { return 0x80000000u; };
+    // The guest activation: shaders, constants, textures, then states.
+    const auto activate=[&](const SparseReader& reader,const Group& selected,bool states) {
+      for(const bool pixel:{false,true}) SetNativeShaderResource(reader,device,selected.effects.shaders[pixel],pixel,reserve,tag);
+      for(const auto& operation:selected.effects.constants) {
+        const NativeMaterialCpuProgram::Constant upload{operation.pixel,operation.first,
+          operation.global?reader.Word(operation.data):operation.data,operation.count};
+        Require(UploadNativeMaterialConstant(reader,device,upload,operation.mask),"composed fixture constant aliases");
+      }
+      for(auto bound:selected.effects.textures) {
+        if(bound.global) {
+          const auto source=reader.Word(bound.handle);
+          bound.handle=reader.Word(source+28);
+          for(uint32_t i=0;i<4;++i) bound.sampler.settings[i]=reader.Word(source+32+i*4);
+        }
+        const uint64_t mask=uint64_t(1)<<(43-bound.slot);
+        SetNativeTextureResource(reader,device,bound.slot,bound.handle,mask,reserve,tag);
+        const auto resolved=ApplyNativeMaterialSampler(ReadNativeMaterialSamplerPass(reader,device,bound.slot),bound.sampler);
+        reader.StoreWord(device+1036+bound.slot*24,resolved.words[1]);
+        reader.StoreWord(device+1040+bound.slot*24,resolved.words[2]);
+        reader.StoreDoubleWord(device+16,reader.DoubleWord(device+16)|mask);
+      }
+      if(states) for(const auto& [offset,value]:selected.states) {
+        const auto writes=NativeMaterialStateCpuWrites(ReadNativeMaterialRenderPassMirrors(reader,device),
+          offset,value,reader.DoubleWord(device+16),reader.DoubleWord(device+24));
+        Require(writes.has_value(),"composed fixture state needs a callback");
+        for(const auto& [address,word]:*writes) reader.StoreWord(device+address,word);
+      }
+    };
+    Pages sequential=initial;
+    {
+      const SparseReader reader{sequential};
+      for(const auto& selected:groups) activate(reader,selected,true);
+    }
+    Pages native=initial;
+    const SparseReader reader{native};
+    NativeSceneMaterialPassState pass;
+    pass.render=ReadNativeMaterialRenderPass(reader,device);
+    for(uint32_t slot=0;slot<16;++slot) pass.samplers[slot]=ReadNativeMaterialSamplerPass(reader,device,slot);
+    auto cursor=pass.Inputs();
+    const auto start=cursor.render;
+    std::vector<NativeStaticWorldHandoffGroup> owed;
+    for(size_t index=0;index<groups.size();++index) {
+      const auto& selected=groups[index];
+      uint32_t slots=0;
+      for(const auto& operation:selected.program.sampler_operations) slots|=1u<<operation.slot;
+      owed.push_back({selected.states,slots,fallback && index==1?nullptr:&selected.effects});
+      cursor=cursor.After(selected.program);
+    }
+    std::vector<size_t> replayed,bound;
+    std::vector<NativeStaticWorldRetirement> tags;
+    const auto writes=HandOffNativeStaticWorld(reader,device,start,cursor.samplers,owed,[&](size_t index) {
+      replayed.push_back(index); activate(reader,groups[index],true);
+    },[&](size_t index) {
+      bound.push_back(index); activate(reader,groups[index],false);
+    },[](NativeStaticWorldRetirement)->uint32_t { throw std::runtime_error("unexpected composed retirement allocation"); },
+      [&](NativeStaticWorldRetirement kind)->uint32_t { tags.push_back(kind); return 0x80000000u; });
+    Require(writes.render==cursor.render,"composed handoff render state diverged from the pass cursor");
+    Require(replayed==std::vector<size_t>{3},"composed handoff replayed other than the last group");
+    Require(bound==(fallback?std::vector<size_t>{1}:std::vector<size_t>{}),
+      "composed handoff ran the activation for a group with effects, or skipped one without");
+    // The deferred path asks for a tag per composed retirement of a handle
+    // with the common bit: two shaders and each replaced texture per group.
+    using R=NativeStaticWorldRetirement;
+    const std::vector<R> composed_tags=fallback?
+      std::vector<R>{R::Vertex,R::Pixel,R::Texture,R::Texture,R::Vertex,R::Pixel,R::Texture,R::Texture}:
+      std::vector<R>{R::Vertex,R::Pixel,R::Texture,R::Texture,R::Vertex,R::Pixel,R::Texture,R::Vertex,R::Pixel,R::Texture,R::Texture};
+    Require(tags==(fence?std::vector<R>{}:composed_tags),"composed handoff retired other than in guest order");
+    const SparseReader expected{sequential};
+    for(uint32_t offset=0;offset<13520;offset+=4)
+      if(reader.Word(device+offset)!=expected.Word(device+offset))
+        throw std::runtime_error("composed handoff device word differs at +"+std::to_string(offset));
+    // Registers only composed groups wrote: G0's vertex c21, and c20 under G2's
+    // A defaults after G0's upload; G1's global pixel c5 over C's; G2's c22.
+    Require(reader.Word(device+(21+112)*16)==expected.Word(0x60010) && reader.Word(device+(20+112)*16)==0x11111111u &&
+      reader.Word(device+(20+112)*16+8)==expected.Word(0x60008) && reader.Word(device+(5+368)*16)==expected.Word(0x60340) &&
+      reader.Word(device+(22+112)*16)==expected.Word(0x60200),"composed handoff lost registers only a composed group wrote");
+    if(fence) for(const uint32_t handle:{0x49000u,0x48000u,A,B,C,0x40000u,0x40100u,0x50000u,0x51000u,0x40200u,0x53000u,0x57000u})
+      Require(reader.Word(handle+8)==fence,"composed handoff skipped a retirement");
+    const std::array<uint8_t,4096> zero{};
+    for(const auto* pages:{&sequential,&native}) for(const auto& entry:*pages) {
+      const auto page=entry.first;
+      const auto left=sequential.find(page);
+      const auto right=native.find(page);
+      if((left==sequential.end()?zero:left->second)!=(right==native.end()?zero:right->second))
+        throw std::runtime_error("composed handoff arena differs in page "+std::to_string(page));
+    }
+  };
+  run(200,false); run(0,false); run(200,true); run(0,true);
+}
 struct CountingMutex {
   bool locked=false; uint64_t locks=0;
   void lock() { Require(!locked,"walk lock reacquired a held non-recursive mutex"); locked=true; ++locks; }
@@ -2137,7 +2334,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
-    GroupOrder(); StaticWorldPass(); WalkLock(); StaticWalkPlan();
+    GroupOrder(); StaticWorldPass(); StaticWorldComposedBinds(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

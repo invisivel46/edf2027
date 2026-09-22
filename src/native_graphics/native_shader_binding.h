@@ -48,9 +48,11 @@ NativeShaderDefaults ReadNativeShaderDefaults(const Reader& reader,uint32_t shad
   }
   return result;
 }
+// cached, when given, is this shader's ReadNativeShaderDefaults read earlier
+// (the static world handoff keeps it per material; shader objects are immutable).
 template<class Reader,class Reserve,class LegacyTag>
 void SetNativeShaderResource(const Reader& reader,uint32_t device,uint32_t shader,bool pixel,
-    Reserve reserve,LegacyTag tag) {
+    Reserve reserve,LegacyTag tag,const NativeShaderDefaults* cached=nullptr) {
   const auto slot=reader.Add(device,pixel?12416:12420);
   RetireNativeBoundResource(reader,device,reader.Word(slot),reserve,tag);
   reader.StoreWord(slot,shader);
@@ -70,7 +72,9 @@ void SetNativeShaderResource(const Reader& reader,uint32_t device,uint32_t shade
     write(16,dirty|(uint64_t(1)<<49));
   } else write(16,wide(16)|(uint64_t(1)<<51));
   if(!shader) return;
-  const auto defaults=ReadNativeShaderDefaults(reader,shader,pixel);
+  NativeShaderDefaults read;
+  if(!cached) read=ReadNativeShaderDefaults(reader,shader,pixel);
+  const auto& defaults=cached?*cached:read;
   if(!defaults.present) return;
   write(pixel?8:0,wide(pixel?8:0)&~defaults.clear_constants);
   if(defaults.dirty_shared) write(24,wide(24)|2);

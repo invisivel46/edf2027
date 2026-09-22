@@ -11827,6 +11827,55 @@ void LogNativeStaticWorldGroup(uint32_t group,uint64_t recorded) {
     REXLOG_INFO("Native static group execution: group={:#x} completed=true recorded_batches={} compatibility_calls=0 boundary_mask={:#x} occurrences={}",
       group,recorded,0u,count);
 }
+// Handoff bind effects of one owed group, keyed like the group material cache:
+// the published group material (its program and constants generation; held,
+// so neither address is reused while cached), for this instance and device.
+// Built once per key; unreadable effects return null and the group binds
+// through ActivateNativeMaterial, which reports the failure as before.
+std::shared_ptr<const NativeStaticWorldBindEffects> NativeStaticWorldBindEffectsFor(const GuestReader& reader,
+    uint32_t instance,uint32_t device,const std::shared_ptr<const NativeSceneGroupMaterial>& material) {
+  if(!material) return nullptr;
+  struct Entry {
+    std::shared_ptr<const NativeSceneGroupMaterial> material;
+    std::shared_ptr<const NativeSceneMaterialProgram> program;
+    std::shared_ptr<const NativeStaticWorldBindEffects> effects;
+  };
+  static std::mutex mutex;
+  static std::map<std::pair<uint32_t,uint32_t>,Entry> cache;
+  const std::pair key{instance,device};
+  {
+    std::lock_guard lock(mutex);
+    const auto found=cache.find(key);
+    if(found!=cache.end() && found->second.material==material && found->second.program==material->program)
+      return found->second.effects;
+  }
+  std::shared_ptr<const NativeStaticWorldBindEffects> effects;
+  try { effects=std::make_shared<const NativeStaticWorldBindEffects>(ReadNativeStaticWorldBindEffects(reader,instance,device)); }
+  catch(const std::exception&) { return nullptr; }
+  std::lock_guard lock(mutex);
+  if(cache.size()>=16384) cache.clear();
+  cache.insert_or_assign(key,Entry{material,material->program,effects});
+  return effects;
+}
+// Retirement allocation and legacy tag of a composed bind, from the frames the
+// setters get under ActivateNativeMaterial's 144-byte frame below `frame`: the
+// texture setter's 160 bytes (tag at its r1-80), the shader setters' 128 (r1-48).
+uint32_t ReserveNativeHandoffRetirement(const PPCContext& frame,uint8_t* base,uint32_t device,NativeStaticWorldRetirement kind) {
+  const bool texture=kind==NativeStaticWorldRetirement::Texture;
+  const uint32_t below=144+(texture?160:128);
+  auto work=frame;
+  if(work.r1.u32<below) throw std::runtime_error("invalid native handoff retirement stack");
+  work.r1.u64=work.r1.u32-below; work.r3.u64=device;
+  work.lr=texture?0x8213BBE0:kind==NativeStaticWorldRetirement::Pixel?0x82149664:0x82149924;
+  EnterNativeSceneBoundary(NativeSceneBoundary::RetirementAllocation);
+  sub_82141440(work,base);
+  return work.r3.u32;
+}
+uint32_t NativeHandoffRetirementTag(const GuestReader& reader,const PPCContext& frame,NativeStaticWorldRetirement kind) {
+  const uint32_t below=144+(kind==NativeStaticWorldRetirement::Texture?80:48);
+  if(frame.r1.u32<below) throw std::runtime_error("invalid native handoff retirement tag");
+  return reader.Word(frame.r1.u32-below);
+}
 }
 // Replaces 821C3BB8(owner+240) for one world owner. Native groups draw from the
 // scene publication with explicit pass inputs; the device state they owe is
@@ -11863,7 +11912,7 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     cursor=NativeScenePassCursorState{device,pass.Inputs(),ReadNativeDrawViewportWords(reader,device),ActiveTargetsLocked(state)};
   };
   load_pass();
-  struct Owed { uint32_t material; std::shared_ptr<const NativeSceneMaterialProgram> program; };
+  struct Owed { uint32_t material; std::shared_ptr<const NativeSceneMaterialProgram> program; std::shared_ptr<const NativeSceneGroupMaterial> published; };
   struct World { uint32_t vertex; VertexParameterRange parameter; std::array<uint8_t,64> bytes; };
   std::vector<Owed> owed;
   std::optional<World> world;
@@ -11871,24 +11920,30 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
   const auto handoff=[&] {
     if(owed.empty()) return;
     std::vector<NativeStaticWorldHandoffGroup> groups;
-    groups.reserve(owed.size());
+    std::vector<std::shared_ptr<const NativeStaticWorldBindEffects>> effects;
+    groups.reserve(owed.size()); effects.reserve(owed.size());
     for(const auto& group:owed) {
       uint32_t slots=0;
       for(const auto& operation:group.program->sampler_operations) slots|=1u<<operation.slot;
-      groups.push_back({group.program->inputs.state_overrides,slots});
+      effects.push_back(NativeStaticWorldBindEffectsFor(reader,group.material,device,group.published));
+      groups.push_back({group.program->inputs.state_overrides,slots,effects.back().get()});
     }
     auto work=frame;
+    const auto replays=counters.replays,binds=counters.binds;
     const auto writes=HandOffNativeStaticWorld(reader,device,owed_start,cursor.material.samplers,groups,[&](size_t index) {
       // 821B94E8 through the activation hook: CPU program, host shader
       // bindings and setter publications, exactly as the guest group would.
       work.r3.u64=owed[index].material; work.lr=0x821D979C; sub_821B94E8(work,base);
       ++counters.replays;
     },[&](size_t index) {
-      // The skipped group's binds and uploads, so intermediate textures and
-      // shaders retire and registers only it wrote hold its values.
+      // A group without composable effects: its binds and uploads through the
+      // activation, so intermediate textures and shaders retire and registers
+      // only it wrote hold its values.
       ActivateNativeMaterial(work,base,owed[index].material,device,false);
       ++counters.binds;
-    });
+    },[&](NativeStaticWorldRetirement kind) { return ReserveNativeHandoffRetirement(frame,base,device,kind); },
+      [&](NativeStaticWorldRetirement kind) { return NativeHandoffRetirementTag(reader,frame,kind); });
+    counters.composed+=owed.size()-(counters.replays-replays)-(counters.binds-binds);
     if(writes.render!=cursor.material.render) throw std::runtime_error("native static world handoff diverged from the pass cursor");
     for(const auto offset:writes.operations) {
       const auto setter=NativeMaterialStateSetter(offset);
@@ -12017,7 +12072,7 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
       world=World{resolved.back().vertex,*resolved.back().world_parameter,resolved.back().world};
     }
     if(owed.empty()) owed_start=cursor.material.render;
-    owed.push_back({setup->material,material->program});
+    owed.push_back({setup->material,material->program,material});
     cursor.material=std::move(next);
     ++counters.native_groups; counters.instances+=instances.size(); counters.batches+=batches;
     LogNativeStaticWorldGroup(group,batches);
@@ -12043,9 +12098,9 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     for(const auto count:counters.fallbacks) fallbacks+=count;
     const auto& f=counters.fallbacks;
     REXLOG_INFO("Native static world pass: passes={} native_groups={} empty_groups={} instances={} draws={} batches={} fallback_groups={} "
-      "guest_queue={} program={} scissor={} eligibility={} pass_state={} instance={} handoffs={} replays={} binds={} original={}",
+      "guest_queue={} program={} scissor={} eligibility={} pass_state={} instance={} handoffs={} replays={} binds={} composed={} original={}",
       passes,counters.native_groups,counters.empty_groups,counters.instances,counters.draws,counters.batches,fallbacks,
-      f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.binds,counters.original);
+      f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.binds,counters.composed,counters.original);
   }
 }
 }
@@ -12411,14 +12466,22 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
   // masks and sampler words, exactly as for static world groups.
   if(!owed.empty()) {
     auto work=frame;
+    // As for static world groups: a pass not replayed still binds and uploads,
+    // so its textures and shaders retire in guest order; composed from its
+    // cached effects, or through the activation when they are unreadable.
+    std::vector<std::shared_ptr<const NativeStaticWorldBindEffects>> effects;
+    effects.reserve(owed.size());
+    for(size_t index=0;index<owed.size();++index) {
+      effects.push_back(NativeStaticWorldBindEffectsFor(reader,plan[index].pass,device,materials[index]));
+      owed[index].effects=effects.back().get();
+    }
     const auto writes=HandOffNativeStaticWorld(reader,device,start.render,cursor.samplers,owed,[&](size_t index) {
       work.r3.u64=plan[index].pass; work.lr=0x821B2ECC; sub_821B94E8(work,base);
       ++counters.replays;
     },[&](size_t index) {
-      // As for static world groups: a pass not replayed still binds and
-      // uploads, so its textures and shaders retire in guest order.
       ActivateNativeMaterial(work,base,plan[index].pass,device,false);
-    });
+    },[&](NativeStaticWorldRetirement kind) { return ReserveNativeHandoffRetirement(frame,base,device,kind); },
+      [&](NativeStaticWorldRetirement kind) { return NativeHandoffRetirementTag(reader,frame,kind); });
     if(writes.render!=cursor.render) throw std::runtime_error("native model handoff diverged from the pass cursor");
     for(const auto offset:writes.operations) {
       const auto setter=NativeMaterialStateSetter(offset);
