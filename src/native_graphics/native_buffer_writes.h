@@ -257,6 +257,41 @@ class NativeBufferWrites {
     for(size_t i=0;i<Count;++i) result[i]={(*versions)[i],sources[i].candidate,false,true,false};
     return result;
   }
+  // Non-consuming TryValidateObservedSet for a consumer that retained `expected`:
+  // true only while every owner keeps that lifetime and revision, the proven
+  // candidate, no overlapping or unranged writer, and its next observation is
+  // not a scheduled comparison. Nothing is observed, counted or read, so an
+  // unchanged consumer skips revalidation; any false takes the guarded path,
+  // which also performs every due sample that draws are waiting on.
+  template<size_t Count>
+  bool Unchanged(const std::array<SnapshotIdentityView,Count>& sources,
+      const std::array<ObservedVersion,Count>& expected,SnapshotPolicy policy) {
+    std::lock_guard lock(mutex_);
+    if(subscriptions_unknown_ || trust_revoked_ || policy.audit_revisions || !policy.verify_interval) return false;
+    for(size_t i=0;i<Count;++i) {
+      const auto& source=sources[i];
+      for(size_t earlier=0;earlier<i;++earlier) if(sources[earlier].owner==source.owner) return false;
+      const auto found=subscriptions_.find(source.owner);
+      if(!source.candidate || found==subscriptions_.end()) return false;
+      const auto& subscription=found->second;
+      const auto& candidate=*source.candidate;
+      if(subscription.version.lifetime!=expected[i].lifetime || subscription.version.revision!=expected[i].revision ||
+         subscription.range.address!=source.physical || subscription.range.bytes!=source.bytes ||
+         !candidate || candidate->size()!=source.bytes ||
+         subscription.audited_revision!=subscription.version.revision ||
+         subscription.observations<policy.verify_initial ||
+         subscription.observations%policy.verify_interval==0 ||
+         subscription.audited_contents.lock()!=candidate) return false;
+      const auto range=subscription.range;
+      for(auto* writer=writers_;writer;writer=writer->next_) {
+        if(!writer->range_) return false;
+        const auto active=*writer->range_;
+        if(uint64_t(active.address)<uint64_t(range.address)+range.bytes &&
+           uint64_t(range.address)<uint64_t(active.address)+active.bytes) return false;
+      }
+    }
+    return true;
+  }
   enum class SnapshotRejection { None, UnknownTracking, ActiveWriter, MissingOwner, ExtentMismatch };
   struct SnapshotFailure {
     SnapshotRejection reason=SnapshotRejection::None;

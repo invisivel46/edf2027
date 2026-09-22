@@ -13,6 +13,8 @@
 #include "native_graphics/native_scene_execution.h"
 #include "native_graphics/native_scene_geometry_install.h"
 #include "native_graphics/native_static_group_eligibility.h"
+#include "native_graphics/native_recorded_reads.h"
+#include "native_graphics/native_buffer_writes.h"
 #include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d12_backend.h"
 #include <bit>
@@ -758,6 +760,140 @@ void QueuedGuestState() {
   reader.StoreWord(30044,16); Reject(load_material); reader.StoreWord(30044,3);
   reader.StoreWord(29104,4097); Reject(load_material);
 }
+// Static preload reprocesses a group only when its membership revision, a
+// recorded guest input or a tracked buffer write changed. Proving an unchanged
+// group compares recorded bytes and revisions; it never re-decodes the group.
+void PreloadChangeSignals() {
+  struct CountingReader {
+    const GeometryRetryReader& reader;
+    mutable size_t reads=0;
+    uint32_t Add(uint32_t address,uint32_t offset) const { return reader.Add(address,offset); }
+    const uint8_t* Bytes(uint32_t at,size_t size) const { ++reads; return reader.Bytes(at,size); }
+    uint32_t Word(uint32_t at) const { return GuestBlockWord(Bytes(at,4)); }
+  };
+  std::vector<uint8_t> memory(0x10000);
+  const GeometryRetryReader reader{memory};
+  reader.StoreWord(26012,27000);
+  reader.StoreWord(27072,28000); reader.StoreWord(27076,28100);
+  reader.StoreWord(28004,28200); reader.StoreWord(28128,28300);
+  reader.StoreWord(27060,32); reader.StoreWord(27140,8);
+  reader.StoreWord(27000,28400); reader.StoreWord(28416,29000);
+  reader.StoreWord(29108,29200); reader.StoreWord(29200,29300); reader.StoreWord(29300,29400);
+  const NativeSceneGeometrySource expected{27004,27084,28300,32,6,29000,29400};
+  NativeRecordedReads descriptor;
+  Require(ReadNativeSceneGeometrySource(NativeRecordingReader(reader,descriptor),26000)==expected,
+    "recording reader changed the geometry descriptor");
+  CountingReader decoded{reader};
+  Require(ReadNativeSceneGeometrySource(decoded,26000)==expected,"counting reader changed the geometry descriptor");
+  CountingReader proven{reader};
+  Require(descriptor.Unchanged(proven) && proven.reads==descriptor.ranges() && proven.reads<decoded.reads,
+    "unchanged group descriptor was re-read instead of compared");
+  reader.StoreWord(27064,5); reader.StoreWord(29000,7);
+  Require(descriptor.Unchanged(reader),"a byte the descriptor never read invalidated the group");
+  reader.StoreWord(27060,48);
+  Require(!descriptor.Unchanged(reader),"changed descriptor stride was not detected");
+  NativeRecordedReads reread;
+  Require(ReadNativeSceneGeometrySource(NativeRecordingReader(reader,reread),26000).stride==48 && reread.Unchanged(reader),
+    "changed group was not re-read");
+  reader.StoreWord(28416,29004);
+  Require(!reread.Unchanged(reader),"changed material pointer behind the descriptor was not detected");
+  reader.StoreWord(28416,29000);
+  Require(reread.Unchanged(reader),"restored descriptor bytes were not recognized");
+  Require(!NativeRecordedReads{}.Unchanged(reader),"an empty record proved a group unchanged");
+
+  // Material inputs: constant stores are untracked, so their bytes are compared.
+  NativeMaterialParameters::Groups schema;
+  schema[0].push_back({"local",31000,1,0});
+  schema[1].push_back({"global",31500,1,4});
+  reader.StoreWord(31004,31200); reader.StoreWord(31500,31400);
+  reader.StoreWord(31400,31300); reader.StoreWord(31408,1);
+  reader.StoreWord(31200,0x3f800000); reader.StoreWord(31300,0x40000000);
+  reader.StoreWord(29204,29440); reader.StoreWord(29444,29500);
+  schema.textures[0].push_back({"local_image",30000});
+  reader.StoreWord(30004,30300); reader.StoreWord(30008,2);
+  for(uint32_t i=0;i<4;++i) reader.StoreWord(30012+i*4,i+1);
+  reader.StoreWord(30344,0x3c0);
+  reader.StoreWord(29096,30600); reader.StoreWord(29104,1);
+  reader.StoreWord(30600,0x44); reader.StoreWord(30604,7);
+  const auto load_material=[&](NativeRecordedReads& reads) {
+    const NativeRecordingReader recorder(reader,reads);
+    auto inputs=ReadNativeSceneMaterialInputs(recorder,29000,schema,
+      [](bool,const std::string&) { return size_t(16); },[](const std::string&) { return true; });
+    ReadNativeMaterialSamplerOperations(recorder,schema);
+    return inputs;
+  };
+  NativeRecordedReads material;
+  const auto inputs=load_material(material);
+  Require(material.Unchanged(reader),"unchanged material inputs were not proven");
+  reader.StoreWord(31320,9); reader.StoreWord(30608,0x48);
+  Require(material.Unchanged(reader),"bytes outside the material inputs invalidated the group");
+  reader.StoreWord(31300,0x40400000);
+  Require(!material.Unchanged(reader),"changed global constant was not detected");
+  NativeRecordedReads refreshed;
+  const auto changed=load_material(refreshed);
+  Require(changed!=inputs && GuestBlockWord(changed.constants[1].registers.data())==0x40400000 && refreshed.Unchanged(reader),
+    "changed material constant was not re-read");
+  reader.StoreWord(30340,0x80000000);
+  Require(!refreshed.Unchanged(reader),"changed texture header was not detected");
+  reader.StoreWord(30340,0); reader.StoreWord(30604,8);
+  Require(!refreshed.Unchanged(reader),"changed material state override was not detected");
+  reader.StoreWord(30604,7);
+  Require(refreshed.Unchanged(reader),"restored material inputs were not recognized");
+
+  // Membership: identical observations keep the prune revision; erasing a group advances it.
+  NativeSceneSources sources;
+  sources.Born(100);
+  const NativeSceneSources::Part parts[]{ {1000,0,0,0,500} };
+  sources.Observe(100,parts);
+  const auto membership=sources.GroupRevision();
+  sources.Observe(100,parts);
+  Require(sources.GroupRevision()==membership,"unchanged membership invalidated preload records");
+  sources.Retire(100);
+  Require(!sources.FindGroup(500) && sources.GroupRevision()!=membership,"erased group did not advance the prune revision");
+
+  // Buffers: the probe consumes no observation, defers due comparisons and
+  // reports tracked writes and overlapping writers.
+  NativeBufferWrites writes;
+  writes.Subscribe(1,0x1000,64); writes.Subscribe(2,0x2000,32);
+  const std::vector<uint8_t> vertex_bytes(64,1),index_bytes(32,2);
+  const auto vertex=std::make_shared<const std::vector<uint8_t>>(vertex_bytes);
+  const auto index=std::make_shared<const std::vector<uint8_t>>(index_bytes);
+  NativeBufferWrites::SnapshotPolicy policy{};
+  policy.verify_initial=1; policy.verify_interval=4;
+  using Source=NativeBufferWrites::SnapshotSource;
+  const auto observe=[&] {
+    return writes.CopyObservedSet(std::array<Source,2>{{
+      {1,0x1000,vertex_bytes,vertex},{2,0x2000,index_bytes,index}}},nullptr,policy);
+  };
+  const auto first=observe();
+  Require(first && (*first)[0].contents==vertex && (*first)[1].contents==index,"initial geometry observation copied");
+  const std::array<NativeBufferWrites::ObservedVersion,2> loaded{(*first)[0].version,(*first)[1].version};
+  using View=NativeBufferWrites::SnapshotIdentityView;
+  const std::array<View,2> views{{{1,0x1000,64,&vertex},{2,0x2000,32,&index}}};
+  for(int i=0;i<16;++i) Require(writes.Unchanged(views,loaded,policy),"unchanged buffers required revalidation");
+  const auto before=writes.Trust();
+  Require(before.trusted==0 && before.verified==2,"unchanged probe consumed or verified an observation");
+  size_t accepted=0;
+  while(writes.TryValidateObservedSet(views,policy)) ++accepted;
+  Require(accepted==3 && !writes.Unchanged(views,loaded,policy),"probe skipped a due live comparison");
+  const auto verified=observe();
+  Require(verified && (*verified)[0].contents==vertex && (*verified)[0].version.revision==loaded[0].revision &&
+    writes.Unchanged(views,loaded,policy),"verified unchanged buffers were not accepted as unchanged");
+  writes.Record(0x3000,16);
+  Require(writes.Unchanged(views,loaded,policy),"unrelated write invalidated the group");
+  {
+    NativeBufferWrites::WriterScope active(&writes,NativeBufferWrites::Range{0x1010,4});
+    Require(!writes.Unchanged(views,loaded,policy),"overlapping active writer was ignored");
+  }
+  Require(writes.Unchanged(views,loaded,policy),"completed disjoint writer scope invalidated the group");
+  writes.Record(0x2010,4);
+  Require(!writes.Unchanged(views,loaded,policy),"tracked index write did not invalidate the group");
+  const auto rewritten=observe();
+  Require(rewritten && (*rewritten)[1].version.revision!=loaded[1].revision,"changed buffer did not require a re-load");
+  const std::array<NativeBufferWrites::ObservedVersion,2> reloaded{(*rewritten)[0].version,(*rewritten)[1].version};
+  Require(!writes.Unchanged(views,reloaded,NativeBufferWrites::SnapshotPolicy{}),
+    "compare-every-observation policy skipped the live comparison");
+}
 std::span<const uint8_t> Bytes(ID3DBlob* code) {
   return {static_cast<const uint8_t*>(code->GetBufferPointer()),code->GetBufferSize()};
 }
@@ -1242,7 +1378,7 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
 int main() {
   try {
     PassCamera(); Visibility();
-    QueuedGuestState();
+    QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
     GroupOrder();
     NativeSceneSources sources;

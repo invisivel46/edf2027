@@ -15,6 +15,7 @@
 #include "native_scene_cpu_window.h"
 #include "native_scene_membership.h"
 #include "native_scene_geometry.h"
+#include "native_recorded_reads.h"
 #include "native_scene_geometry_install.h"
 #include "native_material_cpu_program.h"
 #include "native_scene_handoff.h"
@@ -865,9 +866,20 @@ struct Bridge {
     std::array<NativeBufferWrites::ObservedVersion,2> versions{};
     std::shared_ptr<const NativeDeclaration> declaration;
     Microsoft::WRL::ComPtr<ID3DBlob> shader;
+    NativeRecordedReads reads; // Descriptor bytes behind `source`.
   };
   std::map<uint32_t,SceneGeometryLoad> scene_geometry_loads;
+  struct SceneMaterialLoad {
+    uint64_t revision=0;
+    uint32_t material=0;
+    std::shared_ptr<const NativeMaterialParameters::Groups> schema;
+    std::shared_ptr<const NativeSceneGroupMaterial> published;
+    NativeRecordedReads reads; // Material, pass, parameter and sampler bytes behind `published`.
+  };
+  std::map<uint32_t,SceneMaterialLoad> scene_material_loads;
+  uint64_t scene_preload_group_revision=UINT64_MAX;
   uint64_t scene_geometry_loaded=0,scene_geometry_reused=0,scene_geometry_deferred=0;
+  uint64_t scene_geometry_unchanged=0,scene_geometry_verified=0,scene_material_unchanged=0;
   std::set<std::string> scene_geometry_reasons;
   uint64_t scene_material_loaded=0,scene_material_reused=0,scene_material_deferred=0;
   uint64_t scene_material_constructed=0,scene_material_rejected=0;
@@ -3721,8 +3733,13 @@ namespace edf::native {
 namespace {
 void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) {
   if(!state.initialized) return;
-  state.scene_adapter.PruneGroupGeometry(state.scene_sources);
-  std::erase_if(state.scene_geometry_loads,[&](const auto& entry) { return !state.scene_sources.FindGroup(entry.first); });
+  // Only a membership change can leave an adapter entry or load record stale.
+  if(state.scene_preload_group_revision!=state.scene_sources.GroupRevision()) {
+    state.scene_adapter.PruneGroupGeometry(state.scene_sources);
+    std::erase_if(state.scene_geometry_loads,[&](const auto& entry) { return !state.scene_sources.FindGroup(entry.first); });
+    std::erase_if(state.scene_material_loads,[&](const auto& entry) { return !state.scene_sources.FindGroup(entry.first); });
+    state.scene_preload_group_revision=state.scene_sources.GroupRevision();
+  }
   const NativeSceneCpuWindow reader(backing);
   NativeBufferWrites::SnapshotPolicy policy{};
   policy.audit_revisions=REXCVAR_GET(edf_native_retirement_audit);
@@ -3730,10 +3747,39 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
     policy.verify_interval=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_interval),0,1<<20));
     policy.verify_initial=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_initial),0,1<<16));
   }
+  // Change signals: group revision, descriptor bytes, buffer generations and
+  // write revisions, declaration/shader identity. Buffer comparisons that are
+  // due (the sampled writer-coverage oracle) and every audit policy fall
+  // through to the guarded path, so the live comparison keeps its cadence.
+  const auto current=[&](uint32_t address,const auto& group,const auto& load) {
+    if(load.revision!=group.revision || !load.reads.Unchanged(reader)) return false;
+    const auto* vb=state.model_buffers.Find(load.source.vertex,NativeModelBuffers::Kind::Vertex);
+    const auto* ib=state.model_buffers.Find(load.source.index,NativeModelBuffers::Kind::Index);
+    if(!vb || !ib || !vb->physical || !ib->physical ||
+       vb->generation!=load.vertex_generation || ib->generation!=load.index_generation) return false;
+    const auto shader=state.shaders.find(load.source.shader);
+    if(shader==state.shaders.end() || !shader->second.bindings ||
+       shader->second.bindings->shader().bytecode.Get()!=load.shader.Get()) return false;
+    try { if(state.declarations.Get(load.source.declaration)!=load.declaration) return false; }
+    catch(const std::exception&) { return false; }
+    if(!state.scene_adapter.GroupGeometry(address,group.revision)) return false;
+    const auto index_contents=ib->index_contents?ib->index_contents:
+      (ib->index_storage?ib->index_storage->SourceSnapshot():nullptr);
+    using View=NativeBufferWrites::SnapshotIdentityView;
+    return BufferWrites().Unchanged(std::array<View,2>{{
+      {load.source.vertex,*vb->physical,vb->bytes,&vb->vertex_contents},
+      {load.source.index,*ib->physical,ib->bytes,&index_contents}}},load.versions,policy);
+  };
   const auto loaded_before=state.scene_geometry_loaded;
-  for(const auto& [address,group]:state.scene_sources.Groups()) {
+  for(const auto& entry:state.scene_sources.Groups()) {
+    const auto address=entry.first; const auto& group=entry.second; // Captured below.
+    const auto cached=state.scene_geometry_loads.find(address);
+    if(cached!=state.scene_geometry_loads.end() && current(address,group,cached->second)) {
+      ++state.scene_geometry_unchanged; continue;
+    }
     try {
-      const auto input=ReadNativeSceneGeometrySource(reader,address);
+      NativeRecordedReads reads;
+      const auto input=ReadNativeSceneGeometrySource(NativeRecordingReader(reader,reads),address);
       const auto* vb=state.model_buffers.Find(input.vertex,NativeModelBuffers::Kind::Vertex);
       const auto* ib=state.model_buffers.Find(input.index,NativeModelBuffers::Kind::Index);
       if(!vb || !ib || !vb->physical || !ib->physical || vb->stride!=input.stride || !vb->bytes || !ib->bytes)
@@ -3746,17 +3792,20 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
       const auto versions=BufferWrites().TryValidateObservedSet(std::array<View,2>{{
         {input.vertex,*vb->physical,vb->bytes,&vb->vertex_contents},
         {input.index,*ib->physical,ib->bytes,&index_contents}}},policy);
-      const auto cached=state.scene_geometry_loads.find(address);
-      const auto same_versions=[&] {
-        if(!versions || cached==state.scene_geometry_loads.end()) return false;
-        for(size_t i=0;i<2;++i) if((*versions)[i].lifetime!=cached->second.versions[i].lifetime ||
-            (*versions)[i].revision!=cached->second.versions[i].revision) return false;
+      const auto same_identity=[&] {
+        return cached!=state.scene_geometry_loads.end() && cached->second.source==input &&
+          cached->second.revision==group.revision &&
+          cached->second.vertex_generation==vb->generation && cached->second.index_generation==ib->generation &&
+          cached->second.declaration==declaration && cached->second.shader.Get()==shader.bytecode.Get() &&
+          state.scene_adapter.GroupGeometry(address,group.revision);
+      };
+      const auto same_versions=[&](const std::array<NativeBufferWrites::ObservedVersion,2>& observed) {
+        for(size_t i=0;i<2;++i) if(observed[i].lifetime!=cached->second.versions[i].lifetime ||
+            observed[i].revision!=cached->second.versions[i].revision) return false;
         return true;
       };
-      if(same_versions() && cached->second.source==input && cached->second.revision==group.revision &&
-         cached->second.vertex_generation==vb->generation && cached->second.index_generation==ib->generation &&
-         cached->second.declaration==declaration && cached->second.shader.Get()==shader.bytecode.Get() &&
-         state.scene_adapter.GroupGeometry(address,group.revision)) {
+      if(versions && same_identity() && same_versions(*versions)) {
+        cached->second.reads=std::move(reads);
         ++state.scene_geometry_reused; continue;
       }
       using Snapshots=std::array<NativeBufferWrites::ObservedSnapshot,2>;
@@ -3775,6 +3824,14 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
       if(!observed) throw std::runtime_error("static preload geometry writer transaction is unavailable");
       for(const auto& value:*observed) if(value.unreported_change)
         REXLOG_WARN("Native scene preload detected an unreported geometry write; source comparison repaired the snapshot");
+      // A scheduled comparison that found the retained candidates unchanged at
+      // the loaded revisions is a verification, not a new load: rebuilding the
+      // mesh here re-loaded ~verify_interval-th of all groups every tick.
+      if(same_identity() && (*observed)[0].contents==vb->vertex_contents && (*observed)[1].contents==index_contents &&
+         same_versions({(*observed)[0].version,(*observed)[1].version})) {
+        cached->second.reads=std::move(reads);
+        ++state.scene_geometry_verified; continue;
+      }
       auto& backend=EnsureSceneBackendLocked(state);
       auto& mesh=state.meshes.Acquire(backend,shader,
         {input.vertex,input.index,input.declaration,input.shader,0},declaration->bytes(),input.stride,
@@ -3788,7 +3845,7 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
         throw std::runtime_error("static preload geometry changed before publication");
       state.scene_adapter.PublishGroupGeometry(address,group.revision,std::move(geometry),input);
       state.scene_geometry_loads[address]={input,group.revision,vb->generation,ib->generation,
-        {(*observed)[0].version,(*observed)[1].version},declaration,shader.bytecode};
+        {(*observed)[0].version,(*observed)[1].version},declaration,shader.bytecode,std::move(reads)};
       ++state.scene_geometry_loaded;
     } catch(const std::exception& error) {
       state.scene_adapter.RetireGroupGeometry(address);
@@ -3800,29 +3857,62 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
   }
   if(!state.scene_sources.Groups().empty() &&
      (loaded_before!=state.scene_geometry_loaded || state.scene_publication_tick%120==0))
-    REXLOG_INFO("Native scene geometry preload: groups={} ready={} loaded={} reused={} deferred={} (simulation publication; no draws)",
+    REXLOG_INFO("Native scene geometry preload: groups={} ready={} loaded={} reused={} verified={} unchanged={} deferred={} (simulation publication; no draws)",
       state.scene_sources.Groups().size(),state.scene_adapter.geometry_groups(),state.scene_geometry_loaded,
-      state.scene_geometry_reused,state.scene_geometry_deferred);
+      state.scene_geometry_reused,state.scene_geometry_verified,state.scene_geometry_unchanged,state.scene_geometry_deferred);
 }
 void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing) {
   const NativeSceneCpuWindow reader(backing);
+  // Change signals: group revision, the descriptor's material, the published
+  // program, schema/shader/texture identities and every recorded input byte
+  // (constants included: their stores are untracked, so bytes are compared).
+  const auto current=[&](uint32_t address,const auto& group,const auto& load) {
+    const auto geometry=state.scene_geometry_loads.find(address);
+    if(load.revision!=group.revision || !load.published || geometry==state.scene_geometry_loads.end() ||
+       geometry->second.source.material!=load.material ||
+       state.scene_adapter.GroupMaterial(address,group.revision)!=load.published) return false;
+    const auto& program=*load.published->program;
+    if(program.backend!=state.scene_backend) return false;
+    try { if(state.material_parameters.Get(load.material)!=load.schema) return false; }
+    catch(const std::exception&) { return false; }
+    const auto vs=state.shaders.find(program.inputs.vertex),ps=state.shaders.find(program.inputs.pixel);
+    if(vs==state.shaders.end() || ps==state.shaders.end() || !vs->second.bindings || !vs->second.reversed_bindings ||
+       !ps->second.bindings || !(program.vertex.bytecode==vs->second.bindings->shader().bytecode) ||
+       !(program.reversed_vertex.bytecode==vs->second.reversed_bindings->shader().bytecode) ||
+       !(program.pixel.bytecode==ps->second.bindings->shader().bytecode)) return false;
+    if(program.textures.size()!=program.inputs.textures.size()) return false;
+    for(size_t i=0;i<program.textures.size();++i) {
+      const auto handle=program.inputs.textures[i].handle;
+      if(!handle) { if(program.textures[i]) return false; continue; }
+      const auto texture=state.textures.find(handle);
+      if(texture==state.textures.end() || !texture->second.content_valid ||
+         texture->second.backend!=program.textures[i]) return false;
+    }
+    return load.reads.Unchanged(reader);
+  };
   for(const auto& [address,group]:state.scene_sources.Groups()) {
+    const auto cached=state.scene_material_loads.find(address);
+    if(cached!=state.scene_material_loads.end() && current(address,group,cached->second)) {
+      ++state.scene_material_unchanged; continue;
+    }
     try {
       const auto geometry=state.scene_geometry_loads.find(address);
       if(geometry==state.scene_geometry_loads.end()) throw std::runtime_error("material awaits group descriptor");
       const auto material=geometry->second.source.material;
-      const auto pass=reader.Word(reader.Add(material,108));
-      const auto vertex=reader.Word(reader.Word(pass));
-      const auto pixel=reader.Word(reader.Add(reader.Word(reader.Add(pass,4)),4));
+      NativeRecordedReads reads;
+      const NativeRecordingReader recorder(reader,reads);
+      const auto pass=recorder.Word(recorder.Add(material,108));
+      const auto vertex=recorder.Word(recorder.Word(pass));
+      const auto pixel=recorder.Word(recorder.Add(recorder.Word(recorder.Add(pass,4)),4));
       const auto& vs=state.shaders.at(vertex);
       const auto& ps=state.shaders.at(pixel);
       if(!vs.reversed_bindings) throw std::runtime_error("native material has no vertex variants");
       const auto schema=state.material_parameters.Get(material);
-      auto inputs=ReadNativeSceneMaterialInputs(reader,material,*schema,[&](bool pixel_stage,const std::string& name) {
+      auto inputs=ReadNativeSceneMaterialInputs(recorder,material,*schema,[&](bool pixel_stage,const std::string& name) {
         return pixel_stage?ps.bindings->GuestFloatRegisterBytes(name):std::max(
           vs.bindings->GuestFloatRegisterBytes(name),vs.reversed_bindings->GuestFloatRegisterBytes(name));
       },[&](const std::string& name) { return ps.bindings->ResolveResource(name).used(); });
-      auto sampler_operations=ReadNativeMaterialSamplerOperations(reader,*schema);
+      auto sampler_operations=ReadNativeMaterialSamplerOperations(recorder,*schema);
       std::vector<std::shared_ptr<NativeBackendTexture>> textures;
       for(const auto& input:inputs.textures) {
         if(!input.handle) { textures.emplace_back(); continue; }
@@ -3839,26 +3929,30 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
          previous->program->reversed_vertex.bytecode==vs.reversed_bindings->shader().bytecode &&
          previous->program->pixel.bytecode==ps.bindings->shader().bytecode) {
         state.scene_adapter.PublishGroupMaterial(address,group.revision,previous->program,std::move(inputs.constants));
-        ++state.scene_material_reused; continue;
+        ++state.scene_material_reused;
+      } else {
+        auto program=std::make_shared<NativeSceneMaterialProgram>();
+        auto constants=std::move(inputs.constants);
+        program->backend=state.scene_backend; program->inputs=std::move(inputs); program->textures=std::move(textures);
+        program->sampler_operations=std::move(sampler_operations);
+        program->vertex=vs.bindings->shader(); program->reversed_vertex=vs.reversed_bindings->shader();
+        program->pixel=ps.bindings->shader();
+        state.scene_adapter.PublishGroupMaterial(address,group.revision,std::move(program),std::move(constants));
+        ++state.scene_material_loaded;
       }
-      auto program=std::make_shared<NativeSceneMaterialProgram>();
-      auto constants=std::move(inputs.constants);
-      program->backend=state.scene_backend; program->inputs=std::move(inputs); program->textures=std::move(textures);
-      program->sampler_operations=std::move(sampler_operations);
-      program->vertex=vs.bindings->shader(); program->reversed_vertex=vs.reversed_bindings->shader();
-      program->pixel=ps.bindings->shader();
-      state.scene_adapter.PublishGroupMaterial(address,group.revision,std::move(program),std::move(constants));
-      ++state.scene_material_loaded;
+      state.scene_material_loads[address]={group.revision,material,schema,
+        state.scene_adapter.GroupMaterial(address,group.revision),std::move(reads)};
     } catch(const std::exception& error) {
       state.scene_adapter.RetireGroupMaterial(address); ++state.scene_material_deferred;
+      state.scene_material_loads.erase(address);
       if(state.scene_material_reasons.size()<32 && state.scene_material_reasons.insert(error.what()).second)
         REXLOG_INFO("Native scene material preload deferred: {}",error.what());
     }
   }
   if(!state.scene_sources.Groups().empty() && state.scene_publication_tick%120==0)
-    REXLOG_INFO("Native scene material preload: groups={} ready={} loaded={} reused={} deferred={} (owned inputs; pass state still explicit)",
+    REXLOG_INFO("Native scene material preload: groups={} ready={} loaded={} reused={} unchanged={} deferred={} (owned inputs; pass state still explicit)",
       state.scene_sources.Groups().size(),state.scene_adapter.material_groups(),state.scene_material_loaded,
-      state.scene_material_reused,state.scene_material_deferred);
+      state.scene_material_reused,state.scene_material_unchanged,state.scene_material_deferred);
 }
 void PublishStaticScenePartsLocked(Bridge& state,const GuestReader& reader,uint32_t owner) {
   if(!state.scene_sources.HasOwner(owner)) return; // Nested initial model load precedes completed construction.

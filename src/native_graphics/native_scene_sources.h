@@ -47,6 +47,8 @@ class NativeSceneSources {
     return found==groups_.end()?nullptr:&found->second;
   }
   const auto& Groups() const { return groups_; }
+  // Advances whenever any group is added, changed or erased.
+  uint64_t GroupRevision() const { return group_revision_; }
   uint64_t Born(uint32_t owner) {
     if(!owner || next_==UINT64_MAX) throw std::runtime_error("invalid native scene source lifetime");
     Retire(owner);
@@ -152,7 +154,7 @@ class NativeSceneSources {
     const auto found=groups_.find(part.group);
     if(found==groups_.end()) return;
     found->second.parts.erase(part.instance);
-    if(found->second.parts.empty()) groups_.erase(found);
+    if(found->second.parts.empty()) { groups_.erase(found); ++group_revision_; }
     else found->second.revision=++group_revision_;
   }
   uint64_t next_=1;
