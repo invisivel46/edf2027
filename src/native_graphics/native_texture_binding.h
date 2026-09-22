@@ -14,8 +14,8 @@ inline std::array<uint32_t,6> NativeTextureBindingWords(std::array<uint32_t,6> p
   result[2]=texture[2];
   result[3]=(texture[3]&~0x7ff80000u)|(previous[3]&0x7ff80000u);
   result[4]=(previous[4]&~0x3fcu)|
-    ((std::max(uint32_t(minimum),(texture[4]>>2)&15u)<<2)&0x3cu)|
-    ((std::min(uint32_t(maximum),(texture[4]>>6)&15u)<<6)&0x3c0u);
+    (((std::max)(uint32_t(minimum),(texture[4]>>2)&15u)<<2)&0x3cu)|
+    (((std::min)(uint32_t(maximum),(texture[4]>>6)&15u)<<6)&0x3c0u);
   result[5]=(texture[5]&0x1ffffe00u)+(((std::rotl(texture[5],12)&0xfffu)+512)&0x1000u);
   result[5]=(result[5]&~0x1ffu)|(previous[5]&0x1ffu);
   return result;

@@ -250,7 +250,7 @@ void StaticWorldPass() {
   });
   Require(trace==std::vector<std::string>{"native 40960","native 41216","empty","native 41472","handoff",
     "guest 41728","native 41984","native 42240","handoff"},"static world walk left published order or skipped a handoff");
-  Require(replayed==std::vector<uint32_t>{0xa100,0xa200,0xa400,0xa500},
+  Require(replayed==decltype(replayed){0xa100,0xa200,0xa400,0xa500},
     "static world handoff replayed other than each last slot binder and the last group");
   // Pass-state chaining equals the mirrors sequential guest groups leave.
   const SparseReader expected{sequential};
