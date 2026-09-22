@@ -81,6 +81,7 @@
 #include "native_profile_result.h"
 #include "native_capture_policy.h"
 #include "native_ab_alternate.h"
+#include "native_post_finish_plan.h"
 #include "native_constant_ownership.h"
 #include "immediate_mesh_key.h"
 #include "d3d11_bindings.h"
@@ -3193,7 +3194,6 @@ EDF_RENDER_PHASE(821A3BA0, RenderBuckets)
 EDF_RENDER_PHASE(821B2C28, RenderMesh)
 EDF_RENDER_PHASE(820D3FD0, RenderOverlay)
 EDF_RENDER_PHASE(821BE9D8, RenderSceneEnd)
-EDF_RENDER_PHASE(820B0B80, RenderFinish)
 REX_EXTERN(__imp__sub_821C9478);
 REX_HOOK_RAW(sub_821C9478) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderPose);
@@ -3202,6 +3202,195 @@ REX_HOOK_RAW(sub_821C9478) {
   __imp__sub_821C9478(ctx,base);
   if(native_model_dirty_poses) native_model_dirty_poses->push_back(vector);
 }
+// Finish/post stage 820B0B80. Steps 1-2 of making it native: the guest body
+// still runs every time and is the fallback for every failure below. The plan
+// derives what its passes will set; the audit compares that plan with the
+// setters, targets and quads the guest body actually issues.
+REXCVAR_DEFINE_BOOL(edf_native_post_finish,false,"EDF2027",
+  "Build a native plan of the finish/post stage 820B0B80 before its guest body runs. The guest body still runs; it remains the fallback whenever a record or format check fails");
+REXCVAR_DEFINE_BOOL(edf_native_post_finish_audit,false,"EDF2027",
+  "Compare the native finish plan with the setters, targets and quads 820B0B80 actually issues, and log mismatches (development)");
+namespace edf::native {
+namespace {
+// Guest-thread only: the post chain, its setters and its quad draws all run
+// synchronously inside the hooked call.
+struct PostFinishRecorder {
+  uint32_t self=0;
+  std::set<uint32_t> targets,techniques;
+  PostFinishObservation seen;
+  uint64_t errors=0;
+  std::string first_error;
+  bool Effect(uint32_t effect) const { return effect>=self && effect-self<PostFinishLayout::kEffectSpan; }
+  void Fail(const std::exception& error) { if(!errors++) first_error=error.what(); }
+};
+thread_local PostFinishRecorder* post_finish_recorder=nullptr;
+struct PostFinishStats {
+  uint64_t planned=0,rejected=0,audited=0,clean=0,mismatches=0,unobserved=0,recorder_errors=0;
+  std::optional<std::array<float,3>> tone; // last values the native bindings reflected
+};
+PostFinishStats& FinishStats() { static PostFinishStats stats; return stats; }
+// 820A62E8/820A6908 strings: +4 inline buffer or pointer, +20 size, +24 capacity.
+std::string ReadGuestStdString(const GuestReader& reader,uint32_t address) {
+  const auto size=reader.Word(reader.Add(address,20)),capacity=reader.Word(reader.Add(address,24));
+  if(size>256 || size>capacity) throw std::runtime_error("unsupported guest parameter name string");
+  const auto data=capacity>=16 ? reader.Word(reader.Add(address,4)) : reader.Add(address,4);
+  if(!size) return {};
+  return std::string(reinterpret_cast<const char*>(reader.Bytes(data,size)),size);
+}
+PostFinishInput ReadPostFinishInput(const GuestReader& reader,uint32_t self,const std::optional<std::array<float,3>>& tone) {
+  using L=PostFinishLayout;
+  if(!self) throw std::runtime_error("no post owner");
+  PostFinishInput in; in.self=self;
+  const auto owner=reader.Word(L::kOwnerGlobal);
+  in.screen_width=std::bit_cast<int32_t>(reader.Word(reader.Add(owner,L::kOwnerWidth)));
+  in.screen_height=std::bit_cast<int32_t>(reader.Word(reader.Add(owner,L::kOwnerHeight)));
+  in.scene_texture=reader.Word(reader.Add(owner,L::kOwnerSceneTexture));
+  const auto record=[&](uint32_t address) {
+    PostFinishRecord r; r.address=address;
+    r.texture=reader.Word(reader.Add(address,L::kRecordTexture));
+    r.width=std::bit_cast<int32_t>(reader.Word(reader.Add(address,L::kRecordWidth)));
+    r.height=std::bit_cast<int32_t>(reader.Word(reader.Add(address,L::kRecordHeight)));
+    r.texel_x=std::bit_cast<float>(reader.Word(reader.Add(address,L::kRecordTexelX)));
+    r.texel_y=std::bit_cast<float>(reader.Word(reader.Add(address,L::kRecordTexelY)));
+    return r;
+  };
+  for(uint32_t k=0;k<L::kFirstPyramidCount;++k) in.first[k]=record(reader.Add(self,L::kFirstPyramid+k*L::kRecordStride));
+  const auto records=reader.Word(reader.Add(self,L::kSecondPyramid));
+  const auto count=reader.Word(reader.Add(self,L::kSecondCount));
+  if(!records || !count || count>L::kMaxSecondCount)
+    throw std::runtime_error(std::format("second pyramid {:#x} count {} unsupported",records,count));
+  for(uint32_t i=0;i<count;++i) in.second.push_back(record(reader.Add(records,i*L::kRecordStride)));
+  in.blur=record(reader.Add(self,L::kBlurTarget));
+  in.blur_vertical=record(reader.Add(self,L::kBlurTargetVertical));
+  const auto technique=[&](uint32_t effect) { return reader.Word(reader.Add(self,effect+L::kTechniqueOffset)); };
+  in.mono_technique=technique(L::kMonoEffect); in.downsample_tone_technique=technique(L::kDownsampleToneEffect);
+  in.downsample_technique=technique(L::kDownsampleEffect); in.tone_technique=technique(L::kToneEffect);
+  in.blur_technique=technique(L::kBlurEffect); in.bloom_technique=technique(L::kBloomEffect);
+  in.tone=tone; in.tone_source=tone?PostToneSource::LivePreviousFrame:PostToneSource::None;
+  return in;
+}
+}
+}
+REX_EXTERN(__imp__sub_820B0B80);
+REX_HOOK_RAW(sub_820B0B80) {
+  edf::native::HookTiming timing(edf::native::HookPhase::RenderFinish);
+  const bool audit=REXCVAR_GET(edf_native_post_finish_audit);
+  if((!REXCVAR_GET(edf_native_post_finish) && !audit) || !REXCVAR_GET(edf_native_host) ||
+     !REXCVAR_GET(edf_native_shader_bridge) || !REXCVAR_GET(edf_native_seam_draws) ||
+     edf::native::post_finish_recorder) {
+    __imp__sub_820B0B80(ctx,base); return;
+  }
+  auto& stats=edf::native::FinishStats();
+  const auto self=ctx.r3.u32;
+  std::optional<edf::native::PostFinishPlan> plan;
+  try {
+    const edf::native::GuestReader reader(base);
+    const auto input=edf::native::ReadPostFinishInput(reader,self,stats.tone);
+    plan=edf::native::BuildPostFinishPlan(input);
+    if(++stats.planned<=2) {
+      std::string first,second;
+      for(const auto& r:input.first) first+=std::format(" {}x{}/texel={},{}",r.width,r.height,r.texel_x,r.texel_y);
+      for(const auto& r:input.second) second+=std::format(" {}x{}",r.width,r.height);
+      REXLOG_INFO("Native post finish plan: owner={:#x}, passes={}, screen={}x{}, first=[{} ], second=[{} ], blur={}x{}, tone_source={}",
+        self,plan->passes.size(),input.screen_width,input.screen_height,first,second,input.blur.width,input.blur.height,
+        input.tone?"live-previous-frame":"none");
+    }
+  } catch(const std::exception& error) {
+    plan.reset();
+    if(edf::native::ShouldLogPostFinish(++stats.rejected))
+      REXLOG_INFO("Native post finish fallback: {} (rejected={}, planned={})",error.what(),stats.rejected,stats.planned);
+  }
+  if(!plan || !audit) { __imp__sub_820B0B80(ctx,base); return; }
+  edf::native::PostFinishRecorder recorder;
+  recorder.self=self;
+  for(const auto& pass:plan->passes) {
+    if(pass.target) recorder.targets.insert(pass.target);
+    recorder.techniques.insert(pass.technique);
+  }
+  {
+    struct Scope { ~Scope() { edf::native::post_finish_recorder=nullptr; } } scope;
+    edf::native::post_finish_recorder=&recorder;
+    __imp__sub_820B0B80(ctx,base);
+  }
+  try {
+    const auto result=edf::native::ComparePostFinish(*plan,recorder.seen);
+    ++stats.audited;
+    if(result.mismatches.empty() && !recorder.errors) ++stats.clean;
+    stats.unobserved+=result.native_unobserved;
+    if(recorder.errors && edf::native::ShouldLogPostFinish(++stats.recorder_errors))
+      REXLOG_WARN("Native post finish audit recorder: frame={}, errors={}, first={}",stats.audited,recorder.errors,recorder.first_error);
+    for(const auto& mismatch:result.mismatches)
+      if(edf::native::ShouldLogPostFinish(++stats.mismatches))
+        REXLOG_WARN("Native post finish mismatch: frame={}, pass={}, {} (mismatches={})",
+          stats.audited,mismatch.pass,mismatch.what,stats.mismatches);
+    if(edf::native::ShouldLogPostFinish(stats.audited))
+      REXLOG_INFO("Native post finish audit: frames={}, clean={}, mismatches={}, native_unobserved_passes={}, tone_compared={}, tone_source={}, recorder_errors={}",
+        stats.audited,stats.clean,stats.mismatches,stats.unobserved,result.tone_compared,
+        plan->tone?"live-previous-frame":"none",stats.recorder_errors);
+    if(const auto tone=edf::native::PostObservedTone(*plan,recorder.seen)) stats.tone=tone;
+  } catch(const std::exception& error) {
+    REXLOG_ERROR("Native post finish audit: {}",error.what());
+  }
+}
+// Observers for the finish audit. Each records only while an audited 820B0B80
+// is on this thread's stack, and only for the post owner's own effects,
+// targets and techniques; the original always runs, and a failed read is
+// counted, never thrown into guest code.
+#define EDF_POST_FINISH_OBSERVER(address,...) \
+  REX_EXTERN(__imp__sub_##address); \
+  REX_HOOK_RAW(sub_##address) { \
+    if(auto* recorder=edf::native::post_finish_recorder) { \
+      try { __VA_ARGS__ } catch(const std::exception& error) { recorder->Fail(error); } \
+    } \
+    __imp__sub_##address(ctx,base); \
+  }
+// 821BCD58(effect,name,float4*,count)
+EDF_POST_FINISH_OBSERVER(821BCD58,
+  if(recorder->Effect(ctx.r3.u32)) {
+    const edf::native::GuestReader reader(base);
+    edf::native::PostSetterCall call;
+    call.effect=ctx.r3.u32; call.name=edf::native::ReadGuestStdString(reader,ctx.r4.u32);
+    call.kind=edf::native::PostSetterKind::Vectors;
+    if(ctx.r6.u32>64) throw std::runtime_error("post vector setter count");
+    reader.Bytes(ctx.r5.u32,size_t(ctx.r6.u32)*16);
+    for(uint32_t i=0;i<ctx.r6.u32*4;++i) call.values.push_back(std::bit_cast<float>(reader.Word(ctx.r5.u32+i*4)));
+    recorder->seen.Setter(std::move(call));
+  })
+// 821BCE98(effect,name,texture)
+EDF_POST_FINISH_OBSERVER(821BCE98,
+  if(recorder->Effect(ctx.r3.u32)) {
+    const edf::native::GuestReader reader(base);
+    edf::native::PostSetterCall call;
+    call.effect=ctx.r3.u32; call.name=edf::native::ReadGuestStdString(reader,ctx.r4.u32);
+    call.kind=edf::native::PostSetterKind::Texture; call.texture=ctx.r5.u32;
+    recorder->seen.Setter(std::move(call));
+  })
+// 821BCF28(effect,name,f1,r5,r6,r7)
+EDF_POST_FINISH_OBSERVER(821BCF28,
+  if(recorder->Effect(ctx.r3.u32)) {
+    const edf::native::GuestReader reader(base);
+    edf::native::PostSetterCall call;
+    call.effect=ctx.r3.u32; call.name=edf::native::ReadGuestStdString(reader,ctx.r4.u32);
+    call.kind=edf::native::PostSetterKind::Sampler;
+    call.values={float(ctx.f1.f64)}; call.words={ctx.r5.u32,ctx.r6.u32,ctx.r7.u32};
+    recorder->seen.Setter(std::move(call));
+  })
+// 821B94E8(technique): closes a pass. Unrelated activations inside the scope
+// (no pending setters or target) are not passes of this chain.
+EDF_POST_FINISH_OBSERVER(821B94E8,
+  auto& pending=recorder->seen.pending;
+  if(recorder->techniques.contains(ctx.r3.u32) && (pending.target || !pending.setters.empty()))
+    recorder->seen.Activate(ctx.r3.u32);)
+// 821A79B8(device,primitive,vertices,count): the pass quad, four (x,y,u,v).
+EDF_POST_FINISH_OBSERVER(821A79B8,
+  if(recorder->seen.quad_armed) {
+    const edf::native::GuestReader reader(base);
+    reader.Bytes(ctx.r5.u32,64);
+    edf::native::PostQuad quad{};
+    for(uint32_t i=0;i<16;++i) quad[i]=std::bit_cast<float>(reader.Word(ctx.r5.u32+i*4));
+    recorder->seen.Quad(quad);
+  })
+#undef EDF_POST_FINISH_OBSERVER
 REXCVAR_DEFINE_BOOL(edf_native_scene_tree,false,"EDF2027",
   "Use native spatial tree traversal and culling; leaf callbacks remain explicit.");
 REXCVAR_DEFINE_BOOL(edf_native_scene_tree_published,false,"EDF2027",
@@ -8223,6 +8412,8 @@ REX_HOOK_RAW(sub_821B8C30) {
 REX_EXTERN(__imp__sub_821B8828);
 REX_HOOK_RAW(sub_821B8828) {
   const auto owner = ctx.r3.u32;
+  if(auto* recorder=edf::native::post_finish_recorder; recorder && recorder->targets.contains(owner))
+    recorder->seen.BeginTarget(owner);
   __imp__sub_821B8828(ctx,base);
   if (REXCVAR_GET(edf_native_shader_bridge)) {
     try { edf::native::BeginRenderTarget(owner); }
@@ -10402,6 +10593,17 @@ REX_HOOK_RAW(sub_821FD8F8) {
         auto& pixel=*state.shaders.at(state.linked_pixel).bindings;
         if(!post_seam) { bindings.Bind(*state.context.Get()); pixel.Bind(*state.context.Get()); }
         auto& target=output_draw ? state.scenes.at(state.active_output).output : state.render_targets.at(state.active_target).native;
+        if(auto* finish_audit=edf::native::post_finish_recorder; finish_audit && finish_audit->seen.native_armed) {
+          // Finish audit: the extent this pass really draws to, and the tone
+          // constants the live native bindings carry (no guest setter writes them).
+          try {
+            std::array<float,3> tone{NAN,NAN,NAN};
+            const std::array<const char*,3> names{"g_PostEffect_MiddleGray","g_PostEffect_LuminanceWhite","g_PostEffect_ToneMap"};
+            for(size_t c=0;c<names.size();++c)
+              if(const auto value=pixel.ReadFloatVector(names[c]);!value.empty()) tone[c]=value[0];
+            finish_audit->seen.NativeDraw(int32_t(target.sampled.width),int32_t(target.sampled.height),tone);
+          } catch(const std::exception& error) { finish_audit->Fail(error); }
+        }
         // Read the actual post-pass views before drawing, not a guessed target
         // from the resource registry after later passes may have changed it.
         const auto post_prefix=REXCVAR_GET(edf_native_output_capture_scene_color)
