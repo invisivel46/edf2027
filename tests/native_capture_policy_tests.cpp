@@ -28,6 +28,22 @@ int main() {
   check(!ShouldCaptureNativeOutput(606, 0, 32, 7, 600));
   check(ShouldCaptureNativeOutput(std::numeric_limits<uint64_t>::max(), 127, 1000, 1, 600));
   check(!ShouldCaptureNativeOutput(600, 128, 1000, 1, 600));
+  // Output frame counting: guest frames by indexed draws since scene begin, a
+  // full native frame (no guest indexed draws) by having drawn the scene.
+  using edf::native::NativeOutputFrameCounts;
+  using edf::native::NativeSceneDrew;
+  check(NativeOutputFrameCounts(true, 10, 4, false));
+  check(!NativeOutputFrameCounts(true, 4, 4, false));   // Menus/loading: no 3D, not counted.
+  check(NativeOutputFrameCounts(true, 4, 4, true));     // Full frame with no guest indexed draws.
+  check(!NativeOutputFrameCounts(false, 4, 4, true));   // An invalid output never counts.
+  check(!NativeOutputFrameCounts(false, 10, 4, false));
+  check(NativeSceneDrew(5, 4, false) && NativeSceneDrew(4, 4, true) && !NativeSceneDrew(4, 4, false));
+  // A run of full frames advances the counter as guest frames do.
+  {
+    uint64_t frames = 0;
+    for (int i = 0; i < 5; ++i) if (NativeOutputFrameCounts(true, 100, 100, true)) ++frames;
+    check(frames == 5);
+  }
   if (failures) std::cerr << failures << " capture policy failures\n";
   return failures ? 1 : 0;
 }

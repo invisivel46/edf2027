@@ -1151,6 +1151,9 @@ struct Bridge {
   uint64_t scene_begins = 0, scene_ends = 0;
   uint64_t scene_resolves = 0,scene_resolve_errors = 0;
   uint64_t scene_indexed_start = 0;
+  // A full native frame recorded on the current scene (reset at scene begin);
+  // it counts as the scene's indexed draws (NativeSceneDrew).
+  bool scene_full_frame = false;
   uint32_t scene_captures = 0;
   uint64_t indexed_output_frames = 0;
   uint64_t indexed_trace_frame = 0;
@@ -1294,7 +1297,8 @@ void AuditGeneratedWrites(Bridge& state,const NativeBufferWrites::Batch& batch) 
 }
 void CaptureScene(Bridge& state,uint32_t owner) {
   const auto prefix=REXCVAR_GET(edf_native_scene_capture);
-  if (prefix.empty() || state.scene_captures>=3 || state.indexed_submitted==state.scene_indexed_start) return;
+  if (prefix.empty() || state.scene_captures>=3 ||
+      !NativeSceneDrew(state.indexed_submitted,state.scene_indexed_start,state.scene_full_frame)) return;
   const auto scene=state.scenes.find(owner);
   if (scene==state.scenes.end()) return;
   const auto number=++state.scene_captures;
@@ -6307,6 +6311,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
       return false;
     }
     context.renderer=renderer;
+    state.scene_full_frame=true;  // Counts as the scene's indexed draws for output frames and captures.
     context.owner=owner_; context.guest_context=context_;
     const auto width=reader_.Word(reader_.Add(renderer,84)),height=reader_.Word(reader_.Add(renderer,88));
     const auto rect=edf::native::ReadGuestWords<4>(reader_,reader_.Add(scene,480));
@@ -10113,6 +10118,7 @@ REX_HOOK_RAW(sub_8219C7A8) {
       }
       state.active_output=0;
       state.scene_indexed_start=state.indexed_submitted;
+      state.scene_full_frame=false;
       state.visibility.clear();
       auto& scene=found->second;
       scene.color_surface=color_surface;
@@ -10248,7 +10254,8 @@ REX_HOOK_RAW(sub_8219C840) {
         }
       }
       const auto prefix=REXCVAR_GET(edf_native_scene_capture);
-      const bool indexed_output=scene.output.content_valid && state.indexed_submitted>state.scene_indexed_start;
+      const bool indexed_output=edf::native::NativeOutputFrameCounts(scene.output.content_valid,state.indexed_submitted,
+        state.scene_indexed_start,state.scene_full_frame);
       if(indexed_output) state.movie_pacing_active.store(false,std::memory_order_relaxed);
       if(indexed_output) ++state.indexed_output_frames;
       // Retail exposure adapts per frame. The first three outputs alone cannot
@@ -12680,7 +12687,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         const auto post_frame=state.indexed_output_frames+1;
         if((output_draw || state.active_target) && pixel.shader().source_fingerprint==0x6b7926f9747c6933ull &&
            REXCVAR_GET(edf_native_output_capture_scene_color) && !post_prefix.empty() &&
-           state.indexed_submitted>state.scene_indexed_start &&
+           edf::native::NativeSceneDrew(state.indexed_submitted,state.scene_indexed_start,state.scene_full_frame) &&
            edf::native::ShouldCaptureNativeOutput(post_frame,state.output_captures,
              REXCVAR_GET(edf_native_output_capture_limit),REXCVAR_GET(edf_native_output_capture_interval),
              REXCVAR_GET(edf_native_output_capture_start_frame)) &&
