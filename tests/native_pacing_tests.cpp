@@ -217,6 +217,27 @@ int main() {
   check(native_frames==30 && native_steps==60,"slow renderer lost elapsed simulation steps");
   for (uint64_t n=0;n!=8;++n)
     check(NativePacingResult(n)==(n>4?1:n),"retail catch-up clamp");
+  {
+    // A 30 FPS movie draws every other paced swap; a 15 FPS one every fourth.
+    NativeMoviePacing movie; uint64_t draws=0; bool active=false, stayed=true;
+    for(int swap=0;swap!=240;++swap) {
+      if(swap%2==0) { ++draws; active=true; }
+      active=movie.Swap(draws,active); stayed=stayed && active;
+    }
+    check(stayed,"30 FPS movie flickered out of pacing");
+    for(int swap=0;swap!=240;++swap) {
+      if(swap%4==0) { ++draws; active=true; }
+      active=movie.Swap(draws,active); stayed=stayed && active;
+    }
+    check(stayed,"15 FPS movie flickered out of pacing");
+    int released=0; ++draws; active=movie.Swap(draws,true);
+    while(active && released<100) { active=movie.Swap(draws,active); ++released; }
+    check(!active && released==int(NativeMoviePacing::kIdleSwaps),"ended movie did not release after the idle swaps");
+    check(!movie.Swap(draws,false) && !movie.Swap(draws,false),"released movie pacing re-armed without a draw");
+    ++draws; check(movie.Swap(draws,true),"new movie draw did not re-arm pacing");
+    // A completed 3D frame clears the flag even while movie draws continue.
+    ++draws; check(!movie.Swap(draws,false),"movie pacing overrode the 3D-frame clear");
+  }
   std::cout << "Native pacing failures: " << failures << '\n';
   return failures ? 1 : 0;
 }

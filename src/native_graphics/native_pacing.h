@@ -88,6 +88,25 @@ class NativePacingClock {
   bool initialized_ = false;
 };
 
+// Movie playback keeps the retail clocks. It stays paced only while movie draws
+// keep arriving: a swap with no new draw since the previous swap counts as idle,
+// and kIdleSwaps consecutive idle swaps release it. While paced, swaps run at
+// the requested interval (60 Hz), so a 29.97 FPS movie leaves one idle swap
+// between draws and a 15 FPS one three; eight tolerates a ~100 ms decode stall
+// without releasing mid-movie, and costs ~133 ms of extra pacing after the end.
+// Any new draw resets the count; the draw itself re-arms the caller's flag.
+struct NativeMoviePacing {
+  static constexpr uint32_t kIdleSwaps=8;
+  uint64_t seen=0;
+  uint32_t idle=0;
+  // Returns the pacing state to keep for this swap.
+  bool Swap(uint64_t draws,bool active) {
+    if(draws!=seen) { seen=draws; idle=0; return active; }
+    if(!active) { idle=0; return false; }
+    return ++idle<kIdleSwaps;
+  }
+};
+
 inline uint64_t NativePacingSteps(uint64_t current, uint64_t previous, uint32_t divisor) {
   // Retail sign-extends this field before unsigned division. Negative divisors
   // are not a supported native pacing configuration; never silently reinterpret.

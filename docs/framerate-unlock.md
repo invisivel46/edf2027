@@ -491,6 +491,18 @@ that intermediate unlocked run. Future matched inputs must wait for gameplay
 in both runs; fixed startup deadlines were not equivalent. Captures are
 `out/unlock-equivalence-locked.bmp` and `out/unlock-equivalence-unlocked.bmp`.
 
+Follow-up: that rule kept menus and mission loading at 60 Hz from the intro
+movie until the first 3D frame, making loads 50–100 seconds. Movie pacing now
+also ends when draws stop. Each swap compares the movie draw count with the
+previous swap (`NativeMoviePacing` in `native_pacing.h`), and eight consecutive
+swaps without a new draw clear the flag. Paced swaps run at 60 Hz, so a 29.97
+FPS movie leaves one idle swap between draws and a 15 FPS movie leaves three.
+Eight covers a decode stall of about 100 ms without releasing mid-movie, and
+adds about 133 ms of pacing after the movie ends. Any new draw re-arms pacing
+straight away. The 3D-frame clear is unchanged. `native_pacing_tests` covers
+the 30 and 15 FPS cadences, the release and the re-arm. Not yet measured in a
+run.
+
 ### Gameplay-triggered baseline measurement
 
 Locked run `binding-validation-20260918-161237-e07434db` (owned PID 40392,

@@ -1005,9 +1005,11 @@ struct Bridge {
   uint64_t movie_uploads=0, movie_upload_errors=0;
   uint64_t movie_draws=0, movie_draw_errors=0;
   // Movie drawing can run on a helper between main-thread UI swaps. Keep both
-  // clocks paced until a completed 3D scene takes over, rather than clearing
-  // playback state on a UI-only swap that did not itself draw the movie.
+  // clocks paced until a completed 3D scene takes over or movie_pacing sees
+  // NativeMoviePacing::kIdleSwaps swaps in a row without a new movie draw,
+  // rather than clearing on the first UI-only swap that did not draw the movie.
   std::atomic<bool> movie_pacing_active{false};
+  NativeMoviePacing movie_pacing;
   std::unique_ptr<ShaderBindings> movie_vertex,movie_pixel,movie_pixel_sd;
   std::array<std::optional<NativeMovieBindings>,2> movie_bindings;
   std::unique_ptr<QuadStream> movie_vertices;
@@ -5444,8 +5446,11 @@ REX_EXTERN(edf_native_swap_wait) {
   const auto entry_phase=timing.clock.PhasePercent(now);
   const auto entry_ticks=pacing.ticks, entry_ack=pacing.acknowledged;
   // Movie decoding/presentation follows the title's requested swap interval.
-  // The gameplay unlock must not speed up that separate playback loop.
-  const bool movie_frame=state.movie_pacing_active.load(std::memory_order_relaxed);
+  // The gameplay unlock must not speed up that separate playback loop. Menus
+  // and loading after the movie must not stay paced, so release once draws stop.
+  const bool movie_frame=state.movie_pacing.Swap(state.movie_draws,
+    state.movie_pacing_active.load(std::memory_order_relaxed));
+  if(!movie_frame) state.movie_pacing_active.store(false,std::memory_order_relaxed);
   bool released=REXCVAR_GET(edf_native_unlock_framerate) && !movie_frame
     ? pacing.CompleteUnpaced(interval):pacing.CompleteNative(interval);
   // Publish the callback increment once, before sleeping. A statistics reader
