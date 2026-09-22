@@ -1,7 +1,9 @@
 #pragma once
 #include "d3d11_mesh.h"
+#include "native_shared_vector.h"
 #include <atomic>
 #include <map>
+#include <set>
 
 namespace edf::native {
 using NativeSceneMatrix=std::array<float,16>;
@@ -89,9 +91,20 @@ struct NativeSceneInstance {
   NativeSceneObject object;
   NativeSceneMatrix previous=kNativeSceneIdentity;
 };
+struct NativeSceneInstanceOrder {
+  std::pair<uint64_t,uint64_t> operator()(const std::shared_ptr<const NativeSceneInstance>& instance) const {
+    return {instance->object.order,instance->id};
+  }
+};
+struct NativeSceneInstanceId {
+  uint64_t operator()(const std::shared_ptr<const NativeSceneInstance>& instance) const { return instance->id; }
+};
+using NativeSceneInstances=NativeSharedVector<std::shared_ptr<const NativeSceneInstance>>;
 struct NativeSceneSnapshot {
   uint64_t tick=0;
-  std::vector<std::shared_ptr<const NativeSceneInstance>> instances;
+  // Render order. Database publications keep it sorted by NativeSceneInstanceOrder
+  // and share every chunk that no tick has changed since.
+  NativeSceneInstances instances;
 };
 
 // Single simulation producer; readers acquire immutable snapshots atomically.
@@ -101,6 +114,7 @@ class NativeSceneDatabase {
  public:
   uint64_t Create(NativeSceneObject object);
   void Update(uint64_t id,NativeSceneObject object);
+  bool Matches(uint64_t id,const NativeSceneObject& object) const { return objects_.at(id).object==object; }
   bool Remove(uint64_t id);
   void Clear();
   std::shared_ptr<const NativeSceneSnapshot> Publish(uint64_t tick);
@@ -110,6 +124,8 @@ class NativeSceneDatabase {
   NativeSceneSnapshot Select(std::span<const uint64_t> ids);
   std::shared_ptr<const NativeSceneInstance> SelectOne(uint64_t id);
   std::shared_ptr<const NativeSceneSnapshot> Acquire() const { return published_.load(); }
+  // The last publication's instances ordered by id, sharing its chunks.
+  const NativeSceneInstances& PublishedById() const { return by_id_; }
  private:
   struct Entry {
     NativeSceneObject object;
@@ -118,6 +134,10 @@ class NativeSceneDatabase {
     bool dirty=true;
   };
   std::map<uint64_t,Entry> objects_;
+  // Ids created, updated or removed since the last publication. Publication
+  // visits only these; a removal before any publication leaves nothing here.
+  std::set<uint64_t> changed_;
+  NativeSceneInstances ordered_,by_id_;
   std::atomic<std::shared_ptr<const NativeSceneSnapshot>> published_;
   uint64_t next_id_=1;
 };

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
 
 namespace edf::native {
 namespace {
@@ -146,6 +147,7 @@ uint64_t NativeSceneDatabase::Create(NativeSceneObject object) {
   Validate(object);
   if(next_id_==(std::numeric_limits<uint64_t>::max)()) throw std::runtime_error("native scene identity exhausted");
   const auto id=next_id_;
+  changed_.insert(id);
   objects_.emplace(id,Entry{std::move(object)});
   ++next_id_;
   return id;
@@ -154,13 +156,22 @@ void NativeSceneDatabase::Update(uint64_t id,NativeSceneObject object) {
   Validate(object);
   auto& entry=objects_.at(id);
   if(entry.object==object) return;
+  changed_.insert(id);
   entry.object=std::move(object); entry.dirty=true;
 }
-bool NativeSceneDatabase::Remove(uint64_t id) { return objects_.erase(id)!=0; }
-void NativeSceneDatabase::Clear() { objects_.clear(); }
+bool NativeSceneDatabase::Remove(uint64_t id) {
+  const auto found=objects_.find(id);
+  if(found==objects_.end()) return false;
+  if(by_id_.Find(id,NativeSceneInstanceId{})) changed_.insert(id); else changed_.erase(id);
+  objects_.erase(found); return true;
+}
+void NativeSceneDatabase::Clear() {
+  for(const auto& [id,entry]:objects_)
+    if(by_id_.Find(id,NativeSceneInstanceId{})) changed_.insert(id); else changed_.erase(id);
+  objects_.clear();
+}
 NativeSceneSnapshot NativeSceneDatabase::Select(std::span<const uint64_t> ids) {
   NativeSceneSnapshot result;
-  result.instances.reserve(ids.size());
   for(auto id:ids) result.instances.push_back(SelectOne(id));
   return result;
 }
@@ -177,9 +188,20 @@ std::shared_ptr<const NativeSceneSnapshot> NativeSceneDatabase::Publish(uint64_t
   const auto old=Acquire();
   if(old && tick<=old->tick) throw std::runtime_error("native scene ticks must increase");
   auto snapshot=std::make_shared<NativeSceneSnapshot>(); snapshot->tick=tick;
-  snapshot->instances.reserve(objects_.size());
+  // Work on copies: they share storage with the last publication, and writes
+  // clone only the chunks holding changed ids.
+  auto ordered=ordered_,by_id=by_id_;
+  const NativeSceneInstanceOrder order{}; const NativeSceneInstanceId identity{};
   std::vector<std::pair<Entry*,std::shared_ptr<const NativeSceneInstance>>> changed;
-  for(auto& [id,entry]:objects_) {
+  for(const auto id:changed_) {
+    const auto* prior=by_id.Find(id,identity);
+    const auto prior_order=prior?std::optional(order(*prior)):std::nullopt;
+    const auto found=objects_.find(id);
+    if(found==objects_.end()) {
+      if(prior_order) { ordered.Erase(*prior_order,order); by_id.Erase(id,identity); }
+      continue;
+    }
+    auto& entry=found->second;
     auto instance=entry.published;
     if(entry.dirty) {
       auto replacement=std::make_shared<NativeSceneInstance>();
@@ -191,13 +213,14 @@ std::shared_ptr<const NativeSceneSnapshot> NativeSceneDatabase::Publish(uint64_t
       instance=std::move(replacement);
       changed.emplace_back(&entry,instance);
     }
-    snapshot->instances.push_back(std::move(instance));
+    if(!instance) continue;
+    if(prior_order && *prior_order!=order(instance)) ordered.Erase(*prior_order,order);
+    ordered.Assign(instance,order); by_id.Assign(instance,identity);
   }
-  std::sort(snapshot->instances.begin(),snapshot->instances.end(),[](const auto& a,const auto& b) {
-    return a->object.order==b->object.order?a->id<b->id:a->object.order<b->object.order;
-  });
+  snapshot->instances=ordered;
   // No publication changes until all allocations and ordering have succeeded.
   for(auto& [entry,instance]:changed) { entry->published=std::move(instance); entry->dirty=false; }
+  ordered_=std::move(ordered); by_id_=std::move(by_id); changed_.clear();
   published_.store(snapshot);
   return snapshot;
 }

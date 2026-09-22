@@ -74,6 +74,26 @@ void TreePublicationReuse() {
     "occupancy change was not recaptured");
   Require(trees.Publish(reader,owner) && trees.captures()==3 && trees.reuses()==3,"tree reuse count");
 }
+void SharedIndex() {
+  NativeSharedMap<uint32_t,uint32_t> map;
+  for(uint32_t i=0;i<1000;++i) map.Set(i*7919%1000,i);
+  const auto frozen=map;
+  Require(map.Shares(frozen) && map.size()==1000,"shared map copy was not shared");
+  uint32_t expected=0;
+  for(const auto& [key,value]:frozen) Require(key==expected++ && value*7919%1000==key,"shared map order");
+  for(uint32_t i=0;i<1000;i+=2) Require(map.Erase(i),"shared map erase");
+  *map.Mutable(1)=5000; map.Set(1001,1);
+  Require(!map.Shares(frozen) && map.size()==501 && frozen.size()==1000 && frozen.at(1)!=5000 && map.at(1)==5000 &&
+    frozen.contains(0) && !map.contains(0) && !map.Erase(0) && !map.Mutable(0) && map.contains(1001),
+    "shared map write reached a shared copy");
+  expected=1;
+  for(const auto& [key,value]:map) { Require(key==expected,"shared map order after erase"); expected+=2; }
+  Require(expected==1003,"shared map iteration skipped a chunk");
+  Require(map.EraseIf([](const auto& entry) { return entry.first>500; })==251 && map.size()==250 && frozen.size()==1000,
+    "shared map erase_if");
+  NativeSharedVector<int> list{1,2,3};
+  Require(list.size()==3 && list[2]==3 && NativeSharedVector<int>{}.empty(),"shared vector sequence");
+}
 void GeometryPublicationRetry() {
   constexpr uint32_t device=0x1000,old_vertex=0x10000,old_index=0x10100,queue=0x18000;
   const NativeSceneGeometrySource input{0x11000,0x11100,0x12000,28,6,0x13000,0x14000};
@@ -603,6 +623,8 @@ void Visibility() {
     world[0]=2; sources.PublishWorld(100,world);
     object.distance=500; sources.PublishVisibility(100,object);
     const auto updated=sources.AcquireSnapshot();
+    Require(updated!=generation && updated->Groups().Shares(generation->Groups()),
+      "world/visibility events copied unchanged group membership");
     Require(generation->WorldRegisters(source,2000)->at(0)==1 &&
       updated->WorldRegisters(source,2000)->at(0)==2 && generation->Visibility(100)->distance==250 &&
       updated->Visibility(100)->distance==500,"source snapshot mixed world or visibility generations");
@@ -1301,6 +1323,14 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   const auto retired=adapter.Publish(3);
   Require(!retired->Find(adapter_left) && updated->Find(adapter_left),"retirement changed an older publication");
   Require(adapter.objects()==1,"adapter retirement removed another owner");
+  Require(retired->by_source.size()==1 && updated->by_source.size()==2 && !retired->by_source.Shares(updated->by_source),
+    "retirement did not patch the source index");
+  const auto idle=adapter.Publish(4);
+  Require(idle->snapshot!=retired->snapshot && idle->snapshot->tick==4 &&
+    idle->snapshot->instances.Shares(retired->snapshot->instances) && idle->by_id.Shares(retired->by_id) &&
+    idle->by_source.Shares(retired->by_source) && idle->group_geometry.Shares(retired->group_geometry) &&
+    idle->group_order.Shares(retired->group_order),
+    "unchanged tick rebuilt its publication indexes");
   render(selected); Require(pixel(16,0)==255,"adapter retirement invalidated an in-flight scene");
   // Populate a part which has never been observed/drawn, then render solely
   // from its publication after the producer and its source records retire.
@@ -1475,7 +1505,7 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
 }
 int main() {
   try {
-    PassCamera(); Visibility();
+    SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
     GroupOrder();

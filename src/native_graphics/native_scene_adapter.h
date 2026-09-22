@@ -24,18 +24,24 @@ struct NativeSceneGroupMaterial {
 };
 // Walk order of one world owner's owner+240 group list (821C3BB8).
 using NativeSceneGroupOrder=std::vector<uint32_t>;
-using NativeSceneGroupOrders=std::map<uint32_t,std::shared_ptr<const NativeSceneGroupOrder>>;
+using NativeSceneGroupOrders=NativeSharedMap<uint32_t,std::shared_ptr<const NativeSceneGroupOrder>>;
 struct NativeSceneGroupOrderAudit { uint64_t checks=0,mismatches=0,missing=0; };
+struct NativeSceneGroupKey {
+  template<class T> uint32_t operator()(const std::shared_ptr<const T>& value) const { return value->group; }
+};
+// Every index shares the chunks no tick has changed with the previous
+// publication; building one costs what changed, and none is written once built.
 struct NativeScenePublication {
   std::shared_ptr<const NativeSceneSources> sources;
   std::shared_ptr<const NativeSceneMembership::Publication> membership;
   NativeSceneTreePublications::Images trees;
   std::shared_ptr<const NativeSceneSnapshot> snapshot;
-  std::vector<std::shared_ptr<const NativeSceneInstance>> by_id;
-  std::map<std::array<uint64_t,4>,std::shared_ptr<const NativeSceneInstance>> by_source;
+  NativeSceneInstances by_id;
+  NativeSharedMap<std::array<uint64_t,4>,std::shared_ptr<const NativeSceneInstance>> by_source;
   // Assets can exist before any material or visible object has been captured.
-  std::vector<std::shared_ptr<const NativeSceneGroupGeometry>> group_geometry;
-  std::vector<std::shared_ptr<const NativeSceneGroupMaterial>> group_materials;
+  // Ordered by group address.
+  NativeSharedVector<std::shared_ptr<const NativeSceneGroupGeometry>> group_geometry;
+  NativeSharedVector<std::shared_ptr<const NativeSceneGroupMaterial>> group_materials;
   std::map<uint32_t,NativeScenePassAnimation> world_animations;
   NativeSceneGroupOrders group_order;
   std::shared_ptr<const NativeScenePassCameras> cameras;
@@ -71,15 +77,15 @@ class NativeSceneAdapter {
   // Keeps the previous immutable order when the walk is unchanged; returns
   // whether a new order was published. Cost is linear in the list length.
   bool PublishGroupOrder(uint32_t owner,std::span<const uint32_t> order) {
-    auto& slot=group_orders_[owner];
-    if(slot && std::ranges::equal(*slot,order)) return false;
-    slot=std::make_shared<const NativeSceneGroupOrder>(order.begin(),order.end());
+    const auto* slot=group_orders_.Find(owner);
+    if(slot && *slot && std::ranges::equal(**slot,order)) return false;
+    group_orders_.Set(owner,std::make_shared<const NativeSceneGroupOrder>(order.begin(),order.end()));
     return true;
   }
-  void RetireGroupOrder(uint32_t owner) { group_orders_.erase(owner); }
+  void RetireGroupOrder(uint32_t owner) { group_orders_.Erase(owner); }
   std::shared_ptr<const NativeSceneGroupOrder> GroupOrder(uint32_t owner) const {
-    const auto found=group_orders_.find(owner);
-    return found!=group_orders_.end()?found->second:nullptr;
+    const auto* found=group_orders_.Find(owner);
+    return found?*found:nullptr;
   }
   // Compares the latest published order with a live walk of the same list.
   bool AuditGroupOrder(uint32_t owner,std::span<const uint32_t> live) {
@@ -97,13 +103,13 @@ class NativeSceneAdapter {
     std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry,
     std::optional<NativeSceneGeometrySource> setup={});
   std::shared_ptr<const NativeSceneGroupGeometry> GroupGeometry(uint32_t group,uint64_t revision) const;
-  void RetireGroupGeometry(uint32_t group) { group_geometry_.erase(group); }
+  void RetireGroupGeometry(uint32_t group) { group_geometry_.Erase(group,NativeSceneGroupKey{}); }
   void PruneGroupGeometry(const NativeSceneSources& sources);
   size_t geometry_groups() const { return group_geometry_.size(); }
   void PublishGroupMaterial(uint32_t group,uint64_t revision,std::shared_ptr<const NativeSceneMaterialProgram> program,
     std::vector<NativeSceneMaterialInputs::Constant> constants);
   std::shared_ptr<const NativeSceneGroupMaterial> GroupMaterial(uint32_t group,uint64_t revision) const;
-  void RetireGroupMaterial(uint32_t group) { group_material_programs_.erase(group); }
+  void RetireGroupMaterial(uint32_t group) { group_material_programs_.Erase(group,NativeSceneGroupKey{}); }
   size_t material_groups() const { return group_material_programs_.size(); }
   struct Population { size_t examined=0,created=0,rejected=0; };
   // Populate registered parts even if visibility has never selected them.
@@ -150,9 +156,14 @@ class NativeSceneAdapter {
   NativeSceneGroupOrderAudit group_order_audit_;
   std::atomic<std::shared_ptr<const NativeScenePublication>> publication_;
   std::map<Key,uint64_t> objects_;
+  // by_source as last published, and the keys whose object may differ from it.
+  NativeSharedMap<Key,std::shared_ptr<const NativeSceneInstance>> by_source_;
+  std::set<Key> changed_sources_;
+  void SourceChanged(const Key& key) { changed_sources_.insert(key); }
+  void SourceRemoved(const Key& key) { if(by_source_.contains(key)) changed_sources_.insert(key); else changed_sources_.erase(key); }
   std::map<GeometryKey,std::weak_ptr<const NativeIndexedMesh::RetainedDraw>> geometry_;
-  std::map<uint32_t,std::shared_ptr<const NativeSceneGroupGeometry>> group_geometry_;
-  std::map<uint32_t,std::shared_ptr<const NativeSceneGroupMaterial>> group_material_programs_;
+  NativeSharedVector<std::shared_ptr<const NativeSceneGroupGeometry>> group_geometry_;
+  NativeSharedVector<std::shared_ptr<const NativeSceneGroupMaterial>> group_material_programs_;
   std::map<uint64_t,std::vector<std::weak_ptr<const NativeSceneMaterial>>> materials_;
   std::map<uint32_t,std::weak_ptr<const NativeSceneMaterial>> group_materials_;
   struct PopulatedGroup {

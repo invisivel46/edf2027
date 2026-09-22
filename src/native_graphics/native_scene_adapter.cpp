@@ -7,32 +7,32 @@ void NativeSceneAdapter::PublishGroupMaterial(uint32_t group,uint64_t revision,s
   if(!group || !revision || !program) throw std::runtime_error("invalid native material program publication");
   const auto previous=GroupMaterial(group,revision);
   if(previous && previous->program==program && previous->constants==constants) return;
-  group_material_programs_[group]=std::make_shared<const NativeSceneGroupMaterial>(group,revision,std::move(program),std::move(constants));
+  group_material_programs_.Assign(std::make_shared<const NativeSceneGroupMaterial>(group,revision,std::move(program),std::move(constants)),
+    NativeSceneGroupKey{});
 }
 std::shared_ptr<const NativeSceneGroupMaterial> NativeSceneAdapter::GroupMaterial(uint32_t group,uint64_t revision) const {
-  const auto found=group_material_programs_.find(group);
-  return found!=group_material_programs_.end() && found->second->revision==revision?found->second:nullptr;
+  const auto* found=group_material_programs_.Find(group,NativeSceneGroupKey{});
+  return found && (*found)->revision==revision?*found:nullptr;
 }
 void NativeSceneAdapter::PublishGroupGeometry(uint32_t group,uint64_t revision,
     std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry,std::optional<NativeSceneGeometrySource> setup) {
   if(!group || !revision || !geometry) throw std::runtime_error("invalid native scene geometry publication");
   const auto old=GroupGeometry(group,revision);
   if(old && old->geometry==geometry && old->setup==setup) return;
-  group_geometry_[group]=std::make_shared<const NativeSceneGroupGeometry>(group,revision,std::move(geometry),std::move(setup));
+  group_geometry_.Assign(std::make_shared<const NativeSceneGroupGeometry>(group,revision,std::move(geometry),std::move(setup)),
+    NativeSceneGroupKey{});
 }
 std::shared_ptr<const NativeSceneGroupGeometry> NativeSceneAdapter::GroupGeometry(uint32_t group,uint64_t revision) const {
-  const auto found=group_geometry_.find(group);
-  return found!=group_geometry_.end() && found->second->revision==revision?found->second:nullptr;
+  const auto* found=group_geometry_.Find(group,NativeSceneGroupKey{});
+  return found && (*found)->revision==revision?*found:nullptr;
 }
 void NativeSceneAdapter::PruneGroupGeometry(const NativeSceneSources& sources) {
-  std::erase_if(group_material_programs_,[&](const auto& entry) {
-    const auto* group=sources.FindGroup(entry.first);
-    return !group || group->revision!=entry.second->revision;
-  });
-  std::erase_if(group_geometry_,[&](const auto& entry) {
-    const auto* group=sources.FindGroup(entry.first);
-    return !group || group->revision!=entry.second->revision;
-  });
+  const auto stale=[&](const auto& entry) {
+    const auto* group=sources.FindGroup(entry->group);
+    return !group || group->revision!=entry->revision;
+  };
+  group_material_programs_.EraseIf(stale);
+  group_geometry_.EraseIf(stale);
 }
 NativeSceneAdapter::Population NativeSceneAdapter::PopulateGroup(const NativeSceneSources& sources,uint32_t address,
     std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry,NativeSceneMaterialCapture capture,
@@ -76,18 +76,17 @@ NativeSceneAdapter::Population NativeSceneAdapter::PopulateGroup(const NativeSce
   return result;
 }
 std::shared_ptr<const NativeSceneInstance> NativeScenePublication::Find(uint64_t id) const {
-  const auto at=std::lower_bound(by_id.begin(),by_id.end(),id,
-    [](const auto& instance,uint64_t key) { return instance->id<key; });
-  return at!=by_id.end() && (*at)->id==id?*at:nullptr;
+  const auto* found=by_id.Find(id,NativeSceneInstanceId{});
+  return found?*found:nullptr;
 }
 std::shared_ptr<const NativeSceneInstance> NativeScenePublication::Resolve(
     const NativeSceneSources::Source& source,
     const std::shared_ptr<const NativeIndexedMesh::RetainedDraw>& geometry,
     const NativeSceneMaterialCapture& capture) const {
-  const auto found=by_source.find({source.owner,source.generation,source.lod,source.part});
-  if(found==by_source.end() || !geometry || !capture.material ||
-     found->second->object.geometry!=geometry || geometry->backend()!=capture.material->backend()) return {};
-  const auto& retained=found->second;
+  const auto* found=by_source.Find({source.owner,source.generation,source.lod,source.part});
+  if(!found || !geometry || !capture.material ||
+     (*found)->object.geometry!=geometry || geometry->backend()!=capture.material->backend()) return {};
+  const auto& retained=*found;
   if(retained->object.material==capture.material && retained->object.world==capture.world &&
      retained->previous==capture.world) return retained;
   auto resolved=std::make_shared<NativeSceneInstance>(*retained);
@@ -109,13 +108,20 @@ std::shared_ptr<const NativeScenePublication> NativeSceneAdapter::Publish(uint64
   publication->world_animations=world_animations_;
   publication->group_order=group_orders_;
   publication->cameras=cameras_;
-  for(const auto& [group,geometry]:group_geometry_) publication->group_geometry.push_back(geometry);
-  for(const auto& [group,material]:group_material_programs_) publication->group_materials.push_back(material);
-  publication->by_id=publication->snapshot->instances;
-  std::sort(publication->by_id.begin(),publication->by_id.end(),
-    [](const auto& a,const auto& b) { return a->id<b->id; });
-  for(const auto& [source,id]:objects_)
-    if(auto instance=publication->Find(id)) publication->by_source.emplace(source,std::move(instance));
+  publication->group_geometry=group_geometry_;
+  publication->group_materials=group_material_programs_;
+  publication->by_id=scene_.PublishedById();
+  // Patch only the sources whose object was observed, updated or retired.
+  auto by_source=by_source_;
+  for(const auto& key:changed_sources_) {
+    const auto object=objects_.find(key);
+    const auto* instance=object==objects_.end()?nullptr:publication->by_id.Find(object->second,NativeSceneInstanceId{});
+    const auto* prior=by_source.Find(key);
+    if(!instance) { if(prior) by_source.Erase(key); }
+    else if(!prior || *prior!=*instance) by_source.Set(key,*instance);
+  }
+  publication->by_source=by_source;
+  by_source_=std::move(by_source); changed_sources_.clear();
   publication_.store(publication);
   return publication;
 }
@@ -135,6 +141,7 @@ size_t NativeSceneAdapter::UpdateWorld(uint32_t owner,uint64_t generation,const 
       }
     if(!supported || matrices!=1) continue;
     object.world=DecodeNativeQueuedWorld(registers,column_major);
+    if(!scene_.Matches(at->second,object)) SourceChanged(at->first);
     scene_.Update(at->second,std::move(object));
     ++updated;
   }
@@ -184,7 +191,12 @@ uint64_t NativeSceneAdapter::Observe(const NativeSceneSources::Source& source,
   object.material=std::move(capture.material); object.world=capture.world;
   const Key key{source.owner,source.generation,source.lod,source.part};
   const auto found=objects_.find(key);
-  if(found!=objects_.end()) { scene_.Update(found->second,std::move(object)); return found->second; }
+  if(found!=objects_.end()) {
+    // Marked before the write, so a failed mark cannot hide a change.
+    if(!scene_.Matches(found->second,object)) SourceChanged(key);
+    scene_.Update(found->second,std::move(object)); return found->second;
+  }
+  SourceChanged(key);
   const auto id=scene_.Create(std::move(object));
   try { objects_.emplace(key,id); } catch(...) { scene_.Remove(id); throw; }
   return id;
@@ -199,7 +211,7 @@ void NativeSceneAdapter::Retire(uint32_t owner) {
   }
   size_t removed=0;
   for(auto at=objects_.lower_bound(Key{owner,0,0,0});at!=objects_.end() && at->first[0]==owner;++removed) {
-    scene_.Remove(at->second); at=objects_.erase(at);
+    SourceRemoved(at->first); scene_.Remove(at->second); at=objects_.erase(at);
   }
   // Expired weak indexes cost memory, never identity: every lookup locks them.
   // A full scan per retired owner made loading quadratic, so amortize it.

@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <map>
 #include <span>
@@ -10,6 +11,7 @@
 #include "guest_block.h"
 #include "guest_instance_parameters.h"
 #include "native_scene_visibility.h"
+#include "native_shared_vector.h"
 
 namespace edf::native {
 // Constructor/destructor events establish lifetime. Observation cannot create
@@ -17,7 +19,8 @@ namespace edf::native {
 class NativeSceneSources {
  public:
   // One immutable generation supplies membership, LOD, world and visibility
-  // together. Repeated acquisitions share storage until a producer event.
+  // together. Repeated acquisitions share storage until a producer event, and
+  // every generation shares the chunks that later events did not touch.
   std::shared_ptr<const NativeSceneSources> AcquireSnapshot() const {
     if(!snapshot_) {
       auto result=std::make_shared<NativeSceneSources>();
@@ -40,122 +43,131 @@ class NativeSceneSources {
   };
   struct Group {
     uint64_t revision=0;
-    std::map<uint32_t,Part> parts;
+    NativeSharedMap<uint32_t,Part> parts;
   };
-  const Group* FindGroup(uint32_t group) const {
-    const auto found=groups_.find(group);
-    return found==groups_.end()?nullptr:&found->second;
-  }
-  const auto& Groups() const { return groups_; }
+  using GroupMap=NativeSharedMap<uint32_t,Group>;
+  const Group* FindGroup(uint32_t group) const { return groups_.Find(group); }
+  const GroupMap& Groups() const { return groups_; }
   // Advances whenever any group is added, changed or erased.
   uint64_t GroupRevision() const { return group_revision_; }
   uint64_t Born(uint32_t owner) {
     if(!owner || next_==UINT64_MAX) throw std::runtime_error("invalid native scene source lifetime");
     Retire(owner);
     snapshot_.reset();
-    owners_.emplace(owner,Owner{next_++,{}});
-    return owners_.at(owner).generation;
+    const auto generation=next_;
+    owners_.Set(owner,Owner{generation,std::make_shared<const Parts>(),{},{}});
+    ++next_;
+    return generation;
   }
   bool Retire(uint32_t owner) {
-    const auto found=owners_.find(owner);
-    if(found==owners_.end()) return false;
+    const auto* found=owners_.Find(owner);
+    if(!found) return false;
     snapshot_.reset();
-    for(const auto& part:found->second.parts) { RemoveGroupPart(part); parts_.erase(part.instance); }
-    owners_.erase(found); return true;
+    const auto parts=found->parts;
+    for(const auto& part:parts->all) { RemoveGroupPart(part); parts_.Erase(part.instance); }
+    owners_.Erase(owner); return true;
   }
   bool Observe(uint32_t owner,std::span<const Part> parts) {
-    const auto found=owners_.find(owner);
-    if(found==owners_.end()) return false;
-    if(std::equal(parts.begin(),parts.end(),found->second.parts.begin(),found->second.parts.end())) return true;
+    const auto* found=owners_.Find(owner);
+    if(!found) return false;
+    const auto old=found->parts;
+    const auto generation=found->generation;
+    if(std::equal(parts.begin(),parts.end(),old->all.begin(),old->all.end())) return true;
     std::map<uint32_t,Source> replacements;
-    std::array<std::vector<Part>,3> lod_parts;
+    auto next=std::make_shared<Parts>();
     for(const auto& part:parts) {
       if(part.lod>=3) throw std::runtime_error("invalid native static LOD");
-      lod_parts[part.lod].push_back(part);
-      if(!part.instance || !replacements.emplace(part.instance,Source{found->second.generation,owner,part.lod,part.part,part.world_data,part.world_first}).second)
+      next->lod[part.lod].push_back(part);
+      if(!part.instance || !replacements.emplace(part.instance,Source{generation,owner,part.lod,part.part,part.world_data,part.world_first}).second)
         throw std::runtime_error("duplicate native scene source part");
-      const auto existing=parts_.find(part.instance);
-      if(existing!=parts_.end() && existing->second.owner!=owner)
+      const auto* existing=parts_.Find(part.instance);
+      if(existing && existing->owner!=owner)
         throw std::runtime_error("native scene part has two live owners");
     }
-    std::vector<Part> retained(parts.begin(),parts.end());
+    next->all.assign(parts.begin(),parts.end());
     snapshot_.reset();
-    for(const auto& old:found->second.parts) { RemoveGroupPart(old); parts_.erase(old.instance); }
-    parts_.merge(replacements);
-    for(const auto& part:retained) if(part.group) {
-      auto& group=groups_[part.group];
-      group.parts.emplace(part.instance,part); group.revision=++group_revision_;
+    for(const auto& part:old->all) { RemoveGroupPart(part); parts_.Erase(part.instance); }
+    for(auto& [instance,source]:replacements) parts_.Set(instance,std::move(source));
+    for(const auto& part:next->all) if(part.group) {
+      auto* group=groups_.Mutable(part.group);
+      if(!group) { groups_.Set(part.group,Group{}); group=groups_.Mutable(part.group); }
+      if(!group->parts.contains(part.instance)) group->parts.Set(part.instance,part);
+      group->revision=++group_revision_;
     }
-    found->second.parts=std::move(retained);
-    found->second.lod_parts=std::move(lod_parts);
+    owners_.Mutable(owner)->parts=std::move(next);
     return true;
   }
-  const Source* Find(uint32_t instance) const {
-    const auto found=parts_.find(instance); return found==parts_.end()?nullptr:&found->second;
-  }
+  const Source* Find(uint32_t instance) const { return parts_.Find(instance); }
   bool HasOwner(uint32_t owner) const { return owners_.contains(owner); }
   uint64_t Generation(uint32_t owner) const {
-    const auto found=owners_.find(owner);
-    return found==owners_.end()?0:found->second.generation;
+    const auto* found=owners_.Find(owner);
+    return found?found->generation:0;
   }
   std::optional<std::span<const Part>> LodParts(uint32_t descriptor) const {
     for(uint32_t lod=0;lod<3;++lod) {
       const uint32_t offset=408+lod*44;
       if(descriptor<offset) continue;
-      const auto found=owners_.find(descriptor-offset);
-      if(found!=owners_.end()) return found->second.lod_parts[lod];
+      if(const auto* found=owners_.Find(descriptor-offset)) return std::span<const Part>(found->parts->lod[lod]);
     }
     return {};
   }
   using World=std::array<uint8_t,64>;
   bool PublishVisibility(uint32_t owner,const NativeSceneVisibility& visibility) {
-    const auto found=owners_.find(owner);
-    if(found==owners_.end()) return false;
-    if(!found->second.visibility || *found->second.visibility!=visibility) {
+    const auto* found=owners_.Find(owner);
+    if(!found) return false;
+    if(!found->visibility || *found->visibility!=visibility) {
+      auto published=std::make_shared<const NativeSceneVisibility>(visibility);
       snapshot_.reset();
-      found->second.visibility=std::make_shared<const NativeSceneVisibility>(visibility);
+      owners_.Mutable(owner)->visibility=std::move(published);
     }
     return true;
   }
   std::shared_ptr<const NativeSceneVisibility> Visibility(uint32_t owner) const {
-    const auto found=owners_.find(owner);
-    return found==owners_.end()?nullptr:found->second.visibility;
+    const auto* found=owners_.Find(owner);
+    return found?found->visibility:nullptr;
   }
   bool PublishWorld(uint32_t owner,const World& registers) {
-    const auto found=owners_.find(owner);
-    if(found==owners_.end()) return false;
-    if(!found->second.world || *found->second.world!=registers) {
+    const auto* found=owners_.Find(owner);
+    if(!found) return false;
+    if(!found->world || *found->world!=registers) {
+      auto published=std::make_shared<const World>(registers);
       snapshot_.reset();
-      found->second.world=std::make_shared<const World>(registers);
+      owners_.Mutable(owner)->world=std::move(published);
     }
     return true;
   }
   std::shared_ptr<const World> WorldRegisters(const Source& source,uint32_t data) const {
     if(!data || source.world_data!=data) return {};
-    const auto found=owners_.find(source.owner);
-    if(found==owners_.end() || found->second.generation!=source.generation) return {};
-    return found->second.world;
+    const auto* found=owners_.Find(source.owner);
+    if(!found || found->generation!=source.generation) return {};
+    return found->world;
   }
   size_t owners() const { return owners_.size(); }
   size_t parts() const { return parts_.size(); }
  private:
   mutable std::shared_ptr<const NativeSceneSources> snapshot_;
+  // Shared by every generation until the owner's membership is replaced.
+  struct Parts {
+    std::vector<Part> all;
+    std::array<std::vector<Part>,3> lod;
+  };
   struct Owner {
-    uint64_t generation; std::vector<Part> parts; std::shared_ptr<const World> world;
-    std::array<std::vector<Part>,3> lod_parts;
+    uint64_t generation=0;
+    std::shared_ptr<const Parts> parts;
+    std::shared_ptr<const World> world;
     std::shared_ptr<const NativeSceneVisibility> visibility;
   };
-  std::map<uint32_t,Owner> owners_;
-  std::map<uint32_t,Source> parts_;
-  std::map<uint32_t,Group> groups_;
+  NativeSharedMap<uint32_t,Owner> owners_;
+  NativeSharedMap<uint32_t,Source> parts_;
+  GroupMap groups_;
   uint64_t group_revision_=0;
   void RemoveGroupPart(const Part& part) {
     if(!part.group) return;
-    const auto found=groups_.find(part.group);
-    if(found==groups_.end()) return;
-    found->second.parts.erase(part.instance);
-    if(found->second.parts.empty()) { groups_.erase(found); ++group_revision_; }
-    else found->second.revision=++group_revision_;
+    auto* group=groups_.Mutable(part.group);
+    if(!group) return;
+    group->parts.Erase(part.instance);
+    if(group->parts.empty()) { groups_.Erase(part.group); ++group_revision_; }
+    else group->revision=++group_revision_;
   }
   uint64_t next_=1;
 };
