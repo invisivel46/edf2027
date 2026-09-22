@@ -214,7 +214,9 @@ void StaticGroupEligibility() {
   check(Result::Supported);
   reader.StoreWord(textures+4,textures+28+4-8); check(Result::AliasedInput); // Retired by the repeated slot.
   captured(); reader.StoreWord(textures+4,device+1024-28); check(Result::AliasedInput); // Header read in device mirror.
-  captured(); reader.StoreWord(material+72,device+2048); reader.StoreWord(device+2048+4,objects);
+  // Fenced, so the table's zeroed neighbour records fail on aliasing, not retirement.
+  captured(); reader.StoreWord(device+10780,200);
+  reader.StoreWord(material+72,device+2048); reader.StoreWord(device+2048+4,objects);
   check(Result::AliasedInput); // Texture table inside the device mirror.
   memory=seed;
   constexpr uint32_t defaults=0x28000,header=0x20000+872;
@@ -283,6 +285,7 @@ void GroupOrder() {
   Reject([&] { CaptureNativeSceneGroupOrder(reader,list,order); });
   reader.StoreWord(0x600,0x600);
   Reject([&] { CaptureNativeSceneGroupOrder(reader,list,order); });
+}
 void StaticWorldResolve() {
   using D=NativeStaticWorldDecline;
   // The guest-draw path reports these exact strings; the pass shares them.
