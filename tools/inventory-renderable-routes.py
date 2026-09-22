@@ -21,8 +21,8 @@ def read(name):
 source = BRIDGE.read_text(encoding='utf-8')
 sha = hashlib.sha256(BRIDGE.read_bytes()).hexdigest()
 contracts = {
-    'sub_821C9478': ('pose', 'EDF_RENDER_PHASE(821C9478, RenderPose)',
-                     'Timing wrapper forwards to original pose function unconditionally.'),
+    'sub_821C9478': ('pose', 'REX_HOOK_RAW(sub_821C9478)',
+                     'Timing wrapper forwards to original pose function unconditionally; inside the 821A4DE8 walk it records the output vector address for model pose publication.'),
     'sub_821B2C28': ('mesh', 'EDF_RENDER_PHASE(821B2C28, RenderMesh)',
                      'Timing wrapper forwards to original mesh function unconditionally.'),
     'sub_820D3FD0': ('overlay', 'EDF_RENDER_PHASE(820D3FD0, RenderOverlay)',

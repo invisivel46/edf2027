@@ -77,6 +77,7 @@
 #include "native_pacing.h"
 #include "native_camera_history.h"
 #include "native_model_pose_history.h"
+#include "native_model_publication.h"
 #include "native_profile_result.h"
 #include "native_capture_policy.h"
 #include "native_ab_alternate.h"
@@ -213,6 +214,10 @@ REXCVAR_DEFINE_BOOL(edf_native_camera_interpolation,true,"EDF2027",
                    "Interpolate published camera poses in experimental unlocked mode; false permits diagnostic comparison");
 REXCVAR_DEFINE_BOOL(edf_native_model_interpolation,true,"EDF2027",
                    "Interpolate model pose uploads in experimental unlocked mode; false permits diagnostic comparison");
+REXCVAR_DEFINE_BOOL(edf_native_model_publication,false,"EDF2027",
+                   "Capture model draw layouts at first sight and publish per-tick pose snapshots; draws are unchanged (development)");
+REXCVAR_DEFINE_BOOL(edf_native_model_publication_audit,false,"EDF2027",
+                   "Compare published model layouts and poses with live memory at model draw entry (development)");
 REXCVAR_DEFINE_BOOL(edf_native_capture_indexed_state,false,"EDF2027",
                    "Trace up to 256 indexed draw states per selected capture frame; requires scene capture prefix (development)");
 REXCVAR_DEFINE_INT32(edf_native_probe_x, -1, "EDF2027", "Optional native scene invalid-RGB probe pixel X");
@@ -3127,6 +3132,11 @@ struct NativeModelMotionState {
   }
 };
 NativeModelMotionState& ModelMotionState() { static NativeModelMotionState value; return value; }
+// Leaked: guest frees (820B2510) may still arrive during static destruction.
+edf::native::NativeModelPublications& ModelPublications() { static auto* value=new edf::native::NativeModelPublications; return *value; }
+// Pose vectors rebuilt by 821C9478 during this thread's 821A4DE8 dirty walk
+// (slot +8 after the helper join); null outside that walk.
+thread_local std::vector<uint32_t>* native_model_dirty_poses=nullptr;
 thread_local NativeLoopBudget native_render_budget;
 thread_local uint64_t native_render_publication=0;
 struct NativeModelRenderContext {
@@ -3184,7 +3194,14 @@ EDF_RENDER_PHASE(821B2C28, RenderMesh)
 EDF_RENDER_PHASE(820D3FD0, RenderOverlay)
 EDF_RENDER_PHASE(821BE9D8, RenderSceneEnd)
 EDF_RENDER_PHASE(820B0B80, RenderFinish)
-EDF_RENDER_PHASE(821C9478, RenderPose)
+REX_EXTERN(__imp__sub_821C9478);
+REX_HOOK_RAW(sub_821C9478) {
+  edf::native::HookTiming timing(edf::native::HookPhase::RenderPose);
+  // r4 is the output pose vector; recording its address keeps the tick O(dirty).
+  const auto vector=ctx.r4.u32;
+  __imp__sub_821C9478(ctx,base);
+  if(native_model_dirty_poses) native_model_dirty_poses->push_back(vector);
+}
 REXCVAR_DEFINE_BOOL(edf_native_scene_tree,false,"EDF2027",
   "Use native spatial tree traversal and culling; leaf callbacks remain explicit.");
 REXCVAR_DEFINE_BOOL(edf_native_scene_tree_published,false,"EDF2027",
@@ -4662,11 +4679,80 @@ REX_HOOK_RAW(sub_820B2510) {
     std::lock_guard lock(motion.mutex);
     motion.Erase(ctx.r3.u32);
   }
+  // Ungated so a live toggle cannot leave a layout past its free: one relaxed
+  // load while nothing is registered, and never the bridge lock.
+  ModelPublications().RetireAddress(ctx.r3.u32);
   __imp__sub_820B2510(ctx,base);
+}
+namespace {
+// Model draw entry (render helper). Capture and audit only: guest state and
+// the draw are unchanged, and no failure reaches guest code.
+void ObserveNativeModelPublication(uint8_t* base,uint32_t instance,uint32_t vector) {
+  try {
+    auto& models=ModelPublications();
+    const edf::native::GuestReader reader(base);
+    // Buffer identities are read under the bridge lock, which the model draw
+    // path never holds (its indexed draws take it themselves).
+    const auto decode=[&](const auto& body) {
+      auto& state=edf::native::State();
+      std::lock_guard lock(state.mutex);
+      return body([&](uint32_t owner,edf::native::NativeModelBuffers::Kind kind)->uint64_t {
+        const auto* found=state.model_buffers.Find(owner,kind);
+        return found?found->generation:0;
+      });
+    };
+    if(REXCVAR_GET(edf_native_model_publication_audit)) {
+      if(const auto published=models.Find(instance)) {
+        const auto poses=models.AcquirePoses();
+        const auto audit=decode([&](const auto& lookup) {
+          return edf::native::AuditNativeModelPublication(reader,published,poses.get(),vector,lookup);
+        });
+        static std::atomic<uint64_t> audits{0},layouts{0},published_poses{0},poses_changed{0};
+        const auto count=audits.fetch_add(1,std::memory_order_relaxed)+1;
+        const auto layout_mismatches=layouts.fetch_add(audit.layout_mismatch,std::memory_order_relaxed)+audit.layout_mismatch;
+        const auto pose_count=published_poses.fetch_add(audit.published,std::memory_order_relaxed)+audit.published;
+        const auto pose_mismatches=poses_changed.fetch_add(audit.pose_mismatch,std::memory_order_relaxed)+audit.pose_mismatch;
+        if(audit.layout_mismatch && layout_mismatches<=8)
+          REXLOG_WARN("Native model publication audit: layout mismatch instance={:#x} generation={} decoded={}",
+            instance,published.generation,audit.decoded);
+        if(count<=4 || count%1000==0)
+          REXLOG_INFO("Native model publication audit: draws={} layout_mismatches={} published_poses={} pose_mismatches={} unpublished={}",
+            count,layout_mismatches,pose_count,pose_mismatches,count-pose_count);
+      }
+    }
+    const auto identity=edf::native::ReadGuestWords<2>(reader,instance);
+    if(models.Current(instance,identity[0],identity[1],vector) || models.Rejected(instance,identity[1],vector)) return;
+    try {
+      auto layout=decode([&](const auto& lookup) {
+        return edf::native::DecodeNativeModelLayoutWith(reader,instance,vector,lookup);
+      });
+      const auto storage=edf::native::ReadNativeModelPoseRange(reader,vector).begin;
+      const auto meshes=layout.meshes.size(),batches=layout.Batches();
+      const auto captured=models.Register(std::move(layout),storage);
+      static std::atomic<uint64_t> captures{0};
+      const auto count=captures.fetch_add(1,std::memory_order_relaxed)+1;
+      if(count<=8 || (count&(count-1))==0)
+        REXLOG_INFO("Native model publication: captured instance={:#x} generation={} meshes={} batches={} bones={} registered={}",
+          instance,captured.generation,meshes,batches,captured.layout->bones,models.size());
+    } catch(const std::exception& error) {
+      models.Reject(instance,identity[1],vector);
+      static std::atomic<uint64_t> rejections{0};
+      const auto count=rejections.fetch_add(1,std::memory_order_relaxed)+1;
+      if(count<=8 || (count&(count-1))==0)
+        REXLOG_WARN("Native model publication: rejected instance={:#x} node={:#x} rejections={}: {}",instance,identity[1],count,error.what());
+    }
+  } catch(const std::exception& error) {
+    static std::atomic<uint64_t> failures{0};
+    const auto count=failures.fetch_add(1,std::memory_order_relaxed)+1;
+    if(count<=8 || (count&(count-1))==0)
+      REXLOG_WARN("Native model publication: observation failed instance={:#x} failures={}: {}",instance,count,error.what());
+  }
+}
 }
 REX_EXTERN(__imp__sub_821C9C20);
 REX_HOOK_RAW(sub_821C9C20) {
   edf::native::HookTiming model_timing(edf::native::HookPhase::RenderModel);
+  if(REXCVAR_GET(edf_native_model_publication)) ObserveNativeModelPublication(base,ctx.r3.u32,ctx.r4.u32);
   if(!native_render_budget.unlocked || native_render_budget.divisor!=1 ||
      !REXCVAR_GET(edf_native_model_interpolation)) { __imp__sub_821C9C20(ctx,base); return; }
   const edf::native::GuestReader reader(base);
@@ -4917,7 +5003,16 @@ REX_HOOK_RAW(sub_821A4DE8) {
                       manager,actual,desired);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceTransition,edge);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::FrameTransition);
-  __imp__sub_821A4DE8(ctx,base);
+  const bool model_publication=REXCVAR_GET(edf_native_model_publication);
+  std::vector<uint32_t> dirty_poses;
+  {
+    struct Scope {
+      std::vector<uint32_t>* previous=native_model_dirty_poses;
+      ~Scope() { native_model_dirty_poses=previous; }
+    } scope;
+    native_model_dirty_poses=model_publication?&dirty_poses:nullptr;
+    __imp__sub_821A4DE8(ctx,base);
+  }
   if(REXCVAR_GET(edf_native_scene_camera_owned)) {
     auto cameras=edf::native::ReadNativeScenePassCameras(edf::native::GuestReader(base),manager);
     auto& state=edf::native::State();
@@ -4956,6 +5051,20 @@ REX_HOOK_RAW(sub_821A4DE8) {
         REXCVAR_GET(edf_native_scene_membership_owned)?state.scene_membership.AcquirePublication():nullptr,
         REXCVAR_GET(edf_native_scene_membership_owned)?edf::native::TreePublications().AcquireAll():edf::native::NativeSceneTreePublications::Images{});
   }
+  // Pose generation for this tick, beside the scene publication: only vectors
+  // the dirty walk rebuilt (and first-sight seeds) are read from guest memory.
+  if(model_publication) {
+    try {
+      const auto published=ModelPublications().PublishPoses(edf::native::GuestReader(base),native_loop_budget.tick,dirty_poses);
+      static uint64_t publications=0;
+      if(++publications<=4 || publications%1000==0)
+        REXLOG_INFO("Native model poses: generation={} tick={} dirty={} published={} registered={} pose_failures={}",
+          published->generation,published->tick,dirty_poses.size(),published->poses.size(),
+          ModelPublications().size(),ModelPublications().pose_failures());
+    } catch(const std::exception& error) {
+      REXLOG_WARN("Native model pose publication failed: {}",error.what());
+    }
+  } else if(ModelPublications().size()) ModelPublications().Clear();
   timing.Finish();
   if(edge) REXLOG_INFO("Native resource transition: end manager={:#x}",manager);
 }

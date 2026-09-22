@@ -1,0 +1,220 @@
+#include "native_graphics/native_model_publication.h"
+#include <bit>
+#include <cstring>
+#include <functional>
+#include <iostream>
+#include <vector>
+
+using namespace edf::native;
+namespace {
+void Require(bool value,const char* message) { if(!value) throw std::runtime_error(message); }
+template<class F> void Reject(F f,const char* message) {
+  bool rejected=false; try { f(); } catch(const std::exception&) { rejected=true; } Require(rejected,message);
+}
+// Synthetic big-endian guest memory, as in the scene tests.
+struct Memory {
+  std::vector<uint8_t>& bytes;
+  uint32_t Add(uint32_t address,uint32_t offset) const { return address+offset; }
+  uint32_t Word(uint32_t at) const {
+    uint32_t value=0; for(unsigned i=0;i<4;++i) value=(value<<8)|bytes.at(at+i); return value;
+  }
+  const uint8_t* Bytes(uint32_t at,size_t size) const {
+    if(!at || at>bytes.size() || size>bytes.size()-at) throw std::runtime_error("model test range");
+    return bytes.data()+at;
+  }
+  void StoreWord(uint32_t at,uint32_t value) const { for(unsigned i=0;i<4;++i) bytes.at(at+i)=uint8_t(value>>(24-i*8)); }
+  void StoreByte(uint32_t at,uint8_t value) const { bytes.at(at)=value; }
+  void StoreFloat(uint32_t at,float value) const { StoreWord(at,std::bit_cast<uint32_t>(value)); }
+};
+// Instance -> model node -> two mesh records -> three 148-byte batches.
+constexpr uint32_t kInstance=0x500,kVector=0x600,kContainer=0x1000,kNode=0x2000,kRecords=0x3000,
+  kBatches=0x4000,kSecondBatch=0x5000,kMaterial=0x6000,kPasses=0x7000,kDeclarationMap=0x8000,
+  kDeclarationNode=0x8200,kDeclaration=0x9000,kPose=0xA000;
+void BuildModel(const Memory& memory,uint32_t bones=2,bool skinned=true) {
+  memory.StoreWord(kInstance,kContainer); memory.StoreWord(kInstance+4,kNode); memory.StoreByte(kInstance+12,skinned);
+  memory.StoreWord(kContainer+4,0x1100); // End node; distinct from kNode.
+  memory.StoreWord(kNode+44,kRecords); memory.StoreWord(kNode+52,2);
+  memory.StoreWord(kRecords+4,kBatches); memory.StoreWord(kRecords+8,kBatches+2*148);
+  memory.StoreWord(kRecords+44,1); memory.StoreByte(kRecords+48,0);
+  memory.StoreWord(kRecords+52+4,kSecondBatch); memory.StoreWord(kRecords+52+8,kSecondBatch+148);
+  memory.StoreWord(kRecords+52+44,7); memory.StoreByte(kRecords+52+48,1); // Palette-skinned: no bone upload.
+  memory.StoreWord(kMaterial+16,kPasses); memory.StoreWord(kMaterial+24,2);
+  memory.StoreWord(kDeclarationMap+4,0x8100); memory.StoreWord(kDeclarationNode+28,kDeclaration);
+  for(const auto batch:{kBatches,kBatches+148,kSecondBatch}) {
+    memory.StoreWord(batch,kMaterial); memory.StoreWord(batch+60,32);
+    memory.StoreWord(batch+72,kDeclarationMap); memory.StoreWord(batch+76,kDeclarationNode);
+    memory.StoreWord(batch+140,100);
+  }
+  memory.StoreWord(kVector+4,bones?kPose:0); memory.StoreWord(kVector+8,bones?kPose+64*bones:0);
+  for(uint32_t i=0;i<bones*16;++i) memory.StoreFloat(kPose+i*4,float(i)+0.5f);
+}
+NativeModelLayout Decode(const Memory& memory,const NativeModelBuffers* buffers=nullptr) {
+  return DecodeNativeModelLayout(memory,kInstance,kVector,buffers);
+}
+void DecodesGuestLayout() {
+  std::vector<uint8_t> bytes(0x10000);
+  const Memory memory{bytes};
+  BuildModel(memory);
+  NativeModelBuffers buffers;
+  buffers.Publish(kBatches+4,NativeModelBuffers::Kind::Vertex,0xB000,32,4);
+  buffers.Publish(kSecondBatch+84,NativeModelBuffers::Kind::Index,0xC000,2,100);
+  const auto layout=Decode(memory,&buffers);
+  Require(layout.container==kContainer && layout.node==kNode && layout.skinned && layout.bones==2 &&
+    layout.meshes.size()==2 && layout.Batches()==3,"model layout shape");
+  const auto& rigid=layout.meshes[0],&palette=layout.meshes[1];
+  Require(rigid.address==kRecords && rigid.bone==1 && rigid.uploads_bone && !rigid.skinned,"bone-uploading record");
+  Require(palette.address==kRecords+52 && palette.skinned && !palette.uploads_bone,"palette record must not name a bone");
+  const auto& batch=rigid.batches[1];
+  Require(batch.address==kBatches+148 && batch.material==kMaterial && batch.declaration==kDeclaration &&
+    batch.stride==32 && batch.index_count==100 && batch.draw_count==99,"batch fields");
+  Require(batch.passes==std::vector<uint32_t>{kPasses,kPasses+112},"material pass record addresses");
+  Require(rigid.batches[0].vertex.owner==kBatches+4 && rigid.batches[0].vertex.generation==buffers.Find(kBatches+4,NativeModelBuffers::Kind::Vertex)->generation &&
+    rigid.batches[0].index==NativeModelBufferIdentity{kBatches+84,0},"vertex identity through NativeModelBuffers");
+  Require(palette.batches[0].index.generation==buffers.Find(kSecondBatch+84,NativeModelBuffers::Kind::Index)->generation &&
+    palette.batches[0].vertex==NativeModelBufferIdentity{kSecondBatch+4,0},"index identity through NativeModelBuffers");
+  Require(Decode(memory,&buffers)==layout && !(Decode(memory)==layout),"layout equality covers buffer identities");
+  // A rigid instance uploads every record's bone, so bone 7 is out of range.
+  memory.StoreByte(kInstance+12,0);
+  Reject([&] { Decode(memory); },"rigid record bone outside the pose accepted");
+  memory.StoreWord(kRecords+52+44,0);
+  const auto rigid_layout=Decode(memory);
+  Require(!rigid_layout.skinned && rigid_layout.meshes[1].uploads_bone,"rigid instance uploads every record");
+}
+void RejectsUnexpectedMemory() {
+  const std::vector<std::pair<const char*,std::function<void(const Memory&)>>> cases{
+    {"container end node",[](const Memory& m) { m.StoreWord(kContainer+4,kNode); }},
+    {"null container",[](const Memory& m) { m.StoreWord(kInstance,0); }},
+    {"mesh count",[](const Memory& m) { m.StoreWord(kNode+52,kNativeModelMaxMeshes+1); }},
+    {"mesh table address",[](const Memory& m) { m.StoreWord(kNode+44,0); }},
+    {"batch extent",[](const Memory& m) { m.StoreWord(kRecords+8,kBatches+150); }},
+    {"batch end without storage",[](const Memory& m) { m.StoreWord(kRecords+4,0); }},
+    {"bone outside pose",[](const Memory& m) { m.StoreWord(kRecords+44,2); }},
+    {"empty skinned pose",[](const Memory& m) { m.StoreWord(kVector+4,0); m.StoreWord(kVector+8,0); }},
+    {"pose extent",[](const Memory& m) { m.StoreWord(kVector+8,kPose+100); }},
+    {"negative pass count",[](const Memory& m) { m.StoreWord(kMaterial+24,0xffffffffu); }},
+    {"passes without records",[](const Memory& m) { m.StoreWord(kMaterial+16,0); }},
+    {"missing material",[](const Memory& m) { m.StoreWord(kSecondBatch,0); }},
+    {"stride",[](const Memory& m) { m.StoreWord(kBatches+60,6); }},
+    {"declaration end node",[](const Memory& m) { m.StoreWord(kDeclarationMap+4,kDeclarationNode); }},
+    {"missing declaration",[](const Memory& m) { m.StoreWord(kDeclarationNode+28,0); }},
+    {"index count",[](const Memory& m) { m.StoreWord(kBatches+140,kNativeModelMaxIndices+1); }},
+    {"unmapped pass table",[](const Memory& m) { m.StoreWord(kMaterial+16,0xfff0); }},
+  };
+  for(const auto& [name,change]:cases) {
+    std::vector<uint8_t> bytes(0x10000);
+    const Memory memory{bytes};
+    BuildModel(memory); Decode(memory);
+    change(memory);
+    bool rejected=false;
+    try { Decode(memory); } catch(const std::exception&) { rejected=true; }
+    if(!rejected) { std::cerr<<"accepted: "<<name<<"\n"; throw std::runtime_error("unexpected model memory accepted"); }
+  }
+}
+void RegistryGenerationsAndRetirement() {
+  std::vector<uint8_t> bytes(0x10000);
+  const Memory memory{bytes};
+  BuildModel(memory);
+  NativeModelPublications models;
+  Require(!models.Find(kInstance) && !models.Current(kInstance,kContainer,kNode,kVector),"empty registry");
+  const auto first=models.Register(Decode(memory),kPose);
+  Require(first.generation==1 && models.size()==1 && models.Find(kInstance).layout==first.layout &&
+    models.Current(kInstance,kContainer,kNode,kVector) && !models.Current(kInstance,kContainer,kNode,kVector+16),
+    "first-sight registration");
+  Require(!models.RetireAddress(0x4321) && models.size()==1,"unrelated free retired a layout");
+  // Same instance, new model: a new generation replaces the old one.
+  const auto second=models.Register(Decode(memory),kPose);
+  Require(second.generation==2 && models.size()==1 && models.Find(kInstance).generation==2 && first.layout->node==kNode,
+    "re-registration must bump the generation and keep the old layout immutable");
+  // Pose storage free (821C8F10 growth or destruction through 820B2510).
+  Require(models.RetireAddress(kPose)==1 && !models.Find(kInstance) && models.size()==0 && models.retirements()==1,
+    "pose storage free did not retire the layout");
+  models.Register(Decode(memory),kPose);
+  Require(models.RetireAddress(kNode)==1 && !models.Find(kInstance),"model node free did not retire the layout");
+  models.Register(Decode(memory),kPose);
+  Require(models.Retire(kInstance) && !models.Retire(kInstance) && !models.RetireAddress(kPose),"retirement keys survived");
+  models.Reject(kInstance,kNode,kVector);
+  Require(models.Rejected(kInstance,kNode,kVector) && !models.Rejected(kInstance,kNode+4,kVector),"rejection identity");
+  models.Register(Decode(memory),kPose);
+  Require(!models.Rejected(kInstance,kNode,kVector),"registration kept a stale rejection");
+}
+void PosePublicationIsImmutableAndDirtyOnly() {
+  std::vector<uint8_t> bytes(0x20000);
+  const Memory memory{bytes};
+  BuildModel(memory);
+  // A second rigid instance on its own pose vector and model.
+  constexpr uint32_t other=0x700,other_vector=0x780,other_pose=0xE000;
+  memory.StoreWord(other,kContainer); memory.StoreWord(other+4,kNode); memory.StoreByte(other+12,1);
+  memory.StoreWord(other_vector+4,other_pose); memory.StoreWord(other_vector+8,other_pose+128);
+  memory.StoreFloat(other_pose,42.f);
+  NativeModelPublications models;
+  const auto layout=models.Register(Decode(memory),kPose);
+  const auto other_layout=models.Register(DecodeNativeModelLayout(memory,other,other_vector,nullptr),other_pose);
+  // First sight seeds both poses without a dirty walk.
+  const auto first=models.PublishPoses(memory,10,{});
+  Require(first->generation==1 && first->tick==10 && first->poses.size()==2,"first-sight poses were not seeded");
+  const auto* pose=first->Find(kInstance);
+  Require(pose && pose->layout_generation==layout.generation && pose->matrices.size()==2 &&
+    pose->matrices[1][3]==19.5f,"seeded pose contents");
+  const auto live=ReadNativeModelPose(memory,kVector);
+  Require(SameNativeModelPose(pose->matrices,live),"published pose differs from live memory");
+  // Only kVector was rebuilt this tick: the other pose must stay shared.
+  memory.StoreFloat(kPose,-1.f); memory.StoreFloat(other_pose,-2.f);
+  const std::vector<uint32_t> dirty{kVector,kVector,0x9990};
+  const auto second=models.PublishPoses(memory,11,dirty);
+  Require(second->generation==2 && second->Find(kInstance)->matrices[0][0]==-1.f &&
+    second->Find(kInstance)->pose_generation==2,"dirty pose was not snapshotted");
+  Require(second->Find(other)==first->Find(other) && second->Find(other)->matrices[0][0]==42.f,
+    "clean pose was re-read instead of shared");
+  Require(first->Find(kInstance)->matrices[0][0]==0.5f,"an older publication changed");
+  // Audit: layout and pose agree, then a live change is reported.
+  const auto lookup=[](uint32_t,NativeModelBuffers::Kind) { return uint64_t(0); };
+  auto audit=AuditNativeModelPublication(memory,layout,second.get(),kVector,lookup);
+  Require(audit.decoded && !audit.layout_mismatch && audit.published && !audit.pose_mismatch,"clean audit");
+  memory.StoreFloat(kPose+4,99.f);
+  audit=AuditNativeModelPublication(memory,layout,second.get(),kVector,lookup);
+  Require(audit.published && audit.pose_mismatch && !audit.layout_mismatch,"pose audit missed a live change");
+  memory.StoreWord(kBatches+140,90);
+  audit=AuditNativeModelPublication(memory,layout,second.get(),kVector,lookup);
+  Require(audit.layout_mismatch && audit.decoded,"layout audit missed an index count change");
+  memory.StoreWord(kContainer+4,kNode);
+  audit=AuditNativeModelPublication(memory,layout,second.get(),kVector,lookup);
+  Require(audit.layout_mismatch && !audit.decoded,"layout audit hid a decode failure");
+  memory.StoreWord(kContainer+4,0x1100); memory.StoreWord(kBatches+140,100);
+  audit=AuditNativeModelPublication(memory,other_layout,first.get(),kVector,lookup);
+  Require(audit.layout_mismatch,"audit ignored a different pose vector");
+  // Skeleton size change retires; retirement leaves older publications intact.
+  memory.StoreWord(other_vector+8,other_pose+192);
+  const auto third=models.PublishPoses(memory,12,std::vector<uint32_t>{other_vector});
+  Require(!third->Find(other) && !models.Find(other) && models.pose_failures()==1 && second->Find(other),
+    "skeleton size change kept a stale layout");
+  Require(models.RetireAddress(kPose)==1,"pose storage free");
+  const auto fourth=models.PublishPoses(memory,13,std::vector<uint32_t>{kVector});
+  Require(fourth->poses.empty() && third->Find(kInstance) && models.AcquirePoses()==fourth,"retired pose still published");
+  // Storage moved by vector growth: the new storage becomes the retirement key.
+  models.Register(Decode(memory),kPose);
+  memory.StoreWord(kVector+4,0xF000); memory.StoreWord(kVector+8,0xF000+128);
+  models.PublishPoses(memory,14,std::vector<uint32_t>{kVector});
+  Require(!models.RetireAddress(kPose) && models.RetireAddress(0xF000)==1,"moved pose storage kept the old key");
+  // Unreadable dirty storage drops only that pose.
+  models.Register(Decode(memory),0xF000);
+  models.PublishPoses(memory,15,{});
+  memory.StoreWord(kVector+8,0xF000+100);
+  const auto failed=models.PublishPoses(memory,16,std::vector<uint32_t>{kVector});
+  Require(!failed->Find(kInstance) && models.Find(kInstance),"unreadable pose stayed published");
+  models.Clear();
+  Require(!models.size() && !models.AcquirePoses() && !models.RetireAddress(0xF000),"clear");
+}
+}
+int main() {
+  try {
+    DecodesGuestLayout();
+    RejectsUnexpectedMemory();
+    RegistryGenerationsAndRetirement();
+    PosePublicationIsImmutableAndDirtyOnly();
+  } catch(const std::exception& error) {
+    std::cerr<<"native model publication test failed: "<<error.what()<<"\n";
+    return 1;
+  }
+  std::cout<<"native model publication tests passed\n";
+  return 0;
+}
