@@ -69,7 +69,7 @@ struct NativeFrameContext {
 };
 struct NativeFramePass {
   virtual ~NativeFramePass()=default;
-  virtual const char* name()=0;
+  virtual const char* name() const=0;
   virtual void Record(NativeFrameContext&)=0;
 };
 class NativeFrameHost {

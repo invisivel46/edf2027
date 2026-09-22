@@ -7,7 +7,7 @@ namespace {
 class NativeFrameStubPass final : public NativeFramePass {
  public:
   explicit NativeFrameStubPass(const char* name):name_(name) {}
-  const char* name() override { return name_; }
+  const char* name() const override { return name_; }
   void Record(NativeFrameContext& context) override { context.host.Unimplemented(name_); }
  private:
   const char* name_;
@@ -16,7 +16,7 @@ class NativeFrameStubPass final : public NativeFramePass {
 // and falls back to the guest 820B0B80 only when that reports an error.
 class NativeFramePostPass final : public NativeFramePass {
  public:
-  const char* name() override { return "post"; }
+  const char* name() const override { return "post"; }
   void Record(NativeFrameContext& context) override { context.output_ready=context.host.Finish(context); }
 };
 }

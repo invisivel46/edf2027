@@ -37,7 +37,7 @@ class TraceHost final : public NativeFrameHost {
 class NamedPass final : public NativeFramePass {
  public:
   explicit NamedPass(const char* name):name_(name) {}
-  const char* name() override { return name_; }
+  const char* name() const override { return name_; }
   void Record(NativeFrameContext& context) override { context.host.Unimplemented("replaced"); }
  private:
   const char* name_;

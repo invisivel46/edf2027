@@ -5865,7 +5865,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
  public:
   NativeFullFrameModelsPass(uint8_t* base,std::shared_ptr<NativeFullFrameModelsShared> shared)
     :reader_(base),shared_(std::move(shared)) {}
-  const char* name() override { return "models"; }
+  const char* name() const override { return "models"; }
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     shared_->transparent.reset();
@@ -5938,7 +5938,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
 class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass {
  public:
   explicit NativeFullFrameTransparentPass(std::shared_ptr<NativeFullFrameModelsShared> shared):shared_(std::move(shared)) {}
-  const char* name() override { return "transparent"; }
+  const char* name() const override { return "transparent"; }
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     auto frame=std::move(shared_->transparent);
@@ -5967,7 +5967,7 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
 class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
  public:
   explicit NativeFullFrameSkyPass(uint8_t* base):reader_(base) {}
-  const char* name() override { return "sky"; }
+  const char* name() const override { return "sky"; }
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     const auto sky=NativeSkyObjects().Current();
@@ -6050,7 +6050,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
 class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass {
  public:
   explicit NativeFullFrameStaticWorldPass(uint8_t* base):reader_(base) {}
-  const char* name() override { return "static_world"; }
+  const char* name() const override { return "static_world"; }
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     const auto& publication=context.inputs.publication;
