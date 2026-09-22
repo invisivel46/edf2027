@@ -1,5 +1,7 @@
 # Exercise the production adapter, substituting only the guest call and logging.
 file(READ "${SOURCE}" source)
+# Undo the renderer preset layer: EDF_NATIVE_FLAG(x) -> REXCVAR_GET(edf_native_x).
+string(REGEX REPLACE "EDF_NATIVE_FLAG\\(([a-z_0-9]+)\\)" "REXCVAR_GET(edf_native_\\1)" source "${source}")
 string(FIND "${source}" "REX_HOOK_RAW(sub_8243A000) {" begin)
 if(begin LESS 0)
     message(FATAL_ERROR "Missing worker callback audit hook")
