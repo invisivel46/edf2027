@@ -24,6 +24,7 @@ void EnterNativeSceneBoundary(NativeSceneBoundary boundary) { fixture_scene_exec
 #include "native_graphics/native_scene_geometry_install.h"
 #include "native_graphics/native_material_cpu_program.h"
 #include "native_graphics/native_shader_binding.h"
+#include "native_graphics/native_texture_binding.h"
 #include "native_graphics/native_indexed_completion.h"
 #include <array>
 #include <bit>
@@ -1966,7 +1967,8 @@ int main() {
     // Execute production group orchestration, real CPU geometry/material/tail
     // helpers, and retained WARP output from the same guest-derived inputs.
     for(unsigned draws:{0u,1u,3u}) for(bool changed_material:{false,true})
-      for(bool fallback:{false,true}) for(bool fail_tail:{false,true}) {
+      for(bool fallback:{false,true}) for(bool fail_tail:{false,true}) for(bool captured:{false,true}) {
+      if(captured && (!changed_material || fail_tail)) continue;
       using namespace edf::native;
       auto reference=std::make_unique<Arena>(),actual=std::make_unique<Arena>();
       auto* base=reference->bytes.data();
@@ -2004,9 +2006,33 @@ int main() {
         for(unsigned word=0;word<4;++word) REX_STORE_U32(data+word*4,0x3f000000+block*16+word);
         ++block;
       }
-      // One declared opaque fixture: position-only quad, no textures or explicit
-      // state lists, disjoint constants, fence retirement, identity world. The
-      // pixel constant changes red -> blue; its oracle lives in the GPU helper.
+      // Captured live shape: 3 local + 1 global texture, the recorded five-state
+      // list and a fenced previous binding on slot 1.
+      constexpr uint32_t texture_table=0x95000,global_table=0x95100,global_source=0x95200,
+        state_table=0x95300,texture_objects=0x96000,old_texture=texture_objects+0x800;
+      if(captured) {
+        for(uint32_t i=0;i<3;++i) {
+          REX_STORE_U32(texture_table+i*28+4,texture_objects+i*0x100);
+          REX_STORE_U32(texture_table+i*28+8,i);
+        }
+        REX_STORE_U32(material_instance+72,texture_table); REX_STORE_U32(material_instance+80,3);
+        REX_STORE_U32(global_table,global_source); REX_STORE_U32(global_table+4,3);
+        REX_STORE_U32(global_source+28,texture_objects+0x300);
+        REX_STORE_U32(material_instance+84,global_table); REX_STORE_U32(material_instance+92,1);
+        for(uint32_t i=0;i<4;++i) for(uint32_t word=0;word<6;++word)
+          REX_STORE_U32(texture_objects+i*0x100+28+word*4,0x10000*(i+1)+word);
+        const std::array<std::array<uint32_t,2>,5> states{{{0x38,2},{0x30,1},{0x3c,1},{0x48,6},{0x4c,7}}};
+        for(uint32_t i=0;i<states.size();++i) {
+          REX_STORE_U32(state_table+i*8,states[i][0]); REX_STORE_U32(state_table+i*8+4,states[i][1]);
+          REX_STORE_U32(device+56+states[i][0],NativeMaterialStateSetter(states[i][0]));
+        }
+        REX_STORE_U32(material_instance+96,state_table); REX_STORE_U32(material_instance+104,5);
+        REX_STORE_U32(device+12272+4,old_texture);
+      }
+      // Declared fixture: position-only quad, disjoint constants, fence retirement,
+      // identity world, and either no texture/state lists or the captured shape.
+      // The pixel constant changes red -> blue; its oracle lives in the GPU helper.
+      // GPU state stays the incoming words; captured state is checked on the CPU.
       constexpr uint32_t gpu_vertices=0x90000,gpu_indices=0x91000;
       REX_STORE_U32(device+10424,0x10001); REX_STORE_U32(device+10332,15);
       REX_STORE_U32(vertices+24,gpu_vertices);
@@ -2105,10 +2131,35 @@ int main() {
           Require(!std::memcmp(memory+device+1792,bytes.data(),64),"world mirror published before CPU restoration");
         });
       };
+      // Production texture binding with old-resource retirement, and production
+      // state CPU writes. Sampler words need image tables outside this arena.
+      const auto bind_texture=[](const GeometryFixtureReader& reader,const NativeMaterialCpuProgram::Texture& operation) {
+        SetNativeTextureResource(reader,device,operation.slot,operation.handle,uint64_t(1)<<(43-operation.slot),
+          []()->uint32_t { throw std::runtime_error("captured texture required retirement queue growth"); },
+          []()->uint32_t { throw std::runtime_error("captured texture required a deferred retirement tag"); });
+      };
+      const auto apply_state=[](const GeometryFixtureReader& reader,const NativeMaterialCpuProgram::State& operation) {
+        const auto writes=NativeMaterialStateCpuWrites(ReadNativeMaterialRenderPassMirrors(reader,device),
+          operation.offset,operation.value,reader.DoubleWord(device+16),reader.DoubleWord(device+24));
+        Require(writes.has_value(),"captured material state required its original callback");
+        for(const auto& [offset,value]:*writes) reader.StoreWord(device+offset,value);
+      };
       const auto activate=[&](uint8_t* base,bool native) {
         if(!native) {
+          // The arena has no original texture, sampler or indirect state setters.
+          // Retail runs shaders/constants; the captured lists then replay through
+          // the executors compared with retail by the binding tests and live oracle.
+          std::array<uint32_t,3> counts{};
+          for(uint32_t i=0;i<3;++i) {
+            counts[i]=REX_LOAD_U32(material_instance+80+i*12); REX_STORE_U32(material_instance+80+i*12,0);
+          }
           auto ctx=context(); ctx.r3.u64=material_instance; ctx.r4.u64=device;
           material_reference=true; __imp__sub_821B8E48(ctx,base); material_reference=false;
+          for(uint32_t i=0;i<3;++i) REX_STORE_U32(material_instance+80+i*12,counts[i]);
+          const GeometryFixtureReader reader{base};
+          const auto program=ReadNativeMaterialCpuProgram(reader,material_instance,device);
+          for(const auto& operation:program.textures) bind_texture(reader,operation);
+          for(const auto& operation:program.states) apply_state(reader,operation);
           return;
         }
         const GeometryFixtureReader reader{base};
@@ -2121,8 +2172,8 @@ int main() {
           const auto first=operation.first/4,last=(operation.first+operation.count-1)/4;
           const auto mask=(UINT64_MAX>>first)&(UINT64_MAX<<(63-last));
           Require(UploadNativeMaterialConstant(reader,device,operation,mask),"supported material required legacy constant setter");
-        },[](const auto&) { throw std::runtime_error("unconfigured native material texture"); },
-          [](const auto&) { throw std::runtime_error("unconfigured native material state"); });
+        },[&](const auto& operation) { bind_texture(reader,operation); },
+          [&](const auto& operation) { apply_state(reader,operation); });
       };
       world(base,false); install(base,false);
       if(changed_material) { activate(base,false); world(base,false); }
@@ -2182,6 +2233,13 @@ int main() {
       Require(!same_projection(),"CPU word negative control was not detected");
       actual->bytes[device+1792]^=1;
       base=actual->bytes.data();
+      if(captured) {
+        Require(REX_LOAD_U32(device+12272)==texture_objects && REX_LOAD_U32(device+12272+4)==texture_objects+0x100 &&
+          REX_LOAD_U32(device+12272+12)==texture_objects+0x300 && REX_LOAD_U32(old_texture+8)==200,
+          "captured texture bindings or fenced retirement missing");
+        if(!draws) Require(REX_LOAD_U32(device+10424)==0x07060706 && (REX_LOAD_U32(device+10440)&7)==2 &&
+          (REX_LOAD_U32(device+10420)&4),"captured material state words missing");
+      }
       const uint64_t owed_constants=1|(changed_material?(uint64_t(3)<<62):0);
       Require(REX_LOAD_U64(device)==(draws?0:owed_constants),"no-draw group consumed dirty state");
       // Minimal cutover blocker: retained submission alone does not own these
@@ -2221,7 +2279,7 @@ int main() {
       }
     }
     FinishNativeStaticGroupGpu();
-    std::cout << "Static group handoff: 24 cases; ordering/CPU/omitted-tail/pixel controls detected\n";
+    std::cout << "Static group handoff: 30 cases (6 captured texture/state shapes); ordering/CPU/omitted-tail/pixel controls detected\n";
     real_state_packets=true;
     struct Bank { uint32_t number,offset,words; };
     constexpr Bank banks[]{{18688,9984,40},{8192,10240,16},{8448,10316,21},{8576,10400,5},

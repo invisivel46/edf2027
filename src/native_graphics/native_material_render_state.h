@@ -151,8 +151,9 @@ inline std::optional<std::vector<std::pair<uint32_t,uint32_t>>> NativeMaterialSt
   if(flags24) { dirty24|=flags24; write(24,uint32_t(dirty24>>32)); write(28,uint32_t(dirty24)); }
   return writes;
 }
+// Device mirrors only. Fixed image constants are verified by the live reader.
 template<class Reader>
-NativeMaterialRenderPass ReadNativeMaterialRenderPass(const Reader& reader,uint32_t device) {
+NativeMaterialRenderPass ReadNativeMaterialRenderPassMirrors(const Reader& reader,uint32_t device) {
   NativeMaterialRenderPass pass;
   const auto word=[&](uint32_t offset){return reader.Word(reader.Add(device,offset));};
   pass.color_mask=word(10332); pass.scissor_enabled=word(11584);
@@ -163,7 +164,11 @@ NativeMaterialRenderPass ReadNativeMaterialRenderPass(const Reader& reader,uint3
   pass.blend_factor=ReadGuestWords<4>(reader,reader.Add(device,10336));
   pass.color_requested=ReadGuestWords<4>(reader,reader.Add(device,11588));
   pass.color_targets=ReadGuestWords<4>(reader,reader.Add(device,12168));
-  if(reader.Word(0x8200964c)!=0x3b808081u) throw std::runtime_error("native material color scale changed");
   return pass;
+}
+template<class Reader>
+NativeMaterialRenderPass ReadNativeMaterialRenderPass(const Reader& reader,uint32_t device) {
+  if(reader.Word(0x8200964c)!=0x3b808081u) throw std::runtime_error("native material color scale changed");
+  return ReadNativeMaterialRenderPassMirrors(reader,device);
 }
 }

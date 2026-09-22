@@ -135,7 +135,10 @@ void StaticGroupEligibility() {
     Require(memory==before,"eligibility preflight mutated guest memory");
   };
   check(Result::Supported);
-  reader.StoreWord(device+10424,0); check(Result::PassState); memory=seed;
+  // Incoming state is carried explicitly; only the resolved pass must decode.
+  reader.StoreWord(device+10424,0x07060706); check(Result::Supported); memory=seed;
+  reader.StoreWord(device+10424,0x0303); check(Result::PassState); memory=seed;
+  reader.StoreWord(device+10420,1); check(Result::PassState); memory=seed;
   reader.StoreWord(device+12188,0x30000);
   check(Result::RetirementMode);
   reader.StoreWord(device+10780,200); check(Result::Supported);
@@ -147,9 +150,51 @@ void StaticGroupEligibility() {
   check(Result::AliasedInput);
   memory=seed; reader.StoreWord(device+10780,200); reader.StoreWord(device+12164,record-8);
   check(Result::AliasedInput); // Old resource fence would overwrite a captured operation.
-  for(uint32_t count:{80u,92u,104u}) {
-    memory=seed; reader.StoreWord(material+count,1); check(Result::TextureOrState);
-  }
+  // Captured live shape: 3 local + 1 global texture and the same 5 state operations.
+  constexpr uint32_t textures=0x29000,globals=0x2a000,global_source=0x2a100,states=0x2b000,objects=0x2c000;
+  const auto operations=[&](std::initializer_list<std::array<uint32_t,2>> list) {
+    uint32_t i=0;
+    for(const auto& [offset,value]:list) {
+      reader.StoreWord(states+i*8,offset); reader.StoreWord(states+i*8+4,value);
+      reader.StoreWord(device+56+offset,NativeMaterialStateSetter(offset)); ++i;
+    }
+    reader.StoreWord(material+96,states); reader.StoreWord(material+104,i);
+  };
+  const auto captured=[&] {
+    memory=seed;
+    for(uint32_t i=0;i<3;++i) {
+      reader.StoreWord(textures+i*28+4,objects+i*64); reader.StoreWord(textures+i*28+8,i);
+      reader.StoreWord(objects+i*64+28,0x1000+i);
+    }
+    reader.StoreWord(material+72,textures); reader.StoreWord(material+80,3);
+    reader.StoreWord(globals,global_source); reader.StoreWord(globals+4,3);
+    reader.StoreWord(global_source+28,objects+192);
+    reader.StoreWord(material+84,globals); reader.StoreWord(material+92,1);
+    operations({{0x38,2},{0x30,1},{0x3c,1},{0x48,6},{0x4c,7}});
+  };
+  captured(); check(Result::Supported);
+  captured(); reader.StoreWord(device+10424,0x07060706); check(Result::Supported); // After a blended group.
+  captured(); reader.StoreWord(device+56+0x3c,0); check(Result::TextureOrState); // Setter identity changed.
+  captured(); reader.StoreWord(textures+28+8,16); check(Result::TextureOrState); // Invalid sampler slot.
+  captured(); reader.StoreWord(material+104,6); reader.StoreWord(states+40,0xc8); reader.StoreWord(states+44,1);
+  reader.StoreWord(device+56+0xc8,NativeMaterialStateSetter(0xc8)); check(Result::TextureOrState); // Scissor callback.
+  captured(); reader.StoreWord(states+32,0x48); reader.StoreWord(states+36,3); check(Result::PassState); // Resolved blend factor.
+  // A material's own operations may replace an unrepresentable inherited word.
+  memory=seed; reader.StoreWord(device+10424,0x0303); operations({{0x3c,0}}); check(Result::Supported);
+  memory=seed; reader.StoreWord(device+10420,1); operations({{0x6c,0}}); check(Result::Supported);
+  memory=seed; reader.StoreWord(device+10420,1); operations({{0x6c,1}}); reader.StoreWord(device+12184,1);
+  check(Result::PassState);
+  // Old texture retirement: fence required, and its write joins the alias check.
+  constexpr uint32_t old_texture=0x2d000;
+  captured(); reader.StoreWord(device+12272+4,old_texture); check(Result::RetirementMode);
+  reader.StoreWord(device+10780,200); check(Result::Supported);
+  reader.StoreWord(device+12272+4,textures+28+4-8); check(Result::AliasedInput);
+  captured(); reader.StoreWord(device+10780,200); reader.StoreWord(textures+28+8,0); // Slot 0 twice.
+  check(Result::Supported);
+  reader.StoreWord(textures+4,textures+28+4-8); check(Result::AliasedInput); // Retired by the repeated slot.
+  captured(); reader.StoreWord(textures+4,device+1024-28); check(Result::AliasedInput); // Header read in device mirror.
+  captured(); reader.StoreWord(material+72,device+2048); reader.StoreWord(device+2048+4,objects);
+  check(Result::AliasedInput); // Texture table inside the device mirror.
   memory=seed;
   constexpr uint32_t defaults=0x28000,header=0x20000+872;
   reader.StoreWord(header+20,defaults-header);
