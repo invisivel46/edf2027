@@ -1,5 +1,7 @@
 #pragma once
 #include "native_scene_visibility.h"
+#include <stdexcept>
+#include <vector>
 
 namespace edf::native {
 template<class Reader,class Draw>
@@ -11,6 +13,18 @@ void DispatchNativeSceneGroups(const Reader& reader,uint32_t list,Draw draw) {
     draw(reader.Word(reader.Add(node,8)));
     if(node==reader.Word(reader.Add(list,4))) throw std::runtime_error("native scene group iterator invalidated");
     node=reader.Word(node);
+  }
+}
+// 821C3BB8 walks owner+240 as a circular list with a sentinel at +4:
+// node+0 is next, node+8 the group; the walk stops on returning to the sentinel.
+template<class Reader>
+void CaptureNativeSceneGroupOrder(const Reader& reader,uint32_t list,std::vector<uint32_t>& order) {
+  order.clear();
+  const auto end=reader.Word(reader.Add(list,4));
+  if(!end) throw std::runtime_error("native scene group list has no sentinel");
+  for(auto node=reader.Word(end);node!=end;node=reader.Word(node)) {
+    if(!node || order.size()>=(1u<<20)) throw std::runtime_error("invalid native scene group list");
+    order.push_back(reader.Word(reader.Add(node,8)));
   }
 }
 inline uint32_t NativeVisibilityAabb(const NativeSceneVisibilityView& view,

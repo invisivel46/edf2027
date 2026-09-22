@@ -2,6 +2,7 @@
 #include "native_graphics/native_scene_bindings.h"
 #include "native_graphics/native_scene_sources.h"
 #include "native_graphics/native_scene_adapter.h"
+#include "native_graphics/native_scene_tree.h"
 #include "native_graphics/native_scene_pass_inputs.h"
 #include "native_graphics/native_queued_scene.h"
 #include "native_graphics/native_scene_cpu_window.h"
@@ -158,6 +159,62 @@ void StaticGroupEligibility() {
   auto invalid=input; invalid.count=0;
   Require(AssessNativeStaticGroup(reader,device,stack,invalid)==Result::Geometry,"zero geometry count admitted");
   Require(AssessNativeStaticGroup(reader,device+1,stack,input)==Result::Alignment,"unaligned device admitted");
+}
+void GroupOrder() {
+  std::vector<uint8_t> memory(0x1000);
+  const GeometryRetryReader reader{memory};
+  constexpr uint32_t owner=0x100,list=owner+240,sentinel=0x400;
+  // 821C3BB8 layout: list+4 is the sentinel; node+0 next, node+4 previous, node+8 group.
+  const auto link=[&](std::initializer_list<uint32_t> nodes) {
+    reader.StoreWord(list+4,sentinel);
+    uint32_t previous=sentinel;
+    for(const auto node:nodes) {
+      reader.StoreWord(previous,node); reader.StoreWord(node+4,previous); reader.StoreWord(node+8,0x9000+node);
+      previous=node;
+    }
+    reader.StoreWord(previous,sentinel); reader.StoreWord(sentinel+4,previous);
+  };
+  using Order=std::vector<uint32_t>;
+  Order order,live;
+  NativeSceneAdapter adapter;
+  link({}); CaptureNativeSceneGroupOrder(reader,list,order);
+  Require(order.empty(),"empty group list captured a group");
+  link({0x500,0x480,0x600}); CaptureNativeSceneGroupOrder(reader,list,order);
+  Require(order==Order{0x9500,0x9480,0x9600},"group order capture lost the list walk order");
+  Order dispatched;
+  DispatchNativeSceneGroups(reader,list,[&](uint32_t group) { dispatched.push_back(group); });
+  Require(dispatched==order,"group order capture differs from group dispatch");
+  Require(adapter.PublishGroupOrder(owner,order),"first group order was not published");
+  const auto first=adapter.GroupOrder(owner);
+  const auto first_publication=adapter.Publish(1);
+  Require(first_publication->group_order.at(owner)==first,"scene publication omitted the group order");
+  CaptureNativeSceneGroupOrder(reader,list,order);
+  Require(!adapter.PublishGroupOrder(owner,order) && adapter.GroupOrder(owner)==first &&
+    adapter.Publish(2)->group_order.at(owner)==first,"unchanged group order replaced its publication");
+  link({0x500,0x700,0x480,0x600}); CaptureNativeSceneGroupOrder(reader,list,order);
+  Require(adapter.PublishGroupOrder(owner,order) && *adapter.GroupOrder(owner)==Order{0x9500,0x9700,0x9480,0x9600} &&
+    *first==Order{0x9500,0x9480,0x9600},"group insertion was not published or mutated a retained order");
+  const auto inserted=adapter.GroupOrder(owner);
+  link({0x500,0x600}); CaptureNativeSceneGroupOrder(reader,list,order);
+  Require(adapter.PublishGroupOrder(owner,order) && *adapter.GroupOrder(owner)==Order{0x9500,0x9600} &&
+    inserted->size()==4 && *first_publication->group_order.at(owner)==*first,
+    "group removal was not published or mutated a retained order");
+  CaptureNativeSceneGroupOrder(reader,list,live);
+  Require(adapter.AuditGroupOrder(owner,live) && adapter.group_order_audit().checks==1 &&
+    !adapter.group_order_audit().mismatches,"matching live group walk counted as a mismatch");
+  link({0x600,0x500}); CaptureNativeSceneGroupOrder(reader,list,live);
+  Require(!adapter.AuditGroupOrder(owner,live) && adapter.group_order_audit().mismatches==1,"reordered live walk was not counted");
+  link({0x500}); CaptureNativeSceneGroupOrder(reader,list,live);
+  Require(!adapter.AuditGroupOrder(owner,live) && adapter.group_order_audit().mismatches==2,"removed live group was not counted");
+  Require(!adapter.AuditGroupOrder(0x200,live) && adapter.group_order_audit().missing==1 &&
+    adapter.group_order_audit().mismatches==2 && adapter.group_order_audit().checks==4,"unpublished owner audit miscounted");
+  adapter.RetireGroupOrder(owner);
+  Require(!adapter.GroupOrder(owner) && !adapter.Publish(3)->group_order.count(owner) &&
+    first_publication->group_order.count(owner),"group order retirement changed a retained publication");
+  link({0x600,0x500}); reader.StoreWord(0x600,0);
+  Reject([&] { CaptureNativeSceneGroupOrder(reader,list,order); });
+  reader.StoreWord(0x600,0x600);
+  Reject([&] { CaptureNativeSceneGroupOrder(reader,list,order); });
 }
 void PassCamera() {
   GeometryPublicationRetry();
@@ -1187,6 +1244,7 @@ int main() {
     PassCamera(); Visibility();
     QueuedGuestState();
     TreePublicationReuse();
+    GroupOrder();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

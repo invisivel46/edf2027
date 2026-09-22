@@ -3148,6 +3148,17 @@ REXCVAR_DEFINE_BOOL(edf_native_scene_tree,false,"EDF2027",
   "Use native spatial tree traversal and culling; leaf callbacks remain explicit.");
 REXCVAR_DEFINE_BOOL(edf_native_scene_tree_published,false,"EDF2027",
   "Read immutable spatial hierarchy published by the world producer.");
+REXCVAR_DEFINE_BOOL(edf_native_scene_group_order,false,"EDF2027",
+  "Publish each world owner's static group walk order (owner+240) at simulation step.");
+REXCVAR_DEFINE_BOOL(edf_native_scene_group_order_audit,false,"EDF2027",
+  "Compare the published static group order with a live walk at world-pass entry (development).");
+namespace edf::native {
+void RetireGroupOrder(uint32_t owner) {
+  auto& state=State();
+  std::lock_guard lock(state.mutex);
+  state.scene_adapter.RetireGroupOrder(owner);
+}
+}
 #define EDF_TREE_MUTATION(address) \
   REX_EXTERN(__imp__sub_##address); \
   REX_HOOK_RAW(sub_##address) { \
@@ -3162,6 +3173,7 @@ EDF_TREE_MUTATION(821C49A0)
 REX_EXTERN(__imp__sub_820B5F38);
 REX_HOOK_RAW(sub_820B5F38) {
   edf::native::TreePublications().Retire(ctx.r3.u32);
+  edf::native::RetireGroupOrder(ctx.r3.u32);
   __imp__sub_820B5F38(ctx,base);
 }
 REX_EXTERN(__imp__sub_821C61D8);
@@ -3253,6 +3265,26 @@ REX_HOOK_RAW(sub_820B4250) {
       if(reported.insert(error.what()).second) REXLOG_INFO("Native tree publication deferred: {}",error.what());
     }
   }
+  if(REXCVAR_GET(edf_native_scene_group_order) || REXCVAR_GET(edf_native_scene_group_order_audit)) {
+    static thread_local std::vector<uint32_t> order;
+    try {
+      const edf::native::GuestReader reader(base);
+      edf::native::CaptureNativeSceneGroupOrder(reader,reader.Add(owner,240),order);
+      auto& state=edf::native::State();
+      std::lock_guard lock(state.mutex);
+      if(state.scene_adapter.PublishGroupOrder(owner,order)) {
+        static std::atomic<uint64_t> changes=0;
+        const auto count=++changes;
+        if(count<=4 || count%1000==0) REXLOG_INFO("Native group order publication: owner={:#x} groups={} changes={}",owner,order.size(),count);
+      }
+    } catch(const std::exception& error) {
+      edf::native::RetireGroupOrder(owner);
+      static std::set<std::string> reported;
+      static std::mutex reported_mutex;
+      std::lock_guard lock(reported_mutex);
+      if(reported.insert(error.what()).second) REXLOG_INFO("Native group order publication deferred: {}",error.what());
+    }
+  }
   if(published) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
@@ -3263,6 +3295,18 @@ REX_EXTERN(__imp__sub_820B4310);
 REX_EXTERN(sub_821C61D8);
 REX_EXTERN(sub_821C3BB8);
 REX_HOOK_RAW(sub_820B4310) {
+  if(REXCVAR_GET(edf_native_scene_group_order_audit)) {
+    static thread_local std::vector<uint32_t> live;
+    const edf::native::GuestReader reader(base);
+    edf::native::CaptureNativeSceneGroupOrder(reader,reader.Add(ctx.r3.u32,240),live);
+    auto& state=edf::native::State();
+    std::lock_guard lock(state.mutex);
+    const bool matched=state.scene_adapter.AuditGroupOrder(ctx.r3.u32,live);
+    const auto& audit=state.scene_adapter.group_order_audit();
+    if(audit.checks<=4 || audit.checks%1000==0 || (!matched && audit.mismatches+audit.missing<=64))
+      REXLOG_INFO("Native group order audit: owner={:#x} groups={} checks={} mismatches={} missing={}",
+        ctx.r3.u32,live.size(),audit.checks,audit.mismatches,audit.missing);
+  }
   if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
     edf::native::native_scene_animation_owner=ctx.r3.u32;
     edf::native::native_scene_pass_animation.reset();
@@ -3296,6 +3340,7 @@ REX_HOOK_RAW(sub_820B5FA8) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     state.scene_adapter.RetireWorldAnimation(ctx.r3.u32);
+    state.scene_adapter.RetireGroupOrder(ctx.r3.u32);
   }
   __imp__sub_820B5FA8(ctx,base);
 }

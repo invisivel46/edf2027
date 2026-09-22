@@ -107,6 +107,7 @@ std::shared_ptr<const NativeScenePublication> NativeSceneAdapter::Publish(uint64
   publication->trees=std::move(trees);
   publication->snapshot=scene_.Publish(tick);
   publication->world_animations=world_animations_;
+  publication->group_order=group_orders_;
   publication->cameras=cameras_;
   for(const auto& [group,geometry]:group_geometry_) publication->group_geometry.push_back(geometry);
   for(const auto& [group,material]:group_material_programs_) publication->group_materials.push_back(material);

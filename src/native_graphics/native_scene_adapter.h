@@ -22,6 +22,10 @@ struct NativeSceneGroupMaterial {
   std::shared_ptr<const NativeSceneMaterialProgram> program;
   std::vector<NativeSceneMaterialInputs::Constant> constants;
 };
+// Walk order of one world owner's owner+240 group list (821C3BB8).
+using NativeSceneGroupOrder=std::vector<uint32_t>;
+using NativeSceneGroupOrders=std::map<uint32_t,std::shared_ptr<const NativeSceneGroupOrder>>;
+struct NativeSceneGroupOrderAudit { uint64_t checks=0,mismatches=0,missing=0; };
 struct NativeScenePublication {
   std::shared_ptr<const NativeSceneSources> sources;
   std::shared_ptr<const NativeSceneMembership::Publication> membership;
@@ -33,6 +37,7 @@ struct NativeScenePublication {
   std::vector<std::shared_ptr<const NativeSceneGroupGeometry>> group_geometry;
   std::vector<std::shared_ptr<const NativeSceneGroupMaterial>> group_materials;
   std::map<uint32_t,NativeScenePassAnimation> world_animations;
+  NativeSceneGroupOrders group_order;
   std::shared_ptr<const NativeScenePassCameras> cameras;
   std::shared_ptr<const NativeSceneInstance> Find(uint64_t id) const;
   // Select a retained lifetime and apply pass-resolved material/world without
@@ -63,6 +68,28 @@ class NativeSceneAdapter {
   // Animation writers can advance between scene publications. Acquire their
   // immutable generation at render entry under the same producer/reader lock.
   std::shared_ptr<const WorldAnimations> AcquireWorldAnimations() const { return world_animation_publication_; }
+  // Keeps the previous immutable order when the walk is unchanged; returns
+  // whether a new order was published. Cost is linear in the list length.
+  bool PublishGroupOrder(uint32_t owner,std::span<const uint32_t> order) {
+    auto& slot=group_orders_[owner];
+    if(slot && std::ranges::equal(*slot,order)) return false;
+    slot=std::make_shared<const NativeSceneGroupOrder>(order.begin(),order.end());
+    return true;
+  }
+  void RetireGroupOrder(uint32_t owner) { group_orders_.erase(owner); }
+  std::shared_ptr<const NativeSceneGroupOrder> GroupOrder(uint32_t owner) const {
+    const auto found=group_orders_.find(owner);
+    return found!=group_orders_.end()?found->second:nullptr;
+  }
+  // Compares the latest published order with a live walk of the same list.
+  bool AuditGroupOrder(uint32_t owner,std::span<const uint32_t> live) {
+    ++group_order_audit_.checks;
+    const auto order=GroupOrder(owner);
+    if(!order) { ++group_order_audit_.missing; return false; }
+    if(std::ranges::equal(*order,live)) return true;
+    ++group_order_audit_.mismatches; return false;
+  }
+  const NativeSceneGroupOrderAudit& group_order_audit() const { return group_order_audit_; }
   std::shared_ptr<const NativeIndexedMesh::RetainedDraw> RetainGeometry(
     std::shared_ptr<NativeRenderBackend> backend,const NativeIndexedMesh& mesh,
     uint32_t first,uint32_t count,int32_t base=0);
@@ -119,6 +146,8 @@ class NativeSceneAdapter {
   std::shared_ptr<const NativeScenePassCameras> cameras_=std::make_shared<const NativeScenePassCameras>();
   std::map<uint32_t,NativeScenePassAnimation> world_animations_;
   std::shared_ptr<const WorldAnimations> world_animation_publication_=std::make_shared<const WorldAnimations>();
+  NativeSceneGroupOrders group_orders_;
+  NativeSceneGroupOrderAudit group_order_audit_;
   std::atomic<std::shared_ptr<const NativeScenePublication>> publication_;
   std::map<Key,uint64_t> objects_;
   std::map<GeometryKey,std::weak_ptr<const NativeIndexedMesh::RetainedDraw>> geometry_;
