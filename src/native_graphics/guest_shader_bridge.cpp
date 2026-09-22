@@ -3834,10 +3834,18 @@ REX_HOOK_RAW(sub_820B33B0) {
   const bool scene=REXCVAR_GET(edf_native_scene_adapter_audit) || REXCVAR_GET(edf_native_scene_queued);
   if(scene) {
     auto& state=edf::native::State();
-    std::lock_guard submission(state.submissions);
-    std::lock_guard lock(state.mutex);
-    state.scene_adapter.Retire(object);
-    state.scene_sources.Retire(object);
+    // The destructor hook normally retired this address already. Only this
+    // constructor can Born it, so an absent owner stays absent and the loader
+    // need not wait for submission order to retire nothing.
+    bool stale;
+    { std::lock_guard lock(state.mutex);
+      stale=state.scene_sources.HasOwner(object) || state.scene_adapter.HasOwner(object); }
+    if(stale) {
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      state.scene_adapter.Retire(object);
+      state.scene_sources.Retire(object);
+    }
   }
   __imp__sub_820B33B0(ctx,base);
   if(scene) {
@@ -3865,6 +3873,9 @@ REX_HOOK_RAW(sub_820B2AC0) {
   __imp__sub_820B2AC0(ctx,base);
   if(REXCVAR_GET(edf_native_scene_adapter_audit) || REXCVAR_GET(edf_native_scene_queued)) {
     auto& state=edf::native::State();
+    // Nested in construction the owner is not yet born and cannot become so
+    // on another thread; skip the submission wait for a publication of nothing.
+    { std::lock_guard lock(state.mutex); if(!state.scene_sources.HasOwner(owner)) return; }
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
     edf::native::PublishStaticScenePartsLocked(state,edf::native::GuestReader(base),owner);

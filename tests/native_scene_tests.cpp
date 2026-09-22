@@ -1045,6 +1045,57 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
     "group population reused a retired native identity");
   populated.Retire(300); catalog.Retire(300); catalog.Retire(400);
   Require(!catalog.FindGroup(500),"retired parts kept a live group index");
+  {
+    // Retirement visits only the owner's own groups: a loader publication per
+    // object must not scan every populated group (quadratic mission loading).
+    NativeSceneAdapter scaled; NativeSceneSources owners;
+    constexpr uint32_t count=512,shared=70000;
+    const auto all=[](const auto&) { return true; };
+    for(uint32_t i=0;i<count;++i) {
+      owners.Born(1000+i);
+      const NativeSceneSources::Part own[]{ {20000+i,0,0,30000+i,40000+i} };
+      owners.Observe(1000+i,own); owners.PublishWorld(1000+i,world);
+    }
+    for(uint32_t i=0;i<count;++i)
+      Require(scaled.PopulateGroup(owners,40000+i,retained_left->object.geometry,captured,all).created==1,
+        "scaled group did not populate its owner");
+    Require(scaled.objects()==count && scaled.populated_groups()==count,"scaled population is incomplete");
+    for(uint32_t i=0;i<count;i+=2) {
+      const auto checks=scaled.retire_checks();
+      scaled.Retire(1000+i);
+      Require(scaled.retire_checks()-checks==1,"owner retirement scanned unrelated populated groups");
+      Require(!scaled.HasOwner(1000+i),"retired owner kept adapter state");
+    }
+    const auto checks=scaled.retire_checks();
+    scaled.Retire(999); scaled.Retire(1000);
+    Require(scaled.retire_checks()==checks,"unknown or repeated retirement scanned populated groups");
+    Require(scaled.objects()==count/2 && scaled.populated_groups()==count/2,"retirement removed another owner's group");
+    for(uint32_t i=0;i<count;++i)
+      Require(scaled.PopulateGroup(owners,40000+i,retained_left->object.geometry,captured,all).created==size_t(i%2==0),
+        "retirement did not invalidate exactly the retired owners' groups");
+    // A group shared by several owners retires with any of them. Index entries
+    // left behind by a repopulation must neither erase a group without that
+    // owner nor miss one which still contains it.
+    for(uint32_t i=0;i<3;++i) {
+      owners.Retire(1000+i); owners.Born(1000+i);
+      const NativeSceneSources::Part part[]{ {50000+i,0,0,60000+i,shared} };
+      owners.Observe(1000+i,part); owners.PublishWorld(1000+i,world);
+    }
+    const auto share=[&] { return scaled.PopulateGroup(owners,shared,retained_left->object.geometry,captured,all); };
+    Require(share().created==3,"shared group did not populate every owner");
+    scaled.Retire(1000);
+    Require(share().created==1 && share().examined==0,"shared group survived one owner's retirement");
+    owners.Retire(1001); scaled.Retire(1001);
+    Require(share().examined==2 && !scaled.HasOwner(1001),"shared group kept a retired owner");
+    const NativeSceneSources::Part moved[]{ {50002,0,0,60002,0} };
+    owners.Observe(1002,moved);
+    Require(share().examined==1,"shared group kept a relocated part");
+    scaled.Retire(1002);
+    Require(share().examined==0,"stale owner index erased a repopulated group without that owner");
+    scaled.Retire(1000);
+    Require(share().examined==1,"owner index missed a group still containing the retired owner");
+    Require(scaled.objects()==count-2,"shared retirement removed the wrong objects");
+  }
   render(*unseen_publication->snapshot); Require(pixel(32,0)==255,"unseen publication borrowed retired producer assets");
   {
     auto pass=captured; pass.world=event_world; pass.world[12]=-.5f;

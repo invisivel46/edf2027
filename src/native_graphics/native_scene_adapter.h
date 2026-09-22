@@ -7,6 +7,7 @@
 #include "native_scene_membership.h"
 #include "native_scene_tree_publication.h"
 #include <functional>
+#include <set>
 
 namespace edf::native {
 struct NativeSceneGroupGeometry {
@@ -90,7 +91,14 @@ class NativeSceneAdapter {
     uint32_t first,uint32_t count,int32_t base,NativeSceneMaterialCapture capture);
   uint64_t Observe(const NativeSceneSources::Source& source,
     std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry,NativeSceneMaterialCapture capture);
+  // Cost follows the owner's own groups and objects, not the whole scene.
   void Retire(uint32_t owner);
+  bool HasOwner(uint32_t owner) const {
+    const auto at=objects_.lower_bound(Key{owner,0,0,0});
+    return (at!=objects_.end() && at->first[0]==owner) || owner_groups_.contains(owner);
+  }
+  size_t retire_checks() const { return retire_checks_; }
+  size_t populated_groups() const { return populated_groups_.size(); }
   size_t UpdateWorld(uint32_t owner,uint64_t generation,const NativeSceneSources::World& registers);
   std::shared_ptr<const NativeScenePublication> Publish(uint64_t tick,
     std::shared_ptr<const NativeSceneSources> sources={},
@@ -125,7 +133,11 @@ class NativeSceneAdapter {
     std::vector<uint32_t> owners;
   };
   std::map<uint32_t,PopulatedGroup> populated_groups_;
+  // Owner -> groups populated with it. Entries may be stale (group since
+  // repopulated or pruned); Retire verifies against the group's owners.
+  std::map<uint32_t,std::set<uint32_t>> owner_groups_;
   uint64_t observations_=0;
+  size_t retired_=0,retire_checks_=0;
   void Prune();
   // Returns the retained material equivalent to this one, registering it if
   // there is none, so that equal materials share one object.

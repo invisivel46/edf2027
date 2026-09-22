@@ -71,6 +71,7 @@ NativeSceneAdapter::Population NativeSceneAdapter::PopulateGroup(const NativeSce
   // replaced. World changes are delivered separately by UpdateWorld events.
   std::sort(owners.begin(),owners.end());
   owners.erase(std::unique(owners.begin(),owners.end()),owners.end());
+  for(const auto owner:owners) owner_groups_[owner].insert(address);
   populated_groups_[address]={group->revision,geometry,capture.material,std::move(owners)};
   return result;
 }
@@ -189,16 +190,22 @@ uint64_t NativeSceneAdapter::Observe(const NativeSceneSources::Source& source,
 }
 void NativeSceneAdapter::Retire(uint32_t owner) {
   // Model replacement can keep the same source addresses and group revision.
-  std::erase_if(populated_groups_,[&](const auto& entry) {
-    return std::binary_search(entry.second.owners.begin(),entry.second.owners.end(),owner);
-  });
-  bool removed=false;
-  for(auto at=objects_.lower_bound(Key{owner,0,0,0});at!=objects_.end() && at->first[0]==owner;) {
-    scene_.Remove(at->second); at=objects_.erase(at); removed=true;
+  if(auto groups=owner_groups_.extract(owner)) for(const auto address:groups.mapped()) {
+    ++retire_checks_;
+    const auto found=populated_groups_.find(address);
+    if(found!=populated_groups_.end() &&
+       std::binary_search(found->second.owners.begin(),found->second.owners.end(),owner)) populated_groups_.erase(found);
   }
-  if(removed) Prune();
+  size_t removed=0;
+  for(auto at=objects_.lower_bound(Key{owner,0,0,0});at!=objects_.end() && at->first[0]==owner;++removed) {
+    scene_.Remove(at->second); at=objects_.erase(at);
+  }
+  // Expired weak indexes cost memory, never identity: every lookup locks them.
+  // A full scan per retired owner made loading quadratic, so amortize it.
+  if((retired_+=removed)>=4096) Prune();
 }
 void NativeSceneAdapter::Prune() {
+  retired_=0;
   std::erase_if(populated_groups_,[](const auto& entry) {
     return entry.second.geometry.expired() || entry.second.material.expired();
   });
