@@ -38,10 +38,12 @@ struct PostFinishRecord {
   float texel_x=0,texel_y=0; // +32/+36; 820B04B8 uses +32 as the blur step
 };
 // Where the three tone constants came from. No setter in 820B0B80's call tree
-// writes MiddleGray/LuminanceWhite/ToneMap, and their preset source is not
-// located; the audit supplies the values the previous audited frame observed
-// on the live native effect bindings.
-enum class PostToneSource:uint8_t { None, LivePreviousFrame };
+// writes MiddleGray/LuminanceWhite/ToneMap: they are shared parameters of the
+// effect pool [8257C02C], set by 820B1028 (defaults) and 820B5718 (environment
+// presets). The audit supplies the values the previous audited frame observed
+// on the live native effect bindings; the full-frame path reads the pool
+// itself each frame (native_full_frame_post.h).
+enum class PostToneSource:uint8_t { None, LivePreviousFrame, SharedPool };
 struct PostFinishInput {
   uint32_t self=0;
   int32_t screen_width=0,screen_height=0;

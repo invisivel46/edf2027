@@ -1,4 +1,11 @@
 #include "native_graphics/native_post_finish_plan.h"
+#include "native_graphics/native_full_frame_post.h"
+#include <algorithm>
+#include <bit>
+#include <cstring>
+#include <functional>
+#include <map>
+#include <span>
 #include <cmath>
 #include <iostream>
 #include <numbers>
@@ -308,6 +315,202 @@ void TestLogPolicy() {
   for(uint64_t n=1;n<=8;++n) CHECK(ShouldLogPostFinish(n));
   CHECK(!ShouldLogPostFinish(9) && !ShouldLogPostFinish(999) && ShouldLogPostFinish(1000) && ShouldLogPostFinish(2000));
 }
+
+// Full-frame post: the recorded draws are the plan, issued as bindings, with
+// the pool tone on every draw and the bloom last into the output.
+struct RecordingSink:NativePostSink {
+  std::vector<NativePostDraw> draws;
+  void Draw(const NativePostDraw& draw) override { draws.push_back(draw); }
+};
+NativePostTone Tone() {
+  NativePostTone tone;
+  tone.middle_gray={0.8f,0,0,1}; tone.luminance_white={1.5f,0,0,1}; tone.tone_map={0.8f,0,0,1};
+  tone.luminance_vector={0.6154f,0.7154f,0.0721f,1};
+  return tone;
+}
+bool SameFloats(const std::vector<float>& values,std::span<const float> expected) {
+  return values.size()==expected.size() && std::equal(values.begin(),values.end(),expected.begin(),
+    [](float a,float b) { return std::bit_cast<uint32_t>(a)==std::bit_cast<uint32_t>(b); });
+}
+void TestFullFrameRecording() {
+  const auto input=Input();
+  const auto tone=Tone();
+  RecordingSink sink;
+  const auto frame=RecordNativePost(sink,input,tone);
+  auto planned_input=input; planned_input.tone=tone.Scalars();
+  const auto plan=BuildPostFinishPlan(planned_input);
+  // 5 first-pyramid reductions, Mono + 4 second-pyramid ones, Tone, BlurH, BlurV, then the bloom.
+  CHECK(sink.draws.size()==14 && plan.passes.size()==14 && frame.draws.size()==14);
+  const std::array<PostPassKind,14> kinds{PostPassKind::Downsample,PostPassKind::Downsample,PostPassKind::Downsample,
+    PostPassKind::Downsample,PostPassKind::Downsample,PostPassKind::Mono,PostPassKind::Downsample,PostPassKind::Downsample,
+    PostPassKind::Downsample,PostPassKind::DownsampleTone,PostPassKind::Tone,PostPassKind::BlurHorizontal,
+    PostPassKind::BlurVertical,PostPassKind::Bloom};
+  for(size_t p=0;p<std::min(sink.draws.size(),plan.passes.size());++p) {
+    const auto& draw=sink.draws[p];
+    const auto& pass=plan.passes[p];
+    CHECK(draw.kind==kinds[p] && draw.kind==pass.kind && draw.pass==p);
+    CHECK(draw.target==pass.target && draw.target_texture==pass.target_texture);
+    CHECK(draw.width==pass.target_width && draw.height==pass.target_height);
+    CHECK(draw.technique==pass.technique && draw.quad==*pass.quad);
+    CHECK(draw.output==(p+1==plan.passes.size()));
+    // Every setter of the plan is a binding of the draw, with its exact value.
+    size_t vectors=0,samplers=0;
+    for(const auto& setter:pass.setters) switch(setter.kind) {
+      case PostSetterKind::Vectors: {
+        ++vectors;
+        const auto* constant=FindPostConstant(draw,setter.name.c_str());
+        CHECK(constant && SameFloats(constant->values,setter.values));
+        break;
+      }
+      case PostSetterKind::Texture: {
+        const auto* texture=FindPostTexture(draw,setter.name.c_str());
+        CHECK(texture && texture->handle==setter.texture);
+        break;
+      }
+      case PostSetterKind::Sampler:
+        ++samplers;
+        CHECK(std::any_of(draw.samplers.begin(),draw.samplers.end(),[&](const auto& s) {
+          return s.name==setter.name && s.words==setter.words && s.value==setter.values[0]; }));
+        break;
+    }
+    CHECK(draw.samplers.size()==samplers && draw.constants.size()==vectors+4);
+    // The pool tone, as float4, on every draw.
+    for(const auto& [name,value]:{std::pair{kPostMiddleGray,tone.middle_gray},std::pair{kPostLuminanceWhite,tone.luminance_white},
+                                  std::pair{kPostToneMap,tone.tone_map},std::pair{kPostLuminanceVector,tone.luminance_vector}}) {
+      const auto* constant=FindPostConstant(draw,name);
+      CHECK(constant && SameFloats(constant->values,value));
+    }
+  }
+  // Chain wiring: each reduction reads the previous record; the history reads itself.
+  const auto& d=sink.draws;
+  CHECK(FindPostTexture(d[0],kPostDiffuse0)->handle==input.scene_texture);
+  for(size_t k=1;k<5;++k) CHECK(FindPostTexture(d[k],kPostDiffuse0)->handle==input.first[k-1].texture);
+  CHECK(FindPostTexture(d[5],kPostDiffuse0)->handle==input.first[4].texture && d[5].target==input.second[0].address);
+  CHECK(FindPostTexture(d[9],kPostOldTone)->handle==d[9].target_texture && d[9].target==input.second[4].address);
+  CHECK(FindPostTexture(d[10],kPostTone)->handle==input.second[4].texture && d[10].target==input.blur.address);
+  CHECK(FindPostTexture(d[11],kPostDiffuse0)->handle==input.blur.texture && FindPostTexture(d[12],kPostDiffuse0)->handle==input.blur.texture);
+  CHECK(d[12].target==input.blur_vertical.address);
+  CHECK(FindPostTexture(d[13],kPostDiffuse0)->handle==input.scene_texture);
+  CHECK(FindPostTexture(d[13],kPostDiffuse1)->handle==input.blur_vertical.texture);
+  CHECK(FindPostTexture(d[13],kPostTone)->handle==input.second[4].texture);
+  CHECK(d[13].target==0 && d[13].width==1280 && d[13].height==720);
+  // Constants derived from the plan: sizes, offsets and the blur kernel.
+  CHECK(SameFloats(FindPostConstant(d[0],kPostDownsampleOffset)->values,PostDownsampleOffsets(1280,720)));
+  CHECK(SameFloats(FindPostConstant(d[4],kPostDownsampleOffset)->values,PostDownsampleOffsets(80,45)));
+  CHECK(SameFloats(FindPostConstant(d[5],kPostDownsampleOffset)->values,PostDownsampleOffsets(40,22)));
+  CHECK(SameFloats(FindPostConstant(d[11],kPostBlurOffset)->values,PostBlurTaps(input.first[4].texel_x,false)));
+  CHECK(SameFloats(FindPostConstant(d[12],kPostBlurOffset)->values,PostBlurTaps(input.first[4].texel_x,true)));
+  CHECK(d[13].quad==PostDownsampleQuad(1280,720));
+  CHECK(frame.plan.tone && (*frame.plan.tone==std::array<float,3>{0.8f,1.5f,0.8f}) && frame.plan.tone_source==PostToneSource::SharedPool);
+  // A nonfinite tone or a plan without the bloom is refused before anything is drawn.
+  auto bad=tone; bad.tone_map[0]=NAN;
+  RecordingSink refused;
+  bool threw=false;
+  try { RecordNativePost(refused,input,bad); } catch(const std::runtime_error&) { threw=true; }
+  CHECK(threw && refused.draws.empty());
+  auto truncated=plan; truncated.passes.pop_back(); threw=false;
+  try { BuildNativePostFrame(truncated,tone); } catch(const std::runtime_error&) { threw=true; }
+  CHECK(threw);
+}
+
+// Synthetic guest memory: big-endian regions.
+class SyntheticMemory final:public PostGuestMemory {
+ public:
+  SyntheticMemory() { regions_[0x82570000u].resize(0x10000); regions_[0x40000000u].resize(0x10000); }
+  const uint8_t* Bytes(uint32_t address,size_t size) const override {
+    for(const auto& [base,bytes]:regions_)
+      if(address>=base && size_t(address-base)+size<=bytes.size()) return bytes.data()+(address-base);
+    throw std::runtime_error("unmapped synthetic read");
+  }
+  uint8_t* At(uint32_t address,size_t size) { return const_cast<uint8_t*>(Bytes(address,size)); }
+  void Put(uint32_t address,uint32_t value) { auto* p=At(address,4); for(int b=0;b<4;++b) p[b]=uint8_t(value>>(24-b*8)); }
+  void PutFloat(uint32_t address,float value) { Put(address,std::bit_cast<uint32_t>(value)); }
+  void PutByte(uint32_t address,uint8_t value) { *At(address,1)=value; }
+  // 820A62E8 string: inline below 16, else a pointer to `text`.
+  void PutString(uint32_t string,uint32_t text,const std::string& value) {
+    const auto size=uint32_t(value.size());
+    const auto data=size>=16?text:string+4;
+    std::memcpy(At(data,size),value.data(),size);
+    if(size>=16) Put(string+4,text);
+    Put(string+20,size); Put(string+24,size>=16?size:15);
+  }
+ private:
+  std::map<uint32_t,std::vector<uint8_t>> regions_;
+};
+// MSVC map: head (isnil) with the root at +4; leaves point at the head.
+void BuildPool(SyntheticMemory& memory,const std::vector<std::pair<std::string,std::array<float,4>>>& entries) {
+  using T=PostToneLayout;
+  constexpr uint32_t kPool=0x40000100u,kHead=0x40000200u,kNodes=0x40001000u,kNodeSize=0x100u;
+  memory.Put(T::kPoolGlobal,kPool); memory.Put(kPool+T::kPoolHead,kHead); memory.PutByte(kHead+T::kNodeIsNil,1);
+  auto sorted=entries;
+  std::sort(sorted.begin(),sorted.end(),[](const auto& a,const auto& b) { return a.first<b.first; });
+  uint32_t next=kNodes;
+  const std::function<uint32_t(size_t,size_t)> build=[&](size_t begin,size_t end)->uint32_t {
+    if(begin>=end) return kHead;
+    const size_t middle=(begin+end)/2;
+    const auto node=next; next+=kNodeSize;
+    memory.PutByte(node+T::kNodeIsNil,0);
+    memory.PutString(node+T::kNodeKey,node+0x80,sorted[middle].first);
+    memory.Put(node+T::kNodeValue+T::kValueData,node+0xC0); memory.Put(node+T::kNodeValue+T::kValueCount,1);
+    for(uint32_t c=0;c<4;++c) memory.PutFloat(node+0xC0+c*4,sorted[middle].second[c]);
+    memory.Put(node+T::kNodeLeft,build(begin,middle));
+    memory.Put(node+T::kNodeRight,build(middle+1,end));
+    return node;
+  };
+  memory.Put(kHead+T::kNodeParent,build(0,sorted.size()));
+}
+void TestToneSource() {
+  using T=PostToneLayout;
+  SyntheticMemory memory;
+  // 820B1028's defaults beside other shared parameters, short (inline) keys included.
+  BuildPool(memory,{{"g_FogColor",{0.1f,0.2f,0.3f,1}},{"g_FogParam",{1,2,3,4}},{"g_LightVector",{0,-1,0,1}},
+    {kPostMiddleGray,{0.8f,0,0,1}},{kPostLuminanceWhite,{1.5f,0,0,1}},{kPostToneMap,{0.8f,0,0,1}},
+    {kPostLuminanceVector,{0.6154f,0.7154f,0.0721f,1}},{"g_PostEffect_MiddleGrayX",{9,9,9,9}},{"g_ShadowArea1",{5,6,7,8}}});
+  const auto tone=ReadNativePostTone(memory);
+  CHECK(tone.origin==NativePostToneOrigin::Pool);
+  CHECK((tone.middle_gray==std::array<float,4>{0.8f,0,0,1}) && (tone.luminance_white==std::array<float,4>{1.5f,0,0,1}));
+  CHECK((tone.tone_map==std::array<float,4>{0.8f,0,0,1}) && (tone.luminance_vector==std::array<float,4>{0.6154f,0.7154f,0.0721f,1}));
+  CHECK((ReadPostPoolVector(memory,"g_FogColor")==std::array<float,4>{0.1f,0.2f,0.3f,1}));
+  CHECK((ReadPostPoolVector(memory,"g_PostEffect_MiddleGrayX")==std::array<float,4>{9,9,9,9}));
+  // Prefix, suffix and absent names are not matches (821A1EB0's second compare).
+  CHECK(!ReadPostPoolVector(memory,"g_PostEffect_Middle"));
+  CHECK(!ReadPostPoolVector(memory,"g_Absent") && !ReadPostPoolVector(memory,"zzz") && !ReadPostPoolVector(memory,""));
+  // The value is re-read each call: a preset change shows on the next frame.
+  BuildPool(memory,{{kPostMiddleGray,{0.5f,0,0,1}},{kPostLuminanceWhite,{1.5f,0,0,1}},{kPostToneMap,{1,0,0,1}},
+    {kPostLuminanceVector,{0.6154f,0.7154f,0.0721f,1}}});
+  CHECK(ReadNativePostTone(memory).Scalars()==(std::array<float,3>{0.5f,1.5f,1.0f}));
+  // Before 820B1028 registers them, the tone is refused, not guessed.
+  BuildPool(memory,{{kPostMiddleGray,{0.5f,0,0,1}},{kPostToneMap,{1,0,0,1}}});
+  bool threw=false;
+  try { ReadNativePostTone(memory); } catch(const std::runtime_error&) { threw=true; }
+  CHECK(threw);
+  BuildPool(memory,{{kPostMiddleGray,{NAN,0,0,1}},{kPostLuminanceWhite,{1.5f,0,0,1}},{kPostToneMap,{1,0,0,1}},
+    {kPostLuminanceVector,{0.6154f,0.7154f,0.0721f,1}}});
+  threw=false;
+  try { ReadNativePostTone(memory); } catch(const std::runtime_error&) { threw=true; }
+  CHECK(threw);
+  // 820B5718's preset: table+[table+28]+index*172, fields +108/+112/+116/+120.
+  constexpr uint32_t kManager=0x40008000u,kTable=0x40009000u,kBase=0x40;
+  memory.Put(T::kManagerGlobal,kManager); memory.Put(kManager+T::kManagerTable,kTable);
+  memory.Put(kTable+T::kTableCount,8); memory.Put(kTable+T::kTableBase,kBase);
+  for(uint32_t i=0;i<8;++i) {
+    const auto preset=kTable+kBase+i*T::kPresetStride;
+    memory.PutFloat(preset+T::kPresetMiddleGray,0.5f+0.1f*float(i));
+    memory.PutFloat(preset+T::kPresetLuminanceWhite,1.5f);
+    memory.PutFloat(preset+T::kPresetToneMap,1.0f-0.05f*float(i));
+    for(uint32_t c=0;c<3;++c) memory.PutFloat(preset+T::kPresetLuminanceVector+c*4,0.25f*float(c+1));
+    memory.PutFloat(preset+T::kPresetLuminanceVector+12,7.0f); // not read: 820B5718 stores 1.0
+  }
+  const auto preset=ReadNativePostTonePreset(memory,4);
+  CHECK(preset.origin==NativePostToneOrigin::Preset);
+  CHECK((preset.middle_gray==std::array<float,4>{0.5f+0.1f*4.0f,0,0,1}) && (preset.luminance_white==std::array<float,4>{1.5f,0,0,1}));
+  CHECK((preset.tone_map==std::array<float,4>{1.0f-0.05f*4.0f,0,0,1}) && (preset.luminance_vector==std::array<float,4>{0.25f,0.5f,0.75f,1}));
+  for(const uint32_t index:{8u,0xFFFFFFFFu}) {
+    threw=false;
+    try { ReadNativePostTonePreset(memory,index); } catch(const std::runtime_error&) { threw=true; }
+    CHECK(threw);
+  }
+}
 }
 
 int main() {
@@ -319,6 +522,8 @@ int main() {
   TestIssue();
   TestMode();
   TestLogPolicy();
+  TestFullFrameRecording();
+  TestToneSource();
   if(failures) std::cerr<<failures<<" post finish plan failures\n";
   else std::cout<<"post finish plan tests passed\n";
   return failures?1:0;

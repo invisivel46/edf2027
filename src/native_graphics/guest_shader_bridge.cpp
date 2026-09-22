@@ -88,6 +88,7 @@
 #include "native_capture_policy.h"
 #include "native_ab_alternate.h"
 #include "native_post_finish_plan.h"
+#include "native_full_frame_post.h"
 #include "native_constant_ownership.h"
 #include "immediate_mesh_key.h"
 #include "d3d11_bindings.h"
@@ -3810,6 +3811,210 @@ REX_HOOK_RAW(sub_821A8F20) {
   }
   run->bloom_attempted=true;
   if(!edf::native::IssueNativePostBloom(ctx,base,*run)) __imp__sub_821A8F20(ctx,base);
+}
+// Full-frame post: the finish stage 820B0B80 with zero guest calls. The pure
+// half (tone source, plan -> draws) is native_full_frame_post.cpp; this is its
+// sink. Guest memory is only read here: no guest function runs, no device
+// mirror is written, and the target scopes 821B8828/821B88B0 and activations
+// 821B94E8 are replaced by the native target stack and named bindings.
+namespace edf::native {
+namespace {
+class GuestPostMemory final:public PostGuestMemory {
+ public:
+  explicit GuestPostMemory(const GuestReader& reader):reader_(reader) {}
+  const uint8_t* Bytes(uint32_t address,size_t size) const override { return reader_.Bytes(address,size); }
+ private:
+  const GuestReader& reader_;
+};
+struct FullFramePostStats { uint64_t frames=0,draws=0,failures=0,uninitialized=0,fallback_samplers=0; };
+FullFramePostStats& FullPostStats() { static FullFramePostStats stats; return stats; }
+// Clamped point or linear, one mip. Only where the pixel bindings hold no
+// sampler from a guest-activated frame (see NativePostSampler).
+NativeBackendSampler* FullPostSampler(Bridge& state,bool point) {
+  auto& backend=EnsureSceneBackendLocked(state);
+  static std::map<std::pair<const NativeRenderBackend*,bool>,NativeBackendSampler*> cache;
+  auto& cached=cache[{&backend,point}];
+  if(!cached) {
+    NativeBackendSamplerDesc desc{};
+    desc.min=desc.mag=point?NativeBackendFilter::Point:NativeBackendFilter::Linear; desc.mip=NativeBackendFilter::Point;
+    desc.u=desc.v=desc.w=NativeBackendAddress::Clamp; desc.max_lod=0;
+    cached=&backend.CreateSampler(desc);
+  }
+  return cached;
+}
+// The engine's big-endian float4 register stream, as the setters leave it.
+std::vector<uint8_t> GuestFloatBytes(std::span<const float> values) {
+  std::vector<uint8_t> bytes(values.size()*4);
+  for(size_t i=0;i<values.size();++i) {
+    const auto bits=std::bit_cast<uint32_t>(values[i]);
+    for(size_t b=0;b<4;++b) bytes[i*4+b]=uint8_t(bits>>(24-b*8));
+  }
+  return bytes;
+}
+// Called with the submission and registry locks held.
+class BridgePostSink final:public NativePostSink {
+ public:
+  BridgePostSink(Bridge& state,const GuestReader& reader,uint32_t owner,uint32_t device,float center)
+    : state_(state),reader_(reader),owner_(owner),device_(device),center_(center) {}
+  void Draw(const NativePostDraw& draw) override {
+    auto& state=state_;
+    // Technique -> pass (+108) -> shader handles, as ObserveActivation reads them.
+    const auto pass=reader_.Word(reader_.Add(draw.technique,108));
+    const auto vertex=reader_.Word(reader_.Word(pass));
+    const auto pixel=reader_.Word(reader_.Add(reader_.Word(reader_.Add(pass,4)),4));
+    const auto vs_found=state.shaders.find(vertex),ps_found=state.shaders.find(pixel);
+    if(vs_found==state.shaders.end() || ps_found==state.shaders.end())
+      throw std::runtime_error(std::format("{} technique {:#x} shaders {:#x}/{:#x} are not registered natively",
+        PostPassName(draw.kind),draw.technique,vertex,pixel));
+    auto& vs=VertexBindingsForDraw(vs_found->second,false);
+    auto& ps=*ps_found->second.bindings;
+    NativeRenderTarget* target=nullptr;
+    if(draw.output) target=&state.scenes.at(owner_).output;
+    else {
+      const auto found=state.render_targets.find(draw.target);
+      if(found==state.render_targets.end())
+        throw std::runtime_error(std::format("pass {} ({}) target {:#x} is not a registered native target",draw.pass,PostPassName(draw.kind),draw.target));
+      if(found->second.texture_handle!=draw.target_texture)
+        throw std::runtime_error(std::format("pass {} ({}) target {:#x} texture {:#x}, planned {:#x}",draw.pass,PostPassName(draw.kind),
+          draw.target,found->second.texture_handle,draw.target_texture));
+      target=&found->second.native;
+    }
+    if(int64_t(target->sampled.width)!=draw.width || int64_t(target->sampled.height)!=draw.height)
+      throw std::runtime_error(std::format("pass {} ({}) target is {}x{}, planned {}x{}",draw.pass,PostPassName(draw.kind),
+        target->sampled.width,target->sampled.height,draw.width,draw.height));
+    // Constants by name: a name the native compiler optimized out is skipped.
+    for(const auto& constant:draw.constants) ps.SetGuestFloatRegisters(constant.name,GuestFloatBytes(constant.values));
+    // Textures and samplers by name. A sampler the bindings already hold was
+    // decoded from the guest's own sampler words on a guest-activated frame and
+    // is kept; otherwise 821BCF28's records (words 0) get point and the rest
+    // linear, both clamped.
+    std::vector<std::pair<const NativePostTexture*,NativeBackendSampler*>> inputs;
+    for(const auto& texture:draw.textures) {
+      auto* sampler=ps.ReadSampler(texture.name);
+      if(!sampler) {
+        const bool point=std::any_of(draw.samplers.begin(),draw.samplers.end(),[&](const auto& s) {
+          return s.name==texture.name && s.words==std::array<uint32_t,3>{}; });
+        sampler=FullPostSampler(state,point); ++FullPostStats().fallback_samplers;
+      }
+      inputs.emplace_back(&texture,sampler);
+    }
+    ps.BeginResourceUpdate();
+    try {
+      for(const auto& [texture,sampler]:inputs) {
+        // Unresolved history (the first frame's m_OldTone) binds nothing, and
+        // CanInitializeReductionTarget then leaves the target invalid.
+        const auto found=state.textures.find(texture->handle);
+        const std::shared_ptr<NativeBackendTexture> missing;
+        const auto& view=found==state.textures.end() || !found->second.content_valid ? missing : found->second.backend;
+        if(!ps.TrySetTexture(texture->name,view)) continue;
+        if(!ps.TrySetSampler(texture->name,sampler)) throw std::runtime_error("native post sampler has no binding: "+texture->name);
+      }
+      ps.EndResourceUpdate();
+    } catch(...) { ps.ClearTextures(); ps.ClearSamplers(); throw; }
+    // The tone history reads its own previous resolve (m_OldTone), as the guest does.
+    if(draw.kind!=PostPassKind::DownsampleTone && SamplesTarget(ps,*target))
+      throw std::runtime_error(std::format("pass {} ({}) samples its own target",draw.pass,PostPassName(draw.kind)));
+    // The target scope 821B8828 would open, on the native stack only.
+    struct Scope {
+      Bridge& state; bool open=false; uint32_t target=0;
+      ~Scope() {
+        if(!open) return;
+        state.active_target=state.target_stack.back().second; state.target_stack.pop_back();
+        BindActiveTarget(state);
+      }
+    } scope{state};
+    if(draw.output) { state.active_target=0; state.active_scene=0; state.active_output=owner_; }
+    else {
+      state.target_stack.emplace_back(draw.target,state.active_target); state.active_target=draw.target;
+      scope.open=true; scope.target=draw.target;
+    }
+    BindActiveTarget(state);
+    const auto vertices=GuestFloatBytes(draw.quad);
+    const auto viewport=MakeNativeViewport(0,0,uint32_t(draw.width),uint32_t(draw.height),0,1,false,{0,0,0,0});
+    const bool initialized=CanInitializeReductionTarget(vs.shader(),ps.shader(),vertices,viewport,kNativeOpaqueCopyState,
+      uint32_t(draw.width),uint32_t(draw.height),ps.HasAllTextureInputs());
+    auto shifted=viewport;
+    if(initialized && center_!=0.f) { shifted.viewport.TopLeftX+=center_; shifted.viewport.TopLeftY+=center_; }
+    auto& quads=vs_found->second.quads;
+    if(!quads) quads=std::make_unique<QuadStream>(state.device.Get(),vs.shader());
+    auto& recorder=RecordDrawSetup(state,reader_,device_,{vs,ps,shifted,kNativeOpaqueCopyState,
+      QuadStream::Layout(),kNativeQuadLayoutId,uint64_t(vertex)<<1,pixel,NativeBackendTopology::TriangleList});
+    quads->Draw(EnsureSceneBackendLocked(state),recorder,vertices);
+    target->content_valid=initialized;
+    if(!initialized) ++FullPostStats().uninitialized;
+    ++FullPostStats().draws;
+    if(draw.output) return;
+    // The resolve 821B88B0 would perform: EndRenderTarget's, on the recorder.
+    if(state.context) {
+      ID3D11ShaderResourceView* empty[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT]{};
+      state.context->PSSetShaderResources(0,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,empty);
+      state.context->VSSetShaderResources(0,D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT,empty);
+    }
+    auto& registered=state.render_targets.at(draw.target);
+    ResolveNativeRenderTarget(SceneRecorderLocked(state),registered.native);
+    ++state.bind_generation;
+    state.recorded={};
+    state.textures.insert_or_assign(registered.texture_handle,registered.native.sampled);
+  }
+ private:
+  Bridge& state_;
+  const GuestReader& reader_;
+  uint32_t owner_,device_;
+  float center_;
+};
+}
+bool RecordNativeFullFramePost(uint8_t* base,uint32_t self,bool resolve_scene,std::string* error) {
+  auto& stats=FullPostStats();
+  try {
+    if(!EDF_NATIVE_FLAG(shader_bridge) || !EDF_NATIVE_FLAG(seam_draws))
+      throw std::runtime_error("the full-frame post needs the shader bridge and recorded (seam) draws");
+    const GuestReader reader(base);
+    const GuestPostMemory memory(reader);
+    const auto owner=reader.Word(PostFinishLayout::kOwnerGlobal);
+    auto& state=State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto found=state.scenes.find(owner);
+    if(found==state.scenes.end()) throw std::runtime_error(std::format("screen owner {:#x} has no native scene",owner));
+    auto& scene=found->second;
+    // The 8219C930 hook, mode 1: close the scene and resolve it to owner+104.
+    if(resolve_scene) {
+      if(state.active_scene==owner) { state.active_scene=0; BindActiveTarget(state); }
+      ResolveScene(reader,state,owner);
+    }
+    const auto input=reader.Word(reader.Add(owner,PostFinishLayout::kOwnerSceneTexture));
+    if(const auto resolved=state.textures.find(input);resolved==state.textures.end() || !resolved->second.content_valid)
+      throw std::runtime_error(std::format("HDR scene texture {:#x} is not resolved",input));
+    // Its ordinary output, as the hook's tail creates it: owner+112.
+    const auto surface=reader.Word(reader.Add(owner,112));
+    const auto& creation=state.surface_creations.at(surface);
+    if(creation.msaa || creation.width!=scene.color.sampled.width || creation.height!=scene.color.sampled.height ||
+       (creation.format!=0x1a220186 && creation.format!=0x18280186))
+      throw std::runtime_error("unsupported ordinary output surface contract");
+    if(scene.output_surface!=surface || !scene.output.backend_surface) {
+      scene.output=CreateNativeRenderTarget(EnsureSceneBackendLocked(state),creation.width,creation.height,DXGI_FORMAT_R8G8B8A8_UNORM);
+      scene.output_surface=surface;
+    }
+    scene.output.content_valid=false;
+    const auto device=reader.Word(reader.Add(owner,8));
+    const float center=REXCVAR_GET(edf_native_pixel_centers) ? GuestPixelCenterOffset(ReadVertexCenterWord(reader,device)) : 0.f;
+    BridgePostSink sink(state,reader,owner,device,center);
+    const auto frame=RecordNativePost(sink,memory,self);
+    // Leave the composite as the active ordinary output: the end-frame
+    // publication (8219C840 hook) presents it.
+    state.active_target=0; state.active_scene=0; state.active_output=owner;
+    BindActiveTarget(state);
+    if(ShouldLogPostFinish(++stats.frames))
+      REXLOG_INFO("Native full-frame post: frames={}, draws={}, owner={:#x}, tone={},{},{}, uninitialized={}, fallback_samplers={}, failures={}",
+        stats.frames,frame.draws.size(),owner,frame.tone.middle_gray[0],frame.tone.luminance_white[0],frame.tone.tone_map[0],
+        stats.uninitialized,stats.fallback_samplers,stats.failures);
+    return true;
+  } catch(const std::exception& failure) {
+    if(ShouldLogPostFinish(++stats.failures)) REXLOG_ERROR("Native full-frame post: {} (failures={})",failure.what(),stats.failures);
+    if(error) *error=failure.what();
+    return false;
+  }
+}
 }
 // Observers for the finish audit. Each records only while an audited 820B0B80
 // is on this thread's stack, and only for the post owner's own effects,
