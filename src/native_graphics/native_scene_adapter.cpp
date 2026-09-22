@@ -40,6 +40,10 @@ NativeSceneAdapter::Population NativeSceneAdapter::PopulateGroup(const NativeSce
   Population result;
   const auto* group=sources.FindGroup(address);
   if(!group || !geometry || !capture.material || geometry->backend()!=capture.material->backend()) return result;
+  // Callers resolve a fresh capture every frame. Intern it first so that an
+  // unchanged material compares identical to the one recorded below; comparing
+  // the fresh object re-populated every part of every group on every frame.
+  capture.material=InternMaterial(std::move(capture.material));
   const auto prior=populated_groups_.find(address);
   if(prior!=populated_groups_.end() && prior->second.revision==group->revision &&
      prior->second.geometry.lock()==geometry && prior->second.material.lock()==capture.material) return result;
@@ -155,22 +159,25 @@ std::shared_ptr<const NativeIndexedMesh::RetainedDraw> NativeSceneAdapter::Retai
   }
   return geometry;
 }
+std::shared_ptr<const NativeSceneMaterial> NativeSceneAdapter::InternMaterial(
+    std::shared_ptr<const NativeSceneMaterial> material) {
+  auto& candidates=materials_[material->fingerprint()];
+  for(auto at=candidates.begin();at!=candidates.end();) {
+    const auto existing=at->lock();
+    if(!existing) { at=candidates.erase(at); continue; }
+    if(existing==material || existing->Equivalent(*material)) return existing;
+    ++at;
+  }
+  candidates.push_back(material);
+  return material;
+}
 uint64_t NativeSceneAdapter::Observe(const NativeSceneSources::Source& source,
     std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry,NativeSceneMaterialCapture capture) {
   if(!source.generation || !source.owner || !geometry || !capture.material ||
      geometry->backend()!=capture.material->backend())
     throw std::runtime_error("native scene observation has no compatible retained assets/lifetime");
   if((++observations_&4095)==0) Prune();
-  auto& candidates=materials_[capture.material->fingerprint()];
-  for(auto at=candidates.begin();at!=candidates.end();) {
-    const auto existing=at->lock();
-    if(!existing) { at=candidates.erase(at); continue; }
-    if(existing==capture.material || existing->Equivalent(*capture.material)) { capture.material=existing; break; }
-    ++at;
-  }
-  bool indexed=false;
-  for(const auto& candidate:candidates) if(candidate.lock()==capture.material) { indexed=true; break; }
-  if(!indexed) candidates.push_back(capture.material);
+  capture.material=InternMaterial(std::move(capture.material));
   NativeSceneObject object; object.geometry=std::move(geometry);
   object.material=std::move(capture.material); object.world=capture.world;
   const Key key{source.owner,source.generation,source.lod,source.part};

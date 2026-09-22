@@ -127,5 +127,8 @@ class NativeSceneAdapter {
   std::map<uint32_t,PopulatedGroup> populated_groups_;
   uint64_t observations_=0;
   void Prune();
+  // Returns the retained material equivalent to this one, registering it if
+  // there is none, so that equal materials share one object.
+  std::shared_ptr<const NativeSceneMaterial> InternMaterial(std::shared_ptr<const NativeSceneMaterial> material);
 };
 }
