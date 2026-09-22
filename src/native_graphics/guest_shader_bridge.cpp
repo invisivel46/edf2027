@@ -76,6 +76,7 @@
 #include "native_model_pose_history.h"
 #include "native_profile_result.h"
 #include "native_capture_policy.h"
+#include "native_ab_alternate.h"
 #include "native_constant_ownership.h"
 #include "immediate_mesh_key.h"
 #include "d3d11_bindings.h"
@@ -4401,7 +4402,24 @@ REX_HOOK_RAW(sub_821C0C00) {
 }
 REXCVAR_DEFINE_BOOL(edf_native_frame_dispatch,false,"EDF2027",
   "Own outer render phase dispatch in native code; remaining phase callbacks are retained.");
+REXCVAR_DEFINE_INT32(edf_native_ab_alternate,0,"EDF2027",
+  "A/B diagnostics: alternate guest and native passes in runs of N indexed output frames from the capture start frame; odd runs are native, 0 off (development)").range(0,1000);
 REX_HOOK_RAW(sub_821A5080) {
+  bool ab_native=true;
+  if(const auto ab_period=REXCVAR_GET(edf_native_ab_alternate); ab_period>0) {
+    uint64_t frame=0;
+    {
+      auto& state=edf::native::State();
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      frame=state.indexed_output_frames+1;
+    }
+    ab_native=edf::native::AbSide(frame,REXCVAR_GET(edf_native_output_capture_start_frame),ab_period);
+    static std::atomic<uint64_t> ab_logged=0;
+    if(ab_logged.exchange(frame,std::memory_order_relaxed)!=frame)
+      REXLOG_INFO("ab_alternate frame={} native={}",frame,ab_native?1:0);
+  }
+  const edf::native::NativeAbSideLatch ab_latch(ab_native);
   edf::native::NativeSceneQueues queues;
   struct RestoreSceneQueues {
     uint32_t animation_owner=edf::native::native_scene_animation_owner;
