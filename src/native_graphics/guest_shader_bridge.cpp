@@ -3659,9 +3659,19 @@ REX_HOOK_RAW(sub_820B4310) {
     // The static opaque world pass: native groups in published order, guest
     // 821D96D8 per unsupported group, original 821C3BB8 when no order applies.
     // edf_native_ab_alternate latches a guest side on alternate frames for image A/B.
-    if(edf::native::NativeStaticWorldPassEnabled() && edf::native::NativeAbNativeSide())
-      edf::native::RenderNativeStaticWorldPass(work,base,owner);
-    else { work.r3.u64=reader.Add(owner,240); work.lr=0x820B434C; sub_821C3BB8(work,base); }
+    // A throw must never unwind through guest code: the pass is switched off for
+    // the rest of the run and this frame's groups go to the original walk.
+    static std::atomic<bool> world_pass_failed=false;
+    bool drawn=false;
+    if(!world_pass_failed.load(std::memory_order_relaxed) &&
+       edf::native::NativeStaticWorldPassEnabled() && edf::native::NativeAbNativeSide()) {
+      try { edf::native::RenderNativeStaticWorldPass(work,base,owner); drawn=true; }
+      catch(const std::exception& error) {
+        if(!world_pass_failed.exchange(true))
+          REXLOG_ERROR("Native static world pass disabled after failure: {}",error.what());
+      }
+    }
+    if(!drawn) { work.r3.u64=reader.Add(owner,240); work.lr=0x820B434C; sub_821C3BB8(work,base); }
   } else __imp__sub_820B4310(ctx,base);
 }
 REX_EXTERN(__imp__sub_820B5FA8);
@@ -11395,12 +11405,21 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
       NativeQueuedSceneGroup batch;
       batch.targets=cursor.targets;
       const auto draws=state.scene_native_draws;
-      for(auto& result:resolved) {
-        if(!batch.objects.empty() && (batch.view.view!=result.view.view || batch.view.projection!=result.view.projection ||
-           batch.view.view_projection!=result.view.view_projection)) FlushNativeQueuedSceneLocked(state,batch);
-        batch.view=result.view; batch.objects.push_back(std::move(result.object));
+      try {
+        for(auto& result:resolved) {
+          if(!batch.objects.empty() && (batch.view.view!=result.view.view || batch.view.projection!=result.view.projection ||
+             batch.view.view_projection!=result.view.view_projection)) FlushNativeQueuedSceneLocked(state,batch);
+          batch.view=result.view; batch.objects.push_back(result.object);
+        }
+        FlushNativeQueuedSceneLocked(state,batch);
       }
-      FlushNativeQueuedSceneLocked(state,batch);
+      catch(const std::exception& error) {
+        // Nothing of this group is owed to the guest yet: hand its selections back.
+        report(error.what());
+        ++state.bind_generation; state.recorded={};
+        for(auto at=instances.rbegin();at!=instances.rend();++at) queues->Push(group,*at);
+        return F::Instance;
+      }
       ++state.bind_generation;
       batches=batch.execution.recordings();
       counters.draws+=state.scene_native_draws-draws;
