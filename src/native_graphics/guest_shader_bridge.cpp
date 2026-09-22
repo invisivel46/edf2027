@@ -904,9 +904,6 @@ struct Bridge {
   // Full-frame pass frames (models, sky) whose snapshots a recording uses;
   // released with scene_recorded_snapshots at submission.
   std::vector<std::shared_ptr<const void>> scene_recorded_frames;
-  // edf_native_full_frame: the renderable registry's latest tick snapshot.
-  // Empty until the registry producer publishes one.
-  std::shared_ptr<const NativeRenderRegistrySnapshot> render_registry=std::make_shared<const NativeRenderRegistrySnapshot>();
   uint64_t scene_native_objects=0,scene_native_draws=0,scene_native_fallbacks=0;
   uint64_t scene_native_direct_instances=0,scene_native_direct_retries=0;
   uint64_t scene_native_direct_worlds=0;
@@ -5862,8 +5859,8 @@ struct NativeFullFrameModelsShared {
 // recorded here, the transparent ones (bucket-key order) by the Transparent
 // pass. Program and geometry come from the model pass caches
 // (NativeModelPassProgramLocked / NativeModelGeometryLocked); guest memory is
-// read, never called. The registry producer is not in yet: until it publishes,
-// the snapshot is empty and this records nothing.
+// read, never called. The snapshot is the render registry's (fed on with the full
+// frame); before its first tick there is none and this records nothing.
 class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
  public:
   NativeFullFrameModelsPass(uint8_t* base,std::shared_ptr<NativeFullFrameModelsShared> shared)
@@ -6136,8 +6133,10 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
       edf::native::native_scene_publication=state.scene_adapter.AcquirePublication();
       edf::native::native_scene_pass_cameras=EDF_NATIVE_FLAG(scene_camera_owned)?state.scene_adapter.AcquireCameras():nullptr;
       edf::native::native_scene_pass_animations=state.scene_adapter.AcquireWorldAnimations();
-      registry=state.render_registry;
     }
+    // The renderable registry's latest tick (edf_native_render_registry, and
+    // always with the full frame); null before its first tick.
+    registry=edf::native::RenderRegistry().AcquireSnapshot();
     return {edf::native::native_scene_publication,edf::native::native_scene_pass_cameras,
       edf::native::native_scene_pass_animations,native_render_publication,std::move(registry)};
   }
@@ -6845,11 +6844,11 @@ REX_EXTERN(__imp__sub_821C2090);
 REX_HOOK_RAW(sub_821C2090) {
   const uint32_t object=ctx.r3.u32;
   __imp__sub_821C2090(ctx,base);
-  if(REXCVAR_GET(edf_native_render_registry)) edf::native::RenderRegistry().Born(object);
+  if(REXCVAR_GET(edf_native_render_registry) || EDF_NATIVE_FLAG(full_frame)) edf::native::RenderRegistry().Born(object);
 }
 REX_EXTERN(__imp__sub_821C1FE8);
 REX_HOOK_RAW(sub_821C1FE8) {
-  if(REXCVAR_GET(edf_native_render_registry)) edf::native::RenderRegistry().Died(ctx.r3.u32);
+  if(REXCVAR_GET(edf_native_render_registry) || EDF_NATIVE_FLAG(full_frame)) edf::native::RenderRegistry().Died(ctx.r3.u32);
   __imp__sub_821C1FE8(ctx,base);
 }
 REX_EXTERN(__imp__sub_821C0D70);
@@ -6857,14 +6856,14 @@ REX_HOOK_RAW(sub_821C0D70) {
   // r4==1 links obj+120 into scene+100; any other value unlinks it.
   const uint32_t object=ctx.r3.u32,flag=ctx.r4.u32;
   __imp__sub_821C0D70(ctx,base);
-  if(REXCVAR_GET(edf_native_render_registry)) edf::native::RenderRegistry().Subscribed(object,flag==1);
+  if(REXCVAR_GET(edf_native_render_registry) || EDF_NATIVE_FLAG(full_frame)) edf::native::RenderRegistry().Subscribed(object,flag==1);
 }
 namespace {
 // End of 821A4DE8 (r3 is the scene): after the scene+100 slot-2 walk, so this
 // tick's pose builds are in memory. Failures stay native and are counted.
 void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
   auto& registry=edf::native::RenderRegistry();
-  if(!REXCVAR_GET(edf_native_render_registry)) { if(registry.active()) registry.Clear(); return; }
+  if(!REXCVAR_GET(edf_native_render_registry) && !EDF_NATIVE_FLAG(full_frame)) { if(registry.active()) registry.Clear(); return; }
   try {
     const edf::native::GuestReader reader(base);
     // Buffer identities are read under the bridge lock, first sight only.

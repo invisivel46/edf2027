@@ -46,7 +46,7 @@ struct NativeFrameInputs {
   std::shared_ptr<const std::map<uint32_t,NativeScenePassCamera>> cameras;
   std::shared_ptr<const std::map<uint32_t,NativeScenePassAnimation>> animations;
   uint64_t motion_publication=0;  // Model motion generation (native_render_publication).
-  // The renderable registry's tick snapshot (native_render_entry.h); empty until its producer publishes.
+  // The render registry's latest tick snapshot (native_render_entry.h); null before its first tick.
   std::shared_ptr<const NativeRenderRegistrySnapshot> registry;
 };
 struct NativeFrameView {
