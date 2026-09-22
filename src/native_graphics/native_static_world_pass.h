@@ -29,12 +29,12 @@ struct NativeStaticWorldPassCounters {
 inline std::shared_ptr<const NativeSceneGroupOrder> NativeStaticWorldOrder(
     const NativeScenePublication* publication,uint32_t owner,const NativeSceneQueues* queues) {
   if(!publication || !queues || !queues->enabled) return nullptr;
-  const auto found=publication->group_order.find(owner);
-  if(found==publication->group_order.end() || !found->second) return nullptr;
-  std::vector<uint32_t> sorted(found->second->begin(),found->second->end());
+  const auto* found=publication->group_order.Find(owner);
+  if(!found || !*found) return nullptr;
+  std::vector<uint32_t> sorted((*found)->begin(),(*found)->end());
   std::ranges::sort(sorted);
   if(!queues->Within([&](uint32_t group) { return std::ranges::binary_search(sorted,group); })) return nullptr;
-  return found->second;
+  return *found;
 }
 // Published order, one decision per group. native returns a fallback reason
 // without having changed guest or queue state; the owed device state of every
