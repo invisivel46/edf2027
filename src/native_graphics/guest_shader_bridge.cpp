@@ -229,6 +229,8 @@ REXCVAR_DEFINE_BOOL(edf_native_model_publication_audit,false,"EDF2027",
                    "Compare published model layouts and poses with live memory at model draw entry (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_pass,false,"EDF2027",
                    "Draw rigid published models natively at 821C9C20; any unsupported object runs the original draw. Requires edf_native_model_publication and the static world pass scene flags (development)");
+REXCVAR_DEFINE_BOOL(edf_native_model_pass_skinned,false,"EDF2027",
+                   "Also draw palette-skinned models (instance+12 set) in the native model pass, binding the packed bone palette as g_mWorldArray; requires edf_native_model_pass (development)");
 REXCVAR_DEFINE_BOOL(edf_native_capture_indexed_state,false,"EDF2027",
                    "Trace up to 256 indexed draw states per selected capture frame; requires scene capture prefix (development)");
 REXCVAR_DEFINE_INT32(edf_native_probe_x, -1, "EDF2027", "Optional native scene invalid-RGB probe pixel X");
@@ -12051,7 +12053,9 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
 namespace edf::native {
 // Replaces one 821C9C20 object (rigid path: per record 821A17D8 then 821B2C28,
 // which binds stream/declaration/indices per batch and runs 821B94E8 +
-// 821FE358 per material pass). Everything is resolved from the layout and
+// 821FE358 per material pass; with edf_native_model_pass_skinned also the
+// palette path: 821A1738 once, then 821A17D8 only for records with rec+48
+// clear). Everything is resolved from the layout and
 // pose publications, the per-pass-record material programs and retained
 // batch geometry before anything is recorded; a decline leaves guest and
 // device state untouched and returns false so the caller runs the original.
@@ -12084,7 +12088,8 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
     summary();
     return false;
   };
-  // Publication gate: rigid, layout current, pose published for this tick.
+  // Publication gate: rigid (or palette-skinned when enabled), layout current,
+  // pose published for this tick and not render-dependent.
   auto& models=::ModelPublications();
   const auto published=models.Find(instance);
   if(published && render_dependent) models.MarkRenderDependent(instance,published.generation);
@@ -12092,7 +12097,8 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
   const auto poses=models.AcquirePoses();
   const auto gate=GateNativeModelPass(published,published && models.Current(instance,identity[0],identity[1],vector),
     reader.Bytes(reader.Add(instance,12),1)[0],poses.get(),native_render_budget.tick,
-    render_dependent || (published && models.RenderDependent(instance,published.generation)));
+    render_dependent || (published && models.RenderDependent(instance,published.generation)),
+    REXCVAR_GET(edf_native_model_pass_skinned));
   if(!gate) return decline(*gate.decline);
   if(interpolating && (!interpolated || interpolated->size()!=gate.pose->matrices.size())) return decline(D::Pose);
   const auto& matrices=interpolating?*interpolated:gate.pose->matrices;
@@ -12103,6 +12109,27 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
   const auto parameter=reader.Word(reader.Add(reader.Word(0x8257C02C),32));
   const auto world_storage=parameter?reader.Word(parameter):0;
   if(!world_storage) return decline(D::World);
+  // Palette path: 821A1738(*(*0x8257C02C+36)) packs the pose into the scratch
+  // at descriptor+0, clamped to descriptor+16, before the first record. A null
+  // descriptor (the guest skips the pack) or storage is not represented.
+  // Records that do not upload their bone draw with the g_mWorld storage as
+  // it stands, so its entry bytes seed the world plan.
+  uint32_t palette_storage=0,palette_limit=0;
+  std::array<uint8_t,64> world_entry{};
+  if(layout.skinned) {
+    const auto descriptor=reader.Word(reader.Add(reader.Word(0x8257C02C),36));
+    palette_storage=descriptor?reader.Word(descriptor):0;
+    if(!palette_storage) return decline(D::Palette);
+    palette_limit=reader.Word(reader.Add(descriptor,16));
+    try {
+      const auto count=NativeBonePaletteCount(uint32_t(matrices.size()),palette_limit);
+      if(count) reader.WritableBytes(palette_storage,size_t(count)*kNativeBonePaletteBytes,4);
+      std::memcpy(world_entry.data(),reader.Bytes(world_storage,64),64);
+    } catch(const std::exception& error) { report(error.what()); return decline(D::Palette); }
+  }
+  std::vector<std::array<uint8_t,64>> worlds;
+  try { worlds=NativeModelWorldPlan(layout,matrices,world_entry); }
+  catch(const std::exception& error) { report(error.what()); return decline(D::World); }
   const auto device=reader.Word(reader.Add(reader.Word(0x8257BFB4),8));
   // The 821C9C20 and 821B2C28 frames the setters and activations run under.
   if(ctx.r1.u32<4096+128+176) return decline(D::Eligibility);
@@ -12153,7 +12180,9 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
     // guest activation uploads them live. That includes the pass-owned camera
     // and animation globals (the static pass substitutes its published camera;
     // a model draw uploads whatever the globals hold now), and excludes
-    // g_mWorld, which each record supplies. Failures retry once per tick.
+    // g_mWorld, which each record supplies, and for a palette object
+    // g_mWorldArray, which the draw packs from the pose over the live scratch.
+    // Failures retry once per tick.
     const auto refresh=[&](Bridge::ModelPassLoad& load) {
       const auto& schema=*load.schema;
       const auto& published=load.published->constants;
@@ -12161,7 +12190,7 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
       std::optional<std::vector<NativeSceneMaterialInputs::Constant>> constants;
       for(size_t i=0;i<load.layout.size();++i) {
         const auto& slot=load.layout[i];
-        if(published[i].global && published[i].name=="g_mWorld") continue;
+        if(published[i].global && (published[i].name=="g_mWorld" || (layout.skinned && published[i].name=="g_mWorldArray"))) continue;
         const auto* data=ReadNativeSceneMaterialConstant(window,schema,slot);
         const auto& old=published[i].registers;
         if(old.size()==slot.bytes && std::equal(old.begin(),old.end(),data)) continue;
@@ -12268,6 +12297,31 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
       try { geometry=geometry_of(source,batch_of(draw)); }
       catch(const std::exception& error) { report(error.what()); }
       if(!geometry || geometry->backend()!=state.scene_backend.get()) return decline(D::Geometry);
+      // g_mWorldArray of a palette object: the pass's global must name the
+      // scratch 821A1738 packed, and the shader's array (the slot's reflected
+      // bytes) must hold every packed bone; the tail keeps the live scratch.
+      const std::vector<NativeSceneMaterialInputs::Constant>* constants=&material->constants;
+      std::vector<NativeSceneMaterialInputs::Constant> palette_constants;
+      if(layout.skinned) {
+        const auto& load=state.model_pass_loads.at(draw.pass);
+        for(size_t i=0;i<material->constants.size();++i) {
+          const auto& constant=material->constants[i];
+          if(constant.name!="g_mWorldArray") continue;
+          if(!constant.global || constant.pixel || !load.schema || i>=load.layout.size()) return decline(D::Palette);
+          std::optional<std::vector<uint8_t>> registers;
+          try {
+            const auto& schema=*load.schema;
+            const auto& slot=load.layout[i];
+            if(slot.group!=1 || slot.parameter>=schema[1].size() || schema[1][slot.parameter].ReadValue(window,true).data!=palette_storage)
+              return decline(D::Palette);
+            const auto* live=ReadNativeSceneMaterialConstant(window,schema,slot);
+            registers=NativeModelPaletteRegisters(matrices,palette_limit,{live,slot.bytes});
+          } catch(const std::exception& error) { report(error.what()); return decline(D::Palette); }
+          if(!registers) return decline(D::Palette);
+          if(constants!=&palette_constants) { palette_constants=material->constants; constants=&palette_constants; }
+          palette_constants[i].registers=std::move(*registers);
+        }
+      }
       NativeSceneResolvedMaterial result;
       NativeSceneMaterialPassState next;
       try {
@@ -12279,12 +12333,16 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
         desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
         desc.render_targets=targets.count; desc.rtv_format=targets.rtv_format;
         desc.dsv_format=targets.dsv_format; desc.sample_count=targets.samples;
-        result=program.Resolve(desc,viewport.reverse_depth,material->constants,cursor.render,cursor.samplers,
-          REXCVAR_GET(edf_native_anisotropic_filtering));
+        result=program.Resolve(desc,viewport.reverse_depth,*constants,cursor.render,cursor.samplers,
+          REXCVAR_GET(edf_native_anisotropic_filtering),layout.skinned);
       } catch(const std::exception& error) { report(error.what()); return decline(D::PassState); }
-      // g_mWorld exactly as 821A17D8 stores it: the record's bone, column-major.
-      try { ApplyNativeScenePublishedWorld(result.capture,NativeModelWorldRegisters(matrices[layout.meshes[draw.mesh].bone])); }
-      catch(const std::exception& error) { report(error.what()); return decline(D::World); }
+      // g_mWorld exactly as 821A17D8 stores it: the record's bone, column-major,
+      // or on the palette path, for a record with rec+48 set, what the storage
+      // holds. A palette shader need not declare g_mWorld at all.
+      try {
+        if(!layout.skinned || NativeSceneCaptureBindsWorld(result.capture))
+          ApplyNativeScenePublishedWorld(result.capture,worlds[draw.mesh]);
+      } catch(const std::exception& error) { report(error.what()); return decline(D::World); }
       auto object=std::make_shared<NativeSceneInstance>();
       object->id=(uint64_t(1)<<62)+ ++ids; object->changed_tick=UINT64_MAX;
       object->object.geometry=std::move(geometry); object->object.material=result.capture.material;
@@ -12326,9 +12384,20 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
   auto frame=ctx;
   frame.r1.u64=ctx.r1.u32-128; reader.StoreWord(frame.r1.u32,ctx.r1.u32);
   frame.r1.u64=stack; reader.StoreWord(stack,ctx.r1.u32-128);
-  // 1. 821A17D8 of the last record: g_mWorld's storage holds its bone.
-  if(!layout.meshes.empty()) reader.StoreCpuWords(world_storage,NativeModelWorldWords(matrices[layout.meshes.back().bone]));
-  // 2. 821B2C28's stream/declaration/index setters for the last batch.
+  // 1. 821A1738 on the palette path: the scratch holds the packed pose, as the
+  // 821A1738 hook stores it. Written, not proven unread: later skinned draws
+  // pack before they upload, but the scratch is shared and other readers of
+  // it were not audited, and the material replays below upload from it.
+  if(layout.skinned) {
+    const auto bones=NativeModelPaletteWords(matrices,palette_limit);
+    for(uint32_t bone=0;bone<bones.size();++bone)
+      reader.StoreCpuWords(reader.Add(palette_storage,bone*kNativeBonePaletteBytes),bones[bone]);
+  }
+  // 2. 821A17D8 of the last uploading record: g_mWorld's storage holds its bone
+  // (on the palette path, unchanged when no record uploads).
+  if(const auto uploaded=NativeModelLastWorldUpload(layout))
+    reader.StoreCpuWords(world_storage,NativeModelWorldWords(matrices[layout.meshes[*uploaded].bone]));
+  // 3. 821B2C28's stream/declaration/index setters for the last batch.
   const NativeModelBatchLayout* last=nullptr;
   for(const auto& mesh:layout.meshes) if(!mesh.batches.empty()) last=&mesh.batches.back();
   if(last) {
@@ -12337,7 +12406,7 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
     ::InstallNativeStaticGeometry(work,base,device,NativeSceneGeometrySource{last->vertex.owner,last->index.owner,
       last->declaration,last->stride,last->draw_count,last->passes.empty()?0:last->passes.back(),0},progress);
   }
-  // 3. Material activations: the last pass and each sampler slot's last
+  // 4. Material activations: the last pass and each sampler slot's last
   // binder through 821B94E8, then every pass's combined render words, dirty
   // masks and sampler words, exactly as for static world groups.
   if(!owed.empty()) {

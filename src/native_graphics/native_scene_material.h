@@ -205,7 +205,7 @@ struct NativeSceneMaterialProgram {
   NativeSceneResolvedMaterial Resolve(NativeBackendPipelineDesc desc,bool reversed,
       std::span<const NativeSceneMaterialInputs::Constant> constants,
       NativeMaterialRenderPass render,std::array<NativeMaterialSamplerPass,16> samplers,
-      int filtering_override=-1) const {
+      int filtering_override=-1,bool palette=false) const {
     if(!backend) throw std::runtime_error("native material has no backend");
     render=ResolveRenderState(std::move(render));
     samplers=ResolveSamplers(std::move(samplers));
@@ -241,7 +241,7 @@ struct NativeSceneMaterialProgram {
       factor.emplace();
       for(size_t i=0;i<4;++i) (*factor)[i]=std::bit_cast<float>(render.blend_factor[i]);
     }
-    return {Capture(pipeline,reversed,constants,resources,factor),std::move(render),std::move(samplers)};
+    return {Capture(pipeline,reversed,constants,resources,factor,palette),std::move(render),std::move(samplers)};
   }
   // The caller supplies a pipeline/blend factor with state_overrides already
   // applied, and samplers resolved against explicit pass state. This constructs
@@ -250,13 +250,13 @@ struct NativeSceneMaterialProgram {
   NativeSceneMaterialCapture Capture(NativeBackendPipeline& pipeline,bool reversed,
       std::span<const NativeSceneMaterialInputs::Constant> constants,
       std::span<NativeBackendSampler* const> samplers,
-      std::optional<std::array<float,4>> blend_factor={}) const {
+      std::optional<std::array<float,4>> blend_factor={},bool palette=false) const {
     if(textures.size()!=inputs.textures.size() || samplers.size()!=textures.size())
       throw std::runtime_error("native scene material resources are incomplete");
     ShaderBindings vs(nullptr,reversed?reversed_vertex:vertex),ps(nullptr,pixel);
     ValidateNativeShaderLink(vs.shader(),ps.shader());
     ApplyBindings(vs,ps,constants,samplers);
-    return CaptureNativeSceneMaterial(backend,pipeline,vs,ps,blend_factor);
+    return CaptureNativeSceneMaterial(backend,pipeline,vs,ps,blend_factor,{},palette);
   }
   // Also refresh the shared bindings used by mixed passes. Resource updates
   // must remove slots omitted by this material, while unsupplied constants

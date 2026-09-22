@@ -16,6 +16,12 @@ void ApplyNativeScenePublishedWorld(NativeSceneMaterialCapture& capture,std::spa
   if(!world) throw std::runtime_error("published world matrix missing");
   capture.world=DecodeNativeQueuedWorld(registers,world->column_major);
 }
+bool NativeSceneCaptureBindsWorld(const NativeSceneMaterialCapture& capture) {
+  if(!capture.material) return false;
+  for(const auto& constant:capture.material->constants()) for(const auto& matrix:constant.matrices)
+    if(matrix.source==NativeSceneMatrixSource::World) return true;
+  return false;
+}
 namespace {
 bool Matches(const NativeSceneMaterial& material,const ShaderBindings& vertex,const ShaderBindings& pixel) {
   if(material.constants().size()!=vertex.ConstantImages().size()+pixel.ConstantImages().size() ||
@@ -79,14 +85,14 @@ NativeSceneMaterialCapture Refresh(std::shared_ptr<const NativeSceneMaterial> ma
 NativeSceneMaterialCapture CaptureNativeSceneMaterial(
     std::shared_ptr<NativeRenderBackend> backend,NativeBackendPipeline& pipeline,
     const ShaderBindings& vertex,const ShaderBindings& pixel,
-    std::optional<std::array<float,4>> blend_factor,std::shared_ptr<const NativeSceneMaterial> previous) {
+    std::optional<std::array<float,4>> blend_factor,std::shared_ptr<const NativeSceneMaterial> previous,bool palette) {
   if(vertex.BindsResources()) throw std::runtime_error("native scene capture does not support vertex textures");
-  if(previous && previous->backend()==backend.get() && previous->pipeline()==&pipeline &&
+  if(!palette && previous && previous->backend()==backend.get() && previous->pipeline()==&pipeline &&
      previous->blend_factor()==blend_factor && Matches(*previous,vertex,pixel))
     return Refresh(std::move(previous),vertex,pixel);
   const auto world=vertex.ReadFloat4x4("g_mWorld");
-  if(!world) throw std::runtime_error("native rigid scene capture requires g_mWorld");
-  NativeSceneMaterialCapture result; result.world=*world;
+  if(!world && !palette) throw std::runtime_error("native rigid scene capture requires g_mWorld");
+  NativeSceneMaterialCapture result; result.world=world.value_or(kNativeSceneIdentity);
   std::vector<NativeSceneConstant> constants;
   std::optional<NativeSceneMatrix> view,projection,view_projection;
   for(auto [stage,bindings]:{std::pair{NativeBackendStage::Vertex,&vertex},std::pair{NativeBackendStage::Pixel,&pixel}}) {
@@ -120,6 +126,8 @@ NativeSceneMaterialCapture CaptureNativeSceneMaterial(
         const std::string name=desc.Name;
         const bool matrix=type.Class==D3D_SVC_MATRIX_COLUMNS || type.Class==D3D_SVC_MATRIX_ROWS;
         if(!matrix) continue;
+        // The palette is object data the caller bound as registers; it stays in the image.
+        if(palette && stage==NativeBackendStage::Vertex && name=="g_mWorldArray" && type.Elements) continue;
         if(type.Rows!=4 || type.Columns!=4 || type.Elements || type.Type!=D3D_SVT_FLOAT)
           throw std::runtime_error("unsupported scene matrix shape: "+name);
         const auto value=bindings->ReadFloat4x4(name);

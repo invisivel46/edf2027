@@ -262,6 +262,112 @@ void ModelPassGateDeclines() {
   const auto skinned_poses=models.PublishPoses(memory,13,{});
   Require(reason(GateNativeModelPass(skinned,true,0,skinned_poses.get(),13,false))==D::Skinned,"skinned layout accepted");
 }
+// The palette-skinned fixture (record 0 uploads bone 1, record 1 has rec+48 set)
+// over an eight-bone pose, with every batch's buffers published.
+void SkinnedBuffers(const Memory& memory,NativeModelBuffers& buffers) {
+  BuildModel(memory,8,true);
+  uint32_t address=0x10000;
+  for(const auto batch:{kBatches,kBatches+148,kSecondBatch}) {
+    buffers.Publish(batch+4,NativeModelBuffers::Kind::Vertex,address,32,4); address+=0x1000;
+    buffers.Publish(batch+84,NativeModelBuffers::Kind::Index,address,2,100); address+=0x1000;
+  }
+}
+void SkinnedModelPassGate() {
+  using D=NativeModelPassDecline;
+  const auto reason=[](const NativeModelPoseGate& gate) { return gate.decline.value_or(D::Count); };
+  std::vector<uint8_t> bytes(0x20000);
+  const Memory memory{bytes};
+  NativeModelBuffers buffers;
+  SkinnedBuffers(memory,buffers);
+  NativeModelPublications models;
+  const auto layout=models.Register(Decode(memory,&buffers),kPose);
+  const auto poses=models.PublishPoses(memory,10,{});
+  Require(layout.layout->skinned && layout.layout->bones==8,"skinned fixture");
+  const auto accepted=GateNativeModelPass(layout,true,1,poses.get(),10,false,true);
+  Require(accepted && accepted.pose==poses->Find(kInstance) && accepted.pose->matrices.size()==8,"enabled skinned model declined");
+  Require(reason(GateNativeModelPass(layout,true,1,poses.get(),10,false))==D::Skinned,"skinned model accepted with the cvar off");
+  Require(reason(GateNativeModelPass(layout,true,0,poses.get(),10,false,true))==D::Skinned,"skinned layout accepted under a rigid live byte");
+  Require(reason(GateNativeModelPass(layout,true,1,poses.get(),10,true,true))==D::RenderDependent,"render-dependent skinned pose accepted");
+  Require(reason(GateNativeModelPass(layout,true,1,poses.get(),11,false,true))==D::PoseTick,"skinned pose from another tick accepted");
+  models.MarkRenderDependent(kInstance,layout.generation);
+  Require(models.RenderDependent(kInstance,layout.generation),"skinned render-dependence latch");
+  // A palette record names no bone; an uploading record's bone must be in range.
+  auto palette_bone=*layout.layout; palette_bone.meshes[1].bone=99;
+  Require(GateNativeModelPass({layout.generation,std::make_shared<const NativeModelLayout>(palette_bone)},true,1,poses.get(),10,false,true),
+    "palette record's bone field was range-checked");
+  auto upload_bone=*layout.layout; upload_bone.meshes[0].bone=8;
+  Require(reason(GateNativeModelPass({layout.generation,std::make_shared<const NativeModelLayout>(upload_bone)},true,1,poses.get(),10,false,true))==D::Bone,
+    "uploading record's bone outside the pose accepted");
+  // A rigid layout never takes a non-uploading record, nor the palette path.
+  auto rigid=*layout.layout; rigid.skinned=false;
+  const NativeModelPublications::Layout rigid_layout{layout.generation,std::make_shared<const NativeModelLayout>(rigid)};
+  Require(reason(GateNativeModelPass(rigid_layout,true,0,poses.get(),10,false,true))==D::Bone,"rigid layout with a palette record accepted");
+  Require(reason(GateNativeModelPass(rigid_layout,true,1,poses.get(),10,false,true))==D::Skinned,"rigid layout accepted under a palette live byte");
+}
+void PaletteFitsShaderArray() {
+  std::vector<NativePoseMatrix> pose(70);
+  for(size_t bone=0;bone<pose.size();++bone) for(size_t i=0;i<16;++i) pose[bone][i]=float(bone*16+i)+0.125f;
+  pose[0][4]=-0.f;
+  // The decoded Blend/SingleBlend layout: 68 float4x3, 204 registers.
+  std::vector<uint8_t> scratch(204*16);
+  for(size_t i=0;i<scratch.size();++i) scratch[i]=uint8_t(i*7+3);
+  const auto full=NativeModelPaletteRegisters(pose,68,scratch);
+  Require(full && full->size()==scratch.size(),"a 68-bone palette must fit a 204-register array");
+  std::vector<uint8_t> guest(68*kNativeBonePaletteBytes);
+  Require(PackGuestBonePalette(pose,guest,68)==68 && std::equal(guest.begin(),guest.end(),full->begin()),
+    "palette registers differ from the 821A1738 scratch bytes");
+  Require(GuestBlockWord(full->data()+4)==0x80000000u,"palette lost a signed zero");
+  // An array smaller than the clamped palette declines; the limit clamps first.
+  Require(!NativeModelPaletteRegisters(pose,68,std::span(scratch).first(203*16)),"palette larger than the shader array accepted");
+  Require(!NativeModelPaletteRegisters(pose,69,scratch),"69 bones accepted by a 68-bone array");
+  const auto clamped=NativeModelPaletteRegisters(pose,2,std::span(scratch).first(6*16));
+  Require(clamped && clamped->size()==96 && std::equal(clamped->begin(),clamped->end(),guest.begin()),
+    "limit-clamped palette in an exact array");
+  // Bones past the pose or the limit keep the live scratch, as in the guest.
+  const std::span<const NativePoseMatrix> three(pose.data(),3);
+  const auto partial=NativeModelPaletteRegisters(three,68,scratch);
+  Require(partial && std::equal(guest.begin(),guest.begin()+3*48,partial->begin()) &&
+    std::equal(scratch.begin()+3*48,scratch.end(),partial->begin()+3*48),"palette tail did not keep the scratch");
+  Require(!NativeModelPaletteRegisters(three,68,std::span(scratch).first(100)),"partial register scratch accepted");
+  // Handoff words: stored big-endian they are the same scratch bytes.
+  const auto words=NativeModelPaletteWords(pose,68);
+  Require(words.size()==68,"handoff palette bone count");
+  for(size_t bone=0;bone<words.size();++bone) for(size_t i=0;i<12;++i)
+    Require(GuestBlockWord(guest.data()+bone*48+i*4)==words[bone][i],"handoff palette word differs from 821A1738");
+  Require(NativeModelPaletteWords(pose,0).empty(),"zero limit packed bones");
+}
+void SkinnedWorldFollowsRecordFlag() {
+  std::vector<uint8_t> bytes(0x20000);
+  const Memory memory{bytes};
+  NativeModelBuffers buffers;
+  SkinnedBuffers(memory,buffers);
+  const auto layout=Decode(memory,&buffers);
+  const auto pose=ReadNativeModelPose(memory,kVector);
+  std::array<uint8_t,64> entry{};
+  for(size_t i=0;i<entry.size();++i) entry[i]=uint8_t(0xA0+i);
+  // Record 0 (rec+48 clear) uploads bone 1; record 1 (rec+48 set) inherits it.
+  auto worlds=NativeModelWorldPlan(layout,pose,entry);
+  Require(worlds.size()==2 && worlds[0]==NativeModelWorldRegisters(pose[1]) && worlds[1]==worlds[0],
+    "palette record did not inherit the previous upload");
+  Require(NativeModelLastWorldUpload(layout)==0u,"last uploading record");
+  // Palette record first: it draws with the storage's entry bytes.
+  auto swapped=layout; std::swap(swapped.meshes[0],swapped.meshes[1]);
+  worlds=NativeModelWorldPlan(swapped,pose,entry);
+  Require(worlds[0]==entry && worlds[1]==NativeModelWorldRegisters(pose[1]),"palette record before any upload");
+  Require(NativeModelLastWorldUpload(swapped)==1u,"last uploading record after the swap");
+  // No uploading record: the storage is left alone.
+  auto none=layout; none.meshes[0].uploads_bone=false; none.meshes[0].skinned=true;
+  worlds=NativeModelWorldPlan(none,pose,entry);
+  Require(worlds[0]==entry && worlds[1]==entry && !NativeModelLastWorldUpload(none),"no upload changed the world");
+  // Rigid: every record uploads its own bone.
+  memory.StoreByte(kInstance+12,0); memory.StoreWord(kRecords+52+44,5);
+  const auto rigid=Decode(memory,&buffers);
+  worlds=NativeModelWorldPlan(rigid,pose,entry);
+  Require(worlds[0]==NativeModelWorldRegisters(pose[1]) && worlds[1]==NativeModelWorldRegisters(pose[5]) &&
+    NativeModelLastWorldUpload(rigid)==1u,"rigid records upload their own bones");
+  auto outside=layout; outside.meshes[0].bone=8;
+  Reject([&] { NativeModelWorldPlan(outside,pose,entry); },"world plan accepted a bone outside the pose");
+}
 void ModelPassDrawPlanFollowsGuestOrder() {
   std::vector<uint8_t> bytes(0x20000);
   const Memory memory{bytes};
@@ -384,6 +490,9 @@ int main() {
     RegistryGenerationsAndRetirement();
     PosePublicationIsImmutableAndDirtyOnly();
     ModelPassGateDeclines();
+    SkinnedModelPassGate();
+    PaletteFitsShaderArray();
+    SkinnedWorldFollowsRecordFlag();
     ModelPassDrawPlanFollowsGuestOrder();
     ModelWorldMatchesGuestUpload();
     CaptureRacesWithFree();
