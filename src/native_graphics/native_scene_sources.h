@@ -111,6 +111,28 @@ class NativeSceneSources {
     }
     return {};
   }
+  // Everything the per-frame visibility walk needs from one owner, found with
+  // one lookup: its bounds and each LOD's parts. Retains that membership, so
+  // the spans stay valid after a later producer event replaces the owner.
+  struct Candidate {
+    bool registered=false;
+    std::shared_ptr<const NativeSceneVisibility> visibility;
+    std::shared_ptr<const void> retained;
+    std::array<std::span<const Part>,3> lods;
+    // As LodParts(owner+408+lod*44): absent for an unregistered owner or LOD.
+    std::optional<std::span<const Part>> Lod(uint32_t lod) const {
+      if(!registered || lod>=lods.size()) return {};
+      return lods[lod];
+    }
+  };
+  Candidate FindCandidate(uint32_t owner) const {
+    Candidate result;
+    const auto* found=owners_.Find(owner);
+    if(!found) return result;
+    result.registered=true; result.visibility=found->visibility; result.retained=found->parts;
+    for(size_t lod=0;lod<3;++lod) result.lods[lod]=found->parts->lod[lod];
+    return result;
+  }
   using World=std::array<uint8_t,64>;
   bool PublishVisibility(uint32_t owner,const NativeSceneVisibility& visibility) {
     const auto* found=owners_.Find(owner);

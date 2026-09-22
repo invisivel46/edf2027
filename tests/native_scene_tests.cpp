@@ -802,6 +802,26 @@ void QueuedGuestState() {
   sources.Observe(owner,parts);
   Require(sources.LodParts(owner+408)->size()==2 && sources.LodParts(owner+452)->size()==1 &&
     !sources.LodParts(30000),"native LOD selection did not resolve its registered parts");
+  {
+    // The visibility walk's single lookup must answer as LodParts/Visibility
+    // do, and keep its parts after a producer event replaces the owner's.
+    const auto candidate=sources.FindCandidate(owner);
+    Require(candidate.registered && !candidate.visibility && candidate.Lod(0)->size()==2 &&
+      candidate.Lod(1)->size()==1 && candidate.Lod(2)->empty() && !candidate.Lod(3) &&
+      candidate.Lod(0)->data()==sources.LodParts(owner+408)->data(),"visibility candidate disagreed with LOD lookup");
+    Require(!sources.FindCandidate(30000).registered && !sources.FindCandidate(30000).Lod(0),
+      "unregistered visibility candidate resolved parts");
+    const std::array<NativeSceneSources::Part,1> moved{{{19500,0,0}}};
+    sources.Observe(owner,moved);
+    Require(sources.FindCandidate(owner).Lod(0)->front().instance==19500 &&
+      candidate.Lod(0)->front().instance==17000 && candidate.Lod(1)->front().instance==18000,
+      "visibility candidate lost or mixed its membership after a producer event");
+    NativeSceneVisibility bounds; bounds.lod_count=2;
+    sources.PublishVisibility(owner,bounds);
+    Require(sources.FindCandidate(owner).visibility==sources.Visibility(owner) && !candidate.visibility,
+      "visibility candidate did not follow published bounds");
+    sources.Observe(owner,parts);
+  }
   reader.StoreWord(owner+436,20000); reader.StoreWord(20004,21000);
   reader.StoreWord(17016,22000); reader.StoreWord(17020,22012);
   reader.StoreWord(22000,21000); reader.StoreWord(22004,12); reader.StoreWord(22008,4);
@@ -850,6 +870,8 @@ void QueuedGuestState() {
   Require(sources.HasOwner(owner) && !sources.Find(19000),"empty model did not clear parts while preserving lifetime");
   sources.Retire(owner); Require(!sources.HasOwner(owner),"static source survived retirement");
   Require(!sources.LodParts(owner+408),"retired native LOD still accepted queue selections");
+  Require(!sources.FindCandidate(owner).registered && !sources.FindCandidate(owner).Lod(0) &&
+    !sources.FindCandidate(owner).visibility,"retired owner remained a visibility candidate");
   Require(!sources.WorldRegisters(source,21000) && !sources.PublishWorld(owner,world),"retired source accepted a world publication");
   sources.Born(owner); sources.PublishWorld(owner,world);
   Require(!sources.WorldRegisters(source,21000),"reused owner address accepted an old world generation");

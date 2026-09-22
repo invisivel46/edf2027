@@ -1806,10 +1806,18 @@ const NativeSceneSources& NativeSceneSourcesForPass(const Bridge& state) {
   }
   return state.scene_sources;
 }
+// The immutable source generation this pass reads, or null when the pass reads
+// the producer's current sources (under state.mutex) instead. Taken once per
+// walk: a published generation needs no lock, and cannot change within a pass.
+std::shared_ptr<const NativeSceneSources> PublishedNativeSceneSourcesForPass(const Bridge& state) {
+  if(!REXCVAR_GET(edf_native_scene_sources_owned) || !native_scene_publication || !native_scene_publication->sources) return {};
+  NativeSceneSourcesForPass(state);
+  return native_scene_publication->sources;
+}
+// source is sources.Find(instance), already looked up by the caller.
 template<class Reader>
-void ReadNativeSceneInstanceParameters(const Reader& reader,const NativeSceneSources& sources,
+void ReadNativeSceneInstanceParameters(const Reader& reader,const NativeSceneSources::Source* source,
     uint32_t instance,std::vector<InstanceParameter>& parameters) {
-  const auto* source=sources.Find(instance);
   if(!REXCVAR_GET(edf_native_scene_instance_owned) || !source || !source->world_first) {
     ReadInstanceParameters(reader,instance,parameters); return;
   }
@@ -1826,12 +1834,17 @@ void ReadNativeSceneInstanceParameters(const Reader& reader,const NativeSceneSou
     REXLOG_INFO("Native owned instance metadata: reads={} audited={}",count,REXCVAR_GET(edf_native_scene_transform_audit));
 }
 template<class Reader>
+void ReadNativeSceneInstanceParameters(const Reader& reader,const NativeSceneSources& sources,
+    uint32_t instance,std::vector<InstanceParameter>& parameters) {
+  ReadNativeSceneInstanceParameters(reader,sources.Find(instance),instance,parameters);
+}
+template<class Reader>
 bool NativeStaticWorldOnly(const Reader& reader,const NativeSceneSources& sources,
                           uint32_t instance,uint32_t first,uint32_t device) {
   const auto* source=sources.Find(instance);
   if(!source || !source->world_data) return false;
-  std::vector<InstanceParameter> parameters;
-  ReadNativeSceneInstanceParameters(reader,sources,instance,parameters);
+  static thread_local std::vector<InstanceParameter> parameters;
+  ReadNativeSceneInstanceParameters(reader,source,instance,parameters);
   return parameters.size()==1 && parameters[0].count==4 && parameters[0].first==first &&
     parameters[0].data==source->world_data &&
     !(uint64_t(parameters[0].data)<uint64_t(device)+5888 && uint64_t(parameters[0].data)+64>uint64_t(device)+1792);
@@ -4195,6 +4208,13 @@ REX_HOOK_RAW(sub_820B4038) {
   }
   size_t member_index=0;
   if(membership) cursor=membership->members.empty()?end:membership->members.front().node;
+  // Resolve the pass's source generation once per walk, not per candidate:
+  // each candidate then costs one owner lookup and no bridge lock.
+  std::shared_ptr<const NativeSceneSources> pass_sources;
+  {
+    auto& state=State(); std::lock_guard lock(state.mutex);
+    pass_sources=PublishedNativeSceneSourcesForPass(state);
+  }
   uint64_t candidates=0,retained=0,selected=0,checks=0,mismatches=0;
   uint64_t native_members=0;
   size_t visited=0;
@@ -4221,11 +4241,10 @@ REX_HOOK_RAW(sub_820B4038) {
       }
     }
     if(unseen) {
-      std::shared_ptr<const NativeSceneVisibility> published;
-      {
-        auto& state=State(); std::lock_guard lock(state.mutex);
-        published=NativeSceneSourcesForPass(state).Visibility(owner);
-      }
+      NativeSceneSources::Candidate source;
+      if(pass_sources) source=pass_sources->FindCandidate(owner);
+      else { auto& state=State(); std::lock_guard lock(state.mutex); source=state.scene_sources.FindCandidate(owner); }
+      const auto& published=source.visibility;
       const auto read_live=[&](bool lods) {
         const GuestReadWindow window(cpu,owner,lods?540:356);
         return ReadNativeSceneVisibility(window,owner,lods);
@@ -4293,9 +4312,7 @@ REX_HOOK_RAW(sub_820B4038) {
       // audited static direct-dispatch method may bypass the virtual callback.
       if(visible && published && object.lod_count && queues->enabled &&
          hidden==0 && mode==0 && cpu.Word(reader.Add(table,16))==0x820B2670) {
-        const auto lod=NativeVisibilityLod(object,depth);
-        auto& state=State(); std::lock_guard lock(state.mutex);
-        const auto parts=NativeSceneSourcesForPass(state).LodParts(reader.Add(owner,408+lod*44));
+        const auto parts=source.Lod(NativeVisibilityLod(object,depth));
         native_selected=parts.has_value();
         if(parts) for(const auto& part:*parts) {
           if(!part.group || (!queues->Contains(part.group) &&
@@ -5387,7 +5404,7 @@ bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t i
     const auto* source=sources.Find(instance);
     if(!source) return false;
     static thread_local std::vector<InstanceParameter> parameters;
-    ReadNativeSceneInstanceParameters(reader,sources,instance,parameters);
+    ReadNativeSceneInstanceParameters(reader,source,instance,parameters);
     const bool world_only=group.world_parameter && parameters.size()==1 && parameters[0].count==4 &&
       parameters[0].first==group.world_parameter->first &&
       !(uint64_t(parameters[0].data)<uint64_t(device)+5888 && uint64_t(parameters[0].data)+64>uint64_t(device)+1792);
