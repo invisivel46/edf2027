@@ -249,8 +249,7 @@ void TestIssue() {
   const auto trace=Execute(plan,steps);
   const auto result=ComparePostFinish(plan,trace.seen);
   CHECK(result.mismatches.empty() && !result.native_unobserved && result.tone_compared==9);
-  for(const auto& mismatch:result.mismatches) std::cerr<<"  pass "<<mismatch.pass<<": "<<mismatch.what<<"
-";
+  for(const auto& mismatch:result.mismatches) std::cerr<<"  pass "<<mismatch.pass<<": "<<mismatch.what<<"\n";
   std::vector<uint32_t> expected;
   for(const auto& record:in.first) expected.push_back(record.address);
   for(const auto& record:in.second) expected.push_back(record.address);
