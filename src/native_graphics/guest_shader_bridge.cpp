@@ -1150,6 +1150,13 @@ Bridge& State() { static Bridge state; return state; }
 // State().mutex for one visibility walk; see native_scene_walk_lock.h.
 using BridgeWalkLock=NativeWalkLockScope<std::mutex>;
 using BridgeGuestCall=NativeWalkGuestCall<std::mutex>;
+// The current tree walk's camera view, shared with the list gathers it runs
+// under its own scope: one read per walk, again only after a guest call.
+struct BridgeWalkView {
+  const BridgeWalkLock* scope; uint32_t context;
+  NativeGuestCallCached<NativeSceneVisibilityView> view;
+};
+inline thread_local BridgeWalkView* bridge_walk_view=nullptr;
 // Defined below, next to the selection it mirrors; declared here because
 // the texture hook, further up, is the first thing to create a scene resource.
 edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state);
@@ -3507,13 +3514,20 @@ REX_HOOK_RAW(sub_821C61D8) {
   }
   edf::native::NativeSceneTreeReader tree_reader(reader,publications,std::move(hierarchy),
     REXCVAR_GET(edf_native_scene_visibility_audit));
-  // One bridge lock scope for the walk: each leaf list's gather reuses it and
-  // every guest call below releases it. The view is read once and again only
-  // after a guest call, which alone can change camera data.
+  // One bridge lock scope for the walk: each leaf list's gather reuses it,
+  // every guest call below releases it and so does the end of every list, so
+  // the hold never spans the traversal. The view is read once and again only
+  // after a guest call, which alone can change camera data; the gathers share
+  // it, and releasing the lock does not invalidate it.
   edf::native::BridgeWalkLock walk_lock(edf::native::State().mutex);
-  edf::native::NativeGuestCallCached<edf::native::NativeSceneVisibilityView> walk_view;
+  edf::native::BridgeWalkView walk_view{&walk_lock,context,{}};
+  const auto outer_view=std::exchange(edf::native::bridge_walk_view,&walk_view);
+  struct RestoreWalkView {
+    edf::native::BridgeWalkView* outer;
+    ~RestoreWalkView() { edf::native::bridge_walk_view=outer; }
+  } restore_view{outer_view};
   edf::native::TraverseNativeSceneTree(tree_reader,manager,[&](uint32_t node) {
-    const auto& view=walk_view.Get(edf::native::BridgeWalkLock::guest_calls,
+    const auto& view=walk_view.view.Get(edf::native::BridgeWalkLock::guest_calls,
       [&] { return edf::native::ReadNativeSceneVisibilityView(reader,context); });
     const auto center=edf::native::ReadNativeVisibilityFloats<4>(tree_reader,reader.Add(node,32));
     const auto transformed=edf::native::NativeVisibilityTransform(center,view.matrix);
@@ -3543,6 +3557,7 @@ REX_HOOK_RAW(sub_821C61D8) {
   },[&](uint32_t list) {
     work.r3.u64=manager; work.r4.u64=list; work.r5.u64=context; work.lr=0x821C56F8;
     sub_820B4038(work,base);
+    walk_lock.EndList();
   });
   walk_lock.Release();
   static std::atomic<uint64_t> traversals=0,audited=0,owned_reads=0,live_reads=0;
@@ -4502,10 +4517,11 @@ static bool TryNativeBucketInsert(PPCContext& ctx,uint8_t* base) {
   }
   return false;
 }
-static void DispatchNativeBucketObject(PPCContext& ctx,uint8_t* base) {
+// `native_tried`: the caller already ran TryNativeBucketInsert and it declined.
+static void DispatchNativeBucketObject(PPCContext& ctx,uint8_t* base,bool native_tried=false) {
   const bool audit=REXCVAR_GET(edf_native_bucket_dispatch_audit),native=REXCVAR_GET(edf_native_bucket_dispatch);
   if(!audit && !native) { __imp__sub_821C0C00(ctx,base); return; }
-  if(!audit) { if(!TryNativeBucketInsert(ctx,base)) __imp__sub_821C0C00(ctx,base); return; }
+  if(!audit) { if(native_tried || !TryNativeBucketInsert(ctx,base)) __imp__sub_821C0C00(ctx,base); return; }
   using namespace edf::native;
   const GuestReader reader(base);
   const auto object=ctx.r3.u32,context=ctx.r4.u32;
@@ -4624,10 +4640,10 @@ REX_HOOK_RAW(sub_820B4038) {
     edf::native::BridgeGuestCall guest; __imp__sub_820B4038(ctx,base); return;
   }
   using namespace edf::native;
-  // Inside a tree walk (821C61D8) the walk's lock scope is current and stays
-  // held across lists; standalone gathers own a scope for this list. Either
-  // way the bridge lock is taken at most once between guest calls, and every
-  // guest call below releases it.
+  // Inside a tree walk (821C61D8) the walk's lock scope is current and the
+  // walk releases it when this list ends; standalone gathers own a scope for
+  // this list. Either way a hold covers at most this list and kObjectBudget
+  // candidates, and every guest call below releases it.
   std::optional<BridgeWalkLock> own_lock;
   auto* bridge=BridgeWalkLock::current;
   if(!bridge) bridge=&own_lock.emplace(State().mutex);
@@ -4638,7 +4654,13 @@ REX_HOOK_RAW(sub_820B4038) {
   uint32_t end=0;
   const auto generation=reader.Word(reader.Add(context,12));
   uint32_t cursor=0;
-  auto view=ReadNativeSceneVisibilityView(cpu,context);
+  // The walk's view when this list runs under the walk's own scope.
+  auto* walk_view=bridge_walk_view && bridge_walk_view->scope==bridge && bridge_walk_view->context==context?bridge_walk_view:nullptr;
+  const auto read_view=[&] {
+    const auto read=[&] { return ReadNativeSceneVisibilityView(cpu,context); };
+    return walk_view?walk_view->view.Get(BridgeWalkLock::guest_calls,read):read();
+  };
+  auto view=read_view();
   auto* center_destination=const_cast<uint8_t*>(cpu.WritableBytes(reader.Add(context,32),16,4));
   auto work=ctx;
   if(work.r1.u32<160) throw std::runtime_error("invalid native visibility stack");
@@ -4862,29 +4884,30 @@ REX_HOOK_RAW(sub_820B4038) {
           ++selected;
         }
       }
-      bool bucket_inserted=false;
-      if(visible && !native_selected && static_walk && hidden==0 && (int32_t(mode)==1 || int32_t(mode)==2)) {
-        // Sort modes 1/2 through the native bucket insert when it is enabled:
-        // no guest code runs, so membership, the view and the plan stay valid.
+      if(visible && !native_selected) {
+        // Classify first. Sort modes 1/2 go through the native bucket insert
+        // when it is enabled: it touches guest memory only, so it is not a
+        // guest call, keeps the hold, and membership, the view and the plan
+        // stay valid. Only a route into the original routine is a guest call.
+        const bool try_native=hidden==0 && (int32_t(mode)==1 || int32_t(mode)==2);
         work.r3.u64=owner; work.r4.u64=context; work.lr=0x820B410C;
-        bucket_inserted=TryNativeBucketInsert(work,base);
-        bucket_native+=bucket_inserted;
-      }
-      if(visible && !native_selected && !bucket_inserted) {
-        // Unported callbacks may change membership or node values. Continue
-        // from the original post-callback link rather than an older snapshot.
-        membership.reset();
-        cpu.Invalidate(); center_destination=nullptr;
-        work.r3.u64=owner; work.r4.u64=context; work.lr=0x820B410C;
-        // Hierarchy writer hooks invalidate tree images if this callback
-        // changes membership, bounds or topology. Unrelated callback activity
-        // must not discard every completed producer publication.
-        { BridgeGuestCall guest; DispatchNativeBucketObject(work,base); }
-        callback=true;
-        // A remaining callback can update camera data; no live read window or
-        // registry span survives it.
-        view=ReadNativeSceneVisibilityView(cpu,context);
-        center_destination=const_cast<uint8_t*>(cpu.WritableBytes(reader.Add(context,32),16,4));
+        callback=NativeWalkBucketDispatch<std::mutex>(try_native,[&] { return TryNativeBucketInsert(work,base); },[&] {
+          // Unported callbacks may change membership or node values. Continue
+          // from the original post-callback link rather than an older snapshot.
+          membership.reset();
+          cpu.Invalidate(); center_destination=nullptr;
+          // Hierarchy writer hooks invalidate tree images if this callback
+          // changes membership, bounds or topology. Unrelated callback activity
+          // must not discard every completed producer publication.
+          DispatchNativeBucketObject(work,base,try_native);
+        });
+        bucket_native+=try_native && !callback;
+        if(callback) {
+          // A remaining callback can update camera data; no live read window or
+          // registry span survives it.
+          view=read_view();
+          center_destination=const_cast<uint8_t*>(cpu.WritableBytes(reader.Add(context,32),16,4));
+        }
       }
     }
     // Pure native math/queue selection cannot mutate membership. A remaining
@@ -4902,6 +4925,7 @@ REX_HOOK_RAW(sub_820B4038) {
       if(plan_drives && next!=node[0]) { plan.reset(); plan_drives=false; ++plan_abandoned; }
       cursor=next;
     } else cursor=node[0];
+    bridge->Advance();
   }
   if(plan && !plan_drives && plan_index!=plan->members.size()) ++plan_audit.membership;  // The plan holds more members.
   bridge->Hold();

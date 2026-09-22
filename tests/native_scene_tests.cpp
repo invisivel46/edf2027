@@ -559,6 +559,47 @@ void WalkLock() {
     Require(walk.acquisitions==2 && mutex.locks==3,"walk lock not taken once after the guest call");
   }
   Require(!Scope::current && !mutex.locked,"walk scope did not release the lock");
+  {
+    // Two leaf lists in one walk: the hold ends at the list boundary, and a
+    // native bucket insert is not a guest call.
+    mutex.locks=0;
+    Scope walk(mutex);
+    const auto calls=Scope::guest_calls;
+    uint32_t camera_reads=0;
+    NativeGuestCallCached<uint32_t> walk_view;
+    const auto list=[&](bool native_ok) {
+      walk.Hold();
+      Require(walk_view.Get(Scope::guest_calls,[&] { ++camera_reads; return camera; })==9,"walk view changed");
+      bool native_ran=false,guest_ran=false;
+      const bool guest=NativeWalkBucketDispatch<CountingMutex>(true,[&] {
+        Require(mutex.locked && Scope::current==&walk,"native bucket insert ran outside the walk hold");
+        native_ran=true; return native_ok;
+      },[&] { Require(!mutex.locked && !Scope::current,"guest bucket dispatch ran under the walk lock"); guest_ran=true; });
+      Require(native_ran && guest==!native_ok && guest_ran==!native_ok,"bucket dispatch route");
+      if(native_ok) Require(mutex.locked,"native bucket insert released the walk lock");
+      walk.Hold();
+      walk.EndList();
+      Require(!mutex.locked && Scope::current==&walk,"walk lock held past a list boundary");
+    };
+    list(true);
+    Require(Scope::guest_calls==calls && walk.acquisitions==1 && mutex.locks==1,"native bucket insert counted as a guest call");
+    list(true);
+    Require(Scope::guest_calls==calls && walk.acquisitions==2 && walk.lists==2 && camera_reads==1,
+            "list boundary did not release once, or reread the view");
+    list(false);
+    Require(Scope::guest_calls==calls+1 && walk.acquisitions==4,"guest bucket dispatch not a guest call");
+    Require(walk_view.Get(Scope::guest_calls,[&] { ++camera_reads; return camera; })==9 && camera_reads==2,
+            "view not reread after a guest bucket dispatch");
+    // A long list releases the hold after the object budget.
+    walk.Hold();
+    for(uint32_t i=0;i+1<Scope::kObjectBudget;++i) walk.Advance();
+    Require(mutex.locked,"walk lock released before the object budget");
+    walk.Advance();
+    Require(!mutex.locked,"walk lock held past the object budget");
+    walk.Advance();
+    Require(!mutex.locked && walk.acquisitions==5,"object budget reacquired the lock");
+  }
+  Require(!Scope::current && !mutex.locked,"list walk scope did not release the lock");
   for(const uint32_t group:{0x500u,0x600u})
     Require(queues.Take(group)==reference.Take(group),"walk-locked queue order differs from per-object pushes");
   // Exceptions unwind through the scope without leaving the mutex held.
