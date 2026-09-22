@@ -107,6 +107,17 @@ struct NativePostFrame {
 NativePostFrame BuildNativePostFrame(const PostFinishPlan& plan,const NativePostTone& tone);
 const NativePostConstant* FindPostConstant(const NativePostDraw& draw,const char* name);
 const NativePostTexture* FindPostTexture(const NativePostDraw& draw,const char* name);
+// Whether the draw samples its own record's texture (+4), i.e. the target's
+// resolved copy, never its surface. Two passes do so by design:
+// - DownsampleTone reads its own previous resolve as m_OldTone (the history);
+// - BlurH (820B04B8) draws into this+500, the record the Tone pass has just
+//   resolved, while reading that resolve (this+504). On the Xbox the draw goes
+//   to EDRAM and the texture is overwritten only by the resolve that ends the
+//   pass; natively the surface and the resolved texture are separate resources
+//   (CreateNativeRenderTarget), so the same order holds.
+// Any other self-read is a plan error.
+bool NativePostReadsOwnResolve(const NativePostDraw& draw);
+bool NativePostOwnResolveAllowed(const NativePostDraw& draw);
 
 // What records the draws. One call per draw, in order; the chain passes each
 // draw into and then resolve their record's target, the bloom draws into the

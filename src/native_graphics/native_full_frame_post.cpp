@@ -166,6 +166,8 @@ NativePostFrame BuildNativePostFrame(const PostFinishPlan& plan,const NativePost
     for(const auto& [name,value]:{std::pair{kPostMiddleGray,&tone.middle_gray},std::pair{kPostLuminanceWhite,&tone.luminance_white},
                                   std::pair{kPostToneMap,&tone.tone_map},std::pair{kPostLuminanceVector,&tone.luminance_vector}})
       draw.constants.push_back({name,Floats(*value)});
+    if(!NativePostOwnResolveAllowed(draw))
+      throw std::runtime_error(std::format("native post: pass {} ({}) reads its own target's texture {:#x}",p,PostPassName(pass.kind),draw.target_texture));
     frame.draws.push_back(std::move(draw));
   }
   return frame;
@@ -177,6 +179,15 @@ const NativePostConstant* FindPostConstant(const NativePostDraw& draw,const char
 const NativePostTexture* FindPostTexture(const NativePostDraw& draw,const char* name) {
   for(const auto& texture:draw.textures) if(texture.name==name) return &texture;
   return nullptr;
+}
+
+bool NativePostReadsOwnResolve(const NativePostDraw& draw) {
+  return !draw.output && draw.target_texture &&
+    std::any_of(draw.textures.begin(),draw.textures.end(),[&](const auto& t) { return t.handle==draw.target_texture; });
+}
+bool NativePostOwnResolveAllowed(const NativePostDraw& draw) {
+  return !NativePostReadsOwnResolve(draw) ||
+    draw.kind==PostPassKind::DownsampleTone || draw.kind==PostPassKind::BlurHorizontal;
 }
 
 NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& input,const NativePostTone& tone) {

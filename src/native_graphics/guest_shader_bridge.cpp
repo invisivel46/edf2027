@@ -3928,8 +3928,13 @@ class BridgePostSink final:public NativePostSink {
       }
       ps.EndResourceUpdate();
     } catch(...) { ps.ClearTextures(); ps.ClearSamplers(); throw; }
-    // The tone history reads its own previous resolve (m_OldTone), as the guest does.
-    if(draw.kind!=PostPassKind::DownsampleTone && SamplesTarget(ps,*target))
+    // Reading the target's own RESOLVED texture is the guest's order for the
+    // tone history and BlurH (NativePostOwnResolveAllowed; BuildNativePostFrame
+    // refuses any other). The surface being drawn is never sampled.
+    if(target->backend_surface)
+      if(auto* surface=target->backend_surface->texture(); surface && ps.UsesTexture(*surface))
+        throw std::runtime_error(std::format("pass {} ({}) samples the surface it draws into",draw.pass,PostPassName(draw.kind)));
+    if(target->sampled.backend && ps.UsesTexture(*target->sampled.backend) && !NativePostOwnResolveAllowed(draw))
       throw std::runtime_error(std::format("pass {} ({}) samples its own target",draw.pass,PostPassName(draw.kind)));
     // The target scope 821B8828 would open, on the native stack only.
     struct Scope {

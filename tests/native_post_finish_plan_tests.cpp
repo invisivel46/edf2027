@@ -332,6 +332,7 @@ bool SameFloats(const std::vector<float>& values,std::span<const float> expected
     [](float a,float b) { return std::bit_cast<uint32_t>(a)==std::bit_cast<uint32_t>(b); });
 }
 void TestFullFrameRecording() {
+  bool threw=false;
   const auto input=Input();
   const auto tone=Tone();
   RecordingSink sink;
@@ -400,11 +401,30 @@ void TestFullFrameRecording() {
   CHECK(SameFloats(FindPostConstant(d[11],kPostBlurOffset)->values,PostBlurTaps(input.first[4].texel_x,false)));
   CHECK(SameFloats(FindPostConstant(d[12],kPostBlurOffset)->values,PostBlurTaps(input.first[4].texel_x,true)));
   CHECK(d[13].quad==PostDownsampleQuad(1280,720));
+  // Regression (first full-frame run, every frame refused as "pass 11 (BlurH)
+  // samples its own target"): BlurH draws into this+500 and reads this+504,
+  // the Tone pass's resolve of the same record; the history reads its own.
+  // Those two, and only those, read their own resolve, and both are allowed.
+  CHECK(d[11].target==d[10].target && d[11].target==input.blur.address);
+  CHECK(FindPostTexture(d[11],kPostDiffuse0)->handle==d[11].target_texture);
+  for(size_t p=0;p<d.size();++p) {
+    CHECK(NativePostReadsOwnResolve(d[p])==(p==9 || p==11));
+    CHECK(NativePostOwnResolveAllowed(d[p]));
+  }
+  // BlurV reads the same texture but draws into this+448: not a self-read.
+  CHECK(d[12].target_texture==input.blur_vertical.texture && FindPostTexture(d[12],kPostDiffuse0)->handle!=d[12].target_texture);
+  // Any other pass reading its own texture is refused.
+  auto self_read=d[3]; self_read.textures[0].handle=self_read.target_texture;
+  CHECK(NativePostReadsOwnResolve(self_read) && !NativePostOwnResolveAllowed(self_read));
+  auto self_read_plan=plan; self_read_plan.passes[3].setters[1].texture=self_read_plan.passes[3].target_texture;
+  threw=false;
+  try { BuildNativePostFrame(self_read_plan,tone); } catch(const std::runtime_error&) { threw=true; }
+  CHECK(threw);
   CHECK(frame.plan.tone && (*frame.plan.tone==std::array<float,3>{0.8f,1.5f,0.8f}) && frame.plan.tone_source==PostToneSource::SharedPool);
   // A nonfinite tone or a plan without the bloom is refused before anything is drawn.
   auto bad=tone; bad.tone_map[0]=NAN;
   RecordingSink refused;
-  bool threw=false;
+  threw=false;
   try { RecordNativePost(refused,input,bad); } catch(const std::runtime_error&) { threw=true; }
   CHECK(threw && refused.draws.empty());
   auto truncated=plan; truncated.passes.pop_back(); threw=false;
