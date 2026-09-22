@@ -1,5 +1,4 @@
 #pragma once
-#include <atomic>
 #include <cstdint>
 
 namespace edf::native {
@@ -14,8 +13,10 @@ namespace edf::native {
 //   about to produce, and logs `ab_alternate frame=F native=0|1` once per F.
 //   Output captures are named <prefix>.output.<F>.bmp, so every capture maps
 //   to its side through that log line (or through AbSide with the same cvars).
+//   The latch is thread_local: it is visible only to the thread running that
+//   helper call, so concurrent helper calls cannot interleave their sides.
 // - Every native pass gated by its own cvar (edf_native_static_world_pass,
-//   model, post and map-effect passes, ...) must additionally require
+//   model, post, bucket insert, map-effect walk, ...) must additionally require
 //   NativeAbNativeSide() before taking its native branch; otherwise it takes
 //   the guest branch for the whole helper call. Query the latch, never
 //   recompute the side mid-frame: indexed_output_frames advances inside the
@@ -31,16 +32,16 @@ inline bool AbSide(uint64_t frame, int64_t start, int64_t period) {
   return ((frame - uint64_t(start)) / uint64_t(period)) % 2 == 1;
 }
 
-inline std::atomic<bool> native_ab_native_side{true};
-inline bool NativeAbNativeSide() { return native_ab_native_side.load(std::memory_order_relaxed); }
+inline thread_local bool native_ab_native_side=true;
+inline bool NativeAbNativeSide() { return native_ab_native_side; }
 
 // Latches the side for one render helper call and restores the enclosing
 // latch on exit, so nested or aborted helper calls cannot leak a side.
 class NativeAbSideLatch {
  public:
   explicit NativeAbSideLatch(bool native)
-      : previous_(native_ab_native_side.exchange(native, std::memory_order_relaxed)) {}
-  ~NativeAbSideLatch() { native_ab_native_side.store(previous_, std::memory_order_relaxed); }
+      : previous_(native_ab_native_side) { native_ab_native_side = native; }
+  ~NativeAbSideLatch() { native_ab_native_side = previous_; }
   NativeAbSideLatch(const NativeAbSideLatch&) = delete;
   NativeAbSideLatch& operator=(const NativeAbSideLatch&) = delete;
  private:

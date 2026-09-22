@@ -5,6 +5,7 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 using namespace edf::native;
@@ -293,6 +294,88 @@ void ModelWorldMatchesGuestUpload() {
   const auto transposed=DecodeNativeQueuedWorld(registers,false);
   Require(transposed[1]==pose[4] && transposed[12]==pose[3],"row-major decode of the upload must transpose");
 }
+// Frees the given address through the registry at the first byte-range read,
+// as a guest free (820B2510) on another thread would while a decode or a pose
+// read is in progress. Reads never hold the registry lock, so this re-enters.
+struct FreeingReader {
+  const Memory& memory;
+  NativeModelPublications& models;
+  mutable uint32_t free=0;
+  mutable size_t retired=0;
+  uint32_t Word(uint32_t at) const { return memory.Word(at); }
+  const uint8_t* Bytes(uint32_t at,size_t size) const {
+    if(const auto address=std::exchange(free,0)) retired+=models.RetireAddress(address);
+    return memory.Bytes(at,size);
+  }
+};
+void CaptureRacesWithFree() {
+  std::vector<uint8_t> bytes(0x20000);
+  const Memory memory{bytes};
+  BuildModel(memory);
+  NativeModelPublications models;
+  const auto capture=[&](uint32_t freed,uint32_t storage=kPose) {
+    NativeModelPublications::CaptureScope scope(models);
+    const FreeingReader reader{memory,models,freed};
+    auto layout=DecodeNativeModelLayout(reader,kInstance,kVector,nullptr);
+    return models.Register(std::move(layout),storage,&scope);
+  };
+  // The very first capture: nothing is registered, yet a node free during the
+  // decode must still drop it.
+  Require(!models.size() && !capture(kNode) && !models.Find(kInstance) && models.stale_captures()==1,
+    "first capture registered a layout whose node was freed during decode");
+  Require(!capture(kInstance) && !capture(kPose) && models.stale_captures()==3 && !models.size(),
+    "capture registered a layout whose instance or pose storage was freed during decode");
+  // An unrelated free does not drop it; a free before the scope opened does not either.
+  Require(capture(0x4321) && models.size()==1,"unrelated free dropped a capture");
+  Require(models.RetireAddress(kNode)==1 && !models.size(),"registered node free");
+  Require(capture(0) && models.stale_captures()==3,"free before the capture began dropped it");
+  // A stale capture replaces nothing: the registered generation and its
+  // render-dependence latch (the model pass gate) survive.
+  const auto registered=models.Find(kInstance);
+  models.MarkRenderDependent(kInstance,registered.generation);
+  {
+    NativeModelPublications::CaptureScope scope(models);
+    auto layout=Decode(memory);
+    models.RetireAddress(0xE000); // Unkeyed, but recorded while a capture is open.
+    Require(!models.Register(std::move(layout),0xE000,&scope) && models.Find(kInstance).generation==registered.generation,
+      "stale capture replaced the registered layout");
+  }
+  Require(models.RenderDependent(kInstance,registered.generation),"stale capture cleared the render-dependence latch");
+  // Overlapping scopes: a free between the two openings drops only the older one.
+  {
+    NativeModelPublications::CaptureScope older(models);
+    Require(models.RetireAddress(kNode)==1,"node free with a capture open");
+    NativeModelPublications::CaptureScope newer(models);
+    Require(!models.Register(Decode(memory),kPose,&older) && models.Register(Decode(memory),kPose,&newer),
+      "free epochs across overlapping captures");
+  }
+  // Scopes closed: frees are no longer recorded, and keyed addresses still retire.
+  Require(capture(0) && !models.RetireAddress(0x4321) && models.RetireAddress(kPose)==1 && !models.size(),
+    "retirement after the captures closed");
+  // Pose reads happen outside the lock: freeing the registered storage while
+  // it is read retires the layout, and the commit publishes nothing for it.
+  models.Register(Decode(memory),kPose);
+  FreeingReader reader{memory,models,kPose};
+  const auto raced=models.PublishPoses(reader,20,{});
+  Require(reader.retired==1 && !raced->Find(kInstance) && !models.Find(kInstance),"pose committed after its storage was freed");
+  // Storage moved and the new storage freed mid-read: not keyed yet, so only
+  // the free epoch catches it; the pose is dropped and reseeded.
+  models.Register(Decode(memory),kPose);
+  models.PublishPoses(memory,21,{});
+  memory.StoreWord(kVector+4,0xF000); memory.StoreWord(kVector+8,0xF000+128);
+  reader.free=0xF000; reader.retired=0;
+  const auto moved=models.PublishPoses(reader,22,std::vector<uint32_t>{kVector});
+  Require(!reader.retired && !moved->Find(kInstance) && models.Find(kInstance) && !models.RetireAddress(0xF000),
+    "pose read from freed storage was committed or keyed");
+  // The unlocked read keeps the latch and publishes under the live generation.
+  const auto current=models.Find(kInstance);
+  models.MarkRenderDependent(kInstance,current.generation);
+  const auto reseeded=models.PublishPoses(memory,23,{});
+  Require(reseeded->Find(kInstance) && reseeded->Find(kInstance)->layout_generation==current.generation &&
+    models.RenderDependent(kInstance,current.generation),"pose commit lost the generation or the latch");
+  Require(models.RetireAddress(0xF000)==1 && !models.RenderDependent(kInstance,current.generation),
+    "freed pose read was not reseeded, or retirement kept the latch");
+}
 }
 int main() {
   try {
@@ -303,6 +386,7 @@ int main() {
     ModelPassGateDeclines();
     ModelPassDrawPlanFollowsGuestOrder();
     ModelWorldMatchesGuestUpload();
+    CaptureRacesWithFree();
   } catch(const std::exception& error) {
     std::cerr<<"native model publication test failed: "<<error.what()<<"\n";
     return 1;

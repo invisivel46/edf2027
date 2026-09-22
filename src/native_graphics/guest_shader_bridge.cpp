@@ -4175,7 +4175,8 @@ REX_EXTERN(sub_821C0C00);
 REX_HOOK_RAW(sub_820B35A0) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderList);
   if(REXCVAR_GET(edf_native_map_effect_census)) RecordNativeMapEffectCensus(base,ctx.r4.u32);
-  if(!REXCVAR_GET(edf_native_map_effect_list)) { __imp__sub_820B35A0(ctx,base); return; }
+  // The A/B guest side keeps the original loop for the whole helper call.
+  if(!REXCVAR_GET(edf_native_map_effect_list) || !edf::native::NativeAbNativeSide()) { __imp__sub_820B35A0(ctx,base); return; }
   const NativeRawGuestWords words{base};
   auto work=ctx;
   const auto stack=work.r1.u32-112;
@@ -4927,7 +4928,8 @@ REX_EXTERN(__imp__sub_821C0C00);
 // True when a sort-mode 1/2 object was inserted natively and no guest code
 // ran; false leaves the object to the original routine.
 static bool TryNativeBucketInsert(PPCContext& ctx,uint8_t* base) {
-  if(!REXCVAR_GET(edf_native_bucket_dispatch) || REXCVAR_GET(edf_native_bucket_dispatch_audit)) return false;
+  if(!REXCVAR_GET(edf_native_bucket_dispatch) || REXCVAR_GET(edf_native_bucket_dispatch_audit) ||
+     !edf::native::NativeAbNativeSide()) return false;
   using namespace edf::native;
   const GuestReader reader(base);
   const auto object=ctx.r3.u32,context=ctx.r4.u32;
@@ -4951,7 +4953,9 @@ static bool TryNativeBucketInsert(PPCContext& ctx,uint8_t* base) {
 }
 // `native_tried`: the caller already ran TryNativeBucketInsert and it declined.
 static void DispatchNativeBucketObject(PPCContext& ctx,uint8_t* base,bool native_tried=false) {
-  const bool audit=REXCVAR_GET(edf_native_bucket_dispatch_audit),native=REXCVAR_GET(edf_native_bucket_dispatch);
+  // The audit always runs the original; only the native insert follows the A/B side.
+  const bool audit=REXCVAR_GET(edf_native_bucket_dispatch_audit),
+    native=REXCVAR_GET(edf_native_bucket_dispatch) && edf::native::NativeAbNativeSide();
   if(!audit && !native) { __imp__sub_821C0C00(ctx,base); return; }
   if(!audit) { if(native_tried || !TryNativeBucketInsert(ctx,base)) __imp__sub_821C0C00(ctx,base); return; }
   using namespace edf::native;
@@ -5529,8 +5533,9 @@ REX_HOOK_RAW(sub_820B2510) {
     std::lock_guard lock(motion.mutex);
     motion.Erase(ctx.r3.u32);
   }
-  // Ungated so a live toggle cannot leave a layout past its free: one relaxed
-  // load while nothing is registered, and never the bridge lock.
+  // Ungated so a live toggle cannot leave a layout past its free: two atomic
+  // loads unless a capture is in flight or the address hits a key bucket, and
+  // never the bridge lock.
   ModelPublications().RetireAddress(ctx.r3.u32);
   __imp__sub_820B2510(ctx,base);
 }
@@ -5574,13 +5579,24 @@ void ObserveNativeModelPublication(uint8_t* base,uint32_t instance,uint32_t vect
     }
     const auto identity=edf::native::ReadGuestWords<2>(reader,instance);
     if(models.Current(instance,identity[0],identity[1],vector) || models.Rejected(instance,identity[1],vector)) return;
+    // Open before the decode reads guest memory: a free (820B2510) of the
+    // instance, node or pose storage from here to Register drops the capture.
+    const edf::native::NativeModelPublications::CaptureScope capture(models);
     try {
       auto layout=decode([&](const auto& lookup) {
         return edf::native::DecodeNativeModelLayoutWith(reader,instance,vector,lookup);
       });
       const auto storage=edf::native::ReadNativeModelPoseRange(reader,vector).begin;
       const auto meshes=layout.meshes.size(),batches=layout.Batches();
-      const auto captured=models.Register(std::move(layout),storage);
+      const auto captured=models.Register(std::move(layout),storage,&capture);
+      if(!captured) {
+        // Not a rejection: the next draw of a live instance captures again.
+        static std::atomic<uint64_t> stale{0};
+        const auto count=stale.fetch_add(1,std::memory_order_relaxed)+1;
+        if(count<=8 || (count&(count-1))==0)
+          REXLOG_INFO("Native model publication: dropped capture instance={:#x} freed during decode stale={}",instance,count);
+        return;
+      }
       static std::atomic<uint64_t> captures{0};
       const auto count=captures.fetch_add(1,std::memory_order_relaxed)+1;
       if(count<=8 || (count&(count-1))==0)

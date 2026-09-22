@@ -5,8 +5,10 @@
 #include "native_material_sampler.h"
 #include <algorithm>
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace edf::native {

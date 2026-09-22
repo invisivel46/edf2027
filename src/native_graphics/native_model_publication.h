@@ -4,11 +4,13 @@
 #include "native_model_pose_history.h"
 #include "native_shared_vector.h"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <unordered_map>
@@ -159,7 +161,16 @@ NativeModelLayout DecodeNativeModelLayout(const Reader& reader,uint32_t instance
   });
 }
 // Per-(instance, generation) layouts plus an immutable per-tick pose map.
-// A leaf lock: no callback or other lock is taken while it is held.
+// A leaf lock: no callback or other lock is taken while it is held, and guest
+// memory is never read under it.
+//
+// Frees race decodes: a layout is decoded without the lock and registered
+// afterwards, and a pose vector is read without it and committed afterwards.
+// Both run inside a CaptureScope; while any scope is open RetireAddress
+// records every freed address with a free epoch, and Register / the pose
+// commit drop what names an address freed after their scope began. With no
+// scope open the free hook is two atomic loads unless the address hashes to a
+// bucket that holds a key.
 class NativeModelPublications {
  public:
   struct Layout {
@@ -177,11 +188,24 @@ class NativeModelPublications {
     NativeSharedMap<uint32_t,std::shared_ptr<const Pose>> poses;
     const Pose* Find(uint32_t instance) const { const auto* found=poses.Find(instance); return found?found->get():nullptr; }
   };
+  // Open for the whole decode-then-register (or read-then-commit) window.
+  class CaptureScope {
+   public:
+    explicit CaptureScope(NativeModelPublications& owner):owner_(owner),epoch_(owner.BeginCapture()) {}
+    ~CaptureScope() { owner_.EndCapture(epoch_); }
+    CaptureScope(const CaptureScope&)=delete;
+    CaptureScope& operator=(const CaptureScope&)=delete;
+    uint64_t epoch() const { return epoch_; }
+   private:
+    NativeModelPublications& owner_;
+    uint64_t epoch_;
+  };
   size_t size() const { return count_.load(std::memory_order_relaxed); }
   uint64_t captures() const { std::lock_guard lock(mutex_); return captures_; }
   uint64_t retirements() const { std::lock_guard lock(mutex_); return retirements_; }
   uint64_t pose_failures() const { std::lock_guard lock(mutex_); return pose_failures_; }
   uint64_t snapshots() const { std::lock_guard lock(mutex_); return snapshots_; }
+  uint64_t stale_captures() const { std::lock_guard lock(mutex_); return stale_captures_; }
   Layout Find(uint32_t instance) const {
     std::lock_guard lock(mutex_);
     const auto found=entries_.find(instance);
@@ -203,16 +227,21 @@ class NativeModelPublications {
   }
   void Reject(uint32_t instance,uint32_t node,uint32_t pose_vector) {
     std::lock_guard lock(mutex_);
-    if(rejected_.size()>=4096) rejected_.clear();
-    rejected_.insert_or_assign(instance,std::pair{node,pose_vector});
+    if(rejected_.size()>=4096) { for(const auto& rejected:rejected_) Mark(rejected.first,-1); rejected_.clear(); }
+    if(rejected_.insert_or_assign(instance,std::pair{node,pose_vector}).second) Mark(instance,1);
   }
   // Replaces any older generation of the same instance. Its pose is seeded
-  // at the next publication even when simulation does not rebuild it.
-  Layout Register(NativeModelLayout layout,uint32_t storage=0) {
+  // at the next publication even when simulation does not rebuild it. With a
+  // capture scope, a layout whose instance, node or pose storage was freed
+  // after the scope began is dropped (empty result) and nothing is replaced:
+  // the registered generation, its pose and its render-dependence latch stay.
+  Layout Register(NativeModelLayout layout,uint32_t storage=0,const CaptureScope* capture=nullptr) {
     if(!layout.instance || !layout.node || !layout.pose_vector) throw std::runtime_error("incomplete native model layout");
     std::lock_guard lock(mutex_);
+    if(capture && (FreedSinceLocked(layout.instance,capture->epoch()) || FreedSinceLocked(layout.node,capture->epoch()) ||
+       (storage && FreedSinceLocked(storage,capture->epoch())))) { ++stale_captures_; return {}; }
     RetireLocked(layout.instance,false);
-    rejected_.erase(layout.instance);
+    EraseRejectedLocked(layout.instance);
     const auto instance=layout.instance,node=layout.node,vector=layout.pose_vector;
     Entry entry{{++generation_,std::make_shared<const NativeModelLayout>(std::move(layout))},storage};
     AddKey(instance,instance); AddKey(node,instance);
@@ -243,10 +272,14 @@ class NativeModelPublications {
   // Deallocation (820B2510): the freed block was an instance, its model node
   // or the pose storage it was captured with. Vector growth (821C8F10) frees
   // the old storage the same way; a later draw captures a new generation.
+  // Lock-free unless a capture is in flight or the address hits a key bucket.
   size_t RetireAddress(uint32_t address) {
-    if(!count_.load(std::memory_order_relaxed) || !address) return 0;
+    if(!address) return 0;
+    // Pairs with EndCapture: a scope seen closed has its keys marked.
+    if(!capturing_.load(std::memory_order_seq_cst) && !marks_[Bucket(address)].load(std::memory_order_relaxed)) return 0;
     std::lock_guard lock(mutex_);
-    rejected_.erase(address);
+    if(capturing_.load(std::memory_order_relaxed)) freed_.emplace_back(address,++free_epoch_);
+    EraseRejectedLocked(address);
     std::vector<uint32_t> instances;
     const auto [first,last]=keys_.equal_range(address);
     for(auto at=first;at!=last;++at) instances.push_back(at->second);
@@ -256,38 +289,66 @@ class NativeModelPublications {
   }
   // Engine thread, after the tick's dirty walk. Only vectors built this tick
   // (and first-sight seeds) are read; every other entry keeps its shared pose.
+  // The vector list is taken under the lock, guest memory is read without it,
+  // and the commit re-checks each instance's layout generation and the read
+  // storage's free epoch, so a concurrent retire or free wins. Poses carry the
+  // generation seen at collection, which the model pass gate and the
+  // render-dependence latch (untouched here) key on.
   template<class Reader>
   std::shared_ptr<const PosePublication> PublishPoses(const Reader& reader,uint64_t tick,std::span<const uint32_t> dirty) {
-    std::lock_guard lock(mutex_);
-    std::vector<uint32_t> pending(dirty.begin(),dirty.end());
-    pending.insert(pending.end(),seeds_.begin(),seeds_.end());
-    seeds_.clear();
-    std::sort(pending.begin(),pending.end());
-    pending.erase(std::unique(pending.begin(),pending.end()),pending.end());
-    ++pose_generation_;
-    for(const auto vector:pending) {
-      const auto found=vectors_.find(vector);
-      if(found==vectors_.end()) continue;
-      const auto instances=found->second;
+    struct Read {
+      uint32_t vector=0,storage=0;
+      bool failed=false;
+      std::vector<std::pair<uint32_t,uint64_t>> instances; // (instance, layout generation) when collected.
       std::vector<NativePoseMatrix> matrices;
-      uint32_t storage=0;
-      try { matrices=ReadNativeModelPose(reader,vector,&storage); }
-      catch(const std::exception&) {
+    };
+    const CaptureScope capture(*this);
+    std::vector<Read> reads;
+    {
+      std::lock_guard lock(mutex_);
+      std::vector<uint32_t> pending(dirty.begin(),dirty.end());
+      pending.insert(pending.end(),seeds_.begin(),seeds_.end());
+      seeds_.clear();
+      std::sort(pending.begin(),pending.end());
+      pending.erase(std::unique(pending.begin(),pending.end()),pending.end());
+      for(const auto vector:pending) {
+        const auto found=vectors_.find(vector);
+        if(found==vectors_.end()) continue;
+        auto& read=reads.emplace_back(); read.vector=vector;
+        for(const auto instance:found->second) read.instances.emplace_back(instance,entries_.at(instance).layout.generation);
+      }
+    }
+    for(auto& read:reads) {
+      try { read.matrices=ReadNativeModelPose(reader,read.vector,&read.storage); }
+      catch(const std::exception&) { read.failed=true; }
+    }
+    std::lock_guard lock(mutex_);
+    const auto live=[&](uint32_t instance,uint64_t generation)->Entry* {
+      const auto found=entries_.find(instance);
+      return found!=entries_.end() && found->second.layout.generation==generation?&found->second:nullptr;
+    };
+    ++pose_generation_;
+    for(const auto& read:reads) {
+      // Storage freed while it was read: the copy is unusable; reseed next tick.
+      const bool freed=!read.failed && read.storage && FreedSinceLocked(read.storage,capture.epoch());
+      if(read.failed || freed) {
         ++pose_failures_;
-        for(const auto instance:instances) poses_.Erase(instance);
+        for(const auto& [instance,generation]:read.instances) if(live(instance,generation)) poses_.Erase(instance);
+        if(freed && vectors_.contains(read.vector)) seeds_.insert(read.vector);
         continue;
       }
       ++snapshots_;
-      for(const auto instance:instances) {
-        auto& entry=entries_.at(instance);
+      for(const auto& [instance,generation]:read.instances) {
+        auto* entry=live(instance,generation);
+        if(!entry) continue; // Retired or re-registered while the pose was read.
         // The skeleton changed size: the captured bone checks no longer hold.
-        if(matrices.size()!=entry.layout.layout->bones) { ++pose_failures_; RetireLocked(instance,true); continue; }
-        if(storage!=entry.storage) {
-          if(entry.storage) RemoveKey(entry.storage,instance);
-          if(storage) AddKey(storage,instance);
-          entry.storage=storage;
+        if(read.matrices.size()!=entry->layout.layout->bones) { ++pose_failures_; RetireLocked(instance,true); continue; }
+        if(read.storage!=entry->storage) {
+          if(entry->storage) RemoveKey(entry->storage,instance);
+          if(read.storage) AddKey(read.storage,instance);
+          entry->storage=read.storage;
         }
-        poses_.Set(instance,std::make_shared<const Pose>(Pose{instance,entry.layout.generation,pose_generation_,matrices}));
+        poses_.Set(instance,std::make_shared<const Pose>(Pose{instance,entry->layout.generation,pose_generation_,read.matrices}));
       }
     }
     auto publication=std::make_shared<PosePublication>();
@@ -300,19 +361,44 @@ class NativeModelPublications {
     std::lock_guard lock(mutex_);
     retirements_+=entries_.size();
     entries_.clear(); keys_.clear(); vectors_.clear(); seeds_.clear(); rejected_.clear(); render_dependent_.clear();
+    for(auto& mark:marks_) mark.store(0,std::memory_order_relaxed);
     poses_=decltype(poses_){}; published_.reset();
     count_.store(0,std::memory_order_relaxed);
   }
  private:
   struct Entry { Layout layout; uint32_t storage=0; };
+  static constexpr uint32_t kMarkBits=14;
+  // Fibonacci hashing spreads aligned guest heap blocks over the buckets.
+  static uint32_t Bucket(uint32_t address) { return uint32_t(address*0x9E3779B1u)>>(32-kMarkBits); }
+  // Counting prefilter over keys_ and rejected_ instances: written under the
+  // lock, read without it by the free hook.
+  void Mark(uint32_t address,int delta) { marks_[Bucket(address)].fetch_add(uint32_t(delta),std::memory_order_relaxed); }
+  uint64_t BeginCapture() {
+    std::lock_guard lock(mutex_);
+    capturing_.fetch_add(1,std::memory_order_seq_cst);
+    active_.insert(free_epoch_);
+    return free_epoch_;
+  }
+  void EndCapture(uint64_t epoch) {
+    std::lock_guard lock(mutex_);
+    active_.erase(active_.find(epoch));
+    if(active_.empty()) freed_.clear();
+    else { const auto oldest=*active_.begin(); std::erase_if(freed_,[&](const auto& freed) { return freed.second<=oldest; }); }
+    capturing_.fetch_sub(1,std::memory_order_seq_cst);
+  }
+  bool FreedSinceLocked(uint32_t address,uint64_t epoch) const {
+    return std::any_of(freed_.begin(),freed_.end(),[&](const auto& freed) { return freed.first==address && freed.second>epoch; });
+  }
+  void EraseRejectedLocked(uint32_t instance) { if(rejected_.erase(instance)) Mark(instance,-1); }
   void AddKey(uint32_t address,uint32_t instance) {
     const auto [first,last]=keys_.equal_range(address);
     for(auto at=first;at!=last;++at) if(at->second==instance) return;
     keys_.emplace(address,instance);
+    Mark(address,1);
   }
   void RemoveKey(uint32_t address,uint32_t instance) {
     const auto [first,last]=keys_.equal_range(address);
-    for(auto at=first;at!=last;++at) if(at->second==instance) { keys_.erase(at); return; }
+    for(auto at=first;at!=last;++at) if(at->second==instance) { keys_.erase(at); Mark(address,-1); return; }
   }
   bool RetireLocked(uint32_t instance,bool count) {
     const auto found=entries_.find(instance);
@@ -333,15 +419,19 @@ class NativeModelPublications {
   }
   mutable std::mutex mutex_;
   std::atomic<size_t> count_{0};
+  std::atomic<uint32_t> capturing_{0};
+  std::array<std::atomic<uint32_t>,size_t(1)<<kMarkBits> marks_{};
   std::unordered_map<uint32_t,Entry> entries_;
   std::unordered_multimap<uint32_t,uint32_t> keys_;
   std::unordered_map<uint32_t,std::vector<uint32_t>> vectors_;
   std::unordered_set<uint32_t> seeds_;
   std::unordered_map<uint32_t,std::pair<uint32_t,uint32_t>> rejected_;
   std::unordered_map<uint32_t,uint64_t> render_dependent_;
+  std::multiset<uint64_t> active_;                  // Open capture scopes' start epochs.
+  std::vector<std::pair<uint32_t,uint64_t>> freed_; // (address, free epoch) while a scope is open.
   NativeSharedMap<uint32_t,std::shared_ptr<const Pose>> poses_;
   std::shared_ptr<const PosePublication> published_;
-  uint64_t generation_=0,pose_generation_=0,captures_=0,retirements_=0,pose_failures_=0,snapshots_=0;
+  uint64_t generation_=0,pose_generation_=0,free_epoch_=0,captures_=0,retirements_=0,pose_failures_=0,snapshots_=0,stale_captures_=0;
 };
 struct NativeModelAudit {
   bool decoded=true,layout_mismatch=false,published=false,pose_mismatch=false;

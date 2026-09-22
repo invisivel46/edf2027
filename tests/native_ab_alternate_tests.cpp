@@ -1,5 +1,6 @@
 #include "native_graphics/native_ab_alternate.h"
 #include <iostream>
+#include <thread>
 
 int main() {
   using edf::native::AbSide;
@@ -23,6 +24,24 @@ int main() {
     check(!edf::native::NativeAbNativeSide());
     { edf::native::NativeAbSideLatch inner(true); check(edf::native::NativeAbNativeSide()); }
     check(!edf::native::NativeAbNativeSide());
+  }
+  check(edf::native::NativeAbNativeSide());
+  // The latch is per thread: a helper call on another thread neither sees nor
+  // disturbs this thread's side.
+  {
+    edf::native::NativeAbSideLatch guest(false);
+    bool other_initial = false, other_latched = true, other_restored = false;
+    std::thread other([&] {
+      other_initial = edf::native::NativeAbNativeSide();
+      { edf::native::NativeAbSideLatch latch(false); other_latched = edf::native::NativeAbNativeSide(); }
+      other_restored = edf::native::NativeAbNativeSide();
+    });
+    other.join();
+    check(other_initial && !other_latched && other_restored);
+    check(!edf::native::NativeAbNativeSide());
+    std::thread native([&] { edf::native::NativeAbSideLatch latch(true); other_latched = edf::native::NativeAbNativeSide(); });
+    native.join();
+    check(other_latched && !edf::native::NativeAbNativeSide());
   }
   check(edf::native::NativeAbNativeSide());
   if (failures) std::cerr << failures << " native A/B alternate checks failed\n";
