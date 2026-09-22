@@ -123,146 +123,203 @@ struct SparseReader {
   }
   void StoreDoubleWord(uint32_t at,uint64_t value) const { StoreWord(at,uint32_t(value>>32)); StoreWord(at+4,uint32_t(value)); }
   void StoreByte(uint32_t at,uint8_t value) const { const_cast<uint8_t*>(Bytes(at,1))[0]=value; }
+  const uint8_t* WritableBytes(uint32_t at,size_t size,size_t) const { return Bytes(at,size); }
 };
 // The static world pass against sequential guest groups on a CPU arena. Guest
 // activation is modelled by the production executors, as ActivateNativeMaterial
-// runs them: texture binding with retirement, sampler words, state CPU writes.
+// runs them: constant uploads, texture binding with retirement, sampler words,
+// state CPU writes. Run once with a live fence (retirement stamps the replaced
+// handle's +8) and once without (retirement queues a tagged deferred entry):
+// the whole arena, not only the device block, must match sequential groups.
 void StaticWorldPass() {
-  constexpr uint32_t device=0x10000,owner=0x300;
+  constexpr uint32_t device=0x10000,owner=0x300,queue=0x30000,common=0x100;
   struct Material {
     uint32_t address;
     std::vector<std::array<uint32_t,2>> states;
+    std::vector<NativeMaterialCpuProgram::Constant> constants;
     std::vector<NativeMaterialCpuProgram::Texture> textures;
     NativeSceneMaterialProgram program;
   };
   using Pages=std::map<uint32_t,std::array<uint8_t,4096>>;
-  Pages initial;
-  const SparseReader setup{initial};
-  setup.StoreWord(0x8200964c,0x3b808081u); setup.StoreWord(0x82003198,0x42000000u);
-  for(uint32_t i=0;i<6;++i) setup.StoreWord(0x82009608+i*4,i*2);
-  setup.StoreWord(device+10780,200); setup.StoreWord(device+12184,1); setup.StoreWord(device+12168,1);
-  for(uint32_t offset:{10424u,10456u,10460u,10464u}) setup.StoreWord(device+offset,0x10001);
-  setup.StoreWord(device+10420,0x70); setup.StoreWord(device+10440,0x5); setup.StoreWord(device+10428,0x80000007);
-  setup.StoreWord(device+10332,15); setup.StoreWord(device+11576,0x10001); setup.StoreWord(device+11580,0);
-  setup.StoreWord(device+11588,15);
-  for(uint32_t slot=0;slot<16;++slot) {
-    for(uint32_t i=0;i<6;++i) setup.StoreWord(device+1024+slot*24+i*4,0x9e3779b9u*(slot*6+i+1));
-    setup.StoreWord(device+12272+slot*4,0x40000+slot*0x100);
-    setup.StoreByte(device+11652+slot,uint8_t(slot%5)); setup.StoreByte(device+11678+slot,uint8_t(slot%3));
-    setup.StoreByte(device+11704+slot,uint8_t(15-slot%4)); setup.StoreByte(device+11730+slot,uint8_t(slot%2?5:0));
-  }
-  const auto texture=[&](uint32_t slot,uint32_t handle,std::array<uint32_t,4> settings) {
-    for(uint32_t i=0;i<6;++i) setup.StoreWord(handle+28+i*4,(0x85ebca6bu*(i+1))^(handle<<3));
-    NativeMaterialCpuProgram::Texture result{slot,handle,{}};
-    result.sampler.slot=slot; result.sampler.settings=settings;
-    result.sampler.texture_filter_high=setup.Word(handle+40)&0x80000000u;
-    result.sampler.texture_lod=setup.Word(handle+44)&0x3fcu;
-    return result;
-  };
-  const auto material=[&](uint32_t address,std::vector<std::array<uint32_t,2>> states,
-                          std::vector<NativeMaterialCpuProgram::Texture> textures) {
-    Material result{address,std::move(states),std::move(textures),{}};
-    result.program.inputs.state_overrides=result.states;
-    for(const auto& bound:result.textures) result.program.sampler_operations.push_back(bound.sampler);
-    return result;
-  };
-  const auto half=std::bit_cast<uint32_t>(.5f),quarter=std::bit_cast<uint32_t>(-.25f);
-  // M0's states and slot 0 are superseded within its run, so the handoff never
-  // replays it; G is a guest group between two native runs.
-  std::vector<Material> materials;
-  materials.push_back(material(0xa000,{{0x3c,1},{0x48,6},{0x98,3}},{texture(0,0x50000,{half,1,1,1})}));
-  materials.push_back(material(0xa100,{{0x44,0x80402010u},{0x28,1}},{texture(1,0x51000,{quarter,2,0,1})}));
-  materials.push_back(material(0xa200,{{0x34,2},{0x4c,7}},{texture(0,0x52000,{0,1,1,0})}));
-  materials.push_back(material(0xa300,{{0x38,1},{0xd8,3}},{texture(2,0x53000,{half,0,0,0})}));
-  materials.push_back(material(0xa400,{{0x60,1},{0x4c,5},{0x40,1},{0x58,4}},{texture(0,0x54000,{quarter,1,0,1})}));
-  materials.push_back(material(0xa500,{{0x64,0x80},{0x154,0x7f}},{texture(3,0x55000,{0,1,1,1})}));
-  const auto activate=[&](const SparseReader& reader,const Material& selected) {
-    for(const auto& bound:selected.textures) {
-      const uint64_t mask=uint64_t(1)<<(43-bound.slot);
-      SetNativeTextureResource(reader,device,bound.slot,bound.handle,mask,
-        []()->uint32_t { throw std::runtime_error("unexpected retirement allocation"); },
-        []()->uint32_t { throw std::runtime_error("unexpected retirement tag"); });
-      const auto resolved=ApplyNativeMaterialSampler(ReadNativeMaterialSamplerPass(reader,device,bound.slot),bound.sampler);
-      reader.StoreWord(device+1036+bound.slot*24,resolved.words[1]);
-      reader.StoreWord(device+1040+bound.slot*24,resolved.words[2]);
-      reader.StoreDoubleWord(device+16,reader.DoubleWord(device+16)|mask);
-    }
-    for(const auto& [offset,value]:selected.states) {
-      const auto writes=NativeMaterialStateCpuWrites(ReadNativeMaterialRenderPassMirrors(reader,device),
-        offset,value,reader.DoubleWord(device+16),reader.DoubleWord(device+24));
-      Require(writes.has_value(),"static world fixture state needs a callback");
-      for(const auto& [address,word]:*writes) reader.StoreWord(device+address,word);
-    }
-  };
-  const auto find=[&](uint32_t address) -> const Material& {
-    for(const auto& candidate:materials) if(candidate.address==address) return candidate;
-    throw std::runtime_error("unknown static world fixture group");
-  };
   // Published order: E has no selections; G has a guest-queued selection.
   constexpr uint32_t empty=0xa600,guest=0xa300;
   const std::vector<uint32_t> order{0xa000,0xa100,empty,0xa200,guest,0xa400,0xa500};
-  Pages sequential=initial;
-  {
-    const SparseReader reader{sequential};
-    for(const auto group:order) if(group!=empty) activate(reader,find(group));
-  }
-  Pages native=initial;
-  const SparseReader reader{native};
-  const auto load=[&] {
-    NativeSceneMaterialPassState pass;
-    pass.render=ReadNativeMaterialRenderPass(reader,device);
-    for(uint32_t slot=0;slot<16;++slot) pass.samplers[slot]=ReadNativeMaterialSamplerPass(reader,device,slot);
-    return pass.Inputs();
-  };
-  auto cursor=load();
-  std::vector<const Material*> owed;
-  NativeMaterialRenderPass owed_start;
-  std::vector<std::string> trace;
-  std::vector<size_t> replayed;
-  WalkNativeStaticWorld(order,[&](uint32_t group) -> std::optional<NativeStaticWorldFallback> {
-    if(group==guest) return NativeStaticWorldFallback::GuestQueue;
-    if(group==empty) { trace.push_back("empty"); return {}; }
-    const auto& selected=find(group);
-    if(owed.empty()) owed_start=cursor.render;
-    owed.push_back(&selected);
-    cursor=cursor.After(selected.program);
-    trace.push_back("native "+std::to_string(group));
-    return {};
-  },[&](uint32_t group,NativeStaticWorldFallback reason) {
-    Require(reason==NativeStaticWorldFallback::GuestQueue,"static world fallback reason");
-    trace.push_back("guest "+std::to_string(group));
-    activate(reader,find(group));
-    cursor=load();
-  },[&] {
-    if(owed.empty()) return;
-    trace.push_back("handoff");
-    std::vector<NativeStaticWorldHandoffGroup> groups;
-    for(const auto* selected:owed) {
-      uint32_t slots=0;
-      for(const auto& operation:selected->program.sampler_operations) slots|=1u<<operation.slot;
-      groups.push_back({selected->program.inputs.state_overrides,slots});
+  const auto run=[&](uint32_t fence) {
+    Pages initial;
+    const SparseReader setup{initial};
+    setup.StoreWord(0x8200964c,0x3b808081u); setup.StoreWord(0x82003198,0x42000000u);
+    for(uint32_t i=0;i<6;++i) setup.StoreWord(0x82009608+i*4,i*2);
+    setup.StoreWord(device+10780,fence); setup.StoreWord(device+10784,common);
+    setup.StoreWord(device+13148,queue); setup.StoreWord(device+13152,queue+8*16);
+    setup.StoreWord(device+12184,1); setup.StoreWord(device+12168,1);
+    for(uint32_t offset:{10424u,10456u,10460u,10464u}) setup.StoreWord(device+offset,0x10001);
+    setup.StoreWord(device+10420,0x70); setup.StoreWord(device+10440,0x5); setup.StoreWord(device+10428,0x80000007);
+    setup.StoreWord(device+10332,15); setup.StoreWord(device+11576,0x10001); setup.StoreWord(device+11580,0);
+    setup.StoreWord(device+11588,15);
+    for(uint32_t slot=0;slot<16;++slot) {
+      for(uint32_t i=0;i<6;++i) setup.StoreWord(device+1024+slot*24+i*4,0x9e3779b9u*(slot*6+i+1));
+      setup.StoreWord(device+12272+slot*4,0x40000+slot*0x100); setup.StoreWord(0x40000+slot*0x100,common);
+      setup.StoreByte(device+11652+slot,uint8_t(slot%5)); setup.StoreByte(device+11678+slot,uint8_t(slot%3));
+      setup.StoreByte(device+11704+slot,uint8_t(15-slot%4)); setup.StoreByte(device+11730+slot,uint8_t(slot%2?5:0));
     }
-    const auto writes=HandOffNativeStaticWorld(reader,device,owed_start,cursor.samplers,groups,[&](size_t index) {
-      replayed.push_back(owed[index]->address); activate(reader,*owed[index]);
+    for(uint32_t i=0;i<256;++i) setup.StoreWord(0x60000+i*4,0x3f800000u+i*0x1001u);
+    // A null handle binds nothing: no descriptor words, texture lod or filter bit.
+    const auto texture=[&](uint32_t slot,uint32_t handle,std::array<uint32_t,4> settings) {
+      NativeMaterialCpuProgram::Texture result{slot,handle,{}};
+      result.sampler.slot=slot; result.sampler.settings=settings;
+      if(!handle) return result;
+      setup.StoreWord(handle,common);
+      for(uint32_t i=0;i<6;++i) setup.StoreWord(handle+28+i*4,(0x85ebca6bu*(i+1))^(handle<<3));
+      result.sampler.texture_filter_high=setup.Word(handle+40)&0x80000000u;
+      result.sampler.texture_lod=setup.Word(handle+44)&0x3fcu;
+      return result;
+    };
+    const auto material=[&](uint32_t address,std::vector<std::array<uint32_t,2>> states,
+                            std::vector<NativeMaterialCpuProgram::Constant> constants,
+                            std::vector<NativeMaterialCpuProgram::Texture> textures) {
+      Material result{address,std::move(states),std::move(constants),std::move(textures),{}};
+      result.program.inputs.state_overrides=result.states;
+      for(const auto& bound:result.textures) result.program.sampler_operations.push_back(bound.sampler);
+      return result;
+    };
+    const auto half=std::bit_cast<uint32_t>(.5f),quarter=std::bit_cast<uint32_t>(-.25f);
+    // M0's states and slot 0 are superseded within its run, and M1's slot 1 is
+    // last touched by M2's null bind, so the first handoff replays only M2 and
+    // M0/M1 bind: their textures retire at M2's binds, M1's descriptor words
+    // stay under the null bind, and vertex c20 (M0) and pixel c5 (M1) are
+    // written by no replayed activation. G is a guest group between two runs.
+    std::vector<Material> materials;
+    materials.push_back(material(0xa000,{{0x3c,1},{0x48,6},{0x98,3}},{{false,20,0x60000,2}},
+      {texture(0,0x50000,{half,1,1,1})}));
+    materials.push_back(material(0xa100,{{0x44,0x80402010u},{0x28,1}},{{true,5,0x60100,1}},
+      {texture(1,0x51000,{quarter,2,0,1})}));
+    materials.push_back(material(0xa200,{{0x34,2},{0x4c,7}},{{false,21,0x60200,1}},
+      {texture(0,0x52000,{0,1,1,0}),texture(1,0,{half,1,0,1})}));
+    materials.push_back(material(0xa300,{{0x38,1},{0xd8,3}},{{false,21,0x60300,1}},{texture(2,0x53000,{half,0,0,0})}));
+    materials.push_back(material(0xa400,{{0x60,1},{0x4c,5},{0x40,1},{0x58,4}},{},{texture(0,0x54000,{quarter,1,0,1})}));
+    materials.push_back(material(0xa500,{{0x64,0x80},{0x154,0x7f}},{{true,6,0x60340,2}},{texture(3,0x55000,{0,1,1,1})}));
+    // states=false is the handoff's bind: the activation without its state operations.
+    const auto activate=[&](const SparseReader& reader,const Material& selected,bool states) {
+      for(const auto& operation:selected.constants) {
+        const auto first=operation.first/4,last=(operation.first+operation.count-1)/4;
+        const uint64_t mask=(~uint64_t(0)>>(first))&(~uint64_t(0)<<(63-last));
+        Require(UploadNativeMaterialConstant(reader,device,operation,mask),"static world fixture constant aliases");
+      }
+      for(const auto& bound:selected.textures) {
+        const uint64_t mask=uint64_t(1)<<(43-bound.slot);
+        SetNativeTextureResource(reader,device,bound.slot,bound.handle,mask,
+          []()->uint32_t { throw std::runtime_error("unexpected retirement allocation"); },
+          []()->uint32_t { return 0x80000000u; });
+        const auto resolved=ApplyNativeMaterialSampler(ReadNativeMaterialSamplerPass(reader,device,bound.slot),bound.sampler);
+        reader.StoreWord(device+1036+bound.slot*24,resolved.words[1]);
+        reader.StoreWord(device+1040+bound.slot*24,resolved.words[2]);
+        reader.StoreDoubleWord(device+16,reader.DoubleWord(device+16)|mask);
+      }
+      if(states) for(const auto& [offset,value]:selected.states) {
+        const auto writes=NativeMaterialStateCpuWrites(ReadNativeMaterialRenderPassMirrors(reader,device),
+          offset,value,reader.DoubleWord(device+16),reader.DoubleWord(device+24));
+        Require(writes.has_value(),"static world fixture state needs a callback");
+        for(const auto& [address,word]:*writes) reader.StoreWord(device+address,word);
+      }
+    };
+    const auto find=[&](uint32_t address) -> const Material& {
+      for(const auto& candidate:materials) if(candidate.address==address) return candidate;
+      throw std::runtime_error("unknown static world fixture group");
+    };
+    Pages sequential=initial;
+    {
+      const SparseReader reader{sequential};
+      for(const auto group:order) if(group!=empty) activate(reader,find(group),true);
+    }
+    Pages native=initial;
+    const SparseReader reader{native};
+    const auto load=[&] {
+      NativeSceneMaterialPassState pass;
+      pass.render=ReadNativeMaterialRenderPass(reader,device);
+      for(uint32_t slot=0;slot<16;++slot) pass.samplers[slot]=ReadNativeMaterialSamplerPass(reader,device,slot);
+      return pass.Inputs();
+    };
+    auto cursor=load();
+    std::vector<const Material*> owed;
+    NativeMaterialRenderPass owed_start;
+    std::vector<std::string> trace;
+    std::vector<uint32_t> replayed,bound;
+    WalkNativeStaticWorld(order,[&](uint32_t group) -> std::optional<NativeStaticWorldFallback> {
+      if(group==guest) return NativeStaticWorldFallback::GuestQueue;
+      if(group==empty) { trace.push_back("empty"); return {}; }
+      const auto& selected=find(group);
+      if(owed.empty()) owed_start=cursor.render;
+      owed.push_back(&selected);
+      cursor=cursor.After(selected.program);
+      trace.push_back("native "+std::to_string(group));
+      return {};
+    },[&](uint32_t group,NativeStaticWorldFallback reason) {
+      Require(reason==NativeStaticWorldFallback::GuestQueue,"static world fallback reason");
+      trace.push_back("guest "+std::to_string(group));
+      activate(reader,find(group),true);
+      cursor=load();
+    },[&] {
+      if(owed.empty()) return;
+      trace.push_back("handoff");
+      std::vector<NativeStaticWorldHandoffGroup> groups;
+      for(const auto* selected:owed) {
+        uint32_t slots=0;
+        for(const auto& operation:selected->program.sampler_operations) slots|=1u<<operation.slot;
+        groups.push_back({selected->program.inputs.state_overrides,slots});
+      }
+      const auto writes=HandOffNativeStaticWorld(reader,device,owed_start,cursor.samplers,groups,[&](size_t index) {
+        replayed.push_back(owed[index]->address); activate(reader,*owed[index],true);
+      },[&](size_t index) {
+        bound.push_back(owed[index]->address); activate(reader,*owed[index],false);
+      });
+      Require(writes.render==cursor.render,"static world handoff render state diverged from the pass cursor");
+      owed.clear();
     });
-    Require(writes.render==cursor.render,"static world handoff render state diverged from the pass cursor");
-    owed.clear();
-  });
-  Require(trace==std::vector<std::string>{"native 40960","native 41216","empty","native 41472","handoff",
-    "guest 41728","native 41984","native 42240","handoff"},"static world walk left published order or skipped a handoff");
-  Require(replayed==decltype(replayed){0xa100,0xa200,0xa400,0xa500},
-    "static world handoff replayed other than each last slot binder and the last group");
-  // Pass-state chaining equals the mirrors sequential guest groups leave.
-  const SparseReader expected{sequential};
-  NativeSceneMaterialPassState oracle;
-  oracle.render=ReadNativeMaterialRenderPass(expected,device);
-  for(uint32_t slot=0;slot<16;++slot) oracle.samplers[slot]=ReadNativeMaterialSamplerPass(expected,device,slot);
-  Require(cursor==oracle.Inputs(),"chained static world pass state differs from sequential guest groups");
-  // The whole device block: render words, blend factor, alpha reference,
-  // sampler records, bound textures and dirty masks.
-  for(uint32_t offset=0;offset<13520;offset+=4)
-    if(reader.Word(device+offset)!=expected.Word(device+offset))
-      throw std::runtime_error("static world handoff device word differs at +"+std::to_string(offset));
+    Require(trace==std::vector<std::string>{"native 40960","native 41216","empty","native 41472","handoff",
+      "guest 41728","native 41984","native 42240","handoff"},"static world walk left published order or skipped a handoff");
+    Require(replayed==decltype(replayed){0xa200,0xa400,0xa500},
+      "static world handoff replayed other than each last slot binder and the last group");
+    Require(bound==decltype(bound){0xa000,0xa100},"static world handoff skipped an unreplayed group's binds");
+    // Pass-state chaining equals the mirrors sequential guest groups leave.
+    const SparseReader expected{sequential};
+    NativeSceneMaterialPassState oracle;
+    oracle.render=ReadNativeMaterialRenderPass(expected,device);
+    for(uint32_t slot=0;slot<16;++slot) oracle.samplers[slot]=ReadNativeMaterialSamplerPass(expected,device,slot);
+    Require(cursor==oracle.Inputs(),"chained static world pass state differs from sequential guest groups");
+    // The whole device block: render words, blend factor, alpha reference,
+    // constant registers, sampler records, bound textures and dirty masks.
+    for(uint32_t offset=0;offset<13520;offset+=4)
+      if(reader.Word(device+offset)!=expected.Word(device+offset))
+        throw std::runtime_error("static world handoff device word differs at +"+std::to_string(offset));
+    // Null slot: record+12's texture bits are M1's under M2's null bind.
+    Require(((reader.Word(device+1024+24+12)^setup.Word(0x51000+28+12))&~0x7ff80000u)==0 &&
+      reader.Word(device+12272+4)==0,"static world null bind kept pre-pass texture words");
+    // Registers only a skipped activation wrote hold its values.
+    Require(reader.Word(device+(20+112)*16)==expected.Word(0x60000) && reader.Word(device+(5+368)*16)==expected.Word(0x60100),
+      "static world handoff lost registers only a skipped activation wrote");
+    // Retirement in sequential order: each replaced handle stamped with the
+    // fence, or one tagged entry per replaced handle in the deferred queue.
+    const std::vector<uint32_t> retired{0x40000,0x40100,0x50000,0x51000,0x40200,0x52000,0x40300};
+    if(fence) {
+      for(const auto handle:retired) Require(reader.Word(handle+8)==fence,"static world handoff skipped a texture retirement");
+      Require(reader.Word(device+13148)==queue,"fenced retirement queued an entry");
+    } else {
+      Require(reader.Word(device+13148)==queue+8*retired.size(),"deferred retirement entry count");
+      for(size_t i=0;i<retired.size();++i)
+        Require(reader.DoubleWord(queue+uint32_t(i)*8)==((uint64_t((retired[i]>>2)|0x80000000u)<<32)|0xffffffffu),
+          "deferred retirement left sequential order");
+    }
+    // Everything else the groups touched: handles, queue, constant sources.
+    const std::array<uint8_t,4096> zero{};
+    for(const auto* pages:{&sequential,&native}) for(const auto& entry:*pages) {
+      const auto page=entry.first;
+      const auto left=sequential.find(page);
+      const auto right=native.find(page);
+      if((left==sequential.end()?zero:left->second)!=(right==native.end()?zero:right->second))
+        throw std::runtime_error("static world handoff arena differs in page "+std::to_string(page));
+    }
+  };
+  run(200); run(0);
   Require(NativeStaticWorldReplayPlan(std::vector<NativeStaticWorldHandoffGroup>{{{},1},{{},2},{{},1},{{},0}})==
     std::vector<size_t>{1,2,3} && NativeStaticWorldReplayPlan({}).empty(),"static world replay plan");
   // Order selection: anything short of a covering published order runs 821C3BB8.
@@ -285,7 +342,8 @@ void StaticWorldPass() {
   Require(queues.Take(0xa000)==taken,"declined static group selections changed order");
   auto disabled=NativeSceneQueues{};
   disabled.Push(0xa000,0x7000);
-  const SparseReader list_reader{native};
+  Pages lists;
+  const SparseReader list_reader{lists};
   disabled.Materialize(list_reader);
   Require(!NativeStaticWorldOrder(publication.get(),owner,&disabled),"static world pass ran over materialized queues");
 }

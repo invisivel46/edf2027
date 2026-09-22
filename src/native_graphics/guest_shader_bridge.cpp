@@ -5325,7 +5325,10 @@ REX_EXTERN(sub_8213BA98);
 namespace {
 void BindNativeShaderResource(PPCContext&,uint8_t*,bool);
 void PublishNativeShaderBinding(uint32_t,uint32_t,bool);
-void ActivateNativeMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint32_t device) {
+// states=false runs the activation without its state operations (the static
+// world handoff writes those combined): shader binds with defaults, constant
+// uploads and texture binds with their retirements and sampler words.
+void ActivateNativeMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint32_t device,bool states=true) {
   const edf::native::GuestReader reader(base);
   const auto program=edf::native::ReadNativeMaterialCpuProgram(reader,instance,device);
   auto work=ctx;
@@ -5396,6 +5399,7 @@ void ActivateNativeMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint
     reader.StoreWord(reader.Add(device,16),uint32_t((dirty|mask)>>32));
     reader.StoreWord(reader.Add(device,20),uint32_t(dirty|mask));
   },[&](const auto& operation) {
+    if(!states) return;
     work.r3.u64=device; work.r4.u64=operation.value; work.ctr.u64=operation.setter; work.lr=0x821B920C;
     const auto dirty=[&](uint32_t offset) {
       return (uint64_t(reader.Word(reader.Add(device,offset)))<<32)|reader.Word(reader.Add(device,offset+4));
@@ -11091,6 +11095,11 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
       // bindings and setter publications, exactly as the guest group would.
       work.r3.u64=owed[index].material; work.lr=0x821D979C; sub_821B94E8(work,base);
       ++counters.replays;
+    },[&](size_t index) {
+      // The skipped group's binds and uploads, so intermediate textures and
+      // shaders retire and registers only it wrote hold its values.
+      ActivateNativeMaterial(work,base,owed[index].material,device,false);
+      ++counters.binds;
     });
     if(writes.render!=cursor.material.render) throw std::runtime_error("native static world handoff diverged from the pass cursor");
     for(const auto offset:writes.operations) {
@@ -11232,9 +11241,9 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     for(const auto count:counters.fallbacks) fallbacks+=count;
     const auto& f=counters.fallbacks;
     REXLOG_INFO("Native static world pass: passes={} native_groups={} empty_groups={} instances={} draws={} batches={} fallback_groups={} "
-      "guest_queue={} program={} scissor={} eligibility={} pass_state={} instance={} handoffs={} replays={} original={}",
+      "guest_queue={} program={} scissor={} eligibility={} pass_state={} instance={} handoffs={} replays={} binds={} original={}",
       passes,counters.native_groups,counters.empty_groups,counters.instances,counters.draws,counters.batches,fallbacks,
-      f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.original);
+      f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.binds,counters.original);
   }
 }
 }

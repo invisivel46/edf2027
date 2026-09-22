@@ -19,7 +19,7 @@ inline constexpr std::array<const char*,size_t(NativeStaticWorldFallback::Count)
   "guest_queue","program","scissor","eligibility","pass_state","instance"
 };
 struct NativeStaticWorldPassCounters {
-  uint64_t passes=0,original=0,native_groups=0,empty_groups=0,instances=0,draws=0,batches=0,handoffs=0,replays=0;
+  uint64_t passes=0,original=0,native_groups=0,empty_groups=0,instances=0,draws=0,batches=0,handoffs=0,replays=0,binds=0;
   std::array<uint64_t,size_t(NativeStaticWorldFallback::Count)> fallbacks{};
 };
 // The published walk of owner+240, or null when the original 821C3BB8 must run:
@@ -54,9 +54,9 @@ struct NativeStaticWorldHandoffGroup {
   std::span<const std::array<uint32_t,2>> states;
   uint32_t slots=0;
 };
-// Activations replayed at handoff, in walk order: the last group (shaders,
-// constants, its textures) and the last group to touch each sampler slot
-// (bound texture, descriptor words, retirement of the previous handle).
+// Activations replayed whole at handoff, in walk order: the last group
+// (shaders, constants, its textures) and the last group to touch each sampler
+// slot (bound texture and its setter publications). Other groups bind only.
 inline std::vector<size_t> NativeStaticWorldReplayPlan(std::span<const NativeStaticWorldHandoffGroup> groups) {
   std::vector<size_t> result;
   uint32_t seen=0;
@@ -98,17 +98,26 @@ inline NativeStaticWorldStateWrites NativeStaticWorldStateHandoff(NativeMaterial
   result.render=pass;
   return result;
 }
-// Leaves the device mirrors as the skipped guest groups would: replay the
-// planned activations, then write the combined render words and dirty masks,
-// then the combined sampler words of every touched slot. Sampler words outside
-// the key (texture format/address) and bound handles come from the replayed
-// last binder of that slot. Computed before any write, so a throw changes nothing.
-template<class Reader,class Replay>
+// Leaves the device mirrors as the skipped guest groups would: in walk order,
+// replay the planned activations and run every other group's activation minus
+// its state operations (bind: shader and texture binds, each retiring the
+// handle it replaces through the resource fence at +8 (Release 82134220 and
+// Lock 82134408 block on it) or the deferred queue, and its constant uploads
+// and shader defaults). Then write the combined render words and dirty masks,
+// then the combined sampler words of every touched slot. Every bind retires
+// what sequential guest groups would have, in their order, with the current
+// fence: no guest fence is inserted inside a native run, so it is the value
+// the sequential bind would have read or a later one, never an earlier one.
+// Texture descriptor words come from the last non-null binder of each slot, as
+// a null bind leaves them. Computed before any write, so a throw changes nothing.
+template<class Reader,class Replay,class Bind>
 NativeStaticWorldStateWrites HandOffNativeStaticWorld(const Reader& reader,uint32_t device,
     const NativeMaterialRenderPass& start,const std::array<NativeMaterialSamplerPass,16>& samplers,
-    std::span<const NativeStaticWorldHandoffGroup> groups,Replay&& replay) {
+    std::span<const NativeStaticWorldHandoffGroup> groups,Replay&& replay,Bind&& bind) {
   auto writes=NativeStaticWorldStateHandoff(start,groups);
-  for(const auto index:NativeStaticWorldReplayPlan(groups)) replay(index);
+  const auto plan=NativeStaticWorldReplayPlan(groups);
+  for(size_t index=0,next=0;index<groups.size();++index)
+    if(next<plan.size() && plan[next]==index) { replay(index); ++next; } else bind(index);
   for(const auto& [offset,value]:writes.words) reader.StoreWord(reader.Add(device,offset),value);
   const auto dirty=[&](uint32_t offset,uint64_t mask) {
     if(!mask) return;
