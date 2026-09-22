@@ -37,6 +37,9 @@ struct NativeRenderEntry {
   // radius obj+352, cull distance obj+76, sort mode obj+52, sort bias obj+56,
   // hidden halfword obj+64.
   std::array<float,4> centre{};
+  // The rest of the 821B2B00 bound after the centre: three oriented half axes
+  // obj+304/+320/+336 (float4 each), the box 821C33E8 tests on a partial sphere.
+  std::array<float,12> axes{};
   float radius=0,cull_distance=0,sort_bias=0;
   int32_t mode=0;
   bool hidden=false;
