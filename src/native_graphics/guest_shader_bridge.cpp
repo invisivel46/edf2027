@@ -26,6 +26,7 @@
 #include "native_static_group_eligibility.h"
 #include "native_static_world_resolve.h"
 #include "native_static_world_pass.h"
+#include "native_static_world_cache.h"
 #include "native_queued_scene.h"
 #include "native_decode_workers.h"
 #include "native_d3d12_preview.h"
@@ -352,6 +353,8 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        RenderListener, RenderUiListener,
                        RenderQueued, RenderMaterialGroup,
                        RenderGatherClassify, RenderGatherVisibility, RenderGatherLod, RenderGatherPush, RenderGatherGuest,
+                       QueuedEligibility, QueuedResolve, QueuedInstances, QueuedRecord,
+                       QueuedHandoff, QueuedHandoffBinds, QueuedHandoffReplays,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
@@ -406,6 +409,8 @@ class HookTiming {
       "render.listener","render.ui_listener",
       "render.queued","render.material_group",
       "render.gather.classify","render.gather.visibility","render.gather.lod","render.gather.push","render.gather.guest_dispatch",
+      "render.queued.eligibility","render.queued.resolve","render.queued.instances","render.queued.record",
+      "render.queued.handoff","render.queued.handoff_binds","render.queued.handoff_replays",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
       "load.shader.registration","load.shader.lock","load.shader.entry",
       "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
@@ -873,6 +878,9 @@ struct Bridge {
   // scene can actually share targets with. See the cvar.
   std::shared_ptr<edf::native::NativeRenderBackend> scene_backend;
   NativeSceneAdapter scene_adapter;
+  // Advanced whenever state.shaders gains, replaces or releases an entry, so
+  // anything derived from a registered shader's bindings can tell it is stale.
+  uint64_t shader_registry_generation=0;
   uint64_t scene_publication_tick=0,scene_published_selections=0,scene_current_selections=0;
   NativeSceneRenderer scene_renderer;
   std::vector<NativeSceneSnapshot> scene_recorded_snapshots;
@@ -1347,6 +1355,7 @@ void ForgetOwner(uint32_t owner) {
   // excludes native users; bound GPU resources retain their D3D references.
   std::lock_guard lock(state.mutex);
   const auto erased = std::erase_if(state.shaders, [owner](const auto& item) { return item.second.owner == owner; });
+  ++state.shader_registry_generation;
   state.active_vertex = state.linked_vertex = state.linked_pixel = 0;
   state.validated_links.clear();
   state.active_vertex_parameters.reset();
@@ -1537,6 +1546,7 @@ void RegisterShaders(const GuestReader& reader, uint32_t owner, const Effect& ef
   // Replace the entire owner on reload so address reuse cannot select old code.
   std::erase_if(state.shaders, [owner](const auto& item) { return item.second.owner == owner; });
   for (auto& [handle, shader] : fresh) state.shaders.insert_or_assign(handle, std::move(shader));
+  ++state.shader_registry_generation;
   // A handle may now name different code; every pair is checked again.
   state.validated_links.clear();
   REXLOG_INFO("Native shader bridge: owner={:#x}, {} guest shaders registered, {} resident",
@@ -6416,7 +6426,10 @@ void SynchronizeNativeQueuedSceneInstance(uint8_t* base,uint32_t device,NativeQu
   std::lock_guard lock(state.mutex);
   SynchronizeNativeQueuedSceneInstanceLocked(state,GuestReader(base),device,group);
 }
-struct NativeStaticPassView { GuestViewportWords viewport; ActiveTargets targets; };
+struct NativeStaticPassView {
+  GuestViewportWords viewport; ActiveTargets targets;
+  bool operator==(const NativeStaticPassView&) const=default;
+};
 // Publication inputs of one static group. deferred_geometry is the identity a
 // pending geometry handoff will bind instead of the draw's live bindings.
 struct NativeStaticGroupInputs {
@@ -6552,6 +6565,8 @@ NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge
   auto& slot=shared?*shared:local;
   if(!slot || slot->group!=group.material.get() || slot->geometry!=geometry.get() ||
      slot->pass.viewport!=result.pass.viewport || slot->pass.targets!=targets) {
+    // Only the world pass shares a slot; its cache misses land here.
+    HookTiming resolve_timing(HookPhase::QueuedResolve,shared!=nullptr);
     NativeBackendPipelineDesc desc;
     desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(viewport.reverse_depth);
     desc.pixel_id=program.inputs.pixel;
@@ -11933,10 +11948,20 @@ uint32_t NativeHandoffRetirementTag(const GuestReader& reader,const PPCContext& 
 // Replaces 821C3BB8(owner+240) for one world owner. Native groups draw from the
 // scene publication with explicit pass inputs; the device state they owe is
 // handed off before any guest group and at the end, so later stages inherit
-// what the sequential guest groups would have left. Guest calls run unlocked.
+// what the sequential guest groups would have left. Guest calls run unlocked:
+// the bridge locks are taken once per contiguous run of native groups and
+// released before every handoff (its activations run guest code) and every
+// fallback group. A group's pass-invariant work - eligibility, the chained
+// pass state, the resolved and interned material, its pipeline and world
+// binding - comes from NativeStaticWorldGroupCache while its key matches; the
+// key's comment lists why every input of that work is compared or signalled.
+// Per frame only the instances' worlds, the camera and the queues change.
 void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
   const GuestReader reader(base);
   static NativeStaticWorldPassCounters counters;
+  using GroupCache=NativeStaticWorldGroupCache<NativeStaticPassView,std::optional<NativeStaticGroupMaterial>>;
+  // Read and written only under state.mutex.
+  static GroupCache cache;
   const auto publication=native_scene_publication;
   auto* queues=native_scene_queues;
   const auto order=native_scene_pass_camera?NativeStaticWorldOrder(publication.get(),owner,queues):nullptr;
@@ -11954,6 +11979,11 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
   reader.StoreWord(frame.r1.u32,ctx.r1.u32);
   const auto device=reader.Word(reader.Add(reader.Word(0x8257BFB4),8));
   auto& state=State();
+  // One acquisition per run of native groups (submission gate, then registry).
+  std::unique_lock run_submission(state.submissions,std::defer_lock);
+  std::unique_lock run_lock(state.mutex,std::defer_lock);
+  const auto lock_run=[&] { if(!run_lock.owns_lock()) { run_submission.lock(); run_lock.lock(); } };
+  const auto unlock_run=[&] { if(run_lock.owns_lock()) { run_lock.unlock(); run_submission.unlock(); } };
   // Pass state and view come from the device once per pass and again after
   // each guest group; native groups chain it and never read bound state.
   NativeScenePassCursorState cursor;
@@ -11971,7 +12001,10 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
   std::optional<World> world;
   NativeMaterialRenderPass owed_start;
   const auto handoff=[&] {
+    // Ends the run: the activations below are guest code.
+    unlock_run();
     if(owed.empty()) return;
+    HookTiming handoff_timing(HookPhase::QueuedHandoff);
     std::vector<NativeStaticWorldHandoffGroup> groups;
     std::vector<std::shared_ptr<const NativeStaticWorldBindEffects>> effects;
     groups.reserve(owed.size()); effects.reserve(owed.size());
@@ -11986,12 +12019,14 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     const auto writes=HandOffNativeStaticWorld(reader,device,owed_start,cursor.material.samplers,groups,[&](size_t index) {
       // 821B94E8 through the activation hook: CPU program, host shader
       // bindings and setter publications, exactly as the guest group would.
+      HookTiming replay_timing(HookPhase::QueuedHandoffReplays);
       work.r3.u64=owed[index].material; work.lr=0x821D979C; sub_821B94E8(work,base);
       ++counters.replays;
     },[&](size_t index) {
       // A group without composable effects: its binds and uploads through the
       // activation, so intermediate textures and shaders retire and registers
       // only it wrote hold its values.
+      HookTiming bind_timing(HookPhase::QueuedHandoffBinds);
       ActivateNativeMaterial(work,base,owed[index].material,device,false);
       ++counters.binds;
     },[&](NativeStaticWorldRetirement kind) { return ReserveNativeHandoffRetirement(frame,base,device,kind); },
@@ -12040,27 +12075,41 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     // 821D96D8 drains a non-empty guest queue; an empty one draws nothing.
     if(reader.Word(reader.Add(group,4))!=reader.Word(reader.Add(group,8))) return F::GuestQueue;
     if(!queues->Contains(group)) { ++counters.empty_groups; LogNativeStaticWorldGroup(group,0); return {}; }
+    lock_run();
+    HookTiming eligibility_timing(HookPhase::QueuedEligibility);
     std::shared_ptr<const NativeSceneGroupMaterial> material;
     std::optional<NativeSceneGeometrySource> setup;
-    {
-      std::lock_guard lock(state.mutex);
-      for(const auto& published:publication->group_materials) if(published->group==group) { material=published; break; }
-      if(const auto* source=NativeSceneSourcesForPass(state).FindGroup(group)) {
-        const auto latest=state.scene_adapter.GroupGeometry(group,source->revision);
-        for(const auto& published:publication->group_geometry)
-          if(published==latest && published->group==group && published->setup &&
-             published->geometry->backend()==state.scene_backend.get()) { setup=published->setup; break; }
-      }
+    std::shared_ptr<const NativeIndexedMesh::RetainedDraw> retained;
+    for(const auto& published:publication->group_materials) if(published->group==group) { material=published; break; }
+    if(const auto* source=NativeSceneSourcesForPass(state).FindGroup(group)) {
+      const auto latest=state.scene_adapter.GroupGeometry(group,source->revision);
+      for(const auto& published:publication->group_geometry)
+        if(published==latest && published->group==group && published->setup &&
+           published->geometry->backend()==state.scene_backend.get()) { setup=published->setup; retained=published->geometry; break; }
     }
     if(!material || !material->program || !setup) return F::Program;
     const auto& program=*material->program;
     if(!program.CanDeferCpuActivation()) return F::Scissor;
-    if(AssessNativeStaticGroup(reader,device,frame.r1.u32,*setup)!=NativeStaticGroupEligibility::Supported) return F::Eligibility;
+    GroupCache::Key key{.group=group,.device=device,.stack=frame.r1.u32,.vertex=program.inputs.vertex,.pixel=program.inputs.pixel,
+      .material=material,.program=material->program,.setup=*setup,.geometry=retained,.backend=state.scene_backend,
+      .pass=cursor.material,.view=NativeStaticPassView{*cursor.viewport,cursor.targets},
+      .filtering=REXCVAR_GET(edf_native_anisotropic_filtering),.shaders=state.shader_registry_generation};
+    // A matching entry's eligibility holds while every guest byte its
+    // assessment read still holds what it read; otherwise assess again,
+    // recording what this assessment reads.
+    auto* candidate=cache.Candidate(key);
+    if(candidate && !candidate->reads.Unchanged(reader)) candidate=nullptr;
+    NativeRecordedReads reads;
+    if(!candidate && AssessNativeStaticGroup(NativeRecordingReader(reader,reads),device,frame.r1.u32,*setup)!=
+       NativeStaticGroupEligibility::Supported) return F::Eligibility;
+    eligibility_timing.Finish();
+    HookTiming resolve_timing(HookPhase::QueuedResolve);
     NativeSceneMaterialPassState next;
     auto constants=material->constants;
     try {
-      next=cursor.material.After(program);
-      DecodeNativeRenderState(next.render.words);
+      // After and its decode read only the incoming pass and the program.
+      if(candidate) next=candidate->next;
+      else { next=cursor.material.After(program); DecodeNativeRenderState(next.render.words); }
       for(auto& constant:constants) {
         if(native_scene_pass_camera->Apply(constant) || !constant.global ||
            (constant.name!="m_WaterTime" && constant.name!="g_SignalBrightness")) continue;
@@ -12068,24 +12117,32 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
         native_scene_pass_animation->Apply(constant);
       }
     } catch(const std::exception& error) { report(error.what()); return F::PassState; }
+    // The entry's material is this pass's when the constants match but for
+    // those feeding only the camera, which is derived from them into its
+    // capture. A miss resolves into fresh with the first instance.
+    std::optional<NativeStaticGroupMaterial> fresh;
+    auto* shared=&fresh;
+    if(candidate && candidate->material && GroupCache::Current(*candidate,constants,
+       candidate->material->resolved.capture.material.get(),candidate->material->resolved.capture.camera)) {
+      shared=&candidate->material; ++cache.hits;
+    } else ++cache.misses;
+    resolve_timing.Finish();
     // Resolve every instance before recording: a decline returns the whole
     // group, with its selections restored, to the guest callback.
     const auto instances=queues->Take(group);
     uint64_t batches=0;
+    std::vector<NativeStaticInstanceResolution> resolved;
+    resolved.reserve(instances.size());
+    const NativeStaticPassInputs pass{device,constants,cursor.material.render,cursor.material.samplers,
+      NativeStaticPassView{*cursor.viewport,cursor.targets}};
     {
-      std::lock_guard submission(state.submissions);
-      std::lock_guard lock(state.mutex);
-      std::vector<NativeStaticInstanceResolution> resolved;
-      resolved.reserve(instances.size());
-      const NativeStaticPassInputs pass{device,constants,cursor.material.render,cursor.material.samplers,
-        NativeStaticPassView{*cursor.viewport,cursor.targets}};
+      HookTiming instances_timing(HookPhase::QueuedInstances);
       // One Resolve per group: its instances share geometry, program and these
       // pass inputs, so they share one material and record as instanced draws.
-      std::optional<NativeStaticGroupMaterial> shared;
       try {
         for(const auto instance:instances) {
           auto result=ResolveNativePublishedStaticInstanceLocked(state,reader,*publication,
-            {group,setup->count,material,setup},instance,pass,nullptr,&shared);
+            {group,setup->count,material,setup},instance,pass,nullptr,shared);
           if(!result) {
             if(const auto* reason=NativeStaticWorldDeclineReason(result.decline)) report(reason);
             break;
@@ -12093,37 +12150,46 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
           resolved.push_back(std::move(result));
         }
       } catch(const std::exception& error) { report(error.what()); resolved.clear(); }
-      if(resolved.size()!=instances.size()) {
-        for(auto at=instances.rbegin();at!=instances.rend();++at) queues->Push(group,*at);
-        return F::Instance;
-      }
-      NativeQueuedSceneGroup batch;
-      batch.targets=cursor.targets;
-      batch.objects.reserve(resolved.size());
-      const auto draws=state.scene_native_draws;
-      // The shared capture gives every instance one view, so this is one flush.
-      try {
-        for(auto& result:resolved) {
-          if(!batch.objects.empty() && (batch.view.view!=result.view.view || batch.view.projection!=result.view.projection ||
-             batch.view.view_projection!=result.view.view_projection)) FlushNativeQueuedSceneLocked(state,batch);
-          batch.view=result.view; batch.objects.push_back(result.object);
-        }
-        FlushNativeQueuedSceneLocked(state,batch);
-      }
-      catch(const std::exception& error) {
-        // Nothing of this group is owed to the guest yet: hand its selections back.
-        report(error.what());
-        ++state.bind_generation; state.recorded={};
-        for(auto at=instances.rbegin();at!=instances.rend();++at) queues->Push(group,*at);
-        return F::Instance;
-      }
-      // Each flush already advanced bind_generation and cleared recorded.
-      batches=batch.execution.recordings();
-      counters.draws+=state.scene_native_draws-draws;
-      // Keep the guest path's lookup hint current with what this frame drew.
-      state.scene_adapter.RememberGroupMaterial(group,resolved.back().material);
-      world=World{resolved.back().vertex,*resolved.back().world_parameter,resolved.back().world};
     }
+    if(resolved.size()!=instances.size()) {
+      for(auto at=instances.rbegin();at!=instances.rend();++at) queues->Push(group,*at);
+      return F::Instance;
+    }
+    // A miss resolved under exactly this key (its geometry is the one the
+    // instances resolved against). The eligibility reads are this frame's, or
+    // the candidate's, just revalidated.
+    if(shared==&fresh && fresh && fresh->geometry==retained.get()) {
+      const auto captured=fresh->resolved.capture.material;
+      const auto camera=fresh->resolved.capture.camera;
+      cache.Store(std::move(key),constants,candidate?std::move(candidate->reads):std::move(reads),next,std::move(fresh),captured.get(),camera);
+    }
+    NativeQueuedSceneGroup batch;
+    batch.targets=cursor.targets;
+    batch.objects.reserve(resolved.size());
+    const auto draws=state.scene_native_draws;
+    // The shared capture gives every instance one view, so this is one flush.
+    try {
+      HookTiming record_timing(HookPhase::QueuedRecord);
+      for(auto& result:resolved) {
+        if(!batch.objects.empty() && (batch.view.view!=result.view.view || batch.view.projection!=result.view.projection ||
+           batch.view.view_projection!=result.view.view_projection)) FlushNativeQueuedSceneLocked(state,batch);
+        batch.view=result.view; batch.objects.push_back(result.object);
+      }
+      FlushNativeQueuedSceneLocked(state,batch);
+    }
+    catch(const std::exception& error) {
+      // Nothing of this group is owed to the guest yet: hand its selections back.
+      report(error.what());
+      ++state.bind_generation; state.recorded={};
+      for(auto at=instances.rbegin();at!=instances.rend();++at) queues->Push(group,*at);
+      return F::Instance;
+    }
+    // Each flush already advanced bind_generation and cleared recorded.
+    batches=batch.execution.recordings();
+    counters.draws+=state.scene_native_draws-draws;
+    // Keep the guest path's lookup hint current with what this frame drew.
+    state.scene_adapter.RememberGroupMaterial(group,resolved.back().material);
+    world=World{resolved.back().vertex,*resolved.back().world_parameter,resolved.back().world};
     if(owed.empty()) owed_start=cursor.material.render;
     owed.push_back({setup->material,material->program,material});
     cursor.material=std::move(next);
@@ -12132,6 +12198,7 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     return {};
   };
   const auto fallback=[&](uint32_t group,NativeStaticWorldFallback reason) {
+    unlock_run();
     const auto count=++counters.fallbacks[size_t(reason)];
     if(count<=4 || !(count&(count-1)))
       REXLOG_INFO("Native static world fallback: group={:#x} reason={} count={}",group,kNativeStaticWorldFallbackNames[size_t(reason)],count);
@@ -12145,15 +12212,23 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     load_pass();
   };
   WalkNativeStaticWorld(*order,native,fallback,handoff);
+  uint64_t hits=0,misses=0,stores=0;
+  size_t entries=0;
+  lock_run();
+  cache.EndPass();
+  hits=cache.hits; misses=cache.misses; stores=cache.stores; entries=cache.size();
+  unlock_run();
   const auto passes=++counters.passes;
   if(passes<=4 || passes%1000==0) {
     uint64_t fallbacks=0;
     for(const auto count:counters.fallbacks) fallbacks+=count;
     const auto& f=counters.fallbacks;
     REXLOG_INFO("Native static world pass: passes={} native_groups={} empty_groups={} instances={} draws={} batches={} fallback_groups={} "
-      "guest_queue={} program={} scissor={} eligibility={} pass_state={} instance={} handoffs={} replays={} binds={} composed={} original={}",
+      "guest_queue={} program={} scissor={} eligibility={} pass_state={} instance={} handoffs={} replays={} binds={} composed={} original={} "
+      "cache_hits={} cache_misses={} cache_stores={} cache_entries={}",
       passes,counters.native_groups,counters.empty_groups,counters.instances,counters.draws,counters.batches,fallbacks,
-      f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.binds,counters.composed,counters.original);
+      f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.binds,counters.composed,counters.original,
+      hits,misses,stores,entries);
   }
 }
 }

@@ -19,6 +19,7 @@
 #include "native_graphics/native_buffer_writes.h"
 #include "native_graphics/native_static_world_resolve.h"
 #include "native_graphics/native_static_world_pass.h"
+#include "native_graphics/native_static_world_cache.h"
 #include "native_graphics/native_texture_binding.h"
 #include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d12_backend.h"
@@ -513,6 +514,90 @@ void StaticGroupEligibility() {
   auto invalid=input; invalid.count=0;
   Require(AssessNativeStaticGroup(reader,device,stack,invalid)==Result::Geometry,"zero geometry count admitted");
   Require(AssessNativeStaticGroup(reader,device+1,stack,input)==Result::Alignment,"unaligned device admitted");
+}
+// The static world pass's cross-frame group cache, driven the way the pass
+// drives it: a candidate whose eligibility reads still hold and whose constants
+// are current is reused, anything else resolves again and is stored.
+void StaticWorldGroupCache() {
+  struct View { uint32_t viewport=0,targets=0; bool operator==(const View&) const=default; };
+  struct Material { std::shared_ptr<const int> identity; };
+  using Cache=NativeStaticWorldGroupCache<View,Material>;
+  using Constant=NativeSceneMaterialInputs::Constant;
+  const auto program=std::make_shared<NativeSceneMaterialProgram>();
+  program->inputs.vertex=0x100; program->inputs.pixel=0x200;
+  const auto publish=[](std::shared_ptr<const NativeSceneMaterialProgram> with) {
+    auto group=std::make_shared<NativeSceneGroupMaterial>();
+    group->group=0x5000; group->revision=1; group->program=std::move(with);
+    group->constants={{true,"tint",std::vector<uint8_t>(16,1),false},{false,"g_mViewProjection",std::vector<uint8_t>(64,2),true}};
+    return std::shared_ptr<const NativeSceneGroupMaterial>(std::move(group));
+  };
+  const auto material=publish(program);
+  Cache::Key key{.group=0x5000,.device=0x10000,.stack=0x70000,.vertex=0x100,.pixel=0x200,.material=material,
+    .program=material->program,.setup={0x1000,0x2000,0x3000,32,6,0x4000,0x100},.geometry=std::make_shared<const int>(7),
+    .backend=std::make_shared<const int>(9),.view={1,2},.filtering=-1,.shaders=3};
+  key.pass.render.words[0]=0x10001;
+  std::vector<uint8_t> memory(256);
+  const GeometryRetryReader guest{memory};
+  Cache cache;
+  size_t resolves=0;
+  NativeSceneView camera;
+  const auto lookup=[&](const Cache::Key& inputs,const std::vector<Constant>& constants) {
+    auto* entry=cache.Candidate(inputs);
+    if(entry && entry->reads.Unchanged(guest) && Cache::Current(*entry,constants,nullptr,camera)) return entry->material.identity;
+    ++resolves;
+    NativeRecordedReads reads;
+    const NativeRecordingReader recorder(guest,reads);
+    recorder.Word(0x40); recorder.Bytes(0x80,16);
+    return cache.Store(inputs,constants,std::move(reads),{},Material{std::make_shared<const int>(int(resolves))},nullptr,camera).material.identity;
+  };
+  const auto constants=material->constants;
+  const auto identity=lookup(key,constants);
+  Require(resolves==1 && cache.size()==1,"first group visit did not resolve and store");
+  Require(lookup(key,constants)==identity && resolves==1,"cache hit resolved again or changed the material");
+  Require(lookup(key,constants)==identity && resolves==1,"second cache hit resolved again");
+  // Every key component: a change is a different group, pass or publication.
+  const auto misses=[&](auto&& change,const char* what) { auto changed=key; change(changed); Require(!cache.Candidate(changed),what); };
+  misses([](Cache::Key& k) { k.group+=4; },"group address change hit");
+  misses([](Cache::Key& k) { k.device+=16; },"device change hit");
+  misses([](Cache::Key& k) { k.stack-=16; },"stack change hit");
+  misses([](Cache::Key& k) { k.vertex^=1; },"vertex id change hit");
+  misses([](Cache::Key& k) { k.pixel^=1; },"pixel id change hit");
+  misses([&](Cache::Key& k) { k.program=std::make_shared<NativeSceneMaterialProgram>(*program); },"program change hit");
+  misses([](Cache::Key& k) { k.setup.count+=3; },"geometry setup change hit");
+  misses([](Cache::Key& k) { k.setup.material+=4; },"guest material change hit");
+  misses([](Cache::Key& k) { k.geometry=std::make_shared<const int>(7); },"retained geometry change hit");
+  misses([](Cache::Key& k) { k.backend=std::make_shared<const int>(9); },"backend change hit");
+  misses([](Cache::Key& k) { k.pass.render.words[0]^=1; },"incoming render words change hit");
+  misses([](Cache::Key& k) { k.pass.samplers[3].words[1]^=1; },"incoming sampler pass change hit");
+  misses([](Cache::Key& k) { k.view.viewport^=1; },"pass viewport change hit");
+  misses([](Cache::Key& k) { k.view.targets^=1; },"pass targets change hit");
+  misses([](Cache::Key& k) { k.filtering=16; },"filtering change hit");
+  misses([](Cache::Key& k) { k.shaders+=1; },"shader registry change hit");
+  Require(cache.Candidate(key),"unchanged key missed");
+  // Constants: without a derivable camera every constant is compared.
+  auto tinted=constants; tinted[0].registers[3]^=1;
+  Require(lookup(key,tinted)!=identity && resolves==2,"changed material constant reused the material");
+  auto moved=constants; moved[1].registers[7]^=1;
+  Require(lookup(key,moved)!=identity && resolves==3,"underivable camera change reused the material");
+  const auto current=lookup(key,constants);
+  Require(resolves==4 && lookup(key,constants)==current && resolves==4,"restored constants did not hit");
+  // Eligibility: a changed guest byte the assessment read resolves again.
+  memory[0x85]^=1;
+  Require(lookup(key,constants)!=current && resolves==5,"changed eligibility input reused the entry");
+  Require(cache.Candidate(key) && lookup(key,constants) && resolves==5,"revalidated eligibility did not hit");
+  // A program or constant republish is a new published object: the old
+  // entry no longer hits and the group resolves under the new one.
+  auto republished=key; republished.material=publish(program);
+  const auto before=lookup(key,constants);
+  Require(lookup(republished,constants)!=before && resolves==6,"republished material reused the old resolve");
+  Require(!cache.Candidate(key),"old publication hit after a republish");
+  auto reprogrammed=key;
+  reprogrammed.program=std::make_shared<NativeSceneMaterialProgram>(*program);
+  reprogrammed.material=publish(reprogrammed.program);
+  Require(lookup(reprogrammed,constants) && resolves==7 && !cache.Candidate(republished),"republished program reused the old resolve");
+  cache.Invalidate(0x5000);
+  Require(!cache.Candidate(reprogrammed) && cache.size()==0,"invalidated group survived");
+  cache.Clear();
 }
 // A BasicLockable that records every acquisition, so tests can count them.
 // The composed handoff against sequential guest groups that also bind shaders
@@ -1965,6 +2050,37 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   Require(resolved.render.words==desc.state,"material resolution changed expected pipeline words");
   Require((resolved.samplers[0].words[2]&0x3fc)==0x3c0,"material resolution lost final inherited LOD state");
   Require(pass_samplers[0].words[2]==0,"material resolution mutated source pass");
+  {
+    // The world pass's cache derives a hit's camera from the pass constants
+    // instead of resolving again: it must equal a resolve's bit for bit, and
+    // the camera constants must not reach the material image.
+    auto camera_constants=program_constants;
+    std::vector<uint8_t> projection(64),transposed(64);
+    for(size_t i=0;i<16;++i) {
+      Word(projection,i*4,std::bit_cast<uint32_t>(float(i)+.5f));
+      Word(transposed,i*4,std::bit_cast<uint32_t>(float(i*3%16)-4.f));
+    }
+    camera_constants[1].registers=projection; camera_constants[2].registers=transposed;
+    const auto moved=material_program->Resolve(material_desc,false,camera_constants,pass_state,pass_samplers);
+    Require(moved.capture.material->Equivalent(*resolved.capture.material),"camera constants reached the material image");
+    Require(!NativeSceneCameraIdentical(moved.capture.camera,resolved.capture.camera),"camera test constants left the camera unchanged");
+    std::vector<uint8_t> derived;
+    const auto camera=NativeStaticCaptureCamera(*moved.capture.material,camera_constants,&derived);
+    Require(camera && NativeSceneCameraIdentical(*camera,moved.capture.camera),"derived camera differs from the resolved capture");
+    Require(derived==std::vector<uint8_t>{0,1,1,0},"derived camera marked the wrong constants");
+    using Cache=NativeStaticWorldGroupCache<int,int>;
+    Cache cache;
+    Cache::Key key; key.group=1;
+    const auto& entry=cache.Store(key,camera_constants,{},{},0,moved.capture.material.get(),moved.capture.camera);
+    Require(entry.derived,"a resolved capture's camera was not derivable");
+    NativeSceneView reused;
+    Require(Cache::Current(entry,program_constants,resolved.capture.material.get(),reused) &&
+      NativeSceneCameraIdentical(reused,resolved.capture.camera),"cache hit derived a camera other than a resolve's");
+    auto tinted=program_constants; tinted[3].registers[3]^=1;
+    Require(!Cache::Current(entry,tinted,resolved.capture.material.get(),reused),"non-camera constant change reused the material");
+    auto world=program_constants; world[0].registers[5]^=1;
+    Require(!Cache::Current(entry,world,resolved.capture.material.get(),reused),"g_mWorld constant change reused the material");
+  }
   NativeSceneMaterialPassState inherited{pass_state,pass_samplers};
   inherited.samplers[7].words[0]=0x12400;
   const auto first_pass=inherited.After(*material_program);
@@ -2367,7 +2483,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
-    GroupOrder(); StaticWorldPass(); StaticWorldComposedBinds(); WalkLock(); StaticWalkPlan();
+    GroupOrder(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

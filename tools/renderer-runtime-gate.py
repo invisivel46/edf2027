@@ -64,7 +64,13 @@ THREAD = re.compile(r'\] \[(t\d+)\] ')
 HOOK = re.compile(r'Native hook timing: phase=([\w.]+) calls=(\d+) total_ms=([\d.eE+-]+) max_ms=([\d.eE+-]+)')
 FRAME_PHASE = 'engine.render_helper'
 PHASES = ('engine.render_helper', 'render.queued', 'render.material_group', 'render.children',
-          'render.gather', 'render.model', 'render.finish', 'render.list', 'render.buckets')
+          'render.gather', 'render.model', 'render.finish', 'render.list', 'render.buckets',
+          # Sub-phases of render.queued in the native static world pass. Inclusive
+          # and overlapping: resolve is also counted inside instances on a cache
+          # miss, and the handoff binds and replays inside handoff.
+          'render.queued.eligibility', 'render.queued.resolve', 'render.queued.instances',
+          'render.queued.record', 'render.queued.handoff', 'render.queued.handoff_binds',
+          'render.queued.handoff_replays')
 # The first scene draw after the loading screen. Loading takes anywhere from
 # seconds to minutes, so windows are measured from here, not from launch.
 ENTRY = 'Native indexed input: draw=1,'
