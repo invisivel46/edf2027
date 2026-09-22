@@ -3184,6 +3184,8 @@ REXCVAR_DEFINE_BOOL(edf_native_scene_group_order_audit,false,"EDF2027",
   "Compare the published static group order with a live walk at world-pass entry (development).");
 namespace edf::native {
 void RetireGroupOrder(uint32_t owner) {
+  // Destructor path of every world: stay off the bridge lock unless orders exist.
+  if(!REXCVAR_GET(edf_native_scene_group_order) && !REXCVAR_GET(edf_native_scene_group_order_audit)) return;
   auto& state=State();
   std::lock_guard lock(state.mutex);
   state.scene_adapter.RetireGroupOrder(owner);
@@ -3328,7 +3330,15 @@ REX_HOOK_RAW(sub_820B4310) {
   if(REXCVAR_GET(edf_native_scene_group_order_audit)) {
     static thread_local std::vector<uint32_t> live;
     const edf::native::GuestReader reader(base);
-    edf::native::CaptureNativeSceneGroupOrder(reader,reader.Add(ctx.r3.u32,240),live);
+    bool captured=true;
+    try { edf::native::CaptureNativeSceneGroupOrder(reader,reader.Add(ctx.r3.u32,240),live); }
+    catch(const std::exception& error) {
+      // A torn list is an audit finding, never an exception through guest code.
+      static uint64_t failures=0;
+      if(++failures<=8) REXLOG_INFO("Native group order audit: owner={:#x} live walk failed: {}",ctx.r3.u32,error.what());
+      captured=false;
+    }
+    if(captured) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     const bool matched=state.scene_adapter.AuditGroupOrder(ctx.r3.u32,live);
@@ -3336,6 +3346,7 @@ REX_HOOK_RAW(sub_820B4310) {
     if(audit.checks<=4 || audit.checks%1000==0 || (!matched && audit.mismatches+audit.missing<=64))
       REXLOG_INFO("Native group order audit: owner={:#x} groups={} checks={} mismatches={} missing={}",
         ctx.r3.u32,live.size(),audit.checks,audit.mismatches,audit.missing);
+    }
   }
   if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
     edf::native::native_scene_animation_owner=ctx.r3.u32;

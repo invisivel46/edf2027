@@ -171,6 +171,9 @@ class NativeSceneAdapter {
     std::weak_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
     std::weak_ptr<const NativeSceneMaterial> material;
     std::vector<uint32_t> owners;
+    // Parts the live eligibility check turned down, and unchanged visits since.
+    size_t rejected=0;
+    uint32_t skips=0;
   };
   std::map<uint32_t,PopulatedGroup> populated_groups_;
   // Owner -> groups populated with it. Entries may be stale (group since

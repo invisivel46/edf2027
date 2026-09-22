@@ -45,8 +45,11 @@ NativeSceneAdapter::Population NativeSceneAdapter::PopulateGroup(const NativeSce
   // the fresh object re-populated every part of every group on every frame.
   capture.material=InternMaterial(std::move(capture.material));
   const auto prior=populated_groups_.find(address);
+  // Rejections come from a live check that can pass later (during loading, for
+  // example), so a group with rejected parts is retried every 64th unchanged visit.
   if(prior!=populated_groups_.end() && prior->second.revision==group->revision &&
-     prior->second.geometry.lock()==geometry && prior->second.material.lock()==capture.material) return result;
+     prior->second.geometry.lock()==geometry && prior->second.material.lock()==capture.material &&
+     (!prior->second.rejected || ++prior->second.skips<64)) return result;
   size_t matrices=0; bool column=false;
   for(const auto& constant:capture.material->constants()) for(const auto& matrix:constant.matrices)
     if(matrix.source==NativeSceneMatrixSource::World) {
@@ -72,7 +75,7 @@ NativeSceneAdapter::Population NativeSceneAdapter::PopulateGroup(const NativeSce
   std::sort(owners.begin(),owners.end());
   owners.erase(std::unique(owners.begin(),owners.end()),owners.end());
   for(const auto owner:owners) owner_groups_[owner].insert(address);
-  populated_groups_[address]={group->revision,geometry,capture.material,std::move(owners)};
+  populated_groups_[address]={group->revision,geometry,capture.material,std::move(owners),result.rejected};
   return result;
 }
 std::shared_ptr<const NativeSceneInstance> NativeScenePublication::Find(uint64_t id) const {
