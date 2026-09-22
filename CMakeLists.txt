@@ -82,11 +82,7 @@ if(EDF2027_OBSERVE_SCALAR_STORES)
         "${CMAKE_SOURCE_DIR}/src/native_graphics/guest_raw_store_observer.h")
 endif()
 
-set(_native_indexed_tail ${CMAKE_CURRENT_BINARY_DIR}/native_indexed_cpu_tail.cpp)
-add_custom_command(OUTPUT ${_native_indexed_tail}
-    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_native_indexed_tail}
-        -P ${CMAKE_SOURCE_DIR}/tools/extract-native-indexed-tail.cmake
-    DEPENDS generated/default/edf2017_recomp.48.cpp tools/extract-native-indexed-tail.cmake tools/native-draw-prefix.cmake VERBATIM)
+set(_native_indexed_tail ${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/native_indexed_completion.cpp)
 target_sources(edf2027 PRIVATE ${_native_indexed_tail})
 set(_native_immediate_tail ${CMAKE_CURRENT_BINARY_DIR}/native_immediate_cpu_tail.cpp)
 add_custom_command(OUTPUT ${_native_immediate_tail}
@@ -94,35 +90,15 @@ add_custom_command(OUTPUT ${_native_immediate_tail}
         -P ${CMAKE_SOURCE_DIR}/tools/extract-native-immediate-tail.cmake
     DEPENDS generated/default/edf2017_recomp.42.cpp generated/default/edf2017_recomp.10.cpp tools/extract-native-immediate-tail.cmake tools/native-draw-prefix.cmake VERBATIM)
 target_sources(edf2027 PRIVATE ${_native_immediate_tail})
-set(_native_derived_tail ${CMAKE_CURRENT_BINARY_DIR}/native_derived_cpu_tail.cpp)
-add_custom_command(OUTPUT ${_native_derived_tail}
-    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_native_derived_tail}
-        -P ${CMAKE_SOURCE_DIR}/tools/extract-native-derived-tail.cmake
-    DEPENDS generated/default/edf2017_recomp.54.cpp tools/extract-native-derived-tail.cmake VERBATIM)
+set(_native_derived_tail ${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/native_derived_state.cpp)
 target_sources(edf2027 PRIVATE ${_native_derived_tail})
-set(_native_shader_output_tail ${CMAKE_CURRENT_BINARY_DIR}/native_shader_output_cpu_tail.cpp)
-add_custom_command(OUTPUT ${_native_shader_output_tail}
-    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_native_shader_output_tail}
-        -P ${CMAKE_SOURCE_DIR}/tools/extract-native-shader-output.cmake
-    DEPENDS generated/default/edf2017_recomp.66.cpp tools/extract-native-shader-output.cmake VERBATIM)
+set(_native_shader_output_tail ${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/native_shader_output.cpp)
 target_sources(edf2027 PRIVATE ${_native_shader_output_tail})
-set(_native_shader_upload_tail ${CMAKE_CURRENT_BINARY_DIR}/native_shader_upload_cpu_tail.cpp)
-add_custom_command(OUTPUT ${_native_shader_upload_tail}
-    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_native_shader_upload_tail}
-        -P ${CMAKE_SOURCE_DIR}/tools/extract-native-shader-upload.cmake
-    DEPENDS generated/default/edf2017_recomp.50.cpp tools/extract-native-shader-upload.cmake VERBATIM)
+set(_native_shader_upload_tail ${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/native_shader_upload.cpp)
 target_sources(edf2027 PRIVATE ${_native_shader_upload_tail})
-set(_native_main_state_tail ${CMAKE_CURRENT_BINARY_DIR}/native_main_state_cpu_tail.cpp)
-add_custom_command(OUTPUT ${_native_main_state_tail}
-    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_native_main_state_tail}
-        -P ${CMAKE_SOURCE_DIR}/tools/extract-native-main-state.cmake
-    DEPENDS generated/default/edf2017_recomp.17.cpp tools/extract-native-main-state.cmake VERBATIM)
+set(_native_main_state_tail ${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/native_main_state.cpp)
 target_sources(edf2027 PRIVATE ${_native_main_state_tail})
-set(_native_shader_cache_tail ${CMAKE_CURRENT_BINARY_DIR}/native_shader_cache_cpu_tail.cpp)
-add_custom_command(OUTPUT ${_native_shader_cache_tail}
-    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_native_shader_cache_tail}
-        -P ${CMAKE_SOURCE_DIR}/tools/extract-native-shader-cache.cmake
-    DEPENDS generated/default/edf2017_recomp.32.cpp tools/extract-native-shader-cache.cmake VERBATIM)
+set(_native_shader_cache_tail ${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/native_shader_cache.cpp)
 target_sources(edf2027 PRIVATE ${_native_shader_cache_tail})
 set(_native_buffer_unlock ${CMAKE_CURRENT_BINARY_DIR}/native_buffer_unlock.cpp)
 add_custom_command(OUTPUT ${_native_buffer_unlock}
@@ -191,6 +167,57 @@ add_custom_command(OUTPUT ${_native_present}
 target_sources(edf2027 PRIVATE ${_native_present})
 
 if(BUILD_TESTING)
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    set(_scalar_effect_fixture ${CMAKE_CURRENT_BINARY_DIR}/renderer_scalar_effect_fixture.inc)
+    file(GLOB _scalar_effect_sources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/generated/default/edf2017_recomp.*.cpp)
+    add_custom_command(OUTPUT ${_scalar_effect_fixture}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/renderer_scalar_effects.py --emit-cpp ${_scalar_effect_fixture}
+        DEPENDS tools/renderer_scalar_effects.py tools/renderer_scalar_analysis.py
+                tests/fixtures/renderer-scalar-pilot.json tests/fixtures/renderer-scalar-boundaries.json
+                ${_scalar_effect_sources} VERBATIM)
+    add_executable(edf_renderer_scalar_pipeline_tests tests/renderer_scalar_pipeline_tests.cpp ${_scalar_effect_fixture})
+    target_include_directories(edf_renderer_scalar_pipeline_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/generated/default)
+    target_link_libraries(edf_renderer_scalar_pipeline_tests PRIVATE rex::runtime)
+    add_test(NAME edf_renderer_scalar_pipeline_tests COMMAND edf_renderer_scalar_pipeline_tests
+        --report ${CMAKE_CURRENT_BINARY_DIR}/renderer_scalar_pipeline_report.json)
+    add_custom_target(edf_renderer_scalar_effects_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_scalar_effects
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_renderer_scalar_effects_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_scalar_effects)
+    set_tests_properties(edf_renderer_scalar_effects_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    set(_scalar_fixture ${CMAKE_CURRENT_BINARY_DIR}/renderer_scalar_original_fixture.inc)
+    file(GLOB _scalar_generated_sources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/generated/default/edf2017_recomp.*.cpp)
+    add_custom_command(OUTPUT ${_scalar_fixture}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/analyze-renderer-scalars.py --emit-cpp ${_scalar_fixture}
+        DEPENDS tools/analyze-renderer-scalars.py tools/renderer_scalar_analysis.py
+                tests/fixtures/renderer-scalar-pilot.json ${_scalar_generated_sources} VERBATIM)
+    add_executable(edf_renderer_scalar_contract_tests tests/renderer_scalar_contract_tests.cpp ${_scalar_fixture})
+    target_include_directories(edf_renderer_scalar_contract_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/generated/default)
+    target_link_libraries(edf_renderer_scalar_contract_tests PRIVATE rex::runtime)
+    add_test(NAME edf_renderer_scalar_contract_tests COMMAND edf_renderer_scalar_contract_tests
+        ${CMAKE_CURRENT_BINARY_DIR}/renderer_scalar_contract_report.json)
+    add_custom_target(edf_renderer_scalar_analysis_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_scalar_analysis
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_renderer_scalar_analysis_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_scalar_analysis)
+    set_tests_properties(edf_renderer_scalar_analysis_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    set(_setter_fixture ${CMAKE_CURRENT_BINARY_DIR}/renderer_setter_original_fixture.inc)
+    add_custom_command(OUTPUT ${_setter_fixture}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/renderer_setter_analysis.py --emit-cpp ${_setter_fixture}
+        DEPENDS tools/renderer_setter_analysis.py tools/renderer_scalar_analysis.py
+                tests/fixtures/renderer-scalar-pilot.json tests/fixtures/renderer-setter-pilot.json
+                tests/fixtures/renderer-setter-family-v2.json
+                ${_scalar_generated_sources} VERBATIM)
+    add_executable(edf_renderer_setter_contract_tests tests/renderer_setter_contract_tests.cpp ${_setter_fixture})
+    target_include_directories(edf_renderer_setter_contract_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/generated/default)
+    target_link_libraries(edf_renderer_setter_contract_tests PRIVATE rex::runtime)
+    add_test(NAME edf_renderer_setter_contract_tests COMMAND edf_renderer_setter_contract_tests
+        ${CMAKE_CURRENT_BINARY_DIR}/renderer_setter_contract_report.json)
+    add_custom_target(edf_renderer_setter_analysis_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_setter_analysis
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_renderer_setter_analysis_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_setter_analysis)
+    set_tests_properties(edf_renderer_setter_analysis_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_test(NAME edf_native_hook_boundary_audit
       COMMAND ${CMAKE_COMMAND}
         -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/guest_shader_bridge.cpp
@@ -255,7 +282,8 @@ if(BUILD_TESTING)
         target_sources(edf_native_immediate_tail_tests PRIVATE ${_native_buffer_lock})
         target_sources(edf_native_immediate_tail_tests PRIVATE ${_native_worker_init})
         target_sources(edf_native_immediate_tail_tests PRIVATE ${_native_device_defaults})
-        target_link_libraries(edf_native_immediate_tail_tests PRIVATE rex::runtime)
+        target_sources(edf_native_immediate_tail_tests PRIVATE tests/native_static_group_gpu.cpp)
+        target_link_libraries(edf_native_immediate_tail_tests PRIVATE rex::runtime edf_native_d3d11)
         add_test(NAME edf_native_immediate_tail_tests COMMAND edf_native_immediate_tail_tests)
         target_link_libraries(edf_native_sdk_ui_tests PRIVATE edf_native_sdk_ui)
         add_test(NAME edf_native_sdk_ui_tests COMMAND edf_native_sdk_ui_tests)

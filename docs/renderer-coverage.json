@@ -1,0 +1,3315 @@
+{
+  "version": 2,
+  "scope": "6e9c94b+worktree-2026-09-22-coverage",
+  "tasks": [
+    {
+      "id": "R01.scope",
+      "title": "Classify the exported closure",
+      "status": "open",
+      "dependencies": [],
+      "change": "For each assigned function/site, trace the seed-to-function path and its outgoing calls; label renderer consumer, producer, shared utility or unreachable for a named mode. Expand roots for newly found render targets. Scope labels need instruction/source evidence.",
+      "completion_test": "Every census function and indirect site has an evidenced role or an explicit follow-up; no utility is declared renderer work solely from reachability, and exclusions name the mode and proof.",
+      "execution": {
+        "kind": "investigation",
+        "input_paths": [
+          "out/renderer-inventory/complete-function-inventory.csv",
+          "out/renderer-inventory/root-manifest.csv",
+          "out/renderer-inventory/generated-call-edges.csv",
+          "out/renderer-inventory/indirect-site-ledger.csv"
+        ],
+        "search_symbols": "sub_821A5080|sub_820B4310|sub_820B4250",
+        "first_slice": "Classify one root-to-callee path starting at sub_821A5080. Select at most five functions from that path, not the first five unrelated CSV rows.",
+        "prerequisite_evidence": "No implementation prerequisite. The coverage audit must be current, and selected generated-code and Ghidra locators must exist.",
+        "steps": [
+          "Find the selected function in the function inventory; record root_reasons and incoming/outgoing direct edges in contract.csv.",
+          "Read the native hook and generated PPC body for each selected function. Use the existing Ghidra body as an aid, and check disputed control flow against emitted instructions.",
+          "For each branch, list render submission, simulation writes, resource operations and indirect targets. Assign renderer-consumer, producer, shared-utility or unresolved; a single function may have multiple roles.",
+          "Record the exact mode/guard for any exclusion. Add a scoped follow-up for unknown callees/targets, then move to the next connected slice. Leave the package open until all assigned rows have evidence."
+        ],
+        "acceptance_cases": [
+          "A shared allocator reached from a renderer is classified as a utility with its caller obligations retained.",
+          "An indirect call with a plausible vtable candidate stays unresolved without receiver/registration proof.",
+          "Every selected function has both an incoming-path witness and a documented outgoing-boundary disposition."
+        ],
+        "test_targets": [],
+        "do_not": [
+          "Do not port the 9,216-function closure wholesale.",
+          "Do not use class names, hook presence or absence of an __imp__ call as proof of ownership."
+        ],
+        "stop_condition": "If a body is truncated or a target cannot be identified, save the last proven instruction/argument flow and the next precise lookup. Do not classify the path as unreachable.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R01.callbacks",
+      "title": "Close frame receiver populations",
+      "status": "open",
+      "dependencies": [
+        "R01.scope"
+      ],
+      "change": "Resolve the eight 821A5080 sites and bucket slot 4 at 821A3C50 using registration/removal writers, receiver identity and verified vtables; check player/free/motion/base cameras and listeners.",
+      "completion_test": "Registration-to-call table covers all eight sites plus bucket dispatch; runtime target traces map to it; unknown targets fail coverage and get a task.",
+      "execution": {
+        "kind": "investigation",
+        "input_paths": [
+          "src/native_graphics/native_frame_dispatch.h",
+          "out/renderer-inventory/core-callback-candidates.csv",
+          "out/renderer-inventory/startup-listener-registration.csv",
+          "out/renderer-inventory/world-camera-factory-registration.csv"
+        ],
+        "search_symbols": "821A5158|821A51D8|821A5264|821A5290|821A52A8|821A52E4|821A52F8|821A5368|821A3C50",
+        "first_slice": "Resolve the scene-begin callback at 821A5158 (manager+132, slot1) from registration through removal before tackling the other eight sites.",
+        "prerequisite_evidence": "R01.scope must identify the selected callback as renderer-facing; full broad-closure triage is not required to investigate this site.",
+        "steps": [
+          "Record instruction, receiver expression, slot byte offset, argument values and candidate targets. Keep pointer verification separate from receiver membership.",
+          "Trace all discovered writers of the receiver/list field and constructor vtable installs. Add registration, mutation and removal locators to the same row.",
+          "Follow each candidate implementation through its render/producer boundary; retain mode guards for player, free, motion and base cameras and listeners.",
+          "Compare with observed targets when R10.trace data exists. An unobserved but reachable candidate remains in scope. Deliver a nine-site table and explicit unresolved receiver questions."
+        ],
+        "acceptance_cases": [
+          "All eight outer sites and bucket site821A3C50 have rows.",
+          "Removal/re-registration and a changed receiver table cannot escape the candidate population silently.",
+          "An unknown runtime target creates a new task row instead of being discarded."
+        ],
+        "test_targets": [
+          "edf_native_frame_dispatch_tests"
+        ],
+        "do_not": [
+          "Do not replace the callback with a guessed class-specific target.",
+          "Do not treat one Mission1 trace as proof that other modes cannot register another receiver."
+        ],
+        "stop_condition": "If receiver registration is missing, retain original dispatch for that site and hand off the exact receiver field and candidate writer search.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R01.modes",
+      "title": "Declare supported and compatibility modes",
+      "status": "open",
+      "dependencies": [
+        "R01.callbacks"
+      ],
+      "change": "Inventory startup/loading/gameplay/pause/results/movie, player counts, camera modes, backend choices, ownership toggles and diagnostic branches. Decide support or explicit unsupported behavior for each combination.",
+      "completion_test": "Mode matrix includes guards and fallback behavior; every supported branch has a scenario and every unsupported branch has a tested diagnostic.",
+      "execution": {
+        "kind": "investigation",
+        "input_paths": [
+          "out/renderer-coverage/configuration-modes.csv",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "README.md",
+          "docs/renderer-coverage-runtime.md"
+        ],
+        "search_symbols": "edf_native_scene_backend|edf_native_seam_draws|edf_native_frame_dispatch",
+        "first_slice": "Build the backend x recorded/direct-draw matrix first: D3D12, D3D11, WARP variants and empty backend.",
+        "prerequisite_evidence": "Use current setting definitions and actual consumer guards. R01.callbacks supplies known camera/listener modes; leave unknown mode populations explicit.",
+        "steps": [
+          "For each selected setting, read its definition, accepted range, restart requirement and every consumer guard; record literal default separately from accepted values.",
+          "List compatible and incompatible combinations using the source guards, starting with backend and seam_draws. Record the existing rejection/migration behavior.",
+          "Map supported combinations to scenario IDs and specific captures/tests. Mark unexecuted combinations untested, not unsupported.",
+          "Repeat for cadence, workers, credits, MSAA, resolution/canvas, camera/player modes and ownership/debug switches. Propose any support-policy change separately from observed behavior."
+        ],
+        "acceptance_cases": [
+          "D3D12 plus direct D3D11-only draws has an explicit disposition backed by its guard.",
+          "Every one of the98 captured definitions has a value/guard/restart/test row.",
+          "Unsupported is justified by source or an explicit product decision; an absent test is recorded as untested."
+        ],
+        "test_targets": [],
+        "do_not": [
+          "Do not silently change defaults or remove compatibility modes while cataloging them.",
+          "Do not enumerate the Cartesian product blindly; document guard-equivalent groups and pairwise choices."
+        ],
+        "stop_condition": "If a requested support policy is not determined by source or existing project decisions, document the alternatives and impact; do not invent a supported/unsupported label.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R02.publication",
+      "title": "Separate simulation mutations from rendering",
+      "status": "open",
+      "dependencies": [
+        "R01.callbacks",
+        "R09.effects"
+      ],
+      "change": "Split 820B4250 counter/time mutations and 821A4DE8 publication from render repeats. Publish camera, transforms, animation, effect clocks and resource generation together.",
+      "completion_test": "Render a retained generation repeatedly: simulation counters, authoritative poses and resource lifetimes remain unchanged; one producer tick advances once.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "src/native_graphics/native_scene_adapter.h",
+          "src/native_graphics/native_scene_sources.h",
+          "src/native_graphics/native_model_pose_history.h",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "820B4250|821A4DE8|Publish|generation",
+        "first_slice": "Document and test the owner+364 counter and owner+356 time writes in820B4250 before moving any operation out of rendering.",
+        "prerequisite_evidence": "R01.callbacks identifies the selected producer/render route; R09.effects supplies its writes, readers and ordering. Do not move a write whose consumers are unknown.",
+        "steps": [
+          "Record before/after simulation fields and the publication point after821A4DE8. Identify which thread owns each mutation and which resource generation the data refers to.",
+          "Define one immutable publication record with generation/tick ID and retained handles for the selected state. Specify how the consumer acquires it without combining generations.",
+          "Move only proven simulation updates to the producer tick; make repeated rendering consume the same retained record without advancing those updates.",
+          "Add repeat-render/new-tick tests before expanding the record to camera, animation and effects. Include a delayed consumer retaining the previous generation."
+        ],
+        "acceptance_cases": [
+          "Rendering one generation10 times leaves selected counters/time and authoritative poses byte-identical.",
+          "One new simulation tick applies the update once and publishes a new generation.",
+          "A producer update while an old frame is pending does not invalidate that frame or mix its inputs."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests"
+        ],
+        "do_not": [
+          "Do not copy all live guest memory into a snapshot.",
+          "Do not move updates based only on a function name such as RenderWorld."
+        ],
+        "stop_condition": "If simulation versus rendering ownership cannot be distinguished, keep that update in its current owner and return an evidence-backed contract question.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R02.camera",
+      "title": "Own camera derivation and interpolation inputs",
+      "status": "open",
+      "dependencies": [
+        "R02.publication"
+      ],
+      "change": "Replace live camera inputs around 821CDDF8 and 821BE8D0 with retained per-view projection/view/FOV/viewport values; preserve matrix rounding and source-pose restoration.",
+      "completion_test": "Locked/unlocked movement, zoom, camera changes and dimension edge cases match reference matrices; simultaneous views never share camera state accidentally.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "src/native_graphics/native_camera_history.h",
+          "src/native_graphics/native_scene_pass_inputs.h",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "821CDDF8|821BE8D0|NativeCamera|projection",
+        "first_slice": "Capture one player-view camera record and compare its view/projection bytes with the current path at a locked simulation tick.",
+        "prerequisite_evidence": "R02.publication must provide a generation and retention contract for this view. Resolve dimensions/FOV and matrix operation order before replacing derivation.",
+        "steps": [
+          "Trace view/projection/FOV/viewport producers and distinguish authoritative source pose from derived matrices.",
+          "Store the selected per-view camera inputs and derived values in the publication; use a view identity so a second view cannot overwrite the first.",
+          "Preserve audited floating-point operation order and scoped source-pose restoration. Add interpolation as a consumer operation over two retained generations.",
+          "Compare locked/unlocked, zoom and view changes against the reference path, recording any intentional numeric tolerance and its reason."
+        ],
+        "acceptance_cases": [
+          "Repeated rendering does not alter authoritative camera pose/FOV.",
+          "Two views with different projection/viewport retain separate values.",
+          "Zoom, dimension changes and invalid dimensions follow an explicit policy and do not introduce silent NaNs or changed rounding."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests"
+        ],
+        "do_not": [
+          "Do not recompute projection with an algebraically equivalent formula without checking float rounding.",
+          "Do not import a live viewport after selecting an older camera generation."
+        ],
+        "stop_condition": "If a camera mode lacks a known producer or identity, preserve its current path and leave that mode open.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R03.selection",
+      "title": "Finish immutable static selection",
+      "status": "open",
+      "dependencies": [
+        "R02.publication",
+        "R09.effects"
+      ],
+      "change": "Publish hidden/mode flags, duplicate marks, LOD inputs, hierarchy and ordered membership together at 821C61D8/820B4038/821BEE68/821C3BB8; eliminate mixed live-generation selection.",
+      "completion_test": "Visibility, LOD, duplicate/order, removal, reinsert and address-reuse fixtures match the reference and audited gameplay without live selection reads.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_scene_tree_publication.h",
+          "src/native_graphics/native_scene_membership.h",
+          "src/native_graphics/native_scene_visibility.h",
+          "src/native_graphics/native_scene_sources.h",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "821C61D8|820B4038|821BEE68|821C3BB8|hidden|duplicate",
+        "first_slice": "Select one static leaf containing two ordered objects and publish all inputs used to accept/reject those objects.",
+        "prerequisite_evidence": "R02.publication supplies a retained generation; R09.effects identifies writers of hidden/mode/duplicate/LOD inputs for this leaf.",
+        "steps": [
+          "Read the current selector and list every guest-memory field it reads, including inherited flags and duplicate bookkeeping.",
+          "Trace writers for missing fields; add fields to the same publication as hierarchy and ordered membership, rather than fetching them later.",
+          "Run selection against only that retained generation; defer live mutations to a new generation through the established producer contract.",
+          "Add exact selected-ID/order comparisons and a guard that detects guest selection reads. Expand to hierarchy and LOD boundaries after the leaf fixture passes."
+        ],
+        "acceptance_cases": [
+          "Hidden/visible, LOD threshold and duplicate cases return the expected IDs in the expected order.",
+          "Remove/reinsert and same-address new lifetime do not select stale objects.",
+          "Changing live guest fields after publication does not change selection of that publication."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests"
+        ],
+        "do_not": [
+          "Do not mix retained membership with current adapter records.",
+          "Do not treat an empty scene or zero audit checks as a passing comparison."
+        ],
+        "stop_condition": "If a required field has no known writer, keep that selection route explicit and request a writer investigation instead of reading it live inside the native consumer.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R03.mutation",
+      "title": "Resolve mutation and unknown-object fallback",
+      "status": "open",
+      "dependencies": [
+        "R01.callbacks",
+        "R03.selection"
+      ],
+      "change": "Enumerate 821C0C00 callback implementations and mutation writers; specify republish/defer behavior for every unsupported or mid-selection mutation route.",
+      "completion_test": "Adversarial callback/removal tests preserve order and retained lifetimes; fallback counts are attributed to a declared route and no silent live-list restart remains.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "src/native_graphics/native_scene_membership.h",
+          "src/native_graphics/native_scene_tree_publication.h",
+          "out/renderer-inventory/indirect-site-ledger.csv",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "821C0C00|Invalidate|mutation|fallback",
+        "first_slice": "Reproduce one callback that removes or changes the next object during leaf traversal.",
+        "prerequisite_evidence": "R01.callbacks identifies the chosen target and mutation contract; R03.selection gives the immutable traversal behavior to preserve.",
+        "steps": [
+          "Find the821C0C00 fallback and record when it invalidates, calls original code and refreshes live state.",
+          "Build a fixture for mutation during traversal: next removal, current removal, insertion or target replacement. Write the required order/visibility result before changing behavior.",
+          "Choose an explicit contract consistent with producers: retain the current generation, or abort/defer and republish. Keep guest-pointer validation boundaries around callbacks.",
+          "Replace only the proven live fallback route and expose a reason counter for any remaining unsupported route. Check reuse after removal."
+        ],
+        "acceptance_cases": [
+          "Removing the next node neither dereferences freed memory nor skips an unrelated retained node.",
+          "New insertions appear only in the defined generation/order.",
+          "Unknown callbacks cannot silently restart traversal over mutable live links."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests"
+        ],
+        "do_not": [
+          "Do not continue with cached live pointers after a guest callback.",
+          "Do not swallow an unsupported callback and count the object as rendered."
+        ],
+        "stop_condition": "If callback mutation semantics differ by mode, retain separate explicit mode branches until each has evidence.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R04.pass",
+      "title": "Submit a complete retained static pass",
+      "status": "open",
+      "dependencies": [
+        "R03.mutation",
+        "R05.pass",
+        "R09.effects",
+        "R09.retirement"
+      ],
+      "change": "Move required CPU setup/activation/indexed-tail effects at 821D96D8, 821B94E8 and 821B8E48 to explicit producer or native owners; submit geometry/material/world from retained inputs.",
+      "completion_test": "Static pass succeeds with legacy setup, activation and draw submission disabled; mixed-content ordering and retirement remain correct on D3D11/D3D12.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "src/native_graphics/native_scene_handoff.h",
+          "src/native_graphics/native_scene_material.h",
+          "src/native_graphics/native_scene_pass_inputs.h",
+          "out/renderer-inventory/static-pass-contracts.csv",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "821D96D8|821B94E8|821B8E48|indexed_cpu_tail",
+        "first_slice": "Render one retained static group including geometry, material and world transforms while counting every legacy setup/activation/tail call it makes.",
+        "prerequisite_evidence": "Selected group has R03.mutation selection semantics, R05.pass inputs, R09.effects CPU-effect ownership and R09.retirement lifetime/queue contracts.",
+        "steps": [
+          "Make a before/after table of every retained call for the group. Separate required CPU writes from packet emission and actual native submission.",
+          "Move required writes to their documented producer/native owner; keep ordering and retirement operations even when packet emission is removed.",
+          "Submit the group from retained handles and explicit pass inputs. Add a fixture guard that fails if legacy setup/activation/draw submission runs for the selected supported group.",
+          "Compare output and state with the reference, then expand to multiple materials and mixed static/animated ordering. Keep unsupported groups counted and assigned."
+        ],
+        "acceptance_cases": [
+          "Nonempty supported static pass renders while guarded legacy consumer calls remain zero.",
+          "A material boundary preserves inherited state needed by the following draw.",
+          "Retiring a resource after publication does not break the in-flight frame; address reuse does not revive it."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests",
+          "edf_native_immediate_tail_tests"
+        ],
+        "do_not": [
+          "Do not equate removing a draw call with removing its CPU side effects.",
+          "Do not add a new ownership flag without implementing the complete selected boundary."
+        ],
+        "stop_condition": "If a retained CPU write lacks an owner/reader contract, stop removing that call and return the exact missing effect to R09.effects.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R05.pass",
+      "title": "Own view, target and pass transitions",
+      "status": "open",
+      "dependencies": [
+        "R02.camera",
+        "R09.resources"
+      ],
+      "change": "Specify begin/end, inherited target, clear, viewport, scissor, format, resolve and post-pass contracts, including 821BE8D0/821BE9D8 and tiled-to-untiled compatibility branches.",
+      "completion_test": "Nested/offscreen/multiple-view tests verify explicit target and state restoration; loading direct-scene output and normal post output both present.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_scene_pass_inputs.h",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "out/renderer-inventory/pass-format-contracts.csv",
+          "out/renderer-inventory/untiled-boundary-contracts.csv",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "821BE8D0|821BE9D8|8219C5A8|8219C840|viewport|resolve",
+        "first_slice": "Describe one ordinary gameplay begin/end pair and the loading direct-scene end path before changing target inheritance.",
+        "prerequisite_evidence": "R02.camera provides retained per-view inputs and R09.resources defines target identity/retention. Existing pass-contract rows remain partial until their remaining obligations are resolved.",
+        "steps": [
+          "Record target color/depth handles, formats, sample count, viewport, scissor, clear values, resolve source/destination and entry/exit CPU writes.",
+          "Create an explicit pass record that contains every currently inherited input and a defined output-state handoff to the next pass.",
+          "Apply begin/draw/end/resolve using that record. Preserve required producer dirty-state effects separately from removed rendering packets.",
+          "Add nested/offscreen and loading fixtures, then test resize/recreation with old pass records still retained."
+        ],
+        "acceptance_cases": [
+          "Nested pass B returns to the required A target/state without reading unrelated current guest state.",
+          "Loading with no active output still produces an eligible correctly owned direct-scene frame.",
+          "MSAA resolve and resource recreation preserve matching extent/format/lifetime."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests",
+          "edf_native_backend_compositor_tests"
+        ],
+        "do_not": [
+          "Do not import the most recently bound target as the owner of an older pass.",
+          "Do not restore Xbox tile replay as a compatibility shortcut."
+        ],
+        "stop_condition": "If begin/end ownership differs between direct-scene and normal output, document both routes and leave the unproven route open.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R05.post",
+      "title": "Validate post-processing and output transforms",
+      "status": "open",
+      "dependencies": [
+        "R05.pass",
+        "R09.assets"
+      ],
+      "change": "Enumerate techniques that implement tone mapping, exposure/bloom-like passes, fog/environment and output gamma; document which are actually present, with exact pass identities.",
+      "completion_test": "Named pass captures compare scene color and final output across authored presets, MSAA modes and 720p/1080p; no unnamed technique or rejected state remains.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "src/native_graphics/effect.cpp",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "docs/native-renderer-migration.md",
+          "tests/native_display_gamma_tests.cpp"
+        ],
+        "search_symbols": "Tone|MiddleGray|Luminance|post|bloom|gamma",
+        "first_slice": "Identify one actual post technique and capture its input scene-color and output for the same frame.",
+        "prerequisite_evidence": "R05.pass gives target order/lifetime; R09.assets gives the selected effect identity and reflected parameters. A descriptive label such as bloom is not an identity.",
+        "steps": [
+          "Record effect/technique/pass identifiers, shader fingerprints, samplers, constants and target formats from source/assets.",
+          "Trace authored environment values through upload to the native bindings. Distinguish tone-map/gamma/display transforms and their order.",
+          "Capture paired inputs/outputs and compare with a matched reference at720p before changing arithmetic or viewport offsets.",
+          "Fix only demonstrated differences, add focused parameter/output tests, then repeat for1080p and relevant MSAA/preset variants."
+        ],
+        "acceptance_cases": [
+          "Paired captures use the same frame and correctly labeled linear/HDR/display spaces.",
+          "Authored preset transitions change only the intended parameters.",
+          "Resolution/MSAA changes preserve sampling alignment, output extent and gamma order."
+        ],
+        "test_targets": [
+          "edf_native_effect_tests",
+          "edf_native_display_gamma_tests"
+        ],
+        "do_not": [
+          "Do not tune authored tone constants by eye to hide a binding/order defect.",
+          "Do not claim HDR fidelity from a clamped BMP."
+        ],
+        "stop_condition": "If no matched reference or actual technique identity is available, deliver the technique/parameter table and keep visual equivalence untested.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R06.pose",
+      "title": "Replace model traversal and pose uploads",
+      "status": "open",
+      "dependencies": [
+        "R02.publication",
+        "R09.effects",
+        "R09.resources"
+      ],
+      "change": "Migrate 821C9478/821C9C20/821B2C28 and 821A1738/821A17D8 into retained rigid/skinned draw records with owned matrix arrays and upload dirty-state effects.",
+      "completion_test": "Rigid and skinned fixtures, attachments, interpolation and LODs render with original model traversal disabled and unchanged authoritative bones.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_model_pose_history.h",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "out/renderer-inventory/content-boundary-contracts.csv",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "821C9478|821C9C20|821B2C28|821A1738|821A17D8",
+        "first_slice": "Build one rigid-model record and one two-bone skinned record; enumerate their original traversal/upload calls.",
+        "prerequisite_evidence": "R02.publication supplies a tick/generation; R09.effects supplies upload dirty-state and traversal contracts; R09.resources supplies retained mesh ownership.",
+        "steps": [
+          "Record model-record layout, matrix-index selection, skinning branch, palette size and draw order from the original traversal.",
+          "Publish immutable model draw records and copied/retained matrix arrays with explicit lifetime. Separate authoritative bones from interpolated render poses.",
+          "Implement native traversal/upload for the two fixtures and guard their original model-render calls. Preserve any required CPU upload mirrors in their declared owner.",
+          "Extend to attachments and mixed skinned/unskinned records, then validate interpolation across two ticks with source bones unchanged."
+        ],
+        "acceptance_cases": [
+          "Rigid records choose the correct matrix; skinned records upload the expected palette and draw order.",
+          "Repeated interpolated frames leave source bones byte-identical.",
+          "Palette replacement/removal while an older frame is pending never uses released storage."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests"
+        ],
+        "do_not": [
+          "Do not call original model traversal and label pose interpolation as full ownership.",
+          "Do not retain a pointer to a mutable guest palette without a lifetime contract."
+        ],
+        "stop_condition": "If a record flag or matrix upload side effect is unknown, keep that branch open and request its exact local-effect contract.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R06.families",
+      "title": "Close model-family render routes",
+      "status": "open",
+      "dependencies": [
+        "R01.callbacks",
+        "R06.pose"
+      ],
+      "change": "For each assigned renderable method, follow direct and indirect routes to submission, classify per-instance/attachment overrides and migrate the remaining native consumer; keep external class labels provisional.",
+      "completion_test": "Soldier/civilian/enemy/large multipart/vehicle/attachment rows each have a targeted scene or evidenced unreachable disposition; no original render callback needed.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "out/renderer-inventory/renderable-method-review.csv",
+          "out/renderer-inventory/renderable-content-routes.csv",
+          "out/renderer-inventory/renderable-helper-routes.csv",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "820DEA08|8210E6C0|8219A2D0|821E2250|821E5810",
+        "first_slice": "Choose the soldier/player method sub_820DEA08 and one supported concrete receiver. Finish its route before selecting another family.",
+        "prerequisite_evidence": "R01.callbacks proves that receiver can reach the method; R06.pose provides the retained rigid/skinned consumer used by its draws.",
+        "steps": [
+          "Find the method row and enumerate its direct/helper/indirect route to draw submission; note class labels as provisional until receiver evidence exists.",
+          "Record family-specific visibility, attachment, material, pose, topology and pass overrides; compare them with the shared model contract.",
+          "Implement only the missing overrides around the shared native consumer and create a fixture for each distinct branch.",
+          "Choose a mission/scenario that actually instantiates the receiver and collect route plus image evidence. Repeat per method, including multipart enemies and vehicles."
+        ],
+        "acceptance_cases": [
+          "The selected receiver reaches the expected native consumer without original render traversal.",
+          "Attachments retain parent/child pose and ordering across LOD/removal.",
+          "Each method/class row is tested or retains a precise unresolved/unvisited disposition."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests"
+        ],
+        "do_not": [
+          "Do not assume all classes sharing a method share all runtime overrides.",
+          "Do not mark an entire family complete from one visible soldier."
+        ],
+        "stop_condition": "If no reproducible scenario or registration proof exists for a family, deliver its static contract and leave runtime acceptance open.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R07.effects",
+      "title": "Own dynamic effects and transparency",
+      "status": "open",
+      "dependencies": [
+        "R02.publication",
+        "R05.pass",
+        "R09.dynamic"
+      ],
+      "change": "For each particle, spark, smoke, projectile, muzzle, shell and glass method, retain geometry/material/lifetime/sort inputs and remove per-render simulation changes.",
+      "completion_test": "Controlled firing, explosions, trails, overlapping alpha/additive effects and expiry match reference ordering; render repeats do not age effects.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "out/renderer-inventory/renderable-method-review.csv",
+          "out/renderer-inventory/renderable-content-routes.csv",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "src/native_graphics/native_scene.h",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "8211D250|82121848|821897A8|8217D6E0",
+        "first_slice": "Trace one muzzle-flash or particle method to geometry, sort key, material parameters and lifetime update.",
+        "prerequisite_evidence": "R02.publication owns effect time; R05.pass owns blend/depth/pass context; R09.dynamic retains transient geometry bytes.",
+        "steps": [
+          "Separate effect simulation (spawn/age/expiry) from geometry preparation and rendering; document exact input fields and writers.",
+          "Publish geometry, material, transform, depth/sort order and lifetime identity at the producer tick.",
+          "Render retained records in the original required transparent/additive order without advancing age; retain buffers until completion.",
+          "Compare controlled firing and overlapping effects before expanding to trails, smoke, sparks, glass and projectile families."
+        ],
+        "acceptance_cases": [
+          "Ten renders of one tick do not age or expire an effect.",
+          "Two overlapping alpha effects preserve the required draw order; additive paths keep their own state.",
+          "Expiry/removal and buffer reuse do not leak old effects into later frames."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests",
+          "edf_native_quad_tests"
+        ],
+        "do_not": [
+          "Do not assume all transparency can be sorted by distance.",
+          "Do not infer a specific particle method from smoke pixels alone."
+        ],
+        "stop_condition": "If sort key, spawn owner or lifetime writer is unknown, preserve the route and record that exact prerequisite.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R07.environment",
+      "title": "Own special world and destruction families",
+      "status": "open",
+      "dependencies": [
+        "R03.selection",
+        "R04.pass",
+        "R09.dynamic"
+      ],
+      "change": "Follow sky, wire, rock, tree, grass, broken-object and broken-piece routes; implement their topology, material and lifecycle deviations from the static group path.",
+      "completion_test": "Outdoor/environment and destruction scenes exercise each family; broken/removing objects leave no stale retained draws or resource aliases.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "out/renderer-inventory/renderable-method-review.csv",
+          "out/renderer-inventory/renderable-helper-routes.csv",
+          "src/native_graphics/native_scene_geometry.h",
+          "src/native_graphics/native_scene_membership.h",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "820B8D28|820BB270|820BBA48|82172698|8211FAA8|82120168",
+        "first_slice": "Choose one special method, preferably sky sub_820BB270 or broken-piece sub_82120168, and record how it differs from a static group.",
+        "prerequisite_evidence": "R03.selection and R04.pass define retained static behavior; R09.dynamic covers any mutable topology or transient vertex storage.",
+        "steps": [
+          "Trace the selected method through helpers to topology/material/pass setup and submission; record any object removal or destruction side effects.",
+          "Express its deviations as explicit retained inputs rather than extra live guest reads in the static pass.",
+          "Implement the special draw path and lifecycle transition, with fixtures for visibility and retirement.",
+          "Repeat for wire, rocks, trees, grass and destruction families; use actual environment/mission evidence to exercise each."
+        ],
+        "acceptance_cases": [
+          "Sky/vegetation state does not leak into the following ordinary world draw.",
+          "Destruction removes the intact draw and retains debris for its documented lifetime.",
+          "Same-address replacement and LOD/cull changes do not show stale parts."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests"
+        ],
+        "do_not": [
+          "Do not force line/ribbon/debris topology through a triangle-only static contract.",
+          "Do not close all environment families from a city capture."
+        ],
+        "stop_condition": "If a special family uses an unidentified helper or geometry writer, add that bounded investigation before changing its rendering.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R07.shadows",
+      "title": "Identify and migrate shadow passes",
+      "status": "open",
+      "dependencies": [
+        "R01.callbacks",
+        "R05.pass",
+        "R06.pose"
+      ],
+      "change": "Trace shadow-related effect techniques, render-target/depth writes and caster/receiver callbacks from source/assets; associate observed pass identities with static, animated and effect casters. Do not infer shadows from a dark patch.",
+      "completion_test": "Document the actual shadow technique and target contract (or evidence of absence per mode), then compare static/moving caster and receiver occlusion in controlled captures.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "src/native_graphics/effect.cpp",
+          "docs/native-renderer-migration.md",
+          "out/renderer-inventory/renderable-content-routes.csv"
+        ],
+        "search_symbols": "shadow|Shadow|depth|stencil",
+        "first_slice": "Identify one real shadow-producing technique/pass and its caster/receiver route; the initial slice is investigation only.",
+        "prerequisite_evidence": "R01.callbacks supplies renderer routes and R05.pass supplies pass identities. R06.pose is needed only when migrating animated casters.",
+        "steps": [
+          "Search effect techniques, reflected parameters, depth/stencil/target setup and caster-related routes. Record positive and negative search results.",
+          "Trace a candidate from producer through draw to the sampled/receiver pass; distinguish actual shadows from baked texture shading or other darkening.",
+          "Capture a controlled stationary/moving caster and receiver pair with candidate pass counters. If no technique is found, bound the searched modes/assets instead of claiming global absence.",
+          "Only after identification, publish the caster/receiver inputs and migrate the complete pass; add occlusion and animated-caster tests."
+        ],
+        "acceptance_cases": [
+          "The pass identity is linked to target writes and receiver use, not just a symbol name.",
+          "Moving a caster changes the expected receiver shadow in a matched reference.",
+          "Absence claims state an exact asset/mode search scope and retained unknowns."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests",
+          "edf_native_effect_tests"
+        ],
+        "do_not": [
+          "Do not invent a shadow-map implementation before identifying the game technique.",
+          "Do not use a dark screenshot region as sole proof of shadow coverage."
+        ],
+        "stop_condition": "If the actual shadow technique cannot be identified, stop at a reproducible search report and a precise next producer/pass query.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R07.special",
+      "title": "Resolve base/no-op/test renderable methods",
+      "status": "open",
+      "dependencies": [
+        "R01.scope",
+        "R01.callbacks"
+      ],
+      "change": "For shared 8252B718 and test/base-class rows, verify concrete dispatch and overrides; determine whether each family renders elsewhere, is producer-only, or is genuinely unreachable.",
+      "completion_test": "Each class/table row has registration and slot evidence; no-op local body alone never closes a whole content family.",
+      "execution": {
+        "kind": "investigation",
+        "input_paths": [
+          "out/renderer-inventory/renderable-method-review.csv",
+          "out/renderer-inventory/verified-vtable-pointers.csv",
+          "out/renderer-inventory/renderable-table-installations.csv",
+          "out/renderer-inventory/renderable-constructor-review.csv"
+        ],
+        "search_symbols": "8252B718|8210E220|821E5558",
+        "first_slice": "Select one concrete class table pointing to8252B718; follow its constructor and other render-related slots.",
+        "prerequisite_evidence": "R01.scope identifies the table/function slice; R01.callbacks provides known receiver-registration routes.",
+        "steps": [
+          "Confirm the slot pointer against the verified table row and local body; record the distinction between a no-op method and a no-render object.",
+          "Find constructor installations, concrete subclasses and other render/producer callbacks that may perform the visible work.",
+          "Trace registration/removal and mode activation. For debug/test objects, determine whether the audited build can construct/register them.",
+          "Assign each selected class no-op-slot, alternate-render-route, producer-only or unresolved with evidence; repeat for all shared/base/test rows."
+        ],
+        "acceptance_cases": [
+          "A no-op slot with another rendering slot is not classified as a non-rendering family.",
+          "A claimed unreachable debug route has constructor/registration/mode evidence.",
+          "Every class sharing the method receives its own disposition or a justified shared contract."
+        ],
+        "test_targets": [],
+        "do_not": [
+          "Do not delete classes or callbacks based on a no-op local body.",
+          "Do not import external port-complete labels as evidence."
+        ],
+        "stop_condition": "If concrete construction or registration is unknown, keep the class unresolved with the exact table/slot and missing writer.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R08.ui",
+      "title": "Own HUD, XUI, fonts and overlays",
+      "status": "open",
+      "dependencies": [
+        "R01.callbacks",
+        "R05.pass",
+        "R09.assets"
+      ],
+      "change": "Migrate player overlay 820D3FD0, listener callbacks and UI composition to retained draw records; cover text, radar, menus, pause/results and SDK settings overlay.",
+      "completion_test": "Startup/menu/gameplay/pause/results show correct order, text, clip/scissor and authored canvas at 720p/1080p and alternate aspect ratios; original UI callbacks disabled for consumer.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "src/native_graphics/native_xui_bindings.h",
+          "src/native_graphics/font_effect.cpp",
+          "src/native_graphics/native_canvas_constants.h",
+          "tests/native_xui_tests.cpp",
+          "tests/native_ui_tests.cpp"
+        ],
+        "search_symbols": "820D3FD0|RenderOverlay|RenderUiListener|Xui|font",
+        "first_slice": "Publish and replay one HUD/text layer at a fixed camera/tick, recording its position in final composition.",
+        "prerequisite_evidence": "R01.callbacks identifies overlay/listener receivers; R05.pass provides target/clip state; R09.assets covers the selected font/XUI material contract.",
+        "steps": [
+          "Trace UI production separately from rendering. Record texture/font handles, authored canvas coordinates, clip/scissor, layer order and parameters.",
+          "Build retained draw records for the selected layer, preserving update cadence and references until the frame finishes.",
+          "Render the layer through native UI submission with original consumer calls guarded; compare final composed output, not only intermediate scene color.",
+          "Expand to radar/crosshair, menus/pause/results and SDK overlay, then verify canvas transforms at720p/1080p and alternate aspect."
+        ],
+        "acceptance_cases": [
+          "Text, radar and crosshair stay in the expected layer and clip region.",
+          "Pause and SDK overlays cover the intended game content without corrupting its target.",
+          "Authored1280x720 coordinates scale consistently at native1080p with no double scaling."
+        ],
+        "test_targets": [
+          "edf_native_xui_tests",
+          "edf_native_ui_tests",
+          "edf_native_backend_sdk_ui_tests"
+        ],
+        "do_not": [
+          "Do not move menu/gameplay state updates into repeated render execution.",
+          "Do not accept partial output captures as final UI composition proof."
+        ],
+        "stop_condition": "If font/texture lifetime or listener ordering is unknown, preserve that layer and document the missing contract.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R08.loading",
+      "title": "Close loading and mission transitions",
+      "status": "open",
+      "dependencies": [
+        "R05.pass",
+        "R08.ui",
+        "R09.retirement"
+      ],
+      "change": "Specify no-active-output/direct-scene publication, concurrent loader submissions and menu-to-map/retry/exit handoff; avoid holding submission locks across pacing waits.",
+      "completion_test": "Cold and warm load, retry, return to menu and another mission show changing loading frames with bounded queues; old-generation resources drain before reuse.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "src/native_graphics/native_backend_frame_queue.h",
+          "tools/start-native-binding-validation.ps1",
+          "docs/renderer-coverage-runtime.md"
+        ],
+        "search_symbols": "8219C840|direct_scene|loading|submissions",
+        "first_slice": "Reproduce the no-active-output loading branch and link its eligibility counter to an actually published and presented sequence.",
+        "prerequisite_evidence": "R05.pass and R08.ui supply direct-scene/UI composition; R09.retirement supplies old-generation drain rules. Readiness alone is not publication success.",
+        "steps": [
+          "Record menu-to-load-to-gameplay states, active target/output identities, thread ownership and submission-lock intervals.",
+          "Add or use sequence evidence for eligibility, publication, acquisition and presentation; identify any dropped/blocked stage.",
+          "Fix the selected output/locking/lifetime defect while preserving loader producer work; do not hold the shared submission gate across pacing sleep or unrelated completion waits.",
+          "Exercise cold/warm load, retry, menu return and another mission; retain queue peaks and old/new resource generation evidence."
+        ],
+        "acceptance_cases": [
+          "Loading frames actually present while no ordinary output exists.",
+          "Queue/upload memory remains bounded during a slow load.",
+          "Retry or next mission does not consume resources from the retired map generation."
+        ],
+        "test_targets": [
+          "edf_native_backend_compositor_tests",
+          "edf_native_host_lifetime_tests"
+        ],
+        "do_not": [
+          "Do not interpret cumulative XUI/font counts as per-frame visible progress.",
+          "Do not change scene ownership merely to suppress a black-frame log."
+        ],
+        "stop_condition": "If the scenario cannot reach loading deterministically, fix/record R10.input readiness first; do not mark the transition passed.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R08.movie",
+      "title": "Own movie composition and lifetime",
+      "status": "open",
+      "dependencies": [
+        "R05.pass",
+        "R09.resources"
+      ],
+      "change": "Trace movie decode producers and retained original calls; retain YUV/RGB textures and conversion parameters until consumption, including skip and end-of-movie.",
+      "completion_test": "Supported SD/HD movie paths play, skip and transition with correct color/topology and no stale frame or premature plane retirement.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_movie_bindings.h",
+          "src/native_graphics/movie_effect.cpp",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "tests/native_movie_tests.cpp"
+        ],
+        "search_symbols": "movie|Movie|YUV|plane",
+        "first_slice": "Trace one decoded movie frame from plane production through native conversion to the host frame.",
+        "prerequisite_evidence": "R05.pass identifies the movie composition target; R09.resources defines plane ownership and upload lifetime.",
+        "steps": [
+          "List format, dimensions, pitch/stride, YUV/RGB conversion constants, producer thread and plane reuse point.",
+          "Retain or copy the planes and parameters as one frame identity until the consumer/GPU finishes; keep decoder production separate.",
+          "Implement/verify native conversion and composition with correct topology and color range; compare a known decoded input and matched output.",
+          "Exercise skip/end while frames are queued, then repeat for supported SD/HD variants and menu transition."
+        ],
+        "acceptance_cases": [
+          "All planes belong to the same decoded frame and retain correct pitch/extent.",
+          "Known color samples agree with the documented conversion/range.",
+          "Skip/end drains or cancels pending frames without presenting a stale movie frame over the menu."
+        ],
+        "test_targets": [
+          "edf_native_movie_tests",
+          "edf_native_backend_compositor_tests"
+        ],
+        "do_not": [
+          "Do not overwrite decoded plane memory still referenced by a queued draw.",
+          "Do not claim SD/HD coverage from a cumulative movie counter."
+        ],
+        "stop_condition": "If a movie variant or decoded reference is unavailable, leave that variant untested and deliver the known format/lifetime contract.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R08.present",
+      "title": "Close host presentation and device lifecycle",
+      "status": "open",
+      "dependencies": [
+        "R05.pass",
+        "R09.sync",
+        "R09.retirement"
+      ],
+      "change": "Review host files outside native_graphics, 820B0B80 finish callbacks, surface ring ownership, resize/fullscreen/minimize/restore and device recreation policy.",
+      "completion_test": "Resize and mode changes preserve frame order and resource completion; host tests pass and captured unique frame IDs match submissions with no unexplained repeats/drops.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_backend_host.cpp",
+          "src/native_graphics/native_host_surface.cpp",
+          "src/native_graphics/native_backend_frame_queue.h",
+          "src/native_graphics/native_backend_present.cpp",
+          "tests/native_host_lifetime_tests.cpp"
+        ],
+        "search_symbols": "820B0B80|Present|resize|sequence|completion",
+        "first_slice": "Trace one published frame through acquisition, GPU copy, Present and surface release, including its sequence IDs.",
+        "prerequisite_evidence": "R05.pass owns final output, R09.sync defines completion waits and R09.retirement defines release timing. Include host integration outside native_graphics when following call sites.",
+        "steps": [
+          "Write the surface-ring state transitions and ownership at each stage. Identify original finish callbacks and required CPU effects.",
+          "Remove only render-consumer dependence already covered by those contracts; retain surface references through copy/presentation completion.",
+          "Handle resize/minimize/restore/shutdown by draining or invalidating the correct generation; make device-loss recovery or explicit failure policy visible.",
+          "Compare submitted/acquired/presented sequence IDs and complete-frame captures during transitions. Investigate repeats/drops by stage."
+        ],
+        "acceptance_cases": [
+          "No surface is reused before the consuming GPU operation completes.",
+          "Resize/restore presents the new extent without dangling old targets.",
+          "Shutdown releases only owned resources and cannot deadlock on an unpublished or canceled frame."
+        ],
+        "test_targets": [
+          "edf_native_backend_host_tests",
+          "edf_native_host_lifetime_tests",
+          "edf_native_present_tail_tests"
+        ],
+        "do_not": [
+          "Do not equate calling Present with a new rendered image.",
+          "Do not remove finish callbacks until their CPU/lifetime effects are assigned."
+        ],
+        "stop_condition": "If device-loss behavior is not implemented or reproducible, record the actual failure policy and leave recovery acceptance open.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R09.effects",
+      "title": "Classify all retained CPU effects",
+      "status": "open",
+      "dependencies": [
+        "R01.scope"
+      ],
+      "change": "For each assigned explicit/macro/adapter/store boundary, finish local effects if pending and trace transitive writes, readers, aliasing, exceptions and callbacks. Assign simulation, producer lifetime, native consumer or compatibility ownership.",
+      "completion_test": "Every assigned source site has a complete effects/owner/ordering table with instruction evidence and differential tests; partial local review is not a completed status.",
+      "execution": {
+        "kind": "investigation",
+        "input_paths": [
+          "out/renderer-inventory/retained-call-effect-reviews.csv",
+          "out/renderer-inventory/macro-original-dependencies.csv",
+          "out/renderer-inventory/retained-adapter-terminal-edges.csv",
+          "out/renderer-inventory/state-write-ledger.csv"
+        ],
+        "search_symbols": "821D96D8|821BE9D8|82141440|82149608",
+        "first_slice": "Choose one explicit retained call required by R04.pass; review its complete connected CPU effect contract before selecting another callee.",
+        "prerequisite_evidence": "R01.scope proves the selected call matters to a renderer route. Reuse existing partial local-effect evidence instead of restarting decompilation.",
+        "steps": [
+          "Record branch guard, arguments, return use and already reviewed local writes. Mark local versus transitive evidence separately.",
+          "Follow outgoing calls and pointer aliases far enough to assign every relevant write, callback, allocation, release, lock and failure effect; include vector/atomic/zero-fill operations.",
+          "For each destination, identify reader, lifetime and required ordering; assign simulation producer, resource producer, native consumer or compatibility-only owner.",
+          "Deliver a contract and a differential fixture specification; implement a fixture when needed to resolve disputed behavior. Repeat by selected callee, not by every raw store row independently."
+        ],
+        "acceptance_cases": [
+          "No required CPU write disappears merely because packet emission is unnecessary.",
+          "Aliased memory, callback writes and failure-after-partial-write are represented in the contract.",
+          "Stack-only disposition has alias/escape evidence; unknown transitive effects keep the call open."
+        ],
+        "test_targets": [],
+        "do_not": [
+          "Do not count87,579 store candidates as87,579 implementation tasks.",
+          "Do not upgrade a partial local review to complete callee semantics."
+        ],
+        "stop_condition": "If a helper/provider is unresolved, record exact callsite, arguments and consumer obligation; do not delete or bypass the retained call.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R09.resources",
+      "title": "Close resource creation and identity contracts",
+      "status": "open",
+      "dependencies": [
+        "R09.effects"
+      ],
+      "change": "Review texture/declaration/shader/VB/IB create/import/lock/unlock/destruction and physical/virtual alias writers, including ImportTexture function reference; retain versioned identity through frame completion.",
+      "completion_test": "Create/failure/update/free/reallocate-same-address and alias tests reject stale handles and preserve in-flight frames, with no unreported guest writes.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "src/native_graphics/native_model_buffers.h",
+          "src/native_graphics/native_buffer_writes.h",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "out/renderer-inventory/native-original-references.csv",
+          "tests/native_scene_tests.cpp"
+        ],
+        "search_symbols": "ImportTexture|82201458|NotifyUpdateAliases|ObservedVersion|CommitObserved",
+        "first_slice": "Choose one VB/IB owner and trace create, publish, update, retire and same-address replacement before reviewing other resource kinds.",
+        "prerequisite_evidence": "R09.effects supplies the selected allocator/lock/unlock/destructor effects and the physical/virtual alias relationship.",
+        "steps": [
+          "Write a lifecycle table with resource identity, lifetime ID, revision, aliases, producer and retained native handle.",
+          "Trace every known mutation route including import callback82201458, unlock, guest writes and free/reallocation; distinguish identity change from content revision.",
+          "Fix or specify the observed-version handshake so a snapshot commits only if the owner/lifetime/revision still match; retain old handles for pending consumers.",
+          "Add create/update/failure/reuse tests and repeat for textures, declarations and shaders. Attribute untracked writers to a named follow-up."
+        ],
+        "acceptance_cases": [
+          "Same address with a new lifetime never reuses stale native bytes or metadata.",
+          "An alias update invalidates all overlapping published owners it is required to affect.",
+          "Failed allocation/import does not publish a partially initialized resource or leak a retained reference."
+        ],
+        "test_targets": [
+          "edf_native_scene_tests",
+          "edf_native_guest_memory_tests"
+        ],
+        "do_not": [
+          "Do not replace lifetime identity with an address-only cache key.",
+          "Do not assume CPU-only heap placement without verifying the relevant allocation route."
+        ],
+        "stop_condition": "If a write route bypasses revision tracking, keep that resource on the explicit validated path until its writer is incorporated.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R09.retirement",
+      "title": "Close retirement queue and allocator ownership",
+      "status": "open",
+      "dependencies": [
+        "R09.effects"
+      ],
+      "change": "Trace 82141440 queue growth/consumption, immediate fence tags, allocator providers, reference transitions and resource destruction. Preserve callback ordering and failure semantics.",
+      "completion_test": "Queue exhaustion, allocation failure, same-resource rebind, delayed GPU completion and address reuse have explicit expected results and passing lifetime tests.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "src/native_graphics/native_index_binding.h",
+          "src/native_graphics/native_texture_binding.h",
+          "src/native_graphics/native_shader_binding.h",
+          "out/renderer-inventory/retirement-owner-provenance.csv",
+          "out/renderer-inventory/small-retained-contracts.csv"
+        ],
+        "search_symbols": "82141440|RetireNativeBoundResource|10780|10784|13148",
+        "first_slice": "Follow one texture/shader unbind through immediate-fence tagging or the eight-byte retirement queue, including queue exhaustion.",
+        "prerequisite_evidence": "R09.effects must provide the queue writer and allocator-call contracts. Queue consumption and GPU completion are separate facts to establish.",
+        "steps": [
+          "Record queue record layout, old-resource predicate, preserved tag inputs, cursor/capacity and allocation-growth behavior.",
+          "Find the queue consumer and the event/fence that makes release safe; trace reference ownership through failure and same-pointer rebind.",
+          "Create differential fixtures for both retirement branches and allocator exhaustion before changing ownership code.",
+          "Preserve observable ordering, alias writes and failure effects; test delayed completion and same-address reuse across pending frames."
+        ],
+        "acceptance_cases": [
+          "Queue-full handling preserves every record and the observed tag bits.",
+          "Immediate retirement and deferred retirement follow the correct predicates.",
+          "Rebinding the same pointer or retiring aliased memory does not change the original required write order."
+        ],
+        "test_targets": [
+          "edf_native_shader_binding_tests",
+          "edf_native_backend_completion_tests"
+        ],
+        "do_not": [
+          "Do not zero an apparently uninitialized tag input that the original preserves.",
+          "Do not infer the queue is unused because one gameplay run did not fill it."
+        ],
+        "stop_condition": "If the queue consumer or allocator ownership cannot be proved, keep retirement behavior and report the precise missing release condition.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R09.shader",
+      "title": "Finish shader-default aliasing and failure parity",
+      "status": "open",
+      "dependencies": [
+        "R09.retirement"
+      ],
+      "change": "After the fixed retirement-before-default-read ordering, investigate payload aliasing during incremental constant writes, concurrent mutation and malformed count/extent behavior; either preserve reachable behavior or prove input preconditions.",
+      "completion_test": "Differential fixtures cover pixel/vertex, null/no-default, payload self-alias and failure-after-partial-write; document excluded malformed streams with provider evidence.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "src/native_graphics/native_shader_binding.h",
+          "tests/native_shader_binding_tests.cpp",
+          "out/renderer-inventory/small-retained-contracts.csv",
+          "src/native_graphics/guest_shader_bridge.cpp"
+        ],
+        "search_symbols": "ReadNativeShaderDefaults|SetNativeShaderResource|82149608|821498C8",
+        "first_slice": "Add a fixture where an early constant write aliases a later defaults payload word; compare incremental original reads against the current collected-word parser.",
+        "prerequisite_evidence": "R09.retirement provides retirement ordering and alias semantics. The earlier retirement-before-default-read fix is baseline behavior to preserve.",
+        "steps": [
+          "Read the pixel/vertex original contracts and existing tests. List the three stream phases and exact read/write/failure sequence.",
+          "Construct the smallest valid aliased stream that distinguishes incremental reads from precollection; record expected memory mutations at each step.",
+          "Determine whether reachable providers permit the alias or malformed input. Fix reachable parity differences, or document a proven provider precondition; never infer safety from absence in a sample.",
+          "Extend tests for null shader, absent defaults, pixel/vertex dirty stores and failure after partial application. Keep the previous retirement alias regression passing."
+        ],
+        "acceptance_cases": [
+          "Retirement still precedes binding/default sampling in the required order.",
+          "Payload self-alias behavior matches the justified contract.",
+          "Malformed count/extent behavior has an explicit reachable-input policy and tests, including already-applied writes when required."
+        ],
+        "test_targets": [
+          "edf_native_shader_binding_tests"
+        ],
+        "do_not": [
+          "Do not combine the two pixel dirty stores without an equivalence argument.",
+          "Do not simply remove bounds validation to mimic malformed loops."
+        ],
+        "stop_condition": "If malformed or aliasing inputs have no established provider contract, deliver the failing differential case and precise reachability question before choosing behavior.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R09.dynamic",
+      "title": "Own dynamic geometry and scratch buffers",
+      "status": "open",
+      "dependencies": [
+        "R09.resources"
+      ],
+      "change": "Enumerate immediate/nonindexed/quads, wire/trail/debris and transient ring producers; snapshot mutable bytes before render and retain through GPU consumption.",
+      "completion_test": "Wraparound, append, concurrent publication, removal and large effect bursts never overwrite in-flight data; geometry contracts record all encountered formats.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_upload_ring.h",
+          "src/native_graphics/native_buffer_writes.h",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "tests/native_upload_ring_tests.cpp",
+          "tests/native_quad_tests.cpp"
+        ],
+        "search_symbols": "immediate|transient|append|ring|quad",
+        "first_slice": "Trace one immediate quad or effect vertex buffer from producer write through upload-ring allocation and GPU completion.",
+        "prerequisite_evidence": "R09.resources supplies identity/revision and release rules for the selected transient owner.",
+        "steps": [
+          "Record byte extent, stride/topology, index use, producer writer and all consumers of the mutable buffer.",
+          "Snapshot or retain immutable bytes before the producer can reuse them; attach the snapshot to the publication/frame identity.",
+          "Reserve ring space with explicit completion ownership and implement wrap/split behavior without overwriting pending uploads.",
+          "Stress append, wraparound, concurrent publication and large effect bursts; feed encountered formats into the contract catalog."
+        ],
+        "acceptance_cases": [
+          "A producer rewrite after publication cannot change the older queued draw.",
+          "Ring wrap waits/splits or allocates according to policy instead of overwriting pending data.",
+          "Large bursts report bounds/rejections explicitly and preserve draw order."
+        ],
+        "test_targets": [
+          "edf_native_upload_ring_tests",
+          "edf_native_quad_tests",
+          "edf_native_scene_tests"
+        ],
+        "do_not": [
+          "Do not retain a naked pointer to scratch memory across a producer update.",
+          "Do not treat a successful allocation as proof of safe GPU reuse."
+        ],
+        "stop_condition": "If completion ownership for a transient block is unknown, keep its existing synchronized path and resolve that owner first.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R09.sync",
+      "title": "Close worker, signal and synchronization callbacks",
+      "status": "open",
+      "dependencies": [
+        "R01.scope",
+        "R09.effects"
+      ],
+      "change": "Resolve worker registration modes, 8213C9F0 alternate signals, access10/12/14 and other lock callers, monitor/profiling callbacks, vblank/event delivery and SDK imports.",
+      "completion_test": "Each callback population, activation guard and lock/event owner is evidenced; contention, failure and shutdown tests terminate without deadlock or lifetime races.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "out/renderer-inventory/retained-callback-review.csv",
+          "out/renderer-inventory/worker-registration-review.json",
+          "out/renderer-inventory/sdk-monitor-provenance.json",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "tests/native_worker_callback_audit_tests.cpp"
+        ],
+        "search_symbols": "8243A000|8213C9F0|82134408|8214EBA0|KfAcquireSpinLock",
+        "first_slice": "Choose one worker registration mode and follow its callback/context pair from writer to invocation and shutdown.",
+        "prerequisite_evidence": "R01.scope distinguishes renderer-relevant callbacks; R09.effects provides local lock, signal and event mutations.",
+        "steps": [
+          "Record registration mode, callback/context fields, writers, invocation guard, thread and lock held at each stage.",
+          "Resolve alternate targets and external monitor/profiling callbacks separately; enumerate lock access/caller combinations instead of generalizing one audited caller.",
+          "Draw a lock-order and signal/wait table, including exception/cancellation/shutdown paths. Implement only the selected proven owner transition.",
+          "Add contention, missing-callback, alternate-mode and shutdown fixtures. Use bounded waits so a deadlock produces a recorded failed test."
+        ],
+        "acceptance_cases": [
+          "Callback/context publication cannot mix two registrations under the documented synchronization.",
+          "Every selected signal has a corresponding wait/completion contract, including failure paths.",
+          "Shutdown and contended execution complete within the fixture deadline without leaked locks."
+        ],
+        "test_targets": [
+          "edf_native_worker_callback_audit_tests",
+          "edf_native_backend_completion_tests"
+        ],
+        "do_not": [
+          "Do not remove a lock because sampled single-threaded gameplay worked.",
+          "Do not classify SDK synchronization imports as renderer packet tails."
+        ],
+        "stop_condition": "If an external callback population is unavailable, preserve it and record provider/registration requirements; do not substitute a no-op.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R09.assets",
+      "title": "Close shader/texture/declaration/render-state coverage",
+      "status": "open",
+      "dependencies": [
+        "R01.modes"
+      ],
+      "change": "Re-run disc effect/texture coverage, enumerate technique render-state combinations, merge runtime declaration catalogs and add offline replay for immediate/font/movie/XUI/utility contracts.",
+      "completion_test": "Zero missing assets, rejected contracts and omitted records across the declared content corpus; catalog growth is reported, not treated as proof of exhaustion.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "docs/native-coverage.md",
+          "src/native_graphics/native_contract_ledger.h",
+          "tools/native_texture_check.cpp",
+          "tests/native_effect_tests.cpp",
+          "tests/fixtures/geometry-contract-mission1.txt"
+        ],
+        "search_symbols": "coverage|contract|rejected|declaration|technique",
+        "first_slice": "Replay the existing Mission1 declaration fixture with the documented effect catalog, recording the exact corpus identity and accepted/rejected totals.",
+        "prerequisite_evidence": "R01.modes defines which backend/format combinations are in scope. Inspect the documented checker invocation before running it; do not invent asset paths or flags.",
+        "steps": [
+          "Read native-coverage.md and the checker/test argument parser. Record asset root, corpus hashes, command, omissions and failure counters.",
+          "Enumerate technique render-state combinations and compare with native decoding/binding support, not merely shader compilation.",
+          "Implement additive catalog merge with stable contract identity and provenance; retain rejected records and report newly seen combinations.",
+          "Add offline replay for one uncovered path (immediate/font/movie/XUI/utility) at a time and associate runtime captures with mission/weapon/menu scope."
+        ],
+        "acceptance_cases": [
+          "Merging two catalogs preserves their union and reports new/rejected contracts without duplication.",
+          "Intentionally unsupported declaration/state is reported as a rejection, not silently omitted.",
+          "Zero failures identifies the exact closed asset set; runtime declaration exhaustion is not inferred."
+        ],
+        "test_targets": [
+          "edf_native_effect_tests",
+          "edf_native_texture_tests"
+        ],
+        "do_not": [
+          "Do not erase rejected contracts to obtain a clean summary.",
+          "Do not call Mission1 the complete runtime declaration corpus."
+        ],
+        "stop_condition": "If assets/checker binaries or a variant are missing, record the exact prerequisite and keep that coverage axis untested.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R09.compat",
+      "title": "Make compatibility and diagnostic routes explicit",
+      "status": "open",
+      "dependencies": [
+        "R01.modes",
+        "R09.effects"
+      ],
+      "change": "For every disabled-bridge/host/activation/ownership fallback and diagnostic branch, retain an explicit supported owner or reject the mode; verify macros are forwarding, not replacements.",
+      "completion_test": "Toggle matrix exercises all declared paths; no branch is marked native solely because a hook exists and no removed mode silently falls back.",
+      "execution": {
+        "kind": "investigation-and-implementation",
+        "input_paths": [
+          "out/renderer-inventory/native-dependency-classification.csv",
+          "out/renderer-inventory/macro-original-dependencies.csv",
+          "out/renderer-coverage/configuration-modes.csv",
+          "src/native_graphics/guest_shader_bridge.cpp"
+        ],
+        "search_symbols": "ownership|fallback|EDF_RENDER_PHASE|EDF_RENDER_STATE_SETTER",
+        "first_slice": "Choose one ownership-predicate fallback and exercise both sides using a valid fixture for its exact guard.",
+        "prerequisite_evidence": "R01.modes supplies supported-mode intent; R09.effects supplies the retained original call effects. Unproven policy changes are proposals, not defaults to change.",
+        "steps": [
+          "Record branch predicate, effective settings, selected original/native route and required post-state for the chosen callsite.",
+          "Use fixtures to enter each guard outcome; confirm failure/unsupported cases remain visible and correctly owned.",
+          "If replacing a supported route, preserve CPU effects and add route attribution. If rejecting an unsupported route, use the agreed policy and an explicit diagnostic.",
+          "Repeat for host/bridge/activation-disabled and diagnostic paths, preserving macro forwarding classifications."
+        ],
+        "acceptance_cases": [
+          "Both native and retained branches produce the documented required CPU state.",
+          "Unsupported configuration cannot silently enter an unowned renderer.",
+          "Diagnostic-only branches are labeled and do not falsely count toward native completion."
+        ],
+        "test_targets": [
+          "edf_native_frame_dispatch_tests"
+        ],
+        "do_not": [
+          "Do not remove compatibility routes simply to make original-call counts zero.",
+          "Do not change unrelated defaults to force a fixture through the desired path."
+        ],
+        "stop_condition": "If support policy or callee effects are absent, leave the fallback intact and return that exact prerequisite.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R10.trace",
+      "title": "Make runtime route coverage attributable",
+      "status": "open",
+      "dependencies": [
+        "R01.callbacks"
+      ],
+      "change": "Add bounded per-scenario counters for callback instruction/target/receiver, content method, pass identity, backend and fallback reason; merge with static ledgers and report new routes.",
+      "completion_test": "A scripted run produces per-scenario route IDs and new-target tasks; sampling/overflow and unexercised routes are explicit. Aggregate draw counts alone cannot pass.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_frame_dispatch.h",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "tools/summarize-renderer-coverage-run.py",
+          "out/renderer-inventory/indirect-site-ledger.csv",
+          "tests/native_frame_dispatch_tests.cpp"
+        ],
+        "search_symbols": "ResolveIndirectFunction|HookTiming|RenderOverlay|RenderPose",
+        "first_slice": "Instrument the outer callback at821A5158 with instruction/target/receiver and scenario identity, using a bounded collector.",
+        "prerequisite_evidence": "R01.callbacks supplies the selected site/receiver contract; instrumentation of an unresolved target is allowed, but must label it unresolved rather than assuming a class.",
+        "steps": [
+          "Define a trace row with schema version, run/scenario ID, timestamp, frame/publication ID, instruction, target, receiver/vtable, backend/pass and fallback reason.",
+          "Record at the actual dispatch/branch, not only an enclosing timing scope. Bound memory/events and expose dropped/sampled counts.",
+          "Join observed sites/targets to static ledgers; retain unknowns with their raw locators and emit a new-work list.",
+          "Test known/unknown target and collector overflow, then capture one scenario interval and verify attribution before broadening to family/pass events."
+        ],
+        "acceptance_cases": [
+          "A changed target at the same callsite is preserved as a distinct observation.",
+          "Overflow/sampling is reported and cannot masquerade as complete target coverage.",
+          "Every event joins to a known row or an explicit new-target investigation."
+        ],
+        "test_targets": [
+          "edf_native_frame_dispatch_tests"
+        ],
+        "do_not": [
+          "Do not log every draw without a bound and then use the run for performance measurement.",
+          "Do not treat timing phase names as exact callback receiver proof."
+        ],
+        "stop_condition": "If a site lacks a stable frame/scenario identifier, record the missing correlation and do not claim scenario attribution.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R10.capture",
+      "title": "Capture complete frames in a timed burst",
+      "status": "open",
+      "dependencies": [],
+      "change": "Extend the one-shot native_backend_host GPU capture to a bounded timestamped burst with published sequence IDs; retain final composition and label partial scene captures separately. Hidden automated runs have no capturable main window through the existing window script.",
+      "completion_test": "Before/during/after gameplay, pause and loading frames are captured with sequence and wall-clock metadata; final UI composition is present and no partial output is mislabeled complete.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_backend_host.cpp",
+          "src/native_graphics/native_host_surface.cpp",
+          "src/native_graphics/native_capture_policy.h",
+          "tests/native_backend_host_tests.cpp",
+          "tests/native_capture_policy_tests.cpp"
+        ],
+        "search_symbols": "captured_|edf_native_host_capture|Capture|sequence_",
+        "first_slice": "Extend the final-host capture policy to request exactly three images with distinct timestamps/sequence IDs; keep the existing one-shot behavior as the default.",
+        "prerequisite_evidence": "No other task must be complete. Read both backend-host and D3D11-host capture paths and retain their final-composition semantics.",
+        "steps": [
+          "Locate when each host path captures relative to UI composition and presentation; identify the published sequence and resource lifetime at that point.",
+          "Implement a bounded capture schedule/count and unique output naming. Define handling for repeated sequence IDs, missing images, write errors and overwrite attempts.",
+          "Write a manifest containing capture index, wall/monotonic time, sequence, extent/backend and complete-versus-partial kind. Avoid changing normal behavior when capture is off.",
+          "Add policy/host tests and collect before/during/after gameplay and pause/loading examples; verify actual UI composition visually."
+        ],
+        "acceptance_cases": [
+          "Exactly the configured bounded number of files is produced; existing files are not silently overwritten.",
+          "Manifest sequence/time matches the captured final host frame, including repeated images.",
+          "Disabled capture causes no readback/file activity; old one-shot configuration still works."
+        ],
+        "test_targets": [
+          "edf_native_capture_policy_tests",
+          "edf_native_backend_host_tests"
+        ],
+        "do_not": [
+          "Do not repurpose partial scene-output BMPs and label them complete.",
+          "Do not require a visible OS main window for automated GPU capture."
+        ],
+        "stop_condition": "If a backend cannot expose final composition or sequence identity, report that limitation explicitly and leave its acceptance open.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R10.input",
+      "title": "Synchronize scenario controls with gameplay state",
+      "status": "open",
+      "dependencies": [
+        "R10.trace"
+      ],
+      "change": "Replace elapsed-time-only scenario assumptions with a reached-gameplay/camera-control marker; record intended and actual poll time and extend the movement/fire window after cutscene completion. The probe delivered the 180000 ms movement event at 183403 ms.",
+      "completion_test": "Each control action has a reached-state precondition, observed input interval and visible/state effect; delayed polling and intro camera motion cannot produce a false movement pass.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/scripted_input.h",
+          "src/scripted_input_logic.h",
+          "tools/renderer-coverage-input.txt",
+          "tests/scripted_input_reload_tests.cpp",
+          "docs/renderer-coverage-runtime.md"
+        ],
+        "search_symbols": "GetDeviceState|ReloadInputEvents|t0_|ButtonsAt|AnalogAt",
+        "first_slice": "Add one wait-for-gameplay-ready action followed by a short movement event, while preserving the existing time-only script format.",
+        "prerequisite_evidence": "R10.trace must provide or identify a trustworthy gameplay/control-ready event. Merely seeing a rendered scene is insufficient because the intro renders before control is available.",
+        "steps": [
+          "Define readiness from an audited game/control state and record its provenance. Keep waiting bounded with a visible timeout result.",
+          "Schedule dependent actions relative to the actual readiness event; record intended time, actual poll time, scenario and release time.",
+          "Preserve old scripts, live reload clock semantics, neutral expiry and real-pad merging; do not replay expired events after a reload.",
+          "Add delayed-ready/no-ready/reload tests, then verify a movement or fire action by resulting state/captures, not just delivered buttons."
+        ],
+        "acceptance_cases": [
+          "A late readiness event shifts dependent controls instead of losing them during a cutscene.",
+          "No readiness before deadline reports not-reached and leaves controls neutral.",
+          "Reload and expiry do not latch buttons/axes or restart the scenario clock."
+        ],
+        "test_targets": [
+          "edf_scripted_input_tests"
+        ],
+        "do_not": [
+          "Do not change the player control scheme to make one script work.",
+          "Do not use a fixed180-second delay as proof of gameplay readiness."
+        ],
+        "stop_condition": "If no validated control-ready marker is available, deliver the candidate field/producer investigation instead of inventing a timer heuristic.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R10.scenarios",
+      "title": "Run the declared content and lifecycle matrix",
+      "status": "open",
+      "dependencies": [
+        "R10.trace",
+        "R10.capture",
+        "R10.input"
+      ],
+      "change": "Exercise the scenario table with deterministic controls, timestamped screenshots, route counters and a matched reference. Include all map/environment and enemy/weapon families identified by the asset/mission census.",
+      "completion_test": "Every scenario records reached/observed/compared status and artifacts; failures have tasks; no queued input or screenshot is mistaken for proof of its intended effect.",
+      "execution": {
+        "kind": "runtime-validation",
+        "input_paths": [
+          "docs/renderer-coverage-scenario-results.json",
+          "docs/renderer-coverage-runtime.md",
+          "tools/start-native-binding-validation.ps1",
+          "tools/renderer-coverage-input.txt",
+          "tools/summarize-renderer-coverage-run.py"
+        ],
+        "search_symbols": "S01|S02|S03|S04|S05|S06|S07|S08|S09|S10|S11|S12|S13",
+        "first_slice": "Repeat S03/S04 using readiness, route attribution and complete-frame burst artifacts before selecting an unvisited scenario.",
+        "prerequisite_evidence": "R10.trace, R10.capture and R10.input must provide their selected-scenario evidence. A matched reference is required for parity; otherwise report execution only.",
+        "steps": [
+          "Select one scenario and list its required mode, map/content, controls, observation markers and pass/fail conditions before launching.",
+          "Use isolated userdata and a new output directory. Record executable/source hashes, exact arguments, input file and machine/backend information.",
+          "Run bounded controls and collect reached-state, route, complete-frame and resource evidence. Stop only the owned process after verifying its actual executable path.",
+          "Compare with the reference, assign reached/observed/compared status separately, add new gaps, and update only the supported scenario conclusions. Repeat across the content census."
+        ],
+        "acceptance_cases": [
+          "Every claimed action has an actual reached marker and observed effect.",
+          "Missing families/modes or unavailable references remain explicit untested cases.",
+          "Each failure/new target has a task and artifacts sufficient to reproduce it."
+        ],
+        "test_targets": [],
+        "do_not": [
+          "Do not infer all-map coverage from Mission1.",
+          "Do not kill an existing user game process or reuse output paths that would overwrite evidence."
+        ],
+        "stop_condition": "If assets, readiness, input or reference prerequisites fail, record not-reached/not-compared and resolve the named prerequisite before treating the scenario as accepted.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R10.cadence",
+      "title": "Integrate complete frames at independent cadence",
+      "status": "open",
+      "dependencies": [
+        "R04.pass",
+        "R06.families",
+        "R07.effects",
+        "R07.environment",
+        "R07.shadows",
+        "R08.ui",
+        "R08.loading",
+        "R08.movie",
+        "R08.present"
+      ],
+      "change": "Consume retained full-frame publications independently of the simulation clock, interpolate render inputs and retire generations by consumer completion.",
+      "completion_test": "60 Hz producer / 120 Hz consumer produces measured unique frames with stable simulation over movement/combat/load and no original consumer helper invocation.",
+      "execution": {
+        "kind": "implementation",
+        "input_paths": [
+          "src/native_graphics/native_pacing.h",
+          "src/native_graphics/native_frame_flight.h",
+          "src/native_graphics/native_queued_scene.h",
+          "src/native_graphics/guest_shader_bridge.cpp",
+          "tools/report-native-host-cadence.py"
+        ],
+        "search_symbols": "simulation|generation|interpol|FrameExtraSimulationSteps|render_helper",
+        "first_slice": "Use a deterministic fixture with a60Hz producer and120Hz consumer rendering one complete retained publication without guest render callbacks.",
+        "prerequisite_evidence": "For the selected mode, R04.pass/R06.families/R07.effects/R07.environment/R07.shadows/R08.ui/R08.loading/R08.movie/R08.present must provide complete consumer and lifetime contracts. Do not integrate partial content and call full-frame independence complete.",
+        "steps": [
+          "Write the producer-publication-consumer-retirement state machine, including missed ticks, interpolation endpoints, pause and loading transitions.",
+          "Schedule render consumption independently while preserving exactly one authoritative simulation update per tick; interpolate only approved render inputs.",
+          "Guard all original consumer entries for the selected supported mode and retain input generations until every consuming GPU frame finishes.",
+          "Test delayed producer/consumer and transitions, then measure produced publication IDs, rendered unique images and presented sequences in gameplay."
+        ],
+        "acceptance_cases": [
+          "A60Hz simulation remains60Hz when render cadence changes to120Hz.",
+          "Extra frames show measured interpolation/image changes where expected, rather than repeated Present of one image.",
+          "Pause/load/consumer lag preserves simulation authority and resource lifetime without original consumer reentry."
+        ],
+        "test_targets": [
+          "edf_native_pacing_tests",
+          "edf_native_scene_tests",
+          "edf_native_host_lifetime_tests"
+        ],
+        "do_not": [
+          "Do not increase simulation speed to reach a rendering target.",
+          "Do not claim120Hz from an FPS cap or presentation count alone."
+        ],
+        "stop_condition": "If any required content still needs an original consumer callback, leave full-frame integration incomplete and identify that specific upstream task.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    },
+    {
+      "id": "R10.performance",
+      "title": "Measure non-audit performance and backend parity",
+      "status": "open",
+      "dependencies": [
+        "R10.cadence",
+        "R10.scenarios"
+      ],
+      "change": "Run D3D12 hardware and declared D3D11 fallback, worker counts 0/1/4, MSAA 1/2/4, native resolutions and frame credits; use a smaller pairwise matrix with rationale for combinations.",
+      "completion_test": "Report CPU/GPU/frame-time distributions, unique image cadence, visual comparisons and memory peaks with audit instrumentation off; 120 Hz is measured rather than inferred from a cap.",
+      "execution": {
+        "kind": "runtime-validation",
+        "input_paths": [
+          "tools/report-native-host-cadence.py",
+          "tools/report-native-frame-trace.py",
+          "tools/report-native-geometry-runs.py",
+          "tools/start-native-binding-validation.ps1",
+          "docs/native-backend-migration.md"
+        ],
+        "search_symbols": "edf_native_geometry_workers|edf_native_frame_latency|edf_native_msaa|edf_native_vsync",
+        "first_slice": "Measure one fixed gameplay route on D3D12 with default settings and diagnostics/capture disabled; establish a reproducible baseline before changing one variable.",
+        "prerequisite_evidence": "R10.cadence provides the mode being assessed, R10.scenarios provides a repeatable route and accepted content. Record the actual machine/display configuration.",
+        "steps": [
+          "Define warmup and measurement intervals, deterministic route, power/display settings and required metrics before running.",
+          "Collect CPU/GPU and frame-time distribution, unique image cadence, memory peak and failures with intrusive audit tracing/readback disabled.",
+          "Compare backend, worker0/1/4, sample count, native resolution and credits using a documented pairwise matrix; change one factor for causal comparisons.",
+          "Report medians and tail percentiles, durations/sample counts, visual checks and limitations. Separate regression from a target the implementation never met."
+        ],
+        "acceptance_cases": [
+          "Reported intervals exclude startup/warmup and identify instrumentation overhead.",
+          "120Hz claims include unique-image cadence and preserved simulation, not only presentation rate.",
+          "Each comparison names backend/settings, content route and sample size; unsupported combinations are explicit."
+        ],
+        "test_targets": [],
+        "do_not": [
+          "Do not use the35.6FPS capture-heavy audit run as a performance baseline.",
+          "Do not average away stalls or silently discard failed runs."
+        ],
+        "stop_condition": "If the route cannot repeat or timing instrumentation changes behavior materially, report the measurement limitation and fix it before drawing a performance conclusion.",
+        "deliverables": [
+          "contract.csv: selected source locators, branch/receiver, inputs, writes/outputs, owner, lifetime, evidence and unresolved question.",
+          "results.md: exact slice attempted, prerequisite evidence, changes/findings, commands with exit codes, acceptance cases passed/failed/not-run, and remaining scope.",
+          "Epistemic evidence IDs and any confirmed claim IDs; negative results and unresolved assumptions must be included."
+        ]
+      }
+    }
+  ],
+  "features": [
+    {
+      "id": "F01",
+      "name": "Static world geometry/material/world matrices",
+      "status": "partial-or-unverified",
+      "works": "Retained geometry/material preload and published draw path exist",
+      "original": "Setup/activation/indexed CPU tails remain",
+      "unknown": "Complete pass ownership and unseen/mutating inputs",
+      "tasks": [
+        "R03.selection",
+        "R03.mutation",
+        "R04.pass"
+      ],
+      "scenarios": [
+        "S03",
+        "S06"
+      ],
+      "evidence": "src/native_graphics/guest_shader_bridge.cpp:3331; docs/native-scene-renderer-handoff.md"
+    },
+    {
+      "id": "F02",
+      "name": "Visibility, hierarchy, LOD, hidden and duplicate state",
+      "status": "partial-or-unverified",
+      "works": "Native hierarchy/membership/LOD implementations exist",
+      "original": "Unknown callback and live-selection fallbacks",
+      "unknown": "Coherent generation for all flags and mutations",
+      "tasks": [
+        "R03.selection",
+        "R03.mutation"
+      ],
+      "scenarios": [
+        "S03",
+        "S06"
+      ],
+      "evidence": "src/native_graphics/native_scene_visibility.h; native_scene_membership.h; native_scene_tree_publication.h"
+    },
+    {
+      "id": "F03",
+      "name": "Rigid models, skinning, animation and attachments",
+      "status": "partial-or-unverified",
+      "works": "Native pose interpolation and GPU submission exist",
+      "original": "821C9478/821C9C20/821B2C28 and matrix uploads",
+      "unknown": "Complete model consumer independence",
+      "tasks": [
+        "R06.pose",
+        "R06.families"
+      ],
+      "scenarios": [
+        "S03",
+        "S04",
+        "S08"
+      ],
+      "evidence": "out/renderer-inventory/content-boundary-contracts.csv"
+    },
+    {
+      "id": "F04",
+      "name": "Soldiers, civilians, insects, bosses and multipart enemies",
+      "status": "partial-or-unverified",
+      "works": "47 method census identifies candidate families",
+      "original": "Per-family original callbacks remain",
+      "unknown": "Runtime receiver populations and per-family parity",
+      "tasks": [
+        "R06.families"
+      ],
+      "scenarios": [
+        "S03",
+        "S08"
+      ],
+      "evidence": "out/renderer-inventory/renderable-method-review.csv"
+    },
+    {
+      "id": "F05",
+      "name": "Vehicles, mounted weapons and vehicle cameras",
+      "status": "partial-or-unverified",
+      "works": "Vehicle-family methods are exported",
+      "original": "Vehicle/model/camera callbacks",
+      "unknown": "Entry/exit, attachments and view differences",
+      "tasks": [
+        "R06.families",
+        "R02.camera"
+      ],
+      "scenarios": [
+        "S08"
+      ],
+      "evidence": "renderable-method-review.csv:sub_8219A2D0,sub_821E2250,sub_821E5810"
+    },
+    {
+      "id": "F06",
+      "name": "Projectiles, particles, sparks, smoke and trails",
+      "status": "partial-or-unverified",
+      "works": "Native draw infrastructure; method census",
+      "original": "Effect-family producers/consumers not separated",
+      "unknown": "Sorting, dynamic geometry and effect time ownership",
+      "tasks": [
+        "R07.effects",
+        "R09.dynamic"
+      ],
+      "scenarios": [
+        "S04",
+        "S08"
+      ],
+      "evidence": "out/renderer-inventory/renderable-method-review.csv"
+    },
+    {
+      "id": "F07",
+      "name": "Muzzle flash, shells, transparent glass and additive effects",
+      "status": "partial-or-unverified",
+      "works": "Distinct candidate methods exported",
+      "original": "Original family callbacks",
+      "unknown": "Blend/depth/order and expiry parity",
+      "tasks": [
+        "R07.effects"
+      ],
+      "scenarios": [
+        "S04",
+        "S06"
+      ],
+      "evidence": "renderable-method-review.csv:sub_821897A8,sub_8218A658,sub_8217D6E0"
+    },
+    {
+      "id": "F08",
+      "name": "Sky, terrain decorations, wires, trees and grass",
+      "status": "partial-or-unverified",
+      "works": "Static and special-family paths identified",
+      "original": "Special renderable methods",
+      "unknown": "All environment and topology variants",
+      "tasks": [
+        "R07.environment"
+      ],
+      "scenarios": [
+        "S03",
+        "S06",
+        "S08"
+      ],
+      "evidence": "out/renderer-inventory/renderable-method-review.csv"
+    },
+    {
+      "id": "F09",
+      "name": "Destruction, debris, removal and respawn",
+      "status": "partial-or-unverified",
+      "works": "Membership/resource invalidation infrastructure",
+      "original": "Broken-object/piece callbacks and lifetime helpers",
+      "unknown": "Retained removal, address reuse and debris variants",
+      "tasks": [
+        "R07.environment",
+        "R09.resources"
+      ],
+      "scenarios": [
+        "S06",
+        "S07"
+      ],
+      "evidence": "renderable-method-review.csv:sub_8211FAA8,sub_82120168"
+    },
+    {
+      "id": "F10",
+      "name": "Shadows and caster/receiver passes",
+      "status": "partial-or-unverified",
+      "works": "Generic target/depth/material support exists",
+      "original": "No complete shadow consumer ownership demonstrated",
+      "unknown": "Actual technique/receiver/caster population still needs identification",
+      "tasks": [
+        "R07.shadows"
+      ],
+      "scenarios": [
+        "S03",
+        "S08"
+      ],
+      "evidence": "docs/renderer-remaining-work.md:R07; src/native_graphics/guest_shader_bridge.cpp"
+    },
+    {
+      "id": "F11",
+      "name": "Camera, projection, zoom and interpolation",
+      "status": "partial-or-unverified",
+      "works": "Published cameras and scoped interpolation",
+      "original": "821CDDF8 derivation and 821BE8D0 forward",
+      "unknown": "Other camera modes, multi-view and rounding parity",
+      "tasks": [
+        "R02.camera"
+      ],
+      "scenarios": [
+        "S03",
+        "S04",
+        "S09"
+      ],
+      "evidence": "out/renderer-inventory/small-retained-contracts.csv"
+    },
+    {
+      "id": "F12",
+      "name": "Single/multiple views, split-screen, free/motion cameras",
+      "status": "partial-or-unverified",
+      "works": "Outer-frame camera candidates mapped",
+      "original": "Eight indirect outer calls and bucket dispatch",
+      "unknown": "Supported mode population; split-screen not validated",
+      "tasks": [
+        "R01.callbacks",
+        "R01.modes",
+        "R05.pass"
+      ],
+      "scenarios": [
+        "S09"
+      ],
+      "evidence": "docs/renderer-completion-inventory.md:Concrete callback and forwarding boundaries"
+    },
+    {
+      "id": "F13",
+      "name": "Targets, viewport, scissor, clear, resolve and offscreen passes",
+      "status": "partial-or-unverified",
+      "works": "Native pass/target state exists",
+      "original": "Begin/end and compatibility CPU effects",
+      "unknown": "Nested/inherited state and recreation closure",
+      "tasks": [
+        "R05.pass"
+      ],
+      "scenarios": [
+        "S01",
+        "S02",
+        "S09",
+        "S10"
+      ],
+      "evidence": "out/renderer-inventory/pass-format-contracts.csv"
+    },
+    {
+      "id": "F14",
+      "name": "Post-processing, environment/fog, tone mapping and gamma",
+      "status": "partial-or-unverified",
+      "works": "Native effect and output infrastructure",
+      "original": "Guest-authored pass orchestration/constants",
+      "unknown": "Technique census and matched reference output",
+      "tasks": [
+        "R05.post"
+      ],
+      "scenarios": [
+        "S03",
+        "S08",
+        "S10"
+      ],
+      "evidence": "src/native_graphics/effect.cpp; docs/native-renderer-migration.md"
+    },
+    {
+      "id": "F15",
+      "name": "HUD, radar, crosshair, fonts and in-game overlays",
+      "status": "partial-or-unverified",
+      "works": "Native XUI/font/utility paths; prior city/HUD captures",
+      "original": "820D3FD0 and listener callbacks",
+      "unknown": "Full composition ownership and replay coverage",
+      "tasks": [
+        "R08.ui",
+        "R09.assets"
+      ],
+      "scenarios": [
+        "S03",
+        "S04",
+        "S05"
+      ],
+      "evidence": "src/native_graphics/xui_effect.cpp; font_effect.cpp; content-boundary-contracts.csv"
+    },
+    {
+      "id": "F16",
+      "name": "Title, menus, pause, mission results and SDK settings",
+      "status": "partial-or-unverified",
+      "works": "Native UI/backend paths",
+      "original": "Menu/UI production and listeners",
+      "unknown": "Every menu/results branch and scale/clip parity",
+      "tasks": [
+        "R08.ui"
+      ],
+      "scenarios": [
+        "S01",
+        "S05",
+        "S07",
+        "S10"
+      ],
+      "evidence": "docs/native-renderer-migration.md; README.md"
+    },
+    {
+      "id": "F17",
+      "name": "Loading, direct-scene output and concurrent loader",
+      "status": "partial-or-unverified",
+      "works": "Native direct-scene publication path documented",
+      "original": "Loader and end-frame CPU contracts",
+      "unknown": "Cold/warm/retry/exit and queue bounds",
+      "tasks": [
+        "R08.loading"
+      ],
+      "scenarios": [
+        "S02",
+        "S07"
+      ],
+      "evidence": "docs/native-backend-migration.md:Loading-transition classification and longer validation"
+    },
+    {
+      "id": "F18",
+      "name": "Movies, conversion, skipping and movie-to-menu transition",
+      "status": "partial-or-unverified",
+      "works": "Native movie effects and binding paths",
+      "original": "Decode/texture production originals",
+      "unknown": "SD/HD variants and plane lifetimes",
+      "tasks": [
+        "R08.movie"
+      ],
+      "scenarios": [
+        "S01",
+        "S11"
+      ],
+      "evidence": "src/native_graphics/movie_effect.cpp; native_movie_bindings.h"
+    },
+    {
+      "id": "F19",
+      "name": "Presentation, VSync/VRR, pacing and surface ring",
+      "status": "partial-or-unverified",
+      "works": "D3D12 host and ordered native presentation",
+      "original": "Finish callbacks and helper-dependent frame generation",
+      "unknown": "Independent unique-image cadence",
+      "tasks": [
+        "R08.present",
+        "R10.cadence"
+      ],
+      "scenarios": [
+        "S03",
+        "S10",
+        "S12"
+      ],
+      "evidence": "README.md; docs/native-backend-migration.md"
+    },
+    {
+      "id": "F20",
+      "name": "D3D12/D3D11 hardware and WARP/direct/recorded modes",
+      "status": "partial-or-unverified",
+      "works": "Backend implementations and scene tests exist",
+      "original": "Direct/compatibility branches remain",
+      "unknown": "Per-mode gameplay parity and support policy",
+      "tasks": [
+        "R01.modes",
+        "R09.compat",
+        "R10.performance"
+      ],
+      "scenarios": [
+        "S12"
+      ],
+      "evidence": "src/native_graphics/guest_shader_bridge.cpp:210"
+    },
+    {
+      "id": "F21",
+      "name": "Geometry workers, frame credits and submission budgets",
+      "status": "partial-or-unverified",
+      "works": "0/1/parallel workers and credits exposed",
+      "original": "Worker callbacks and synchronization tails",
+      "unknown": "Stress, cancellation and independent scheduling",
+      "tasks": [
+        "R09.sync",
+        "R10.performance"
+      ],
+      "scenarios": [
+        "S07",
+        "S12"
+      ],
+      "evidence": "src/native_graphics/guest_shader_bridge.cpp:216"
+    },
+    {
+      "id": "F22",
+      "name": "Render size, aspect, MSAA and sampler quality",
+      "status": "partial-or-unverified",
+      "works": "Native size/MSAA and sampler controls",
+      "original": "Authored canvas and some inherited state",
+      "unknown": "All accepted combinations and restart behavior",
+      "tasks": [
+        "R05.post",
+        "R08.ui",
+        "R10.performance"
+      ],
+      "scenarios": [
+        "S10",
+        "S12"
+      ],
+      "evidence": "src/native_graphics/guest_shader_bridge.cpp:157"
+    },
+    {
+      "id": "F23",
+      "name": "Texture, shader and declaration assets/contracts",
+      "status": "partial-or-unverified",
+      "works": "Native import/reflection and coverage tools",
+      "original": "Creation/import and setter callbacks",
+      "unknown": "Catalog completeness and unsupported states",
+      "tasks": [
+        "R09.assets",
+        "R09.resources"
+      ],
+      "scenarios": [
+        "S01",
+        "S08"
+      ],
+      "evidence": "docs/native-coverage.md"
+    },
+    {
+      "id": "F24",
+      "name": "Shader bindings/default streams and material state",
+      "status": "partial-or-unverified",
+      "works": "Retirement/default ordering fix built with regression",
+      "original": "Retirement allocator and CPU compatibility",
+      "unknown": "Payload aliasing and malformed stream parity",
+      "tasks": [
+        "R09.shader",
+        "R09.effects"
+      ],
+      "scenarios": [
+        "S03",
+        "S04",
+        "S13"
+      ],
+      "evidence": "src/native_graphics/native_shader_binding.h; tests/native_shader_binding_tests.cpp"
+    },
+    {
+      "id": "F25",
+      "name": "VB/IB/dynamic buffers, locks and physical aliases",
+      "status": "partial-or-unverified",
+      "works": "Versioned model buffers and guest write tracking",
+      "original": "Allocation/lock/unlock/free providers",
+      "unknown": "All dynamic writers and failure semantics",
+      "tasks": [
+        "R09.resources",
+        "R09.dynamic"
+      ],
+      "scenarios": [
+        "S04",
+        "S06",
+        "S13"
+      ],
+      "evidence": "src/native_graphics/native_model_buffers.h; docs/geometry-decoder-branch-status.md"
+    },
+    {
+      "id": "F26",
+      "name": "Retirement, allocator failure, destruction and reuse",
+      "status": "partial-or-unverified",
+      "works": "Native retained generations and retirement hooks",
+      "original": "82141440 and provider/queue callbacks",
+      "unknown": "Queue consumption and cross-thread/in-flight reuse",
+      "tasks": [
+        "R09.retirement"
+      ],
+      "scenarios": [
+        "S07",
+        "S13"
+      ],
+      "evidence": "out/renderer-inventory/retirement-owner-provenance.csv"
+    },
+    {
+      "id": "F27",
+      "name": "Worker signals, events, locks, vblank and profiling",
+      "status": "partial-or-unverified",
+      "works": "Native/extracted CPU routes",
+      "original": "Alternate callbacks and SDK imports",
+      "unknown": "Complete registration/monitor populations",
+      "tasks": [
+        "R09.sync"
+      ],
+      "scenarios": [
+        "S12",
+        "S13"
+      ],
+      "evidence": "out/renderer-inventory/retained-callback-review.csv"
+    },
+    {
+      "id": "F28",
+      "name": "Bridge-disabled, ownership fallback and audit modes",
+      "status": "partial-or-unverified",
+      "works": "Explicit route classifications exist",
+      "original": "Original fallback is intentional in some modes",
+      "unknown": "Supported-mode policy and no hidden reentry",
+      "tasks": [
+        "R09.compat"
+      ],
+      "scenarios": [
+        "S12",
+        "S13"
+      ],
+      "evidence": "out/renderer-inventory/native-dependency-classification.csv"
+    },
+    {
+      "id": "F29",
+      "name": "Resize, fullscreen, minimize/restore and shutdown",
+      "status": "partial-or-unverified",
+      "works": "Native host lifecycle implementation/tests exist",
+      "original": "Host integration outside graphics census",
+      "unknown": "Device-loss policy and completion on transitions",
+      "tasks": [
+        "R08.present"
+      ],
+      "scenarios": [
+        "S10",
+        "S13"
+      ],
+      "evidence": "src/native_graphics/native_backend_host.h; tests/native_host_lifetime_tests.cpp"
+    },
+    {
+      "id": "F30",
+      "name": "Independent frame scheduling and performance",
+      "status": "partial-or-unverified",
+      "works": "Pacing infrastructure; prior sampled gameplay",
+      "original": "Original content/frame helpers still required",
+      "unknown": "Sustained 120 unique frames with stable simulation",
+      "tasks": [
+        "R02.publication",
+        "R10.cadence",
+        "R10.performance"
+      ],
+      "scenarios": [
+        "S12"
+      ],
+      "evidence": "docs/native-scene-renderer-handoff.md"
+    },
+    {
+      "id": "F31",
+      "name": "Base/shared no-op and debug/test object families",
+      "status": "partial-or-unverified",
+      "works": "Shared method 8252B718 and test methods in census",
+      "original": "Alternate render paths not excluded",
+      "unknown": "Concrete dispatch and actual reachability",
+      "tasks": [
+        "R07.special"
+      ],
+      "scenarios": [
+        "S08",
+        "S09"
+      ],
+      "evidence": "out/renderer-inventory/renderable-method-review.csv"
+    },
+    {
+      "id": "F32",
+      "name": "All maps, weapons and runtime-only declaration combinations",
+      "status": "partial-or-unverified",
+      "works": "Mission 1 fixture; disc coverage tooling",
+      "original": "Unvisited render routes remain possible",
+      "unknown": "Full content corpus and newly discovered paths",
+      "tasks": [
+        "R09.assets",
+        "R10.trace",
+        "R10.scenarios"
+      ],
+      "scenarios": [
+        "S08"
+      ],
+      "evidence": "docs/native-coverage.md:100"
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "S01",
+      "name": "Cold startup, title, menu and story skip",
+      "completion_test": "Capture menu/movie route identities, UI text and final menu output",
+      "tasks": [
+        "R08.ui",
+        "R08.movie"
+      ],
+      "status": "partially-exercised",
+      "execution": {
+        "status": "partially-exercised",
+        "evidence": "out/renderer-coverage/runtime-results.json",
+        "observation": "Both cold launches reached Mission 1 through scripted title/menu confirmations; cumulative movie, XUI and font activity recorded. No complete menu/movie visual comparison."
+      }
+    },
+    {
+      "id": "S02",
+      "name": "Menu to Mission 1 loading",
+      "completion_test": "Observe direct-scene output, loading UI, progress and first gameplay frame",
+      "tasks": [
+        "R08.loading"
+      ],
+      "status": "partially-exercised",
+      "execution": {
+        "status": "partially-exercised",
+        "evidence": "out/renderer-coverage/runtime-results.json",
+        "observation": "Both runs crossed loading into Mission 1. Direct-scene eligibility and UI activity are observed; loading pixels/progress and publication success are not fully captured."
+      }
+    },
+    {
+      "id": "S03",
+      "name": "Stationary and moving city/player/NPC view",
+      "completion_test": "Capture before/after, camera/world change, static groups, model and HUD counters",
+      "tasks": [
+        "R03.selection",
+        "R06.families",
+        "R02.camera"
+      ],
+      "status": "partially-exercised",
+      "execution": {
+        "status": "partially-exercised",
+        "evidence": "out/renderer-coverage/probe.output.2400.bmp; probe.output.2700.bmp; probe.output.3000.bmp; gameplay.bmp",
+        "observation": "City, player, soldiers, civilians, large UFO, environment, HUD and changing views observed. Movement and aim delivered; cutscene-to-gameplay overlaps movement start, so exact player displacement is not isolated."
+      }
+    },
+    {
+      "id": "S04",
+      "name": "Aim, fire, change weapon, zoom and effect expiry",
+      "completion_test": "Verify ammo/projectile/effect changes, transparent order and camera motion",
+      "tasks": [
+        "R07.effects",
+        "R06.pose"
+      ],
+      "status": "partially-exercised",
+      "execution": {
+        "status": "partially-exercised",
+        "evidence": "out/renderer-coverage/probe.output.2700.bmp; probe.output.3300.bmp; runtime-results.json",
+        "observation": "AF14 120/120 changes to Stingray M1; smoke and RELOAD appear during RT255+0x0200 probe. Weapon/fire/reload path reached. Projectile identity, effect-family coverage, zoom and reference parity are unverified."
+      }
+    },
+    {
+      "id": "S05",
+      "name": "Pause and resume",
+      "completion_test": "Capture pause composition, frozen simulation and resumed gameplay",
+      "tasks": [
+        "R08.ui",
+        "R02.publication"
+      ],
+      "status": "partially-exercised",
+      "execution": {
+        "status": "partially-exercised",
+        "evidence": "out/renderer-coverage/pause.bmp; probe.output.4500.bmp",
+        "observation": "Host capture shows Pause with Return to Game/Retry/Quit/Game Settings. Later scene capture shows gameplay without pause. Simulation freeze and complete-frame reference parity not measured."
+      }
+    },
+    {
+      "id": "S06",
+      "name": "Destroy objects, approach/cull/LOD, remove and reinsert",
+      "completion_test": "Verify topology/visibility/lifecycle transitions with route identities",
+      "tasks": [
+        "R03.mutation",
+        "R07.environment"
+      ],
+      "status": "not-exercised",
+      "execution": {
+        "status": "not-exercised",
+        "evidence": "R03.mutation; R07.environment",
+        "observation": "No controlled destruction/removal/LOD proof."
+      }
+    },
+    {
+      "id": "S07",
+      "name": "Retry, exit, reload and switch mission; results",
+      "completion_test": "Track generation drain, resource reuse, queue peak and loading output",
+      "tasks": [
+        "R08.loading",
+        "R09.retirement"
+      ],
+      "status": "not-exercised",
+      "execution": {
+        "status": "not-exercised",
+        "evidence": "R08.loading; R09.retirement",
+        "observation": "Retry/quit controls visible but not selected. No reload/retry/results acceptance."
+      }
+    },
+    {
+      "id": "S08",
+      "name": "Mission/content census: environments, enemy types, vehicles and weapon families",
+      "completion_test": "Choose missions from asset/script evidence; exercise every family, record untouched families",
+      "tasks": [
+        "R06.families",
+        "R07.effects",
+        "R09.assets"
+      ],
+      "status": "not-exercised",
+      "execution": {
+        "status": "not-exercised",
+        "evidence": "R06.families; R07.effects; R09.assets",
+        "observation": "Only Mission 1 observed; complete enemy/vehicle/weapon/map corpus remains open."
+      }
+    },
+    {
+      "id": "S09",
+      "name": "Multiple views and player/free/motion cameras",
+      "completion_test": "First establish supported activation, then inspect view isolation and pass order",
+      "tasks": [
+        "R01.modes",
+        "R05.pass"
+      ],
+      "status": "not-exercised",
+      "execution": {
+        "status": "not-exercised",
+        "evidence": "R01.modes; R05.pass",
+        "observation": "No multi-view/free-camera activation; intro camera observed incidentally."
+      }
+    },
+    {
+      "id": "S10",
+      "name": "720p/1080p, aspect, resize, fullscreen and minimize/restore",
+      "completion_test": "Inspect canvas/clip, targets, surface ring and recreation",
+      "tasks": [
+        "R08.present",
+        "R08.ui",
+        "R05.post"
+      ],
+      "status": "not-exercised",
+      "execution": {
+        "status": "not-exercised",
+        "evidence": "R08.present; R08.ui",
+        "observation": "Runs use 1280x720; no resize/fullscreen/aspect matrix."
+      }
+    },
+    {
+      "id": "S11",
+      "name": "SD/HD movie playback, skip and end",
+      "completion_test": "Inspect plane conversion and movie-to-menu resource transition",
+      "tasks": [
+        "R08.movie"
+      ],
+      "status": "not-exercised",
+      "execution": {
+        "status": "not-exercised",
+        "evidence": "R08.movie",
+        "observation": "Movie counter activity during startup is insufficient for SD/HD playback acceptance."
+      }
+    },
+    {
+      "id": "S12",
+      "name": "Backend/worker/MSAA/credit/VSync/cadence matrix",
+      "completion_test": "Pairwise supported settings; matched output and non-audit timing",
+      "tasks": [
+        "R10.performance",
+        "R09.compat"
+      ],
+      "status": "not-exercised",
+      "execution": {
+        "status": "not-exercised",
+        "evidence": "R10.performance",
+        "observation": "D3D12 with diagnostics and a 120 cap only; not a backend comparison or non-audit cadence test."
+      }
+    },
+    {
+      "id": "S13",
+      "name": "Resource/CPU contract failure, reuse and shutdown fixtures",
+      "completion_test": "Differential alias/queue/failure cases and in-flight GPU completion",
+      "tasks": [
+        "R09.shader",
+        "R09.resources",
+        "R09.sync"
+      ],
+      "status": "partially-exercised",
+      "execution": {
+        "status": "partially-exercised",
+        "evidence": "out/renderer-coverage/targeted-tests.json",
+        "observation": "Existing shader-binding and frame-dispatch unit executables pass. Resource failure/reuse/device loss and graceful shutdown matrix remains open."
+      }
+    }
+  ],
+  "sources": [
+    {
+      "path": "out/renderer-inventory/complete-function-inventory.csv",
+      "sha256": "c632051cb041823f66d51032ba5f6a51e6bf7f795dba57482f841652e41bd9b2",
+      "rows": 9216
+    },
+    {
+      "path": "out/renderer-inventory/native-boundary-routes.csv",
+      "sha256": "a932800cf9561b42b95f99d267316cc7d89d3b3d05f45bf64ac2d7705b343ceb",
+      "rows": 237
+    },
+    {
+      "path": "out/renderer-inventory/retained-call-effect-reviews.csv",
+      "sha256": "b81a85beb3f5c62038951231f7cb1a8d84af58f8dd7a8183854c6bd64810f1a4",
+      "rows": 186
+    },
+    {
+      "path": "out/renderer-inventory/macro-original-dependencies.csv",
+      "sha256": "c3835cab3627a1fc7a59656121f0934771c25cf63e44e0dc7207fa52ba20eacb",
+      "rows": 87
+    },
+    {
+      "path": "out/renderer-inventory/native-original-references.csv",
+      "sha256": "d8d5ff78750f8cab740ab21ae7d454ce019f685990721da1ae0f07711a8f8098",
+      "rows": 1
+    },
+    {
+      "path": "out/renderer-inventory/native-reentry-sites.csv",
+      "sha256": "5c35c5b0a963c1bb9b4e66d3c6261a36959f7233afafe1a50b04a7d9ff7980e8",
+      "rows": 251
+    },
+    {
+      "path": "out/renderer-inventory/indirect-site-ledger.csv",
+      "sha256": "4319100de9f5be919edffa26369ceadc9af4d8a85aaed89563d80bc5beb521fb",
+      "rows": 3332
+    },
+    {
+      "path": "out/renderer-inventory/renderable-method-review.csv",
+      "sha256": "d9bbb33b96538105f570705db05f0ba7b119127d34f6bf62ee64f35942b72ba4",
+      "rows": 47
+    },
+    {
+      "path": "out/renderer-inventory/renderable-content-routes.csv",
+      "sha256": "b29065617a8583c78207b1dce3d5176c7ea54a67ba38090f29e0f5c18c6a82db",
+      "rows": 47
+    },
+    {
+      "path": "out/renderer-inventory/retained-adapter-terminal-edges.csv",
+      "sha256": "8e1db6cc380745c6ee1f77d8c9c357621626f6a4155723f6fa182e2205e778f5",
+      "rows": 75
+    },
+    {
+      "path": "out/renderer-inventory/retained-callback-review.csv",
+      "sha256": "ba54929a1e61f3523691a4d2f9a082089a313889f576dc133defdc5699253689",
+      "rows": 4
+    },
+    {
+      "path": "out/renderer-inventory/core-callback-candidates.csv",
+      "sha256": "71af8d95f014bb2877baeb6dbcd2c6b1a444c72e3a6faa494971187370fe9dbc",
+      "rows": 28
+    },
+    {
+      "path": "out/renderer-inventory/state-write-ledger.csv",
+      "sha256": "17d0e7e490d3f1cd9ae4c397d27fede0bbc4c806d155561db2bef398b470b88a",
+      "rows": 87579
+    },
+    {
+      "path": "out/renderer-inventory/adapter-nonscalar-operations.csv",
+      "sha256": "035f2c63765917872617649c97f7e4fc2daae3814f07e2041e7c2d9876228110",
+      "rows": 24
+    },
+    {
+      "path": "out/renderer-inventory/ghidra-unresolved-direct-targets.csv",
+      "sha256": "d779f6aea3613fdd33a8b7ce311f57141510d1c13e4a1f80f1744358accd7e1b",
+      "rows": 5689
+    },
+    {
+      "path": "out/renderer-inventory/decompiler-quality.csv",
+      "sha256": "8bf14c90d6eec4618ebf06cd7c3265d7a2a4f9c6c0767f0dd67d2b233758bc0e",
+      "rows": 732
+    },
+    {
+      "path": "out/renderer-inventory/content-boundary-contracts.csv",
+      "sha256": "e5cdcb14a5e6c96770f4615db5665bd4e2fd12f9cee30d46cd0266556c0f4da2",
+      "rows": 6
+    },
+    {
+      "path": "out/renderer-inventory/device-state-getters.csv",
+      "sha256": "4a72ad4a832d61d095fcdf93377e135e512222e9b0c03dadc539b6cfed90240a",
+      "rows": 12
+    },
+    {
+      "path": "out/renderer-inventory/helper-callback-review.csv",
+      "sha256": "b7c78f0153a843a93c2eff69251cd17843c080ab45f7abe5c4867ae41d14c9da",
+      "rows": 8
+    },
+    {
+      "path": "out/renderer-inventory/pass-format-contracts.csv",
+      "sha256": "cee328723a1ddf23c811c0dd538c9a003031ac125e359d9ed32ae335415c938a",
+      "rows": 4
+    },
+    {
+      "path": "out/renderer-inventory/sampler-contracts.csv",
+      "sha256": "ad26a0b37422ec5ccf06bc0779e53bf002177678fc14c9733bdfe3e1b6637e94",
+      "rows": 40
+    },
+    {
+      "path": "out/renderer-inventory/scalar-store-function-summary.csv",
+      "sha256": "ffbb8c3a4381152e2cad0c249008295b370862094e1869722819f6a326dfa189",
+      "rows": 170
+    },
+    {
+      "path": "out/renderer-inventory/small-retained-contracts.csv",
+      "sha256": "ad3e6ecdb762e03722d01b17a462f4cbff97d23a756a48ab9520421b82a27953",
+      "rows": 247
+    },
+    {
+      "path": "out/renderer-inventory/state-save-offsets.csv",
+      "sha256": "63c4d0e71ab759938887ec21726e40cea94b8d334040419353ee9c9d5a61d311",
+      "rows": 12
+    },
+    {
+      "path": "out/renderer-inventory/static-pass-contracts.csv",
+      "sha256": "597f5d1efcfec946c4af92d2033625ebcc627133ed3cdd424ceb099263cc6d0d",
+      "rows": 12
+    },
+    {
+      "path": "out/renderer-inventory/untiled-boundary-contracts.csv",
+      "sha256": "f37b3f2e05f1e9ace735f744e9625da616c55ae2d30a809c0b449f58e97da64b",
+      "rows": 2
+    }
+  ],
+  "configuration_modes": [
+    {
+      "name": "edf_fps_cap",
+      "default": "0",
+      "source": "src/launcher_cvars.cpp:8",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_shader_bridge",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:108",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_render_state_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:110",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_material_sampler_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:112",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_material_state_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:114",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_material_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:116",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_material_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:118",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_activation_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:120",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_geometry_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:122",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_instance_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:124",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_pass_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:126",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_geometry_deferred",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:128",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_material_deferred",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:130",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_view_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:132",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_camera_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:134",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_sources_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:136",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_selection_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:138",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_membership_owned",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:140",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_worker_callback_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:142",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_retirement_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:144",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_geometry_verify_interval",
+      "default": "256",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:146",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_geometry_verify_initial",
+      "default": "8",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:148",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_wait_stall_ms",
+      "default": "5000",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:150",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_owned_render_state",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:152",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_anisotropic_filtering",
+      "default": "-1",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:154",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_render_width",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:156",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_msaa",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:158",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_render_height",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:160",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_capture",
+      "default": "\"\"",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:162",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_output_capture_interval",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:164",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_output_capture_limit",
+      "default": "32",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:166",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_output_capture_start_frame",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:168",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_output_capture_scene_color",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:170",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_pixel_centers",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:172",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_loop_trace",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:174",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_motion_trace",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:176",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_instance_motion_trace",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:178",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_adapter_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:180",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_queued",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:182",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_preload",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:184",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_transform_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:186",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_visibility",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:188",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_visibility_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:190",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_unlock_framerate",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:192",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_camera_interpolation",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:194",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_model_interpolation",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:196",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_capture_indexed_state",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:198",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_probe_x",
+      "default": "-1",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:200",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_probe_y",
+      "default": "-1",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:201",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_probe_frame",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:202",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_probe_width",
+      "default": "1",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:204",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_probe_height",
+      "default": "1",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:205",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_probe_draw_limit",
+      "default": "4096",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:206",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_probe_negative",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:207",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_backend",
+      "default": "\"d3d12\"",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:209",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_backend",
+      "default": "\"d3d12\"",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:211",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_upload_megabytes",
+      "default": "256",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:213",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_geometry_workers",
+      "default": "4",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:215",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_frame_operations",
+      "default": "8192",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:217",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_d3d12_debug_layer",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:219",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_seam_draws",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:221",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_backend_present",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:223",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_reuse_material",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:225",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_shader_workers",
+      "default": "-1",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:227",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_backend_preview",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:229",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_batch_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:231",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_contract_limit",
+      "default": "4096",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:233",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_contract_export",
+      "default": "\"\"",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:235",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_contract_coverage",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:237",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_shared_constant_audit",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:239",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_frame_latency",
+      "default": "2",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:241",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_frame_trace",
+      "default": "\"\"",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:243",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_owned_mesh_hit",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:245",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_world_instancing",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:247",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_world_constant_reuse",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:249",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_prepared_geometry",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:251",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_hook_sample_period",
+      "default": "0",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:253",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_hook_timings",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:255",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_loading_trace",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:257",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_load_timings",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:259",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_mesh_watch_audit",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:261",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_untiled_scene",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:263",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_guest_heap_reads",
+      "default": "true",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:265",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_fence_probe",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:267",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_validate_wait",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:269",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_publish_frames",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:271",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_preview_window",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:273",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_tree",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:3127",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_scene_tree_published",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:3129",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_frame_dispatch",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:4167",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_material_activation",
+      "default": "false",
+      "source": "src/native_graphics/guest_shader_bridge.cpp:4617",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_display_trace",
+      "default": "\"\"",
+      "source": "src/native_graphics/native_backend_host.cpp:14",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_host",
+      "default": "true",
+      "source": "src/native_graphics/native_host_surface.cpp:10",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_vsync",
+      "default": "true",
+      "source": "src/native_graphics/native_host_surface.cpp:12",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_host_timings",
+      "default": "false",
+      "source": "src/native_graphics/native_host_surface.cpp:14",
+      "task": "R01.modes",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_host_capture",
+      "default": "\"\"",
+      "source": "src/native_graphics/native_host_surface.cpp:16",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_host_capture_after_ms",
+      "default": "0",
+      "source": "src/native_graphics/native_host_surface.cpp:18",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    },
+    {
+      "name": "edf_native_host_capture_require_image",
+      "default": "false",
+      "source": "src/native_graphics/native_host_surface.cpp:20",
+      "task": "R09.compat",
+      "status": "open",
+      "completion_test": "Enumerate accepted values and guards from this definition and consumers; assign support policy and scenario/fixture for each branch. Default alone is not coverage."
+    }
+  ],
+  "configuration_sources": [
+    {
+      "path": "src/launcher_cvars.cpp",
+      "sha256": "e261dff10bd9962bd897d00f11247c8476005d93697e1cf362c1f904c7dcc8f3"
+    },
+    {
+      "path": "src/native_graphics/guest_shader_bridge.cpp",
+      "sha256": "655aeeeae801bfdcc9a1b0ef00a0c074448c87e5428d056961a63c86e8efeafd"
+    },
+    {
+      "path": "src/native_graphics/native_backend_host.cpp",
+      "sha256": "860cd8c37bd3418dfc8805b29618c35ba44fd0453b40c6f0ea25257ad7e7e3e2"
+    },
+    {
+      "path": "src/native_graphics/native_host_surface.cpp",
+      "sha256": "5b31b1577af4368db3bf56419efa2a1e598d2157f948c1eb11b950d72da37246"
+    }
+  ],
+  "limitation": "Planning assignments cover the declared exported census, not all possible runtime paths. All generated boundary dispositions remain open; no implementation percentage is inferred."
+}

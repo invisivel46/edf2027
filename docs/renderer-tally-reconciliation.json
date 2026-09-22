@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "deferred_sources": [
+    {
+      "path": "out/renderer-inventory/macro-call-effect-reviews.csv",
+      "task": "R09.effects",
+      "reason": "Outside coverage catalog; lacks reviewed source hashes. Reviewer found 38 reviewed hooks, 36 net-new candidates, plus 49 pending hooks. No function credit imported.",
+      "action": "Recheck the 38 reviewed hook bodies against generated/native sources, pin supporting hashes, add the table to coverage generation and join only reviewed hooks.",
+      "completion_test": "Coverage audit includes the table; all credited hooks have explicit evidence freshness and exact source locators; pending callees receive no implied completion."
+    }
+  ],
+  "partial_sources": [
+    "retained-call-effect-reviews.csv",
+    "renderable-content-routes.csv",
+    "content-boundary-contracts.csv",
+    "device-state-getters.csv",
+    "helper-callback-review.csv",
+    "pass-format-contracts.csv",
+    "sampler-contracts.csv",
+    "small-retained-contracts.csv",
+    "static-pass-contracts.csv",
+    "untiled-boundary-contracts.csv"
+  ],
+  "accepted_slices": [
+    {
+      "ledger": "out/renderer-dispatch/ledger.json",
+      "slice": "R01.scope.frame-to-bucket-v1",
+      "partial_functions": [
+        "sub_821A5080",
+        "sub_821A3BA0"
+      ],
+      "scope": "Reviewed two-function local dispatch contract: six direct edges, nine indirect sites, guards, local effects and native boundaries.",
+      "remaining": "All nine receiver populations; transitive contracts; mode and runtime coverage. Caller and utility witnesses do not count as classified functions."
+    },
+    {
+      "ledger": "out/renderer-dispatch/sol-pilot/ledger.json",
+      "slice": "R01.callbacks.scene-begin-owner-v1",
+      "partial_functions": [
+        "sub_821A5080",
+        "sub_821A4980",
+        "sub_820B1F60",
+        "sub_820B1028",
+        "sub_820B1C08",
+        "sub_821A6D28"
+      ],
+      "scope": "Reviewed scene-begin callsite, concrete startup receiver assignment and bounded pair replacement/teardown path.",
+      "remaining": "Alternate raw/alias/indirect writers, receiver population, modes and synchronization; candidate tables do not prove membership."
+    }
+  ],
+  "accepted_getter_sets": [
+    "docs/renderer-getter-acceptance.json"
+  ],
+  "accepted_setter_sets": [
+    "docs/renderer-setter-acceptance.json"
+  ],
+  "accepted_scalar_pipeline": [
+    "out/renderer-scalar-pipeline/bundles/64d99e00f00a3c8d531952cc8c42e5f04f3ae17bc37b9184dcf688d74edab0a5/acceptance.json"
+  ]
+}

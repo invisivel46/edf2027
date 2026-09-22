@@ -2,10 +2,15 @@
 #include "native_graphics/native_scene_bindings.h"
 #include "native_graphics/native_scene_sources.h"
 #include "native_graphics/native_scene_adapter.h"
+#include "native_graphics/native_scene_pass_inputs.h"
 #include "native_graphics/native_queued_scene.h"
 #include "native_graphics/native_scene_cpu_window.h"
 #include "native_graphics/native_scene_membership.h"
 #include "native_graphics/native_scene_geometry.h"
+#include "native_graphics/native_scene_handoff.h"
+#include "native_graphics/native_scene_execution.h"
+#include "native_graphics/native_scene_geometry_install.h"
+#include "native_graphics/native_static_group_eligibility.h"
 #include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d12_backend.h"
 #include <bit>
@@ -19,6 +24,283 @@ template<class F> void Reject(F f) { bool rejected=false; try { f(); } catch(con
 void Word(std::vector<uint8_t>& bytes,size_t offset,uint32_t word) {
   for(size_t i=0;i<4;++i) bytes[offset+i]=uint8_t(word>>(24-i*8));
 }
+struct GeometryRetryReader {
+  std::vector<uint8_t>& bytes;
+  uint32_t Add(uint32_t address,uint32_t offset) const { return address+offset; }
+  uint32_t Word(uint32_t at) const {
+    uint32_t value=0; for(unsigned i=0;i<4;++i) value=(value<<8)|bytes.at(at+i); return value;
+  }
+  uint64_t DoubleWord(uint32_t at) const { return (uint64_t(Word(at))<<32)|Word(at+4); }
+  const uint8_t* Bytes(uint32_t at,size_t size) const {
+    if(at>bytes.size() || size>bytes.size()-at) throw std::runtime_error("geometry test range");
+    return bytes.data()+at;
+  }
+  void StoreWord(uint32_t at,uint32_t value) const {
+    for(unsigned i=0;i<4;++i) bytes.at(at+i)=uint8_t(value>>(24-i*8));
+  }
+  void StoreDoubleWord(uint32_t at,uint64_t value) const { StoreWord(at,uint32_t(value>>32)); StoreWord(at+4,uint32_t(value)); }
+  void StoreByte(uint32_t at,uint8_t value) const { bytes.at(at)=value; }
+};
+void GeometryPublicationRetry() {
+  constexpr uint32_t device=0x1000,old_vertex=0x10000,old_index=0x10100,queue=0x18000;
+  const NativeSceneGeometrySource input{0x11000,0x11100,0x12000,28,6,0x13000,0x14000};
+  for(bool fence:{false,true}) for(unsigned failed=0;failed<3;++failed) {
+    std::vector<uint8_t> memory(0x20000);
+    const GeometryRetryReader reader{memory};
+    reader.StoreWord(device+12188,old_vertex); reader.StoreWord(device+12164,old_index);
+    reader.StoreWord(device+10780,fence?200:0); reader.StoreWord(device+10784,1);
+    for(auto resource:{old_vertex,old_index,input.vertex,input.index}) reader.StoreWord(resource,1);
+    reader.StoreWord(input.vertex+24,0x15000); reader.StoreWord(input.vertex+28,4096);
+    reader.StoreWord(device+13148,queue); reader.StoreWord(device+13152,queue+64);
+    NativeSceneGeometryInstallState progress;
+    std::array<unsigned,3> publications{};
+    unsigned retirements=0;
+    bool fail=true;
+    const auto install=[&](const NativeSceneGeometrySource& source) {
+      InstallNativeSceneGeometry(reader,device,source,
+        [](bool)->uint32_t { throw std::runtime_error("unexpected retry allocation"); },
+        [](bool) { return 0u; },
+        [&](bool,auto,auto,auto,auto) { ++retirements; },
+        [&](NativeGeometryBinding binding) {
+          const auto index=unsigned(binding); ++publications[index];
+          if(index==failed && fail) { fail=false; throw std::runtime_error("publication failed"); }
+        },&progress);
+    };
+    Reject([&] { install(input); });
+    Require(progress.step==failed*2+1,"geometry retry lost completed CPU stage");
+    auto changed=input; ++changed.vertex;
+    Reject([&] { install(changed); });
+    install(input); install(input);
+    Require(progress.step==6 && retirements==2,"geometry retry repeated a resource retirement");
+    for(unsigned i=0;i<3;++i)
+      Require(publications[i]==(i==failed?2u:1u),"geometry retry skipped or repeated a completed publication");
+    Require(reader.Word(device+12188)==input.vertex && reader.Word(device+12164)==input.index &&
+      reader.Word(device+11536)==input.declaration,"geometry retry changed final bindings");
+    Require(reader.Word(input.vertex+8)==0 && reader.Word(input.index+8)==0,
+      "geometry retry retired the newly installed resource");
+    if(fence) Require(reader.Word(old_vertex+8)==200 && reader.Word(old_index+8)==200 &&
+      reader.Word(device+13148)==queue,"geometry retry changed fence retirement");
+    else Require(reader.Word(device+13148)==queue+16 && reader.Word(queue)==(old_vertex>>2) &&
+      reader.Word(queue+8)==(old_index>>2),"geometry retry duplicated or changed deferred retirement records");
+  }
+}
+void StaticGroupEligibility() {
+  using Result=NativeStaticGroupEligibility;
+  constexpr uint32_t device=0x1000,stack=0x38000,material=0x24000,pass=0x25000,record=0x26000,payload=0x27000;
+  const NativeSceneGeometrySource input{0x10000,0x10100,0x12000,28,6,material,0x20000};
+  std::vector<uint8_t> memory(0x40000);
+  const GeometryRetryReader reader{memory};
+  reader.StoreWord(device+10424,0x10001);
+  reader.StoreWord(material+108,pass);
+  reader.StoreWord(pass,pass+32); reader.StoreWord(pass+4,pass+64);
+  reader.StoreWord(pass+32,input.shader); reader.StoreWord(pass+68,0x21000);
+  reader.StoreWord(material,record); reader.StoreWord(material+8,1);
+  reader.StoreWord(record,0); reader.StoreWord(record+4,payload); reader.StoreWord(record+12,1);
+  const auto seed=memory;
+  const auto check=[&](Result expected) {
+    const auto before=memory;
+    Require(AssessNativeStaticGroup(reader,device,stack,input)==expected,"static eligibility misclassified input");
+    Require(memory==before,"eligibility preflight mutated guest memory");
+  };
+  check(Result::Supported);
+  reader.StoreWord(device+10424,0); check(Result::PassState); memory=seed;
+  reader.StoreWord(device+12188,0x30000);
+  check(Result::RetirementMode);
+  reader.StoreWord(device+10780,200); check(Result::Supported);
+  memory=seed; reader.StoreWord(record+4,device+1792); check(Result::AliasedInput);
+  memory=seed; reader.StoreWord(record+4,stack-16); check(Result::AliasedInput);
+  memory=seed;
+  reader.StoreWord(material,device+1792);
+  reader.StoreWord(device+1792+4,payload); reader.StoreWord(device+1792+12,1);
+  check(Result::AliasedInput);
+  memory=seed; reader.StoreWord(device+10780,200); reader.StoreWord(device+12164,record-8);
+  check(Result::AliasedInput); // Old resource fence would overwrite a captured operation.
+  for(uint32_t count:{80u,92u,104u}) {
+    memory=seed; reader.StoreWord(material+count,1); check(Result::TextureOrState);
+  }
+  memory=seed;
+  constexpr uint32_t defaults=0x28000,header=0x20000+872;
+  reader.StoreWord(header+20,defaults-header);
+  reader.StoreWord(defaults+24,20);
+  reader.StoreWord(defaults+36,0xfc000001); reader.StoreWord(defaults+40,0xdeadbeef);
+  reader.StoreWord(record+4,0x11000); // Default destination extends beyond the normal device mirror.
+  check(Result::AliasedInput);
+  memory=seed;
+  auto invalid=input; invalid.count=0;
+  Require(AssessNativeStaticGroup(reader,device,stack,invalid)==Result::Geometry,"zero geometry count admitted");
+  Require(AssessNativeStaticGroup(reader,device+1,stack,input)==Result::Alignment,"unaligned device admitted");
+}
+void PassCamera() {
+  GeometryPublicationRetry();
+  StaticGroupEligibility();
+  {
+    NativeSceneExecution run;
+    Require(!run.complete() && !run.Total() && !run.recordings(),"new group inherited execution evidence");
+    for(uint32_t bit=0;bit<uint32_t(NativeSceneBoundary::Count);++bit) {
+      const auto boundary=static_cast<NativeSceneBoundary>(bit);
+      bool entered=false;
+      Reject([&] { run.Enter(boundary,true); entered=true; });
+      Require(!entered && run.Calls(boundary)==1 && (run.mask()&(1u<<bit)),
+        "strict execution failed to count and reject a boundary before its call");
+      run.Enter(boundary);
+      Require(run.Calls(boundary)==2,"compatible execution lost repeated boundary calls");
+    }
+    run.Recorded(); run.Complete();
+    Require(run.complete() && run.recordings()==1 && run.Total()==2*uint32_t(NativeSceneBoundary::Count),
+      "group completion hid compatibility work");
+    NativeSceneExecution next;
+    Require(!next.complete() && !next.Total() && !next.mask(),"execution evidence leaked between groups");
+    unsigned attempts=0;
+    const auto recorded=next.RecordBatch([&] { ++attempts; return 7; });
+    Require(recorded==7 && next.recordings()==1,"completed recording was not counted");
+    Reject([&] { next.RecordBatch([&]()->int { ++attempts; throw std::runtime_error("partial GPU recording"); }); });
+    Reject([&] { next.RecordBatch([&] { ++attempts; return 8; }); });
+    Require(next.recording_failed() && attempts==2 && next.recordings()==1,
+      "failed GPU recording was counted or retried");
+    Reject([&] { next.Complete(); });
+    Require(!next.complete(),"failed GPU group was marked complete");
+  }
+  {
+    NativeSceneGeometryHandoff handoff;
+    NativeSceneGeometrySource setup{10,20,30,12,6,40,50};
+    std::vector<int> events;
+    const auto install=[&](const auto& value) { Require(value==setup,"handoff lost owned geometry inputs"); events.push_back(1); };
+    const auto consume=[&] { events.push_back(2); };
+    handoff.Defer(setup);
+    Require(events.empty() && handoff.pending()==setup,"deferred geometry installed before native submission");
+    handoff.Finish(install,consume);
+    Require(events==std::vector<int>{1},"fallback before a native draw consumed dirty draw state");
+    events.clear(); handoff.Defer(setup); handoff.DrawAccepted(); handoff.DrawAccepted();
+    handoff.Finish(install,consume); handoff.Finish(install,consume);
+    Require(events==std::vector<int>({1,2}) && !handoff.pending(),"group handoff reordered or repeated compatibility work");
+    events.clear(); handoff.Defer(setup); handoff.DrawAccepted();
+    Reject([&] { handoff.Defer(setup); });
+    Reject([&] { handoff.Finish(install,[] { throw std::runtime_error("tail failed"); }); });
+    handoff.Finish(install,consume);
+    Require(events==std::vector<int>({1,2}),"retry repeated resource binding installation");
+    NativeSceneMaterialHandoff material_handoff;
+    int world=42,activations=0,synchronizations=0;
+    material_handoff.Defer();
+    const auto activate=[&] {
+      Require(material_handoff.activation_pending(),"compatibility activation lost its replay guard");
+      ++activations; world=0;
+    };
+    const auto synchronize=[&] {
+      Require(!material_handoff.activation_pending(),"world restored before material activation completed");
+      ++synchronizations; world=42;
+    };
+    material_handoff.Finish(activate,synchronize); material_handoff.Finish(activate,synchronize);
+    Require(world==42 && activations==1 && synchronizations==1,
+      "material handoff overwrote the final world or repeated side effects");
+    material_handoff.Defer();
+    Reject([&] { material_handoff.Finish(activate,[] { throw std::runtime_error("world copy failed"); }); });
+    material_handoff.Finish(activate,synchronize);
+    Require(world==42 && activations==2 && synchronizations==2,"world retry repeated material activation");
+    // Exercise the combined production boundary, not just each obligation in
+    // isolation: a no-draw group must survive a failed material/world restore.
+    for(bool drawn:{false,true}) for(bool fail_activation:{false,true}) {
+      NativeSceneGeometryHandoff geometry;
+      NativeSceneMaterialHandoff material;
+      geometry.Defer(setup); material.Defer();
+      if(drawn) geometry.DrawAccepted();
+      int installs=0,activation_attempts=0,world_attempts=0,tails=0,invalidations=0;
+      bool fail=true;
+      const auto finish=[&] {
+        FinishNativeSceneGroupHandoff(geometry,[] {},[] {},
+          [&](const auto&) { ++installs; },
+          [&] { material.Finish([&] {
+            ++activation_attempts;
+            if(fail && fail_activation) { fail=false; throw std::runtime_error("activation failed"); }
+          },[&] {
+            ++world_attempts;
+            if(fail && !fail_activation) { fail=false; throw std::runtime_error("world failed"); }
+          }); },[&] { ++tails; },[&] { ++invalidations; });
+      };
+      Reject(finish);
+      Require(geometry.pending() && material.pending() && installs==1 && tails==0 && invalidations==0,
+        "failed restoration lost the group obligation or consumed dirty state");
+      finish(); finish();
+      Require(!geometry.pending() && !material.pending() && installs==1 &&
+        activation_attempts==(fail_activation?2:1) && world_attempts==(fail_activation?1:2) &&
+        tails==int(drawn) && invalidations==1,
+        "group restoration retry skipped or repeated completed work");
+    }
+  }
+  NativeScenePassCamera camera;
+  for(uint32_t i=0;i<16;++i) {
+    camera.view[i]=0x3f800000+i; camera.projection[i]=0x40000000+i;
+    camera.view_projection[i]=0x40800000+i;
+  }
+  const auto retained=camera;
+  {
+    NativeSceneAdapter producer;
+    producer.PublishCameras({{100,camera},{200,camera}});
+    const auto acquired=producer.AcquireCameras();
+    const auto scene=producer.Publish(1);
+    producer.PublishCameras({{100,camera},{200,camera}});
+    Require(producer.AcquireCameras()==acquired,"unchanged cameras replaced their generation");
+    auto changed=camera;
+    changed.view[12]^=1;
+    producer.PublishCameras({{100,changed}});
+    Require(acquired->at(100)==camera && acquired->contains(200) && scene->cameras==acquired,
+      "camera update or view removal mutated an acquired scene");
+    Require(producer.AcquireCameras()->at(100)==changed && !producer.AcquireCameras()->contains(200),
+      "producer camera update retained a removed view");
+    producer.PublishCameras({});
+    Require(producer.AcquireCameras()->empty() && acquired->size()==2,
+      "empty active-view set failed to retire cameras");
+  }
+  for(const auto* name:{"g_mView","g_mViewTranspose","g_mProjection","g_mViewProjection"}) {
+    NativeSceneMaterialInputs::Constant input{false,name,std::vector<uint8_t>(64),true};
+    Require(camera.Apply(input),"native pass camera did not supply named matrix");
+    const auto& expected=input.name=="g_mProjection"?camera.projection:
+      input.name=="g_mViewProjection"?camera.view_projection:camera.view;
+    for(size_t row=0;row<4;++row) for(size_t col=0;col<4;++col)
+      Require(GuestBlockWord(input.registers.data()+(row*4+col)*4)==
+        expected[input.name=="g_mViewTranspose"?row*4+col:col*4+row],
+        "native pass camera changed matrix register orientation");
+    input.global=false;
+    Require(!camera.Apply(input),"native pass replaced a material-local matrix");
+    input.global=true; input.registers.resize(16);
+    Reject([&] { camera.Apply(input); });
+  }
+  NativeSceneMaterialInputs::Constant scalar{true,"g_SignalBrightness",std::vector<uint8_t>(16),true};
+  Require(!camera.Apply(scalar) && camera==retained,"camera overwrote unrelated pass input or producer state");
+  NativeScenePassAnimation animation{0x3e123456,63};
+  Require(animation.Apply(scalar) && GuestBlockWord(scalar.registers.data())==0,
+    "signal brightness changed before counter bit 6");
+  animation.signal_counter=64;
+  Require(animation.Apply(scalar) && GuestBlockWord(scalar.registers.data())==0x41200000,
+    "signal brightness failed at counter bit 6");
+  animation.signal_counter=128;
+  Require(animation.Apply(scalar) && GuestBlockWord(scalar.registers.data())==0,
+    "signal brightness failed to wrap");
+  scalar.name="m_WaterTime";
+  Require(animation.Apply(scalar) && GuestBlockWord(scalar.registers.data())==animation.water_time &&
+    GuestBlockWord(scalar.registers.data()+4)==0 && GuestBlockWord(scalar.registers.data()+8)==0 &&
+    GuestBlockWord(scalar.registers.data()+12)==0x3f800000,
+    "water time lost register contents");
+  NativeSceneAdapter animation_loader;
+  animation_loader.PublishWorldAnimation(100,animation);
+  const auto first=animation_loader.Publish(1);
+  const auto first_pass=animation_loader.AcquireWorldAnimations();
+  const auto first_animation=animation;
+  ++animation.signal_counter;
+  animation_loader.PublishWorldAnimation(100,animation);
+  const auto second_pass=animation_loader.AcquireWorldAnimations();
+  Require(first_pass->at(100)==first_animation && second_pass->at(100)==animation &&
+    first->world_animations.at(100)==first_animation,
+    "pass animation waited for scene publication or changed an acquired generation");
+  animation_loader.PublishWorldAnimation(100,animation);
+  Require(animation_loader.AcquireWorldAnimations()==second_pass,"unchanged animation created a generation");
+  const auto second=animation_loader.Publish(2);
+  animation_loader.RetireWorldAnimation(100);
+  Require(animation_loader.AcquireWorldAnimations()->empty() && second_pass->at(100)==animation,
+    "animation retirement changed an acquired pass");
+  Require(first->world_animations.at(100)==first_animation &&
+    second->world_animations.at(100)==animation && animation_loader.Publish(3)->world_animations.empty(),
+    "world animation publication lost generation isolation or retirement");
+}
 void Visibility() {
   NativeSceneMembership membership;
   membership.Born(100); membership.Born(200);
@@ -26,10 +308,17 @@ void Visibility() {
     membership.InsertAfter(1000,3000,30),"membership insertion failed");
   membership.Publish();
   const auto original=membership.Acquire(100);
+  const auto lists=membership.AcquirePublication();
+  Require(membership.Current(*lists) && membership.AcquirePublication()==lists &&
+    lists->lists.at(100)==original,"unchanged spatial publication lost list sharing");
   Require(original->members==std::vector<NativeSceneMembership::Member>{{2000,20},{1000,10},{3000,30}},
     "native membership changed insertion order");
   Require(membership.Acquire(100)==original,"unchanged membership publication was copied");
   membership.InsertAfter(200,1000,10);
+  const auto moved=membership.AcquirePublication();
+  Require(!membership.Current(*lists) && membership.Current(*moved) &&
+    lists->lists.at(100)->members.size()==3 && moved->lists.at(100)->members.size()==2,
+    "cross-list mutation failed to invalidate the scene membership generation");
   Require(membership.Acquire(100)->members==std::vector<NativeSceneMembership::Member>{{2000,20},{3000,30}} &&
     membership.Acquire(200)->members==std::vector<NativeSceneMembership::Member>{{1000,10}},"cross-list move retained old membership");
   Require(original->members.size()==3,"membership update mutated a published list");
@@ -37,8 +326,16 @@ void Visibility() {
   Require(!membership.InsertAfter(9999,3000,30) && membership.Acquire(100)->members.empty(),
     "move to untracked list retained an old native node");
   membership.Remove(200);
+  const auto removed=membership.AcquirePublication();
+  Require(!membership.Current(*moved) && moved->lists.contains(200) && !removed->lists.contains(200),
+    "list retirement changed a retained publication or kept the retired header");
   Require(!membership.Acquire(200) && membership.nodes()==0,"list-header retirement leaked members");
   membership.Born(100);
+  Require(!membership.Current(*removed) && membership.AcquirePublication()->lists.at(100)->generation!=
+    removed->lists.at(100)->generation,"recycled list did not invalidate spatial publication");
+  NativeSceneAdapter membership_adapter;
+  Require(membership_adapter.Publish(1,{},lists)->membership==lists,
+    "scene publication omitted its spatial membership generation");
   Require(membership.Acquire(100)->generation!=original->generation && membership.Acquire(100)->members.empty(),
     "recycled list address inherited old membership");
   struct Memory {
@@ -108,6 +405,32 @@ void Visibility() {
   Require(old->distance==0 && sources.Visibility(100)->distance==250,"bound update mutated retained state");
   sources.Retire(100); sources.Born(100);
   Require(!sources.Visibility(100) && old->lod_count==3,"recycled owner inherited old visibility");
+  {
+    const std::array<NativeSceneSources::Part,1> parts{{{1000,0,0,2000,3000,4}}};
+    sources.Observe(100,parts);
+    NativeSceneSources::World world{}; world[0]=1;
+    sources.PublishWorld(100,world); sources.PublishVisibility(100,object);
+    const auto generation=sources.AcquireSnapshot();
+    const auto source=*generation->Find(1000);
+    sources.Observe(100,parts); sources.PublishWorld(100,world); sources.PublishVisibility(100,object);
+    Require(sources.AcquireSnapshot()==generation,"unchanged source events replaced a generation");
+    world[0]=2; sources.PublishWorld(100,world);
+    object.distance=500; sources.PublishVisibility(100,object);
+    const auto updated=sources.AcquireSnapshot();
+    Require(generation->WorldRegisters(source,2000)->at(0)==1 &&
+      updated->WorldRegisters(source,2000)->at(0)==2 && generation->Visibility(100)->distance==250 &&
+      updated->Visibility(100)->distance==500,"source snapshot mixed world or visibility generations");
+    sources.Retire(100); sources.Born(100);
+    auto replacement=parts; replacement[0].instance=1004; replacement[0].world_first=8;
+    sources.Observe(100,replacement);
+    const auto recycled=sources.AcquireSnapshot();
+    Require(generation->Find(1000) && generation->FindGroup(3000)->parts.contains(1000) &&
+      generation->LodParts(508)->front().instance==1000 && !recycled->Find(1000) &&
+      recycled->Find(1004)->generation!=source.generation && !recycled->WorldRegisters(source,2000),
+      "source retirement/reuse changed retained membership or inherited dead world data");
+    NativeSceneAdapter adapter;
+    Require(adapter.Publish(4,generation)->sources==generation,"scene publication omitted source generation");
+  }
 }
 void QueuedGuestState() {
   for(bool column:{false,true}) {
@@ -134,6 +457,20 @@ void QueuedGuestState() {
     uint32_t Word(uint32_t at) const { return GuestBlockWord(Bytes(at,4)); }
     void StoreWord(uint32_t at,uint32_t value) const { ::Word(bytes,at,value); }
   } reader;
+  {
+    constexpr uint32_t manager=24000,node=24100,scene=25000;
+    reader.StoreWord(manager,node); reader.StoreWord(manager+12,0);
+    reader.StoreWord(node,0); reader.StoreWord(node+8,scene);
+    for(uint32_t i=0;i<48;++i) reader.StoreWord(scene+32+i*4,0x3f800000+i);
+    const auto cameras=ReadNativeScenePassCameras(reader,manager);
+    Require(cameras.size()==1 && cameras.at(scene).projection[0]==0x3f800000 &&
+      cameras.at(scene).view[0]==0x3f800010 && cameras.at(scene).view_projection[15]==0x3f80002f,
+      "camera producer decoded the wrong matrix ranges");
+    reader.StoreWord(node,node);
+    Reject([&] { ReadNativeScenePassCameras(reader,manager); });
+    reader.StoreWord(manager,0);
+    Require(ReadNativeScenePassCameras(reader,manager).empty(),"empty view list retained a camera");
+  }
   constexpr uint32_t device=1024,bank=device+1792;
   for(size_t i=0;i<256;++i) reader.bytes[16384+i]=uint8_t(i+1);
   const InstanceParameter patches[]{{16384,3,4},{16512,5,2},{16384,255,1}};
@@ -199,8 +536,25 @@ void QueuedGuestState() {
   Require(sources.LodParts(owner+408)->size()==2 && sources.LodParts(owner+452)->size()==1 &&
     !sources.LodParts(30000),"native LOD selection did not resolve its registered parts");
   reader.StoreWord(owner+436,20000); reader.StoreWord(20004,21000);
+  reader.StoreWord(17016,22000); reader.StoreWord(17020,22012);
+  reader.StoreWord(22000,21000); reader.StoreWord(22004,12); reader.StoreWord(22008,4);
   sources.Observe(owner,ReadNativeStaticSceneParts(reader,owner));
   const auto source=*sources.Find(17000);
+  Require(source.world_first==12 && !sources.Find(17028)->world_first,
+    "source publication did not distinguish world-only and empty instance parameters");
+  reader.StoreWord(22004,16);
+  sources.Observe(owner,ReadNativeStaticSceneParts(reader,owner));
+  Require(source.world_first==12 && sources.Find(17000)->world_first==16,
+    "source register update mutated a retained source or kept stale metadata");
+  reader.StoreWord(17020,22024);
+  reader.StoreWord(22012,23000); reader.StoreWord(22016,20); reader.StoreWord(22020,1);
+  sources.Observe(owner,ReadNativeStaticSceneParts(reader,owner));
+  Require(!sources.Find(17000)->world_first,"additional override was certified world-only");
+  reader.StoreWord(17020,22012); reader.StoreWord(22000,21016);
+  sources.Observe(owner,ReadNativeStaticSceneParts(reader,owner));
+  Require(!sources.Find(17000)->world_first,"foreign matrix storage was certified world-only");
+  reader.StoreWord(22000,21000); reader.StoreWord(22004,12);
+  sources.Observe(owner,ReadNativeStaticSceneParts(reader,owner));
   for(size_t i=0;i<16;++i) reader.StoreWord(owner+224+uint32_t(i)*4,std::bit_cast<uint32_t>(float(i)+.25f));
   auto world=ReadNativeStaticWorld(reader,owner);
   for(size_t row=0;row<4;++row) for(size_t col=0;col<4;++col)
@@ -273,6 +627,17 @@ void QueuedGuestState() {
   };
   const auto material_memory=reader.bytes;
   const auto material_inputs=load_material();
+  Require(material_inputs.vertex_registers==std::vector<NativeSceneMaterialDefinition::VertexRegisters>{{"local",0,1},{"global",4,1}},
+    "material publication lost vertex register metadata");
+  NativeSceneMaterialDefinition world_definition;
+  world_definition.vertex_registers={{"g_mWorld",12,4},{"other",16,2}};
+  Require(world_definition.WorldRegisterFirst()==12,"published world register not resolved");
+  world_definition.vertex_registers[1].first=15;
+  Require(!world_definition.WorldRegisterFirst(),"overlapping world register accepted");
+  world_definition.vertex_registers={{"g_mWorld",12,4},{"g_mWorld",32,4}};
+  Require(!world_definition.WorldRegisterFirst(),"ambiguous world register accepted");
+  world_definition.vertex_registers={{"g_mWorld",253,4}};
+  Require(!world_definition.WorldRegisterFirst(),"out-of-bank world register accepted");
   Require(material_inputs.vertex==29400 && material_inputs.pixel==29500 && material_inputs.constants.size()==2 &&
     !material_inputs.constants[0].global && material_inputs.constants[1].global &&
     GuestBlockWord(material_inputs.constants[1].registers.data())==0x40000000 && reader.bytes==material_memory,
@@ -286,6 +651,24 @@ void QueuedGuestState() {
   Require(load_material()!=material_inputs && GuestBlockWord(material_inputs.constants[1].registers.data())==0x40000000,
     "material input snapshot borrowed source values");
   reader.StoreWord(31408,0); Reject(load_material); reader.StoreWord(31408,1);
+  // Native reflection can require more global registers than Xbox metadata.
+  const auto load_matrix=[&] {
+    return ReadNativeSceneMaterialInputs(reader,29000,material_schema,
+      [](bool,const std::string& name) { return name=="unused"?size_t(0):name=="global"?size_t(64):size_t(16); },
+      [](const std::string& name) { return name!="unused_image"; });
+  };
+  reader.StoreWord(31408,4);
+  reader.StoreWord(31360,0x3f800000);
+  const auto matrix_inputs=load_matrix();
+  Require(matrix_inputs.constants[1].registers.size()==64 &&
+    GuestBlockWord(matrix_inputs.constants[1].registers.data()+60)==0x3f800000,
+    "global material truncated native reflection to guest descriptor extent");
+  reader.StoreWord(31408,3); Reject(load_matrix);
+  reader.StoreWord(31408,4097); Reject(load_matrix);
+  reader.StoreWord(31408,1);
+  material_schema[0][0].registers=2; Reject(load_material);
+  material_schema[0][0].registers=0; Reject(load_material);
+  material_schema[0][0].registers=1;
   reader.StoreWord(30044,16); Reject(load_material); reader.StoreWord(30044,3);
   reader.StoreWord(29104,4097); Reject(load_material);
 }
@@ -364,23 +747,103 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   const uint8_t white_pixel[]{255,255,255,255};
   std::shared_ptr<NativeBackendTexture> white=backend->CreateTexture(texture_desc,white_pixel);
   source_pixel.SetTexture("image",white);
-  source_pixel.SetSampler("imageSampler",&backend->CreateSampler({}));
+  NativeBackendSamplerDesc sampler_desc; sampler_desc.max_lod=15;
+  source_pixel.SetSampler("imageSampler",&backend->CreateSampler(sampler_desc));
   const auto captured=CaptureNativeSceneMaterial(backend,pipeline,source_vertex,source_pixel);
+  std::vector<NativeSceneMaterialInputs::Constant> program_constants;
   auto material_program=std::make_shared<NativeSceneMaterialProgram>();
   material_program->backend=backend; material_program->vertex=material_program->reversed_vertex=vs; material_program->pixel=ps;
   for(const auto* name:{"g_mWorld","g_mViewProjection","g_mViewTranspose"})
-    material_program->inputs.constants.push_back({false,name,matrix_bytes});
-  material_program->inputs.constants.push_back({true,"tint",tint_bytes});
+    program_constants.push_back({false,name,matrix_bytes});
+  program_constants.push_back({true,"tint",tint_bytes});
   material_program->inputs.textures.push_back({"image"});
   material_program->inputs.textures.push_back({"imageSampler"});
   material_program->textures={white,{}};
-  NativeBackendSampler* program_samplers[]{nullptr,&backend->CreateSampler({})};
-  const auto program_capture=material_program->Capture(pipeline,false,program_samplers);
+  NativeBackendSampler* program_samplers[]{nullptr,&backend->CreateSampler(sampler_desc)};
+  const auto program_capture=material_program->Capture(pipeline,false,program_constants,program_samplers);
+  auto translated_capture=program_capture;
+  auto translated_world=matrix_bytes;
+  Word(translated_world,(column_major?3:12)*4,std::bit_cast<uint32_t>(0.25f));
+  ApplyNativeScenePublishedWorld(translated_capture,std::span<const uint8_t,64>(translated_world.data(),64));
+  auto expected_world=kNativeSceneIdentity; expected_world[12]=0.25f;
+  Require(translated_capture.world==expected_world && program_capture.world==kNativeSceneIdentity,
+    "published world lost shader layout or modified retained capture");
   Require(program_capture.material->Equivalent(*captured.material),"owned material program disagrees with live binding capture");
-  Reject([&] { material_program->Capture(pipeline,false,{}); });
+  ShaderBindings activated_vertex(nullptr,vs),activated_pixel(nullptr,ps);
+  auto stale_tint=tint_bytes;
+  Word(stale_tint,0,std::bit_cast<uint32_t>(0.25f));
+  activated_pixel.SetGuestFloatRegisters("tint",stale_tint);
+  material_program->ApplyBindings(activated_vertex,activated_pixel,program_constants,program_samplers);
+  const auto activated=CaptureNativeSceneMaterial(backend,pipeline,activated_vertex,activated_pixel);
+  Require(activated.material->Equivalent(*captured.material),
+    "published activation left stale constants or resources in shared bindings");
+  auto untextured=*material_program;
+  untextured.inputs.textures.clear(); untextured.textures.clear();
+  untextured.ApplyBindings(activated_vertex,activated_pixel,program_constants,{});
+  Require(!activated_pixel.ReadTexture("image") && !activated_pixel.ReadSampler("imageSampler"),
+    "published activation retained resources omitted by the next material");
+  material_program->ApplyBindings(activated_vertex,activated_pixel,program_constants,program_samplers);
+  Require(CaptureNativeSceneMaterial(backend,pipeline,activated_vertex,activated_pixel).material->Equivalent(*captured.material),
+    "published activation failed to restore resources after an untextured material");
+  Reject([&] { material_program->Capture(pipeline,false,program_constants,{}); });
+  auto& retained_tint=program_constants.back();
+  retained_tint.registers.resize(32);
+  Reject([&] { material_program->Capture(pipeline,false,program_constants,program_samplers); });
+  Reject([&] { material_program->Capture(pipeline,true,program_constants,program_samplers); });
+  retained_tint.global=true;
+  material_program->Capture(pipeline,false,program_constants,program_samplers);
+  material_program->Capture(pipeline,true,program_constants,program_samplers);
+  retained_tint.global=false; retained_tint.registers.resize(16);
+  NativeMaterialRenderPass pass_state; pass_state.words=desc.state; pass_state.color_targets[0]=1;
+  std::array<NativeMaterialSamplerPass,16> pass_samplers{};
+  material_program->inputs.state_overrides={{0x3c,0},{0xd4,15}};
+  Require(material_program->CanDeferCpuActivation(),"ordinary material incorrectly requires scissor callback");
+  auto scissor_program=*material_program;
+  scissor_program.inputs.state_overrides.push_back({0xc8,1});
+  Require(!scissor_program.CanDeferCpuActivation(),"scissor rectangle callback was deferred without owned geometry");
+  material_program->sampler_operations={{0,0x3c0,0,{0,1,1,1}}};
+  auto material_desc=desc;
+  material_desc.vertex_id=100+uint64_t(column_major);
+  material_desc.input_layout=geometry->input_layout().elements();
+  material_desc.input_layout_id=geometry->input_layout().fingerprint();
+  const auto resolved=material_program->Resolve(material_desc,false,program_constants,pass_state,pass_samplers);
+  Require(resolved.capture.material->Equivalent(*captured.material),
+    "material resolved from explicit pass state differs from visible binding capture");
+  Require(resolved.render.words==desc.state,"material resolution changed expected pipeline words");
+  Require((resolved.samplers[0].words[2]&0x3fc)==0x3c0,"material resolution lost final inherited LOD state");
+  Require(pass_samplers[0].words[2]==0,"material resolution mutated source pass");
+  NativeSceneMaterialPassState inherited{pass_state,pass_samplers};
+  inherited.samplers[7].words[0]=0x12400;
+  const auto first_pass=inherited.After(*material_program);
+  NativeSceneMaterialProgram change_factors;
+  change_factors.inputs.state_overrides={{0x48,2}};
+  const auto second_pass=first_pass.After(change_factors);
+  Require(second_pass.render.words[0]==0x10001 && (second_pass.render.blend_parameters&31)==2,
+    "disabled blend discarded factors needed by a later material");
+  Require(second_pass.samplers==first_pass.samplers && second_pass.samplers[7].words[0]==0x12400 &&
+    (second_pass.samplers[0].words[2]&0x3fc)==0x3c0,
+    "material sequence lost unmentioned sampler slots or inherited LOD");
+  NativeSceneMaterialProgram enable_blend;
+  enable_blend.inputs.state_overrides={{0x3c,1}};
+  const auto third_pass=second_pass.After(enable_blend);
+  Require((third_pass.render.words[0]&31)==2 && second_pass.render.words[0]==0x10001,
+    "later blend enable failed to consume inherited factors or mutated an earlier pass");
+  enable_blend.sampler_operations.push_back({16});
+  Reject([&] { second_pass.After(enable_blend); });
+  Require(second_pass.render.words[0]==0x10001 && inherited.samplers[0].words[2]==0,
+    "failed material transition partially advanced published pass state");
+  auto descriptors=second_pass;
+  descriptors.samplers[7].words[0]|=0x80000001;
+  descriptors.samplers[7].words[1]|=0x12345;
+  descriptors.samplers[7].words[3]|=0x10000000;
+  Require(descriptors.Inputs()==second_pass,"texture descriptor bits entered inherited sampler state");
+  descriptors.samplers[7].words[2]^=1;
+  Require(descriptors.Inputs()!=second_pass,"native pass normalization discarded mip-alias bookkeeping");
+  descriptors=second_pass; descriptors.samplers[7].min_lod^=1;
+  Require(descriptors.Inputs()!=second_pass,"native pass normalization discarded a sampler LOD constraint");
   Require(captured.world==kNativeSceneIdentity && captured.camera.view_projection==kNativeSceneIdentity,
     "retail material capture lost canonical matrix layout");
-  auto red=captured.material;
+  auto red=resolved.capture.material;
   const size_t translation_offset=column_major?12:48;
   Word(matrix_bytes,translation_offset,std::bit_cast<uint32_t>(.25f));
   source_vertex.SetGuestFloatRegisters("g_mWorld",matrix_bytes);
@@ -467,7 +930,7 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
     auto right_capture=captured; right_capture.world[12]=.5f;
     right_capture.material=std::make_shared<NativeSceneMaterial>(backend,pipeline,constants({1,0,0,1}),
       std::vector<NativeSceneTexture>{{source_pixel.TextureImages().front().slot,retained_texture.lock()}},
-      std::vector<NativeSceneSampler>{{source_pixel.SamplerImages().front().slot,&backend->CreateSampler({})}});
+      std::vector<NativeSceneSampler>{{source_pixel.SamplerImages().front().slot,&backend->CreateSampler(sampler_desc)}});
     Require(right_capture.material->Equivalent(*captured.material) &&
       right_capture.material->fingerprint()==captured.material->fingerprint() && !right_capture.material->Equivalent(*blue),
       "material identity omitted bindings or changed equivalent captures");
@@ -539,6 +1002,7 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   populated.Retire(999);
   Require(populate().examined==0,"unrelated retirement invalidated populated groups");
   const auto unseen_publication=populated.Publish(1);
+  const auto unseen_source=*catalog.Find(3000);
   render(*unseen_publication->snapshot);
   Require(pixel(32,0)==255 && unseen_publication->snapshot->instances[0]->object.world==event_world,
     "unseen part did not render from its event-published transform");
@@ -553,6 +1017,22 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   populated.Retire(300); catalog.Retire(300); catalog.Retire(400);
   Require(!catalog.FindGroup(500),"retired parts kept a live group index");
   render(*unseen_publication->snapshot); Require(pixel(32,0)==255,"unseen publication borrowed retired producer assets");
+  {
+    auto pass=captured; pass.world=event_world; pass.world[12]=-.5f;
+    const auto geometry=unseen_publication->snapshot->instances[0]->object.geometry;
+    const auto selected=unseen_publication->Resolve(unseen_source,geometry,pass);
+    Require(selected && selected->id==unseen_publication->snapshot->instances[0]->id &&
+      selected->object.world==pass.world && selected->previous==pass.world &&
+      unseen_publication->snapshot->instances[0]->object.world==event_world,
+      "pass selection mutated its publication or lost the retained source lifetime");
+    auto recycled=unseen_source; ++recycled.generation;
+    Require(!unseen_publication->Resolve(recycled,geometry,pass) &&
+      !unseen_publication->Resolve(unseen_source,{},pass),"pass selection accepted a different lifetime or geometry");
+    NativeSceneSnapshot resolved_pass{1,{selected}};
+    render(resolved_pass);
+    Require(pixel(16,0)==255 && pixel(48,0)==0,
+      "pass selection required the retired producer database or ignored the resolved world");
+  }
   NativeSceneAdapter geometry_loader;
   NativeSceneSources geometry_sources; geometry_sources.Born(900);
   const NativeSceneSources::Part geometry_part[]{ {9000,0,0,0,500} };
@@ -572,6 +1052,18 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   geometry_loader.PublishGroupGeometry(500,geometry_revision,geometry_record->geometry);
   Require(geometry_loader.GroupGeometry(500,geometry_revision)==geometry_record,
     "unchanged geometry publication did not share its record");
+  NativeSceneGeometrySource setup{10,20,30,12,6,40,50};
+  geometry_loader.PublishGroupGeometry(500,geometry_revision,geometry_record->geometry,setup);
+  const auto setup_record=geometry_loader.GroupGeometry(500,geometry_revision);
+  Require(setup_record!=geometry_record && setup_record->setup==setup && !geometry_record->setup,
+    "geometry setup publication mutated an earlier frame");
+  geometry_loader.PublishGroupGeometry(500,geometry_revision,geometry_record->geometry,setup);
+  Require(geometry_loader.GroupGeometry(500,geometry_revision)==setup_record,
+    "unchanged geometry setup rebuilt its publication");
+  setup.material=41;
+  geometry_loader.PublishGroupGeometry(500,geometry_revision,geometry_record->geometry,setup);
+  Require(geometry_loader.GroupGeometry(500,geometry_revision)!=setup_record && setup_record->setup->material==40,
+    "changed material identity reused stale geometry setup");
   geometry_sources.Retire(900); geometry_loader.PruneGroupGeometry(geometry_sources);
   Require(!geometry_loader.geometry_groups(),"retired source retained preloaded geometry");
   geometry_sources.Born(900); geometry_sources.Observe(900,geometry_part);
@@ -584,14 +1076,26 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   loaded_scene.Create(loaded_object);
   render(*loaded_scene.Publish(1));
   Require(pixel(32,0)==255,"published geometry could not render after its source and mesh retired");
-  geometry_loader.PublishGroupMaterial(500,replacement_revision,material_program);
+  geometry_loader.PublishGroupMaterial(500,replacement_revision,material_program,program_constants);
   const auto material_publication=geometry_loader.Publish(2);
+  auto next_constants=program_constants;
+  next_constants.back().registers[0]^=1;
+  geometry_loader.PublishGroupMaterial(500,replacement_revision,material_program,next_constants);
+  const auto next_material=geometry_loader.GroupMaterial(500,replacement_revision);
+  Require(next_material!=material_publication->group_materials[0] &&
+    next_material->program==material_publication->group_materials[0]->program &&
+    next_material->constants==next_constants &&
+    material_publication->group_materials[0]->constants==program_constants,
+    "frame constants rebuilt the program or mutated a retained publication");
+  geometry_loader.PublishGroupMaterial(500,replacement_revision,material_program,next_constants);
+  Require(geometry_loader.GroupMaterial(500,replacement_revision)==next_material,
+    "unchanged material inputs replaced their publication record");
   geometry_sources.Retire(900); geometry_loader.PruneGroupGeometry(geometry_sources);
   Require(!geometry_loader.material_groups() && material_publication->group_materials.size()==1,
     "material retirement changed a published program or retained a live group");
   // Producer bindings now contain blue and no textures; the owned program
   // still constructs and renders its original red material without guest reads.
-  loaded_object.material=material_publication->group_materials[0]->program->Capture(pipeline,false,program_samplers).material;
+  loaded_object.material=material_publication->group_materials[0]->program->Capture(pipeline,false,material_publication->group_materials[0]->constants,program_samplers).material;
   NativeSceneDatabase material_scene; material_scene.Create(loaded_object);
   render(*material_scene.Publish(1));
   Require(pixel(32,0)==255 && pixel(32,2)==0,"owned material program borrowed producer constants or textures");
@@ -600,7 +1104,7 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
 }
 int main() {
   try {
-    Visibility();
+    PassCamera(); Visibility();
     QueuedGuestState();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };

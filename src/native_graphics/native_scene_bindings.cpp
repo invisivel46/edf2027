@@ -1,8 +1,21 @@
 #include "native_scene_bindings.h"
+#include "native_queued_scene.h"
 #include <algorithm>
 #include <cstring>
 
 namespace edf::native {
+void ApplyNativeScenePublishedWorld(NativeSceneMaterialCapture& capture,std::span<const uint8_t,64> registers) {
+  if(!capture.material) throw std::runtime_error("published world requires a native material");
+  const NativeSceneMatrixBinding* world=nullptr;
+  for(const auto& constant:capture.material->constants()) for(const auto& matrix:constant.matrices)
+    if(matrix.source==NativeSceneMatrixSource::World) {
+      if(world || constant.stage!=NativeBackendStage::Vertex)
+        throw std::runtime_error("published world requires one vertex world matrix");
+      world=&matrix;
+    }
+  if(!world) throw std::runtime_error("published world matrix missing");
+  capture.world=DecodeNativeQueuedWorld(registers,world->column_major);
+}
 namespace {
 bool Matches(const NativeSceneMaterial& material,const ShaderBindings& vertex,const ShaderBindings& pixel) {
   if(material.constants().size()!=vertex.ConstantImages().size()+pixel.ConstantImages().size() ||

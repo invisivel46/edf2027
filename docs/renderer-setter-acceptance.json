@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "id": "scalar-setters-v1",
+  "disposition": "partial",
+  "accepted_count": 24,
+  "expected_net_new_partial": 24,
+  "accepted_by": "root coordinator",
+  "acceptance_basis": "Prior independent design review plus final rule, exact-body harness, offline-suite, documentation, and tally checks.",
+  "independent_review": "out/renderer-automation-pilot/accepted/setters-v1/design-review.md",
+  "report": "out/renderer-automation-pilot/accepted/setters-v1/contracts.json",
+  "manifest": "tests/fixtures/renderer-scalar-pilot.json",
+  "selection": "out/renderer-automation-pilot/accepted/setters-v1/selection.json",
+  "rule_source": "out/renderer-automation-pilot/accepted/setters-v1/renderer_setter_analysis.py",
+  "facts": "out/renderer-automation-pilot/accepted/setters-v1/facts.json",
+  "harness_source": "out/renderer-automation-pilot/accepted/setters-v1/renderer_setter_contract_tests.cpp",
+  "harness_runtime_source": "generated/default/edf2017_pch.h",
+  "harness_report": "out/renderer-automation-pilot/accepted/setters-v1/harness-report.json",
+  "offline_report": "out/renderer-automation-pilot/accepted/setters-v1/offline-report.json",
+  "artifacts": {
+    "out/renderer-automation-pilot/accepted/setters-v1/contracts.json": "1dc06f6f0dce371503fd1856f0ce156a6348b8368f8dbd46c2cd8f5f91afda37",
+    "tests/fixtures/renderer-scalar-pilot.json": "65707546ef7606cc45fa77a3481637072c0849dc4c04f80b10c0fb2f5edf4bf2",
+    "out/renderer-automation-pilot/accepted/setters-v1/selection.json": "a47d3ecd0fd29cab79115a4052fff0886762ca6fd7d91281a0f9cf1b15523ef9",
+    "out/renderer-automation-pilot/accepted/setters-v1/renderer_setter_analysis.py": "c8afa11ecfd51942306ce2961fec266f7b386babe22282c4f4a50ff92befd952",
+    "out/renderer-automation-pilot/accepted/setters-v1/facts.json": "ce138cc07dafcc2e1e71337f73f218d311e4fce0ec97d28b720eab4433a4841f",
+    "out/renderer-automation-pilot/accepted/setters-v1/renderer_setter_contract_tests.cpp": "dce7b46d5e9e04f083fc87cc4fba185cbe4e2b9263b23791134457e92f1ef835",
+    "generated/default/edf2017_pch.h": "f271c868acc5166d90f92547b8664cc8cf8510638882bca8eceff47b0a4fee16",
+    "out/renderer-automation-pilot/accepted/setters-v1/harness-report.json": "7540228c58be3d4e45a2fc25d434a1558eb0c74df5de33e718f1515979ce4996",
+    "out/renderer-automation-pilot/accepted/setters-v1/design-review.md": "f9dbb630246dc96f547c46beb2de7c9b3d5841a0fda8d72a5765808eb1592868",
+    "out/renderer-automation-pilot/accepted/setters-v1/offline-report.json": "fce85809db8eff1d529f97f64f8ab98bbd4b459102a4b2e8cc1694f9e59d20fc",
+    "out/renderer-automation-pilot/accepted/setters-v1/pilot-docs.md": "491eb2cd0aa5baf7bec88ce7dd5c298e36d2e6003d76f6b2778631f569944797",
+    "knowledge/evidence/ev-20260922170054-4b2d783c.md": "aaeac03a237b5190e21f3312d06e8da3c366a760258a0e40904c2bd0a0f9e227",
+    "knowledge/evidence/ev-20260922170054-e1657c45.md": "4af5c91e950ba59e9e2ad468117c0b87401c9e8325d0f5b50bd2dce0290178b6",
+    "knowledge/evidence/ev-20260922170054-c60f6248.md": "c05ba2cfd7c6fbb12f3a331c846f3a610db0ea601cdf244552174bd3a77e64b1",
+    "knowledge/evidence/ev-20260922170054-2389e41b.md": "48943965fddec4317202d0df451d0edbe799d5128260f3977933cee266f28c95",
+    "knowledge/evidence/ev-20260922170054-f462c28b.md": "f7bca4e930eb07fd366733e77042dbef841eb90445ba6730cd35b94bf30a1091",
+    "knowledge/evidence/ev-20260922170054-c24f5601.md": "869cb0dae6cb98ccf3850440169bc02a0d4d17c9f3e6228c3bda1b690a6b3d68",
+    "knowledge/evidence/ev-20260922170117-aafc112f.md": "b233e18f98c2184e4ad9c4e0121910b7713d28d8dd45526e883aabeb04e156c3"
+  },
+  "evidence_ids": [
+    "ev-20260922170054-4b2d783c",
+    "ev-20260922170054-e1657c45",
+    "ev-20260922170054-c60f6248",
+    "ev-20260922170054-2389e41b",
+    "ev-20260922170054-f462c28b",
+    "ev-20260922170054-c24f5601",
+    "ev-20260922170117-aafc112f"
+  ],
+  "functions": [
+    "sub_82134EB8", "sub_82134EE8", "sub_821353E8", "sub_82135578",
+    "sub_82135670", "sub_82135720", "sub_82135750", "sub_82135800",
+    "sub_82135830", "sub_82135850", "sub_82135870", "sub_82135890",
+    "sub_821358B0", "sub_821358D0", "sub_82135AB8", "sub_82135BE8",
+    "sub_82136478", "sub_821364C8", "sub_821364F8", "sub_82136620",
+    "sub_82136650", "sub_82136680", "sub_821366B0", "sub_821366D0"
+  ],
+  "remaining": [
+    "No whole-function, boundary, parent-task, receiver-population, or task closure.",
+    "Lifetime, modes, concurrency, native setter replacement, and gameplay validation remain open."
+  ]
+}

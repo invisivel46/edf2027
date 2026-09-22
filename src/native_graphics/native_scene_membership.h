@@ -23,6 +23,19 @@ class NativeSceneMembership {
     uint32_t end=0;
     std::vector<Member> members;
   };
+  struct Publication {
+    uint64_t revision=0;
+    std::map<uint32_t,std::shared_ptr<const Snapshot>> lists;
+  };
+  bool Current(const Publication& publication) const { return publication.revision==revision_; }
+  std::shared_ptr<const Publication> AcquirePublication() {
+    if(!publication_ || !Current(*publication_)) {
+      auto next=std::make_shared<Publication>(); next->revision=revision_;
+      for(const auto& [address,list]:lists_) next->lists.emplace(address,Acquire(address));
+      publication_=std::move(next);
+    }
+    return publication_;
+  }
   void Born(uint32_t list,uint32_t end=0) {
     if(!list || next_generation_==UINT64_MAX) throw std::runtime_error("invalid native membership lifetime");
     Retire(list);
@@ -34,7 +47,7 @@ class NativeSceneMembership {
     const auto found=lists_.find(list);
     if(found==lists_.end()) return false;
     for(const auto& member:found->second.members) nodes_.erase(member.node);
-    lists_.erase(found); return true;
+    lists_.erase(found); ++revision_; return true;
   }
   bool Remove(uint32_t node) {
     if(Retire(node)) return true; // Destruction of the intrusive list header.
@@ -96,6 +109,7 @@ class NativeSceneMembership {
     bool pending=false;
   };
   void Changed(uint32_t address,List& entry) {
+    ++revision_;
     entry.snapshot.reset();
     if(!entry.pending) { changed_.push_back(address); entry.pending=true; }
   }
@@ -104,5 +118,7 @@ class NativeSceneMembership {
   std::map<uint32_t,Location> nodes_;
   std::vector<uint32_t> changed_;
   uint64_t next_generation_=1;
+  uint64_t revision_=0;
+  std::shared_ptr<const Publication> publication_;
 };
 }

@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "disposition": "partial",
+  "reviewed": true,
+  "scope": "frozen-scalar-170",
+  "reviewed_by": [
+    "root-scalar-planner"
+  ],
+  "review": "out/renderer-scalar-pipeline/review-planner.md",
+  "minimum_invocations": 402,
+  "minimum_negative_controls": 3,
+  "inputs": {
+    "tools/renderer_scalar_effects.py": "d1e54b690930c096c5b69099f35b7eaec5a747304368c38b2e631dc5f1e02360",
+    "tools/renderer_scalar_pipeline.py": "5218998e7e6d3022ddd700704f3ae25a015d5af21b1b62207408978b335436ad",
+    "tools/renderer_scalar_acceptance.py": "2dd1dd21a7a30c4d65f6327c6b178d1ca1f14bd41e9737b10d0f3e9fceaa8387",
+    "tools/renderer_scalar_analysis.py": "e86cd5a39163d13a5d66751c6c5dfaf202994bafa7cd00670e67c54733c41b32",
+    "tools/renderer_dispatch.py": "9865a9e4255f0e80a6ea53d9bfa5becd9688480fafb99f943dbae7e156eb3d68",
+    "tests/renderer_scalar_pipeline_tests.cpp": "7b7f203eb67da09a8cf478b9f803c86659446286b6b3d6824a94b55cace9b2e9",
+    "tests/test_renderer_scalar_effects.py": "8e9064be15f0352f593d4a8b16a6006989f6e6b0aea1d161c4636bcca7742f3a",
+    "tests/test_renderer_scalar_pipeline.py": "700fd79c78ec53188e3f970d0409de796c827118c1d84df81ac7e983f09f4fba",
+    "tests/fixtures/renderer-scalar-pilot.json": "65707546ef7606cc45fa77a3481637072c0849dc4c04f80b10c0fb2f5edf4bf2",
+    "tests/fixtures/renderer-scalar-boundaries.json": "98c81d0c139c91f6f47389783dbec78a4c338c8937045e4f9d5fc1a1866ed76e",
+    "generated/default/edf2017_pch.h": "f271c868acc5166d90f92547b8664cc8cf8510638882bca8eceff47b0a4fee16",
+    "out/renderer-scalar-pipeline/review.md": "3da011a3b24577c7848c229729b2d48649eebba6f53a9bc4ece2cad76d983003",
+    "out/renderer-scalar-pipeline/review-lbz-lhz.md": "39dfc3bd52e78fb1b9da51f79f405fceea446fdbbf507e62f9a82496e4c3a459",
+    "out/renderer-scalar-pipeline/review-planner.md": "4a63c33c17f9e99bfbf014ea4bd6f2bb84dc85fa138b06ba36fa770b05b00645",
+    "tools/renderer_scalar_planner.py": "5f8549c1c16cc4da448219436691765ea79159f7f35dd78c17203a6510279388",
+    "tests/test_renderer_scalar_planner.py": "9c42bb1bf4f0b88f07cb585d55bdb0bc5e7c4e3ae463b4f99a6af1901176fa7a"
+  }
+}

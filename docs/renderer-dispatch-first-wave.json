@@ -1,0 +1,90 @@
+{
+  "version": 1,
+  "coordinator": "/root",
+  "slices": [
+    {
+      "id": "R01.scope.frame-to-bucket-v1",
+      "parent": "R01.scope",
+      "kind": "investigation",
+      "model": "gpt-6-astra",
+      "effort": "high",
+      "scope": "Classify the connected sub_821A5080 -> sub_821A3BA0 path, including outgoing boundaries and unresolved receiver populations.",
+      "excludes": "No native changes, broader closure classification, inventory regeneration or parent completion.",
+      "depends_on": [],
+      "required_evidence": [],
+      "allowed_files": [],
+      "inputs": ["docs/renderer-coverage.json", "out/renderer-inventory/complete-function-inventory.csv", "out/renderer-inventory/root-manifest.csv", "out/renderer-inventory/generated-call-edges.csv", "out/renderer-inventory/indirect-site-ledger.csv", "generated/default/edf2017_recomp.41.cpp", "generated/default/edf2017_recomp.47.cpp", "src/native_graphics/guest_shader_bridge.cpp"],
+      "steps": [
+        "Verify the caller/callee edge in generated-call-edges.csv and locate both generated bodies; check available Ghidra exports when useful.",
+        "Record seed justification, every direct outgoing edge, eight frame indirect sites and the bucket-dispatch site. If the counts differ, report the discrepancy instead of forcing the count.",
+        "Produce contract.csv with instruction/source locators, guard, reads, writes, owner/lifetime, classification and evidence IDs. Preserve unresolved targets as explicit follow-ups.",
+        "Write results.md and a submission JSON. Classify only this path; keep the parent open."
+      ],
+      "cases": [
+        {"id": "connected-path", "description": "Both functions have incoming-path witnesses and outgoing-boundary dispositions."},
+        {"id": "indirect-unknowns", "description": "Every indirect site is enumerated; unproven receiver targets remain unresolved with next queries."},
+        {"id": "side-effects", "description": "Simulation/CPU writes and shared utilities are distinguished from render consumption with source evidence."}
+      ],
+      "checks": {"coverage": ["python", "tools/audit-renderer-coverage.py"]},
+      "stop_conditions": ["Report missing/truncated locators without guessing.", "Do not expand beyond the two selected functions; return follow-ups for callees."]
+    },
+    {
+      "id": "R10.capture.final-host-three-frame-v1",
+      "parent": "R10.capture",
+      "kind": "implementation",
+      "model": "gpt-5.6-terra",
+      "effort": "high",
+      "scope": "Implement a bounded three-frame final-host capture with unique output names and truthful sequence/time metadata, preserving disabled and one-shot behavior.",
+      "excludes": "No gameplay boot, visual parity claim, partial-scene relabeling, broad host redesign or parent completion.",
+      "depends_on": [],
+      "required_evidence": [],
+      "allowed_files": ["src/native_graphics/native_backend_host.cpp", "src/native_graphics/native_backend_host.h", "src/native_graphics/native_host_surface.cpp", "src/native_graphics/native_host_surface.h", "src/native_graphics/native_capture_policy.h", "tests/native_capture_policy_tests.cpp", "tests/native_backend_host_tests.cpp"],
+      "inputs": ["docs/renderer-coverage.json", "src/native_graphics/native_backend_host.cpp", "src/native_graphics/native_backend_host.h", "src/native_graphics/native_host_surface.cpp", "src/native_graphics/native_host_surface.h", "src/native_graphics/native_capture_policy.h", "tests/native_capture_policy_tests.cpp", "tests/native_backend_host_tests.cpp", "tools/validate-renderer-offline.py", "docs/renderer-offline-validation.md"],
+      "steps": [
+        "Read both host composition/capture paths. Record their frame identity, capture timing and ownership contract in Epistemic before editing.",
+        "Add the smallest bounded capture API/policy that handles three outputs, exhaustion, repeated sequence IDs and unique filenames. Repeated source sequences must remain truthful.",
+        "Implement metadata and failure handling for missing images, collisions and write errors; preserve capture-off and default one-shot behavior.",
+        "Add independent policy/host tests, build and run the supplemental host test, then run the full offline gate. Request coordinator access before GPU validation.",
+        "Submit patch in the isolated checkout with contract.csv, results.md and result JSON; report gameplay/pause/loading visual acceptance as not_run."
+      ],
+      "cases": [
+        {"id": "three-and-exhausted", "description": "Exactly three outputs are produced and later requests are exhausted."},
+        {"id": "identity", "description": "Manifest index, sequence, time, extent, backend and final-composition kind describe the actual frame; repeated sequences remain truthful."},
+        {"id": "compatibility", "description": "Disabled capture does no readback/file work; default one-shot still works."},
+        {"id": "failures", "description": "Absent image, name collision and write error have tested bounded behavior without silent overwrite."},
+        {"id": "visual-milestone", "description": "Gameplay/pause/loading visual examples remain pending until a milestone boot.", "runtime": true}
+      ],
+      "checks": {
+        "host-build": ["cmake", "--build", "out/build/win-amd64-release", "--target", "edf_native_backend_host_tests", "--parallel", "2"],
+        "host-test": ["ctest", "--test-dir", "out/build/win-amd64-release", "-R", "^edf_native_backend_host_tests$", "--output-on-failure", "--no-tests=error"]
+      },
+      "stop_conditions": ["Escalate if a host cannot expose final composition or sequence identity.", "Ask coordinator to expand ownership before editing any additional file.", "Do not fabricate distinct sequence IDs to satisfy a uniqueness test."]
+    },
+    {
+      "id": "dispatch.readiness-v1",
+      "parent": null,
+      "kind": "coordination",
+      "model": "gpt-5.6-sol",
+      "effort": "medium",
+      "scope": "Independently audit the first-wave packet prerequisites, baseline identity, file ownership and rejection tests.",
+      "excludes": "No source edits, ledger mutations, automatic readiness grants or renderer parent completion.",
+      "depends_on": [],
+      "required_evidence": [],
+      "allowed_files": [],
+      "inputs": ["docs/renderer-coverage.json", "docs/renderer-dispatch-first-wave.json", "tools/renderer_dispatch.py", "tools/dispatch-renderer.py", "tests/test_renderer_dispatch.py", "docs/renderer-dispatch.md"],
+      "steps": [
+        "Inspect both renderer packet scopes, input locators and allowed-file sets against their actual source contracts.",
+        "Verify the pinned baseline includes dirty and untracked inputs and that implementation requires a matching isolated checkout.",
+        "Run dispatch rejection tests and coverage validation; inspect whether tests exercise real rejection paths.",
+        "Publish readiness findings and explicit gaps with evidence IDs. The coordinator alone decides readiness."
+      ],
+      "cases": [
+        {"id": "locators", "description": "Every first-wave input and prerequisite locator exists or has an explicit blocker."},
+        {"id": "ownership", "description": "Allowed writes are disjoint and both host headers are included in capture scope."},
+        {"id": "rejections", "description": "Tests reject stale input/source, dependency violations, overlap, out-of-scope changes, self-review, altered artifacts and stale offline reports."}
+      ],
+      "checks": {"dispatch-tests": ["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_renderer_dispatch.py"], "coverage": ["python", "tools/audit-renderer-coverage.py"]},
+      "stop_conditions": ["Report missing proof as a blocker; successful packet rendering alone is not readiness."]
+    }
+  ]
+}

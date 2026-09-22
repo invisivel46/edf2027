@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include "guest_block.h"
+#include "guest_instance_parameters.h"
 #include "native_scene_visibility.h"
 
 namespace edf::native {
@@ -15,13 +16,26 @@ namespace edf::native {
 // an owner: a guest address alone is not a persistent scene identity.
 class NativeSceneSources {
  public:
+  // One immutable generation supplies membership, LOD, world and visibility
+  // together. Repeated acquisitions share storage until a producer event.
+  std::shared_ptr<const NativeSceneSources> AcquireSnapshot() const {
+    if(!snapshot_) {
+      auto result=std::make_shared<NativeSceneSources>();
+      result->owners_=owners_; result->parts_=parts_; result->groups_=groups_;
+      result->group_revision_=group_revision_; result->next_=next_;
+      snapshot_=std::move(result);
+    }
+    return snapshot_;
+  }
   struct Part {
     uint32_t instance=0,lod=0,part=0,world_data=0,group=0;
+    std::optional<uint32_t> world_first;
     bool operator==(const Part&) const=default;
   };
   struct Source {
     uint64_t generation=0;
     uint32_t owner=0,lod=0,part=0,world_data=0;
+    std::optional<uint32_t> world_first;
     bool operator==(const Source&) const=default;
   };
   struct Group {
@@ -36,12 +50,14 @@ class NativeSceneSources {
   uint64_t Born(uint32_t owner) {
     if(!owner || next_==UINT64_MAX) throw std::runtime_error("invalid native scene source lifetime");
     Retire(owner);
+    snapshot_.reset();
     owners_.emplace(owner,Owner{next_++,{}});
     return owners_.at(owner).generation;
   }
   bool Retire(uint32_t owner) {
     const auto found=owners_.find(owner);
     if(found==owners_.end()) return false;
+    snapshot_.reset();
     for(const auto& part:found->second.parts) { RemoveGroupPart(part); parts_.erase(part.instance); }
     owners_.erase(found); return true;
   }
@@ -54,13 +70,14 @@ class NativeSceneSources {
     for(const auto& part:parts) {
       if(part.lod>=3) throw std::runtime_error("invalid native static LOD");
       lod_parts[part.lod].push_back(part);
-      if(!part.instance || !replacements.emplace(part.instance,Source{found->second.generation,owner,part.lod,part.part,part.world_data}).second)
+      if(!part.instance || !replacements.emplace(part.instance,Source{found->second.generation,owner,part.lod,part.part,part.world_data,part.world_first}).second)
         throw std::runtime_error("duplicate native scene source part");
       const auto existing=parts_.find(part.instance);
       if(existing!=parts_.end() && existing->second.owner!=owner)
         throw std::runtime_error("native scene part has two live owners");
     }
     std::vector<Part> retained(parts.begin(),parts.end());
+    snapshot_.reset();
     for(const auto& old:found->second.parts) { RemoveGroupPart(old); parts_.erase(old.instance); }
     parts_.merge(replacements);
     for(const auto& part:retained) if(part.group) {
@@ -92,8 +109,10 @@ class NativeSceneSources {
   bool PublishVisibility(uint32_t owner,const NativeSceneVisibility& visibility) {
     const auto found=owners_.find(owner);
     if(found==owners_.end()) return false;
-    if(!found->second.visibility || *found->second.visibility!=visibility)
+    if(!found->second.visibility || *found->second.visibility!=visibility) {
+      snapshot_.reset();
       found->second.visibility=std::make_shared<const NativeSceneVisibility>(visibility);
+    }
     return true;
   }
   std::shared_ptr<const NativeSceneVisibility> Visibility(uint32_t owner) const {
@@ -103,8 +122,10 @@ class NativeSceneSources {
   bool PublishWorld(uint32_t owner,const World& registers) {
     const auto found=owners_.find(owner);
     if(found==owners_.end()) return false;
-    if(!found->second.world || *found->second.world!=registers)
+    if(!found->second.world || *found->second.world!=registers) {
+      snapshot_.reset();
       found->second.world=std::make_shared<const World>(registers);
+    }
     return true;
   }
   std::shared_ptr<const World> WorldRegisters(const Source& source,uint32_t data) const {
@@ -116,6 +137,7 @@ class NativeSceneSources {
   size_t owners() const { return owners_.size(); }
   size_t parts() const { return parts_.size(); }
  private:
+  mutable std::shared_ptr<const NativeSceneSources> snapshot_;
   struct Owner {
     uint64_t generation; std::vector<Part> parts; std::shared_ptr<const World> world;
     std::array<std::vector<Part>,3> lod_parts;
@@ -150,8 +172,13 @@ std::vector<NativeSceneSources::Part> ReadNativeStaticSceneParts(const Reader& r
     if(range[0]!=range[1]) reader.Bytes(range[0],range[1]-range[0]);
     const auto parameter=reader.Word(reader.Add(owner,436+lod*44));
     const auto world_data=parameter?reader.Word(reader.Add(parameter,4)):0;
-    for(uint32_t at=range[0],part=0;at<range[1];at+=28,++part)
-      parts.push_back({at,lod,part,world_data,reader.Word(reader.Add(at,8))});
+    for(uint32_t at=range[0],part=0;at<range[1];at+=28,++part) {
+      NativeSceneSources::Part value{at,lod,part,world_data,reader.Word(reader.Add(at,8))};
+      const auto parameters=ReadInstanceParameters(reader,at);
+      if(world_data && parameters.size()==1 && parameters[0].count==4 && parameters[0].data==world_data)
+        value.world_first=parameters[0].first;
+      parts.push_back(std::move(value));
+    }
   }
   return parts;
 }

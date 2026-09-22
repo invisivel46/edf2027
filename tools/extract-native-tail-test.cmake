@@ -1,6 +1,7 @@
 # Build a test fixture from the actual generated routines, not a hand-written
 # imitation. Generated game code stays in the build directory.
 set(result "// Generated native-tail test fixture. Do not edit.\n")
+string(APPEND result "#include \"native_graphics/native_scene_execution.h\"\nnamespace edf::native { void EnterNativeSceneBoundary(NativeSceneBoundary); }\n")
 set(enclosing_items "66:sub_8214ECD8" "74:sub_82134408" "46:sub_821E8740")
 list(APPEND enclosing_items "32:sub_8213AD70")
 list(APPEND enclosing_items "25:sub_821EA320")
@@ -12,6 +13,9 @@ list(APPEND enclosing_items "24:sub_82134958" "76:sub_82134A78")
 list(APPEND enclosing_items "32:sub_8212FC28")
 list(APPEND enclosing_items "41:sub_8212F4B8")
 list(APPEND enclosing_items "40:sub_82149A90" "60:sub_8214B0A0")
+list(APPEND enclosing_items "80:sub_82137410" "31:sub_821375C0")
+list(APPEND enclosing_items "38:sub_821B8E48" "31:sub_82149248" "53:sub_82149358")
+list(APPEND enclosing_items "60:sub_821D9600")
 list(APPEND enclosing_items "50:sub_821498C8" "35:sub_82149608")
 list(APPEND enclosing_items "33:sub_82147BA0" "63:sub_82149AB0")
 list(APPEND enclosing_items "5:sub_821BC588" "70:sub_821BC430")
@@ -129,6 +133,7 @@ string(SUBSTRING "${lock_tail}" 0 ${lock_end} lock_body)
 string(REPLACE "REX_HOOK_RAW(sub_82134408)" "DEFINE_REX_FUNC(edf_test_native_resource_lock)" lock_body "${lock_body}")
 string(REPLACE "REXCVAR_GET(edf_native_shader_bridge)" "edf_test_texture_native()" lock_body "${lock_body}")
 string(APPEND result "\n#include <rex/logging.h>\nbool edf_test_texture_native();\nREX_EXTERN(__imp__sub_82134408);\nREX_EXTERN(__imp__edf_native_buffer_lock_cpu_tail);\n${lock_body}\n")
+string(APPEND result "\nstruct EdfTestBindingReader { uint8_t* base; uint32_t Add(uint32_t a,uint32_t b) const { return a+b; } uint32_t Word(uint32_t a) const { return REX_LOAD_U32(a); } void StoreWord(uint32_t a,uint32_t v) const { REX_STORE_U32(a,v); } };\n")
 foreach(name sub_82149A90 sub_8214B0A0 sub_821498C8 sub_82149608 sub_82147BA0 sub_82149AB0)
     string(FIND "${bridge}" "REX_HOOK_RAW(${name}) {" begin)
     if(begin LESS 0)
@@ -142,6 +147,18 @@ foreach(name sub_82149A90 sub_8214B0A0 sub_821498C8 sub_82149608 sub_82147BA0 su
     math(EXPR end "${end}+2")
     string(SUBSTRING "${tail}" 0 ${end} body)
     string(REPLACE "REX_HOOK_RAW(${name})" "DEFINE_REX_FUNC(edf_test_${name})" body "${body}")
+    # These publication tests compare the compatibility branch with retail.
+    # Native shader retirement/default semantics have their own binding suite.
+    # Keep an explicit rejecting provider so accidentally selecting that branch
+    # cannot silently turn this fixture into evidence for native activation.
+    string(REPLACE "REXCVAR_GET(edf_native_shader_bridge)" "false" body "${body}")
+    string(REPLACE "REXCVAR_GET(edf_native_material_activation)" "false" body "${body}")
+    # The extracted publication fixture deliberately selects compatibility;
+    # production group eligibility is tested through the shared preflight.
+    string(REPLACE "(!edf::native::native_queued_scene_group || !edf::native::native_queued_scene_group->material_compatibility_only)" "true" body "${body}")
+    string(REPLACE "BindNativeShaderResource" "edf_test_unexpected_native_shader_binding" body "${body}")
+    string(REPLACE "edf::native::GuestReader" "EdfTestBindingReader" body "${body}")
+    string(APPEND result "\nvoid edf_test_unexpected_native_shader_binding(PPCContext&,uint8_t*,bool);\n")
     string(REPLACE "PublishNativeDeclarationBinding" "edf_test_declaration_binding" body "${body}")
     string(REPLACE "PublishNativeShaderBinding" "edf_test_shader_binding" body "${body}")
     string(REPLACE "PublishNativeDeclarationContents" "edf_test_declaration_contents" body "${body}")

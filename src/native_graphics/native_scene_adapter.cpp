@@ -2,22 +2,23 @@
 #include "native_queued_scene.h"
 
 namespace edf::native {
-void NativeSceneAdapter::PublishGroupMaterial(uint32_t group,uint64_t revision,std::shared_ptr<const NativeSceneMaterialProgram> program) {
+void NativeSceneAdapter::PublishGroupMaterial(uint32_t group,uint64_t revision,std::shared_ptr<const NativeSceneMaterialProgram> program,
+    std::vector<NativeSceneMaterialInputs::Constant> constants) {
   if(!group || !revision || !program) throw std::runtime_error("invalid native material program publication");
   const auto previous=GroupMaterial(group,revision);
-  if(previous && previous->program==program) return;
-  group_material_programs_[group]=std::make_shared<const NativeSceneGroupMaterial>(group,revision,std::move(program));
+  if(previous && previous->program==program && previous->constants==constants) return;
+  group_material_programs_[group]=std::make_shared<const NativeSceneGroupMaterial>(group,revision,std::move(program),std::move(constants));
 }
 std::shared_ptr<const NativeSceneGroupMaterial> NativeSceneAdapter::GroupMaterial(uint32_t group,uint64_t revision) const {
   const auto found=group_material_programs_.find(group);
   return found!=group_material_programs_.end() && found->second->revision==revision?found->second:nullptr;
 }
 void NativeSceneAdapter::PublishGroupGeometry(uint32_t group,uint64_t revision,
-    std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry) {
+    std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry,std::optional<NativeSceneGeometrySource> setup) {
   if(!group || !revision || !geometry) throw std::runtime_error("invalid native scene geometry publication");
   const auto old=GroupGeometry(group,revision);
-  if(old && old->geometry==geometry) return;
-  group_geometry_[group]=std::make_shared<const NativeSceneGroupGeometry>(group,revision,std::move(geometry));
+  if(old && old->geometry==geometry && old->setup==setup) return;
+  group_geometry_[group]=std::make_shared<const NativeSceneGroupGeometry>(group,revision,std::move(geometry),std::move(setup));
 }
 std::shared_ptr<const NativeSceneGroupGeometry> NativeSceneAdapter::GroupGeometry(uint32_t group,uint64_t revision) const {
   const auto found=group_geometry_.find(group);
@@ -74,14 +75,41 @@ std::shared_ptr<const NativeSceneInstance> NativeScenePublication::Find(uint64_t
     [](const auto& instance,uint64_t key) { return instance->id<key; });
   return at!=by_id.end() && (*at)->id==id?*at:nullptr;
 }
-std::shared_ptr<const NativeScenePublication> NativeSceneAdapter::Publish(uint64_t tick) {
+std::shared_ptr<const NativeSceneInstance> NativeScenePublication::Resolve(
+    const NativeSceneSources::Source& source,
+    const std::shared_ptr<const NativeIndexedMesh::RetainedDraw>& geometry,
+    const NativeSceneMaterialCapture& capture) const {
+  const auto found=by_source.find({source.owner,source.generation,source.lod,source.part});
+  if(found==by_source.end() || !geometry || !capture.material ||
+     found->second->object.geometry!=geometry || geometry->backend()!=capture.material->backend()) return {};
+  const auto& retained=found->second;
+  if(retained->object.material==capture.material && retained->object.world==capture.world &&
+     retained->previous==capture.world) return retained;
+  auto resolved=std::make_shared<NativeSceneInstance>(*retained);
+  resolved->object.material=capture.material; resolved->object.world=capture.world;
+  // The pass already chose this exact world sample. Do not interpolate from
+  // an unrelated material capture or previous visibility observation.
+  resolved->previous=capture.world;
+  return resolved;
+}
+std::shared_ptr<const NativeScenePublication> NativeSceneAdapter::Publish(uint64_t tick,
+    std::shared_ptr<const NativeSceneSources> sources,
+    std::shared_ptr<const NativeSceneMembership::Publication> membership,
+    NativeSceneTreePublications::Images trees) {
   auto publication=std::make_shared<NativeScenePublication>();
+  publication->sources=std::move(sources);
+  publication->membership=std::move(membership);
+  publication->trees=std::move(trees);
   publication->snapshot=scene_.Publish(tick);
+  publication->world_animations=world_animations_;
+  publication->cameras=cameras_;
   for(const auto& [group,geometry]:group_geometry_) publication->group_geometry.push_back(geometry);
   for(const auto& [group,material]:group_material_programs_) publication->group_materials.push_back(material);
   publication->by_id=publication->snapshot->instances;
   std::sort(publication->by_id.begin(),publication->by_id.end(),
     [](const auto& a,const auto& b) { return a->id<b->id; });
+  for(const auto& [source,id]:objects_)
+    if(auto instance=publication->Find(id)) publication->by_source.emplace(source,std::move(instance));
   publication_.store(publication);
   return publication;
 }

@@ -5,7 +5,10 @@
 #include <vector>
 
 namespace edf::native {
-struct InstanceParameter { uint32_t data, first, count; };
+struct InstanceParameter {
+  uint32_t data, first, count;
+  bool operator==(const InstanceParameter&) const=default;
+};
 
 // Retail 821D9600: the vector lives at instance+12, with begin/end at +4/+8.
 // Reader must validate guest addresses and return big-endian words.

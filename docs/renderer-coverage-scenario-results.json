@@ -1,0 +1,15 @@
+{
+  "S01": {"status":"partially-exercised", "evidence":"out/renderer-coverage/runtime-results.json", "observation":"Both cold launches reached Mission 1 through scripted title/menu confirmations; cumulative movie, XUI and font activity recorded. No complete menu/movie visual comparison."},
+  "S02": {"status":"partially-exercised", "evidence":"out/renderer-coverage/runtime-results.json", "observation":"Both runs crossed loading into Mission 1. Direct-scene eligibility and UI activity are observed; loading pixels/progress and publication success are not fully captured."},
+  "S03": {"status":"partially-exercised", "evidence":"out/renderer-coverage/probe.output.2400.bmp; probe.output.2700.bmp; probe.output.3000.bmp; gameplay.bmp", "observation":"City, player, soldiers, civilians, large UFO, environment, HUD and changing views observed. Movement and aim delivered; cutscene-to-gameplay overlaps movement start, so exact player displacement is not isolated."},
+  "S04": {"status":"partially-exercised", "evidence":"out/renderer-coverage/probe.output.2700.bmp; probe.output.3300.bmp; runtime-results.json", "observation":"AF14 120/120 changes to Stingray M1; smoke and RELOAD appear during RT255+0x0200 probe. Weapon/fire/reload path reached. Projectile identity, effect-family coverage, zoom and reference parity are unverified."},
+  "S05": {"status":"partially-exercised", "evidence":"out/renderer-coverage/pause.bmp; probe.output.4500.bmp", "observation":"Host capture shows Pause with Return to Game/Retry/Quit/Game Settings. Later scene capture shows gameplay without pause. Simulation freeze and complete-frame reference parity not measured."},
+  "S06": {"status":"not-exercised", "evidence":"R03.mutation; R07.environment", "observation":"No controlled destruction/removal/LOD proof."},
+  "S07": {"status":"not-exercised", "evidence":"R08.loading; R09.retirement", "observation":"Retry/quit controls visible but not selected. No reload/retry/results acceptance."},
+  "S08": {"status":"not-exercised", "evidence":"R06.families; R07.effects; R09.assets", "observation":"Only Mission 1 observed; complete enemy/vehicle/weapon/map corpus remains open."},
+  "S09": {"status":"not-exercised", "evidence":"R01.modes; R05.pass", "observation":"No multi-view/free-camera activation; intro camera observed incidentally."},
+  "S10": {"status":"not-exercised", "evidence":"R08.present; R08.ui", "observation":"Runs use 1280x720; no resize/fullscreen/aspect matrix."},
+  "S11": {"status":"not-exercised", "evidence":"R08.movie", "observation":"Movie counter activity during startup is insufficient for SD/HD playback acceptance."},
+  "S12": {"status":"not-exercised", "evidence":"R10.performance", "observation":"D3D12 with diagnostics and a 120 cap only; not a backend comparison or non-audit cadence test."},
+  "S13": {"status":"partially-exercised", "evidence":"out/renderer-coverage/targeted-tests.json", "observation":"Existing shader-binding and frame-dispatch unit executables pass. Resource failure/reuse/device loss and graceful shutdown matrix remains open."}
+}

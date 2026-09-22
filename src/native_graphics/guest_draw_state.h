@@ -102,6 +102,7 @@ struct GuestViewportWords {
   // x, y, width, height, min/max depth bits, signed scissor l/t/r/b bits.
   std::array<uint32_t,10> words;
   bool scissor_enabled;
+  bool operator==(const GuestViewportWords&) const=default;
 };
 struct GuestXuiDeviceWords {
   std::array<uint32_t,6> render;

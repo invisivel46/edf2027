@@ -1,0 +1,7506 @@
+{
+  "version": 1,
+  "source_sha256": "ce138cc07dafcc2e1e71337f73f218d311e4fce0ec97d28b720eab4433a4841f",
+  "language": "PowerPC:BE:64:64-32addr",
+  "functions": {
+    "sub_82134EB8": {
+      "instructions": [
+        {
+          "address": "82134EB8",
+          "word": "816328C8"
+        },
+        {
+          "address": "82134EBC",
+          "word": "51640038"
+        },
+        {
+          "address": "82134EC0",
+          "word": "908328C8"
+        },
+        {
+          "address": "82134EC4",
+          "word": "E9630010"
+        },
+        {
+          "address": "82134EC8",
+          "word": "616B0040"
+        },
+        {
+          "address": "82134ECC",
+          "word": "F9630010"
+        },
+        {
+          "address": "82134ED0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82134ED8": {
+      "instructions": [
+        {
+          "address": "82134ED8",
+          "word": "816328C8"
+        },
+        {
+          "address": "82134EDC",
+          "word": "5563077E"
+        },
+        {
+          "address": "82134EE0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82134EE8": {
+      "instructions": [
+        {
+          "address": "82134EE8",
+          "word": "816328C8"
+        },
+        {
+          "address": "82134EEC",
+          "word": "508B1D78"
+        },
+        {
+          "address": "82134EF0",
+          "word": "916328C8"
+        },
+        {
+          "address": "82134EF4",
+          "word": "E9630010"
+        },
+        {
+          "address": "82134EF8",
+          "word": "616B0040"
+        },
+        {
+          "address": "82134EFC",
+          "word": "F9630010"
+        },
+        {
+          "address": "82134F00",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82134F08": {
+      "instructions": [
+        {
+          "address": "82134F08",
+          "word": "816328C8"
+        },
+        {
+          "address": "82134F0C",
+          "word": "5563EE3E"
+        },
+        {
+          "address": "82134F10",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82134F18": {
+      "instructions": [
+        {
+          "address": "82134F18",
+          "word": "816328BC"
+        },
+        {
+          "address": "82134F1C",
+          "word": "39800001"
+        },
+        {
+          "address": "82134F20",
+          "word": "508B1F38"
+        },
+        {
+          "address": "82134F24",
+          "word": "798C97E6"
+        },
+        {
+          "address": "82134F28",
+          "word": "916328BC"
+        },
+        {
+          "address": "82134F2C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82134F30",
+          "word": "616B0200"
+        },
+        {
+          "address": "82134F34",
+          "word": "F9630010"
+        },
+        {
+          "address": "82134F38",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82134F3C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82134F40",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82134F48": {
+      "instructions": [
+        {
+          "address": "82134F48",
+          "word": "816328BC"
+        },
+        {
+          "address": "82134F4C",
+          "word": "5563EFFE"
+        },
+        {
+          "address": "82134F50",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82134F58": {
+      "instructions": [
+        {
+          "address": "82134F58",
+          "word": "81632D3C"
+        },
+        {
+          "address": "82134F5C",
+          "word": "508BF800"
+        },
+        {
+          "address": "82134F60",
+          "word": "91632D3C"
+        },
+        {
+          "address": "82134F64",
+          "word": "556A0043"
+        },
+        {
+          "address": "82134F68",
+          "word": "81632D38"
+        },
+        {
+          "address": "82134F6C",
+          "word": "40820024"
+        },
+        {
+          "address": "82134F70",
+          "word": "556B043E"
+        },
+        {
+          "address": "82134F74",
+          "word": "55692036"
+        },
+        {
+          "address": "82134F78",
+          "word": "716A1010"
+        },
+        {
+          "address": "82134F7C",
+          "word": "7D4A4B78"
+        },
+        {
+          "address": "82134F80",
+          "word": "554A601E"
+        },
+        {
+          "address": "82134F84",
+          "word": "554A0314"
+        },
+        {
+          "address": "82134F88",
+          "word": "554A0104"
+        },
+        {
+          "address": "82134F8C",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82134F90",
+          "word": "2F040000"
+        },
+        {
+          "address": "82134F94",
+          "word": "409A000C"
+        },
+        {
+          "address": "82134F98",
+          "word": "3D600001"
+        },
+        {
+          "address": "82134F9C",
+          "word": "616B0001"
+        },
+        {
+          "address": "82134FA0",
+          "word": "916328B8"
+        },
+        {
+          "address": "82134FA4",
+          "word": "916328D8"
+        },
+        {
+          "address": "82134FA8",
+          "word": "916328DC"
+        },
+        {
+          "address": "82134FAC",
+          "word": "916328E0"
+        },
+        {
+          "address": "82134FB0",
+          "word": "E9630010"
+        },
+        {
+          "address": "82134FB4",
+          "word": "616B0400"
+        },
+        {
+          "address": "82134FB8",
+          "word": "F9630010"
+        },
+        {
+          "address": "82134FBC",
+          "word": "616B0004"
+        },
+        {
+          "address": "82134FC0",
+          "word": "F9630010"
+        },
+        {
+          "address": "82134FC4",
+          "word": "616B0002"
+        },
+        {
+          "address": "82134FC8",
+          "word": "F9630010"
+        },
+        {
+          "address": "82134FCC",
+          "word": "616B0001"
+        },
+        {
+          "address": "82134FD0",
+          "word": "F9630010"
+        },
+        {
+          "address": "82134FD4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82134FD8": {
+      "instructions": [
+        {
+          "address": "82134FD8",
+          "word": "81632D3C"
+        },
+        {
+          "address": "82134FDC",
+          "word": "55630FFE"
+        },
+        {
+          "address": "82134FE0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82134FE8": {
+      "instructions": [
+        {
+          "address": "82134FE8",
+          "word": "81632D3C"
+        },
+        {
+          "address": "82134FEC",
+          "word": "81432D38"
+        },
+        {
+          "address": "82134FF0",
+          "word": "508A2E34"
+        },
+        {
+          "address": "82134FF4",
+          "word": "91432D38"
+        },
+        {
+          "address": "82134FF8",
+          "word": "55690001"
+        },
+        {
+          "address": "82134FFC",
+          "word": "4D820020"
+        },
+        {
+          "address": "82135000",
+          "word": "556A0043"
+        },
+        {
+          "address": "82135004",
+          "word": "81632D38"
+        },
+        {
+          "address": "82135008",
+          "word": "40820024"
+        },
+        {
+          "address": "8213500C",
+          "word": "556B043E"
+        },
+        {
+          "address": "82135010",
+          "word": "55692036"
+        },
+        {
+          "address": "82135014",
+          "word": "716A1010"
+        },
+        {
+          "address": "82135018",
+          "word": "7D4A4B78"
+        },
+        {
+          "address": "8213501C",
+          "word": "554A601E"
+        },
+        {
+          "address": "82135020",
+          "word": "554A0314"
+        },
+        {
+          "address": "82135024",
+          "word": "554A0104"
+        },
+        {
+          "address": "82135028",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "8213502C",
+          "word": "916328B8"
+        },
+        {
+          "address": "82135030",
+          "word": "916328D8"
+        },
+        {
+          "address": "82135034",
+          "word": "916328DC"
+        },
+        {
+          "address": "82135038",
+          "word": "916328E0"
+        },
+        {
+          "address": "8213503C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135040",
+          "word": "616B0400"
+        },
+        {
+          "address": "82135044",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135048",
+          "word": "616B0004"
+        },
+        {
+          "address": "8213504C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135050",
+          "word": "616B0002"
+        },
+        {
+          "address": "82135054",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135058",
+          "word": "616B0001"
+        },
+        {
+          "address": "8213505C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135060",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135068": {
+      "instructions": [
+        {
+          "address": "82135068",
+          "word": "81632D38"
+        },
+        {
+          "address": "8213506C",
+          "word": "5563DF7E"
+        },
+        {
+          "address": "82135070",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135078": {
+      "instructions": [
+        {
+          "address": "82135078",
+          "word": "81632D3C"
+        },
+        {
+          "address": "8213507C",
+          "word": "81432D38"
+        },
+        {
+          "address": "82135080",
+          "word": "508A06FE"
+        },
+        {
+          "address": "82135084",
+          "word": "91432D38"
+        },
+        {
+          "address": "82135088",
+          "word": "55690001"
+        },
+        {
+          "address": "8213508C",
+          "word": "4D820020"
+        },
+        {
+          "address": "82135090",
+          "word": "556A0043"
+        },
+        {
+          "address": "82135094",
+          "word": "81632D38"
+        },
+        {
+          "address": "82135098",
+          "word": "40820024"
+        },
+        {
+          "address": "8213509C",
+          "word": "556B043E"
+        },
+        {
+          "address": "821350A0",
+          "word": "55692036"
+        },
+        {
+          "address": "821350A4",
+          "word": "716A1010"
+        },
+        {
+          "address": "821350A8",
+          "word": "7D4A4B78"
+        },
+        {
+          "address": "821350AC",
+          "word": "554A601E"
+        },
+        {
+          "address": "821350B0",
+          "word": "554A0314"
+        },
+        {
+          "address": "821350B4",
+          "word": "554A0104"
+        },
+        {
+          "address": "821350B8",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "821350BC",
+          "word": "916328B8"
+        },
+        {
+          "address": "821350C0",
+          "word": "916328D8"
+        },
+        {
+          "address": "821350C4",
+          "word": "916328DC"
+        },
+        {
+          "address": "821350C8",
+          "word": "916328E0"
+        },
+        {
+          "address": "821350CC",
+          "word": "E9630010"
+        },
+        {
+          "address": "821350D0",
+          "word": "616B0400"
+        },
+        {
+          "address": "821350D4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821350D8",
+          "word": "616B0004"
+        },
+        {
+          "address": "821350DC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821350E0",
+          "word": "616B0002"
+        },
+        {
+          "address": "821350E4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821350E8",
+          "word": "616B0001"
+        },
+        {
+          "address": "821350EC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821350F0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821350F8": {
+      "instructions": [
+        {
+          "address": "821350F8",
+          "word": "81632D38"
+        },
+        {
+          "address": "821350FC",
+          "word": "556306FE"
+        },
+        {
+          "address": "82135100",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135108": {
+      "instructions": [
+        {
+          "address": "82135108",
+          "word": "81632D3C"
+        },
+        {
+          "address": "8213510C",
+          "word": "81432D38"
+        },
+        {
+          "address": "82135110",
+          "word": "508A44EE"
+        },
+        {
+          "address": "82135114",
+          "word": "91432D38"
+        },
+        {
+          "address": "82135118",
+          "word": "55690001"
+        },
+        {
+          "address": "8213511C",
+          "word": "4D820020"
+        },
+        {
+          "address": "82135120",
+          "word": "556A0043"
+        },
+        {
+          "address": "82135124",
+          "word": "81632D38"
+        },
+        {
+          "address": "82135128",
+          "word": "40820024"
+        },
+        {
+          "address": "8213512C",
+          "word": "556B043E"
+        },
+        {
+          "address": "82135130",
+          "word": "55692036"
+        },
+        {
+          "address": "82135134",
+          "word": "716A1010"
+        },
+        {
+          "address": "82135138",
+          "word": "7D4A4B78"
+        },
+        {
+          "address": "8213513C",
+          "word": "554A601E"
+        },
+        {
+          "address": "82135140",
+          "word": "554A0314"
+        },
+        {
+          "address": "82135144",
+          "word": "554A0104"
+        },
+        {
+          "address": "82135148",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "8213514C",
+          "word": "916328B8"
+        },
+        {
+          "address": "82135150",
+          "word": "916328D8"
+        },
+        {
+          "address": "82135154",
+          "word": "916328DC"
+        },
+        {
+          "address": "82135158",
+          "word": "916328E0"
+        },
+        {
+          "address": "8213515C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135160",
+          "word": "616B0400"
+        },
+        {
+          "address": "82135164",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135168",
+          "word": "616B0004"
+        },
+        {
+          "address": "8213516C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135170",
+          "word": "616B0002"
+        },
+        {
+          "address": "82135174",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135178",
+          "word": "616B0001"
+        },
+        {
+          "address": "8213517C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135180",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135188": {
+      "instructions": [
+        {
+          "address": "82135188",
+          "word": "81632D38"
+        },
+        {
+          "address": "8213518C",
+          "word": "5563C6FE"
+        },
+        {
+          "address": "82135190",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135198": {
+      "instructions": [
+        {
+          "address": "82135198",
+          "word": "81632D3C"
+        },
+        {
+          "address": "8213519C",
+          "word": "81432D38"
+        },
+        {
+          "address": "821351A0",
+          "word": "508AAA14"
+        },
+        {
+          "address": "821351A4",
+          "word": "91432D38"
+        },
+        {
+          "address": "821351A8",
+          "word": "55690001"
+        },
+        {
+          "address": "821351AC",
+          "word": "4D820020"
+        },
+        {
+          "address": "821351B0",
+          "word": "556B0043"
+        },
+        {
+          "address": "821351B4",
+          "word": "4D820020"
+        },
+        {
+          "address": "821351B8",
+          "word": "554B003E"
+        },
+        {
+          "address": "821351BC",
+          "word": "916328B8"
+        },
+        {
+          "address": "821351C0",
+          "word": "916328D8"
+        },
+        {
+          "address": "821351C4",
+          "word": "916328DC"
+        },
+        {
+          "address": "821351C8",
+          "word": "916328E0"
+        },
+        {
+          "address": "821351CC",
+          "word": "E9630010"
+        },
+        {
+          "address": "821351D0",
+          "word": "616B0400"
+        },
+        {
+          "address": "821351D4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821351D8",
+          "word": "616B0004"
+        },
+        {
+          "address": "821351DC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821351E0",
+          "word": "616B0002"
+        },
+        {
+          "address": "821351E4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821351E8",
+          "word": "616B0001"
+        },
+        {
+          "address": "821351EC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821351F0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821351F8": {
+      "instructions": [
+        {
+          "address": "821351F8",
+          "word": "81632D38"
+        },
+        {
+          "address": "821351FC",
+          "word": "55635F7E"
+        },
+        {
+          "address": "82135200",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135208": {
+      "instructions": [
+        {
+          "address": "82135208",
+          "word": "81632D3C"
+        },
+        {
+          "address": "8213520C",
+          "word": "81432D38"
+        },
+        {
+          "address": "82135210",
+          "word": "508A82DE"
+        },
+        {
+          "address": "82135214",
+          "word": "91432D38"
+        },
+        {
+          "address": "82135218",
+          "word": "55690001"
+        },
+        {
+          "address": "8213521C",
+          "word": "4D820020"
+        },
+        {
+          "address": "82135220",
+          "word": "556B0043"
+        },
+        {
+          "address": "82135224",
+          "word": "4D820020"
+        },
+        {
+          "address": "82135228",
+          "word": "554B003E"
+        },
+        {
+          "address": "8213522C",
+          "word": "916328B8"
+        },
+        {
+          "address": "82135230",
+          "word": "916328D8"
+        },
+        {
+          "address": "82135234",
+          "word": "916328DC"
+        },
+        {
+          "address": "82135238",
+          "word": "916328E0"
+        },
+        {
+          "address": "8213523C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135240",
+          "word": "616B0400"
+        },
+        {
+          "address": "82135244",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135248",
+          "word": "616B0004"
+        },
+        {
+          "address": "8213524C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135250",
+          "word": "616B0002"
+        },
+        {
+          "address": "82135254",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135258",
+          "word": "616B0001"
+        },
+        {
+          "address": "8213525C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135260",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135268": {
+      "instructions": [
+        {
+          "address": "82135268",
+          "word": "A1632D38"
+        },
+        {
+          "address": "8213526C",
+          "word": "556306FE"
+        },
+        {
+          "address": "82135270",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135278": {
+      "instructions": [
+        {
+          "address": "82135278",
+          "word": "81632D3C"
+        },
+        {
+          "address": "8213527C",
+          "word": "81432D38"
+        },
+        {
+          "address": "82135280",
+          "word": "508AC0CE"
+        },
+        {
+          "address": "82135284",
+          "word": "91432D38"
+        },
+        {
+          "address": "82135288",
+          "word": "55690001"
+        },
+        {
+          "address": "8213528C",
+          "word": "4D820020"
+        },
+        {
+          "address": "82135290",
+          "word": "556B0043"
+        },
+        {
+          "address": "82135294",
+          "word": "4D820020"
+        },
+        {
+          "address": "82135298",
+          "word": "554B003E"
+        },
+        {
+          "address": "8213529C",
+          "word": "916328B8"
+        },
+        {
+          "address": "821352A0",
+          "word": "916328D8"
+        },
+        {
+          "address": "821352A4",
+          "word": "916328DC"
+        },
+        {
+          "address": "821352A8",
+          "word": "916328E0"
+        },
+        {
+          "address": "821352AC",
+          "word": "E9630010"
+        },
+        {
+          "address": "821352B0",
+          "word": "616B0400"
+        },
+        {
+          "address": "821352B4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821352B8",
+          "word": "616B0004"
+        },
+        {
+          "address": "821352BC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821352C0",
+          "word": "616B0002"
+        },
+        {
+          "address": "821352C4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821352C8",
+          "word": "616B0001"
+        },
+        {
+          "address": "821352CC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821352D0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821352D8": {
+      "instructions": [
+        {
+          "address": "821352D8",
+          "word": "89632D38"
+        },
+        {
+          "address": "821352DC",
+          "word": "556306FE"
+        },
+        {
+          "address": "821352E0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821352E8": {
+      "instructions": [
+        {
+          "address": "821352E8",
+          "word": "81632D3C"
+        },
+        {
+          "address": "821352EC",
+          "word": "2F040000"
+        },
+        {
+          "address": "821352F0",
+          "word": "508BF042"
+        },
+        {
+          "address": "821352F4",
+          "word": "556A0FFE"
+        },
+        {
+          "address": "821352F8",
+          "word": "91632D3C"
+        },
+        {
+          "address": "821352FC",
+          "word": "81632D38"
+        },
+        {
+          "address": "82135300",
+          "word": "409A0024"
+        },
+        {
+          "address": "82135304",
+          "word": "556B043E"
+        },
+        {
+          "address": "82135308",
+          "word": "55682036"
+        },
+        {
+          "address": "8213530C",
+          "word": "71691010"
+        },
+        {
+          "address": "82135310",
+          "word": "7D294378"
+        },
+        {
+          "address": "82135314",
+          "word": "5529601E"
+        },
+        {
+          "address": "82135318",
+          "word": "55290314"
+        },
+        {
+          "address": "8213531C",
+          "word": "55290104"
+        },
+        {
+          "address": "82135320",
+          "word": "7D2B5B78"
+        },
+        {
+          "address": "82135324",
+          "word": "2F0A0000"
+        },
+        {
+          "address": "82135328",
+          "word": "409A000C"
+        },
+        {
+          "address": "8213532C",
+          "word": "3D600001"
+        },
+        {
+          "address": "82135330",
+          "word": "616B0001"
+        },
+        {
+          "address": "82135334",
+          "word": "916328B8"
+        },
+        {
+          "address": "82135338",
+          "word": "916328D8"
+        },
+        {
+          "address": "8213533C",
+          "word": "916328DC"
+        },
+        {
+          "address": "82135340",
+          "word": "916328E0"
+        },
+        {
+          "address": "82135344",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135348",
+          "word": "616B0400"
+        },
+        {
+          "address": "8213534C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135350",
+          "word": "616B0004"
+        },
+        {
+          "address": "82135354",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135358",
+          "word": "616B0002"
+        },
+        {
+          "address": "8213535C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135360",
+          "word": "616B0001"
+        },
+        {
+          "address": "82135364",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135368",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135370": {
+      "instructions": [
+        {
+          "address": "82135370",
+          "word": "81632D3C"
+        },
+        {
+          "address": "82135374",
+          "word": "556317FE"
+        },
+        {
+          "address": "82135378",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135380": {
+      "instructions": [
+        {
+          "address": "82135380",
+          "word": "788B0020"
+        },
+        {
+          "address": "82135384",
+          "word": "F961FFF0"
+        },
+        {
+          "address": "82135388",
+          "word": "3D608201"
+        },
+        {
+          "address": "8213538C",
+          "word": "C801FFF0"
+        },
+        {
+          "address": "82135390",
+          "word": "FC00069C"
+        },
+        {
+          "address": "82135394",
+          "word": "FDA00018"
+        },
+        {
+          "address": "82135398",
+          "word": "C00B964C"
+        },
+        {
+          "address": "8213539C",
+          "word": "EC0D0032"
+        },
+        {
+          "address": "821353A0",
+          "word": "D0032884"
+        },
+        {
+          "address": "821353A4",
+          "word": "E9630018"
+        },
+        {
+          "address": "821353A8",
+          "word": "616B0100"
+        },
+        {
+          "address": "821353AC",
+          "word": "F9630018"
+        },
+        {
+          "address": "821353B0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821353B8": {
+      "instructions": [
+        {
+          "address": "821353B8",
+          "word": "3D608201"
+        },
+        {
+          "address": "821353BC",
+          "word": "C1832884"
+        },
+        {
+          "address": "821353C0",
+          "word": "3941FFF0"
+        },
+        {
+          "address": "821353C4",
+          "word": "C00B9650"
+        },
+        {
+          "address": "821353C8",
+          "word": "3D608200"
+        },
+        {
+          "address": "821353CC",
+          "word": "C1AB08D4"
+        },
+        {
+          "address": "821353D0",
+          "word": "EC0C683A"
+        },
+        {
+          "address": "821353D4",
+          "word": "FC00065E"
+        },
+        {
+          "address": "821353D8",
+          "word": "7C0057AE"
+        },
+        {
+          "address": "821353DC",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "821353E0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821353E8": {
+      "instructions": [
+        {
+          "address": "821353E8",
+          "word": "816328BC"
+        },
+        {
+          "address": "821353EC",
+          "word": "51640038"
+        },
+        {
+          "address": "821353F0",
+          "word": "908328BC"
+        },
+        {
+          "address": "821353F4",
+          "word": "E9630010"
+        },
+        {
+          "address": "821353F8",
+          "word": "616B0200"
+        },
+        {
+          "address": "821353FC",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135400",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135408": {
+      "instructions": [
+        {
+          "address": "82135408",
+          "word": "816328BC"
+        },
+        {
+          "address": "8213540C",
+          "word": "5563077E"
+        },
+        {
+          "address": "82135410",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135418": {
+      "instructions": [
+        {
+          "address": "82135418",
+          "word": "548AC63E"
+        },
+        {
+          "address": "8213541C",
+          "word": "548B863E"
+        },
+        {
+          "address": "82135420",
+          "word": "5488463E"
+        },
+        {
+          "address": "82135424",
+          "word": "794A0020"
+        },
+        {
+          "address": "82135428",
+          "word": "796B0020"
+        },
+        {
+          "address": "8213542C",
+          "word": "78890620"
+        },
+        {
+          "address": "82135430",
+          "word": "79080020"
+        },
+        {
+          "address": "82135434",
+          "word": "F941FFE8"
+        },
+        {
+          "address": "82135438",
+          "word": "F961FFE0"
+        },
+        {
+          "address": "8213543C",
+          "word": "3D608201"
+        },
+        {
+          "address": "82135440",
+          "word": "F921FFF0"
+        },
+        {
+          "address": "82135444",
+          "word": "F901FFF8"
+        },
+        {
+          "address": "82135448",
+          "word": "C9A1FFE8"
+        },
+        {
+          "address": "8213544C",
+          "word": "C801FFE0"
+        },
+        {
+          "address": "82135450",
+          "word": "FDA06E9C"
+        },
+        {
+          "address": "82135454",
+          "word": "C981FFF0"
+        },
+        {
+          "address": "82135458",
+          "word": "FC00069C"
+        },
+        {
+          "address": "8213545C",
+          "word": "C961FFF8"
+        },
+        {
+          "address": "82135460",
+          "word": "FD80669C"
+        },
+        {
+          "address": "82135464",
+          "word": "FD605E9C"
+        },
+        {
+          "address": "82135468",
+          "word": "FDA06818"
+        },
+        {
+          "address": "8213546C",
+          "word": "FD400018"
+        },
+        {
+          "address": "82135470",
+          "word": "C00B964C"
+        },
+        {
+          "address": "82135474",
+          "word": "FD806018"
+        },
+        {
+          "address": "82135478",
+          "word": "FD605818"
+        },
+        {
+          "address": "8213547C",
+          "word": "EDAD0032"
+        },
+        {
+          "address": "82135480",
+          "word": "D1A32864"
+        },
+        {
+          "address": "82135484",
+          "word": "ED4A0032"
+        },
+        {
+          "address": "82135488",
+          "word": "D1432860"
+        },
+        {
+          "address": "8213548C",
+          "word": "EDAC0032"
+        },
+        {
+          "address": "82135490",
+          "word": "D1A32868"
+        },
+        {
+          "address": "82135494",
+          "word": "EC0B0032"
+        },
+        {
+          "address": "82135498",
+          "word": "D003286C"
+        },
+        {
+          "address": "8213549C",
+          "word": "E9630018"
+        },
+        {
+          "address": "821354A0",
+          "word": "656B0003"
+        },
+        {
+          "address": "821354A4",
+          "word": "616BC000"
+        },
+        {
+          "address": "821354A8",
+          "word": "F9630018"
+        },
+        {
+          "address": "821354AC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821354B0": {
+      "instructions": [
+        {
+          "address": "821354B0",
+          "word": "3D608201"
+        },
+        {
+          "address": "821354B4",
+          "word": "C1832860"
+        },
+        {
+          "address": "821354B8",
+          "word": "3941FFF0"
+        },
+        {
+          "address": "821354BC",
+          "word": "C163286C"
+        },
+        {
+          "address": "821354C0",
+          "word": "C1432864"
+        },
+        {
+          "address": "821354C4",
+          "word": "C1232868"
+        },
+        {
+          "address": "821354C8",
+          "word": "C00B9650"
+        },
+        {
+          "address": "821354CC",
+          "word": "3D608200"
+        },
+        {
+          "address": "821354D0",
+          "word": "C1AB08D4"
+        },
+        {
+          "address": "821354D4",
+          "word": "ED8C683A"
+        },
+        {
+          "address": "821354D8",
+          "word": "ED4A683A"
+        },
+        {
+          "address": "821354DC",
+          "word": "ED6B683A"
+        },
+        {
+          "address": "821354E0",
+          "word": "EC09683A"
+        },
+        {
+          "address": "821354E4",
+          "word": "FDA0665E"
+        },
+        {
+          "address": "821354E8",
+          "word": "7DA057AE"
+        },
+        {
+          "address": "821354EC",
+          "word": "FD80565E"
+        },
+        {
+          "address": "821354F0",
+          "word": "FDA05E5E"
+        },
+        {
+          "address": "821354F4",
+          "word": "FC00065E"
+        },
+        {
+          "address": "821354F8",
+          "word": "8161FFF0"
+        },
+        {
+          "address": "821354FC",
+          "word": "3941FFF0"
+        },
+        {
+          "address": "82135500",
+          "word": "7DA057AE"
+        },
+        {
+          "address": "82135504",
+          "word": "8141FFF0"
+        },
+        {
+          "address": "82135508",
+          "word": "3921FFF0"
+        },
+        {
+          "address": "8213550C",
+          "word": "514B402E"
+        },
+        {
+          "address": "82135510",
+          "word": "7D804FAE"
+        },
+        {
+          "address": "82135514",
+          "word": "8141FFF0"
+        },
+        {
+          "address": "82135518",
+          "word": "3921FFF0"
+        },
+        {
+          "address": "8213551C",
+          "word": "516A402E"
+        },
+        {
+          "address": "82135520",
+          "word": "7C004FAE"
+        },
+        {
+          "address": "82135524",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "82135528",
+          "word": "5143402E"
+        },
+        {
+          "address": "8213552C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135530": {
+      "instructions": [
+        {
+          "address": "82135530",
+          "word": "81632F98"
+        },
+        {
+          "address": "82135534",
+          "word": "90832D54"
+        },
+        {
+          "address": "82135538",
+          "word": "2B0B0000"
+        },
+        {
+          "address": "8213553C",
+          "word": "409A0008"
+        },
+        {
+          "address": "82135540",
+          "word": "38800000"
+        },
+        {
+          "address": "82135544",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135548",
+          "word": "39800001"
+        },
+        {
+          "address": "8213554C",
+          "word": "508B0FBC"
+        },
+        {
+          "address": "82135550",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "82135554",
+          "word": "916328B4"
+        },
+        {
+          "address": "82135558",
+          "word": "E9630010"
+        },
+        {
+          "address": "8213555C",
+          "word": "616B0800"
+        },
+        {
+          "address": "82135560",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135564",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135568",
+          "word": "F9630010"
+        },
+        {
+          "address": "8213556C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135570": {
+      "instructions": [
+        {
+          "address": "82135570",
+          "word": "80632D54"
+        },
+        {
+          "address": "82135574",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135578": {
+      "instructions": [
+        {
+          "address": "82135578",
+          "word": "816328B4"
+        },
+        {
+          "address": "8213557C",
+          "word": "508B177A"
+        },
+        {
+          "address": "82135580",
+          "word": "916328B4"
+        },
+        {
+          "address": "82135584",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135588",
+          "word": "616B0800"
+        },
+        {
+          "address": "8213558C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135590",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135598": {
+      "instructions": [
+        {
+          "address": "82135598",
+          "word": "816328B4"
+        },
+        {
+          "address": "8213559C",
+          "word": "5563F7FE"
+        },
+        {
+          "address": "821355A0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821355A8": {
+      "instructions": [
+        {
+          "address": "821355A8",
+          "word": "816328B4"
+        },
+        {
+          "address": "821355AC",
+          "word": "39800001"
+        },
+        {
+          "address": "821355B0",
+          "word": "508B2676"
+        },
+        {
+          "address": "821355B4",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "821355B8",
+          "word": "916328B4"
+        },
+        {
+          "address": "821355BC",
+          "word": "E9630010"
+        },
+        {
+          "address": "821355C0",
+          "word": "616B0800"
+        },
+        {
+          "address": "821355C4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821355C8",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821355CC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821355D0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821355D8": {
+      "instructions": [
+        {
+          "address": "821355D8",
+          "word": "816328B4"
+        },
+        {
+          "address": "821355DC",
+          "word": "5563E77E"
+        },
+        {
+          "address": "821355E0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821355E8": {
+      "instructions": [
+        {
+          "address": "821355E8",
+          "word": "81632F98"
+        },
+        {
+          "address": "821355EC",
+          "word": "90832D58"
+        },
+        {
+          "address": "821355F0",
+          "word": "2B0B0000"
+        },
+        {
+          "address": "821355F4",
+          "word": "409A0008"
+        },
+        {
+          "address": "821355F8",
+          "word": "38800000"
+        },
+        {
+          "address": "821355FC",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135600",
+          "word": "39800001"
+        },
+        {
+          "address": "82135604",
+          "word": "508B07FE"
+        },
+        {
+          "address": "82135608",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "8213560C",
+          "word": "916328B4"
+        },
+        {
+          "address": "82135610",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135614",
+          "word": "616B0800"
+        },
+        {
+          "address": "82135618",
+          "word": "F9630010"
+        },
+        {
+          "address": "8213561C",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135620",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135624",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135628": {
+      "instructions": [
+        {
+          "address": "82135628",
+          "word": "80632D58"
+        },
+        {
+          "address": "8213562C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135630": {
+      "instructions": [
+        {
+          "address": "82135630",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135634",
+          "word": "39800001"
+        },
+        {
+          "address": "82135638",
+          "word": "508B3E30"
+        },
+        {
+          "address": "8213563C",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "82135640",
+          "word": "916328B4"
+        },
+        {
+          "address": "82135644",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135648",
+          "word": "616B0800"
+        },
+        {
+          "address": "8213564C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135650",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135654",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135658",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135660": {
+      "instructions": [
+        {
+          "address": "82135660",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135664",
+          "word": "5563CFFE"
+        },
+        {
+          "address": "82135668",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135670": {
+      "instructions": [
+        {
+          "address": "82135670",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135674",
+          "word": "508B456E"
+        },
+        {
+          "address": "82135678",
+          "word": "916328B4"
+        },
+        {
+          "address": "8213567C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135680",
+          "word": "616B0800"
+        },
+        {
+          "address": "82135684",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135688",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135690": {
+      "instructions": [
+        {
+          "address": "82135690",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135694",
+          "word": "5563C77E"
+        },
+        {
+          "address": "82135698",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821356A0": {
+      "instructions": [
+        {
+          "address": "821356A0",
+          "word": "816328B4"
+        },
+        {
+          "address": "821356A4",
+          "word": "39800001"
+        },
+        {
+          "address": "821356A8",
+          "word": "508B5CA8"
+        },
+        {
+          "address": "821356AC",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "821356B0",
+          "word": "916328B4"
+        },
+        {
+          "address": "821356B4",
+          "word": "E9630010"
+        },
+        {
+          "address": "821356B8",
+          "word": "616B0800"
+        },
+        {
+          "address": "821356BC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821356C0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821356C4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821356C8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821356D0": {
+      "instructions": [
+        {
+          "address": "821356D0",
+          "word": "816328B4"
+        },
+        {
+          "address": "821356D4",
+          "word": "5563AF7E"
+        },
+        {
+          "address": "821356D8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821356E0": {
+      "instructions": [
+        {
+          "address": "821356E0",
+          "word": "816328B4"
+        },
+        {
+          "address": "821356E4",
+          "word": "39800001"
+        },
+        {
+          "address": "821356E8",
+          "word": "508B8B1C"
+        },
+        {
+          "address": "821356EC",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "821356F0",
+          "word": "916328B4"
+        },
+        {
+          "address": "821356F4",
+          "word": "E9630010"
+        },
+        {
+          "address": "821356F8",
+          "word": "616B0800"
+        },
+        {
+          "address": "821356FC",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135700",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135704",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135708",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135710": {
+      "instructions": [
+        {
+          "address": "82135710",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135714",
+          "word": "55637F7E"
+        },
+        {
+          "address": "82135718",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135720": {
+      "instructions": [
+        {
+          "address": "82135720",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135724",
+          "word": "508B73E2"
+        },
+        {
+          "address": "82135728",
+          "word": "916328B4"
+        },
+        {
+          "address": "8213572C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135730",
+          "word": "616B0800"
+        },
+        {
+          "address": "82135734",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135738",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135740": {
+      "instructions": [
+        {
+          "address": "82135740",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135744",
+          "word": "5563977E"
+        },
+        {
+          "address": "82135748",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135750": {
+      "instructions": [
+        {
+          "address": "82135750",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135754",
+          "word": "508BA256"
+        },
+        {
+          "address": "82135758",
+          "word": "916328B4"
+        },
+        {
+          "address": "8213575C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135760",
+          "word": "616B0800"
+        },
+        {
+          "address": "82135764",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135768",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135770": {
+      "instructions": [
+        {
+          "address": "82135770",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135774",
+          "word": "5563677E"
+        },
+        {
+          "address": "82135778",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135780": {
+      "instructions": [
+        {
+          "address": "82135780",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135784",
+          "word": "39800001"
+        },
+        {
+          "address": "82135788",
+          "word": "508BB990"
+        },
+        {
+          "address": "8213578C",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "82135790",
+          "word": "916328B4"
+        },
+        {
+          "address": "82135794",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135798",
+          "word": "616B0800"
+        },
+        {
+          "address": "8213579C",
+          "word": "F9630010"
+        },
+        {
+          "address": "821357A0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821357A4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821357A8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821357B0": {
+      "instructions": [
+        {
+          "address": "821357B0",
+          "word": "816328B4"
+        },
+        {
+          "address": "821357B4",
+          "word": "55634F7E"
+        },
+        {
+          "address": "821357B8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821357C0": {
+      "instructions": [
+        {
+          "address": "821357C0",
+          "word": "816328B4"
+        },
+        {
+          "address": "821357C4",
+          "word": "39800001"
+        },
+        {
+          "address": "821357C8",
+          "word": "508BE804"
+        },
+        {
+          "address": "821357CC",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "821357D0",
+          "word": "916328B4"
+        },
+        {
+          "address": "821357D4",
+          "word": "E9630010"
+        },
+        {
+          "address": "821357D8",
+          "word": "616B0800"
+        },
+        {
+          "address": "821357DC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821357E0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821357E4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821357E8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821357F0": {
+      "instructions": [
+        {
+          "address": "821357F0",
+          "word": "816328B4"
+        },
+        {
+          "address": "821357F4",
+          "word": "55631F7E"
+        },
+        {
+          "address": "821357F8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135800": {
+      "instructions": [
+        {
+          "address": "82135800",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135804",
+          "word": "508BD0CA"
+        },
+        {
+          "address": "82135808",
+          "word": "916328B4"
+        },
+        {
+          "address": "8213580C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135810",
+          "word": "616B0800"
+        },
+        {
+          "address": "82135814",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135818",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135820": {
+      "instructions": [
+        {
+          "address": "82135820",
+          "word": "816328B4"
+        },
+        {
+          "address": "82135824",
+          "word": "5563377E"
+        },
+        {
+          "address": "82135828",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135830": {
+      "instructions": [
+        {
+          "address": "82135830",
+          "word": "98832883"
+        },
+        {
+          "address": "82135834",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135838",
+          "word": "616B0200"
+        },
+        {
+          "address": "8213583C",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135840",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135848": {
+      "instructions": [
+        {
+          "address": "82135848",
+          "word": "88632883"
+        },
+        {
+          "address": "8213584C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135850": {
+      "instructions": [
+        {
+          "address": "82135850",
+          "word": "98832882"
+        },
+        {
+          "address": "82135854",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135858",
+          "word": "616B0200"
+        },
+        {
+          "address": "8213585C",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135860",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135868": {
+      "instructions": [
+        {
+          "address": "82135868",
+          "word": "88632882"
+        },
+        {
+          "address": "8213586C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135870": {
+      "instructions": [
+        {
+          "address": "82135870",
+          "word": "98832881"
+        },
+        {
+          "address": "82135874",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135878",
+          "word": "616B0200"
+        },
+        {
+          "address": "8213587C",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135880",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135888": {
+      "instructions": [
+        {
+          "address": "82135888",
+          "word": "88632881"
+        },
+        {
+          "address": "8213588C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135890": {
+      "instructions": [
+        {
+          "address": "82135890",
+          "word": "9883287F"
+        },
+        {
+          "address": "82135894",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135898",
+          "word": "616B0400"
+        },
+        {
+          "address": "8213589C",
+          "word": "F9630018"
+        },
+        {
+          "address": "821358A0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821358A8": {
+      "instructions": [
+        {
+          "address": "821358A8",
+          "word": "8863287F"
+        },
+        {
+          "address": "821358AC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821358B0": {
+      "instructions": [
+        {
+          "address": "821358B0",
+          "word": "9883287E"
+        },
+        {
+          "address": "821358B4",
+          "word": "E9630018"
+        },
+        {
+          "address": "821358B8",
+          "word": "616B0400"
+        },
+        {
+          "address": "821358BC",
+          "word": "F9630018"
+        },
+        {
+          "address": "821358C0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821358C8": {
+      "instructions": [
+        {
+          "address": "821358C8",
+          "word": "8863287E"
+        },
+        {
+          "address": "821358CC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821358D0": {
+      "instructions": [
+        {
+          "address": "821358D0",
+          "word": "9883287D"
+        },
+        {
+          "address": "821358D4",
+          "word": "E9630018"
+        },
+        {
+          "address": "821358D8",
+          "word": "616B0400"
+        },
+        {
+          "address": "821358DC",
+          "word": "F9630018"
+        },
+        {
+          "address": "821358E0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821358E8": {
+      "instructions": [
+        {
+          "address": "821358E8",
+          "word": "8863287D"
+        },
+        {
+          "address": "821358EC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821358F0": {
+      "instructions": [
+        {
+          "address": "821358F0",
+          "word": "21640000"
+        },
+        {
+          "address": "821358F4",
+          "word": "7D6B5910"
+        },
+        {
+          "address": "821358F8",
+          "word": "556B04E6"
+        },
+        {
+          "address": "821358FC",
+          "word": "91632834"
+        },
+        {
+          "address": "82135900",
+          "word": "816328C4"
+        },
+        {
+          "address": "82135904",
+          "word": "556B0032"
+        },
+        {
+          "address": "82135908",
+          "word": "7D6B2378"
+        },
+        {
+          "address": "8213590C",
+          "word": "916328C4"
+        },
+        {
+          "address": "82135910",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135914",
+          "word": "616B0080"
+        },
+        {
+          "address": "82135918",
+          "word": "F9630010"
+        },
+        {
+          "address": "8213591C",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135920",
+          "word": "656B0200"
+        },
+        {
+          "address": "82135924",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135928",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135930": {
+      "instructions": [
+        {
+          "address": "82135930",
+          "word": "816328C4"
+        },
+        {
+          "address": "82135934",
+          "word": "556306BE"
+        },
+        {
+          "address": "82135938",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135940": {
+      "instructions": [
+        {
+          "address": "82135940",
+          "word": "80632D40"
+        },
+        {
+          "address": "82135944",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135948": {
+      "instructions": [
+        {
+          "address": "82135948",
+          "word": "9081001C"
+        },
+        {
+          "address": "8213594C",
+          "word": "3D608200"
+        },
+        {
+          "address": "82135950",
+          "word": "C00B32B8"
+        },
+        {
+          "address": "82135954",
+          "word": "3D608200"
+        },
+        {
+          "address": "82135958",
+          "word": "C1A1001C"
+        },
+        {
+          "address": "8213595C",
+          "word": "EC0D0032"
+        },
+        {
+          "address": "82135960",
+          "word": "C1AB09A4"
+        },
+        {
+          "address": "82135964",
+          "word": "D00329D0"
+        },
+        {
+          "address": "82135968",
+          "word": "D00329D8"
+        },
+        {
+          "address": "8213596C",
+          "word": "FF006800"
+        },
+        {
+          "address": "82135970",
+          "word": "409A0014"
+        },
+        {
+          "address": "82135974",
+          "word": "C18329D4"
+        },
+        {
+          "address": "82135978",
+          "word": "39400000"
+        },
+        {
+          "address": "8213597C",
+          "word": "FF0C6800"
+        },
+        {
+          "address": "82135980",
+          "word": "419A0008"
+        },
+        {
+          "address": "82135984",
+          "word": "39400001"
+        },
+        {
+          "address": "82135988",
+          "word": "816328C8"
+        },
+        {
+          "address": "8213598C",
+          "word": "FF006800"
+        },
+        {
+          "address": "82135990",
+          "word": "514B5D28"
+        },
+        {
+          "address": "82135994",
+          "word": "916328C8"
+        },
+        {
+          "address": "82135998",
+          "word": "409A0014"
+        },
+        {
+          "address": "8213599C",
+          "word": "C00329DC"
+        },
+        {
+          "address": "821359A0",
+          "word": "39400000"
+        },
+        {
+          "address": "821359A4",
+          "word": "FF006800"
+        },
+        {
+          "address": "821359A8",
+          "word": "419A0008"
+        },
+        {
+          "address": "821359AC",
+          "word": "39400001"
+        },
+        {
+          "address": "821359B0",
+          "word": "514B64E6"
+        },
+        {
+          "address": "821359B4",
+          "word": "39800001"
+        },
+        {
+          "address": "821359B8",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "821359BC",
+          "word": "916328C8"
+        },
+        {
+          "address": "821359C0",
+          "word": "E9630020"
+        },
+        {
+          "address": "821359C4",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821359C8",
+          "word": "39800001"
+        },
+        {
+          "address": "821359CC",
+          "word": "798C5FE6"
+        },
+        {
+          "address": "821359D0",
+          "word": "F9630020"
+        },
+        {
+          "address": "821359D4",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821359D8",
+          "word": "F9630020"
+        },
+        {
+          "address": "821359DC",
+          "word": "E9630010"
+        },
+        {
+          "address": "821359E0",
+          "word": "616B0040"
+        },
+        {
+          "address": "821359E4",
+          "word": "F9630010"
+        },
+        {
+          "address": "821359E8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821359F0": {
+      "instructions": [
+        {
+          "address": "821359F0",
+          "word": "3D608201"
+        },
+        {
+          "address": "821359F4",
+          "word": "C1A329D0"
+        },
+        {
+          "address": "821359F8",
+          "word": "C00B9654"
+        },
+        {
+          "address": "821359FC",
+          "word": "EC0D0032"
+        },
+        {
+          "address": "82135A00",
+          "word": "D001FFF0"
+        },
+        {
+          "address": "82135A04",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "82135A08",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135A10": {
+      "instructions": [
+        {
+          "address": "82135A10",
+          "word": "9081001C"
+        },
+        {
+          "address": "82135A14",
+          "word": "3D608200"
+        },
+        {
+          "address": "82135A18",
+          "word": "C18329D0"
+        },
+        {
+          "address": "82135A1C",
+          "word": "C00B09A4"
+        },
+        {
+          "address": "82135A20",
+          "word": "FF0C0000"
+        },
+        {
+          "address": "82135A24",
+          "word": "C1A1001C"
+        },
+        {
+          "address": "82135A28",
+          "word": "D1A329D4"
+        },
+        {
+          "address": "82135A2C",
+          "word": "D1A329DC"
+        },
+        {
+          "address": "82135A30",
+          "word": "409A0010"
+        },
+        {
+          "address": "82135A34",
+          "word": "FF0D0000"
+        },
+        {
+          "address": "82135A38",
+          "word": "39400000"
+        },
+        {
+          "address": "82135A3C",
+          "word": "419A0008"
+        },
+        {
+          "address": "82135A40",
+          "word": "39400001"
+        },
+        {
+          "address": "82135A44",
+          "word": "816328C8"
+        },
+        {
+          "address": "82135A48",
+          "word": "C18329D8"
+        },
+        {
+          "address": "82135A4C",
+          "word": "FF0C0000"
+        },
+        {
+          "address": "82135A50",
+          "word": "514B5D28"
+        },
+        {
+          "address": "82135A54",
+          "word": "916328C8"
+        },
+        {
+          "address": "82135A58",
+          "word": "409A0010"
+        },
+        {
+          "address": "82135A5C",
+          "word": "FF0D0000"
+        },
+        {
+          "address": "82135A60",
+          "word": "39400000"
+        },
+        {
+          "address": "82135A64",
+          "word": "419A0008"
+        },
+        {
+          "address": "82135A68",
+          "word": "39400001"
+        },
+        {
+          "address": "82135A6C",
+          "word": "514B64E6"
+        },
+        {
+          "address": "82135A70",
+          "word": "39800001"
+        },
+        {
+          "address": "82135A74",
+          "word": "798C67E6"
+        },
+        {
+          "address": "82135A78",
+          "word": "916328C8"
+        },
+        {
+          "address": "82135A7C",
+          "word": "E9630020"
+        },
+        {
+          "address": "82135A80",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135A84",
+          "word": "39800001"
+        },
+        {
+          "address": "82135A88",
+          "word": "798C57E6"
+        },
+        {
+          "address": "82135A8C",
+          "word": "F9630020"
+        },
+        {
+          "address": "82135A90",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135A94",
+          "word": "F9630020"
+        },
+        {
+          "address": "82135A98",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135A9C",
+          "word": "616B0040"
+        },
+        {
+          "address": "82135AA0",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135AA4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135AA8": {
+      "instructions": [
+        {
+          "address": "82135AA8",
+          "word": "C00329D4"
+        },
+        {
+          "address": "82135AAC",
+          "word": "D001FFF0"
+        },
+        {
+          "address": "82135AB0",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "82135AB4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135AB8": {
+      "instructions": [
+        {
+          "address": "82135AB8",
+          "word": "816328C8"
+        },
+        {
+          "address": "82135ABC",
+          "word": "508B7C20"
+        },
+        {
+          "address": "82135AC0",
+          "word": "916328C8"
+        },
+        {
+          "address": "82135AC4",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135AC8",
+          "word": "616B0040"
+        },
+        {
+          "address": "82135ACC",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135AD0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135AD8": {
+      "instructions": [
+        {
+          "address": "82135AD8",
+          "word": "816328C8"
+        },
+        {
+          "address": "82135ADC",
+          "word": "55638FFE"
+        },
+        {
+          "address": "82135AE0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135AE8": {
+      "instructions": [
+        {
+          "address": "82135AE8",
+          "word": "548B043E"
+        },
+        {
+          "address": "82135AEC",
+          "word": "91632980"
+        },
+        {
+          "address": "82135AF0",
+          "word": "E9630020"
+        },
+        {
+          "address": "82135AF4",
+          "word": "656B0008"
+        },
+        {
+          "address": "82135AF8",
+          "word": "F9630020"
+        },
+        {
+          "address": "82135AFC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135B00": {
+      "instructions": [
+        {
+          "address": "82135B00",
+          "word": "80632980"
+        },
+        {
+          "address": "82135B04",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135B08": {
+      "instructions": [
+        {
+          "address": "82135B08",
+          "word": "81632F88"
+        },
+        {
+          "address": "82135B0C",
+          "word": "90832D44"
+        },
+        {
+          "address": "82135B10",
+          "word": "2B0B0000"
+        },
+        {
+          "address": "82135B14",
+          "word": "409A0008"
+        },
+        {
+          "address": "82135B18",
+          "word": "38800000"
+        },
+        {
+          "address": "82135B1C",
+          "word": "8163285C"
+        },
+        {
+          "address": "82135B20",
+          "word": "51640036"
+        },
+        {
+          "address": "82135B24",
+          "word": "9083285C"
+        },
+        {
+          "address": "82135B28",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135B2C",
+          "word": "656B0004"
+        },
+        {
+          "address": "82135B30",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135B34",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135B38": {
+      "instructions": [
+        {
+          "address": "82135B38",
+          "word": "80632D44"
+        },
+        {
+          "address": "82135B3C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135B40": {
+      "instructions": [
+        {
+          "address": "82135B40",
+          "word": "81632F8C"
+        },
+        {
+          "address": "82135B44",
+          "word": "90832D48"
+        },
+        {
+          "address": "82135B48",
+          "word": "2B0B0000"
+        },
+        {
+          "address": "82135B4C",
+          "word": "409A0008"
+        },
+        {
+          "address": "82135B50",
+          "word": "38800000"
+        },
+        {
+          "address": "82135B54",
+          "word": "8163285C"
+        },
+        {
+          "address": "82135B58",
+          "word": "508B2636"
+        },
+        {
+          "address": "82135B5C",
+          "word": "9163285C"
+        },
+        {
+          "address": "82135B60",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135B64",
+          "word": "656B0004"
+        },
+        {
+          "address": "82135B68",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135B6C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135B70": {
+      "instructions": [
+        {
+          "address": "82135B70",
+          "word": "80632D48"
+        },
+        {
+          "address": "82135B74",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135B78": {
+      "instructions": [
+        {
+          "address": "82135B78",
+          "word": "81632F90"
+        },
+        {
+          "address": "82135B7C",
+          "word": "90832D4C"
+        },
+        {
+          "address": "82135B80",
+          "word": "2B0B0000"
+        },
+        {
+          "address": "82135B84",
+          "word": "409A0008"
+        },
+        {
+          "address": "82135B88",
+          "word": "38800000"
+        },
+        {
+          "address": "82135B8C",
+          "word": "8163285C"
+        },
+        {
+          "address": "82135B90",
+          "word": "508B452E"
+        },
+        {
+          "address": "82135B94",
+          "word": "9163285C"
+        },
+        {
+          "address": "82135B98",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135B9C",
+          "word": "656B0004"
+        },
+        {
+          "address": "82135BA0",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135BA4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135BA8": {
+      "instructions": [
+        {
+          "address": "82135BA8",
+          "word": "80632D4C"
+        },
+        {
+          "address": "82135BAC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135BB0": {
+      "instructions": [
+        {
+          "address": "82135BB0",
+          "word": "81632F94"
+        },
+        {
+          "address": "82135BB4",
+          "word": "90832D50"
+        },
+        {
+          "address": "82135BB8",
+          "word": "2B0B0000"
+        },
+        {
+          "address": "82135BBC",
+          "word": "409A0008"
+        },
+        {
+          "address": "82135BC0",
+          "word": "38800000"
+        },
+        {
+          "address": "82135BC4",
+          "word": "8163285C"
+        },
+        {
+          "address": "82135BC8",
+          "word": "508B6426"
+        },
+        {
+          "address": "82135BCC",
+          "word": "9163285C"
+        },
+        {
+          "address": "82135BD0",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135BD4",
+          "word": "656B0004"
+        },
+        {
+          "address": "82135BD8",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135BDC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135BE0": {
+      "instructions": [
+        {
+          "address": "82135BE0",
+          "word": "80632D50"
+        },
+        {
+          "address": "82135BE4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135BE8": {
+      "instructions": [
+        {
+          "address": "82135BE8",
+          "word": "90832D5C"
+        },
+        {
+          "address": "82135BEC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135BF0": {
+      "instructions": [
+        {
+          "address": "82135BF0",
+          "word": "80632D5C"
+        },
+        {
+          "address": "82135BF4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135BF8": {
+      "instructions": [
+        {
+          "address": "82135BF8",
+          "word": "9081001C"
+        },
+        {
+          "address": "82135BFC",
+          "word": "3D608200"
+        },
+        {
+          "address": "82135C00",
+          "word": "39800001"
+        },
+        {
+          "address": "82135C04",
+          "word": "798CDFE6"
+        },
+        {
+          "address": "82135C08",
+          "word": "C1AB3094"
+        },
+        {
+          "address": "82135C0C",
+          "word": "3961FFF0"
+        },
+        {
+          "address": "82135C10",
+          "word": "C001001C"
+        },
+        {
+          "address": "82135C14",
+          "word": "EDA00372"
+        },
+        {
+          "address": "82135C18",
+          "word": "D0032D64"
+        },
+        {
+          "address": "82135C1C",
+          "word": "FC00681E"
+        },
+        {
+          "address": "82135C20",
+          "word": "7C005FAE"
+        },
+        {
+          "address": "82135C24",
+          "word": "8161FFF0"
+        },
+        {
+          "address": "82135C28",
+          "word": "556B043E"
+        },
+        {
+          "address": "82135C2C",
+          "word": "B16328E6"
+        },
+        {
+          "address": "82135C30",
+          "word": "B16328E4"
+        },
+        {
+          "address": "82135C34",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135C38",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135C3C",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135C40",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135C48": {
+      "instructions": [
+        {
+          "address": "82135C48",
+          "word": "C0032D64"
+        },
+        {
+          "address": "82135C4C",
+          "word": "D001FFF0"
+        },
+        {
+          "address": "82135C50",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "82135C54",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135C58": {
+      "instructions": [
+        {
+          "address": "82135C58",
+          "word": "9081001C"
+        },
+        {
+          "address": "82135C5C",
+          "word": "3D608200"
+        },
+        {
+          "address": "82135C60",
+          "word": "39800001"
+        },
+        {
+          "address": "82135C64",
+          "word": "798CD7E6"
+        },
+        {
+          "address": "82135C68",
+          "word": "C1AB32B8"
+        },
+        {
+          "address": "82135C6C",
+          "word": "3961FFF0"
+        },
+        {
+          "address": "82135C70",
+          "word": "C001001C"
+        },
+        {
+          "address": "82135C74",
+          "word": "EDA00372"
+        },
+        {
+          "address": "82135C78",
+          "word": "D0032D68"
+        },
+        {
+          "address": "82135C7C",
+          "word": "FC00681E"
+        },
+        {
+          "address": "82135C80",
+          "word": "7C005FAE"
+        },
+        {
+          "address": "82135C84",
+          "word": "8161FFF0"
+        },
+        {
+          "address": "82135C88",
+          "word": "B16328EA"
+        },
+        {
+          "address": "82135C8C",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135C90",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135C94",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135C98",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135CA0": {
+      "instructions": [
+        {
+          "address": "82135CA0",
+          "word": "C0032D68"
+        },
+        {
+          "address": "82135CA4",
+          "word": "D001FFF0"
+        },
+        {
+          "address": "82135CA8",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "82135CAC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135CB0": {
+      "instructions": [
+        {
+          "address": "82135CB0",
+          "word": "9081001C"
+        },
+        {
+          "address": "82135CB4",
+          "word": "3D608200"
+        },
+        {
+          "address": "82135CB8",
+          "word": "39800001"
+        },
+        {
+          "address": "82135CBC",
+          "word": "798CD7E6"
+        },
+        {
+          "address": "82135CC0",
+          "word": "C1AB32B8"
+        },
+        {
+          "address": "82135CC4",
+          "word": "3961FFF0"
+        },
+        {
+          "address": "82135CC8",
+          "word": "C001001C"
+        },
+        {
+          "address": "82135CCC",
+          "word": "EDA00372"
+        },
+        {
+          "address": "82135CD0",
+          "word": "D0032D6C"
+        },
+        {
+          "address": "82135CD4",
+          "word": "FC00681E"
+        },
+        {
+          "address": "82135CD8",
+          "word": "7C005FAE"
+        },
+        {
+          "address": "82135CDC",
+          "word": "8161FFF0"
+        },
+        {
+          "address": "82135CE0",
+          "word": "B16328E8"
+        },
+        {
+          "address": "82135CE4",
+          "word": "E9630018"
+        },
+        {
+          "address": "82135CE8",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135CEC",
+          "word": "F9630018"
+        },
+        {
+          "address": "82135CF0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135CF8": {
+      "instructions": [
+        {
+          "address": "82135CF8",
+          "word": "C0032D6C"
+        },
+        {
+          "address": "82135CFC",
+          "word": "D001FFF0"
+        },
+        {
+          "address": "82135D00",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "82135D04",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135D08": {
+      "instructions": [
+        {
+          "address": "82135D08",
+          "word": "816328AC"
+        },
+        {
+          "address": "82135D0C",
+          "word": "39800001"
+        },
+        {
+          "address": "82135D10",
+          "word": "556B0036"
+        },
+        {
+          "address": "82135D14",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135D18",
+          "word": "7D6B2378"
+        },
+        {
+          "address": "82135D1C",
+          "word": "916328AC"
+        },
+        {
+          "address": "82135D20",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135D24",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135D28",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135D2C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135D30": {
+      "instructions": [
+        {
+          "address": "82135D30",
+          "word": "814328AC"
+        },
+        {
+          "address": "82135D34",
+          "word": "548B2036"
+        },
+        {
+          "address": "82135D38",
+          "word": "39800001"
+        },
+        {
+          "address": "82135D3C",
+          "word": "554A072E"
+        },
+        {
+          "address": "82135D40",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135D44",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135D48",
+          "word": "916328AC"
+        },
+        {
+          "address": "82135D4C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135D50",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135D54",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135D58",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135D60": {
+      "instructions": [
+        {
+          "address": "82135D60",
+          "word": "814328AC"
+        },
+        {
+          "address": "82135D64",
+          "word": "548B402E"
+        },
+        {
+          "address": "82135D68",
+          "word": "39800001"
+        },
+        {
+          "address": "82135D6C",
+          "word": "554A0626"
+        },
+        {
+          "address": "82135D70",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135D74",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135D78",
+          "word": "916328AC"
+        },
+        {
+          "address": "82135D7C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135D80",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135D84",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135D88",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135D90": {
+      "instructions": [
+        {
+          "address": "82135D90",
+          "word": "814328AC"
+        },
+        {
+          "address": "82135D94",
+          "word": "548B6026"
+        },
+        {
+          "address": "82135D98",
+          "word": "39800001"
+        },
+        {
+          "address": "82135D9C",
+          "word": "554A051E"
+        },
+        {
+          "address": "82135DA0",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135DA4",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135DA8",
+          "word": "916328AC"
+        },
+        {
+          "address": "82135DAC",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135DB0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135DB4",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135DB8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135DC0": {
+      "instructions": [
+        {
+          "address": "82135DC0",
+          "word": "814328AC"
+        },
+        {
+          "address": "82135DC4",
+          "word": "548B801E"
+        },
+        {
+          "address": "82135DC8",
+          "word": "39800001"
+        },
+        {
+          "address": "82135DCC",
+          "word": "554A0416"
+        },
+        {
+          "address": "82135DD0",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135DD4",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135DD8",
+          "word": "916328AC"
+        },
+        {
+          "address": "82135DDC",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135DE0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135DE4",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135DE8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135DF0": {
+      "instructions": [
+        {
+          "address": "82135DF0",
+          "word": "814328AC"
+        },
+        {
+          "address": "82135DF4",
+          "word": "548BA016"
+        },
+        {
+          "address": "82135DF8",
+          "word": "39800001"
+        },
+        {
+          "address": "82135DFC",
+          "word": "554A030E"
+        },
+        {
+          "address": "82135E00",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135E04",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135E08",
+          "word": "916328AC"
+        },
+        {
+          "address": "82135E0C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135E10",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135E14",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135E18",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135E20": {
+      "instructions": [
+        {
+          "address": "82135E20",
+          "word": "814328AC"
+        },
+        {
+          "address": "82135E24",
+          "word": "548BC00E"
+        },
+        {
+          "address": "82135E28",
+          "word": "39800001"
+        },
+        {
+          "address": "82135E2C",
+          "word": "554A0206"
+        },
+        {
+          "address": "82135E30",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135E34",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135E38",
+          "word": "916328AC"
+        },
+        {
+          "address": "82135E3C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135E40",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135E44",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135E48",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135E50": {
+      "instructions": [
+        {
+          "address": "82135E50",
+          "word": "816328AC"
+        },
+        {
+          "address": "82135E54",
+          "word": "39800001"
+        },
+        {
+          "address": "82135E58",
+          "word": "508BE006"
+        },
+        {
+          "address": "82135E5C",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135E60",
+          "word": "916328AC"
+        },
+        {
+          "address": "82135E64",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135E68",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135E6C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135E70",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135E78": {
+      "instructions": [
+        {
+          "address": "82135E78",
+          "word": "816328B0"
+        },
+        {
+          "address": "82135E7C",
+          "word": "39800001"
+        },
+        {
+          "address": "82135E80",
+          "word": "556B0036"
+        },
+        {
+          "address": "82135E84",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135E88",
+          "word": "7D6B2378"
+        },
+        {
+          "address": "82135E8C",
+          "word": "916328B0"
+        },
+        {
+          "address": "82135E90",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135E94",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135E98",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135E9C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135EA0": {
+      "instructions": [
+        {
+          "address": "82135EA0",
+          "word": "814328B0"
+        },
+        {
+          "address": "82135EA4",
+          "word": "548B2036"
+        },
+        {
+          "address": "82135EA8",
+          "word": "39800001"
+        },
+        {
+          "address": "82135EAC",
+          "word": "554A072E"
+        },
+        {
+          "address": "82135EB0",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135EB4",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135EB8",
+          "word": "916328B0"
+        },
+        {
+          "address": "82135EBC",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135EC0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135EC4",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135EC8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135ED0": {
+      "instructions": [
+        {
+          "address": "82135ED0",
+          "word": "814328B0"
+        },
+        {
+          "address": "82135ED4",
+          "word": "548B402E"
+        },
+        {
+          "address": "82135ED8",
+          "word": "39800001"
+        },
+        {
+          "address": "82135EDC",
+          "word": "554A0626"
+        },
+        {
+          "address": "82135EE0",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135EE4",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135EE8",
+          "word": "916328B0"
+        },
+        {
+          "address": "82135EEC",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135EF0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135EF4",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135EF8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135F00": {
+      "instructions": [
+        {
+          "address": "82135F00",
+          "word": "814328B0"
+        },
+        {
+          "address": "82135F04",
+          "word": "548B6026"
+        },
+        {
+          "address": "82135F08",
+          "word": "39800001"
+        },
+        {
+          "address": "82135F0C",
+          "word": "554A051E"
+        },
+        {
+          "address": "82135F10",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135F14",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135F18",
+          "word": "916328B0"
+        },
+        {
+          "address": "82135F1C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135F20",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135F24",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135F28",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135F30": {
+      "instructions": [
+        {
+          "address": "82135F30",
+          "word": "814328B0"
+        },
+        {
+          "address": "82135F34",
+          "word": "548B801E"
+        },
+        {
+          "address": "82135F38",
+          "word": "39800001"
+        },
+        {
+          "address": "82135F3C",
+          "word": "554A0416"
+        },
+        {
+          "address": "82135F40",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135F44",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135F48",
+          "word": "916328B0"
+        },
+        {
+          "address": "82135F4C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135F50",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135F54",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135F58",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135F60": {
+      "instructions": [
+        {
+          "address": "82135F60",
+          "word": "814328B0"
+        },
+        {
+          "address": "82135F64",
+          "word": "548BA016"
+        },
+        {
+          "address": "82135F68",
+          "word": "39800001"
+        },
+        {
+          "address": "82135F6C",
+          "word": "554A030E"
+        },
+        {
+          "address": "82135F70",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135F74",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135F78",
+          "word": "916328B0"
+        },
+        {
+          "address": "82135F7C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135F80",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135F84",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135F88",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135F90": {
+      "instructions": [
+        {
+          "address": "82135F90",
+          "word": "814328B0"
+        },
+        {
+          "address": "82135F94",
+          "word": "548BC00E"
+        },
+        {
+          "address": "82135F98",
+          "word": "39800001"
+        },
+        {
+          "address": "82135F9C",
+          "word": "554A0206"
+        },
+        {
+          "address": "82135FA0",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135FA4",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82135FA8",
+          "word": "916328B0"
+        },
+        {
+          "address": "82135FAC",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135FB0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135FB4",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135FB8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135FC0": {
+      "instructions": [
+        {
+          "address": "82135FC0",
+          "word": "816328B0"
+        },
+        {
+          "address": "82135FC4",
+          "word": "39800001"
+        },
+        {
+          "address": "82135FC8",
+          "word": "508BE006"
+        },
+        {
+          "address": "82135FCC",
+          "word": "798C6FE6"
+        },
+        {
+          "address": "82135FD0",
+          "word": "916328B0"
+        },
+        {
+          "address": "82135FD4",
+          "word": "E9630010"
+        },
+        {
+          "address": "82135FD8",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82135FDC",
+          "word": "F9630010"
+        },
+        {
+          "address": "82135FE0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135FE8": {
+      "instructions": [
+        {
+          "address": "82135FE8",
+          "word": "816328AC"
+        },
+        {
+          "address": "82135FEC",
+          "word": "5563073E"
+        },
+        {
+          "address": "82135FF0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82135FF8": {
+      "instructions": [
+        {
+          "address": "82135FF8",
+          "word": "816328AC"
+        },
+        {
+          "address": "82135FFC",
+          "word": "5563E73E"
+        },
+        {
+          "address": "82136000",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136008": {
+      "instructions": [
+        {
+          "address": "82136008",
+          "word": "816328AC"
+        },
+        {
+          "address": "8213600C",
+          "word": "5563C73E"
+        },
+        {
+          "address": "82136010",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136018": {
+      "instructions": [
+        {
+          "address": "82136018",
+          "word": "816328AC"
+        },
+        {
+          "address": "8213601C",
+          "word": "5563A73E"
+        },
+        {
+          "address": "82136020",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136028": {
+      "instructions": [
+        {
+          "address": "82136028",
+          "word": "A16328AC"
+        },
+        {
+          "address": "8213602C",
+          "word": "5563073E"
+        },
+        {
+          "address": "82136030",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136038": {
+      "instructions": [
+        {
+          "address": "82136038",
+          "word": "816328AC"
+        },
+        {
+          "address": "8213603C",
+          "word": "5563673E"
+        },
+        {
+          "address": "82136040",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136048": {
+      "instructions": [
+        {
+          "address": "82136048",
+          "word": "896328AC"
+        },
+        {
+          "address": "8213604C",
+          "word": "5563073E"
+        },
+        {
+          "address": "82136050",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136058": {
+      "instructions": [
+        {
+          "address": "82136058",
+          "word": "816328AC"
+        },
+        {
+          "address": "8213605C",
+          "word": "5563273E"
+        },
+        {
+          "address": "82136060",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136068": {
+      "instructions": [
+        {
+          "address": "82136068",
+          "word": "816328B0"
+        },
+        {
+          "address": "8213606C",
+          "word": "5563073E"
+        },
+        {
+          "address": "82136070",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136078": {
+      "instructions": [
+        {
+          "address": "82136078",
+          "word": "A16328B0"
+        },
+        {
+          "address": "8213607C",
+          "word": "5563073E"
+        },
+        {
+          "address": "82136080",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136088": {
+      "instructions": [
+        {
+          "address": "82136088",
+          "word": "2B040000"
+        },
+        {
+          "address": "8213608C",
+          "word": "3960043F"
+        },
+        {
+          "address": "82136090",
+          "word": "409A0008"
+        },
+        {
+          "address": "82136094",
+          "word": "39600400"
+        },
+        {
+          "address": "82136098",
+          "word": "916328CC"
+        },
+        {
+          "address": "8213609C",
+          "word": "7C8B0034"
+        },
+        {
+          "address": "821360A0",
+          "word": "814328C4"
+        },
+        {
+          "address": "821360A4",
+          "word": "556BDFFE"
+        },
+        {
+          "address": "821360A8",
+          "word": "516A83DE"
+        },
+        {
+          "address": "821360AC",
+          "word": "914328C4"
+        },
+        {
+          "address": "821360B0",
+          "word": "E9630010"
+        },
+        {
+          "address": "821360B4",
+          "word": "616B0020"
+        },
+        {
+          "address": "821360B8",
+          "word": "F9630010"
+        },
+        {
+          "address": "821360BC",
+          "word": "616B0080"
+        },
+        {
+          "address": "821360C0",
+          "word": "F9630010"
+        },
+        {
+          "address": "821360C4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821360C8": {
+      "instructions": [
+        {
+          "address": "821360C8",
+          "word": "816328CC"
+        },
+        {
+          "address": "821360CC",
+          "word": "556307FE"
+        },
+        {
+          "address": "821360D0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821360D8": {
+      "instructions": [
+        {
+          "address": "821360D8",
+          "word": "81032F88"
+        },
+        {
+          "address": "821360DC",
+          "word": "90832DEC"
+        },
+        {
+          "address": "821360E0",
+          "word": "28080000"
+        },
+        {
+          "address": "821360E4",
+          "word": "4D820020"
+        },
+        {
+          "address": "821360E8",
+          "word": "8148001C"
+        },
+        {
+          "address": "821360EC",
+          "word": "554B873E"
+        },
+        {
+          "address": "821360F0",
+          "word": "2B0B0002"
+        },
+        {
+          "address": "821360F4",
+          "word": "419A001C"
+        },
+        {
+          "address": "821360F8",
+          "word": "2B0B0003"
+        },
+        {
+          "address": "821360FC",
+          "word": "419A0014"
+        },
+        {
+          "address": "82136100",
+          "word": "2B0B000A"
+        },
+        {
+          "address": "82136104",
+          "word": "419A000C"
+        },
+        {
+          "address": "82136108",
+          "word": "2B0B000C"
+        },
+        {
+          "address": "8213610C",
+          "word": "4C9A0020"
+        },
+        {
+          "address": "82136110",
+          "word": "554B6FFE"
+        },
+        {
+          "address": "82136114",
+          "word": "7D6B2279"
+        },
+        {
+          "address": "82136118",
+          "word": "4D820020"
+        },
+        {
+          "address": "8213611C",
+          "word": "8168001C"
+        },
+        {
+          "address": "82136120",
+          "word": "3944FFFF"
+        },
+        {
+          "address": "82136124",
+          "word": "39800001"
+        },
+        {
+          "address": "82136128",
+          "word": "5569873E"
+        },
+        {
+          "address": "8213612C",
+          "word": "55670416"
+        },
+        {
+          "address": "82136130",
+          "word": "552BF87E"
+        },
+        {
+          "address": "82136134",
+          "word": "38C90003"
+        },
+        {
+          "address": "82136138",
+          "word": "396BFFFD"
+        },
+        {
+          "address": "8213613C",
+          "word": "54C9083C"
+        },
+        {
+          "address": "82136140",
+          "word": "7D6B5038"
+        },
+        {
+          "address": "82136144",
+          "word": "7D295078"
+        },
+        {
+          "address": "82136148",
+          "word": "798C2FE6"
+        },
+        {
+          "address": "8213614C",
+          "word": "7D2B5B78"
+        },
+        {
+          "address": "82136150",
+          "word": "556B831E"
+        },
+        {
+          "address": "82136154",
+          "word": "7CEA5B78"
+        },
+        {
+          "address": "82136158",
+          "word": "9148001C"
+        },
+        {
+          "address": "8213615C",
+          "word": "81432804"
+        },
+        {
+          "address": "82136160",
+          "word": "554A0416"
+        },
+        {
+          "address": "82136164",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82136168",
+          "word": "91632804"
+        },
+        {
+          "address": "8213616C",
+          "word": "E9630018"
+        },
+        {
+          "address": "82136170",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82136174",
+          "word": "F9630018"
+        },
+        {
+          "address": "82136178",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136180": {
+      "instructions": [
+        {
+          "address": "82136180",
+          "word": "80632DEC"
+        },
+        {
+          "address": "82136184",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136188": {
+      "instructions": [
+        {
+          "address": "82136188",
+          "word": "81032F8C"
+        },
+        {
+          "address": "8213618C",
+          "word": "90832DF0"
+        },
+        {
+          "address": "82136190",
+          "word": "28080000"
+        },
+        {
+          "address": "82136194",
+          "word": "4D820020"
+        },
+        {
+          "address": "82136198",
+          "word": "8148001C"
+        },
+        {
+          "address": "8213619C",
+          "word": "554B873E"
+        },
+        {
+          "address": "821361A0",
+          "word": "2B0B0002"
+        },
+        {
+          "address": "821361A4",
+          "word": "419A001C"
+        },
+        {
+          "address": "821361A8",
+          "word": "2B0B0003"
+        },
+        {
+          "address": "821361AC",
+          "word": "419A0014"
+        },
+        {
+          "address": "821361B0",
+          "word": "2B0B000A"
+        },
+        {
+          "address": "821361B4",
+          "word": "419A000C"
+        },
+        {
+          "address": "821361B8",
+          "word": "2B0B000C"
+        },
+        {
+          "address": "821361BC",
+          "word": "4C9A0020"
+        },
+        {
+          "address": "821361C0",
+          "word": "554B6FFE"
+        },
+        {
+          "address": "821361C4",
+          "word": "7D6B2279"
+        },
+        {
+          "address": "821361C8",
+          "word": "4D820020"
+        },
+        {
+          "address": "821361CC",
+          "word": "8168001C"
+        },
+        {
+          "address": "821361D0",
+          "word": "3944FFFF"
+        },
+        {
+          "address": "821361D4",
+          "word": "39800001"
+        },
+        {
+          "address": "821361D8",
+          "word": "5569873E"
+        },
+        {
+          "address": "821361DC",
+          "word": "55670416"
+        },
+        {
+          "address": "821361E0",
+          "word": "552BF87E"
+        },
+        {
+          "address": "821361E4",
+          "word": "38C90003"
+        },
+        {
+          "address": "821361E8",
+          "word": "396BFFFD"
+        },
+        {
+          "address": "821361EC",
+          "word": "54C9083C"
+        },
+        {
+          "address": "821361F0",
+          "word": "7D6B5038"
+        },
+        {
+          "address": "821361F4",
+          "word": "7D295078"
+        },
+        {
+          "address": "821361F8",
+          "word": "798C1FE6"
+        },
+        {
+          "address": "821361FC",
+          "word": "7D2B5B78"
+        },
+        {
+          "address": "82136200",
+          "word": "556B831E"
+        },
+        {
+          "address": "82136204",
+          "word": "7CEA5B78"
+        },
+        {
+          "address": "82136208",
+          "word": "9148001C"
+        },
+        {
+          "address": "8213620C",
+          "word": "8143280C"
+        },
+        {
+          "address": "82136210",
+          "word": "554A0416"
+        },
+        {
+          "address": "82136214",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82136218",
+          "word": "9163280C"
+        },
+        {
+          "address": "8213621C",
+          "word": "E9630018"
+        },
+        {
+          "address": "82136220",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82136224",
+          "word": "F9630018"
+        },
+        {
+          "address": "82136228",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136230": {
+      "instructions": [
+        {
+          "address": "82136230",
+          "word": "80632DF0"
+        },
+        {
+          "address": "82136234",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136238": {
+      "instructions": [
+        {
+          "address": "82136238",
+          "word": "81032F90"
+        },
+        {
+          "address": "8213623C",
+          "word": "90832DF4"
+        },
+        {
+          "address": "82136240",
+          "word": "28080000"
+        },
+        {
+          "address": "82136244",
+          "word": "4D820020"
+        },
+        {
+          "address": "82136248",
+          "word": "8148001C"
+        },
+        {
+          "address": "8213624C",
+          "word": "554B873E"
+        },
+        {
+          "address": "82136250",
+          "word": "2B0B0002"
+        },
+        {
+          "address": "82136254",
+          "word": "419A001C"
+        },
+        {
+          "address": "82136258",
+          "word": "2B0B0003"
+        },
+        {
+          "address": "8213625C",
+          "word": "419A0014"
+        },
+        {
+          "address": "82136260",
+          "word": "2B0B000A"
+        },
+        {
+          "address": "82136264",
+          "word": "419A000C"
+        },
+        {
+          "address": "82136268",
+          "word": "2B0B000C"
+        },
+        {
+          "address": "8213626C",
+          "word": "4C9A0020"
+        },
+        {
+          "address": "82136270",
+          "word": "554B6FFE"
+        },
+        {
+          "address": "82136274",
+          "word": "7D6B2279"
+        },
+        {
+          "address": "82136278",
+          "word": "4D820020"
+        },
+        {
+          "address": "8213627C",
+          "word": "8168001C"
+        },
+        {
+          "address": "82136280",
+          "word": "3944FFFF"
+        },
+        {
+          "address": "82136284",
+          "word": "39800001"
+        },
+        {
+          "address": "82136288",
+          "word": "5569873E"
+        },
+        {
+          "address": "8213628C",
+          "word": "55670416"
+        },
+        {
+          "address": "82136290",
+          "word": "552BF87E"
+        },
+        {
+          "address": "82136294",
+          "word": "38C90003"
+        },
+        {
+          "address": "82136298",
+          "word": "396BFFFD"
+        },
+        {
+          "address": "8213629C",
+          "word": "54C9083C"
+        },
+        {
+          "address": "821362A0",
+          "word": "7D6B5038"
+        },
+        {
+          "address": "821362A4",
+          "word": "7D295078"
+        },
+        {
+          "address": "821362A8",
+          "word": "798C17E6"
+        },
+        {
+          "address": "821362AC",
+          "word": "7D2B5B78"
+        },
+        {
+          "address": "821362B0",
+          "word": "556B831E"
+        },
+        {
+          "address": "821362B4",
+          "word": "7CEA5B78"
+        },
+        {
+          "address": "821362B8",
+          "word": "9148001C"
+        },
+        {
+          "address": "821362BC",
+          "word": "81432810"
+        },
+        {
+          "address": "821362C0",
+          "word": "554A0416"
+        },
+        {
+          "address": "821362C4",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "821362C8",
+          "word": "91632810"
+        },
+        {
+          "address": "821362CC",
+          "word": "E9630018"
+        },
+        {
+          "address": "821362D0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821362D4",
+          "word": "F9630018"
+        },
+        {
+          "address": "821362D8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821362E0": {
+      "instructions": [
+        {
+          "address": "821362E0",
+          "word": "80632DF4"
+        },
+        {
+          "address": "821362E4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821362E8": {
+      "instructions": [
+        {
+          "address": "821362E8",
+          "word": "81032F94"
+        },
+        {
+          "address": "821362EC",
+          "word": "90832DF8"
+        },
+        {
+          "address": "821362F0",
+          "word": "28080000"
+        },
+        {
+          "address": "821362F4",
+          "word": "4D820020"
+        },
+        {
+          "address": "821362F8",
+          "word": "8148001C"
+        },
+        {
+          "address": "821362FC",
+          "word": "554B873E"
+        },
+        {
+          "address": "82136300",
+          "word": "2B0B0002"
+        },
+        {
+          "address": "82136304",
+          "word": "419A001C"
+        },
+        {
+          "address": "82136308",
+          "word": "2B0B0003"
+        },
+        {
+          "address": "8213630C",
+          "word": "419A0014"
+        },
+        {
+          "address": "82136310",
+          "word": "2B0B000A"
+        },
+        {
+          "address": "82136314",
+          "word": "419A000C"
+        },
+        {
+          "address": "82136318",
+          "word": "2B0B000C"
+        },
+        {
+          "address": "8213631C",
+          "word": "4C9A0020"
+        },
+        {
+          "address": "82136320",
+          "word": "554B6FFE"
+        },
+        {
+          "address": "82136324",
+          "word": "7D6B2279"
+        },
+        {
+          "address": "82136328",
+          "word": "4D820020"
+        },
+        {
+          "address": "8213632C",
+          "word": "8168001C"
+        },
+        {
+          "address": "82136330",
+          "word": "3944FFFF"
+        },
+        {
+          "address": "82136334",
+          "word": "39800001"
+        },
+        {
+          "address": "82136338",
+          "word": "5569873E"
+        },
+        {
+          "address": "8213633C",
+          "word": "55670416"
+        },
+        {
+          "address": "82136340",
+          "word": "552BF87E"
+        },
+        {
+          "address": "82136344",
+          "word": "38C90003"
+        },
+        {
+          "address": "82136348",
+          "word": "396BFFFD"
+        },
+        {
+          "address": "8213634C",
+          "word": "54C9083C"
+        },
+        {
+          "address": "82136350",
+          "word": "7D6B5038"
+        },
+        {
+          "address": "82136354",
+          "word": "7D295078"
+        },
+        {
+          "address": "82136358",
+          "word": "798C0FE6"
+        },
+        {
+          "address": "8213635C",
+          "word": "7D2B5B78"
+        },
+        {
+          "address": "82136360",
+          "word": "556B831E"
+        },
+        {
+          "address": "82136364",
+          "word": "7CEA5B78"
+        },
+        {
+          "address": "82136368",
+          "word": "9148001C"
+        },
+        {
+          "address": "8213636C",
+          "word": "81432814"
+        },
+        {
+          "address": "82136370",
+          "word": "554A0416"
+        },
+        {
+          "address": "82136374",
+          "word": "7D4B5B78"
+        },
+        {
+          "address": "82136378",
+          "word": "91632814"
+        },
+        {
+          "address": "8213637C",
+          "word": "E9630018"
+        },
+        {
+          "address": "82136380",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82136384",
+          "word": "F9630018"
+        },
+        {
+          "address": "82136388",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136390": {
+      "instructions": [
+        {
+          "address": "82136390",
+          "word": "80632DF8"
+        },
+        {
+          "address": "82136394",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136398": {
+      "instructions": [
+        {
+          "address": "82136398",
+          "word": "9081001C"
+        },
+        {
+          "address": "8213639C",
+          "word": "39800001"
+        },
+        {
+          "address": "821363A0",
+          "word": "798CA7E6"
+        },
+        {
+          "address": "821363A4",
+          "word": "C001001C"
+        },
+        {
+          "address": "821363A8",
+          "word": "D0032900"
+        },
+        {
+          "address": "821363AC",
+          "word": "E9630018"
+        },
+        {
+          "address": "821363B0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821363B4",
+          "word": "F9630018"
+        },
+        {
+          "address": "821363B8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821363C0": {
+      "instructions": [
+        {
+          "address": "821363C0",
+          "word": "C0032900"
+        },
+        {
+          "address": "821363C4",
+          "word": "D001FFF0"
+        },
+        {
+          "address": "821363C8",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "821363CC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821363D0": {
+      "instructions": [
+        {
+          "address": "821363D0",
+          "word": "9081001C"
+        },
+        {
+          "address": "821363D4",
+          "word": "39800001"
+        },
+        {
+          "address": "821363D8",
+          "word": "798CAFE6"
+        },
+        {
+          "address": "821363DC",
+          "word": "C001001C"
+        },
+        {
+          "address": "821363E0",
+          "word": "D00328FC"
+        },
+        {
+          "address": "821363E4",
+          "word": "E9630018"
+        },
+        {
+          "address": "821363E8",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821363EC",
+          "word": "F9630018"
+        },
+        {
+          "address": "821363F0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821363F8": {
+      "instructions": [
+        {
+          "address": "821363F8",
+          "word": "C00328FC"
+        },
+        {
+          "address": "821363FC",
+          "word": "D001FFF0"
+        },
+        {
+          "address": "82136400",
+          "word": "8061FFF0"
+        },
+        {
+          "address": "82136404",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136408": {
+      "instructions": [
+        {
+          "address": "82136408",
+          "word": "816328F8"
+        },
+        {
+          "address": "8213640C",
+          "word": "39800001"
+        },
+        {
+          "address": "82136410",
+          "word": "5164003A"
+        },
+        {
+          "address": "82136414",
+          "word": "798CB7E6"
+        },
+        {
+          "address": "82136418",
+          "word": "908328F8"
+        },
+        {
+          "address": "8213641C",
+          "word": "E9630018"
+        },
+        {
+          "address": "82136420",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82136424",
+          "word": "F9630018"
+        },
+        {
+          "address": "82136428",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136430": {
+      "instructions": [
+        {
+          "address": "82136430",
+          "word": "816328F8"
+        },
+        {
+          "address": "82136434",
+          "word": "556307BE"
+        },
+        {
+          "address": "82136438",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136440": {
+      "instructions": [
+        {
+          "address": "82136440",
+          "word": "81632940"
+        },
+        {
+          "address": "82136444",
+          "word": "39800001"
+        },
+        {
+          "address": "82136448",
+          "word": "5164003C"
+        },
+        {
+          "address": "8213644C",
+          "word": "798C1FE6"
+        },
+        {
+          "address": "82136450",
+          "word": "90832940"
+        },
+        {
+          "address": "82136454",
+          "word": "E9630020"
+        },
+        {
+          "address": "82136458",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "8213645C",
+          "word": "F9630020"
+        },
+        {
+          "address": "82136460",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136468": {
+      "instructions": [
+        {
+          "address": "82136468",
+          "word": "81632940"
+        },
+        {
+          "address": "8213646C",
+          "word": "556307FE"
+        },
+        {
+          "address": "82136470",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136478": {
+      "instructions": [
+        {
+          "address": "82136478",
+          "word": "816328C8"
+        },
+        {
+          "address": "8213647C",
+          "word": "508BAA94"
+        },
+        {
+          "address": "82136480",
+          "word": "916328C8"
+        },
+        {
+          "address": "82136484",
+          "word": "E9630010"
+        },
+        {
+          "address": "82136488",
+          "word": "616B0040"
+        },
+        {
+          "address": "8213648C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82136490",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136498": {
+      "instructions": [
+        {
+          "address": "82136498",
+          "word": "816328C8"
+        },
+        {
+          "address": "8213649C",
+          "word": "55635FFE"
+        },
+        {
+          "address": "821364A0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821364A8": {
+      "instructions": [
+        {
+          "address": "821364A8",
+          "word": "90832858"
+        },
+        {
+          "address": "821364AC",
+          "word": "E9630018"
+        },
+        {
+          "address": "821364B0",
+          "word": "656B0008"
+        },
+        {
+          "address": "821364B4",
+          "word": "F9630018"
+        },
+        {
+          "address": "821364B8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821364C0": {
+      "instructions": [
+        {
+          "address": "821364C0",
+          "word": "80632858"
+        },
+        {
+          "address": "821364C4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821364C8": {
+      "instructions": [
+        {
+          "address": "821364C8",
+          "word": "816328BC"
+        },
+        {
+          "address": "821364CC",
+          "word": "508B26F6"
+        },
+        {
+          "address": "821364D0",
+          "word": "916328BC"
+        },
+        {
+          "address": "821364D4",
+          "word": "E9630010"
+        },
+        {
+          "address": "821364D8",
+          "word": "616B0200"
+        },
+        {
+          "address": "821364DC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821364E0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821364E8": {
+      "instructions": [
+        {
+          "address": "821364E8",
+          "word": "816328BC"
+        },
+        {
+          "address": "821364EC",
+          "word": "5563E7FE"
+        },
+        {
+          "address": "821364F0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821364F8": {
+      "instructions": [
+        {
+          "address": "821364F8",
+          "word": "816328BC"
+        },
+        {
+          "address": "821364FC",
+          "word": "508BC00E"
+        },
+        {
+          "address": "82136500",
+          "word": "916328BC"
+        },
+        {
+          "address": "82136504",
+          "word": "E9630010"
+        },
+        {
+          "address": "82136508",
+          "word": "616B0200"
+        },
+        {
+          "address": "8213650C",
+          "word": "F9630010"
+        },
+        {
+          "address": "82136510",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136518": {
+      "instructions": [
+        {
+          "address": "82136518",
+          "word": "896328BC"
+        },
+        {
+          "address": "8213651C",
+          "word": "7D6A5B78"
+        },
+        {
+          "address": "82136520",
+          "word": "516A063A"
+        },
+        {
+          "address": "82136524",
+          "word": "5543063E"
+        },
+        {
+          "address": "82136528",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136530": {
+      "instructions": [
+        {
+          "address": "82136530",
+          "word": "9081001C"
+        },
+        {
+          "address": "82136534",
+          "word": "39800001"
+        },
+        {
+          "address": "82136538",
+          "word": "798C07E6"
+        },
+        {
+          "address": "8213653C",
+          "word": "C001001C"
+        },
+        {
+          "address": "82136540",
+          "word": "D003294C"
+        },
+        {
+          "address": "82136544",
+          "word": "E9630020"
+        },
+        {
+          "address": "82136548",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "8213654C",
+          "word": "F9630020"
+        },
+        {
+          "address": "82136550",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136558": {
+      "instructions": [
+        {
+          "address": "82136558",
+          "word": "8063294C"
+        },
+        {
+          "address": "8213655C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136560": {
+      "instructions": [
+        {
+          "address": "82136560",
+          "word": "9081001C"
+        },
+        {
+          "address": "82136564",
+          "word": "39800001"
+        },
+        {
+          "address": "82136568",
+          "word": "798C17E6"
+        },
+        {
+          "address": "8213656C",
+          "word": "C001001C"
+        },
+        {
+          "address": "82136570",
+          "word": "D0032944"
+        },
+        {
+          "address": "82136574",
+          "word": "E9630020"
+        },
+        {
+          "address": "82136578",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "8213657C",
+          "word": "F9630020"
+        },
+        {
+          "address": "82136580",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136588": {
+      "instructions": [
+        {
+          "address": "82136588",
+          "word": "80632944"
+        },
+        {
+          "address": "8213658C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136590": {
+      "instructions": [
+        {
+          "address": "82136590",
+          "word": "9081001C"
+        },
+        {
+          "address": "82136594",
+          "word": "C001001C"
+        },
+        {
+          "address": "82136598",
+          "word": "D0032950"
+        },
+        {
+          "address": "8213659C",
+          "word": "E9630020"
+        },
+        {
+          "address": "821365A0",
+          "word": "656B8000"
+        },
+        {
+          "address": "821365A4",
+          "word": "F9630020"
+        },
+        {
+          "address": "821365A8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821365B0": {
+      "instructions": [
+        {
+          "address": "821365B0",
+          "word": "80632950"
+        },
+        {
+          "address": "821365B4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821365B8": {
+      "instructions": [
+        {
+          "address": "821365B8",
+          "word": "9081001C"
+        },
+        {
+          "address": "821365BC",
+          "word": "39800001"
+        },
+        {
+          "address": "821365C0",
+          "word": "798C0FE6"
+        },
+        {
+          "address": "821365C4",
+          "word": "C001001C"
+        },
+        {
+          "address": "821365C8",
+          "word": "D0032948"
+        },
+        {
+          "address": "821365CC",
+          "word": "E9630020"
+        },
+        {
+          "address": "821365D0",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "821365D4",
+          "word": "F9630020"
+        },
+        {
+          "address": "821365D8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821365E0": {
+      "instructions": [
+        {
+          "address": "821365E0",
+          "word": "80632948"
+        },
+        {
+          "address": "821365E4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821365E8": {
+      "instructions": [
+        {
+          "address": "821365E8",
+          "word": "81632D3C"
+        },
+        {
+          "address": "821365EC",
+          "word": "39800001"
+        },
+        {
+          "address": "821365F0",
+          "word": "508BA256"
+        },
+        {
+          "address": "821365F4",
+          "word": "798C8FE6"
+        },
+        {
+          "address": "821365F8",
+          "word": "91632D3C"
+        },
+        {
+          "address": "821365FC",
+          "word": "E9630010"
+        },
+        {
+          "address": "82136600",
+          "word": "7D6B6378"
+        },
+        {
+          "address": "82136604",
+          "word": "F9630010"
+        },
+        {
+          "address": "82136608",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136610": {
+      "instructions": [
+        {
+          "address": "82136610",
+          "word": "81632D3C"
+        },
+        {
+          "address": "82136614",
+          "word": "5563677E"
+        },
+        {
+          "address": "82136618",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136620": {
+      "instructions": [
+        {
+          "address": "82136620",
+          "word": "816328C0"
+        },
+        {
+          "address": "82136624",
+          "word": "508B1F38"
+        },
+        {
+          "address": "82136628",
+          "word": "916328C0"
+        },
+        {
+          "address": "8213662C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82136630",
+          "word": "616B0100"
+        },
+        {
+          "address": "82136634",
+          "word": "F9630010"
+        },
+        {
+          "address": "82136638",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136640": {
+      "instructions": [
+        {
+          "address": "82136640",
+          "word": "816328C0"
+        },
+        {
+          "address": "82136644",
+          "word": "5563EFFE"
+        },
+        {
+          "address": "82136648",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136650": {
+      "instructions": [
+        {
+          "address": "82136650",
+          "word": "816328C0"
+        },
+        {
+          "address": "82136654",
+          "word": "508B177A"
+        },
+        {
+          "address": "82136658",
+          "word": "916328C0"
+        },
+        {
+          "address": "8213665C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82136660",
+          "word": "616B0100"
+        },
+        {
+          "address": "82136664",
+          "word": "F9630010"
+        },
+        {
+          "address": "82136668",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136670": {
+      "instructions": [
+        {
+          "address": "82136670",
+          "word": "816328C0"
+        },
+        {
+          "address": "82136674",
+          "word": "5563F7FE"
+        },
+        {
+          "address": "82136678",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82136680": {
+      "instructions": [
+        {
+          "address": "82136680",
+          "word": "816328C0"
+        },
+        {
+          "address": "82136684",
+          "word": "508B2EB4"
+        },
+        {
+          "address": "82136688",
+          "word": "916328C0"
+        },
+        {
+          "address": "8213668C",
+          "word": "E9630010"
+        },
+        {
+          "address": "82136690",
+          "word": "616B0100"
+        },
+        {
+          "address": "82136694",
+          "word": "F9630010"
+        },
+        {
+          "address": "82136698",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821366A0": {
+      "instructions": [
+        {
+          "address": "821366A0",
+          "word": "816328C0"
+        },
+        {
+          "address": "821366A4",
+          "word": "5563DFFE"
+        },
+        {
+          "address": "821366A8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821366B0": {
+      "instructions": [
+        {
+          "address": "821366B0",
+          "word": "988328C2"
+        },
+        {
+          "address": "821366B4",
+          "word": "E9630010"
+        },
+        {
+          "address": "821366B8",
+          "word": "616B0100"
+        },
+        {
+          "address": "821366BC",
+          "word": "F9630010"
+        },
+        {
+          "address": "821366C0",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821366C8": {
+      "instructions": [
+        {
+          "address": "821366C8",
+          "word": "886328C2"
+        },
+        {
+          "address": "821366CC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821366D0": {
+      "instructions": [
+        {
+          "address": "821366D0",
+          "word": "908333A4"
+        },
+        {
+          "address": "821366D4",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821366D8": {
+      "instructions": [
+        {
+          "address": "821366D8",
+          "word": "806333A4"
+        },
+        {
+          "address": "821366DC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821366E0": {
+      "instructions": [
+        {
+          "address": "821366E0",
+          "word": "81632D3C"
+        },
+        {
+          "address": "821366E4",
+          "word": "508BB890"
+        },
+        {
+          "address": "821366E8",
+          "word": "91632D3C"
+        },
+        {
+          "address": "821366EC",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_821366F0": {
+      "instructions": [
+        {
+          "address": "821366F0",
+          "word": "81632D3C"
+        },
+        {
+          "address": "821366F4",
+          "word": "55634E7E"
+        },
+        {
+          "address": "821366F8",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_82137978": {
+      "instructions": [
+        {
+          "address": "821370E0",
+          "word": "7D8802A6"
+        },
+        {
+          "address": "821370E4",
+          "word": "9181FFF8"
+        },
+        {
+          "address": "821370E8",
+          "word": "FBC1FFE8"
+        },
+        {
+          "address": "821370EC",
+          "word": "FBE1FFF0"
+        },
+        {
+          "address": "821370F0",
+          "word": "9421FF90"
+        },
+        {
+          "address": "821370F4",
+          "word": "81640000"
+        },
+        {
+          "address": "821370F8",
+          "word": "81440004"
+        },
+        {
+          "address": "821370FC",
+          "word": "83E40008"
+        },
+        {
+          "address": "82137100",
+          "word": "83C4000C"
+        },
+        {
+          "address": "82137104",
+          "word": "80E32D40"
+        },
+        {
+          "address": "82137108",
+          "word": "80833058"
+        },
+        {
+          "address": "8213710C",
+          "word": "80A3305C"
+        },
+        {
+          "address": "82137110",
+          "word": "2F070000"
+        },
+        {
+          "address": "82137114",
+          "word": "81033060"
+        },
+        {
+          "address": "82137118",
+          "word": "81233064"
+        },
+        {
+          "address": "8213711C",
+          "word": "7CC82214"
+        },
+        {
+          "address": "82137120",
+          "word": "91633070"
+        },
+        {
+          "address": "82137124",
+          "word": "7CE92A14"
+        },
+        {
+          "address": "82137128",
+          "word": "91433074"
+        },
+        {
+          "address": "8213712C",
+          "word": "93E33078"
+        },
+        {
+          "address": "82137130",
+          "word": "93C3307C"
+        },
+        {
+          "address": "82137134",
+          "word": "419A0034"
+        },
+        {
+          "address": "82137138",
+          "word": "7F045800"
+        },
+        {
+          "address": "8213713C",
+          "word": "41990008"
+        },
+        {
+          "address": "82137140",
+          "word": "7D645B78"
+        },
+        {
+          "address": "82137144",
+          "word": "7F055000"
+        },
+        {
+          "address": "82137148",
+          "word": "41990008"
+        },
+        {
+          "address": "8213714C",
+          "word": "7D455378"
+        },
+        {
+          "address": "82137150",
+          "word": "7F06F800"
+        },
+        {
+          "address": "82137154",
+          "word": "41980008"
+        },
+        {
+          "address": "82137158",
+          "word": "7FE6FB78"
+        },
+        {
+          "address": "8213715C",
+          "word": "7F07F000"
+        },
+        {
+          "address": "82137160",
+          "word": "41980008"
+        },
+        {
+          "address": "82137164",
+          "word": "7FC7F378"
+        },
+        {
+          "address": "82137168",
+          "word": "81632844"
+        },
+        {
+          "address": "8213716C",
+          "word": "81432848"
+        },
+        {
+          "address": "82137170",
+          "word": "50AB805E"
+        },
+        {
+          "address": "82137174",
+          "word": "50EA805E"
+        },
+        {
+          "address": "82137178",
+          "word": "508B047E"
+        },
+        {
+          "address": "8213717C",
+          "word": "50CA047E"
+        },
+        {
+          "address": "82137180",
+          "word": "91632844"
+        },
+        {
+          "address": "82137184",
+          "word": "91432848"
+        },
+        {
+          "address": "82137188",
+          "word": "4BFFDA51"
+        },
+        {
+          "address": "8213718C",
+          "word": "38210070"
+        },
+        {
+          "address": "82137190",
+          "word": "8181FFF8"
+        },
+        {
+          "address": "82137194",
+          "word": "7D8803A6"
+        },
+        {
+          "address": "82137198",
+          "word": "EBC1FFE8"
+        },
+        {
+          "address": "8213719C",
+          "word": "EBE1FFF0"
+        },
+        {
+          "address": "821371A0",
+          "word": "4E800020"
+        },
+        {
+          "address": "82137978",
+          "word": "7C8B2378"
+        },
+        {
+          "address": "8213797C",
+          "word": "38833070"
+        },
+        {
+          "address": "82137980",
+          "word": "91632D40"
+        },
+        {
+          "address": "82137984",
+          "word": "4BFFF75C"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition",
+        "body_membership_discrepancy:additional_range=821370E0-821371A3"
+      ]
+    },
+    "sub_821D5978": {
+      "instructions": [
+        {
+          "address": "821D5978",
+          "word": "38600000"
+        },
+        {
+          "address": "821D597C",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    },
+    "sub_8252B718": {
+      "instructions": [
+        {
+          "address": "8252B718",
+          "word": "4E800020"
+        }
+      ],
+      "decompile_completed": true,
+      "quality": [
+        "raw_evidence_only_no_semantic_completion_claim",
+        "transient_read_only_function_definition"
+      ]
+    }
+  }
+}

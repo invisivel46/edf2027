@@ -60,6 +60,15 @@ To check a separate staging folder, run `cmake -DEXECUTABLE=<absolute-exe-path>
 as prerequisites; this does not replace runtime testing or detect every dynamic
 plugin load.
 
+Renderer changes can be checked without launching the game:
+`.\validate-renderer-offline.cmd` (PowerShell, from the repository root).
+See [offline validation](docs/renderer-offline-validation.md) for the wrapped
+suites, static-pass replay fixture, reports and milestone runtime checks.
+
+Parallel renderer work uses [bounded dispatch packets](docs/renderer-dispatch.md)
+with pinned source, explicit file ownership, model routing and independent review.
+Inspect the queue with `python tools/dispatch-renderer.py status` after initialization.
+
 ![Mission 1 running at 1280x720, 60 fps](docs/media/gameplay.jpg)
 
 ![Gameplay clip](docs/media/gameplay.gif)

@@ -10,6 +10,21 @@
 #include "native_graphics/native_submission_flush.h"
 #include "native_graphics/native_buffer_write_frame.h"
 #include "native_graphics/native_cache_flush.h"
+#include "native_graphics/native_scene_handoff.h"
+#include "native_graphics/native_scene_execution.h"
+#include "native_graphics/native_scene_world_restore.h"
+#include "native_graphics/native_static_group_eligibility.h"
+#include "native_static_group_gpu.h"
+REX_EXTERN(__imp__sub_821D9600);
+
+namespace edf::native {
+NativeSceneExecution fixture_scene_execution;
+void EnterNativeSceneBoundary(NativeSceneBoundary boundary) { fixture_scene_execution.Enter(boundary); }
+}
+#include "native_graphics/native_scene_geometry_install.h"
+#include "native_graphics/native_material_cpu_program.h"
+#include "native_graphics/native_shader_binding.h"
+#include "native_graphics/native_indexed_completion.h"
 #include <array>
 #include <bit>
 #include <cstring>
@@ -26,6 +41,17 @@ struct FlushReader {
   void StoreByte(uint32_t address,uint8_t value) const { REX_STORE_U8(address,value); }
   void StoreWord(uint32_t address,uint32_t value) const { REX_STORE_U32(address,value); }
 };
+struct GeometryFixtureReader {
+  uint8_t* base;
+  uint32_t Add(uint32_t address,uint32_t offset) const { return address+offset; }
+  uint32_t Word(uint32_t address) const { return REX_LOAD_U32(address); }
+  uint64_t DoubleWord(uint32_t address) const { return REX_LOAD_U64(address); }
+  const uint8_t* Bytes(uint32_t address,size_t) const { return base+address; }
+  const uint8_t* WritableBytes(uint32_t address,size_t,size_t) const { return base+address; }
+  void StoreWord(uint32_t address,uint32_t value) const { REX_STORE_U32(address,value); }
+  void StoreDoubleWord(uint32_t address,uint64_t value) const { REX_STORE_U64(address,value); }
+  void StoreByte(uint32_t address,uint8_t value) const { REX_STORE_U8(address,value); }
+};
 static void TestObservedVector(uint8_t* base,simde__m128i* destination,simde__m128i value) {
   simde_mm_store_si128(destination,value);
 }
@@ -35,6 +61,11 @@ static void* TestObservedFill(uint8_t* base,void* destination,int value,size_t b
 #undef simde_mm_store_si128
 #undef memset
 REX_EXTERN(__imp__edf_native_indexed_cpu_tail);
+REX_EXTERN(__imp__sub_82137410);
+REX_EXTERN(__imp__sub_821375C0);
+REX_EXTERN(__imp__sub_821B8E48);
+REX_EXTERN(__imp__sub_82149248);
+REX_EXTERN(__imp__sub_82149358);
 REX_EXTERN(__imp__edf_native_immediate_cpu_tail);
 REX_EXTERN(sub_821FE358);
 REX_EXTERN(__imp__sub_8213DB60);
@@ -288,6 +319,8 @@ bool real_vector_packets=false;
 bool real_special_packets=false;
 bool main_state_fixture=false,shader_cache_hit=false;
 bool real_shader_cache=false;
+bool indexed_bank_fixture=false;
+bool material_reference=false;
 unsigned shader_cache_hits=0,shader_cache_refreshes=0,shader_cache_busy=0;
 uint64_t helper_trace=0;
 uint64_t cache_trace=0;
@@ -431,13 +464,21 @@ REX_EXTERN(sub_8213ECB0) {
   __imp__edf_native_main_state_cpu_tail(ctx,base);
 }
 REX_EXTERN(sub_8213D938) {
+  if(indexed_bank_fixture) {
+    Require(ctx.r6.u32==0,"indexed special encoder mode changed");
+    ++render; ctx.r3.u64=ctx.r4.u64 & ~uint64_t(0x100); return;
+  }
   Require(real_special_packets,"unexpected special render helper");
   if(Ownership::OwnsSpecialRenderPacket(ctx.r3.u32,uint32_t(ctx.lr),ctx.r4.u64,ctx.r6.u32))
     ctx.r3.u64=ctx.r4.u64 & ~uint64_t(0x100);
   else __imp__sub_8213D938(ctx,base);
 }
-REX_EXTERN(sub_8213DDA0) { throw std::runtime_error("unexpected fetch helper"); }
+REX_EXTERN(sub_8213DDA0) {
+  if(indexed_bank_fixture) { ++render; return; } // Audited packet-only encoder.
+  throw std::runtime_error("unexpected fetch helper");
+}
 REX_EXTERN(sub_8213DC20) {
+  if(indexed_bank_fixture) { ++render; return; } // Audited packet-only encoder.
   Require(real_vector_packets,"unexpected vector-state helper");
   if(!Ownership::OwnsVectorStatePackets(ctx.r3.u32,ctx.r4.u64)) __imp__sub_8213DC20(ctx,base);
 }
@@ -770,11 +811,34 @@ REX_EXTERN(sub_82147BA0) {
 REX_EXTERN(sub_82141440) {
   throw std::runtime_error("unexpected shader retirement allocation in binding fixture");
 }
+REX_EXTERN(sub_821498C8) {
+  Require(material_reference,"native material called retail vertex shader binding");
+  __imp__sub_821498C8(ctx,base);
+}
+REX_EXTERN(sub_82149608) {
+  Require(material_reference,"native material called retail pixel shader binding");
+  __imp__sub_82149608(ctx,base);
+}
+REX_EXTERN(sub_82149248) {
+  Require(material_reference,"native material called retail vertex constant setter");
+  __imp__sub_82149248(ctx,base);
+}
+REX_EXTERN(sub_82149358) {
+  Require(material_reference,"native material called retail pixel constant setter");
+  __imp__sub_82149358(ctx,base);
+}
+REX_EXTERN(sub_8213BA98) { throw std::runtime_error("unconfigured material texture reference"); }
+REX_EXTERN(sub_82136888) { throw std::runtime_error("unconfigured material sampler reference"); }
+REX_EXTERN(sub_82136700) { throw std::runtime_error("unconfigured material sampler reference"); }
+REX_EXTERN(sub_82136C20) { throw std::runtime_error("unconfigured material sampler reference"); }
 void edf_test_shader_binding(uint32_t owner,uint32_t shader,bool pixel) {
   auto* base=declaration_fixture_base;
   Require(base && REX_LOAD_U32(owner+(pixel?12416:12420))==shader,
     "shader binding published before original CPU update");
   captured_shaders.Set(owner,shader,pixel);
+}
+void edf_test_unexpected_native_shader_binding(PPCContext&,uint8_t*,bool) {
+  throw std::runtime_error("publication fixture unexpectedly selected native shader activation");
 }
 void edf_test_declaration_contents(uint8_t* base,uint32_t handle) {
   declaration_content_handle=handle;
@@ -1744,6 +1808,42 @@ int main() {
         Require(REX_LOAD_U32(device+40)>cursor+(wrap?1024:0),"unowned tail emitted no packets");
       }
     }
+    // Production orchestration: entry snapshots, store order and partial failure.
+    for(bool initially_dirty:{false,true}) for(bool failure:{false,true}) {
+      struct Memory {
+        mutable std::array<uint64_t,2048> words{};
+        mutable std::vector<uint32_t> writes;
+        uint64_t Wide(uint32_t address) const { return words.at(address/8); }
+        void StoreWide(uint32_t address,uint64_t value) const { writes.push_back(address); words.at(address/8)=value; }
+      } memory;
+      memory.words[0]=1; memory.words[1]=1; memory.words[2]=uint64_t(1)<<49;
+      memory.words[3]=initially_dirty?2:0; memory.words[4]=initially_dirty?1:0;
+      bool caught=false;
+      try {
+        edf::native::CompleteNativeIndexedState(memory,0,[&](uint64_t dirty) {
+          Require(dirty==(uint64_t(1)<<49) && memory.writes==std::vector<uint32_t>{0,8},
+            "indexed main-state call lost entry mask or ordered constant consumption");
+          memory.words[3]=4; memory.words[4]=2;
+          if(failure) throw std::runtime_error("injected main-state failure");
+        });
+      } catch(const std::runtime_error& error) {
+        if(std::string(error.what())!="injected main-state failure") throw;
+        caught=true;
+      }
+      Require(caught==failure,"indexed main-state failure swallowed");
+      if(failure) {
+        Require(memory.writes==std::vector<uint32_t>{0,8} && memory.words[2]==(uint64_t(1)<<49) &&
+          memory.words[3]==4 && memory.words[4]==2,"indexed failure consumed unfinished state");
+        edf::native::CompleteNativeIndexedState(memory,0,[](uint64_t) {});
+        Require(memory.writes==std::vector<uint32_t>({0,8,16,24,32}),"indexed retry repeated completed constant work");
+      } else {
+        const auto expected=initially_dirty?std::vector<uint32_t>{0,8,16,11568,24,32}:std::vector<uint32_t>{0,8,16};
+        Require(memory.writes==expected,"indexed completion store order changed");
+        Require(memory.words[3]==(initially_dirty?0:4) && memory.words[4]==(initially_dirty?0:2),
+          "indexed completion reread helper-modified banks instead of entry snapshots");
+        Require(memory.words[11568/8]==(initially_dirty?0xffffffffff000000ull:0),"indexed render signature changed");
+      }
+    }
     // Every dirty-bank branch in the native prefixes must be packet-free even
     // without ownership scope, including the real mixed CPU-state helper chain.
     for(bool immediate:{false,true}) {
@@ -1826,6 +1926,302 @@ int main() {
       Require(REX_LOAD_U32(device+40)==cursor,"native indexed tail advanced GPU cursor");
       for(uint32_t at=0;at<2048;++at) Require(base[cursor+at]==0,"native indexed tail emitted draw packets");
     }
+    // Every individual dirty bit against the original indexed routine, followed
+    // by a second native completion. This includes bank24 bit1's CPU signature.
+    for(uint32_t bank:{0,8,16,24,32}) for(unsigned bit=0;bit<64;++bit) {
+      auto reference=std::make_unique<Arena>(),native=std::make_unique<Arena>();
+      auto* base=reference->bytes.data();
+      REX_STORE_U8(device+12256,7); expected_stride=28;
+      PrepareDrawCpuState(base);
+      REX_STORE_U64(device+bank,uint64_t(1)<<bit);
+      REX_STORE_U32(device+40,cursor); REX_STORE_U32(device+48,cursor+2048);
+      REX_STORE_U32(device+12164,vertices); REX_STORE_U32(vertices+24,copy);
+      *native=*reference;
+      const auto context=[] {
+        PPCContext ctx{}; ctx.r1.u64=0xf0000; ctx.lr=0x12345678;
+        ctx.r3.u64=device; ctx.r4.u64=4; ctx.r7.u64=3; return ctx;
+      };
+      auto original=context();
+      // Isolate audited packet encoders, including D938's documented mask
+      // return. This comparison does not validate their packet byte encodings.
+      indexed_bank_fixture=true;
+      sub_821FE358(original,reference->bytes.data());
+      indexed_bank_fixture=false;
+      constants=render=derived=rollovers=allocations=copies=0; helper_trace=cache_trace=0;
+      auto actual=context(); __imp__edf_native_indexed_cpu_tail(actual,native->bytes.data());
+      Require(!(constants || render || derived || rollovers || allocations || copies || helper_trace || cache_trace),
+        "native indexed completion reached a retail packet/helper dispatch");
+      for(uint32_t at=0;at<0xe0000;++at) {
+        if((at>=device+40 && at<device+44) || (at>=cursor && at<cursor+2048)) continue;
+        Require(reference->bytes[at]==native->bytes[at],"single dirty-bit indexed CPU projection differs");
+      }
+      const auto completed=std::make_unique<Arena>(*native);
+      actual=context(); __imp__edf_native_indexed_cpu_tail(actual,native->bytes.data());
+      Require(!std::memcmp(completed->bytes.data(),native->bytes.data(),0xe0000),"repeated indexed completion changed CPU state");
+      base=native->bytes.data();
+      Require(REX_LOAD_U32(device+40)==cursor && actual.r1.u64==0xf0000 && actual.lr==0x12345678,
+        "indexed completion changed cursor or caller ABI");
+    }
+    std::cout << "Native indexed completion: 320 single-bit/repetition comparisons and 4 snapshot/failure cases passed\n";
+    // Execute production group orchestration, real CPU geometry/material/tail
+    // helpers, and retained WARP output from the same guest-derived inputs.
+    for(unsigned draws:{0u,1u,3u}) for(bool changed_material:{false,true})
+      for(bool fallback:{false,true}) for(bool fail_tail:{false,true}) {
+      using namespace edf::native;
+      auto reference=std::make_unique<Arena>(),actual=std::make_unique<Arena>();
+      auto* base=reference->bytes.data();
+      REX_STORE_U8(device+12256,7); expected_stride=28;
+      PrepareDrawCpuState(base);
+      REX_STORE_U64(device,1);
+      REX_STORE_U32(device+40,cursor); REX_STORE_U32(device+48,cursor+2048);
+      REX_STORE_U32(device+12164,vertices); REX_STORE_U32(vertices+24,copy);
+      *actual=*reference;
+      NativeSceneGeometryHandoff geometry;
+      NativeSceneGeometryInstallState geometry_progress;
+      NativeSceneMaterialHandoff material;
+      NativeSceneGeometrySource setup{}; setup.declaration=0x65000;
+      setup.vertex=vertices; setup.index=vertices+128; setup.stride=28; setup.count=6;
+      REX_STORE_U32(vertices+28,0x1000); REX_STORE_U32(setup.index+24,copy);
+      REX_STORE_U32(device+12188,fallback?vertices+256:0);
+      constexpr uint32_t material_instance=0x80000,pass=0x81000,pixel_shader=0x68000;
+      setup.material=material_instance; setup.shader=0x60000;
+      REX_STORE_U32(material_instance+108,pass);
+      REX_STORE_U32(pass,pass+32); REX_STORE_U32(pass+4,pass+64);
+      REX_STORE_U32(pass+32,0x60000); REX_STORE_U32(pass+68,pixel_shader);
+      REX_STORE_U32(pixel_shader+64,128);
+      unsigned block=0;
+      for(uint32_t offset:{0,24,36,60}) {
+        const uint32_t record=0x82000+block*32,data=0x84000+block*32,indirect=0x83000+block*4;
+        const bool global=offset==24 || offset==60;
+        const uint32_t first=global?4:0;
+        REX_STORE_U32(material_instance+offset,record);
+        REX_STORE_U32(material_instance+offset+8,1);
+        REX_STORE_U32(indirect,data);
+        REX_STORE_U32(record,global?indirect:first);
+        REX_STORE_U32(record+4,data);
+        REX_STORE_U32(record+8,1);
+        REX_STORE_U32(record+12,global?first:1);
+        for(unsigned word=0;word<4;++word) REX_STORE_U32(data+word*4,0x3f000000+block*16+word);
+        ++block;
+      }
+      // One declared opaque fixture: position-only quad, no textures or explicit
+      // state lists, disjoint constants, fence retirement, identity world. The
+      // pixel constant changes red -> blue; its oracle lives in the GPU helper.
+      constexpr uint32_t gpu_vertices=0x90000,gpu_indices=0x91000;
+      REX_STORE_U32(device+10424,0x10001); REX_STORE_U32(device+10332,15);
+      REX_STORE_U32(vertices+24,gpu_vertices);
+      REX_STORE_U32(setup.index+24,gpu_indices);
+      REX_STORE_U32(setup.declaration,0); REX_STORE_U32(setup.declaration+4,0x2a23b9);
+      REX_STORE_U32(setup.declaration+8,0);
+      const float points[]{-.5f,-.5f,.5f, -.5f,.5f,.5f, .5f,.5f,.5f, .5f,-.5f,.5f};
+      for(unsigned vertex=0;vertex<4;++vertex) for(unsigned component=0;component<3;++component)
+        REX_STORE_U32(gpu_vertices+vertex*setup.stride+component*4,std::bit_cast<uint32_t>(points[vertex*3+component]));
+      const uint16_t indices[]{0,1,2,0,2,3};
+      for(unsigned i=0;i<6;++i) REX_STORE_U16(gpu_indices+i*2,indices[i]);
+      for(unsigned word=0;word<4;++word) {
+        REX_STORE_U32(device+368*16+word*4,(word==0 || word==3)?0x3f800000:0);
+        REX_STORE_U32(0x84040+word*4,(word==2 || word==3)?0x3f800000:0);
+      }
+      constexpr uint32_t fallback_instance=0x92000,fallback_record=0x93000,fallback_data=0x94000;
+      REX_STORE_U32(fallback_instance+16,fallback_record);
+      REX_STORE_U32(fallback_instance+20,fallback_record+12);
+      REX_STORE_U32(fallback_record,fallback_data);
+      REX_STORE_U32(fallback_record+4,8); REX_STORE_U32(fallback_record+8,1);
+      for(unsigned word=0;word<4;++word) REX_STORE_U32(fallback_data+word*4,0x42280000+word);
+      std::array<uint8_t,64> world_bytes{};
+      for(unsigned word:{0u,5u,10u,15u}) { world_bytes[word*4]=0x3f; world_bytes[word*4+1]=0x80; }
+      *actual=*reference;
+      NativeStaticGroupGpuInputs gpu;
+      {
+        const GeometryFixtureReader reader{actual->bytes.data()};
+        Require(AssessNativeStaticGroup(reader,device,0xf0000,setup)==NativeStaticGroupEligibility::Supported,
+          "integrated static group no longer satisfies production eligibility");
+        const auto capture=[&](uint32_t address,size_t bytes) {
+          const auto* begin=reader.Bytes(address,bytes); return std::vector<uint8_t>(begin,begin+bytes);
+        };
+        gpu.declaration=capture(setup.declaration,12);
+        gpu.vertices=capture(reader.Word(setup.vertex+24),setup.stride*4);
+        gpu.indices=capture(reader.Word(setup.index+24),12); gpu.stride=setup.stride;
+        const std::array<uint32_t,6> state_offsets{10424,10420,10440,10428,10332,11584};
+        for(size_t i=0;i<state_offsets.size();++i) gpu.state[i]=reader.Word(device+state_offsets[i]);
+        uint32_t tint=device+368*16;
+        if(changed_material) {
+          const auto program=ReadNativeMaterialCpuProgram(reader,material_instance,device);
+          const auto operation=std::find_if(program.constants.begin(),program.constants.end(),
+            [](const auto& value) { return value.pixel && value.first==0; });
+          Require(operation!=program.constants.end(),"group publication lost pixel constant input");
+          tint=operation->data;
+        }
+        for(unsigned word=0;word<4;++word) gpu.tint[word]=std::bit_cast<float>(reader.Word(tint+word*4));
+        for(unsigned word=0;word<16;++word) {
+          uint32_t bits=0; for(unsigned byte=0;byte<4;++byte) bits=(bits<<8)|world_bytes[word*4+byte];
+          gpu.world[word]=std::bit_cast<float>(bits);
+        }
+      }
+      geometry.Defer(setup);
+      if(changed_material) material.Defer();
+      for(unsigned i=0;i<draws;++i) geometry.DrawAccepted();
+      std::vector<int> trace;
+      unsigned installations=0,activations=0,tails=0,submissions=0;
+      bool clean=true,throw_once=fail_tail && draws,gpu_submitted=false;
+      std::unique_ptr<Arena> before_tail;
+      const auto context=[] {
+        PPCContext ctx{}; ctx.r1.u64=0xf0000; ctx.lr=0x12345678;
+        ctx.r3.u64=device; ctx.r4.u64=4; ctx.r7.u64=6; return ctx;
+      };
+      const auto install=[&](uint8_t* memory,bool native) {
+        if(!native) {
+          auto ctx=context(); ctx.r4.u64=0; ctx.r5.u64=setup.vertex;
+          ctx.r6.u64=0; ctx.r7.u64=setup.stride; ctx.r8.u64=4096;
+          __imp__sub_82137410(ctx,memory);
+          ctx.r3.u64=device; ctx.r4.u64=setup.declaration;
+          __imp__sub_82149A90(ctx,memory);
+          ctx.r3.u64=device; ctx.r4.u64=setup.index;
+          __imp__sub_821375C0(ctx,memory);
+          return;
+        }
+        const GeometryFixtureReader reader{memory};
+        std::vector<NativeGeometryBinding> published;
+        InstallNativeSceneGeometry(reader,device,setup,
+          [](bool)->uint32_t { throw std::runtime_error("unexpected group geometry allocator"); },
+          [](bool)->uint32_t { throw std::runtime_error("unexpected group geometry legacy tag"); },
+          [](bool,auto,auto,auto,auto) {},[&](auto binding) {
+            if(binding==NativeGeometryBinding::Stream)
+              Require(reader.Word(device+12188)==setup.vertex,"stream publication preceded CPU binding");
+            if(binding==NativeGeometryBinding::Declaration)
+              Require(reader.Word(device+11536)==setup.declaration,"declaration publication preceded CPU binding");
+            if(binding==NativeGeometryBinding::Index)
+              Require(reader.Word(device+12164)==setup.index,"index publication preceded CPU binding");
+            published.push_back(binding);
+          },&geometry_progress);
+        Require(published==std::vector<NativeGeometryBinding>{NativeGeometryBinding::Stream,
+          NativeGeometryBinding::Declaration,NativeGeometryBinding::Index},"group geometry publication order");
+      };
+      // Reference is a direct full-matrix copy. Native uses the exact production
+      // restoration helper; publication observes all 64 restored bytes.
+      const auto world=[&](uint8_t* memory,bool native) {
+        if(!native) { std::memcpy(memory+device+1792,world_bytes.data(),64); return; }
+        RestoreNativeSceneWorld(GeometryFixtureReader{memory},device,0,world_bytes,[&](const auto& bytes) {
+          Require(!std::memcmp(memory+device+1792,bytes.data(),64),"world mirror published before CPU restoration");
+        });
+      };
+      const auto activate=[&](uint8_t* base,bool native) {
+        if(!native) {
+          auto ctx=context(); ctx.r3.u64=material_instance; ctx.r4.u64=device;
+          material_reference=true; __imp__sub_821B8E48(ctx,base); material_reference=false;
+          return;
+        }
+        const GeometryFixtureReader reader{base};
+        const auto program=ReadNativeMaterialCpuProgram(reader,material_instance,device);
+        ExecuteNativeMaterialCpuProgram(program,[&](uint32_t shader,bool pixel) {
+          SetNativeShaderResource(reader,device,shader,pixel,
+            []()->uint32_t { throw std::runtime_error("native material allocation not expected"); },
+            []()->uint32_t { throw std::runtime_error("native material retirement tag not expected"); });
+        },[&](const auto& operation) {
+          const auto first=operation.first/4,last=(operation.first+operation.count-1)/4;
+          const auto mask=(UINT64_MAX>>first)&(UINT64_MAX<<(63-last));
+          Require(UploadNativeMaterialConstant(reader,device,operation,mask),"supported material required legacy constant setter");
+        },[](const auto&) { throw std::runtime_error("unconfigured native material texture"); },
+          [](const auto&) { throw std::runtime_error("unconfigured native material state"); });
+      };
+      world(base,false); install(base,false);
+      if(changed_material) { activate(base,false); world(base,false); }
+      if(draws) {
+        auto ctx=context(); indexed_bank_fixture=true;
+        sub_821FE358(ctx,base); indexed_bank_fixture=false;
+      }
+      const auto finish=[&] {
+        auto* base=actual->bytes.data();
+        FinishNativeSceneGroupHandoff(geometry,
+          [&] { trace.push_back(1); world(base,true); },
+          [&] {
+            trace.push_back(2);
+            if(!gpu_submitted) { VerifyNativeStaticGroupGpu(gpu,draws,changed_material); gpu_submitted=true; submissions=draws; }
+          },
+          [&](const auto& value) { Require(value==setup,"group setup changed"); trace.push_back(3); ++installations; install(base,true); },
+          [&] { material.Finish([&] { trace.push_back(4); ++activations; activate(base,true); },
+                                [&] { trace.push_back(5); world(base,true); }); },
+          [&] {
+            trace.push_back(6);
+            if(throw_once) { throw_once=false; throw std::runtime_error("injected tail failure"); }
+            before_tail=std::make_unique<Arena>(*actual);
+            ++tails; auto ctx=context(); __imp__edf_native_indexed_cpu_tail(ctx,base);
+          },[&] { trace.push_back(7); clean=false; });
+      };
+      fixture_scene_execution=NativeSceneExecution{};
+      if(throw_once) {
+        bool caught=false;
+        try { finish(); } catch(const std::runtime_error&) { caught=true; }
+        Require(caught && geometry.pending() && clean,"tail failure lost pending group");
+      }
+      finish(); finish();
+      Require(fixture_scene_execution.Total()==0,"native group differential entered a compatibility binding");
+      if(fallback) trace.push_back(8); // The real compatibility draw below follows this boundary.
+      std::vector<int> expected{1,2,3};
+      if(changed_material) { expected.push_back(4); expected.push_back(5); }
+      if(draws) {
+        expected.push_back(6);
+        if(fail_tail) expected.insert(expected.end(),{1,2,6});
+      }
+      expected.push_back(7); if(fallback) expected.push_back(8);
+      Require(trace==expected,"production group handoff order changed");
+      auto wrong_order=expected; std::swap(wrong_order[1],wrong_order[2]);
+      Require(trace!=wrong_order,"ordering negative control was not detected");
+      Require(installations==1 && activations==unsigned(changed_material) &&
+        tails==unsigned(draws!=0) && submissions==draws && !clean && !geometry.pending() && !material.pending(),
+        "group repeated or omitted owed work");
+      const auto same_projection=[&] {
+        for(uint32_t at=0;at<0xe0000;++at) {
+          if((at>=device+40 && at<device+44) || (at>=cursor && at<cursor+2048)) continue;
+          if(reference->bytes[at]!=actual->bytes[at]) return false;
+        }
+        return true;
+      };
+      Require(same_projection(),"group CPU projection differs from original indexed execution");
+      actual->bytes[device+1792]^=1;
+      Require(!same_projection(),"CPU word negative control was not detected");
+      actual->bytes[device+1792]^=1;
+      base=actual->bytes.data();
+      const uint64_t owed_constants=1|(changed_material?(uint64_t(3)<<62):0);
+      Require(REX_LOAD_U64(device)==(draws?0:owed_constants),"no-draw group consumed dirty state");
+      // Minimal cutover blocker: retained submission alone does not own these
+      // CPU effects. Compare the actual state immediately before consumption.
+      if(draws) {
+        Require(before_tail && before_tail->bytes!=actual->bytes,"indexed chain had no observable CPU effects");
+        if(draws==1 && !changed_material && !fallback && !fail_tail) {
+          std::cout << "Static group indexed CPU writes (4-byte addresses, excluding packets/stack):";
+          for(uint32_t at=0;at<0xe0000;at+=4) {
+            if((at>=device+40 && at<device+44) || (at>=cursor && at<cursor+2048)) continue;
+            if(std::memcmp(before_tail->bytes.data()+at,actual->bytes.data()+at,4))
+              std::cout << " 0x" << std::hex << at << std::dec;
+          }
+          std::cout << '\n';
+        }
+        REX_STORE_U64(device,1);
+        Require(!same_projection(),"omitting indexed dirty-state completion was not detected");
+        REX_STORE_U64(device,0);
+      }
+      Require(REX_LOAD_U32(device+40)==cursor,"group handoff emitted packets");
+      if(fallback) {
+        // The unsupported draw really executes the original instance upload and
+        // indexed consumer, before/after 0/1/3 accepted native draws. Compare its
+        // CPU effects against an independent original sequence after handoff.
+        const auto fallback_draw=[&](uint8_t* memory,bool counted) {
+          if(counted) fixture_scene_execution.Enter(NativeSceneBoundary::InstanceSetup);
+          auto ctx=context(); ctx.r3.u64=fallback_instance; ctx.r4.u64=device;
+          material_reference=true; __imp__sub_821D9600(ctx,memory); material_reference=false;
+          if(counted) fixture_scene_execution.Enter(NativeSceneBoundary::IndexedDraw);
+          ctx=context(); indexed_bank_fixture=true; sub_821FE358(ctx,memory); indexed_bank_fixture=false;
+        };
+        fallback_draw(reference->bytes.data(),false); fallback_draw(actual->bytes.data(),true);
+        Require(same_projection(),"compatibility draw after native group changed CPU effects");
+        Require(fixture_scene_execution.Calls(NativeSceneBoundary::InstanceSetup)==1 &&
+          fixture_scene_execution.Calls(NativeSceneBoundary::IndexedDraw)==1,
+          "unsupported group draw was not counted");
+      }
+    }
+    FinishNativeStaticGroupGpu();
+    std::cout << "Static group handoff: 24 cases; ordering/CPU/omitted-tail/pixel controls detected\n";
     real_state_packets=true;
     struct Bank { uint32_t number,offset,words; };
     constexpr Bank banks[]{{18688,9984,40},{8192,10240,16},{8448,10316,21},{8576,10400,5},
@@ -2102,6 +2498,60 @@ int main() {
       Require(allocated==(initial==7?8u:1u) && REX_LOAD_U32(id_counter)==allocated,
         "shader declaration ID allocation failed zero/wraparound handling");
     }
+    // The authored native cache implementation shares metadata with fallback.
+    // Exercise modular fences, masked signatures, repetition and address reuse;
+    // changing either the fence tag or either signature must fail the oracle.
+    for(uint32_t variant:{0u,1u}) for(unsigned mode=0;mode<8;++mode) {
+      auto reference=std::make_unique<Arena>(),native=std::make_unique<Arena>();
+      constexpr uint32_t program=0x60000,decl=0x65000,completed_address=0x67000;
+      const auto record=program+variant*416;
+      const auto initialize=[&](uint8_t* base,bool reused) {
+        std::memset(base,0,0xe0000);
+        PrepareDrawCpuState(base);
+        REX_STORE_U32(decl+48,reused?9:1);
+        REX_STORE_U32(record+40,(!reused && mode<3)?1:2);
+        REX_STORE_U64(device+12256,reused?0x12345678abcdef01ull:0x0102030405060708ull);
+        REX_STORE_U64(device+12264,0x1112131415161718ull);
+        REX_STORE_U64(record+48,REX_LOAD_U64(device+12256)^(mode==1 || mode==2?0x100000000ull:0));
+        REX_STORE_U64(record+56,REX_LOAD_U64(device+12264)^(mode==1?0x8000000000000000ull:0));
+        REX_STORE_U64(decl+32,mode==1?0:UINT64_MAX);
+        REX_STORE_U64(decl+40,mode==1?0:UINT64_MAX);
+        const uint32_t current=mode==5 || mode==6?5:200;
+        const uint32_t completed=mode==5 || mode==6?0xfffffffeu:100;
+        const uint32_t used=reused?0:mode==3?150:mode==4?100:mode==5?2:mode==6?0xfffffffeu:0;
+        REX_STORE_U32(record+64,used);
+        REX_STORE_U32(device+10780,current);
+        REX_STORE_U32(device+10768,completed_address);
+        REX_STORE_U32(completed_address,completed);
+      };
+      initialize(reference->bytes.data(),false); initialize(native->bytes.data(),false);
+      for(unsigned step=0;step<4;++step) {
+        if(step==3) { // Retired metadata reinitialized at the same guest address.
+          initialize(reference->bytes.data(),true); initialize(native->bytes.data(),true);
+        }
+        PPCContext expected{}; expected.r1.u64=0xf0000; expected.lr=0x12345678;
+        expected.r3.u64=device; expected.r4.u64=program; expected.r5.u64=decl; expected.r6.u64=variant;
+        expected.r28.u64=28; expected.r29.u64=29; expected.r30.u64=30; expected.r31.u64=31;
+        auto actual=expected;
+        const auto before=std::make_unique<Arena>(*native);
+        { Ownership scope(device); __imp__sub_8213EB68(expected,reference->bytes.data()); }
+        if(step==2) { Ownership scope(device); __imp__sub_8213EB68(actual,native->bytes.data()); }
+        else __imp__edf_native_shader_cache_cpu_tail(actual,native->bytes.data());
+        const auto matches=[&] { return !std::memcmp(reference->bytes.data(),native->bytes.data(),0xe0000); };
+        Require(matches() && expected.r3.u64==actual.r3.u64,"native cache lifecycle CPU projection differs");
+        Require(actual.r1.u64==0xf0000 && actual.lr==0x12345678 && actual.r28.u64==28 &&
+          actual.r29.u64==29 && actual.r30.u64==30 && actual.r31.u64==31,"native cache lifecycle ABI differs");
+        const bool busy=(mode==3 || mode==5) && step!=3;
+        Require(actual.r3.u64==unsigned(!busy),"cache fence boundary result differs");
+        if(busy) Require(!std::memcmp(before->bytes.data(),native->bytes.data(),0xe0000),"busy cache changed CPU metadata");
+        for(uint32_t word:{record+64,device+11552,device+11560}) {
+          native->bytes[word]^=1;
+          Require(!matches(),"cache tag/signature negative control escaped projection");
+          native->bytes[word]^=1;
+        }
+      }
+    }
+    std::cout << "Native shader cache: 64 lifecycle comparisons and 192 tag/signature negative controls passed\n";
     main_state_fixture=true;
     unsigned main_packets=0,main_uploads=0;
     for(uint64_t dirty:{uint64_t(0),uint64_t(8),uint64_t(1)<<47,uint64_t(1)<<48,
@@ -2124,8 +2574,15 @@ int main() {
       REX_STORE_U32(program+28,0x70000); REX_STORE_U32(program+872,0x20);
       REX_STORE_U32(metadata+4,12); REX_STORE_U32(second+4,12);
       REX_STORE_U32(metadata+12,0x123400); REX_STORE_U32(second+12,0x567800);
+      REX_STORE_U32(metadata+8,0x01000000); REX_STORE_U32(second+8,0x02000000);
       REX_STORE_U32(other+64,128); REX_STORE_U32(other+24,0x70000);
-      REX_STORE_U32(other+128+40+20,cached?0:1);
+      // Exercise the linked shader feature threshold and both render-mode
+      // selection gates; these were previously zero in the matrix.
+      REX_STORE_U32(other+128+40+8,flags==0x40?0x20000000:flags==0x80?0x10000000:0);
+      REX_STORE_U32(other+128+40+12,0x100);
+      REX_STORE_U32(other+128+40+20,cached?0:3);
+      REX_STORE_U32(other+128+40+28,(flags&0x80)?0x10:0);
+      REX_STORE_U32(device+10428,flags==0x40?8:0);
       REX_STORE_U32(other+128+40+24,0x12345678);
       real_shader_cache=cache_mode>=2;
       if(real_shader_cache) {

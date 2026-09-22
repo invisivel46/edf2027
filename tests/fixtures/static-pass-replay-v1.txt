@@ -1,0 +1,32 @@
+# Synthetic scene-boundary replay, not a retail capture. Pixels are RGBA8.
+# Unit mesh spans x=[-.5,.5], y=[-.5,.5]. 64x32 target, identity camera.
+version 1
+# observe owner generation translation-x R G B (byte colors)
+observe 100 1 -0.25 255 0 0
+observe 200 1 0.25 0 0 255
+# publish label tick expected-instance-count
+publish initial 1 2
+# Independent oracle: integer rectangles, end coordinates exclusive; later wins.
+rect initial 8 8 40 24 255 0 0
+rect initial 24 8 56 24 0 0 255
+# Update one existing lifetime: retained initial image must not change.
+observe 100 1 0.5 0 255 0
+publish updated 2 2
+rect updated 32 8 64 24 0 255 0
+rect updated 24 8 56 24 0 0 255
+# Retire and reuse the same owner address with a fresh generation/native id.
+retire 100
+observe 100 2 -0.5 255 255 0
+publish reused 3 2
+rect reused 24 8 56 24 0 0 255
+rect reused 0 8 32 24 255 255 0
+retire 100
+retire 200
+publish empty 4 0
+# Destroy producer/mesh references before consuming any retained publication.
+release_producer
+render reused
+render initial
+render empty
+render updated
+render initial

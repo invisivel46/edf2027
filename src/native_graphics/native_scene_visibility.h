@@ -18,6 +18,13 @@ struct NativeSceneVisibilityView {
   std::array<float,26> frustum{};
   float depth_scale=0;
 };
+template<size_t N>
+bool NativeVisibilityBitsEqual(const std::array<float,N>& a,const std::array<float,N>& b) {
+  // IEEE equality rejects even identical NaNs. Audits compare the actual
+  // transformed register bits, including NaN payloads and signed zero.
+  for(size_t i=0;i<N;++i) if(std::bit_cast<uint32_t>(a[i])!=std::bit_cast<uint32_t>(b[i])) return false;
+  return true;
+}
 inline float NativeVisibilityMadd(float a,float b,float c) {
   // Match the recompiled single-precision PPC operation, including its double
   // intermediate. Do not let a compiler contract adjacent operations instead.

@@ -11,9 +11,16 @@
 #include "native_constant_cache.h"
 #include "native_scene_sources.h"
 #include "native_scene_adapter.h"
+#include "native_scene_pass_inputs.h"
 #include "native_scene_cpu_window.h"
 #include "native_scene_membership.h"
 #include "native_scene_geometry.h"
+#include "native_scene_geometry_install.h"
+#include "native_material_cpu_program.h"
+#include "native_scene_handoff.h"
+#include "native_scene_execution.h"
+#include "native_scene_world_restore.h"
+#include "native_static_group_eligibility.h"
 #include "native_queued_scene.h"
 #include "native_decode_workers.h"
 #include "native_d3d12_preview.h"
@@ -33,6 +40,11 @@
 #include "native_index_binding.h"
 #include "native_stream_binding.h"
 #include "native_shader_state.h"
+#include "native_shader_binding.h"
+#include "native_frame_dispatch.h"
+#include "native_scene_tree.h"
+#include "native_scene_tree_publication.h"
+#include "native_texture_binding.h"
 #include "native_render_state_snapshot.h"
 #include "native_declarations.h"
 #include "native_material_parameters.h"
@@ -102,6 +114,38 @@ REXCVAR_DEFINE_BOOL(edf_native_shader_bridge, false, "EDF2027",
                    "Validate native shader resources against live guest loads (development)");
 REXCVAR_DEFINE_BOOL(edf_native_render_state_audit,false,"EDF2027",
                    "Compare setter-owned render-state snapshots with live draw state (diagnostic; does not bypass reads)");
+REXCVAR_DEFINE_BOOL(edf_native_material_sampler_audit,false,"EDF2027",
+                   "Compare explicit native material sampler programs with original activation (diagnostic)");
+REXCVAR_DEFINE_BOOL(edf_native_material_state_audit,false,"EDF2027",
+                   "Compare explicit native material render-state programs with original activation (diagnostic)");
+REXCVAR_DEFINE_BOOL(edf_native_scene_material_audit,false,"EDF2027",
+                   "Compare published programs with explicit pass-time constants and visible group setup (diagnostic)");
+REXCVAR_DEFINE_BOOL(edf_native_scene_material_owned,false,"EDF2027",
+                   "Construct queued rigid scene materials from published programs and native pass inputs");
+REXCVAR_DEFINE_BOOL(edf_native_scene_activation_owned,false,"EDF2027",
+                   "Activate queued scene shader bindings from published material inputs");
+REXCVAR_DEFINE_BOOL(edf_native_scene_geometry_owned,false,"EDF2027",
+                   "Use published geometry for the first native group draw, retaining the indexed CPU tail");
+REXCVAR_DEFINE_BOOL(edf_native_scene_instance_owned,false,"EDF2027",
+                   "Use lifecycle-owned world-only instance register metadata");
+REXCVAR_DEFINE_BOOL(edf_native_scene_pass_owned,false,"EDF2027",
+                   "Carry explicit render and sampler pass state between native groups");
+REXCVAR_DEFINE_BOOL(edf_native_scene_geometry_deferred,false,"EDF2027",
+                   "Submit eligible native groups before installing compatibility geometry bindings");
+REXCVAR_DEFINE_BOOL(edf_native_scene_material_deferred,false,"EDF2027",
+                   "Submit eligible native groups before CPU material activation and restore state at handoff");
+REXCVAR_DEFINE_BOOL(edf_native_scene_reject_compatibility,false,"EDF2027",
+                   "Diagnostic: reject counted static-group compatibility boundaries before calling them");
+REXCVAR_DEFINE_BOOL(edf_native_scene_view_owned,false,"EDF2027",
+                   "Carry viewport, scissor and native target selection across native material groups");
+REXCVAR_DEFINE_BOOL(edf_native_scene_camera_owned,false,"EDF2027",
+                   "Consume immutable producer camera matrices at native render entry");
+REXCVAR_DEFINE_BOOL(edf_native_scene_sources_owned,false,"EDF2027",
+                   "Select native static sources, LOD, visibility and world from one scene publication");
+REXCVAR_DEFINE_BOOL(edf_native_scene_selection_owned,false,"EDF2027",
+                   "Resolve published static instances without mutating the current scene database");
+REXCVAR_DEFINE_BOOL(edf_native_scene_membership_owned,false,"EDF2027",
+                   "Select spatial lists and hierarchy from the same publication as native scene sources and assets");
 REXCVAR_DEFINE_BOOL(edf_native_worker_callback_audit,false,"EDF2027",
                    "Log up to 256 render-worker callback registrations for writer provenance (diagnostic)");
 REXCVAR_DEFINE_BOOL(edf_native_retirement_audit,false,"EDF2027",
@@ -239,6 +283,10 @@ REXCVAR_DECLARE(bool, edf_native_host);
 REX_EXTERN(__imp__KeSetEvent);
 
 namespace edf::native {
+NativeSceneTreePublications& TreePublications() {
+  static NativeSceneTreePublications publications;
+  return publications;
+}
 // Capture at renderer initialization. Saving a new F1 choice must not change
 // live UI scaling while the current render targets still have the old size.
 const std::array<int32_t,2>& NativeRenderDimensions() {
@@ -598,6 +646,25 @@ struct RegisteredShader {
   std::array<std::map<ParameterOwner,ParameterPlan,std::owner_less<ParameterOwner>>,2> parameter_plans;
   std::array<ParameterOwner,2> last_plan_owner;
   std::array<ParameterPlan*,2> last_plan{};
+  using PublishedProgramOwner=std::weak_ptr<const NativeSceneMaterialProgram>;
+  std::map<PublishedProgramOwner,std::shared_ptr<const std::vector<VertexParameterRange>>,
+    std::owner_less<PublishedProgramOwner>> published_vertex_ranges;
+  std::shared_ptr<const std::vector<VertexParameterRange>> ResolvePublishedVertexRanges(
+      const std::shared_ptr<const NativeSceneMaterialProgram>& program) {
+    const auto found=published_vertex_ranges.find(PublishedProgramOwner(program));
+    if(found!=published_vertex_ranges.end()) return found->second;
+    if(!reversed_bindings) throw std::runtime_error("published vertex parameters have no reversed shader");
+    auto ranges=std::make_shared<std::vector<VertexParameterRange>>();
+    for(const auto& range:program->inputs.vertex_registers) {
+      if(range.first>256 || range.count>256-range.first)
+        throw std::runtime_error("invalid published activation register range");
+      ranges->push_back({range.name,range.first,range.count,
+        bindings->ResolveFloatRegisters(range.name),reversed_bindings->ResolveFloatRegisters(range.name)});
+    }
+    std::erase_if(published_vertex_ranges,[](const auto& entry) { return entry.first.expired(); });
+    published_vertex_ranges.emplace(PublishedProgramOwner(program),ranges);
+    return ranges;
+  }
   ParameterPlan& MaterialPlan(const std::shared_ptr<const NativeMaterialParameters::Groups>& material,bool reverse) {
     const size_t slot=reverse?1:0;
     auto& previous=last_plan_owner[slot];
@@ -803,6 +870,9 @@ struct Bridge {
   uint64_t scene_geometry_loaded=0,scene_geometry_reused=0,scene_geometry_deferred=0;
   std::set<std::string> scene_geometry_reasons;
   uint64_t scene_material_loaded=0,scene_material_reused=0,scene_material_deferred=0;
+  uint64_t scene_material_constructed=0,scene_material_rejected=0;
+  uint64_t scene_material_binding_bypasses=0;
+  uint64_t scene_geometry_draw_bypasses=0;
   std::set<std::string> scene_material_reasons;
   uint64_t scene_visibility_candidates=0,scene_visibility_retained=0,scene_visibility_selected=0;
   uint64_t scene_visibility_checks=0,scene_visibility_mismatches=0;
@@ -1616,6 +1686,7 @@ struct ActiveTargets {
   std::array<uint32_t,8> rtv_format{};
   uint32_t dsv_format=0,samples=1;
   uint32_t width=0,height=0;
+  bool operator==(const ActiveTargets&) const=default;
 };
 // Whether this shader samples the target it is drawing into.
 //
@@ -1666,6 +1737,19 @@ ActiveTargets ActiveTargetsLocked(Bridge& state) {
   return result;
 }
 struct NativeQueuedSceneGroup {
+  NativeSceneExecution execution;
+  std::optional<GuestViewportWords> pass_viewport;
+  NativeSceneMaterialHandoff material_handoff;
+  NativeSceneGeometryHandoff geometry_handoff;
+  NativeSceneGeometryInstallState geometry_install;
+  bool material_compatibility_only=true;
+  bool published_activation_used=false,all_native_draws=true;
+  uint32_t activation_instance=0;
+  std::shared_ptr<const NativeSceneGroupMaterial> published_material;
+  std::vector<NativeSceneMaterialInputs::Constant> pass_constants;
+  std::optional<NativeMaterialRenderPass> material_pass;
+  std::array<NativeMaterialSamplerPass,16> sampler_pass{};
+  bool material_audited=false;
   std::vector<std::shared_ptr<const NativeSceneInstance>> objects;
   std::shared_ptr<const NativeSceneMaterial> material;
   std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
@@ -1679,13 +1763,60 @@ struct NativeQueuedSceneGroup {
   uint32_t instance=0;
 };
 thread_local NativeQueuedSceneGroup* native_queued_scene_group=nullptr;
+void EnterNativeSceneBoundary(NativeSceneBoundary boundary) {
+  if(native_queued_scene_group)
+    native_queued_scene_group->execution.Enter(boundary,REXCVAR_GET(edf_native_scene_reject_compatibility));
+}
+struct NativeScenePassCursorState {
+  uint32_t device=0;
+  NativeSceneMaterialPassState material;
+  std::optional<GuestViewportWords> viewport;
+  ActiveTargets targets;
+};
+using NativeMaterialPassCursor=std::optional<NativeScenePassCursorState>;
+thread_local NativeMaterialPassCursor* native_material_pass_cursor=nullptr;
 thread_local NativeSceneQueues* native_scene_queues=nullptr;
 thread_local std::shared_ptr<const NativeScenePublication> native_scene_publication;
-bool NativeStaticWorldOnly(const GuestReader& reader,const NativeSceneSources& sources,
+thread_local std::optional<NativeScenePassCamera> native_scene_pass_camera;
+thread_local std::shared_ptr<const NativeScenePassCameras> native_scene_pass_cameras;
+thread_local std::optional<NativeScenePassAnimation> native_scene_pass_animation;
+thread_local std::shared_ptr<const NativeSceneAdapter::WorldAnimations> native_scene_pass_animations;
+thread_local uint32_t native_scene_animation_owner=0;
+const NativeSceneSources& NativeSceneSourcesForPass(const Bridge& state) {
+  if(REXCVAR_GET(edf_native_scene_sources_owned) && native_scene_publication && native_scene_publication->sources) {
+    static uint64_t reads=0;
+    if(++reads<=4 || reads%100000==0)
+      REXLOG_INFO("Native published source reads: count={} tick={}",reads,native_scene_publication->snapshot->tick);
+    return *native_scene_publication->sources;
+  }
+  return state.scene_sources;
+}
+template<class Reader>
+void ReadNativeSceneInstanceParameters(const Reader& reader,const NativeSceneSources& sources,
+    uint32_t instance,std::vector<InstanceParameter>& parameters) {
+  const auto* source=sources.Find(instance);
+  if(!REXCVAR_GET(edf_native_scene_instance_owned) || !source || !source->world_first) {
+    ReadInstanceParameters(reader,instance,parameters); return;
+  }
+  parameters.assign(1,InstanceParameter{source->world_data,*source->world_first,4});
+  if(REXCVAR_GET(edf_native_scene_transform_audit)) {
+    const auto actual=ReadInstanceParameters(reader,instance);
+    if(actual!=parameters) {
+      REXLOG_ERROR("Native instance metadata mismatch: instance={:#x} owner={:#x}",instance,source->owner);
+      throw std::runtime_error("published world-only instance metadata changed without a source event");
+    }
+  }
+  static uint64_t count=0;
+  if(++count<=4 || count%100000==0)
+    REXLOG_INFO("Native owned instance metadata: reads={} audited={}",count,REXCVAR_GET(edf_native_scene_transform_audit));
+}
+template<class Reader>
+bool NativeStaticWorldOnly(const Reader& reader,const NativeSceneSources& sources,
                           uint32_t instance,uint32_t first,uint32_t device) {
   const auto* source=sources.Find(instance);
   if(!source || !source->world_data) return false;
-  const auto parameters=ReadInstanceParameters(reader,instance);
+  std::vector<InstanceParameter> parameters;
+  ReadNativeSceneInstanceParameters(reader,sources,instance,parameters);
   return parameters.size()==1 && parameters[0].count==4 && parameters[0].first==first &&
     parameters[0].data==source->world_data &&
     !(uint64_t(parameters[0].data)<uint64_t(device)+5888 && uint64_t(parameters[0].data)+64>uint64_t(device)+1792);
@@ -1701,10 +1832,10 @@ std::shared_ptr<const NativeSceneInstance> SelectNativeSceneInstanceLocked(Bridg
   return current;
 }
 bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t instance,NativeQueuedSceneGroup& group);
+bool TryAppendPublishedNativeSceneInstance(uint8_t* base,uint32_t device,uint32_t address,uint32_t instance,uint32_t count,NativeQueuedSceneGroup& group);
 void SynchronizeNativeQueuedSceneInstance(uint8_t* base,uint32_t device,NativeQueuedSceneGroup& group);
 void ConfigureNativeQueuedWorldLocked(Bridge& state,NativeQueuedSceneGroup& group) {
   group.world_parameter.reset(); group.constants_clean=false;
-  if(!state.active_vertex_parameters) return;
   size_t matrices=0;
   for(const auto& constant:group.material->constants()) for(const auto& matrix:constant.matrices)
     if(matrix.source==NativeSceneMatrixSource::World) {
@@ -1712,6 +1843,19 @@ void ConfigureNativeQueuedWorldLocked(Bridge& state,NativeQueuedSceneGroup& grou
       ++matrices; group.world_column_major=matrix.column_major;
     }
   if(matrices!=1) return;
+  if(group.published_material) {
+    const auto& definition=group.published_material->program->inputs;
+    const auto first=definition.WorldRegisterFirst();
+    if(!first) return;
+    auto& shader=state.shaders.at(definition.vertex);
+    if(!shader.reversed_bindings) return;
+    auto normal=shader.bindings->ResolveFloatRegisters("g_mWorld");
+    auto reversed=shader.reversed_bindings->ResolveFloatRegisters("g_mWorld");
+    if(normal.bytes()!=64 || reversed.bytes()!=64) return;
+    group.world_parameter=VertexParameterRange{"g_mWorld",*first,4,std::move(normal),std::move(reversed)};
+    return;
+  }
+  if(!state.active_vertex_parameters) return;
   for(const auto& parameter:*state.active_vertex_parameters)
     if(parameter.name=="g_mWorld" && parameter.count==4 && parameter.normal.bytes()==64 && parameter.reversed.bytes()==64) {
       for(const auto& other:*state.active_vertex_parameters)
@@ -1723,8 +1867,12 @@ void FlushNativeQueuedSceneLocked(Bridge& state,NativeQueuedSceneGroup& group) {
   if(group.objects.empty()) return;
   auto& recorder=SceneRecorderLocked(state);
   recorder.SetRenderTargets({group.targets.colors.data(),group.targets.count},group.targets.depth);
-  state.scene_recorded_snapshots.push_back(NativeSceneSnapshot{0,std::move(group.objects)});
-  const auto statistics=state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),group.view,1);
+  const auto statistics=group.execution.RecordBatch([&] {
+    // Keep pending objects until the complete batch has been recorded. A
+    // partial GPU recording cannot be rolled back or safely repeated.
+    state.scene_recorded_snapshots.push_back(NativeSceneSnapshot{0,group.objects});
+    return state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),group.view,1);
+  });
   state.scene_native_objects+=statistics.visible; state.scene_native_draws+=statistics.draws;
   group.objects.clear();
   state.recorded={};
@@ -1956,6 +2104,61 @@ void EndRenderTarget(uint32_t owner) {
   if (state.target_begins <= 5 || state.target_begins % 1000 == 0)
     REXLOG_INFO("Native render target: begins={}, valid_resolves={}, unwritten={}",
                 state.target_begins,state.target_resolves,state.target_unwritten);
+}
+bool ObservePublishedActivation(uint32_t instance) {
+  auto* group=native_queued_scene_group;
+  if(!group || group->activation_instance!=instance || !group->published_material || !group->material_pass)
+    return false;
+  auto& state=State();
+  std::lock_guard submission(state.submissions);
+  std::lock_guard lock(state.mutex);
+  const auto& published=*group->published_material;
+  const auto latest=state.scene_adapter.GroupMaterial(published.group,published.revision);
+  const auto* membership=NativeSceneSourcesForPass(state).FindGroup(published.group);
+  if(!latest || latest->program!=published.program || !membership || membership->revision!=published.revision)
+    return false;
+  const auto& program=*published.program;
+  const auto vertex=program.inputs.vertex,pixel=program.inputs.pixel;
+  if(!state.shaders.contains(vertex) || !state.shaders.contains(pixel) || program.backend!=state.scene_backend)
+    return false;
+  auto& shader=state.shaders.at(vertex);
+  auto& vs=*shader.bindings;
+  auto& ps=*state.shaders.at(pixel).bindings;
+  if(!shader.reversed_bindings || vs.shader().bytecode!=program.vertex.bytecode ||
+     shader.reversed_bindings->shader().bytecode!=program.reversed_vertex.bytecode ||
+     ps.shader().bytecode!=program.pixel.bytecode) return false;
+  auto& reversed=*shader.reversed_bindings;
+  const std::pair<uint32_t,uint32_t> link{vertex,pixel};
+  if(!state.validated_links.contains(link)) {
+    ValidateNativeShaderLink(vs.shader(),ps.shader());
+    ValidateNativeShaderLink(reversed.shader(),ps.shader());
+    state.validated_links.insert(link);
+  }
+  auto ranges=shader.ResolvePublishedVertexRanges(published.program);
+  const auto resolved=program.ResolveSamplers(group->sampler_pass);
+  std::vector<NativeBackendSampler*> samplers;
+  for(const auto& texture:program.inputs.textures) {
+    if(texture.slot>=resolved.size()) throw std::runtime_error("invalid published activation sampler slot");
+    const auto key=NativeFilteringKey(resolved[texture.slot].words,REXCVAR_GET(edf_native_anisotropic_filtering));
+    auto cached=state.samplers.find(key);
+    if(cached==state.samplers.end())
+      cached=state.samplers.emplace(key,&program.backend->CreateSampler(DecodeNativeGuestSampler(key))).first;
+    samplers.push_back(cached->second);
+  }
+  state.active_vertex=0;
+  state.active_vertex_parameters.reset();
+  program.ApplyBindings(vs,ps,group->pass_constants,samplers);
+  if(!shader.reversed_mirrors) program.ApplyBindings(reversed,ps,group->pass_constants,samplers);
+  if(state.context) { vs.Bind(*state.context.Get()); ps.Bind(*state.context.Get()); }
+  state.linked_vertex=vertex; state.linked_pixel=pixel;
+  state.active_vertex_parameters=std::move(ranges);
+  state.active_vertex=vertex;
+  group->published_activation_used=true;
+  ++state.activations;
+  static uint64_t count=0;
+  if(++count<=4 || count%100000==0)
+    REXLOG_INFO("Native published activation: count={} (no live material constants or texture reads)",count);
+  return true;
 }
 void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t device) {
   // Per-stage vector headers, texture vectors and pass pointer share this
@@ -2200,10 +2403,14 @@ GuestXuiDeviceWords ReadAuditedXuiDeviceWords(const Reader& reader,uint32_t devi
   return snapshot;
 }
 template <typename Reader>
-NativeViewportState ReadNativeDrawViewport(const Reader& reader,uint32_t device) {
-  if(!REXCVAR_GET(edf_native_owned_render_state)) return ReadDrawViewport(reader,device);
+GuestViewportWords ReadNativeDrawViewportWords(const Reader& reader,uint32_t device) {
+  if(!REXCVAR_GET(edf_native_owned_render_state)) return ReadViewportWords(reader,device);
   const auto render=ReadAuditedRenderStateWords(reader,device);
-  return DecodeDrawViewport(ReadViewportWords(reader,device,render[5]!=0));
+  return ReadViewportWords(reader,device,render[5]!=0);
+}
+template <typename Reader>
+NativeViewportState ReadNativeDrawViewport(const Reader& reader,uint32_t device) {
+  return DecodeDrawViewport(ReadNativeDrawViewportWords(reader,device));
 }
 namespace {
 // The D3D12 options the cvars carry, applied before anything can build a D3D12
@@ -2935,11 +3142,185 @@ EDF_RENDER_PHASE(821BE9D8, RenderSceneEnd)
 EDF_RENDER_PHASE(820B0B80, RenderFinish)
 EDF_RENDER_PHASE(821C9478, RenderPose)
 EDF_RENDER_PHASE(820B35A0, RenderList)
-EDF_RENDER_PHASE(821C61D8, RenderChildren)
-EDF_RENDER_PHASE(820B4250, RenderWorld)
+REXCVAR_DEFINE_BOOL(edf_native_scene_tree,false,"EDF2027",
+  "Use native spatial tree traversal and culling; leaf callbacks remain explicit.");
+REXCVAR_DEFINE_BOOL(edf_native_scene_tree_published,false,"EDF2027",
+  "Read immutable spatial hierarchy published by the world producer.");
+#define EDF_TREE_MUTATION(address) \
+  REX_EXTERN(__imp__sub_##address); \
+  REX_HOOK_RAW(sub_##address) { \
+    edf::native::TreePublications().Invalidate(); \
+    __imp__sub_##address(ctx,base); \
+  }
+EDF_TREE_MUTATION(821C7740)
+EDF_TREE_MUTATION(821C5730)
+EDF_TREE_MUTATION(821C5488)
+EDF_TREE_MUTATION(821C49A0)
+#undef EDF_TREE_MUTATION
+REX_EXTERN(__imp__sub_820B5F38);
+REX_HOOK_RAW(sub_820B5F38) {
+  edf::native::TreePublications().Retire(ctx.r3.u32);
+  __imp__sub_820B5F38(ctx,base);
+}
+REX_EXTERN(__imp__sub_821C61D8);
+REX_EXTERN(__imp__sub_821C3070);
+REX_EXTERN(__imp__sub_821C3178);
+REX_EXTERN(sub_820B4038);
+REX_HOOK_RAW(sub_821C61D8) {
+  edf::native::HookTiming timing(edf::native::HookPhase::RenderChildren);
+  const edf::native::GuestReader reader(base);
+  const auto manager=ctx.r3.u32,context=ctx.r4.u32;
+  if(!REXCVAR_GET(edf_native_scene_tree) || !REXCVAR_GET(edf_native_shader_bridge) ||
+     *reader.Bytes(reader.Add(manager,108),1)) {
+    __imp__sub_821C61D8(ctx,base); return;
+  }
+  auto work=ctx;
+  if(work.r1.u32<320) throw std::runtime_error("invalid native tree stack");
+  const auto stack=work.r1.u32-320;
+  reader.StoreWord(stack,work.r1.u32); work.r1.u64=stack;
+  uint64_t checks=0;
+  auto& publications=edf::native::TreePublications();
+  std::shared_ptr<const edf::native::NativeSceneTreeImage> hierarchy;
+  if(REXCVAR_GET(edf_native_scene_tree_published)) {
+    if(REXCVAR_GET(edf_native_scene_membership_owned) && edf::native::native_scene_publication) {
+      const auto& trees=edf::native::native_scene_publication->trees;
+      const auto found=trees.find(manager);
+      if(found!=trees.end()) hierarchy=found->second;
+    } else hierarchy=publications.Acquire(manager);
+  }
+  edf::native::NativeSceneTreeReader tree_reader(reader,publications,std::move(hierarchy),
+    REXCVAR_GET(edf_native_scene_visibility_audit));
+  edf::native::TraverseNativeSceneTree(tree_reader,manager,[&](uint32_t node) {
+    const auto view=edf::native::ReadNativeSceneVisibilityView(reader,context);
+    const auto center=edf::native::ReadNativeVisibilityFloats<4>(tree_reader,reader.Add(node,32));
+    const auto transformed=edf::native::NativeVisibilityTransform(center,view.matrix);
+    const auto radius=std::bit_cast<float>(tree_reader.Word(reader.Add(node,64)));
+    const auto sphere=edf::native::NativeVisibilitySphere(view,transformed,radius);
+    const auto result=sphere==2?edf::native::NativeVisibilityAabb(view,center,
+      edf::native::ReadNativeVisibilityFloats<4>(tree_reader,reader.Add(node,48))):sphere;
+    if(REXCVAR_GET(edf_native_scene_visibility_audit)) {
+      const auto camera=reader.Word(reader.Add(context,16));
+      for(uint32_t i=0;i<4;++i) reader.StoreWord(reader.Add(stack,80+i*4),std::bit_cast<uint32_t>(transformed[i]));
+      work.r3.u64=reader.Add(camera,288); work.r4.u64=reader.Add(stack,80); work.f1.f64=radius;
+      work.lr=0x821C6024; __imp__sub_821C3070(work,base);
+      const auto original_sphere=work.r3.u32;
+      auto original=original_sphere;
+      if(original_sphere==2) {
+        work.r3.u64=reader.Add(camera,288); work.r4.u64=reader.Add(camera,96);
+        work.r5.u64=reader.Add(node,32); work.r6.u64=reader.Add(node,48);
+        work.lr=0x821C605C; __imp__sub_821C3178(work,base); original=work.r3.u32;
+      }
+      if(sphere!=original_sphere || result!=original) throw std::runtime_error("native tree classification differs from original");
+      ++checks;
+    }
+    return result;
+  },[&](uint32_t list) {
+    work.r3.u64=manager; work.r4.u64=list; work.r5.u64=context; work.lr=0x821C56F8;
+    sub_820B4038(work,base);
+  });
+  static std::atomic<uint64_t> traversals=0,audited=0,owned_reads=0,live_reads=0;
+  audited+=checks;
+  owned_reads+=tree_reader.owned_reads; live_reads+=tree_reader.live_reads;
+  const auto count=++traversals;
+  if(count<=4 || count%1000==0) REXLOG_INFO("Native scene tree: traversals={} classification_checks={} mismatches=0 owned_reads={} live_reads={}",
+    count,audited.load(),owned_reads.load(),live_reads.load());
+}
+REX_EXTERN(__imp__sub_820B4250);
+REX_HOOK_RAW(sub_820B4250) {
+  edf::native::HookTiming timing(edf::native::HookPhase::RenderWorld);
+  const auto owner=ctx.r3.u32;
+  std::optional<edf::native::NativeScenePassAnimation> published;
+  if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
+    const edf::native::GuestReader reader(base);
+    published=edf::native::NativeScenePassAnimation{
+      reader.Word(reader.Add(owner,356)),reader.Word(reader.Add(owner,364))};
+  }
+  __imp__sub_820B4250(ctx,base);
+  if(REXCVAR_GET(edf_native_scene_tree_published)) {
+    try {
+      if(edf::native::TreePublications().Publish(edf::native::GuestReader(base),owner)) {
+        static std::atomic<uint64_t> publications=0;
+        const auto count=++publications;
+        if(count<=4 || count%1000==0) REXLOG_INFO("Native tree producer publication: owner={:#x} completed={}",owner,count);
+      }
+    } catch(const std::exception& error) {
+      edf::native::TreePublications().Retire(owner);
+      static std::set<std::string> reported;
+      static std::mutex reported_mutex;
+      std::lock_guard lock(reported_mutex);
+      if(reported.insert(error.what()).second) REXLOG_INFO("Native tree publication deferred: {}",error.what());
+    }
+  }
+  if(published) {
+    auto& state=edf::native::State();
+    std::lock_guard lock(state.mutex);
+    state.scene_adapter.PublishWorldAnimation(owner,*published);
+  }
+}
+REX_EXTERN(__imp__sub_820B4310);
+REX_EXTERN(sub_821C61D8);
+REX_EXTERN(sub_821C3BB8);
+REX_HOOK_RAW(sub_820B4310) {
+  if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
+    edf::native::native_scene_animation_owner=ctx.r3.u32;
+    edf::native::native_scene_pass_animation.reset();
+    // Select completed producer inputs at world-pass entry. The outer helper
+    // can begin before this world's update has published its next generation.
+    auto& state=edf::native::State();
+    std::lock_guard lock(state.mutex);
+    edf::native::native_scene_pass_animations=state.scene_adapter.AcquireWorldAnimations();
+    if(const auto publication=edf::native::native_scene_pass_animations) {
+      const auto found=publication->find(ctx.r3.u32);
+      if(found!=publication->end()) edf::native::native_scene_pass_animation=found->second;
+    }
+  }
+  if(REXCVAR_GET(edf_native_scene_tree) && REXCVAR_GET(edf_native_shader_bridge)) {
+    const edf::native::GuestReader reader(base);
+    const auto owner=ctx.r3.u32,context=ctx.r4.u32;
+    auto work=ctx;
+    if(work.r1.u32<112) throw std::runtime_error("invalid native world dispatch stack");
+    const auto stack=work.r1.u32-112;
+    reader.StoreWord(stack,work.r1.u32); work.r1.u64=stack;
+    work.r3.u64=owner; work.r4.u64=reader.Add(owner,372); work.r5.u64=context;
+    work.lr=0x820B4338; sub_820B4038(work,base);
+    work.r3.u64=owner; work.r4.u64=context; work.lr=0x820B4344; sub_821C61D8(work,base);
+    work.r3.u64=reader.Add(owner,240); work.lr=0x820B434C; sub_821C3BB8(work,base);
+  } else __imp__sub_820B4310(ctx,base);
+}
+REX_EXTERN(__imp__sub_820B5FA8);
+REX_HOOK_RAW(sub_820B5FA8) {
+  edf::native::TreePublications().Retire(ctx.r3.u32);
+  {
+    auto& state=edf::native::State();
+    std::lock_guard lock(state.mutex);
+    state.scene_adapter.RetireWorldAnimation(ctx.r3.u32);
+  }
+  __imp__sub_820B5FA8(ctx,base);
+}
 EDF_RENDER_PHASE(8216DA80, RenderListener)
 EDF_RENDER_PHASE(820A6978, RenderUiListener)
-EDF_RENDER_PHASE(821C3BB8, RenderQueued)
+REX_EXTERN(__imp__sub_821C3BB8);
+REX_EXTERN(sub_821D96D8);
+REX_HOOK_RAW(sub_821C3BB8) {
+  edf::native::HookTiming timing(edf::native::HookPhase::RenderQueued);
+  if(!REXCVAR_GET(edf_native_scene_tree) || !REXCVAR_GET(edf_native_shader_bridge)) {
+    __imp__sub_821C3BB8(ctx,base); return;
+  }
+  const edf::native::GuestReader reader(base);
+  auto work=ctx;
+  if(work.r1.u32<112) throw std::runtime_error("invalid native group traversal stack");
+  const auto stack=work.r1.u32-112;
+  reader.StoreWord(stack,work.r1.u32); work.r1.u64=stack;
+  edf::native::NativeMaterialPassCursor material_pass;
+  struct RestoreMaterialPass {
+    edf::native::NativeMaterialPassCursor* previous=edf::native::native_material_pass_cursor;
+    ~RestoreMaterialPass() { edf::native::native_material_pass_cursor=previous; }
+  } restore_material_pass;
+  edf::native::native_material_pass_cursor=REXCVAR_GET(edf_native_scene_pass_owned)?&material_pass:nullptr;
+  edf::native::DispatchNativeSceneGroups(reader,ctx.r3.u32,[&](uint32_t group) {
+    work.r3.u64=group; work.lr=0x821C3C04; sub_821D96D8(work,base);
+  });
+}
 #undef EDF_RENDER_PHASE
 REX_EXTERN(__imp__sub_821D96D8);
 REX_EXTERN(__imp__sub_821BEE68);
@@ -2949,7 +3330,7 @@ REX_HOOK_RAW(sub_821BEE68) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     const edf::native::GuestReader reader(base);
-    const auto parts=state.scene_sources.LodParts(ctx.r3.u32);
+    const auto parts=edf::native::NativeSceneSourcesForPass(state).LodParts(ctx.r3.u32);
     bool supported=parts.has_value();
     if(parts) for(const auto& part:*parts) {
       if(!part.group || (!queues->Contains(part.group) &&
@@ -2973,16 +3354,38 @@ REX_EXTERN(sub_821375C0);
 REX_EXTERN(sub_821B94E8);
 REX_EXTERN(sub_821D9600);
 REX_EXTERN(sub_821FE358);
+REX_EXTERN(__imp__edf_native_indexed_cpu_tail);
+namespace {
+void InstallNativeStaticGeometry(PPCContext&,uint8_t*,uint32_t,const edf::native::NativeSceneGeometrySource&,edf::native::NativeSceneGeometryInstallState&);
+void RestoreNativeStaticMaterial(PPCContext&,uint8_t*,uint32_t,uint32_t);
+}
 REX_HOOK_RAW(sub_821D96D8) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderMaterialGroup);
-  if(!REXCVAR_GET(edf_native_scene_queued)) { __imp__sub_821D96D8(ctx,base); return; }
   edf::native::NativeQueuedSceneGroup group;
   const auto group_address=ctx.r3.u32;
   struct Restore {
+    edf::native::NativeQueuedSceneGroup& group;
+    uint32_t address;
     edf::native::NativeQueuedSceneGroup* previous=edf::native::native_queued_scene_group;
-    ~Restore() { edf::native::native_queued_scene_group=previous; }
-  } restore;
+    ~Restore() {
+      edf::native::native_queued_scene_group=previous;
+      // Report aborted groups too. Logging must never replace their exception.
+      try {
+        static std::array<std::atomic<uint64_t>,size_t(1)<<uint32_t(edf::native::NativeSceneBoundary::Count)> shapes{};
+        const auto& run=group.execution;
+        const auto count=++shapes.at(run.mask());
+        if(!run.complete() || count<=4 || !(count&(count-1)))
+          REXLOG_INFO("Native static group execution: group={:#x} completed={} recorded_batches={} compatibility_calls={} boundary_mask={:#x} occurrences={}",
+            address,run.complete(),run.recordings(),run.Total(),run.mask(),count);
+      } catch(...) {}
+    }
+  } restore{group,group_address};
   edf::native::native_queued_scene_group=&group;
+  if(!REXCVAR_GET(edf_native_scene_queued)) {
+    if(edf::native::native_material_pass_cursor) edf::native::native_material_pass_cursor->reset();
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::OriginalGroup);
+    __imp__sub_821D96D8(ctx,base); group.execution.Complete(); return;
+  }
   size_t native_queue_size=0;
   uint32_t group_device=0;
   if(REXCVAR_GET(edf_native_host) && REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_seam_draws)) {
@@ -2997,14 +3400,81 @@ REX_HOOK_RAW(sub_821D96D8) {
     work.r1.u64=work.r1.u32-128;
     reader.StoreWord(work.r1.u32,ctx.r1.u32);
     uint32_t device=0,index_count=0;
+    const auto install_geometry=[&](const edf::native::NativeSceneGeometrySource& input) {
+      InstallNativeStaticGeometry(work,base,device,input,group.geometry_install);
+    };
+    const auto finish_geometry=[&] {
+      if(!group.geometry_handoff.pending()) return;
+      const auto restore_material=[&] {
+        if(group.material_handoff.pending()) {
+          // Activation writes material defaults into the register bank. The
+          // final instance world must be restored afterwards, never before.
+          group.material_handoff.Finish([&] {
+            RestoreNativeStaticMaterial(work,base,group.activation_instance,device);
+          },[&] { edf::native::SynchronizeNativeQueuedSceneInstance(base,device,group); });
+          static uint64_t count=0;
+          if(++count<=4 || count%100000==0)
+            REXLOG_INFO("Native material handoff: groups={} (CPU activation follows native submission; final instance restored)",count);
+        }
+      };
+      edf::native::FinishNativeSceneGroupHandoff(group.geometry_handoff,
+        [&] { edf::native::SynchronizeNativeQueuedSceneInstance(base,device,group); },
+        [&] {
+          auto& state=edf::native::State();
+          std::lock_guard submission(state.submissions);
+          std::lock_guard lock(state.mutex);
+          edf::native::FlushNativeQueuedSceneLocked(state,group);
+        },install_geometry,restore_material,[&] {
+        work.r3.u64=device; work.r4.u64=4; work.r5.u64=0; work.r6.u64=0; work.r7.u64=index_count;
+        work.lr=0x821D97E8; __imp__edf_native_indexed_cpu_tail(work,base);
+      },[&] { group.constants_clean=false; });
+      if(group.geometry) {
+        static uint64_t count=0;
+        if(++count<=4 || count%100000==0)
+          REXLOG_INFO("Native geometry handoff: groups={} (native submission precedes CPU buffer/declaration setup and draw tail)",count);
+      }
+    };
     const auto prepare=[&] {
+      std::optional<edf::native::NativeSceneGeometrySource> published_setup;
       {
         auto& state=edf::native::State();
         std::lock_guard lock(state.mutex);
         group.material=state.scene_adapter.PreviousGroupMaterial(group_address);
+        if(REXCVAR_GET(edf_native_scene_geometry_owned) && edf::native::native_scene_publication) {
+          const auto* source=edf::native::NativeSceneSourcesForPass(state).FindGroup(group_address);
+          if(source) {
+            const auto latest=state.scene_adapter.GroupGeometry(group_address,source->revision);
+            for(const auto& published:edf::native::native_scene_publication->group_geometry)
+              if(published==latest && published->group==group_address && published->setup &&
+                 published->geometry->backend()==state.scene_backend.get()) {
+                published_setup=published->setup; break;
+              }
+          }
+        }
       }
       device=reader.Word(reader.Add(reader.Word(0x8257BFB4),8));
       group_device=device;
+      if(published_setup) {
+        const auto& input=*published_setup;
+        const auto eligibility=edf::native::AssessNativeStaticGroup(reader,device,work.r1.u32,input);
+        group.material_compatibility_only=eligibility!=edf::native::NativeStaticGroupEligibility::Supported;
+        if(group.material_compatibility_only) {
+          edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::UnsupportedConfiguration);
+          static std::array<std::atomic<uint64_t>,7> reasons{};
+          const auto count=++reasons.at(size_t(eligibility));
+          if(count<=4 || !(count&(count-1)))
+            REXLOG_INFO("Native static group compatibility eligibility: reason={} count={}",unsigned(eligibility),count);
+        }
+        if(native_queue_size && REXCVAR_GET(edf_native_scene_geometry_deferred) &&
+           REXCVAR_GET(edf_native_scene_activation_owned) && REXCVAR_GET(edf_native_scene_material_owned) &&
+           !REXCVAR_GET(edf_native_scene_material_audit) && !group.material_compatibility_only) group.geometry_handoff.Defer(input);
+        else install_geometry(input);
+        index_count=input.count; work.r3.u64=input.material;
+        static uint64_t count=0;
+        if(++count<=4 || count%100000==0)
+          REXLOG_INFO("Native published geometry setup: groups={} (owned descriptor inputs; CPU binding mirrors retained)",count);
+      } else {
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::GeometrySetup);
       auto descriptor=reader.Word(reader.Add(address,12));
       work.r3.u64=device; work.r4.u64=0; work.r5.u64=reader.Add(descriptor,4);
       work.r6.u64=0; work.r7.u64=reader.Word(reader.Add(descriptor,60)); work.r8.u64=4096;
@@ -3022,15 +3492,102 @@ REX_HOOK_RAW(sub_821D96D8) {
       descriptor=reader.Word(reader.Add(address,12));
       index_count=uint32_t((int32_t(reader.Word(reader.Add(descriptor,140)))/3)*3);
       work.r3.u64=reader.Word(reader.Add(reader.Word(descriptor),16));
+      }
+      group.activation_instance=work.r3.u32;
+      if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
+        const auto publication=edf::native::native_scene_publication;
+        if(publication) for(const auto& published:publication->group_materials)
+          if(published->group==group_address) { group.published_material=published; break; }
+        if(group.published_material) {
+          try {
+          if(!edf::native::native_scene_pass_camera) throw std::runtime_error("native material pass has no camera");
+          group.pass_constants=group.published_material->constants;
+          for(auto& constant:group.pass_constants) {
+            if(edf::native::native_scene_pass_camera->Apply(constant)) continue;
+            if(!constant.global || (constant.name!="m_WaterTime" && constant.name!="g_SignalBrightness")) continue;
+            if(!edf::native::native_scene_pass_animation) throw std::runtime_error("missing native animation pass");
+            edf::native::native_scene_pass_animation->Apply(constant);
+          }
+          static std::set<std::string> changed_inputs;
+          for(const auto& constant:group.pass_constants) {
+            if(constant.name=="g_mWorld") continue;
+            const auto& published=group.published_material->constants;
+            const auto old=std::find_if(published.begin(),published.end(),[&](const auto& input) {
+              return input.pixel==constant.pixel && input.global==constant.global && input.name==constant.name;
+            });
+            if(old!=published.end() && old->registers==constant.registers) continue;
+            const auto key=std::string(constant.pixel?"PS ":"VS ")+(constant.global?"global ":"local ")+constant.name;
+            if(changed_inputs.size()<64 && changed_inputs.insert(key).second)
+              REXLOG_INFO("Native scene pass input changed since publication: {}",key);
+          }
+          const auto* cursor=edf::native::native_material_pass_cursor;
+          if(cursor && *cursor && (*cursor)->device==device) {
+            group.material_pass=(*cursor)->material.render;
+            group.sampler_pass=(*cursor)->material.samplers;
+            if(REXCVAR_GET(edf_native_scene_view_owned)) {
+              group.pass_viewport=(*cursor)->viewport;
+              group.targets=(*cursor)->targets;
+            }
+            static uint64_t reads=0;
+            if(++reads<=4 || reads%100000==0)
+              REXLOG_INFO("Native inherited pass inputs: reads={} (no live render-state or sampler reads)",reads);
+          } else if(cursor) {
+            group.material_pass=edf::native::ReadNativeMaterialRenderPass(reader,device);
+            for(uint32_t slot=0;slot<16;++slot)
+              group.sampler_pass[slot]=edf::native::ReadNativeMaterialSamplerPass(reader,device,slot);
+          } else {
+          group.material_pass=edf::native::ReadNativeMaterialRenderPass(reader,device);
+          std::array<bool,16> read{};
+          for(const auto& operation:group.published_material->program->sampler_operations) {
+            if(operation.slot>=read.size()) throw std::runtime_error("invalid published sampler slot");
+            if(!read[operation.slot]) {
+              group.sampler_pass[operation.slot]=edf::native::ReadNativeMaterialSamplerPass(reader,device,operation.slot);
+              read[operation.slot]=true;
+            }
+          }
+          }
+          } catch(const std::exception& error) {
+            static std::set<std::string> errors;
+            if(errors.size()<32 && errors.insert(error.what()).second)
+              REXLOG_ERROR("Native scene pass input construction failed: {}",error.what());
+            group.published_material.reset();
+            group.material_pass.reset();
+          }
+        }
+      }
+      if(edf::native::native_material_pass_cursor) edf::native::native_material_pass_cursor->reset();
+      if(REXCVAR_GET(edf_native_scene_material_deferred) && group.geometry_handoff.pending() &&
+         group.published_material && group.material_pass &&
+         group.published_material->program->CanDeferCpuActivation() &&
+         edf::native::ObservePublishedActivation(group.activation_instance)) {
+        group.material_handoff.Defer();
+        return;
+      }
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::MaterialActivation);
       work.lr=0x821D979C; sub_821B94E8(work,base);
+      if(!group.published_activation_used) finish_geometry();
     };
     const auto draw=[&](uint32_t instance) {
       if(edf::native::TryAppendNativeQueuedSceneInstance(base,device,instance,group)) return;
       edf::native::SynchronizeNativeQueuedSceneInstance(base,device,group);
+      if(edf::native::TryAppendPublishedNativeSceneInstance(base,device,address,instance,index_count,group)) {
+        if(group.geometry_handoff.pending()) group.geometry_handoff.DrawAccepted();
+        else {
+          work.r3.u64=device; work.r4.u64=4; work.r5.u64=0; work.r6.u64=0; work.r7.u64=index_count;
+          work.lr=0x821D97E8;
+          __imp__edf_native_indexed_cpu_tail(work,base);
+        }
+        return;
+      }
+      finish_geometry();
+      group.all_native_draws=false;
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::InstanceSetup);
       work.r3.u64=instance; work.r4.u64=device;
       work.lr=0x821D97D0; sub_821D9600(work,base);
       work.r3.u64=device; work.r4.u64=4; work.r5.u64=0; work.r6.u64=0; work.r7.u64=index_count;
-      work.lr=0x821D97E8; sub_821FE358(work,base);
+      work.lr=0x821D97E8;
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::IndexedDraw);
+      sub_821FE358(work,base);
       // A non-world override would contaminate the shared capture for unseen
       // parts. Certify every full-path instance as well as direct instances.
       if(group.population_safe) {
@@ -3048,7 +3605,33 @@ REX_HOOK_RAW(sub_821D96D8) {
       reader.StoreWord(reader.Add(address,4),0);
     } else edf::native::VisitNativeQueuedScene(reader,address,prepare,draw);
     edf::native::SynchronizeNativeQueuedSceneInstance(base,device,group);
-  } else __imp__sub_821D96D8(ctx,base);
+    finish_geometry();
+    if(auto* cursor=edf::native::native_material_pass_cursor;
+       cursor && group.published_activation_used && group.all_native_draws && group.material_pass) {
+      const edf::native::NativeSceneMaterialPassState incoming{*group.material_pass,group.sampler_pass};
+      auto next=incoming.After(*group.published_material->program);
+      if(REXCVAR_GET(edf_native_material_state_audit) || REXCVAR_GET(edf_native_material_sampler_audit)) {
+        edf::native::NativeSceneMaterialPassState actual;
+        actual.render=edf::native::ReadNativeMaterialRenderPass(reader,device);
+        for(uint32_t slot=0;slot<16;++slot)
+          actual.samplers[slot]=edf::native::ReadNativeMaterialSamplerPass(reader,device,slot);
+        actual=actual.Inputs();
+        if(next!=actual) {
+          REXLOG_ERROR("Native inherited pass mismatch: group={:#x} render_equal={} samplers_equal={}",
+            group_address,next.render==actual.render,next.samplers==actual.samplers);
+          throw std::runtime_error("native inherited material pass differs from CPU mirrors");
+        }
+      }
+      *cursor=edf::native::NativeScenePassCursorState{device,std::move(next),group.pass_viewport,group.targets};
+      static uint64_t count=0;
+      if(++count<=4 || count%100000==0)
+        REXLOG_INFO("Native inherited material pass: groups={} (owned render state and all 16 sampler slots)",count);
+    }
+  } else {
+    if(edf::native::native_material_pass_cursor) edf::native::native_material_pass_cursor->reset();
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::OriginalGroup);
+    __imp__sub_821D96D8(ctx,base);
+  }
   auto& state=edf::native::State();
   std::lock_guard submission(state.submissions);
   std::lock_guard lock(state.mutex);
@@ -3072,6 +3655,7 @@ REX_HOOK_RAW(sub_821D96D8) {
     }
   }
   if(group.geometry && group.material) state.scene_adapter.RememberGroupMaterial(group_address,group.material);
+  group.execution.Complete();
   if(native_queue_size) {
     const auto previous=state.scene_queue_instances;
     state.scene_queue_instances+=native_queue_size; ++state.scene_queue_groups;
@@ -3155,7 +3739,7 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
           {input.index,ib->generation,(*observed)[1].version},
           mesh.VertexStorage(),(*observed)[0].contents,mesh.IndexStorage(),(*observed)[1].contents))
         throw std::runtime_error("static preload geometry changed before publication");
-      state.scene_adapter.PublishGroupGeometry(address,group.revision,std::move(geometry));
+      state.scene_adapter.PublishGroupGeometry(address,group.revision,std::move(geometry),input);
       state.scene_geometry_loads[address]={input,group.revision,vb->generation,ib->generation,
         {(*observed)[0].version,(*observed)[1].version},declaration,shader.bytecode};
       ++state.scene_geometry_loaded;
@@ -3191,6 +3775,7 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
         return pixel_stage?ps.bindings->GuestFloatRegisterBytes(name):std::max(
           vs.bindings->GuestFloatRegisterBytes(name),vs.reversed_bindings->GuestFloatRegisterBytes(name));
       },[&](const std::string& name) { return ps.bindings->ResolveResource(name).used(); });
+      auto sampler_operations=ReadNativeMaterialSamplerOperations(reader,*schema);
       std::vector<std::shared_ptr<NativeBackendTexture>> textures;
       for(const auto& input:inputs.textures) {
         if(!input.handle) { textures.emplace_back(); continue; }
@@ -3201,17 +3786,21 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
       }
       const auto previous=state.scene_adapter.GroupMaterial(address,group.revision);
       if(previous && previous->program->inputs==inputs && previous->program->textures==textures &&
+         previous->program->sampler_operations==sampler_operations &&
          previous->program->backend==state.scene_backend &&
          previous->program->vertex.bytecode==vs.bindings->shader().bytecode &&
          previous->program->reversed_vertex.bytecode==vs.reversed_bindings->shader().bytecode &&
          previous->program->pixel.bytecode==ps.bindings->shader().bytecode) {
+        state.scene_adapter.PublishGroupMaterial(address,group.revision,previous->program,std::move(inputs.constants));
         ++state.scene_material_reused; continue;
       }
       auto program=std::make_shared<NativeSceneMaterialProgram>();
+      auto constants=std::move(inputs.constants);
       program->backend=state.scene_backend; program->inputs=std::move(inputs); program->textures=std::move(textures);
+      program->sampler_operations=std::move(sampler_operations);
       program->vertex=vs.bindings->shader(); program->reversed_vertex=vs.reversed_bindings->shader();
       program->pixel=ps.bindings->shader();
-      state.scene_adapter.PublishGroupMaterial(address,group.revision,std::move(program));
+      state.scene_adapter.PublishGroupMaterial(address,group.revision,std::move(program),std::move(constants));
       ++state.scene_material_loaded;
     } catch(const std::exception& error) {
       state.scene_adapter.RetireGroupMaterial(address); ++state.scene_material_deferred;
@@ -3325,6 +3914,7 @@ REX_HOOK_RAW(sub_821BEF10) {
 REX_EXTERN(__imp__sub_820B4038);
 REX_EXTERN(__imp__sub_821C4EB8);
 REX_HOOK_RAW(sub_821C4EB8) {
+  edf::native::TreePublications().Invalidate();
   const auto node=ctx.r3.u32;
   __imp__sub_821C4EB8(ctx,base);
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
@@ -3334,6 +3924,7 @@ REX_HOOK_RAW(sub_821C4EB8) {
 }
 REX_EXTERN(__imp__sub_821C5D28);
 REX_HOOK_RAW(sub_821C5D28) {
+  edf::native::TreePublications().Invalidate();
   const auto node=ctx.r3.u32;
   __imp__sub_821C5D28(ctx,base);
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
@@ -3344,6 +3935,11 @@ REX_HOOK_RAW(sub_821C5D28) {
 }
 REX_EXTERN(__imp__sub_821A1628);
 REX_HOOK_RAW(sub_821A1628) {
+  if(REXCVAR_GET(edf_native_scene_tree_published)) {
+    auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
+    if(state.scene_membership.HasAnchor(ctx.r3.u32) || state.scene_membership.HasAnchor(ctx.r4.u32))
+      edf::native::TreePublications().Invalidate();
+  }
   const auto anchor=ctx.r3.u32,node=ctx.r4.u32;
   __imp__sub_821A1628(ctx,base);
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
@@ -3356,6 +3952,10 @@ REX_HOOK_RAW(sub_821A1628) {
 }
 REX_EXTERN(__imp__sub_821A1678);
 REX_HOOK_RAW(sub_821A1678) {
+  if(REXCVAR_GET(edf_native_scene_tree_published)) {
+    auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
+    if(state.scene_membership.HasAnchor(ctx.r3.u32)) edf::native::TreePublications().Invalidate();
+  }
   const auto node=ctx.r3.u32;
   __imp__sub_821A1678(ctx,base);
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_scene_visibility)) {
@@ -3376,9 +3976,9 @@ REX_HOOK_RAW(sub_820B4038) {
   const GuestReader reader(base);
   NativeSceneCpuWindow cpu(reader);
   const auto context=ctx.r5.u32;
-  const auto end=reader.Word(reader.Add(ctx.r4.u32,12));
+  uint32_t end=0;
   const auto generation=reader.Word(reader.Add(context,12));
-  auto cursor=reader.Word(ctx.r4.u32);
+  uint32_t cursor=0;
   auto view=ReadNativeSceneVisibilityView(cpu,context);
   auto* center_destination=const_cast<uint8_t*>(cpu.WritableBytes(reader.Add(context,32),16,4));
   auto work=ctx;
@@ -3389,8 +3989,30 @@ REX_HOOK_RAW(sub_820B4038) {
   std::shared_ptr<const NativeSceneMembership::Snapshot> membership;
   {
     auto& state=State(); std::lock_guard lock(state.mutex);
-    membership=state.scene_membership.Acquire(ctx.r4.u32);
-    if(membership && !audit && (membership->end!=end ||
+    bool published=false;
+    if(REXCVAR_GET(edf_native_scene_membership_owned) && native_scene_publication && native_scene_publication->membership) {
+      const auto& lists=*native_scene_publication->membership;
+      if(state.scene_membership.Current(lists)) {
+        const auto found=lists.lists.find(ctx.r4.u32);
+        if(found!=lists.lists.end()) { membership=found->second; published=true; }
+      }
+      if(!published) {
+        static uint64_t fallbacks=0;
+        if(++fallbacks<=4 || fallbacks%10000==0)
+          REXLOG_INFO("Native published membership fallback: count={} list={:#x}",fallbacks,ctx.r4.u32);
+      }
+    }
+    if(published) {
+      end=membership->end;
+      cursor=membership->members.empty()?end:membership->members.front().node;
+      static uint64_t reads=0;
+      if(++reads<=4 || reads%10000==0)
+        REXLOG_INFO("Native published membership: lists={} revision={}",reads,native_scene_publication->membership->revision);
+    } else membership=state.scene_membership.Acquire(ctx.r4.u32);
+    if(!published || audit) {
+      end=reader.Word(reader.Add(ctx.r4.u32,12)); cursor=reader.Word(ctx.r4.u32);
+    }
+    if(membership && !published && !audit && (membership->end!=end ||
        (membership->members.empty()?end:membership->members.front().node)!=cursor)) {
       ++state.scene_membership_mismatches;
       if(state.scene_membership_mismatches<=8)
@@ -3445,7 +4067,7 @@ REX_HOOK_RAW(sub_820B4038) {
       std::shared_ptr<const NativeSceneVisibility> published;
       {
         auto& state=State(); std::lock_guard lock(state.mutex);
-        published=state.scene_sources.Visibility(owner);
+        published=NativeSceneSourcesForPass(state).Visibility(owner);
       }
       const auto read_live=[&](bool lods) {
         const GuestReadWindow window(cpu,owner,lods?540:356);
@@ -3455,7 +4077,13 @@ REX_HOOK_RAW(sub_820B4038) {
       ++candidates; retained+=bool(published);
       if(audit && published) {
         const auto live=read_live(true);
-        if(live!=object) { ++mismatches; object=live; }
+        if(live!=object) {
+          static std::atomic<uint32_t> reports=0;
+          if(reports++<16) REXLOG_ERROR("Native visibility source mismatch: owner={:#x} box={} radius={}/{} distance={}/{} lod_count={}/{} lod_thresholds={}",
+            owner,live.box!=object.box,object.radius,live.radius,object.distance,live.distance,
+            object.lod_count,live.lod_count,live.lod_thresholds!=object.lod_thresholds);
+          ++mismatches; object=live;
+        }
       }
       auto center=NativeVisibilityTransform({object.box[0],object.box[1],object.box[2],object.box[3]},view.matrix);
       if(audit) {
@@ -3463,7 +4091,18 @@ REX_HOOK_RAW(sub_820B4038) {
         work.r3.u64=work.r1.u32+80; work.r4.u64=reader.Add(owner,288); work.r5.u64=reader.Add(camera,96);
         work.lr=0x820B40AC; __imp__sub_821B0198(work,base);
         const auto original=ReadNativeVisibilityFloats<4>(reader,work.r1.u32+80);
-        if(original!=center) { ++mismatches; center=original; }
+        if(!NativeVisibilityBitsEqual(original,center)) {
+          static std::atomic<uint32_t> reports=0;
+          if(reports++<16) REXLOG_ERROR("Native visibility transform mismatch: owner={:#x} native_bits={:#x},{:#x},{:#x},{:#x} original_bits={:#x},{:#x},{:#x},{:#x}",
+            owner,std::bit_cast<uint32_t>(center[0]),std::bit_cast<uint32_t>(center[1]),std::bit_cast<uint32_t>(center[2]),std::bit_cast<uint32_t>(center[3]),
+            std::bit_cast<uint32_t>(original[0]),std::bit_cast<uint32_t>(original[1]),std::bit_cast<uint32_t>(original[2]),std::bit_cast<uint32_t>(original[3]));
+          ++mismatches; center=original;
+        } else if(std::any_of(center.begin(),center.end(),[](float value){return std::isnan(value);})) {
+          static std::atomic<uint64_t> nan_matches=0;
+          const auto count=++nan_matches;
+          if(count<=4 || count%10000==0)
+            REXLOG_INFO("Native visibility NaN parity: checks={} owner={:#x} all_register_bits_match=true",count,owner);
+        }
       }
       std::array<uint32_t,4> encoded_center;
       for(size_t i=0;i<4;++i) encoded_center[i]=std::bit_cast<uint32_t>(center[i]);
@@ -3484,7 +4123,11 @@ REX_HOOK_RAW(sub_820B4038) {
             work.lr=0x820B40F8; __imp__sub_821C33E8(work,base); original_box=work.r3.u32;
           }
           ++checks;
-          if(sphere!=original_sphere || box!=original_box) { ++mismatches; box=original_box; }
+          if(sphere!=original_sphere || box!=original_box) {
+            static std::atomic<uint32_t> reports=0;
+            if(reports++<16) REXLOG_ERROR("Native visibility classification mismatch: owner={:#x} sphere={}/{} box={}/{}",owner,sphere,original_sphere,box,original_box);
+            ++mismatches; box=original_box;
+          }
         }
         visible=box!=0;
       }
@@ -3495,7 +4138,7 @@ REX_HOOK_RAW(sub_820B4038) {
          hidden==0 && mode==0 && cpu.Word(reader.Add(table,16))==0x820B2670) {
         const auto lod=NativeVisibilityLod(object,depth);
         auto& state=State(); std::lock_guard lock(state.mutex);
-        const auto parts=state.scene_sources.LodParts(reader.Add(owner,408+lod*44));
+        const auto parts=NativeSceneSourcesForPass(state).LodParts(reader.Add(owner,408+lod*44));
         native_selected=parts.has_value();
         if(parts) for(const auto& part:*parts) {
           if(!part.group || (!queues->Contains(part.group) &&
@@ -3512,6 +4155,9 @@ REX_HOOK_RAW(sub_820B4038) {
         membership.reset();
         cpu.Invalidate(); center_destination=nullptr;
         work.r3.u64=owner; work.r4.u64=context; work.lr=0x820B410C;
+        // Hierarchy writer hooks invalidate tree images if this callback
+        // changes membership, bounds or topology. Unrelated callback activity
+        // must not discard every completed producer publication.
         __imp__sub_821C0C00(work,base);
         callback=true;
         // A remaining callback can update camera data; no live read window or
@@ -3560,12 +4206,24 @@ REX_HOOK_RAW(sub_821C0C00) {
   }
   __imp__sub_821C0C00(ctx,base);
 }
+REXCVAR_DEFINE_BOOL(edf_native_frame_dispatch,false,"EDF2027",
+  "Own outer render phase dispatch in native code; remaining phase callbacks are retained.");
 REX_HOOK_RAW(sub_821A5080) {
   edf::native::NativeSceneQueues queues;
   struct RestoreSceneQueues {
+    uint32_t animation_owner=edf::native::native_scene_animation_owner;
+    std::optional<edf::native::NativeScenePassCamera> camera=edf::native::native_scene_pass_camera;
+    std::shared_ptr<const edf::native::NativeScenePassCameras> cameras=edf::native::native_scene_pass_cameras;
+    std::optional<edf::native::NativeScenePassAnimation> animation=edf::native::native_scene_pass_animation;
+    std::shared_ptr<const edf::native::NativeSceneAdapter::WorldAnimations> animations=edf::native::native_scene_pass_animations;
     edf::native::NativeSceneQueues* previous=edf::native::native_scene_queues;
     std::shared_ptr<const edf::native::NativeScenePublication> publication=edf::native::native_scene_publication;
     ~RestoreSceneQueues() {
+      edf::native::native_scene_animation_owner=animation_owner;
+      edf::native::native_scene_pass_camera=std::move(camera);
+      edf::native::native_scene_pass_cameras=std::move(cameras);
+      edf::native::native_scene_pass_animation=std::move(animation);
+      edf::native::native_scene_pass_animations=std::move(animations);
       edf::native::native_scene_queues=previous;
       if(!publication && !edf::native::native_scene_publication) return;
       auto& state=edf::native::State();
@@ -3574,6 +4232,11 @@ REX_HOOK_RAW(sub_821A5080) {
       edf::native::native_scene_publication=std::move(publication);
     }
   } restore_scene_queues;
+  edf::native::native_scene_pass_camera.reset();
+  edf::native::native_scene_pass_cameras.reset();
+  edf::native::native_scene_pass_animation.reset();
+  edf::native::native_scene_pass_animations.reset();
+  edf::native::native_scene_animation_owner=0;
   if(REXCVAR_GET(edf_native_scene_queued) && REXCVAR_GET(edf_native_host) &&
      REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_seam_draws)) {
     edf::native::native_scene_queues=&queues;
@@ -3581,6 +4244,9 @@ REX_HOOK_RAW(sub_821A5080) {
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
     edf::native::native_scene_publication=state.scene_adapter.AcquirePublication();
+    if(REXCVAR_GET(edf_native_scene_camera_owned))
+      edf::native::native_scene_pass_cameras=state.scene_adapter.AcquireCameras();
+    edf::native::native_scene_pass_animations=state.scene_adapter.AcquireWorldAnimations();
   }
   struct RestoreRenderBudget {
     NativeLoopBudget budget=native_render_budget;
@@ -3596,7 +4262,36 @@ REX_HOOK_RAW(sub_821A5080) {
   NativeLoopTrace trace("helper_dispatch",ctx.r3.u32,ctx.lr);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceHelper);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::RenderHelper);
-  __imp__sub_821A5080(ctx,base);
+  if(REXCVAR_GET(edf_native_frame_dispatch) && REXCVAR_GET(edf_native_shader_bridge)) {
+    const edf::native::GuestReader reader(base);
+    auto work=ctx;
+    if(work.r1.u32<224) throw std::runtime_error("invalid native frame dispatch stack");
+    const auto stack=work.r1.u32-224;
+    reader.StoreWord(stack,work.r1.u32);
+    work.r1.u64=stack;
+    edf::native::DispatchNativeFrame(reader,ctx.r3.u32,reader.Add(stack,80),
+      [&](uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr) {
+        work.r3.u64=object; work.r4.u64=argument; work.r5.u64=index;
+        work.ctr.u64=function; work.lr=lr;
+        if(function==0x821A3BA0) {
+          auto bucket=work;
+          if(bucket.r1.u32<128) throw std::runtime_error("invalid native bucket dispatch stack");
+          const auto bucket_stack=bucket.r1.u32-128;
+          reader.StoreWord(bucket_stack,bucket.r1.u32); bucket.r1.u64=bucket_stack;
+          edf::native::HookTiming bucket_timing(edf::native::HookPhase::RenderBuckets);
+          edf::native::DispatchNativeFrameBuckets(reader,object,argument,
+            [&](uint32_t callback,uint32_t item,uint32_t input,uint32_t,uint32_t return_address) {
+              bucket.r3.u64=item; bucket.r4.u64=input; bucket.ctr.u64=callback; bucket.lr=return_address;
+              rex::runtime::ResolveIndirectFunction(callback)(bucket,base);
+            });
+        } else rex::runtime::ResolveIndirectFunction(function)(work,base);
+      });
+    static std::atomic<uint64_t> native_frames=0;
+    const auto frame_count=++native_frames;
+    if(frame_count<=4 || frame_count%1000==0)
+      REXLOG_INFO("Native frame dispatch: frames={} (native outer and bucket traversal; world/overlay/presentation callbacks retained)",frame_count);
+    ctx.r3=work.r3;
+  } else __imp__sub_821A5080(ctx,base);
   if(!queues.empty()) throw std::runtime_error("native scene selections survived their render helper");
 }
 REX_EXTERN(__imp__sub_820B2510);
@@ -3718,6 +4413,30 @@ REX_HOOK_RAW(sub_821A17D8) {
 REX_EXTERN(__imp__sub_821BE8D0);
 REX_HOOK_RAW(sub_821BE8D0) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderSceneBegin);
+  if(REXCVAR_GET(edf_native_scene_material_audit) || REXCVAR_GET(edf_native_scene_material_owned)) {
+    const edf::native::GuestReader reader(base);
+    const auto scene=ctx.r4.u32;
+    const auto& cameras=edf::native::native_scene_pass_cameras;
+    const auto found=cameras?cameras->find(scene):edf::native::NativeScenePassCameras::const_iterator{};
+    if(cameras && found!=cameras->end()) {
+      edf::native::native_scene_pass_camera=found->second;
+      if(REXCVAR_GET(edf_native_scene_transform_audit) &&
+         found->second!=edf::native::ReadNativeScenePassCamera(reader,scene)) {
+        REXLOG_ERROR("Native published camera mismatch: scene={:#x}",scene);
+        throw std::runtime_error("native camera changed after producer publication");
+      }
+      static uint64_t reads=0;
+      if(++reads<=4 || reads%1000==0)
+        REXLOG_INFO("Native published camera: reads={} audited={}",reads,REXCVAR_GET(edf_native_scene_transform_audit));
+    } else {
+      edf::native::native_scene_pass_camera=edf::native::ReadNativeScenePassCamera(reader,scene);
+      if(cameras) {
+        static uint64_t misses=0;
+        if(++misses<=4 || misses%1000==0)
+          REXLOG_INFO("Native camera publication fallback: scene={:#x} misses={}",scene,misses);
+      }
+    }
+  }
   // This backend callback consumes scene+32/+96 before render-list traversal.
   // Observe its inputs, not guest state after another simulation tick. A new
   // submission with unchanged matrices is not evidence of interpolated motion.
@@ -3838,6 +4557,12 @@ REX_HOOK_RAW(sub_821A4DE8) {
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceTransition,edge);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::FrameTransition);
   __imp__sub_821A4DE8(ctx,base);
+  if(REXCVAR_GET(edf_native_scene_camera_owned)) {
+    auto cameras=edf::native::ReadNativeScenePassCameras(edf::native::GuestReader(base),manager);
+    auto& state=edf::native::State();
+    std::lock_guard lock(state.mutex);
+    state.scene_adapter.PublishCameras(std::move(cameras));
+  }
   {
     auto& motion=ModelMotionState();
     std::lock_guard lock(motion.mutex);
@@ -3851,13 +4576,24 @@ REX_HOOK_RAW(sub_821A4DE8) {
     std::lock_guard lock(state.mutex);
     state.scene_publication_tick+=std::max(1u,native_loop_budget.steps);
     if(REXCVAR_GET(edf_native_scene_visibility)) state.scene_membership.Publish();
+    if(REXCVAR_GET(edf_native_scene_tree_published)) {
+      auto& trees=edf::native::TreePublications();
+      const edf::native::GuestReader reader(base);
+      for(const auto owner:trees.Owners()) {
+        try { trees.Publish(reader,owner); }
+        catch(const std::exception&) { trees.Retire(owner); }
+      }
+    }
     if(REXCVAR_GET(edf_native_scene_preload)) {
       const edf::native::GuestReader reader(base);
       edf::native::PreloadStaticSceneGeometryLocked(state,reader);
       edf::native::PreloadStaticSceneMaterialsLocked(state,reader);
     }
     if(state.scene_adapter.objects() || state.scene_adapter.geometry_groups() || state.scene_adapter.AcquirePublication())
-      state.scene_adapter.Publish(state.scene_publication_tick);
+      state.scene_adapter.Publish(state.scene_publication_tick,
+        REXCVAR_GET(edf_native_scene_sources_owned)?state.scene_sources.AcquireSnapshot():nullptr,
+        REXCVAR_GET(edf_native_scene_membership_owned)?state.scene_membership.AcquirePublication():nullptr,
+        REXCVAR_GET(edf_native_scene_membership_owned)?edf::native::TreePublications().AcquireAll():edf::native::NativeSceneTreePublications::Images{});
   }
   timing.Finish();
   if(edge) REXLOG_INFO("Native resource transition: end manager={:#x}",manager);
@@ -3920,15 +4656,236 @@ REX_HOOK_RAW(sub_821B6880) {
   }
 }
 REX_EXTERN(__imp__sub_821B8E48);
+REXCVAR_DEFINE_BOOL(edf_native_material_activation,false,"EDF2027",
+  "Run material activation from a native operation list with native sampler resolution");
+REX_EXTERN(sub_821498C8);
+REX_EXTERN(sub_82149608);
+REX_EXTERN(sub_82149248);
+REX_EXTERN(sub_82149358);
+REX_EXTERN(sub_8213BA98);
+namespace {
+void BindNativeShaderResource(PPCContext&,uint8_t*,bool);
+void PublishNativeShaderBinding(uint32_t,uint32_t,bool);
+void ActivateNativeMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint32_t device) {
+  const edf::native::GuestReader reader(base);
+  const auto program=edf::native::ReadNativeMaterialCpuProgram(reader,instance,device);
+  auto work=ctx;
+  if(work.r1.u32<144) throw std::runtime_error("native activation stack");
+  work.r1.u64-=144;
+  reader.StoreWord(work.r1.u32,ctx.r1.u32);
+  edf::native::ExecuteNativeMaterialCpuProgram(program,[&](uint32_t shader,bool pixel) {
+    work.r3.u64=device; work.r4.u64=shader; work.lr=pixel?0x821B8E84:0x821B8E70;
+    BindNativeShaderResource(work,base,pixel);
+    PublishNativeShaderBinding(device,shader,pixel);
+  },[&](const auto& operation) {
+    const auto first=operation.first/4,last=(operation.first+operation.count-1)/4;
+    const uint64_t mask=(~uint64_t(0)>>(first))&(~uint64_t(0)<<(63-last));
+    work.r3.u64=device; work.r4.u64=operation.first; work.r5.u64=operation.data;
+    work.r6.u64=operation.count; work.r7.u64=mask;
+    work.lr=operation.pixel?0x821B8FBC:0x821B8ED8;
+    const auto destination=reader.Add(device,(operation.first+(operation.pixel?368:112))*16);
+    const size_t bytes=size_t(operation.count)*16;
+    const bool disjoint=uint64_t(operation.data)+bytes<=destination || uint64_t(destination)+bytes<=operation.data;
+    if(!(destination&15) && disjoint) {
+      // The audited upload setters only copy these raw float4 bytes and OR
+      // the supplied stage mask. Preserve their stack scratch stores as well.
+      reader.StoreWord(work.r1.u32-32,device);
+      reader.StoreWord(reader.Add(work.r1.u32,48),uint32_t(mask>>32));
+      reader.StoreWord(reader.Add(work.r1.u32,52),uint32_t(mask));
+      auto* target=const_cast<uint8_t*>(reader.WritableBytes(destination,bytes,4));
+      const auto dirty_address=reader.Add(device,operation.pixel?8:0);
+      const uint64_t dirty=(uint64_t(reader.Word(dirty_address))<<32)|reader.Word(reader.Add(dirty_address,4));
+      if(!edf::native::UploadNativeMaterialConstant(reader,device,operation,mask))
+        throw std::runtime_error("native constant eligibility changed during activation");
+      if(REXCVAR_GET(edf_native_scene_material_audit)) {
+        static std::mutex audit_mutex;
+        static std::set<std::tuple<bool,uint32_t,uint32_t,uint32_t>> shapes;
+        bool sample=false;
+        {
+          std::lock_guard lock(audit_mutex);
+          if(shapes.size()<4096) sample=shapes.emplace(operation.pixel,operation.first,operation.count,operation.data&15).second;
+        }
+        if(sample) {
+          const std::vector<uint8_t> expected(target,target+bytes);
+          // Re-run the original with the same incoming flags. The disjoint
+          // source is unchanged, so this is an independent byte-copy oracle.
+          reader.StoreWord(dirty_address,uint32_t(dirty>>32));
+          reader.StoreWord(reader.Add(dirty_address,4),uint32_t(dirty));
+          edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::AuditOracle);
+          if(operation.pixel) sub_82149358(work,base); else sub_82149248(work,base);
+          const auto actual=(uint64_t(reader.Word(dirty_address))<<32)|reader.Word(reader.Add(dirty_address,4));
+          if(std::memcmp(target,expected.data(),bytes) || actual!=(dirty|mask))
+            throw std::runtime_error("native activation CPU constant upload differs from original");
+          REXLOG_INFO("Native activation constant audit: pixel={} first={} count={} source_alignment={} bytes_and_dirty_match=true",
+            operation.pixel,operation.first,operation.count,operation.data&15);
+        }
+      }
+    } else {
+      // Preserve the original vector load/store ordering for aliased uploads.
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::AliasedConstant);
+      if(operation.pixel) sub_82149358(work,base); else sub_82149248(work,base);
+    }
+  },[&](const auto& operation) {
+    const uint64_t mask=uint64_t(1)<<(43-operation.slot);
+    work.r3.u64=device; work.r4.u64=operation.slot; work.r5.u64=operation.handle;
+    work.r6.u64=mask; work.lr=0x821B9090; sub_8213BA98(work,base);
+    const auto inherited=edf::native::ReadNativeMaterialSamplerPass(reader,device,operation.slot);
+    const auto resolved=edf::native::ApplyNativeMaterialSampler(inherited,operation.sampler);
+    reader.StoreWord(reader.Add(device,1036+operation.slot*24),resolved.words[1]);
+    reader.StoreWord(reader.Add(device,1040+operation.slot*24),resolved.words[2]);
+    const auto dirty=(uint64_t(reader.Word(reader.Add(device,16)))<<32)|reader.Word(reader.Add(device,20));
+    reader.StoreWord(reader.Add(device,16),uint32_t((dirty|mask)>>32));
+    reader.StoreWord(reader.Add(device,20),uint32_t(dirty|mask));
+  },[&](const auto& operation) {
+    work.r3.u64=device; work.r4.u64=operation.value; work.ctr.u64=operation.setter; work.lr=0x821B920C;
+    const auto dirty=[&](uint32_t offset) {
+      return (uint64_t(reader.Word(reader.Add(device,offset)))<<32)|reader.Word(reader.Add(device,offset+4));
+    };
+    const auto writes=edf::native::NativeMaterialStateCpuWrites(
+      edf::native::ReadNativeMaterialRenderPass(reader,device),operation.offset,operation.value,dirty(16),dirty(24));
+    if(!writes) {
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::StateCallback);
+      rex::runtime::ResolveIndirectFunction(operation.setter)(work,base); return;
+    }
+    bool sample=false;
+    if(REXCVAR_GET(edf_native_material_state_audit)) {
+      static std::mutex audit_mutex;
+      static std::set<std::pair<uint32_t,uint32_t>> cases;
+      std::lock_guard lock(audit_mutex);
+      if(cases.size()<4096) sample=cases.emplace(operation.offset,operation.value).second;
+    }
+    std::vector<uint32_t> previous;
+    if(sample) for(const auto& [offset,value]:*writes) previous.push_back(reader.Word(reader.Add(device,offset)));
+    for(const auto& [offset,value]:*writes) reader.StoreWord(reader.Add(device,offset),value);
+    if(sample) {
+      const auto expected=edf::native::ReadNativeMaterialRenderPass(reader,device);
+      for(size_t i=0;i<writes->size();++i) reader.StoreWord(reader.Add(device,(*writes)[i].first),previous[i]);
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::AuditOracle);
+      rex::runtime::ResolveIndirectFunction(operation.setter)(work,base);
+      for(const auto& [offset,value]:*writes) if(reader.Word(reader.Add(device,offset))!=value)
+        throw std::runtime_error("native material CPU state word differs from original at "+std::to_string(offset));
+      if(edf::native::ReadNativeMaterialRenderPass(reader,device)!=expected)
+        throw std::runtime_error("native material CPU state differs from original");
+      REXLOG_INFO("Native activation state oracle: offset={:#x} value={:#x} words_and_dirty_match=true",operation.offset,operation.value);
+    }
+    // Replacing the setter also replaces its ownership-publication hook.
+    // Draws consume these snapshots even when the CPU words already match.
+    if(operation.offset==0x44) {
+      auto& state=edf::native::State();
+      std::lock_guard lock(state.mutex);
+      state.render_state_snapshots.PublishBlend(device,
+        edf::native::ReadGuestWords<4>(reader,reader.Add(device,10336)),operation.setter);
+    } else if(operation.offset!=0x64) {
+      edf::native::PublishNativeRenderState(base,device,operation.setter);
+    }
+  });
+  static std::atomic<uint64_t> activations=0;
+  const auto count=++activations;
+  if(count<=4 || count%100000==0)
+    REXLOG_INFO("Native material activation: count={} (native traversal/shaders/constants/samplers/state; aliased uploads, texture retirement and scissor callbacks retained)",count);
+}
+void RestoreNativeStaticMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint32_t device) {
+  // Called only while the group's activation is pending. The activation hook
+  // would skip ObserveActivation in this state; retain its audit path when asked.
+  static std::atomic<uint64_t> native_count=0,fallback_count=0;
+  if(REXCVAR_GET(edf_native_material_activation) && !REXCVAR_GET(edf_native_material_state_audit) &&
+     !REXCVAR_GET(edf_native_material_sampler_audit)) {
+    ActivateNativeMaterial(ctx,base,instance,device);
+    ++native_count;
+  } else {
+    ++fallback_count;
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::MaterialActivation);
+    ctx.r3.u64=instance; ctx.lr=0x821D979C; sub_821B94E8(ctx,base);
+  }
+  const auto count=native_count.load()+fallback_count.load();
+  if(count<=4 || count%100000==0)
+    REXLOG_INFO("Native static material handoff: native={} compatibility={}",native_count.load(),fallback_count.load());
+}
+}
 REX_HOOK_RAW(sub_821B8E48) {
   const auto instance = ctx.r3.u32, device = ctx.r4.u32;
+  std::map<uint32_t,edf::native::NativeMaterialSamplerPass> expected_samplers;
+  std::optional<edf::native::NativeMaterialRenderPass> expected_state;
+  const bool sampler_audit=REXCVAR_GET(edf_native_material_sampler_audit);
+  if(REXCVAR_GET(edf_native_material_state_audit)) {
+    const edf::native::GuestReader reader(base);
+    expected_state=edf::native::ReadNativeMaterialRenderPass(reader,device);
+    const auto states=reader.Word(reader.Add(instance,96)),count=reader.Word(reader.Add(instance,104));
+    if(count>4096) throw std::runtime_error("invalid native material state audit count");
+    for(uint32_t i=0;i<count;++i) {
+      const auto operation=edf::native::ReadGuestWords<2>(reader,reader.Add(states,i*8));
+      try {
+        const auto setter=edf::native::NativeMaterialStateSetter(operation[0]);
+        if(reader.Word(reader.Add(device,56+operation[0]))!=setter)
+          throw std::runtime_error("native material state setter identity changed");
+        edf::native::ApplyNativeMaterialState(*expected_state,operation[0],operation[1]);
+      } catch(const std::exception& error) {
+        REXLOG_ERROR("Native material state audit: material={:#x} offset={:#x} value={:#x}: {}",
+          instance,operation[0],operation[1],error.what());
+        throw;
+      }
+    }
+  }
+  if(sampler_audit) {
+    auto& state=edf::native::State();
+    std::lock_guard lock(state.mutex);
+    const edf::native::GuestReader reader(base);
+    const auto schema=state.material_parameters.Get(instance);
+    const auto operations=edf::native::ReadNativeMaterialSamplerOperations(reader,*schema);
+    for(const auto& operation:operations) {
+      auto found=expected_samplers.find(operation.slot);
+      if(found==expected_samplers.end()) found=expected_samplers.emplace(operation.slot,
+        edf::native::ReadNativeMaterialSamplerPass(reader,device,operation.slot)).first;
+      found->second=edf::native::ApplyNativeMaterialSampler(found->second,operation);
+    }
+  }
   {
     edf::native::HookTiming timing(edf::native::HookPhase::ActivationGuest);
-    __imp__sub_821B8E48(ctx, base);
+    if(REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_material_activation) &&
+       (!edf::native::native_queued_scene_group || !edf::native::native_queued_scene_group->material_compatibility_only))
+      ActivateNativeMaterial(ctx,base,instance,device);
+    else {
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::MaterialActivation);
+      __imp__sub_821B8E48(ctx, base);
+    }
+  }
+  if(expected_state) {
+    const auto actual=edf::native::ReadNativeMaterialRenderPass(edf::native::GuestReader(base),device);
+    if(actual!=*expected_state) {
+      REXLOG_ERROR("Native material state mismatch: material={:#x} expected={:#x}/{:#x}/{:#x}/{:#x}/{:#x}/{:#x} actual={:#x}/{:#x}/{:#x}/{:#x}/{:#x}/{:#x}",
+        instance,expected_state->words[0],expected_state->words[1],expected_state->words[2],expected_state->words[3],expected_state->words[4],expected_state->words[5],
+        actual.words[0],actual.words[1],actual.words[2],actual.words[3],actual.words[4],actual.words[5]);
+      throw std::runtime_error("native material render state differs from guest activation");
+    }
+    static std::atomic<uint64_t> checked=0;
+    const auto count=++checked;
+    if(count<=4 || count%100000==0) REXLOG_INFO("Native material state audit: checked={} mismatches=0",count);
+  }
+  if(sampler_audit) {
+    const edf::native::GuestReader reader(base);
+    static std::atomic<uint64_t> checked=0;
+    for(const auto& [slot,expected]:expected_samplers) {
+      const auto actual=edf::native::ReadSamplerWords(reader,device,slot);
+      if(edf::native::SamplerStateKey(actual)!=edf::native::SamplerStateKey(expected.words) ||
+         (actual[2]&3)!=(expected.words[2]&3)) {
+        REXLOG_ERROR("Native material sampler mismatch: material={:#x} slot={} expected={:#x}/{:#x}/{:#x}/{:#x} actual={:#x}/{:#x}/{:#x}/{:#x}",
+          instance,slot,expected.words[0],expected.words[1],expected.words[2],expected.words[3],actual[0],actual[1],actual[2],actual[3]);
+        throw std::runtime_error("native material sampler program differs from guest activation");
+      }
+      const auto count=++checked;
+      if(count<=4 || count%100000==0)
+        REXLOG_INFO("Native material sampler audit: checked={} mismatches=0",count);
+    }
   }
   if (REXCVAR_GET(edf_native_shader_bridge)) {
     edf::native::HookTiming timing(edf::native::HookPhase::ActivationNative);
-    try { edf::native::ObserveActivation(edf::native::GuestReader(base), instance, device); }
+    if(const auto* group=edf::native::native_queued_scene_group;
+       group && group->material_handoff.activation_pending() && group->activation_instance==instance) return;
+    try {
+      if(!REXCVAR_GET(edf_native_scene_activation_owned) || !REXCVAR_GET(edf_native_scene_material_owned) ||
+         REXCVAR_GET(edf_native_scene_material_audit) || !edf::native::ObservePublishedActivation(instance))
+        edf::native::ObserveActivation(edf::native::GuestReader(base), instance, device);
+    }
     catch (const std::exception& error) { REXLOG_ERROR("Native shader bridge: {}", error.what()); }
   }
 }
@@ -4020,18 +4977,148 @@ void SynchronizeNativeQueuedSceneInstanceLocked(Bridge& state,const GuestReader&
   // There have been no guest callbacks since the last consumed draw. All
   // skipped draws only overwrite this complete matrix, so only the final value
   // is observable by the next guest callback. Keep the source bytes owned.
-  auto* destination=const_cast<uint8_t*>(reader.WritableBytes(reader.Add(device,(112+parameter.first)*16),64,4));
-  std::memcpy(destination,bytes.data(),64);
-  shader.bindings->PatchGuestFloatRegisters(parameter.normal,0,bytes);
-  if(!shader.reversed_mirrors) shader.reversed_bindings->PatchGuestFloatRegisters(parameter.reversed,0,bytes);
+  RestoreNativeSceneWorld(reader,device,parameter.first,bytes,[&](const auto& restored) {
+    shader.bindings->PatchGuestFloatRegisters(parameter.normal,0,restored);
+    if(!shader.reversed_mirrors) shader.reversed_bindings->PatchGuestFloatRegisters(parameter.reversed,0,restored);
+  });
   group.pending_world.reset();
 }
 void SynchronizeNativeQueuedSceneInstance(uint8_t* base,uint32_t device,NativeQueuedSceneGroup& group) {
+  if(group.material_handoff.activation_pending()) return;
   if(!group.pending_world) return;
   auto& state=State();
   std::lock_guard submission(state.submissions);
   std::lock_guard lock(state.mutex);
   SynchronizeNativeQueuedSceneInstanceLocked(state,GuestReader(base),device,group);
+}
+bool TryAppendPublishedNativeSceneInstance(uint8_t* base,uint32_t device,uint32_t address,uint32_t instance,uint32_t count,NativeQueuedSceneGroup& group) {
+  if(!REXCVAR_GET(edf_native_scene_geometry_owned) || !REXCVAR_GET(edf_native_scene_material_owned) ||
+     REXCVAR_GET(edf_native_scene_material_audit) || group.geometry || !group.objects.empty() ||
+     !group.published_material || !group.material_pass || !native_scene_publication) return false;
+  auto& state=State();
+  std::lock_guard submission(state.submissions);
+  std::lock_guard lock(state.mutex);
+  const auto defer=[](const char* reason) {
+    static std::set<std::string> reported;
+    if(reported.insert(reason).second) REXLOG_INFO("Native published geometry draw declined: {}",reason);
+    return false;
+  };
+  if(BufferWrites().Pending()) return defer("pending resource writes");
+  try {
+    const auto& sources=NativeSceneSourcesForPass(state);
+    const auto* membership=sources.FindGroup(address);
+    const auto cached=state.scene_geometry_loads.find(address);
+    if(!membership || !membership->parts.contains(instance) || cached==state.scene_geometry_loads.end() ||
+       cached->second.revision!=membership->revision || group.published_material->revision!=membership->revision) return defer("group membership or preload revision");
+    std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+    for(const auto& published:native_scene_publication->group_geometry)
+      if(published->group==address && published->revision==membership->revision) { geometry=published->geometry; break; }
+    const auto latest=state.scene_adapter.GroupGeometry(address,membership->revision);
+    if(!geometry || !latest || latest->geometry!=geometry || geometry->backend()!=state.scene_backend.get()) return defer("retained geometry publication");
+    const auto& source_geometry=cached->second.source;
+    if(count!=source_geometry.count) return defer("geometry count");
+    if(group.geometry_handoff.pending()) {
+      if(*group.geometry_handoff.pending()!=source_geometry) return defer("deferred geometry identity");
+    } else {
+    const auto& stream=state.streams.at({device,0});
+    if(stream.resource!=source_geometry.vertex || stream.offset ||
+       stream.stride!=source_geometry.stride || state.index_bindings.at(device)!=source_geometry.index ||
+       state.declaration_bindings.at(device)!=source_geometry.declaration) return defer("geometry binding identity");
+    }
+    const auto* vb=state.model_buffers.Find(source_geometry.vertex,NativeModelBuffers::Kind::Vertex);
+    const auto* ib=state.model_buffers.Find(source_geometry.index,NativeModelBuffers::Kind::Index);
+    if(!vb || !ib || !vb->physical || !ib->physical || vb->generation!=cached->second.vertex_generation ||
+       ib->generation!=cached->second.index_generation) return defer("model buffer generation");
+    const auto index_contents=ib->index_contents?ib->index_contents:(ib->index_storage?ib->index_storage->SourceSnapshot():nullptr);
+    using Identity=NativeBufferWrites::SnapshotIdentityView;
+    NativeBufferWrites::SnapshotPolicy policy{};
+    policy.audit_revisions=REXCVAR_GET(edf_native_retirement_audit);
+    if(!policy.audit_revisions && state.mesh_watch_audit.expired()) {
+      policy.verify_interval=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_interval),0,1<<20));
+      policy.verify_initial=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_initial),0,1<<16));
+    }
+    const auto versions=BufferWrites().TryValidateObservedSet(std::array<Identity,2>{{
+      {source_geometry.vertex,*vb->physical,vb->bytes,&vb->vertex_contents},
+      {source_geometry.index,*ib->physical,ib->bytes,&index_contents}}},policy);
+    if(!versions) return defer("observed resource versions unavailable");
+    for(size_t i=0;i<2;++i) if((*versions)[i].lifetime!=cached->second.versions[i].lifetime ||
+      (*versions)[i].revision!=cached->second.versions[i].revision) return defer("observed resource revision changed");
+    const auto& program=*group.published_material->program;
+    if(state.active_vertex!=program.inputs.vertex || state.linked_pixel!=program.inputs.pixel ||
+       !state.active_vertex_parameters || (!group.material_handoff.activation_pending() && state.shader_bindings.Vertex(device)!=program.inputs.vertex)) return false;
+    const GuestReader reader(base);
+    const bool owned_view=REXCVAR_GET(edf_native_scene_view_owned) &&
+      group.material_handoff.activation_pending() && group.pass_viewport.has_value();
+    const auto viewport_words=owned_view?*group.pass_viewport:ReadNativeDrawViewportWords(reader,device);
+    const auto targets=owned_view?group.targets:ActiveTargetsLocked(state);
+    if(owned_view) {
+      if(REXCVAR_GET(edf_native_render_state_audit) &&
+         (viewport_words!=ReadNativeDrawViewportWords(reader,device) || targets!=ActiveTargetsLocked(state))) {
+        REXLOG_ERROR("Native pass view mismatch: group={:#x}",address);
+        throw std::runtime_error("native inherited viewport or targets changed without a pass boundary");
+      }
+      static uint64_t count=0;
+      if(++count<=4 || count%100000==0)
+        REXLOG_INFO("Native owned pass view: reads={} (viewport/scissor/targets from native pass)",count);
+    }
+    const auto viewport=DecodeDrawViewport(viewport_words);
+    if(!targets.count) return false;
+    NativeBackendPipelineDesc desc;
+    desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(viewport.reverse_depth);
+    desc.pixel_id=program.inputs.pixel;
+    desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
+    desc.render_targets=targets.count; desc.rtv_format=targets.rtv_format;
+    desc.dsv_format=targets.dsv_format; desc.sample_count=targets.samples;
+    auto resolved=program.Resolve(desc,viewport.reverse_depth,group.pass_constants,*group.material_pass,group.sampler_pass,
+      REXCVAR_GET(edf_native_anisotropic_filtering));
+    NativeQueuedSceneGroup candidate;
+    candidate.material=resolved.capture.material;
+    candidate.published_material=group.published_material;
+    ConfigureNativeQueuedWorldLocked(state,candidate);
+    if(!candidate.world_parameter || !NativeStaticWorldOnly(reader,sources,instance,candidate.world_parameter->first,device)) return false;
+    const auto* source=sources.Find(instance);
+    if(!source) return false;
+    const auto world=sources.WorldRegisters(*source,source->world_data);
+    if(!world) return false;
+    if(REXCVAR_GET(edf_native_scene_sources_owned) && REXCVAR_GET(edf_native_scene_transform_audit)) {
+      ++state.scene_world_checks;
+      if(std::memcmp(world->data(),reader.Bytes(source->world_data,64),64)) {
+        ++state.scene_world_mismatches;
+        REXLOG_ERROR("Native published first world mismatch: owner={:#x} instance={:#x}",source->owner,instance);
+        return false;
+      }
+    }
+    ApplyNativeScenePublishedWorld(resolved.capture,*world);
+    auto view=resolved.capture.camera;
+    const auto& v=viewport.viewport; const auto& s=viewport.scissor;
+    view.viewport={v.TopLeftX,v.TopLeftY,v.Width,v.Height,v.MinDepth,v.MaxDepth};
+    view.scissor={s.left,s.top,s.right,s.bottom}; view.scissor_enabled=resolved.render.words[5]!=0;
+    if(REXCVAR_GET(edf_native_scene_selection_owned)) {
+      auto selected=native_scene_publication->Resolve(*source,geometry,resolved.capture);
+      if(!selected) return defer("instance lifetime not in scene publication");
+      group.objects.push_back(std::move(selected));
+    } else {
+      const auto id=state.scene_adapter.Observe(*source,geometry,resolved.capture);
+      group.objects.push_back(SelectNativeSceneInstanceLocked(state,id));
+    }
+    group.geometry=std::move(geometry); group.material=resolved.capture.material;
+    group.view=view; group.targets=targets; group.reverse_depth=viewport.reverse_depth;
+    group.pass_viewport=viewport_words;
+    group.vertex=program.inputs.vertex; group.pixel=program.inputs.pixel;
+    group.world_parameter=candidate.world_parameter; group.world_column_major=candidate.world_column_major;
+    // The accepted instance only replaces g_mWorld. Preserve its final CPU
+    // value before the next guest callback, as for subsequent queued instances.
+    group.pending_world=*world;
+    group.instance=instance;
+    group.constants_clean=group.geometry_handoff.pending().has_value();
+    if(++state.scene_geometry_draw_bypasses<=4 || state.scene_geometry_draw_bypasses%10000==0)
+      REXLOG_INFO("Native scene published geometry draws: bypassed={} (no instance callback, indexed mesh acquisition or live binding setup)",state.scene_geometry_draw_bypasses);
+    return true;
+  } catch(const std::exception& error) {
+    if(state.scene_native_reasons.size()<32 && state.scene_native_reasons.insert(error.what()).second)
+      REXLOG_INFO("Native published geometry draw deferred: {}",error.what());
+    return false;
+  }
 }
 bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t instance,NativeQueuedSceneGroup& group) {
   if(!group.geometry || !group.material) return false;
@@ -4040,16 +5127,18 @@ bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t i
   std::lock_guard lock(state.mutex);
   // A pending resource write must pass the full draw's revision/geometry check.
   if(BufferWrites().Pending() || state.active_vertex!=group.vertex || state.linked_pixel!=group.pixel ||
-     !state.active_vertex_parameters || state.shader_bindings.Vertex(device)!=group.vertex) return false;
+     !state.active_vertex_parameters || (!group.material_handoff.activation_pending() && state.shader_bindings.Vertex(device)!=group.vertex)) return false;
   const GuestReader reader(base);
   std::optional<NativeSceneMaterialCapture> capture;
   std::optional<std::array<uint8_t,64>> world_registers;
+  std::shared_ptr<const NativeSceneInstance> published_selection;
   uint64_t id=0;
   try {
-    const auto* source=state.scene_sources.Find(instance);
+    const auto& sources=NativeSceneSourcesForPass(state);
+    const auto* source=sources.Find(instance);
     if(!source) return false;
     static thread_local std::vector<InstanceParameter> parameters;
-    ReadInstanceParameters(reader,instance,parameters);
+    ReadNativeSceneInstanceParameters(reader,sources,instance,parameters);
     const bool world_only=group.world_parameter && parameters.size()==1 && parameters[0].count==4 &&
       parameters[0].first==group.world_parameter->first &&
       !(uint64_t(parameters[0].data)<uint64_t(device)+5888 && uint64_t(parameters[0].data)+64>uint64_t(device)+1792);
@@ -4060,7 +5149,7 @@ bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t i
         group.constants_clean=true;
       }
       world_registers.emplace();
-      if(const auto published=state.scene_sources.WorldRegisters(*source,parameters[0].data)) {
+      if(const auto published=sources.WorldRegisters(*source,parameters[0].data)) {
         *world_registers=*published; ++state.scene_world_reused;
         if(REXCVAR_GET(edf_native_scene_transform_audit)) {
           ++state.scene_world_checks;
@@ -4078,6 +5167,7 @@ bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t i
       }
       capture=NativeSceneMaterialCapture{group.material,DecodeNativeQueuedWorld(*world_registers,group.world_column_major),group.view};
     } else {
+      if(group.geometry_handoff.pending()) return false;
       group.population_safe=false;
       SynchronizeNativeQueuedSceneInstanceLocked(state,reader,device,group);
       if(!NativeQueuedConstantsConsumed(reader,device,parameters)) return false;
@@ -4086,7 +5176,13 @@ bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t i
       capture=CaptureNativeSceneMaterial(state.scene_backend,*group.material->pipeline(),vertex,
         *state.shaders.at(group.pixel).bindings,group.material->blend_factor(),group.material);
     }
-    id=state.scene_adapter.Observe(*source,group.geometry,*capture);
+    if(REXCVAR_GET(edf_native_scene_selection_owned) && world_only && native_scene_publication) {
+      published_selection=native_scene_publication->Resolve(*source,group.geometry,*capture);
+      if(!published_selection) return false;
+      static uint64_t selections=0;
+      if(++selections<=4 || selections%100000==0)
+        REXLOG_INFO("Native immutable instance selection: count={} (no current scene database mutation)",selections);
+    } else id=state.scene_adapter.Observe(*source,group.geometry,*capture);
   } catch(const std::exception& error) {
     ++state.scene_native_direct_retries;
     if(state.scene_native_reasons.size()<32 && state.scene_native_reasons.insert(error.what()).second)
@@ -4099,7 +5195,7 @@ bool TryAppendNativeQueuedSceneInstance(uint8_t* base,uint32_t device,uint32_t i
   if(group.view.view!=camera.view || group.view.projection!=camera.projection || group.view.view_projection!=camera.view_projection)
     FlushNativeQueuedSceneLocked(state,group);
   group.view.view=camera.view; group.view.projection=camera.projection; group.view.view_projection=camera.view_projection;
-  group.objects.push_back(SelectNativeSceneInstanceLocked(state,id));
+  group.objects.push_back(published_selection?std::move(published_selection):SelectNativeSceneInstanceLocked(state,id));
   group.material=group.objects.back()->object.material;
   if(world_registers) { group.pending_world=std::move(world_registers); ++state.scene_native_direct_worlds; }
   if(++state.scene_native_direct_instances%100000==0) {
@@ -6621,6 +7717,41 @@ void AuditNativeRetirement(const edf::native::GuestReader& reader,uint32_t devic
 }
 REX_EXTERN(__imp__sub_82137410);
 REX_EXTERN(sub_82141440);
+namespace {
+void InstallNativeStaticGeometry(PPCContext& ctx,uint8_t* base,uint32_t device,
+    const edf::native::NativeSceneGeometrySource& input,edf::native::NativeSceneGeometryInstallState& progress) {
+  const edf::native::GuestReader reader(base);
+  edf::native::InstallNativeSceneGeometry(reader,device,input,
+    [&](bool index) {
+      auto work=ctx;
+      const uint32_t frame=index?128:144;
+      if(work.r1.u32<frame) throw std::runtime_error("invalid static geometry retirement stack");
+      work.r1.u64=work.r1.u32-frame; work.r3.u64=device;
+      work.lr=index?0x8213761C:0x821374D0;
+      // Queue growth is an explicit remaining allocator boundary, not a setter.
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::RetirementAllocation);
+      sub_82141440(work,base); return work.r3.u32;
+    },[&](bool index) {
+      const uint32_t offset=index?48:64;
+      if(ctx.r1.u32<offset) throw std::runtime_error("invalid static geometry retirement tag");
+      return reader.Word(ctx.r1.u32-offset);
+    },[&](bool index,auto path,auto previous,auto value,auto cursor) {
+      AuditNativeRetirement(reader,device,index,path,previous,value,cursor);
+    },[&](edf::native::NativeGeometryBinding binding) {
+      auto& state=edf::native::State();
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      switch(binding) {
+        case edf::native::NativeGeometryBinding::Stream:
+          state.streams.insert_or_assign({device,0},edf::native::GuestStream{input.vertex,0,input.stride}); break;
+        case edf::native::NativeGeometryBinding::Declaration:
+          state.declaration_bindings.insert_or_assign(device,input.declaration); break;
+        case edf::native::NativeGeometryBinding::Index:
+          state.index_bindings.insert_or_assign(device,input.index); break;
+      }
+    },&progress);
+}
+}
 REX_HOOK_RAW(sub_82137410) {
   const auto device=ctx.r3.u32, stream=ctx.r4.u32;
   const edf::native::GuestStream binding{ctx.r5.u32,ctx.r6.u32,ctx.r7.u32};
@@ -6631,6 +7762,7 @@ REX_HOOK_RAW(sub_82137410) {
       auto work=ctx;
       if(work.r1.u32<144) throw std::runtime_error("invalid stream setter guest stack");
       work.r1.u64=work.r1.u32-144u; work.r3.u64=device; work.lr=0x821374D0;
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::RetirementAllocation);
       sub_82141440(work,base);
       return work.r3.u32;
     },
@@ -6664,6 +7796,7 @@ REX_HOOK_RAW(sub_821375C0) {
       // allocator. In particular, do not overwrite the legacy tag at SP-48.
       if(work.r1.u32<128) throw std::runtime_error("invalid index setter guest stack");
       work.r1.u64=work.r1.u32-128u; work.r3.u64=device; work.lr=0x8213761C;
+      edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::RetirementAllocation);
       sub_82141440(work,base);
       return work.r3.u32;
     },
@@ -6682,6 +7815,22 @@ REX_HOOK_RAW(sub_821375C0) {
 }
 
 namespace {
+void BindNativeShaderResource(PPCContext& ctx,uint8_t* base,bool pixel) {
+  const auto device=ctx.r3.u32,shader=ctx.r4.u32;
+  const edf::native::GuestReader reader(base);
+  edf::native::SetNativeShaderResource(reader,device,shader,pixel,[&] {
+    auto work=ctx;
+    if(work.r1.u32<128) throw std::runtime_error("invalid native shader setter stack");
+    work.r1.u64=work.r1.u32-128; work.r3.u64=device;
+    work.lr=pixel?0x82149664:0x82149924;
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::RetirementAllocation);
+    sub_82141440(work,base);
+    return work.r3.u32;
+  },[&] {
+    if(ctx.r1.u32<48) throw std::runtime_error("invalid native shader retirement tag");
+    return reader.Word(ctx.r1.u32-48);
+  });
+}
 void PublishNativeShaderBinding(uint32_t device,uint32_t shader,bool pixel) {
   if(!REXCVAR_GET(edf_native_shader_bridge)) return;
   auto& state=edf::native::State();
@@ -6763,15 +7912,45 @@ REX_HOOK_RAW(sub_82147BA0) {
   PublishNativeDeclarationContents(base,handle);
 }
 REX_EXTERN(__imp__sub_821498C8);
+REX_EXTERN(__imp__sub_8213BA98);
+REX_HOOK_RAW(sub_8213BA98) {
+  if(!REXCVAR_GET(edf_native_shader_bridge) || !REXCVAR_GET(edf_native_material_activation) ||
+     (edf::native::native_queued_scene_group && edf::native::native_queued_scene_group->material_compatibility_only)) {
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::TextureBinding);
+    __imp__sub_8213BA98(ctx,base); return;
+  }
+  const auto device=ctx.r3.u32;
+  const edf::native::GuestReader reader(base);
+  edf::native::SetNativeTextureResource(reader,device,ctx.r4.u32,ctx.r5.u32,ctx.r6.u64,[&] {
+    auto work=ctx;
+    if(work.r1.u32<160) throw std::runtime_error("invalid native texture setter stack");
+    work.r1.u64=work.r1.u32-160; work.r3.u64=device; work.lr=0x8213BBE0;
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::RetirementAllocation);
+    sub_82141440(work,base); return work.r3.u32;
+  },[&] {
+    if(ctx.r1.u32<80) throw std::runtime_error("invalid native texture retirement tag");
+    return reader.Word(ctx.r1.u32-80);
+  });
+}
 REX_HOOK_RAW(sub_821498C8) {
   const auto device=ctx.r3.u32,shader=ctx.r4.u32;
-  __imp__sub_821498C8(ctx,base);
+  if(REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_material_activation) &&
+     (!edf::native::native_queued_scene_group || !edf::native::native_queued_scene_group->material_compatibility_only)) BindNativeShaderResource(ctx,base,false);
+  else {
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::ShaderBinding);
+    __imp__sub_821498C8(ctx,base);
+  }
   PublishNativeShaderBinding(device,shader,false);
 }
 REX_EXTERN(__imp__sub_82149608);
 REX_HOOK_RAW(sub_82149608) {
   const auto device=ctx.r3.u32,shader=ctx.r4.u32;
-  __imp__sub_82149608(ctx,base);
+  if(REXCVAR_GET(edf_native_shader_bridge) && REXCVAR_GET(edf_native_material_activation) &&
+     (!edf::native::native_queued_scene_group || !edf::native::native_queued_scene_group->material_compatibility_only)) BindNativeShaderResource(ctx,base,true);
+  else {
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::ShaderBinding);
+    __imp__sub_82149608(ctx,base);
+  }
   PublishNativeShaderBinding(device,shader,true);
 }
 // Both retail writers of device+11536: the explicit declaration setter and
@@ -6781,7 +7960,15 @@ REX_HOOK_RAW(sub_82149608) {
 REX_EXTERN(__imp__sub_82149A90);
 REX_HOOK_RAW(sub_82149A90) {
   const auto device=ctx.r3.u32,declaration=ctx.r4.u32;
-  __imp__sub_82149A90(ctx,base);
+  if(REXCVAR_GET(edf_native_shader_bridge)) {
+    const edf::native::GuestReader reader(base);
+    reader.StoreWord(reader.Add(device,11536),declaration);
+    ctx.r12.u64=uint64_t(1)<<51;
+    ctx.r11.u64=(uint64_t(reader.Word(reader.Add(device,16)))<<32)|reader.Word(reader.Add(device,20));
+    ctx.r11.u64|=ctx.r12.u64;
+    reader.StoreWord(reader.Add(device,16),uint32_t(ctx.r11.u64>>32));
+    reader.StoreWord(reader.Add(device,20),uint32_t(ctx.r11.u64));
+  } else __imp__sub_82149A90(ctx,base);
   PublishNativeDeclarationBinding(device,declaration);
 }
 REX_EXTERN(__imp__sub_8214B0A0);
@@ -7314,20 +8501,159 @@ REX_HOOK_RAW(sub_821FE358) {
                 (uint64_t(state.active_vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),
                 state.linked_pixel,edf::native::NativeBackendTopology::TriangleList,
                 REXCVAR_GET(edf_native_world_instancing) && uint32_t(ctx.lr)==0x821D97E8}); };
-              auto& recorder=setup();
+              auto* group=edf::native::native_queued_scene_group;
+              const bool native_material_setup=group && uint32_t(ctx.lr)==0x821D97E8 &&
+                REXCVAR_GET(edf_native_scene_material_owned) && !REXCVAR_GET(edf_native_scene_material_audit);
+              // Native scene rendering binds its own pipeline, resources and
+              // constants. Only audit/fallback draws need the live bindings.
+              auto& recorder=native_material_setup?edf::native::SceneRecorderLocked(state):setup();
               record_timing.Finish();
               edf::native::HookTiming draw_timing(edf::native::HookPhase::IndexedDraw);
               bool native_scene_draw=false;
-              auto* group=edf::native::native_queued_scene_group;
               if(group && uint32_t(ctx.lr)==0x821D97E8) {
                 std::optional<edf::native::NativeSceneMaterialCapture> captured;
                 uint64_t object=0;
                 try {
                   const auto* source=state.scene_sources.Find(group->instance);
                   if(!source) throw std::runtime_error("queued instance has no audited scene lifetime");
-                  captured=edf::native::CaptureNativeSceneMaterial(state.scene_backend,*state.recorded.pipeline,
-                    bindings,*state.shaders.at(state.linked_pixel).bindings,
-                    state.recorded.blend_factor_needed?std::optional(state.recorded.blend_factor):std::nullopt,group->material);
+                  const bool owned=REXCVAR_GET(edf_native_scene_material_owned);
+                  const bool audit=REXCVAR_GET(edf_native_scene_material_audit) && !group->material_audited;
+                  if(!owned || audit)
+                    captured=edf::native::CaptureNativeSceneMaterial(state.scene_backend,*state.recorded.pipeline,
+                      bindings,*state.shaders.at(state.linked_pixel).bindings,
+                      state.recorded.blend_factor_needed?std::optional(state.recorded.blend_factor):std::nullopt,group->material);
+                  const auto resolve=[&](const auto& constants) {
+                      if(!group->published_material || !group->material_pass)
+                        throw std::runtime_error("native material publication or pass missing");
+                      const auto& program=*group->published_material->program;
+                      if(program.inputs.vertex!=state.active_vertex || program.inputs.pixel!=state.linked_pixel)
+                        throw std::runtime_error("published shader pair differs from visible group");
+                      const auto targets=edf::native::ActiveTargetsLocked(state);
+                      if(!targets.count) throw std::runtime_error("native material pass has no color target");
+                      edf::native::NativeBackendPipelineDesc desc;
+                      desc.vertex_id=(uint64_t(state.active_vertex)<<1)|uint64_t(viewport.reverse_depth);
+                      desc.pixel_id=state.linked_pixel;
+                      desc.input_layout=mesh.input_layout().elements(); desc.input_layout_id=mesh.input_layout().fingerprint();
+                      desc.render_targets=targets.count; desc.rtv_format=targets.rtv_format;
+                      desc.dsv_format=targets.dsv_format; desc.sample_count=targets.samples;
+                      return program.Resolve(desc,viewport.reverse_depth,constants,*group->material_pass,group->sampler_pass,
+                        REXCVAR_GET(edf_native_anisotropic_filtering)).capture;
+                  };
+                  std::optional<edf::native::NativeSceneMaterialCapture> resolved;
+                  if(owned) {
+                    resolved=resolve(group->pass_constants);
+                    const auto world=state.scene_sources.WorldRegisters(*source,source->world_data);
+                    if(!world || !state.active_vertex_parameters)
+                      throw std::runtime_error("owned native instance has no published world");
+                    const auto& parameters=*state.active_vertex_parameters;
+                    const auto parameter=std::find_if(parameters.begin(),parameters.end(),[](const auto& value) {
+                      return value.name=="g_mWorld" && value.count==4;
+                    });
+                    if(parameter==parameters.end() || !edf::native::NativeStaticWorldOnly(reader,state.scene_sources,
+                       group->instance,parameter->first,ctx.r3.u32))
+                      throw std::runtime_error("owned native instance has additional overrides");
+                    edf::native::ApplyNativeScenePublishedWorld(*resolved,*world);
+                  }
+                  if(audit) {
+                    group->material_audited=true;
+                    static uint64_t checked=0,mismatched=0,missing=0,animation_generation_differences=0;
+                    static std::set<std::string> reasons;
+                    if(!group->published_material || !group->material_pass) ++missing;
+                    else try {
+                      if(!resolved) resolved=resolve(group->pass_constants);
+                      bool equivalent=resolved->material->Equivalent(*captured->material);
+                      bool generation_difference=false;
+                      if(!equivalent) {
+                        // Audit a later producer generation separately. Keep the rendered
+                        // material on its immutable pass snapshot; never copy live constants.
+                        const auto latest=state.scene_adapter.AcquireWorldAnimations();
+                        const auto producer=latest->find(edf::native::native_scene_animation_owner);
+                        if(latest!=edf::native::native_scene_pass_animations && producer!=latest->end()) {
+                          auto constants=group->pass_constants;
+                          for(auto& constant:constants) producer->second.Apply(constant);
+                          const auto current=resolve(constants);
+                          if(current.material->Equivalent(*captured->material)) {
+                            equivalent=true;
+                            generation_difference=true;
+                          }
+                        }
+                      }
+                      if(!equivalent) {
+                        std::string difference="pipeline/resources";
+                        for(const auto& expected:resolved->material->constants()) {
+                          const auto& actuals=captured->material->constants();
+                          const auto actual=std::find_if(actuals.begin(),actuals.end(),[&](const auto& value) {
+                            return value.stage==expected.stage && value.slot==expected.slot;
+                          });
+                          if(actual==actuals.end() || actual->bytes.size()!=expected.bytes.size()) {
+                            difference="constant buffer shape"; break;
+                          }
+                          const auto mismatch=std::mismatch(expected.bytes.begin(),expected.bytes.end(),actual->bytes.begin());
+                          if(mismatch.first==expected.bytes.end()) continue;
+                          const auto offset=size_t(mismatch.first-expected.bytes.begin());
+                          const auto& shader=expected.stage==edf::native::NativeBackendStage::Vertex?
+                            (viewport.reverse_depth?group->published_material->program->reversed_vertex:group->published_material->program->vertex):
+                            group->published_material->program->pixel;
+                          D3D11_SHADER_DESC shader_desc{};
+                          shader.reflection->GetDesc(&shader_desc);
+                          difference="unnamed constant";
+                          for(UINT index=0;index<shader_desc.ConstantBuffers;++index) {
+                            auto* buffer=shader.reflection->GetConstantBufferByIndex(index);
+                            D3D11_SHADER_BUFFER_DESC buffer_desc{}; buffer->GetDesc(&buffer_desc);
+                            D3D11_SHADER_INPUT_BIND_DESC binding{};
+                            shader.reflection->GetResourceBindingDescByName(buffer_desc.Name,&binding);
+                            if(binding.BindPoint!=expected.slot) continue;
+                            for(UINT variable=0;variable<buffer_desc.Variables;++variable) {
+                              D3D11_SHADER_VARIABLE_DESC value{}; buffer->GetVariableByIndex(variable)->GetDesc(&value);
+                              if(offset>=value.StartOffset && offset<value.StartOffset+value.Size) difference=value.Name;
+                            }
+                          }
+                          static uint64_t details=0;
+                          if(details++<16) {
+                            uint32_t wanted=0,seen=0;
+                            std::memcpy(&wanted,expected.bytes.data()+(offset&~size_t(3)),4);
+                            std::memcpy(&seen,actual->bytes.data()+(offset&~size_t(3)),4);
+                            REXLOG_INFO("Native scene constant difference: name={} stage={} slot={} byte={} native={:#x} visible={:#x}",
+                              difference,uint32_t(expected.stage),expected.slot,offset,wanted,seen);
+                            const auto latest=state.scene_adapter.AcquireWorldAnimations();
+                            const auto producer=latest->find(edf::native::native_scene_animation_owner);
+                            const auto selected=edf::native::native_scene_pass_animation;
+                            if(producer!=latest->end() && selected)
+                              REXLOG_INFO("Native animation timing: owner={:#x} selected_water={:#x} latest_water={:#x} selected_counter={} latest_counter={} same_generation={}",
+                                edf::native::native_scene_animation_owner,selected->water_time,producer->second.water_time,
+                                selected->signal_counter,producer->second.signal_counter,latest==edf::native::native_scene_pass_animations);
+                            if(latest->size()<=4) for(const auto& [owner,value]:*latest)
+                              REXLOG_INFO("Native animation producer: owner={:#x} water={:#x} counter={}",owner,value.water_time,value.signal_counter);
+                          }
+                          break;
+                        }
+                        throw std::runtime_error("pass-time material bindings differ: "+difference);
+                      }
+                      if(resolved->camera.view!=captured->camera.view ||
+                         resolved->camera.projection!=captured->camera.projection ||
+                         resolved->camera.view_projection!=captured->camera.view_projection)
+                        throw std::runtime_error("pass-time camera differs from visible capture");
+                      if(owned && resolved->world!=captured->world)
+                        throw std::runtime_error("published native world differs from visible capture");
+                      if(generation_difference) ++animation_generation_differences;
+                      else ++checked;
+                    } catch(const std::exception& error) {
+                      ++mismatched;
+                      if(reasons.size()<32 && reasons.insert(error.what()).second)
+                        REXLOG_INFO("Native scene material comparison mismatch: {}",error.what());
+                      if(owned) throw;
+                    }
+                    const auto total=checked+mismatched+missing+animation_generation_differences;
+                    if(total<=4 || total%10000==0)
+                      REXLOG_INFO("Native scene material comparison: checked={} mismatched={} missing={} animation_generation_differences={}",checked,mismatched,missing,animation_generation_differences);
+                  }
+                  if(owned) {
+                    captured=std::move(resolved);
+                    if(native_material_setup) ++state.scene_material_binding_bypasses;
+                    if(++state.scene_material_constructed<=4 || state.scene_material_constructed%10000==0)
+                      REXLOG_INFO("Native scene owned materials: constructed={} rejected={} live_binding_bypasses={} (published constants, native pass inputs and published world)",
+                        state.scene_material_constructed,state.scene_material_rejected,state.scene_material_binding_bypasses);
+                  }
                   if(!group->geometry) {
                     ++state.scene_group_material_captures;
                     if(captured->material==group->material) ++state.scene_group_material_reused;
@@ -7336,6 +8662,9 @@ REX_HOOK_RAW(sub_821FE358) {
                   object=state.scene_adapter.Observe(*source,state.scene_backend,mesh,ctx.r6.u32,ctx.r7.u32,ctx.r5.s32,*captured);
                 } catch(const std::exception& error) {
                   captured.reset(); ++state.scene_native_fallbacks;
+                  if(REXCVAR_GET(edf_native_scene_material_owned) &&
+                     (++state.scene_material_rejected<=4 || state.scene_material_rejected%10000==0))
+                    REXLOG_INFO("Native scene owned material rejected: count={} reason={}",state.scene_material_rejected,error.what());
                   if(state.scene_native_reasons.size()<32 && state.scene_native_reasons.insert(error.what()).second)
                     REXLOG_INFO("Native scene queued fallback: {}",error.what());
                 }

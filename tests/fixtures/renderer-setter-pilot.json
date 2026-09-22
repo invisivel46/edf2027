@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "scope": "87 store-bearing functions selected from the frozen scalar getter-unsupported population before setter rule development",
+  "selection": "status unsupported under renderer_scalar_analysis.classify and natural Ghidra high_pcode contains STORE",
+  "source_manifest": "tests/fixtures/renderer-scalar-pilot.json",
+  "source_manifest_sha256": "65707546ef7606cc45fa77a3481637072c0849dc4c04f80b10c0fb2f5edf4bf2",
+  "source_function_count": 170,
+  "excluded_getter_count": 59,
+  "getter_unsupported_count": 111,
+  "raw_pcode_store_count": 96,
+  "natural_high_pcode_store_count": 87,
+  "raw_store_without_natural_store_count": 9,
+  "raw_store_without_natural_store_functions": [
+    "sub_821353B8", "sub_821354B0", "sub_821359F0", "sub_82135AA8",
+    "sub_82135C48", "sub_82135CA0", "sub_82135CF8", "sub_821363C0",
+    "sub_821363F8"
+  ],
+  "natural_ghidra_facts_sha256": "ce138cc07dafcc2e1e71337f73f218d311e4fce0ec97d28b720eab4433a4841f",
+  "accepted_boundary_attestation": {
+    "function_count": 24,
+    "all_decompile_completed": true,
+    "all_boundaries_match_frozen_inventory": true,
+    "ordered_address_word_sha256": "58cc89f567d77ec2b748be0746834fce03d0f63c951d1040168f7be08341018a"
+  },
+  "candidate_count": 87,
+  "functions": [
+    "sub_82134EB8", "sub_82134EE8", "sub_82134F18", "sub_82134F58",
+    "sub_82134FE8", "sub_82135078", "sub_82135108", "sub_82135198",
+    "sub_82135208", "sub_82135278", "sub_821352E8", "sub_82135380",
+    "sub_821353E8", "sub_82135418", "sub_82135530", "sub_82135578",
+    "sub_821355A8", "sub_821355E8", "sub_82135630", "sub_82135670",
+    "sub_821356A0", "sub_821356E0", "sub_82135720", "sub_82135750",
+    "sub_82135780", "sub_821357C0", "sub_82135800", "sub_82135830",
+    "sub_82135850", "sub_82135870", "sub_82135890", "sub_821358B0",
+    "sub_821358D0", "sub_821358F0", "sub_82135948", "sub_82135A10",
+    "sub_82135AB8", "sub_82135AE8", "sub_82135B08", "sub_82135B40",
+    "sub_82135B78", "sub_82135BB0", "sub_82135BE8", "sub_82135BF8",
+    "sub_82135C58", "sub_82135CB0", "sub_82135D08", "sub_82135D30",
+    "sub_82135D60", "sub_82135D90", "sub_82135DC0", "sub_82135DF0",
+    "sub_82135E20", "sub_82135E50", "sub_82135E78", "sub_82135EA0",
+    "sub_82135ED0", "sub_82135F00", "sub_82135F30", "sub_82135F60",
+    "sub_82135F90", "sub_82135FC0", "sub_82136088", "sub_821360D8",
+    "sub_82136188", "sub_82136238", "sub_821362E8", "sub_82136398",
+    "sub_821363D0", "sub_82136408", "sub_82136440", "sub_82136478",
+    "sub_821364A8", "sub_821364C8", "sub_821364F8", "sub_82136530",
+    "sub_82136560", "sub_82136590", "sub_821365B8", "sub_821365E8",
+    "sub_82136620", "sub_82136650", "sub_82136680", "sub_821366B0",
+    "sub_821366D0", "sub_821366E0", "sub_82137978"
+  ]
+}
