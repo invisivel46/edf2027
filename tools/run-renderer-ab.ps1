@@ -13,6 +13,13 @@
 # -BaselineArgs/-CandidateArgs go to start-native-binding-validation.ps1 as
 # -ExtraArgs, so each entry replaces the launcher's option of the same name.
 # -GateArgs goes verbatim to the gate (for example '--min-native-groups','40').
+# With -HookTimings, both runs log "Native hook timing" lines and the gate adds
+# a "phases" section (ms per frame and per call for engine.render_helper and
+# the render.* phases). Phase gates then work too, for example
+#   -HookTimings -GateArgs '--max-phase','render.model=2.5','--expect-drop','render.queued'
+# --max-phase PHASE=MS (repeatable) fails when the candidate's ms per frame is
+# above MS; --expect-drop PHASE (repeatable) fails unless the candidate's cost is
+# below the baseline's. Either one fails if a log has no hook timing lines.
 #
 # The gate measures from 10 s to 150 s after mission entry (the first scene
 # draw), not after launch. Loading plus the scripted menu confirmations take

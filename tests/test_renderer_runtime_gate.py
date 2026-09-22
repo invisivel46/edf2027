@@ -33,6 +33,17 @@ def group(seconds, address, batches, calls):
                          f'recorded_batches={batches} compatibility_calls={calls}')
 
 
+def hook(seconds, phase, calls, total, maximum, thread=1, sampled=False):
+    # The exact REXLOG_INFO formats from HookTiming::Finish in guest_shader_bridge.cpp.
+    if sampled:
+        text = (f'Native sampled hook timing: phase={phase} samples={calls} period=16 total_ms={total} '
+                f'max_ms={maximum} (sampled inclusive CPU wall time)')
+    else:
+        text = (f'Native hook timing: phase={phase} calls={calls} total_ms={total} max_ms={maximum} '
+                f'(inclusive CPU wall time)')
+    return f'{stamp(seconds)} [info] [t{thread}] {text}'
+
+
 ENTRY = 'Native indexed input: draw=1, vertices=3'
 
 
@@ -120,6 +131,82 @@ class GateLogTests(unittest.TestCase):
         code, report = self.run_main(log, log, '--min-native-groups', '3')
         self.assertEqual(code, 1)
         self.assertIn('2 fully native static groups, need 3', report['failures'])
+
+    def timed_log(self, name, model_total, queued_total, entry=10):
+        """Two 5 s buckets of 300 frames in the window plus noise outside it."""
+        return self.write(name, [
+            line(0, 'boot'), line(entry, ENTRY),
+            fps(entry + 5, 60.0, entry + 5),
+            hook(entry + 5.5, 'render.model', 9999, 9999.0, 99.0),        # before the window
+            fps(entry + 10, 60.0, entry + 10),
+            hook(entry + 11, 'engine.render_helper', 300, 1500.0, 9.5, thread=2),
+            hook(entry + 11, 'render.model', 2400, model_total / 2, 0.4, thread=2),
+            hook(entry + 11, 'render.model', 600, model_total / 2, 0.7, thread=5),
+            hook(entry + 12, 'render.queued', 300, queued_total, 1.25e-1),
+            hook(entry + 12, 'render.model', 50, 5.0, 3.0, sampled=True),  # sampled: ignored
+            hook(entry + 16, 'engine.render_helper', 300, 1500.0, 8.0, thread=2),
+            fps(entry + 200, 60.0, entry + 200),
+            hook(entry + 201, 'render.model', 9999, 9999.0, 99.0),       # after the window
+        ])
+
+    def test_phase_costs_per_frame_and_per_call_in_window(self):
+        log = self.timed_log('game.log', model_total=900.0, queued_total=60.0)
+        hooks = gate.summarize(log, 10, 150)['hook_phases']
+        self.assertEqual(hooks['render.model'], dict(calls=3000, total_ms=900.0, max_ms=0.7))
+        self.assertEqual(hooks['engine.render_helper']['calls'], 600)
+        code, report = self.run_main(log, log)
+        self.assertEqual(code, 0, report['failures'])
+        phases = report['phases']
+        self.assertEqual(phases['metric'], 'ms_per_frame')
+        self.assertEqual(phases['frames'], dict(baseline=600, candidate=600))
+        model = phases['by_phase']['render.model']
+        self.assertAlmostEqual(model['candidate']['ms_per_frame'], 1.5)
+        self.assertAlmostEqual(model['candidate']['ms_per_call'], 0.3)
+        self.assertEqual(model['delta'], 0.0)
+        self.assertEqual(set(gate.PHASES), set(phases['by_phase']))
+        self.assertIsNone(phases['by_phase']['render.gather']['candidate'])
+        self.assertIsNone(phases['by_phase']['render.gather']['delta'])
+        self.assertNotIn('hook_phases', report['candidate'])
+
+    def test_phase_limits_and_expected_drops(self):
+        base = self.timed_log('base.log', model_total=900.0, queued_total=60.0)
+        cand = self.timed_log('cand.log', model_total=600.0, queued_total=90.0, entry=40)
+        code, report = self.run_main(cand, base, '--max-phase', 'render.model=1.0',
+                                     '--expect-drop', 'render.model')
+        self.assertEqual(code, 0, report['failures'])
+        self.assertAlmostEqual(report['phases']['by_phase']['render.model']['delta_ms_per_frame'], -0.5)
+        self.assertAlmostEqual(report['phases']['by_phase']['render.queued']['delta'], 0.05)
+        code, report = self.run_main(cand, base, '--max-phase', 'render.model=0.9',
+                                     '--max-phase', 'render.queued=1', '--expect-drop', 'render.queued',
+                                     '--expect-drop', 'render.gather')
+        self.assertEqual(code, 1)
+        self.assertEqual(report['failures'], [
+            'render.model costs 1.0000 ms/frame, above the 0.9 limit',
+            'render.queued costs 0.1500 ms/frame, not below baseline 0.1000',
+            'render.gather: needs timing in both runs to show a drop',
+        ])
+
+    def test_phases_absent_without_timing_in_both_logs(self):
+        timed = self.timed_log('timed.log', model_total=900.0, queued_total=60.0)
+        plain = self.write('plain.log', [line(0, 'boot'), line(10, ENTRY), fps(20, 60.0, 20)])
+        code, report = self.run_main(timed, plain)
+        self.assertEqual(code, 0, report['failures'])
+        self.assertIsNone(report['phases'])
+        code, report = self.run_main(timed, plain, '--expect-drop', 'render.model')
+        self.assertEqual(code, 1)
+        self.assertIn('need "Native hook timing" lines in both logs', report['failures'][0])
+
+    def test_per_call_fallback_without_render_helper(self):
+        log = self.write('game.log', [line(0, 'boot'), line(10, ENTRY), fps(20, 60.0, 20),
+                                      hook(21, 'render.model', 256, 64.0, 1.0)])
+        code, report = self.run_main(log, log, '--max-phase', 'render.model=0.2')
+        self.assertEqual(report['phases']['metric'], 'ms_per_call')
+        self.assertEqual(report['failures'], ['render.model costs 0.2500 ms/call, above the 0.2 limit'])
+
+    def test_bad_max_phase_argument_is_rejected(self):
+        with self.assertRaises(Exception):
+            gate.phase_limit('render.model')
+        self.assertEqual(gate.phase_limit('render.model=2.5'), ('render.model', 2.5))
 
 
 if __name__ == '__main__':
