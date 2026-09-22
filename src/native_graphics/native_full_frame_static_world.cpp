@@ -72,19 +72,6 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
   }
   return result;
 }
-NativeSceneMaterialPassState NativeFullFrameStaticBaseState(const NativeFullFrameStaticTargets& targets) {
-  if(targets.count>4) throw std::runtime_error("native full-frame static pass has more than four color targets");
-  NativeSceneMaterialPassState state;
-  auto& render=state.render;
-  // Target presence gates depth enable and the color write mask, as it does
-  // for the device's own setters.
-  render.depth_target=targets.dsv_format?1:0;
-  for(uint32_t i=0;i<targets.count;++i) render.color_targets[i]=1;
-  render.words[0]=0x10001;
-  for(const auto& [offset,value]:kNativeFullFrameStaticBaseOperations) ApplyNativeMaterialState(render,offset,value);
-  for(auto& sampler:state.samplers) sampler=NativeMaterialSamplerPass{};
-  return state.Inputs();
-}
 std::vector<NativeSceneMaterialInputs::Constant> NativeFullFrameStaticConstants(const NativeSceneGroupMaterial& group,
     const NativeFullFrameStaticCamera& camera) {
   auto constants=group.constants;

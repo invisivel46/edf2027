@@ -230,6 +230,10 @@ void BaseState() {
   bool rejected=false;
   try { NativeFullFrameModelBaseState(targets); } catch(const std::exception&) { rejected=true; }
   Require(rejected,"more than four color targets are refused");
+  // One base state for every full-frame scene pass.
+  Require(&kNativeFullFrameModelBaseOperations==&kNativeFullFrameBaseOperations,"models share the full-frame base operations");
+  targets.count=1;
+  Require(NativeFullFrameModelBaseState(targets)==NativeFullFrameBaseState(targets),"models share the full-frame base state");
 }
 }
 int main() {

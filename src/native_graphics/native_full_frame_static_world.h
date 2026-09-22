@@ -1,4 +1,5 @@
 #pragma once
+#include "native_full_frame_base_state.h"
 #include "native_scene_adapter.h"
 #include "native_scene_tree.h"
 #include "native_scene_static_walk.h"
@@ -107,47 +108,21 @@ struct NativeFullFrameStaticSelection {
 NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScenePublication& publication,
   const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRoutes& routes);
 
-// Target formats and depth direction of the pass (the pipeline inputs a
-// resolved material depends on besides its program and base state).
-struct NativeFullFrameStaticTargets {
-  uint32_t count=1;
-  std::array<uint32_t,8> rtv_format{};
-  uint32_t dsv_format=0,samples=1;
-  bool reverse_depth=false;
-  bool operator==(const NativeFullFrameStaticTargets&) const=default;
-};
+// Target formats and depth direction of the pass, and its base state: the one
+// definition every full-frame scene pass shares (native_full_frame_base_state.h).
+using NativeFullFrameStaticTargets=NativeFullFramePassTargets;
 struct NativeFullFrameStaticPass {
   NativeFullFrameStaticTargets targets;
   NativeBackendViewport viewport;
   NativeBackendScissor scissor;
   int filtering=-1;
 };
-// The pass's base render and sampler state. Each group's state is this plus
-// its own material's state operations - NOT chained from the previous group
-// and never read from the guest device mirrors.
-//
-// Why: in the guest, a group inherits whatever the previous group (or pass)
-// left on the device and 821B8E48 applies only the operations its material
-// lists. Chaining in walk order would make one group's state depend on which
-// groups were visible before it this frame, and chaining from the mirrors
-// needs guest state. The static opaque world is drawn right after scene begin
-// (821BE8D0), which forwards the scene's viewport and clears, uploads the
-// camera and calls 82135530(device,1) - state operation 0x28, depth enable -
-// and sets nothing else. The rest is the Xbox 360 D3D device default state,
-// written here as the operations that produce it:
-//   0x28=1 depth test on (scene begin)     0x30=1 depth write on
-//   0x2c=3 depth func LESS_EQUAL           0x38=6 cull D3DCULL_CCW (back faces, CW front)
-//   0x3c=0 blend off (words[0]=0x10001)    0x48=1/0x4c=0 ONE/ZERO
-//   0xd4..0xe0=15 color writes on          alpha test, stencil, scissor off
-// Samplers start from the default record: every slot a material samples is
-// written by its own sampler operations (filters, LOD range, bias); addressing
-// stays as the texture's. A material that relied on an inherited state it does
-// not set shows up as a group-local difference in the image A/B against the
-// guest path, which is what validates this choice.
-NativeSceneMaterialPassState NativeFullFrameStaticBaseState(const NativeFullFrameStaticTargets& targets);
-// The operations above, in order, for tests and audits.
-inline constexpr std::array<std::array<uint32_t,2>,12> kNativeFullFrameStaticBaseOperations{{
-  {0x28,1},{0x30,1},{0x2c,3},{0x38,6},{0x3c,0},{0x48,1},{0x4c,0},{0x60,0},{0xd4,15},{0xd8,15},{0xdc,15},{0xe0,15}}};
+// Each group's state is the shared base state plus its own material's state
+// operations - NOT chained from the previous group; see NativeFullFrameBaseState.
+inline NativeSceneMaterialPassState NativeFullFrameStaticBaseState(const NativeFullFrameStaticTargets& targets) {
+  return NativeFullFrameBaseState(targets);
+}
+inline constexpr const auto& kNativeFullFrameStaticBaseOperations=kNativeFullFrameBaseOperations;
 
 // One group's material under the pass base state: everything its instances
 // share. camera holds only the matrices (NativeStaticCaptureCamera's).

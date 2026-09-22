@@ -1,5 +1,6 @@
 #pragma once
 #include "native_bucket_dispatch.h"
+#include "native_full_frame_base_state.h"
 #include "native_model_pass.h"
 #include "native_render_entry.h"
 #include "native_scene_adapter.h"
@@ -140,16 +141,9 @@ struct NativeFullFrameModelDrawRef {
 // except for blended passes of mode-0 objects.
 std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::span<const NativeFullFrameModelItem> items,bool opaque);
 
-// Target formats and depth direction of the pass (the pipeline inputs a
-// resolved material depends on besides its program and base state). The same
-// shape as NativeFullFrameStaticTargets; merge them when both land.
-struct NativeFullFrameModelTargets {
-  uint32_t count=1;
-  std::array<uint32_t,8> rtv_format{};
-  uint32_t dsv_format=0,samples=1;
-  bool reverse_depth=false;
-  bool operator==(const NativeFullFrameModelTargets&) const=default;
-};
+// Target formats and depth direction of the pass: the definition every
+// full-frame scene pass shares (native_full_frame_base_state.h).
+using NativeFullFrameModelTargets=NativeFullFramePassTargets;
 struct NativeFullFrameModelPass {
   NativeFullFrameModelTargets targets;
   NativeBackendViewport viewport;
@@ -160,18 +154,14 @@ struct NativeFullFrameModelPass {
   uint32_t palette_limit=kNativeBonePaletteShaderBones;
 };
 // The explicit base state every model draw starts from, opaque and transparent
-// alike: the device state right after scene begin. 821BE8D0 sets only depth
-// enable (82135530, operation 0x28=1); the rest is the D3D device default:
-//   0x28=1 depth test on      0x30=1 depth write on     0x2c=3 LESS_EQUAL
-//   0x38=6 cull CCW           0x3c=0 blend off          0x48=1/0x4c=0 ONE/ZERO
-//   0x60=0 alpha test off     0xd4..0xe0=15 color writes on
-// Samplers start from the default record. A draw's state is this plus its own
-// material's state operations; a transparent material's blend, depth-write
-// and alpha operations are among those, so it keeps them. The same operations
-// as kNativeFullFrameStaticBaseOperations (the static world pass).
-inline constexpr std::array<std::array<uint32_t,2>,12> kNativeFullFrameModelBaseOperations{{
-  {0x28,1},{0x30,1},{0x2c,3},{0x38,6},{0x3c,0},{0x48,1},{0x4c,0},{0x60,0},{0xd4,15},{0xd8,15},{0xdc,15},{0xe0,15}}};
-NativeSceneMaterialPassState NativeFullFrameModelBaseState(const NativeFullFrameModelTargets& targets);
+// alike: the shared full-frame base state (NativeFullFrameBaseState, the same
+// operations as the static world and sky passes). A draw's state is this plus
+// its own material's state operations; a transparent material's blend,
+// depth-write and alpha operations are among those, so it keeps them.
+inline constexpr const auto& kNativeFullFrameModelBaseOperations=kNativeFullFrameBaseOperations;
+inline NativeSceneMaterialPassState NativeFullFrameModelBaseState(const NativeFullFrameModelTargets& targets) {
+  return NativeFullFrameBaseState(targets);
+}
 
 // Published per-pass-record inputs. Neither may call guest code. program is
 // the model pass program cache (Bridge::model_pass_loads, built by

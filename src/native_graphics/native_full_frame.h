@@ -10,6 +10,7 @@ namespace edf::native {
 struct NativeScenePublication;
 struct NativeScenePassCamera;
 struct NativeScenePassAnimation;
+struct NativeRenderRegistrySnapshot;
 // Full-frame native renderer (edf_native_full_frame). The render helper hook
 // sub_821A5080 runs one NativeFullFrame instead of the guest helper. It
 // mirrors DispatchNativeFrame's structure (native_frame_dispatch.h): one view
@@ -45,6 +46,8 @@ struct NativeFrameInputs {
   std::shared_ptr<const std::map<uint32_t,NativeScenePassCamera>> cameras;
   std::shared_ptr<const std::map<uint32_t,NativeScenePassAnimation>> animations;
   uint64_t motion_publication=0;  // Model motion generation (native_render_publication).
+  // The renderable registry's tick snapshot (native_render_entry.h); empty until its producer publishes.
+  std::shared_ptr<const NativeRenderRegistrySnapshot> registry;
 };
 struct NativeFrameView {
   uint32_t scene=0,index=0;
