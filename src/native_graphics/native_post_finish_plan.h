@@ -82,10 +82,11 @@ using PostQuad=std::array<float,16>; // four (x,y,u,v), guest order
 struct PostPassPlan {
   PostPassKind kind=PostPassKind::Downsample;
   uint32_t target=0; // record begun by 821B8828; 0 for the bloom (ordinary output)
+  uint32_t target_texture=0; // the record's +4, which the native target registry is keyed by
   int32_t target_width=0,target_height=0;
   uint32_t technique=0;
   std::vector<PostSetterCall> setters;
-  std::optional<PostQuad> quad; // absent for the bloom, drawn by 821A8F20
+  std::optional<PostQuad> quad; // the bloom's is the one 821A8F20 builds from the screen size
   bool uses_tone=false;
 };
 struct PostFinishPlan {
@@ -200,7 +201,8 @@ inline PostFinishPlan BuildPostFinishPlan(const PostFinishInput& in) {
   // 820B01E8(this, target record, &size, source texture, mode).
   const auto reduce=[&](PostPassKind kind,const PostFinishRecord& target,float width,float height,uint32_t source) {
     PostPassPlan pass;
-    pass.kind=kind; pass.target=target.address; pass.target_width=target.width; pass.target_height=target.height;
+    pass.kind=kind; pass.target=target.address; pass.target_texture=target.texture;
+    pass.target_width=target.width; pass.target_height=target.height;
     const auto effect=in.self+(kind==PostPassKind::Mono ? L::kMonoEffect :
       kind==PostPassKind::DownsampleTone ? L::kDownsampleToneEffect : L::kDownsampleEffect);
     pass.technique=kind==PostPassKind::Mono ? in.mono_technique :
@@ -233,7 +235,8 @@ inline PostFinishPlan BuildPostFinishPlan(const PostFinishInput& in) {
   const auto& history=in.second.back();
   {
     PostPassPlan pass; pass.kind=PostPassKind::Tone; pass.uses_tone=true;
-    pass.target=in.blur.address; pass.target_width=in.blur.width; pass.target_height=in.blur.height;
+    pass.target=in.blur.address; pass.target_texture=in.blur.texture;
+    pass.target_width=in.blur.width; pass.target_height=in.blur.height;
     pass.technique=in.tone_technique;
     const auto effect=in.self+L::kToneEffect;
     pass.setters={texture(effect,kPostDiffuse0,mono_source.texture),texture(effect,kPostTone,history.texture),
@@ -243,7 +246,8 @@ inline PostFinishPlan BuildPostFinishPlan(const PostFinishInput& in) {
   for(const bool vertical:{false,true}) {
     PostPassPlan pass; pass.kind=vertical?PostPassKind::BlurVertical:PostPassKind::BlurHorizontal;
     const auto& target=vertical?in.blur_vertical:in.blur;
-    pass.target=target.address; pass.target_width=target.width; pass.target_height=target.height;
+    pass.target=target.address; pass.target_texture=target.texture;
+    pass.target_width=target.width; pass.target_height=target.height;
     pass.technique=in.blur_technique;
     const auto effect=in.self+L::kBlurEffect;
     const auto taps=PostBlurTaps(mono_source.texel_x,vertical);
@@ -258,6 +262,9 @@ inline PostFinishPlan BuildPostFinishPlan(const PostFinishInput& in) {
     const auto effect=in.self+L::kBloomEffect;
     pass.setters={texture(effect,kPostDiffuse0,in.scene_texture),texture(effect,kPostDiffuse1,in.blur_vertical.texture),
                   sampler(effect,kPostDiffuse0),texture(effect,kPostTone,history.texture),sampler(effect,kPostTone)};
+    // 821A8F20: the same quad as 820B01E8's, from float(owner+84/+88) with the
+    // same 1.0/-1.0/0.5 constants (5084/2252/2260), drawn through 821A79B8.
+    pass.quad=PostDownsampleQuad(float(in.screen_width),float(in.screen_height));
     plan.passes.push_back(std::move(pass));
   }
   return plan;
@@ -368,4 +375,96 @@ inline std::optional<std::array<float,3>> PostObservedTone(const PostFinishPlan&
 }
 // First eight, then every 1000th.
 inline bool ShouldLogPostFinish(uint64_t count) { return count && (count<=8 || count%1000==0); }
+
+// Step 3: the order the native finish loop issues the plan in. Each chain pass
+// (the 820B09B0 replacement) is issued whole, as 820B01E8/820B04B8 order it:
+// begin target 821B8828, the plan's setters, activation 821B94E8, the quad
+// through 821A79B8, end 821B88B0. The bloom's setters and activation stay in
+// the kept guest body of 820B0B80 (guest=true); the loop issues only its quad,
+// in place of 821A8F20's.
+enum class PostIssueKind:uint8_t { BeginTarget, Setter, Activate, Draw, EndTarget };
+inline const char* PostIssueName(PostIssueKind kind) {
+  switch(kind) {
+    case PostIssueKind::BeginTarget: return "begin";
+    case PostIssueKind::Setter: return "setter";
+    case PostIssueKind::Activate: return "activate";
+    case PostIssueKind::Draw: return "draw";
+    case PostIssueKind::EndTarget: return "end";
+  }
+  return "?";
+}
+struct PostIssueStep {
+  PostIssueKind kind=PostIssueKind::BeginTarget;
+  size_t pass=0,setter=0;
+  bool guest=false; // performed by the kept guest body, not by the loop
+};
+inline std::vector<PostIssueStep> BuildPostFinishIssue(const PostFinishPlan& plan) {
+  if(plan.passes.empty() || plan.passes.back().kind!=PostPassKind::Bloom)
+    throw std::runtime_error("post finish issue: the plan does not end with the bloom");
+  std::vector<PostIssueStep> steps;
+  for(size_t p=0;p<plan.passes.size();++p) {
+    const auto& pass=plan.passes[p];
+    const bool bloom=p+1==plan.passes.size();
+    if(bloom==(pass.target!=0) || !pass.quad || !pass.technique)
+      throw std::runtime_error(std::format("post finish issue: pass {} ({}) has no target, quad or technique",p,PostPassName(pass.kind)));
+    if(!bloom) steps.push_back({PostIssueKind::BeginTarget,p,0,false});
+    for(size_t s=0;s<pass.setters.size();++s) steps.push_back({PostIssueKind::Setter,p,s,bloom});
+    steps.push_back({PostIssueKind::Activate,p,0,bloom});
+    steps.push_back({PostIssueKind::Draw,p,0,false});
+    if(!bloom) steps.push_back({PostIssueKind::EndTarget,p,0,false});
+  }
+  return steps;
+}
+// Steps the 820B09B0 replacement issues: every one before the bloom's.
+inline size_t PostIssueChainEnd(const PostFinishPlan& plan,const std::vector<PostIssueStep>& steps) {
+  size_t end=0;
+  while(end<steps.size() && steps[end].pass+1<plan.passes.size()) ++end;
+  return end;
+}
+
+// Why a frame's native loop gave the frame back to the original. Counted per
+// reason; each is decided before anything is issued except Midway and Bloom.
+enum class PostFinishFallback:uint8_t {
+  Plan,          // records or formats did not validate (at 820B0B80 or again at 820B09B0)
+  AuditUnclean,  // the audit is on and its latest guest frame had mismatches
+  Owner,         // 820B09B0 was called for another post owner
+  Target,        // a pass target is not a registered native target of the planned extent
+  Shaders,       // a technique's shader pair has no native registration
+  Draw2D,        // the 2D object 821A79B8 draws through would trap
+  Stack,         // no writable guest stack for the loop's frame
+  Exception,     // preflight threw
+  Midway,        // a step threw after issuing began; the open target is closed and the original reruns
+  Bloom,         // the bloom quad was left to the original 821A8F20
+  Count
+};
+inline const char* PostFinishFallbackName(PostFinishFallback reason) {
+  switch(reason) {
+    case PostFinishFallback::Plan: return "plan";
+    case PostFinishFallback::AuditUnclean: return "audit-unclean";
+    case PostFinishFallback::Owner: return "owner";
+    case PostFinishFallback::Target: return "target";
+    case PostFinishFallback::Shaders: return "shaders";
+    case PostFinishFallback::Draw2D: return "draw2d";
+    case PostFinishFallback::Stack: return "stack";
+    case PostFinishFallback::Exception: return "exception";
+    case PostFinishFallback::Midway: return "midway";
+    case PostFinishFallback::Bloom: return "bloom";
+    case PostFinishFallback::Count: break;
+  }
+  return "?";
+}
+// Which body a frame runs. Native needs the cvar, the A/B native side and a
+// valid plan; with the audit on it also needs the latest frame to have been an
+// audited guest frame that was clean, so native and audited frames alternate.
+enum class PostFinishMode:uint8_t { Guest, Audit, Native };
+struct PostFinishGate {
+  bool native=false,audit=false,ab_native_side=true,plan=false;
+  bool last_audit_clean=false,last_frame_native=false;
+};
+inline PostFinishMode ChoosePostFinishMode(const PostFinishGate& gate) {
+  if(!gate.plan) return PostFinishMode::Guest;
+  if(gate.native && gate.ab_native_side && (!gate.audit || (gate.last_audit_clean && !gate.last_frame_native)))
+    return PostFinishMode::Native;
+  return gate.audit ? PostFinishMode::Audit : PostFinishMode::Guest;
+}
 }
