@@ -12314,6 +12314,10 @@ bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<Nativ
     const auto writes=HandOffNativeStaticWorld(reader,device,start.render,cursor.samplers,owed,[&](size_t index) {
       work.r3.u64=plan[index].pass; work.lr=0x821B2ECC; sub_821B94E8(work,base);
       ++counters.replays;
+    },[&](size_t index) {
+      // As for static world groups: a pass not replayed still binds and
+      // uploads, so its textures and shaders retire in guest order.
+      ActivateNativeMaterial(work,base,plan[index].pass,device,false);
     });
     if(writes.render!=cursor.render) throw std::runtime_error("native model handoff diverged from the pass cursor");
     for(const auto offset:writes.operations) {
