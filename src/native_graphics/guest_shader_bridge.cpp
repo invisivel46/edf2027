@@ -22,6 +22,7 @@
 #include "native_scene_execution.h"
 #include "native_scene_world_restore.h"
 #include "native_static_group_eligibility.h"
+#include "native_static_world_resolve.h"
 #include "native_queued_scene.h"
 #include "native_decode_workers.h"
 #include "native_d3d12_preview.h"
@@ -5143,6 +5144,145 @@ void SynchronizeNativeQueuedSceneInstance(uint8_t* base,uint32_t device,NativeQu
   std::lock_guard lock(state.mutex);
   SynchronizeNativeQueuedSceneInstanceLocked(state,GuestReader(base),device,group);
 }
+struct NativeStaticPassView { GuestViewportWords viewport; ActiveTargets targets; };
+// Publication inputs of one static group. deferred_geometry is the identity a
+// pending geometry handoff will bind instead of the draw's live bindings.
+struct NativeStaticGroupInputs {
+  uint32_t address=0,count=0;
+  const std::shared_ptr<const NativeSceneGroupMaterial>& material;
+  const std::optional<NativeSceneGeometrySource>& deferred_geometry;
+};
+// Pass constants, render-state and sampler pass, and the owned pass view. With
+// no view the draw's live view (NativeStaticDrawBindings::view) is used.
+struct NativeStaticPassInputs {
+  uint32_t device=0;
+  const std::vector<NativeSceneMaterialInputs::Constant>& constants;
+  const NativeMaterialRenderPass& render;
+  const std::array<NativeMaterialSamplerPass,16>& samplers;
+  std::optional<NativeStaticPassView> view;
+};
+// What a guest draw reaching this instance has bound. Only the guest-draw path
+// supplies these; a native pass has no bound state. Each runs at the point the
+// resolve reaches it, so reads, audits and throws keep their order.
+struct NativeStaticDrawBindings {
+  std::function<bool(const NativeSceneGeometrySource&)> geometry;
+  std::function<bool(uint32_t vertex,uint32_t pixel)> program;
+  std::function<NativeStaticPassView()> view;
+  std::function<void(const NativeStaticPassView&)> audit_view;
+};
+struct NativeStaticInstanceResolution {
+  NativeStaticWorldDecline decline=NativeStaticWorldDecline::None;
+  std::shared_ptr<const NativeSceneInstance> object;
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+  std::shared_ptr<const NativeSceneMaterial> material;
+  uint32_t vertex=0,pixel=0;
+  NativeSceneView view;
+  NativeStaticPassView pass{};
+  bool reverse_depth=false;
+  std::optional<VertexParameterRange> world_parameter;
+  bool world_column_major=false;
+  std::array<uint8_t,64> world{};
+  explicit operator bool() const { return decline==NativeStaticWorldDecline::None; }
+};
+// Resolve one published static instance from publication and pass inputs only.
+// Never reads the live bound shaders, streams, index bindings or view; those
+// checks belong to the caller, through draw. Exceptions propagate.
+NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge& state,const GuestReader& reader,
+    const NativeScenePublication& publication,const NativeStaticGroupInputs& group,uint32_t instance,
+    const NativeStaticPassInputs& pass,const NativeStaticDrawBindings* draw=nullptr) {
+  using D=NativeStaticWorldDecline;
+  NativeStaticInstanceResolution result;
+  const auto decline=[&](D reason) { result.decline=reason; return result; };
+  if(BufferWrites().Pending()) return decline(D::PendingWrites);
+  const auto& sources=NativeSceneSourcesForPass(state);
+  const auto* membership=sources.FindGroup(group.address);
+  const auto cached=state.scene_geometry_loads.find(group.address);
+  if(!membership || !membership->parts.contains(instance) || cached==state.scene_geometry_loads.end() ||
+     cached->second.revision!=membership->revision || group.material->revision!=membership->revision) return decline(D::Revision);
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+  for(const auto& published:publication.group_geometry)
+    if(published->group==group.address && published->revision==membership->revision) { geometry=published->geometry; break; }
+  const auto latest=state.scene_adapter.GroupGeometry(group.address,membership->revision);
+  if(!geometry || !latest || latest->geometry!=geometry || geometry->backend()!=state.scene_backend.get()) return decline(D::GeometryPublication);
+  const auto& source_geometry=cached->second.source;
+  if(group.count!=source_geometry.count) return decline(D::GeometryCount);
+  if(group.deferred_geometry) {
+    if(*group.deferred_geometry!=source_geometry) return decline(D::DeferredGeometry);
+  } else if(draw && draw->geometry && !draw->geometry(source_geometry)) return decline(D::GeometryBinding);
+  const auto* vb=state.model_buffers.Find(source_geometry.vertex,NativeModelBuffers::Kind::Vertex);
+  const auto* ib=state.model_buffers.Find(source_geometry.index,NativeModelBuffers::Kind::Index);
+  if(!vb || !ib || !vb->physical || !ib->physical || vb->generation!=cached->second.vertex_generation ||
+     ib->generation!=cached->second.index_generation) return decline(D::BufferGeneration);
+  const auto index_contents=ib->index_contents?ib->index_contents:(ib->index_storage?ib->index_storage->SourceSnapshot():nullptr);
+  using Identity=NativeBufferWrites::SnapshotIdentityView;
+  NativeBufferWrites::SnapshotPolicy policy{};
+  policy.audit_revisions=REXCVAR_GET(edf_native_retirement_audit);
+  if(!policy.audit_revisions && state.mesh_watch_audit.expired()) {
+    policy.verify_interval=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_interval),0,1<<20));
+    policy.verify_initial=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_initial),0,1<<16));
+  }
+  const auto versions=BufferWrites().TryValidateObservedSet(std::array<Identity,2>{{
+    {source_geometry.vertex,*vb->physical,vb->bytes,&vb->vertex_contents},
+    {source_geometry.index,*ib->physical,ib->bytes,&index_contents}}},policy);
+  if(!versions) return decline(D::VersionsUnavailable);
+  for(size_t i=0;i<2;++i) if((*versions)[i].lifetime!=cached->second.versions[i].lifetime ||
+    (*versions)[i].revision!=cached->second.versions[i].revision) return decline(D::VersionChanged);
+  const auto& program=*group.material->program;
+  if(draw && draw->program && !draw->program(program.inputs.vertex,program.inputs.pixel)) return decline(D::ProgramBinding);
+  if(pass.view) {
+    result.pass=*pass.view;
+    if(draw && draw->audit_view) draw->audit_view(result.pass);
+    static uint64_t count=0;
+    if(++count<=4 || count%100000==0)
+      REXLOG_INFO("Native owned pass view: reads={} (viewport/scissor/targets from native pass)",count);
+  } else {
+    if(!draw || !draw->view) throw std::runtime_error("native static instance has no pass view");
+    result.pass=draw->view();
+  }
+  const auto& targets=result.pass.targets;
+  const auto viewport=DecodeDrawViewport(result.pass.viewport);
+  if(!targets.count) return decline(D::Targets);
+  NativeBackendPipelineDesc desc;
+  desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(viewport.reverse_depth);
+  desc.pixel_id=program.inputs.pixel;
+  desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
+  desc.render_targets=targets.count; desc.rtv_format=targets.rtv_format;
+  desc.dsv_format=targets.dsv_format; desc.sample_count=targets.samples;
+  auto resolved=program.Resolve(desc,viewport.reverse_depth,pass.constants,pass.render,pass.samplers,
+    REXCVAR_GET(edf_native_anisotropic_filtering));
+  NativeQueuedSceneGroup candidate;
+  candidate.material=resolved.capture.material;
+  candidate.published_material=group.material;
+  ConfigureNativeQueuedWorldLocked(state,candidate);
+  if(!candidate.world_parameter || !NativeStaticWorldOnly(reader,sources,instance,candidate.world_parameter->first,pass.device)) return decline(D::WorldParameter);
+  const auto* source=sources.Find(instance);
+  if(!source) return decline(D::Source);
+  const auto world=sources.WorldRegisters(*source,source->world_data);
+  if(!world) return decline(D::WorldRegisters);
+  if(REXCVAR_GET(edf_native_scene_sources_owned) && REXCVAR_GET(edf_native_scene_transform_audit)) {
+    ++state.scene_world_checks;
+    if(std::memcmp(world->data(),reader.Bytes(source->world_data,64),64)) {
+      ++state.scene_world_mismatches;
+      REXLOG_ERROR("Native published first world mismatch: owner={:#x} instance={:#x}",source->owner,instance);
+      return decline(D::WorldMismatch);
+    }
+  }
+  ApplyNativeScenePublishedWorld(resolved.capture,*world);
+  result.view=NativeStaticInstanceView(resolved.capture.camera,viewport,resolved.render.words[5]!=0);
+  if(REXCVAR_GET(edf_native_scene_selection_owned)) {
+    result.object=publication.Resolve(*source,geometry,resolved.capture);
+    if(!result.object) return decline(D::Lifetime);
+  } else {
+    const auto id=state.scene_adapter.Observe(*source,geometry,resolved.capture);
+    result.object=SelectNativeSceneInstanceLocked(state,id);
+  }
+  result.geometry=std::move(geometry); result.material=resolved.capture.material;
+  result.vertex=program.inputs.vertex; result.pixel=program.inputs.pixel;
+  result.reverse_depth=viewport.reverse_depth;
+  result.world_parameter=std::move(candidate.world_parameter); result.world_column_major=candidate.world_column_major;
+  result.world=*world;
+  return result;
+}
 bool TryAppendPublishedNativeSceneInstance(uint8_t* base,uint32_t device,uint32_t address,uint32_t instance,uint32_t count,NativeQueuedSceneGroup& group) {
   if(!REXCVAR_GET(edf_native_scene_geometry_owned) || !REXCVAR_GET(edf_native_scene_material_owned) ||
      REXCVAR_GET(edf_native_scene_material_audit) || group.geometry || !group.objects.empty() ||
@@ -5157,110 +5297,45 @@ bool TryAppendPublishedNativeSceneInstance(uint8_t* base,uint32_t device,uint32_
   };
   if(BufferWrites().Pending()) return defer("pending resource writes");
   try {
-    const auto& sources=NativeSceneSourcesForPass(state);
-    const auto* membership=sources.FindGroup(address);
-    const auto cached=state.scene_geometry_loads.find(address);
-    if(!membership || !membership->parts.contains(instance) || cached==state.scene_geometry_loads.end() ||
-       cached->second.revision!=membership->revision || group.published_material->revision!=membership->revision) return defer("group membership or preload revision");
-    std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
-    for(const auto& published:native_scene_publication->group_geometry)
-      if(published->group==address && published->revision==membership->revision) { geometry=published->geometry; break; }
-    const auto latest=state.scene_adapter.GroupGeometry(address,membership->revision);
-    if(!geometry || !latest || latest->geometry!=geometry || geometry->backend()!=state.scene_backend.get()) return defer("retained geometry publication");
-    const auto& source_geometry=cached->second.source;
-    if(count!=source_geometry.count) return defer("geometry count");
-    if(group.geometry_handoff.pending()) {
-      if(*group.geometry_handoff.pending()!=source_geometry) return defer("deferred geometry identity");
-    } else {
-    const auto& stream=state.streams.at({device,0});
-    if(stream.resource!=source_geometry.vertex || stream.offset ||
-       stream.stride!=source_geometry.stride || state.index_bindings.at(device)!=source_geometry.index ||
-       state.declaration_bindings.at(device)!=source_geometry.declaration) return defer("geometry binding identity");
-    }
-    const auto* vb=state.model_buffers.Find(source_geometry.vertex,NativeModelBuffers::Kind::Vertex);
-    const auto* ib=state.model_buffers.Find(source_geometry.index,NativeModelBuffers::Kind::Index);
-    if(!vb || !ib || !vb->physical || !ib->physical || vb->generation!=cached->second.vertex_generation ||
-       ib->generation!=cached->second.index_generation) return defer("model buffer generation");
-    const auto index_contents=ib->index_contents?ib->index_contents:(ib->index_storage?ib->index_storage->SourceSnapshot():nullptr);
-    using Identity=NativeBufferWrites::SnapshotIdentityView;
-    NativeBufferWrites::SnapshotPolicy policy{};
-    policy.audit_revisions=REXCVAR_GET(edf_native_retirement_audit);
-    if(!policy.audit_revisions && state.mesh_watch_audit.expired()) {
-      policy.verify_interval=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_interval),0,1<<20));
-      policy.verify_initial=uint64_t(std::clamp(REXCVAR_GET(edf_native_geometry_verify_initial),0,1<<16));
-    }
-    const auto versions=BufferWrites().TryValidateObservedSet(std::array<Identity,2>{{
-      {source_geometry.vertex,*vb->physical,vb->bytes,&vb->vertex_contents},
-      {source_geometry.index,*ib->physical,ib->bytes,&index_contents}}},policy);
-    if(!versions) return defer("observed resource versions unavailable");
-    for(size_t i=0;i<2;++i) if((*versions)[i].lifetime!=cached->second.versions[i].lifetime ||
-      (*versions)[i].revision!=cached->second.versions[i].revision) return defer("observed resource revision changed");
-    const auto& program=*group.published_material->program;
-    if(state.active_vertex!=program.inputs.vertex || state.linked_pixel!=program.inputs.pixel ||
-       !state.active_vertex_parameters || (!group.material_handoff.activation_pending() && state.shader_bindings.Vertex(device)!=program.inputs.vertex)) return false;
     const GuestReader reader(base);
-    const bool owned_view=REXCVAR_GET(edf_native_scene_view_owned) &&
-      group.material_handoff.activation_pending() && group.pass_viewport.has_value();
-    const auto viewport_words=owned_view?*group.pass_viewport:ReadNativeDrawViewportWords(reader,device);
-    const auto targets=owned_view?group.targets:ActiveTargetsLocked(state);
-    if(owned_view) {
+    // The live guest bindings. The resolve calls each only where it reaches
+    // that check, as the inline reads did.
+    NativeStaticDrawBindings draw;
+    draw.geometry=[&](const NativeSceneGeometrySource& source) {
+      return NativeBoundGeometryMatches(source,[&]() -> const GuestStream& { return state.streams.at({device,0}); },
+        [&] { return state.index_bindings.at(device); },[&] { return state.declaration_bindings.at(device); });
+    };
+    draw.program=[&](uint32_t vertex,uint32_t pixel) {
+      return state.active_vertex==vertex && state.linked_pixel==pixel && state.active_vertex_parameters &&
+        (group.material_handoff.activation_pending() || state.shader_bindings.Vertex(device)==vertex);
+    };
+    draw.view=[&] { const auto viewport=ReadNativeDrawViewportWords(reader,device); return NativeStaticPassView{viewport,ActiveTargetsLocked(state)}; };
+    draw.audit_view=[&](const NativeStaticPassView& view) {
       if(REXCVAR_GET(edf_native_render_state_audit) &&
-         (viewport_words!=ReadNativeDrawViewportWords(reader,device) || targets!=ActiveTargetsLocked(state))) {
+         (view.viewport!=ReadNativeDrawViewportWords(reader,device) || view.targets!=ActiveTargetsLocked(state))) {
         REXLOG_ERROR("Native pass view mismatch: group={:#x}",address);
         throw std::runtime_error("native inherited viewport or targets changed without a pass boundary");
       }
-      static uint64_t count=0;
-      if(++count<=4 || count%100000==0)
-        REXLOG_INFO("Native owned pass view: reads={} (viewport/scissor/targets from native pass)",count);
+    };
+    const bool owned_view=REXCVAR_GET(edf_native_scene_view_owned) &&
+      group.material_handoff.activation_pending() && group.pass_viewport.has_value();
+    NativeStaticPassInputs pass{device,group.pass_constants,*group.material_pass,group.sampler_pass};
+    if(owned_view) pass.view=NativeStaticPassView{*group.pass_viewport,group.targets};
+    auto resolved=ResolveNativePublishedStaticInstanceLocked(state,reader,*native_scene_publication,
+      {address,count,group.published_material,group.geometry_handoff.pending()},instance,pass,&draw);
+    if(!resolved) {
+      if(const auto* reason=NativeStaticWorldDeclineReason(resolved.decline)) return defer(reason);
+      return false;
     }
-    const auto viewport=DecodeDrawViewport(viewport_words);
-    if(!targets.count) return false;
-    NativeBackendPipelineDesc desc;
-    desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(viewport.reverse_depth);
-    desc.pixel_id=program.inputs.pixel;
-    desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
-    desc.render_targets=targets.count; desc.rtv_format=targets.rtv_format;
-    desc.dsv_format=targets.dsv_format; desc.sample_count=targets.samples;
-    auto resolved=program.Resolve(desc,viewport.reverse_depth,group.pass_constants,*group.material_pass,group.sampler_pass,
-      REXCVAR_GET(edf_native_anisotropic_filtering));
-    NativeQueuedSceneGroup candidate;
-    candidate.material=resolved.capture.material;
-    candidate.published_material=group.published_material;
-    ConfigureNativeQueuedWorldLocked(state,candidate);
-    if(!candidate.world_parameter || !NativeStaticWorldOnly(reader,sources,instance,candidate.world_parameter->first,device)) return false;
-    const auto* source=sources.Find(instance);
-    if(!source) return false;
-    const auto world=sources.WorldRegisters(*source,source->world_data);
-    if(!world) return false;
-    if(REXCVAR_GET(edf_native_scene_sources_owned) && REXCVAR_GET(edf_native_scene_transform_audit)) {
-      ++state.scene_world_checks;
-      if(std::memcmp(world->data(),reader.Bytes(source->world_data,64),64)) {
-        ++state.scene_world_mismatches;
-        REXLOG_ERROR("Native published first world mismatch: owner={:#x} instance={:#x}",source->owner,instance);
-        return false;
-      }
-    }
-    ApplyNativeScenePublishedWorld(resolved.capture,*world);
-    auto view=resolved.capture.camera;
-    const auto& v=viewport.viewport; const auto& s=viewport.scissor;
-    view.viewport={v.TopLeftX,v.TopLeftY,v.Width,v.Height,v.MinDepth,v.MaxDepth};
-    view.scissor={s.left,s.top,s.right,s.bottom}; view.scissor_enabled=resolved.render.words[5]!=0;
-    if(REXCVAR_GET(edf_native_scene_selection_owned)) {
-      auto selected=native_scene_publication->Resolve(*source,geometry,resolved.capture);
-      if(!selected) return defer("instance lifetime not in scene publication");
-      group.objects.push_back(std::move(selected));
-    } else {
-      const auto id=state.scene_adapter.Observe(*source,geometry,resolved.capture);
-      group.objects.push_back(SelectNativeSceneInstanceLocked(state,id));
-    }
-    group.geometry=std::move(geometry); group.material=resolved.capture.material;
-    group.view=view; group.targets=targets; group.reverse_depth=viewport.reverse_depth;
-    group.pass_viewport=viewport_words;
-    group.vertex=program.inputs.vertex; group.pixel=program.inputs.pixel;
-    group.world_parameter=candidate.world_parameter; group.world_column_major=candidate.world_column_major;
+    group.objects.push_back(std::move(resolved.object));
+    group.geometry=std::move(resolved.geometry); group.material=std::move(resolved.material);
+    group.view=resolved.view; group.targets=resolved.pass.targets; group.reverse_depth=resolved.reverse_depth;
+    group.pass_viewport=resolved.pass.viewport;
+    group.vertex=resolved.vertex; group.pixel=resolved.pixel;
+    group.world_parameter=std::move(resolved.world_parameter); group.world_column_major=resolved.world_column_major;
     // The accepted instance only replaces g_mWorld. Preserve its final CPU
     // value before the next guest callback, as for subsequent queued instances.
-    group.pending_world=*world;
+    group.pending_world=resolved.world;
     group.instance=instance;
     group.constants_clean=group.geometry_handoff.pending().has_value();
     if(++state.scene_geometry_draw_bypasses<=4 || state.scene_geometry_draw_bypasses%10000==0)

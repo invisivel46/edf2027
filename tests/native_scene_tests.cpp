@@ -15,6 +15,7 @@
 #include "native_graphics/native_static_group_eligibility.h"
 #include "native_graphics/native_recorded_reads.h"
 #include "native_graphics/native_buffer_writes.h"
+#include "native_graphics/native_static_world_resolve.h"
 #include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d12_backend.h"
 #include <bit>
@@ -262,10 +263,62 @@ void GroupOrder() {
   Reject([&] { CaptureNativeSceneGroupOrder(reader,list,order); });
   reader.StoreWord(0x600,0x600);
   Reject([&] { CaptureNativeSceneGroupOrder(reader,list,order); });
+void StaticWorldResolve() {
+  using D=NativeStaticWorldDecline;
+  // The guest-draw path reports these exact strings; the pass shares them.
+  const std::pair<D,const char*> reasons[]{
+    {D::PendingWrites,"pending resource writes"},{D::Revision,"group membership or preload revision"},
+    {D::GeometryPublication,"retained geometry publication"},{D::GeometryCount,"geometry count"},
+    {D::DeferredGeometry,"deferred geometry identity"},{D::GeometryBinding,"geometry binding identity"},
+    {D::BufferGeneration,"model buffer generation"},{D::VersionsUnavailable,"observed resource versions unavailable"},
+    {D::VersionChanged,"observed resource revision changed"},{D::Lifetime,"instance lifetime not in scene publication"}};
+  for(const auto& [decline,reason]:reasons) {
+    const auto* actual=NativeStaticWorldDeclineReason(decline);
+    Require(actual && std::string(actual)==reason,"static world decline reason changed");
+  }
+  for(auto silent:{D::None,D::ProgramBinding,D::Targets,D::WorldParameter,D::Source,D::WorldRegisters,D::WorldMismatch})
+    Require(!NativeStaticWorldDeclineReason(silent),"silent static world decline gained a report");
+
+  struct Stream { uint32_t resource,offset,stride; };
+  const NativeSceneGeometrySource source{0x11000,0x11100,0x12000,28,6,0x13000,0x14000};
+  Stream stream{source.vertex,0,source.stride};
+  uint32_t index=source.index,declaration=source.declaration;
+  unsigned reads=0;
+  const auto bound=[&] {
+    reads=0;
+    return NativeBoundGeometryMatches(source,[&]() -> const Stream& { ++reads; return stream; },
+      [&] { ++reads; return index; },[&] { ++reads; return declaration; });
+  };
+  Require(bound() && reads==3,"bound geometry identity rejected");
+  stream.offset=4; Require(!bound() && reads==1,"stream offset admitted or later bindings read"); stream.offset=0;
+  stream.stride=32; Require(!bound() && reads==1,"stream stride admitted"); stream.stride=source.stride;
+  index=0; Require(!bound() && reads==2,"index binding admitted or declaration read"); index=source.index;
+  declaration=0; Require(!bound() && reads==3,"declaration binding admitted"); declaration=source.declaration;
+  // A missing later binding throws only once every earlier binding matched.
+  const auto missing=[&](const Stream& s) {
+    return NativeBoundGeometryMatches(source,[&]() -> const Stream& { return s; },
+      [&]() -> uint32_t { throw std::out_of_range("no index binding"); },[&] { return declaration; });
+  };
+  Require(!missing({0,0,source.stride}),"mismatched stream reached a missing index binding");
+  Reject([&] { missing(stream); });
+
+  NativeSceneView camera;
+  camera.view[3]=5.0f; camera.view_projection=kNativeSceneIdentity;
+  NativeViewportState viewport{};
+  viewport.viewport={16,32,1280,720,0.25f,1.0f}; viewport.scissor={1,2,3,4};
+  for(bool scissor:{false,true}) {
+    const auto view=NativeStaticInstanceView(camera,viewport,scissor);
+    Require(view.view==camera.view && view.view_projection==camera.view_projection,"static instance view changed the camera");
+    Require(view.viewport.x==16 && view.viewport.y==32 && view.viewport.width==1280 && view.viewport.height==720 &&
+      view.viewport.min_depth==0.25f && view.viewport.max_depth==1.0f,"static instance viewport");
+    Require(view.scissor.left==1 && view.scissor.top==2 && view.scissor.right==3 && view.scissor.bottom==4 &&
+      view.scissor_enabled==scissor,"static instance scissor");
+  }
 }
 void PassCamera() {
   GeometryPublicationRetry();
   StaticGroupEligibility();
+  StaticWorldResolve();
   {
     NativeSceneExecution run;
     Require(!run.complete() && !run.Total() && !run.recordings(),"new group inherited execution evidence");
