@@ -65,6 +65,8 @@ struct NativeFrameContext {
   NativeFrameView view;
   NativeFrameViewport viewport;
   uint32_t renderer=0;       // Active native scene owner (Word(8257BFB4)); 0 when BeginView declined.
+  uint32_t owner=0;          // The helper's owner (r3 of 821A5080), set by BeginView.
+  uint32_t guest_context=0;  // The guest frame context (helper stack+80) as the view's walks read it, set by BeginView.
   bool output_ready=false;   // Set by the post pass: the ordinary output is active for 8219C840.
 };
 struct NativeFramePass {

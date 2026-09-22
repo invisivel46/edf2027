@@ -213,16 +213,21 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     }
     std::vector<std::shared_ptr<const NativeSceneInstance>> objects;
     NativeSceneView view;
+    uint32_t current=0;
+    // A transparent batch never spans items: each carries its item's key and
+    // filing order, so it can merge with other producers' transparents.
     const auto flush=[&] {
       if(objects.empty()) return;
-      frame.batches.push_back({view,NativeSceneSnapshot{0,NativeSceneInstances(objects)},transparent});
+      frame.batches.push_back({view,NativeSceneSnapshot{0,NativeSceneInstances(objects)},transparent,
+        transparent?items[current].key:uint16_t(0),transparent?current:0u});
       objects.clear();
     };
     for(const auto& ref:OrderNativeFullFrameModelDraws(items,!transparent)) {
       auto& draws=resolved[ref.item];
       if(draws.empty()) continue;
       auto& draw=draws.at(ref.index);
-      if(!objects.empty() && !SameView(view,draw.view)) flush();
+      if(!objects.empty() && (!SameView(view,draw.view) || (transparent && ref.item!=current))) flush();
+      current=ref.item;
       view=draw.view; objects.push_back(std::move(draw.object));
       ++stats.draws;
     }

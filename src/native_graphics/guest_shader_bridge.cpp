@@ -52,6 +52,7 @@
 #include "native_full_frame_static_world.h"
 #include "native_full_frame_models.h"
 #include "native_full_frame_sky.h"
+#include "native_full_frame_effects.h"
 #include "native_bucket_dispatch.h"
 #include "native_map_effects.h"
 #include "native_scene_tree.h"
@@ -5801,6 +5802,10 @@ std::shared_ptr<const NativeSceneGroupMaterial> NativeModelPassProgramLocked(Bri
 NativeSceneGeometrySource NativeModelGeometrySource(const GuestReader& reader,const NativeModelBatchLayout& batch,uint32_t pass);
 std::shared_ptr<const NativeIndexedMesh::RetainedDraw> NativeModelGeometryLocked(Bridge& state,const GuestReader& reader,
   const NativeSceneGeometrySource& source,const NativeModelBatchLayout& batch);
+// One full-frame effect draw through the immediate path (defined after RecordNativeSceneImmediate).
+void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
+  const NativeEffectDraw& draw,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
+  const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report);
 }
 namespace {
 // The open scene's targets and the view's viewport, as every full-frame scene
@@ -5849,10 +5854,15 @@ void NativeFullFrameDeclined(const char* pass,const std::string& reason) {
   if(reported.size()<64 && reported.insert(std::string(pass)+": "+reason).second)
     REXLOG_INFO("Native full frame {} declined: {}",pass,reason);
 }
-// The models' transparent half, handed from the Models pass to the
-// Transparent pass of the same view.
+// What the Models and Effects passes of one view hand to its Transparent
+// pass: the models' transparent batches (one item each, keyed), the effects'
+// filed items, and the models' filing count, from which the effects' filing
+// order continues (the registry is unordered, so every model is taken as filed
+// before every effect; only equal keys can tell).
 struct NativeFullFrameModelsShared {
   std::shared_ptr<edf::native::NativeFullFrameModelFrame> transparent;
+  std::vector<edf::native::NativeEffectItem> effects;
+  uint32_t model_order=0;
 };
 // The full frame's Models pass: NativeFullFrameModels::Build over the
 // renderable registry snapshot and the view's camera; the opaque batches are
@@ -5869,6 +5879,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     shared_->transparent.reset();
+    shared_->model_order=0;
     const auto registry=context.inputs.registry;
     if(!registry || registry->entries.empty() || !native_scene_pass_camera || !context.renderer) { ++empty_; return; }
     NativeFullFrameModelCamera camera;
@@ -5919,6 +5930,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     state.scene_recorded_frames.push_back(frame);
     state.scene_recorded_frames.push_back(registry);
     if(!transparent->batches.empty()) shared_->transparent=std::move(transparent);
+    shared_->model_order=uint32_t(frame->plan.transparent.size());
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
@@ -5933,30 +5945,117 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
   edf::native::NativeFullFrameModels models_;
   uint64_t frames_=0,empty_=0,broken_=0;
 };
-// The models' transparent batches (NativeFullFrameModelsPass's split), in
-// 821A3BA0's bucket-key order, after the sky and effects.
+// The full frame's Effects pass: CollectNativeEffectManager over the
+// clEffectObjectManager (vtable 820072D4) the helper's world list (owner+44)
+// holds, with the guest frame context the host wrote for this view (camera
+// +16, depth scale +8, key words +0/+4). The walk commits clEffectEtc02's +612
+// for every object whose slot 4 the guest would have called. Mode-0 effects
+// draw here, inside the walk as in the guest; filed ones go to Transparent.
+class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
+ public:
+  NativeFullFrameEffectsPass(uint8_t* base,std::shared_ptr<NativeFullFrameModelsShared> shared)
+    :reader_(base),shared_(std::move(shared)) {}
+  const char* name() const override { return "effects"; }
+  void Record(edf::native::NativeFrameContext& context) override {
+    using namespace edf::native;
+    shared_->effects.clear();
+    if(!context.renderer || !context.owner || !context.guest_context || !native_scene_pass_camera) return;
+    uint32_t manager=0;
+    const auto end=reader_.Word(reader_.Add(context.owner,56));
+    uint32_t guard=0;
+    for(auto node=reader_.Word(reader_.Add(context.owner,44));node!=end;node=reader_.Word(node)) {
+      if(++guard>4096) throw std::runtime_error("native full frame world list does not terminate");
+      const auto object=reader_.Word(reader_.Add(node,8));
+      if(object && reader_.Word(object)==NativeEffectList::manager_vtable) { manager=object; break; }
+    }
+    if(!manager) { ++absent_; return; }
+    uint32_t order=shared_->model_order;
+    NativeEffectCollection collection;
+    try { collection=CollectNativeEffectManager(reader_,manager,context.guest_context,order); }
+    catch(const std::exception& error) { NativeFullFrameDeclined("effects",error.what()); return; }
+    for(const auto slot:collection.unsupported_slots)
+      if(unsupported_.insert(slot).second) REXLOG_INFO("Native full frame effects: unsupported slot 4 {:#x} (not drawn)",slot);
+    uint64_t drawn=0;
+    if(!collection.immediate.empty()) {
+      auto& state=State();
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      NativeFullFramePassTargets formats; NativeBackendViewport backend_viewport; NativeBackendScissor scissor; NativeViewportState viewport;
+      const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
+      if(state.active_scene==context.renderer && targets.count && targets.depth && state.scene_backend) {
+        const NativeSceneCpuWindow window(reader_);
+        const auto report=[](const std::string& reason) { NativeFullFrameDeclined("effects",reason); };
+        for(const auto& item:collection.immediate) for(const auto& draw:item.draws) {
+          try { RecordNativeFullFrameEffectLocked(state,reader_,window,draw,*native_scene_pass_camera,viewport,formats,report); ++drawn; }
+          catch(const std::exception& error) { report(error.what()); }
+        }
+      }
+    }
+    if(++frames_<=4 || frames_%1000==0)
+      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} absent={}",
+        frames_,manager,collection.visited,collection.culled,collection.hidden,collection.immediate.size(),drawn,
+        collection.items.size(),collection.undrawn_keys,collection.unsupported,absent_);
+    shared_->effects=std::move(collection.items);
+  }
+ private:
+  const edf::native::GuestReader reader_;
+  std::shared_ptr<NativeFullFrameModelsShared> shared_;
+  std::set<uint32_t> unsupported_;
+  uint64_t frames_=0,absent_=0;
+};
+// The frame's one transparent sequence (sub_821A3BA0): the models' mode-1/2
+// batches and the effects' filed items merged by key descending, filing order
+// on ties (MergeNativeTransparentItems), after the sky and mode-0 effects.
 class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass {
  public:
-  explicit NativeFullFrameTransparentPass(std::shared_ptr<NativeFullFrameModelsShared> shared):shared_(std::move(shared)) {}
+  NativeFullFrameTransparentPass(uint8_t* base,std::shared_ptr<NativeFullFrameModelsShared> shared)
+    :reader_(base),shared_(std::move(shared)) {}
   const char* name() const override { return "transparent"; }
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     auto frame=std::move(shared_->transparent);
-    if(!frame || !context.renderer) return;
+    auto effects=std::move(shared_->effects);
+    shared_->effects.clear();
+    if(((!frame || frame->batches.empty()) && effects.empty()) || !context.renderer || !native_scene_pass_camera) return;
     auto& state=State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
     NativeFullFramePassTargets formats; NativeBackendViewport backend_viewport; NativeBackendScissor scissor; NativeViewportState viewport;
     const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
     if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) return;
-    SceneRecorderLocked(state).SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
-    NativeFullFrameModels::Record(*state.scene_backend,state.scene_renderer,*frame);
-    ++state.bind_generation;
-    state.recorded={};
-    state.scene_recorded_frames.push_back(std::move(frame));
+    const NativeSceneCpuWindow window(reader_);
+    const auto report=[](const std::string& reason) { NativeFullFrameDeclined("transparent",reason); };
+    const auto& camera=*native_scene_pass_camera;
+    std::vector<NativeTransparentItem> models;
+    if(frame) for(size_t index=0;index<frame->batches.size();++index)
+      models.push_back({frame->batches[index].key,frame->batches[index].order,[&state,&targets,frame,index](NativeBackendRecorder& recorder) {
+        const auto& batch=frame->batches[index];
+        recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
+        state.scene_renderer.Render(*state.scene_backend,batch.snapshot,batch.view,1);
+        // The batch bound its own targets and pipelines.
+        ++state.bind_generation;
+        state.recorded={};
+      }});
+    const auto model_count=models.size(),effect_count=effects.size();
+    auto effect_items=NativeEffectTransparentItems(std::move(effects),[&](NativeBackendRecorder&,const NativeEffectItem& item) {
+      for(const auto& draw:item.draws) {
+        try { RecordNativeFullFrameEffectLocked(state,reader_,window,draw,camera,viewport,formats,report); }
+        catch(const std::exception& error) { report(error.what()); }
+      }
+    });
+    std::vector<std::vector<NativeTransparentItem>> sources;
+    sources.push_back(std::move(models)); sources.push_back(std::move(effect_items));
+    const auto sequence=MergeNativeTransparentItems(std::move(sources));
+    RecordNativeTransparentItems(sequence,SceneRecorderLocked(state));
+    if(frame) state.scene_recorded_frames.push_back(std::move(frame));
+    if(++frames_<=4 || frames_%1000==0)
+      REXLOG_INFO("Native full frame transparent: frames={} model_batches={} effect_items={} drawn_items={}",
+        frames_,model_count,effect_count,sequence.size());
   }
  private:
+  const edf::native::GuestReader reader_;
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
+  uint64_t frames_=0;
 };
 // The full frame's Sky pass: RecordNativeSky poses the constructed clSky from
 // the rendered camera (scene+224, the copy 821CDDF8 makes) and its static
@@ -6203,6 +6302,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
       return false;
     }
     context.renderer=renderer;
+    context.owner=owner_; context.guest_context=context_;
     const auto width=reader_.Word(reader_.Add(renderer,84)),height=reader_.Word(reader_.Add(renderer,88));
     const auto rect=edf::native::ReadGuestWords<4>(reader_,reader_.Add(scene,480));
     const auto extent=[](uint32_t word,uint32_t limit) {
@@ -6434,7 +6534,8 @@ REX_HOOK_RAW(sub_821A5080) {
       return full_frame.Replace(std::make_unique<NativeFullFrameStaticWorldPass>(base)) &&
         full_frame.Replace(std::make_unique<NativeFullFrameModelsPass>(base,models)) &&
         full_frame.Replace(std::make_unique<NativeFullFrameSkyPass>(base)) &&
-        full_frame.Replace(std::make_unique<NativeFullFrameTransparentPass>(models));
+        full_frame.Replace(std::make_unique<NativeFullFrameEffectsPass>(base,models)) &&
+        full_frame.Replace(std::make_unique<NativeFullFrameTransparentPass>(base,models));
     }();
     if(!wired) throw std::runtime_error("native full frame is missing a pass slot");
     // The helper's stack frame and guest frame context (stack+80), as
@@ -11739,6 +11840,93 @@ void RecordNativeSceneImmediate(Bridge& state,const Reader& reader,uint32_t devi
 }
 }  // namespace
 }  // namespace edf::native
+namespace edf::native {
+// Declaration element words as the guest stores them (big-endian).
+template<size_t N>
+std::array<uint8_t,N*4> NativeFullFrameDeclarationBytes(const std::array<uint32_t,N>& words) {
+  std::array<uint8_t,N*4> bytes{};
+  for(size_t i=0;i<N;++i) for(size_t byte=0;byte<4;++byte) bytes[i*4+byte]=uint8_t(words[i]>>(24-byte*8));
+  return bytes;
+}
+// One effect draw of the full frame (native_full_frame_effects.h), recorded
+// without guest calls: the technique object in the effect-shader object
+// (+244/+288/+188) is the material 821B94E8 would activate, so its program
+// comes from the model pass cache and is applied to the shader bindings as a
+// published activation is (NativeSceneMaterialProgram::ApplyBindings), with
+// the pass camera over its camera globals and the draw's texture in the one
+// slot 821A7640/821A7C70 fill. Render state: the shared full-frame base
+// state, the technique's own operations, then the draw's blend (0x48/0x4c)
+// and, for the ribbons, depth write (0x30). The vertices are the host bytes
+// EncodeNativeEffectVertices builds, one RecordNativeSceneImmediate per guest
+// DrawPrimitiveUP, under the Vs_Particle (44-byte) or VS_3DTex (36-byte)
+// declaration the immediate path accepts. Throws when any of it is missing.
+void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
+    const NativeEffectDraw& draw,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
+    const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report) {
+  const auto technique=reader.Add(draw.effect,NativeEffectTechniqueOffset(draw.technique));
+  const auto material=NativeModelPassProgramLocked(state,window,technique,false,report);
+  if(!material || !material->program) throw std::runtime_error("native effect technique has no program");
+  const auto& program=*material->program;
+  const auto vertex=state.shaders.find(program.inputs.vertex),pixel=state.shaders.find(program.inputs.pixel);
+  if(vertex==state.shaders.end() || pixel==state.shaders.end() || !vertex->second.bindings || !pixel->second.bindings)
+    throw std::runtime_error("native effect shaders are not registered");
+  auto& vs=VertexBindingsForDraw(vertex->second,viewport.reverse_depth);
+  auto& ps=*pixel->second.bindings;
+  const std::pair<uint32_t,uint32_t> link{program.inputs.vertex,program.inputs.pixel};
+  if(!state.validated_links.contains(link)) {
+    ValidateNativeShaderLink(vs.shader(),ps.shader());
+    state.validated_links.insert(link);
+  }
+  auto constants=material->constants;
+  for(auto& constant:constants) camera.Apply(constant);
+  const auto base=NativeFullFrameBaseState(formats);
+  const auto resolved=program.ResolveSamplers(base.samplers);
+  std::vector<NativeBackendSampler*> samplers;
+  for(const auto& texture:program.inputs.textures) {
+    if(texture.slot>=resolved.size()) throw std::runtime_error("invalid native effect sampler slot");
+    const auto key=NativeFilteringKey(resolved[texture.slot].words,REXCVAR_GET(edf_native_anisotropic_filtering));
+    auto cached=state.samplers.find(key);
+    if(cached==state.samplers.end())
+      cached=state.samplers.emplace(key,&EnsureSceneBackendLocked(state).CreateSampler(DecodeNativeGuestSampler(key))).first;
+    samplers.push_back(cached->second);
+  }
+  state.active_vertex=0;
+  state.active_vertex_parameters.reset();
+  program.ApplyBindings(vs,ps,constants,samplers);
+  if(draw.texture) {
+    const auto texture=state.textures.find(draw.texture);
+    if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
+      throw std::runtime_error("native effect texture is not decoded");
+    if(program.inputs.textures.size()!=1) throw std::runtime_error("native effect technique does not sample one texture");
+    ps.BeginResourceUpdate();
+    const bool bound=ps.TrySetTexture(program.inputs.textures[0].name,texture->second.backend);
+    ps.EndResourceUpdate();
+    if(!bound) throw std::runtime_error("native effect texture does not match its shader");
+  }
+  state.linked_vertex=program.inputs.vertex; state.linked_pixel=program.inputs.pixel;
+  auto render=program.ResolveRenderState(base.render);
+  if(draw.blend==kNativeEffectBlendAlpha) { ApplyNativeMaterialState(render,0x48,6); ApplyNativeMaterialState(render,0x4c,7); }
+  else if(draw.blend==kNativeEffectBlendAdditive) { ApplyNativeMaterialState(render,0x48,1); ApplyNativeMaterialState(render,0x4c,1); }
+  if(draw.sets_depth_write) ApplyNativeMaterialState(render,0x30,draw.depth_write?1:0);
+  DecodeNativeRenderState(render.words);
+  // The immediate path's accepted layouts (see the 821FD8F8 hook's checks).
+  const bool particle=draw.kind==NativeEffectDraw::Kind::Particles;
+  static const auto particle_declaration=NativeDeclaration::Create(NativeFullFrameDeclarationBytes<12>({
+    0,0x2a23b9,0, 12,0x2c23a5,0x50000, 20,0x2c23a5,0x50100, 28,0x1a23a6,0xa0000}));
+  static const auto ribbon_declaration=NativeDeclaration::Create(NativeFullFrameDeclarationBytes<9>({
+    0,0x2a23b9,0, 12,0x2c23a5,0x50000, 20,0x1a23a6,0xa0000}));
+  const auto& declaration=particle?particle_declaration:ribbon_declaration;
+  // Synthetic declaration identities: only the immediate mesh cache keys on them.
+  const uint32_t declaration_id=particle?0xFFFFFF01u:0xFFFFFF02u;
+  const auto device=reader.Word(reader.Add(reader.Word(0x8257bfb4),8));
+  for(const auto& [first,count]:NativeEffectDrawCalls(draw)) {
+    const auto bytes=EncodeNativeEffectVertices(draw,first,count);
+    RecordNativeSceneImmediate(state,reader,device,{vs,ps,viewport,render.words,
+      GuestShaderPair{.pixel=program.inputs.pixel,.vertex=program.inputs.vertex},declaration_id,declaration->count(),declaration,
+      draw.primitive(),draw.stride()},bytes);
+  }
+}
+}
 REX_EXTERN(__imp__sub_821FD8F8);
 REX_EXTERN(__imp__edf_native_immediate_cpu_tail);
 REX_HOOK_RAW(sub_821FD8F8) {

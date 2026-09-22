@@ -181,6 +181,11 @@ struct NativeFullFrameModelBatch {
   NativeSceneView view;
   NativeSceneSnapshot snapshot;
   bool transparent=false;
+  // Transparent batches only (one item each): the item's bucket key and its
+  // filing order among the plan's transparents (its index there), for
+  // MergeNativeTransparentItems with the other producers.
+  uint16_t key=0;
+  uint32_t order=0;
 };
 struct NativeFullFrameModelFrame {
   struct Stats {
