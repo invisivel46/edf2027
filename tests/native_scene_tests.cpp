@@ -518,6 +518,39 @@ void StaticGroupEligibility() {
 // The static world pass's cross-frame group cache, driven the way the pass
 // drives it: a candidate whose eligibility reads still hold and whose constants
 // are current is reused, anything else resolves again and is stored.
+// A group's resolve splits into one group step and a step per instance: the
+// group step runs once for any number of instances, and any decline ends the
+// walk short so that the caller returns the whole group.
+void StaticWorldGroupResolve() {
+  using D=NativeStaticWorldDecline;
+  struct Result { D decline=D::None; uint32_t instance=0; };
+  const std::vector<uint32_t> instances{0x100,0x11C,0x138,0x154,0x170,0x18C,0x1A8,0x1C4};
+  std::vector<Result> resolved;
+  size_t groups=0,visits=0;
+  const auto run=[&](D group,uint32_t failing,D instance) {
+    groups=visits=0;
+    return ResolveNativeStaticGroupInstances(instances,resolved,[&] { ++groups; return group; },
+      [&](uint32_t at) { ++visits; return Result{at==failing?instance:D::None,at}; });
+  };
+  Require(run(D::None,0,D::None)==D::None && groups==1 && visits==instances.size() && resolved.size()==instances.size() &&
+    std::ranges::equal(resolved,instances,{},&Result::instance),"static group resolve did not run its group step once for all instances");
+  Require(run(D::Revision,0,D::None)==D::Revision && groups==1 && !visits && resolved.empty(),
+    "static group decline resolved instances");
+  Require(run(D::None,0x154,D::WorldRegisters)==D::WorldRegisters && groups==1 && visits==4 && resolved.size()==3 &&
+    resolved.size()!=instances.size(),"static instance decline did not return the group");
+  Require(run(D::None,0,D::None)==D::None && resolved.size()==instances.size(),"static group resolve kept a previous walk");
+  groups=0;
+  Require(ResolveNativeStaticGroupInstances(std::span<const uint32_t>{},resolved,[&] { ++groups; return D::None; },
+    [&](uint32_t at) { return Result{D::None,at}; })==D::None && resolved.empty() && !groups,"empty static group ran its group step");
+  // The world-only test the per-instance step makes from the source generation.
+  NativeSceneSources::Source source; source.world_data=0x1000; source.world_first=16;
+  Require(NativeStaticWorldOnlySource(source,16,0x80000000),"world-only source rejected");
+  Require(!NativeStaticWorldOnlySource(source,20,0x80000000),"world-only source accepted another register");
+  source.world_first.reset(); Require(!NativeStaticWorldOnlySource(source,16,0x80000000),"source without recorded parameters accepted");
+  source.world_first=16; source.world_data=0x80000000+1792;
+  Require(!NativeStaticWorldOnlySource(source,16,0x80000000),"world data inside the device constants accepted");
+  source.world_data=0; Require(!NativeStaticWorldOnlySource(source,16,0x80000000),"source without world data accepted");
+}
 void StaticWorldGroupCache() {
   struct View { uint32_t viewport=0,targets=0; bool operator==(const View&) const=default; };
   struct Material { std::shared_ptr<const int> identity; };
@@ -2273,6 +2306,44 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
     stats=render(NativeSceneSnapshot{0,grouped});
     Require(stats.visible==kGroupInstances && stats.draws==1 && stats.instanced_draws==1 &&
       pixel(4,0)==255 && pixel(60,0)==255 && pixel(4,2)==0,"static group instances were not one instanced draw");
+    // The world pass resolves each instance from the group's material and its
+    // decoded world. An unchanged instance is its retained object; one whose
+    // material differs from the retained object's is copied once and that copy
+    // is returned again while its material and world hold, without allocating.
+    const auto world_of=[&](size_t i) {
+      auto capture=shared; ApplyNativeScenePublishedWorld(capture,std::span<const uint8_t,64>(group_worlds[i]));
+      return capture.world;
+    };
+    NativeSceneInstanceReuse reuse;
+    for(size_t i=0;i<kGroupInstances;++i)
+      Require(group_publication->Resolve(group_sources[i],geometry,shared.material,world_of(i),&reuse)==group_publication->Find(group_ids[i]),
+        "unchanged static instance did not resolve to its retained object");
+    Require(!reuse.allocations && !reuse.reuses && !reuse.size(),"unchanged static instances allocated or recorded copies");
+    const auto other=resolve().capture.material;
+    Require(other!=shared.material,"independent resolve shared the interned material");
+    std::vector<std::shared_ptr<const NativeSceneInstance>> copies;
+    for(size_t i=0;i<kGroupInstances;++i) {
+      copies.push_back(group_publication->Resolve(group_sources[i],geometry,other,world_of(i),&reuse));
+      Require(copies[i] && copies[i]!=group_publication->Find(group_ids[i]) && copies[i]->object.material==other &&
+        copies[i]->id==group_ids[i] && copies[i]->previous==copies[i]->object.world,"changed static instance copy");
+    }
+    Require(reuse.allocations==kGroupInstances && !reuse.reuses,"changed static instances were not copied once each");
+    for(size_t pass=0;pass<3;++pass) {
+      reuse.EndPass();
+      for(size_t i=0;i<kGroupInstances;++i)
+        Require(group_publication->Resolve(group_sources[i],geometry,other,world_of(i),&reuse)==copies[i],
+          "unchanged static instance allocated a new copy");
+    }
+    Require(reuse.allocations==kGroupInstances && reuse.reuses==3*kGroupInstances,"static instance reuse count");
+    auto moved=world_of(0); moved[12]+=.125f;
+    const auto relocated=group_publication->Resolve(group_sources[0],geometry,other,moved,&reuse);
+    Require(relocated && relocated!=copies[0] && relocated->object.world==moved && reuse.allocations==kGroupInstances+1,
+      "moved static instance reused a stale copy");
+    Require(!group_publication->Resolve(group_sources[0],nullptr,other,moved,&reuse),"static instance resolved without geometry");
+    // Without reuse every changed resolve is a new object, as before.
+    Require(group_publication->Resolve(group_sources[1],geometry,other,world_of(1))!=copies[1],"reuse leaked into a plain resolve");
+    for(size_t pass=0;pass<256;++pass) reuse.EndPass();
+    Require(!reuse.size(),"unused static instance copies were not released");
   }
   const auto publication=adapter.Publish(1);
   Require(adapter.AcquirePublication()==publication && publication->Find(adapter_left) &&
@@ -2483,7 +2554,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
-    GroupOrder(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); WalkLock(); StaticWalkPlan();
+    GroupOrder(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

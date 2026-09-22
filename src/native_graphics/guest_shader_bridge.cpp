@@ -1932,16 +1932,27 @@ void ReadNativeSceneInstanceParameters(const Reader& reader,const NativeSceneSou
     uint32_t instance,std::vector<InstanceParameter>& parameters) {
   ReadNativeSceneInstanceParameters(reader,sources.Find(instance),instance,parameters);
 }
+// source is sources.Find(instance). Owned metadata without the transform
+// audit is exactly the source generation's (ReadNativeSceneInstanceParameters
+// would only copy it), so it is decided from the source without building the
+// parameter list; anything else reads the parameters as before.
+template<class Reader>
+bool NativeStaticWorldOnly(const Reader& reader,const NativeSceneSources::Source& source,
+                          uint32_t instance,uint32_t first,uint32_t device) {
+  if(!source.world_data) return false;
+  if(REXCVAR_GET(edf_native_scene_instance_owned) && source.world_first && !REXCVAR_GET(edf_native_scene_transform_audit))
+    return NativeStaticWorldOnlySource(source,first,device);
+  static thread_local std::vector<InstanceParameter> parameters;
+  ReadNativeSceneInstanceParameters(reader,&source,instance,parameters);
+  return parameters.size()==1 && parameters[0].count==4 && parameters[0].first==first &&
+    parameters[0].data==source.world_data &&
+    !(uint64_t(parameters[0].data)<uint64_t(device)+5888 && uint64_t(parameters[0].data)+64>uint64_t(device)+1792);
+}
 template<class Reader>
 bool NativeStaticWorldOnly(const Reader& reader,const NativeSceneSources& sources,
                           uint32_t instance,uint32_t first,uint32_t device) {
   const auto* source=sources.Find(instance);
-  if(!source || !source->world_data) return false;
-  static thread_local std::vector<InstanceParameter> parameters;
-  ReadNativeSceneInstanceParameters(reader,source,instance,parameters);
-  return parameters.size()==1 && parameters[0].count==4 && parameters[0].first==first &&
-    parameters[0].data==source->world_data &&
-    !(uint64_t(parameters[0].data)<uint64_t(device)+5888 && uint64_t(parameters[0].data)+64>uint64_t(device)+1792);
+  return source && NativeStaticWorldOnly(reader,*source,instance,first,device);
 }
 std::shared_ptr<const NativeSceneInstance> SelectNativeSceneInstanceLocked(Bridge& state,uint64_t id) {
   const auto current=state.scene_adapter.SelectOne(id);
@@ -6484,23 +6495,45 @@ struct NativeStaticGroupMaterial {
   std::optional<VertexParameterRange> world_parameter;
   bool world_column_major=false;
 };
-// Resolve one published static instance from publication and pass inputs only.
+// The per-group half of a published static resolve: what every instance of the
+// group shares under one pass. material points into the caller's slot.
+struct NativeStaticGroupResolution {
+  NativeStaticWorldDecline decline=NativeStaticWorldDecline::None;
+  const NativeSceneSources* sources=nullptr;
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+  const NativeStaticGroupMaterial* material=nullptr;
+  NativeStaticPassView pass{};
+  NativeSceneView view;
+  bool reverse_depth=false;
+  explicit operator bool() const { return decline==NativeStaticWorldDecline::None; }
+};
+// The per-instance half: its publication object and its g_mWorld registers.
+struct NativeStaticInstanceWorld {
+  NativeStaticWorldDecline decline=NativeStaticWorldDecline::None;
+  std::shared_ptr<const NativeSceneInstance> object;
+  std::array<uint8_t,64> world{};
+  explicit operator bool() const { return decline==NativeStaticWorldDecline::None; }
+};
+// Resolve one published static group from publication and pass inputs only,
+// once for all of instances (each must still be a member of the group).
 // Never reads the live bound shaders, streams, index bindings or view; those
-// checks belong to the caller, through draw. Exceptions propagate. shared, when
-// given, carries the group's material between instances resolved against one
-// NativeStaticPassInputs; a different group, geometry or view resolves afresh.
-NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge& state,const GuestReader& reader,
-    const NativeScenePublication& publication,const NativeStaticGroupInputs& group,uint32_t instance,
-    const NativeStaticPassInputs& pass,const NativeStaticDrawBindings* draw=nullptr,
-    std::optional<NativeStaticGroupMaterial>* shared=nullptr) {
+// checks belong to the caller, through draw. Exceptions propagate. slot
+// carries the group's material between resolves against one
+// NativeStaticPassInputs; a different group, geometry or view resolves afresh
+// (under the QueuedResolve timing when timed).
+NativeStaticGroupResolution ResolveNativePublishedStaticGroupLocked(Bridge& state,const GuestReader& reader,
+    const NativeScenePublication& publication,const NativeStaticGroupInputs& group,std::span<const uint32_t> instances,
+    const NativeStaticPassInputs& pass,const NativeStaticDrawBindings* draw,std::optional<NativeStaticGroupMaterial>& slot,bool timed) {
   using D=NativeStaticWorldDecline;
-  NativeStaticInstanceResolution result;
+  NativeStaticGroupResolution result;
   const auto decline=[&](D reason) { result.decline=reason; return result; };
   if(BufferWrites().Pending()) return decline(D::PendingWrites);
   const auto& sources=NativeSceneSourcesForPass(state);
+  result.sources=&sources;
   const auto* membership=sources.FindGroup(group.address);
   const auto cached=state.scene_geometry_loads.find(group.address);
-  if(!membership || !membership->parts.contains(instance) || cached==state.scene_geometry_loads.end() ||
+  if(!membership || !std::ranges::all_of(instances,[&](uint32_t instance) { return membership->parts.contains(instance); }) ||
+     cached==state.scene_geometry_loads.end() ||
      cached->second.revision!=membership->revision || group.material->revision!=membership->revision) return decline(D::Revision);
   std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
   for(const auto& published:publication.group_geometry)
@@ -6562,12 +6595,10 @@ NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge
   const auto& targets=result.pass.targets;
   const auto viewport=DecodeDrawViewport(result.pass.viewport);
   if(!targets.count) return decline(D::Targets);
-  std::optional<NativeStaticGroupMaterial> local;
-  auto& slot=shared?*shared:local;
   if(!slot || slot->group!=group.material.get() || slot->geometry!=geometry.get() ||
      slot->pass.viewport!=result.pass.viewport || slot->pass.targets!=targets) {
-    // Only the world pass shares a slot; its cache misses land here.
-    HookTiming resolve_timing(HookPhase::QueuedResolve,shared!=nullptr);
+    // Only the world pass shares a slot across resolves; its cache misses land here.
+    HookTiming resolve_timing(HookPhase::QueuedResolve,timed);
     NativeBackendPipelineDesc desc;
     desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(viewport.reverse_depth);
     desc.pixel_id=program.inputs.pixel;
@@ -6586,10 +6617,28 @@ NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge
     slot=NativeStaticGroupMaterial{group.material.get(),geometry.get(),result.pass,std::move(resolved),
       std::move(candidate.world_parameter),candidate.world_column_major};
   }
-  const auto& material=*slot;
-  if(!material.world_parameter || !NativeStaticWorldOnly(reader,sources,instance,material.world_parameter->first,pass.device)) return decline(D::WorldParameter);
+  if(!slot->world_parameter) return decline(D::WorldParameter);
+  result.material=&*slot;
+  // Every instance's view: the shared capture's camera in the pass viewport.
+  result.view=NativeStaticInstanceView(slot->resolved.capture.camera,viewport,slot->resolved.render.words[5]!=0);
+  result.reverse_depth=viewport.reverse_depth;
+  result.geometry=std::move(geometry);
+  return result;
+}
+// One instance of a resolved group: its source, its world and its object. The
+// group's world binding is its single vertex g_mWorld, so the decode is
+// ApplyNativeScenePublishedWorld's. reuse, when given, lets an instance
+// resolved to the same material and world as before keep its object.
+NativeStaticInstanceWorld ResolveNativePublishedStaticInstanceWorldLocked(Bridge& state,const GuestReader& reader,
+    const NativeScenePublication& publication,const NativeStaticGroupResolution& group,uint32_t instance,uint32_t device,
+    NativeSceneInstanceReuse* reuse) {
+  using D=NativeStaticWorldDecline;
+  NativeStaticInstanceWorld result;
+  const auto decline=[&](D reason) { result.decline=reason; return result; };
+  const auto& sources=*group.sources;
+  const auto& material=*group.material;
   const auto* source=sources.Find(instance);
-  if(!source) return decline(D::Source);
+  if(!source || !NativeStaticWorldOnly(reader,*source,instance,material.world_parameter->first,device)) return decline(D::WorldParameter);
   const auto world=sources.WorldRegisters(*source,source->world_data);
   if(!world) return decline(D::WorldRegisters);
   if(EDF_NATIVE_FLAG(scene_sources_owned) && REXCVAR_GET(edf_native_scene_transform_audit)) {
@@ -6600,22 +6649,35 @@ NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge
       return decline(D::WorldMismatch);
     }
   }
-  // The instance's own world, on its copy of the group's capture.
-  auto capture=material.resolved.capture;
-  ApplyNativeScenePublishedWorld(capture,*world);
-  result.view=NativeStaticInstanceView(capture.camera,viewport,material.resolved.render.words[5]!=0);
+  const auto& capture=material.resolved.capture;
+  const auto matrix=DecodeNativeQueuedWorld(*world,material.world_column_major);
   if(EDF_NATIVE_FLAG(scene_selection_owned)) {
-    result.object=publication.Resolve(*source,geometry,capture);
+    result.object=publication.Resolve(*source,group.geometry,capture.material,matrix,reuse);
     if(!result.object) return decline(D::Lifetime);
   } else {
-    const auto id=state.scene_adapter.Observe(*source,geometry,capture);
+    const auto id=state.scene_adapter.Observe(*source,group.geometry,NativeSceneMaterialCapture{capture.material,matrix,capture.camera});
     result.object=SelectNativeSceneInstanceLocked(state,id);
   }
-  result.geometry=std::move(geometry); result.material=std::move(capture.material);
-  result.vertex=program.inputs.vertex; result.pixel=program.inputs.pixel;
-  result.reverse_depth=viewport.reverse_depth;
-  result.world_parameter=material.world_parameter; result.world_column_major=material.world_column_major;
   result.world=*world;
+  return result;
+}
+// Both halves for one instance, as the guest draw reaching it resolves it.
+NativeStaticInstanceResolution ResolveNativePublishedStaticInstanceLocked(Bridge& state,const GuestReader& reader,
+    const NativeScenePublication& publication,const NativeStaticGroupInputs& group,uint32_t instance,
+    const NativeStaticPassInputs& pass,const NativeStaticDrawBindings* draw=nullptr) {
+  NativeStaticInstanceResolution result;
+  std::optional<NativeStaticGroupMaterial> slot;
+  const auto resolved=ResolveNativePublishedStaticGroupLocked(state,reader,publication,group,{&instance,1},pass,draw,slot,false);
+  if(!resolved) { result.decline=resolved.decline; return result; }
+  auto world=ResolveNativePublishedStaticInstanceWorldLocked(state,reader,publication,resolved,instance,pass.device,nullptr);
+  if(!world) { result.decline=world.decline; return result; }
+  const auto& material=*resolved.material;
+  const auto& program=*group.material->program;
+  result.object=std::move(world.object); result.geometry=resolved.geometry; result.material=material.resolved.capture.material;
+  result.vertex=program.inputs.vertex; result.pixel=program.inputs.pixel;
+  result.view=resolved.view; result.pass=resolved.pass; result.reverse_depth=resolved.reverse_depth;
+  result.world_parameter=material.world_parameter; result.world_column_major=material.world_column_major;
+  result.world=world.world;
   return result;
 }
 bool TryAppendPublishedNativeSceneInstance(uint8_t* base,uint32_t device,uint32_t address,uint32_t instance,uint32_t count,NativeQueuedSceneGroup& group) {
@@ -11963,6 +12025,7 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
   using GroupCache=NativeStaticWorldGroupCache<NativeStaticPassView,std::optional<NativeStaticGroupMaterial>>;
   // Read and written only under state.mutex.
   static GroupCache cache;
+  static NativeSceneInstanceReuse reuse;
   const auto publication=native_scene_publication;
   auto* queues=native_scene_queues;
   const auto order=native_scene_pass_camera?NativeStaticWorldOrder(publication.get(),owner,queues):nullptr;
@@ -12132,27 +12195,27 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     // group, with its selections restored, to the guest callback.
     const auto instances=queues->Take(group);
     uint64_t batches=0;
-    std::vector<NativeStaticInstanceResolution> resolved;
-    resolved.reserve(instances.size());
+    std::vector<NativeStaticInstanceWorld> resolved;
+    NativeStaticGroupResolution resolution;
     const NativeStaticPassInputs pass{device,constants,cursor.material.render,cursor.material.samplers,
       NativeStaticPassView{*cursor.viewport,cursor.targets}};
     {
       HookTiming instances_timing(HookPhase::QueuedInstances);
-      // One Resolve per group: its instances share geometry, program and these
-      // pass inputs, so they share one material and record as instanced draws.
+      // One group resolve: its instances share geometry, program and these
+      // pass inputs, so they share one material and view and record as
+      // instanced draws. Per instance only its source, world and object.
       try {
-        for(const auto instance:instances) {
-          auto result=ResolveNativePublishedStaticInstanceLocked(state,reader,*publication,
-            {group,setup->count,material,setup},instance,pass,nullptr,shared);
-          if(!result) {
-            if(const auto* reason=NativeStaticWorldDeclineReason(result.decline)) report(reason);
-            break;
-          }
-          resolved.push_back(std::move(result));
-        }
+        const auto decline=ResolveNativeStaticGroupInstances(instances,resolved,[&] {
+          resolution=ResolveNativePublishedStaticGroupLocked(state,reader,*publication,
+            {group,setup->count,material,setup},instances,pass,nullptr,*shared,true);
+          return resolution.decline;
+        },[&](uint32_t instance) {
+          return ResolveNativePublishedStaticInstanceWorldLocked(state,reader,*publication,resolution,instance,device,&reuse);
+        });
+        if(const auto* reason=NativeStaticWorldDeclineReason(decline)) report(reason);
       } catch(const std::exception& error) { report(error.what()); resolved.clear(); }
     }
-    if(resolved.size()!=instances.size()) {
+    if(resolved.size()!=instances.size() || !resolution.material) {
       for(auto at=instances.rbegin();at!=instances.rend();++at) queues->Push(group,*at);
       return F::Instance;
     }
@@ -12162,7 +12225,9 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     if(shared==&fresh && fresh && fresh->geometry==retained.get()) {
       const auto captured=fresh->resolved.capture.material;
       const auto camera=fresh->resolved.capture.camera;
-      cache.Store(std::move(key),constants,candidate?std::move(candidate->reads):std::move(reads),next,std::move(fresh),captured.get(),camera);
+      auto& stored=cache.Store(std::move(key),constants,candidate?std::move(candidate->reads):std::move(reads),next,std::move(fresh),captured.get(),camera);
+      // fresh moved into the entry: the resolution's material is the entry's.
+      resolution.material=&*stored.material;
     }
     NativeQueuedSceneGroup batch;
     batch.targets=cursor.targets;
@@ -12171,11 +12236,8 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     // The shared capture gives every instance one view, so this is one flush.
     try {
       HookTiming record_timing(HookPhase::QueuedRecord);
-      for(auto& result:resolved) {
-        if(!batch.objects.empty() && (batch.view.view!=result.view.view || batch.view.projection!=result.view.projection ||
-           batch.view.view_projection!=result.view.view_projection)) FlushNativeQueuedSceneLocked(state,batch);
-        batch.view=result.view; batch.objects.push_back(result.object);
-      }
+      batch.view=resolution.view;
+      for(const auto& result:resolved) batch.objects.push_back(result.object);
       FlushNativeQueuedSceneLocked(state,batch);
     }
     catch(const std::exception& error) {
@@ -12189,8 +12251,8 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     batches=batch.execution.recordings();
     counters.draws+=state.scene_native_draws-draws;
     // Keep the guest path's lookup hint current with what this frame drew.
-    state.scene_adapter.RememberGroupMaterial(group,resolved.back().material);
-    world=World{resolved.back().vertex,*resolved.back().world_parameter,resolved.back().world};
+    state.scene_adapter.RememberGroupMaterial(group,resolution.material->resolved.capture.material);
+    world=World{material->program->inputs.vertex,*resolution.material->world_parameter,resolved.back().world};
     if(owed.empty()) owed_start=cursor.material.render;
     owed.push_back({setup->material,material->program,material});
     cursor.material=std::move(next);
@@ -12216,8 +12278,9 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
   uint64_t hits=0,misses=0,stores=0;
   size_t entries=0;
   lock_run();
-  cache.EndPass();
+  cache.EndPass(); reuse.EndPass();
   hits=cache.hits; misses=cache.misses; stores=cache.stores; entries=cache.size();
+  const auto reused=reuse.reuses,allocated=reuse.allocations;
   unlock_run();
   const auto passes=++counters.passes;
   if(passes<=4 || passes%1000==0) {
@@ -12226,10 +12289,10 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     const auto& f=counters.fallbacks;
     REXLOG_INFO("Native static world pass: passes={} native_groups={} empty_groups={} instances={} draws={} batches={} fallback_groups={} "
       "guest_queue={} program={} scissor={} eligibility={} pass_state={} instance={} handoffs={} replays={} binds={} composed={} original={} "
-      "cache_hits={} cache_misses={} cache_stores={} cache_entries={}",
+      "cache_hits={} cache_misses={} cache_stores={} cache_entries={} instance_reuses={} instance_allocations={}",
       passes,counters.native_groups,counters.empty_groups,counters.instances,counters.draws,counters.batches,fallbacks,
       f[0],f[1],f[2],f[3],f[4],f[5],counters.handoffs,counters.replays,counters.binds,counters.composed,counters.original,
-      hits,misses,stores,entries);
+      hits,misses,stores,entries,reused,allocated);
   }
 }
 }

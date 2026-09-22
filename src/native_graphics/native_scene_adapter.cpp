@@ -86,17 +86,35 @@ std::shared_ptr<const NativeSceneInstance> NativeScenePublication::Resolve(
     const NativeSceneSources::Source& source,
     const std::shared_ptr<const NativeIndexedMesh::RetainedDraw>& geometry,
     const NativeSceneMaterialCapture& capture) const {
+  return Resolve(source,geometry,capture.material,capture.world);
+}
+std::shared_ptr<const NativeSceneInstance> NativeScenePublication::Resolve(
+    const NativeSceneSources::Source& source,
+    const std::shared_ptr<const NativeIndexedMesh::RetainedDraw>& geometry,
+    const std::shared_ptr<const NativeSceneMaterial>& material,const NativeSceneMatrix& world,
+    NativeSceneInstanceReuse* reuse) const {
   const auto* found=by_source.Find({source.owner,source.generation,source.lod,source.part});
-  if(!found || !geometry || !capture.material ||
-     (*found)->object.geometry!=geometry || geometry->backend()!=capture.material->backend()) return {};
+  if(!found || !geometry || !material ||
+     (*found)->object.geometry!=geometry || geometry->backend()!=material->backend()) return {};
   const auto& retained=*found;
-  if(retained->object.material==capture.material && retained->object.world==capture.world &&
-     retained->previous==capture.world) return retained;
+  if(retained->object.material==material && retained->object.world==world &&
+     retained->previous==world) return retained;
+  NativeSceneInstanceReuse::Entry* entry=nullptr;
+  if(reuse) {
+    if(reuse->entries_.size()>=NativeSceneInstanceReuse::kLimit && !reuse->entries_.contains(retained.get())) reuse->entries_.clear();
+    entry=&reuse->entries_[retained.get()];
+    entry->used=reuse->pass_;
+    // The copy below of this same retained object, differing only in these two.
+    if(entry->resolved && entry->resolved->object.material==material && entry->resolved->object.world==world) {
+      ++reuse->reuses; return entry->resolved;
+    }
+  }
   auto resolved=std::make_shared<NativeSceneInstance>(*retained);
-  resolved->object.material=capture.material; resolved->object.world=capture.world;
+  resolved->object.material=material; resolved->object.world=world;
   // The pass already chose this exact world sample. Do not interpolate from
   // an unrelated material capture or previous visibility observation.
-  resolved->previous=capture.world;
+  resolved->previous=world;
+  if(entry) { entry->retained=retained; entry->resolved=resolved; ++reuse->allocations; }
   return resolved;
 }
 std::shared_ptr<const NativeScenePublication> NativeSceneAdapter::Publish(uint64_t tick,

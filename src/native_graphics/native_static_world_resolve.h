@@ -3,6 +3,9 @@
 #include "native_scene_geometry.h"
 #include "d3d11_render_state.h"
 #include "native_buffer_writes.h"
+#include "native_scene_sources.h"
+#include <span>
+#include <vector>
 
 namespace edf::native {
 // Why a published static instance was not resolved. Declines with a reason are
@@ -28,6 +31,37 @@ inline const char* NativeStaticWorldDeclineReason(NativeStaticWorldDecline decli
     case D::ComparisonChanged: return "due geometry comparison found a change";
     default: return nullptr;
   }
+}
+// Whether a source's instance parameters are its world alone - one range of
+// four registers at first reading the owner's world data, clear of the
+// device's constant block - from what its generation recorded at the lifetime
+// event (ReadNativeStaticSceneParts): no guest read. A source without
+// world_first is decided by reading its parameters instead.
+inline bool NativeStaticWorldOnlySource(const NativeSceneSources::Source& source,uint32_t first,uint32_t device) {
+  return source.world_data && source.world_first && *source.world_first==first &&
+    !(uint64_t(source.world_data)<uint64_t(device)+5888 && uint64_t(source.world_data)+64>uint64_t(device)+1792);
+}
+// One static group's resolve, split by what varies. group() runs once and
+// returns its decline: everything that depends on the group, its geometry and
+// the pass (revisions, buffer generations, the due comparison, the material,
+// its world binding and view), never on an instance. instance(i) runs per
+// instance and returns a result with a decline: the source, its world
+// registers and its publication object. The first decline of either ends the
+// walk and is returned; resolved then holds fewer results than instances and
+// the caller returns the whole group. With no instances nothing runs.
+template<class Result,class Group,class Instance>
+NativeStaticWorldDecline ResolveNativeStaticGroupInstances(std::span<const uint32_t> instances,std::vector<Result>& resolved,
+    Group&& group,Instance&& instance) {
+  resolved.clear();
+  if(instances.empty()) return NativeStaticWorldDecline::None;
+  if(const auto decline=group(); decline!=NativeStaticWorldDecline::None) return decline;
+  resolved.reserve(instances.size());
+  for(const auto at:instances) {
+    auto result=instance(at);
+    if(result.decline!=NativeStaticWorldDecline::None) return result.decline;
+    resolved.push_back(std::move(result));
+  }
+  return NativeStaticWorldDecline::None;
 }
 // A draw whose sampled buffer comparison has fallen due runs it instead of
 // declining until the next preload tick. The retained geometry stays drawable

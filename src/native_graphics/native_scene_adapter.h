@@ -8,6 +8,7 @@
 #include "native_scene_tree_publication.h"
 #include <functional>
 #include <set>
+#include <unordered_map>
 
 namespace edf::native {
 struct NativeSceneGroupGeometry {
@@ -28,6 +29,32 @@ using NativeSceneGroupOrders=NativeSharedMap<uint32_t,std::shared_ptr<const Nati
 struct NativeSceneGroupOrderAudit { uint64_t checks=0,mismatches=0,missing=0; };
 struct NativeSceneGroupKey {
   template<class T> uint32_t operator()(const std::shared_ptr<const T>& value) const { return value->group; }
+};
+// The copies NativeScenePublication::Resolve made of retained instances whose
+// pass material or world differs from theirs, kept across passes and
+// publications: an instance resolved again to the same material and world
+// gets the copy it got before instead of a new allocation. An entry is keyed by
+// its retained object and holds it, so a key is never a recycled address; a
+// republished (changed) object is a new key and its old entry ages out. The
+// copies are immutable, so one still held by an in-flight recording is shared
+// safely. Not synchronized.
+class NativeSceneInstanceReuse {
+ public:
+  // Once per pass: entries unused for kAge passes release what they hold.
+  void EndPass() {
+    if(++pass_%kAge) return;
+    std::erase_if(entries_,[&](const auto& item) { return pass_-item.second.used>kAge; });
+  }
+  void Clear() { entries_.clear(); }
+  size_t size() const { return entries_.size(); }
+  uint64_t allocations=0,reuses=0;
+ private:
+  friend struct NativeScenePublication;
+  struct Entry { std::shared_ptr<const NativeSceneInstance> retained,resolved; uint64_t used=0; };
+  static constexpr size_t kLimit=1<<16;
+  static constexpr uint64_t kAge=64;
+  std::unordered_map<const NativeSceneInstance*,Entry> entries_;
+  uint64_t pass_=0;
 };
 // Every index shares the chunks no tick has changed with the previous
 // publication; building one costs what changed, and none is written once built.
@@ -51,6 +78,14 @@ struct NativeScenePublication {
   std::shared_ptr<const NativeSceneInstance> Resolve(const NativeSceneSources::Source& source,
     const std::shared_ptr<const NativeIndexedMesh::RetainedDraw>& geometry,
     const NativeSceneMaterialCapture& capture) const;
+  // The same from the capture's material and decoded world alone. With reuse,
+  // an instance whose material or world differs from its retained object
+  // returns the copy made for it last time when that copy still matches, and
+  // allocates only when it does not; an unchanged instance is the retained one.
+  std::shared_ptr<const NativeSceneInstance> Resolve(const NativeSceneSources::Source& source,
+    const std::shared_ptr<const NativeIndexedMesh::RetainedDraw>& geometry,
+    const std::shared_ptr<const NativeSceneMaterial>& material,const NativeSceneMatrix& world,
+    NativeSceneInstanceReuse* reuse=nullptr) const;
 };
 // Persistent native objects keyed by audited guest lifetimes. Weak asset indexes
 // deduplicate allocations without keeping a retired level alive.
