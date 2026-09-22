@@ -491,6 +491,42 @@ void StaticGroupEligibility() {
   captured(); reader.StoreWord(device+10780,200);
   reader.StoreWord(material+72,device+2048); reader.StoreWord(device+2048+4,objects);
   check(Result::AliasedInput); // Texture table inside the device mirror.
+  {
+    // The world pass records this assessment's bytes and keeps the fence,
+    // retirement slots and stack as a witness: those words never enter the
+    // record, and over their changes the witness agrees with a fresh assessment.
+    captured(); reader.StoreWord(device+10780,200); reader.StoreWord(device+12188,0x30000);
+    reader.StoreWord(device+12272+4,old_texture);
+    NativeRecordedReads recorded;
+    NativeStaticEligibilityWitness witness;
+    Require(AssessNativeStaticGroup(NativeRecordingReader(reader,recorded),device,stack,input,&witness)==Result::Supported &&
+      !witness.fenced && witness.retirements.size()>4,"witnessed assessment declined or missed a texture retirement slot");
+    const auto agrees=[&](uint32_t at,bool expected,const char* what) {
+      Require(recorded.Unchanged(reader),"per-frame eligibility words entered the recorded reads");
+      Require(witness.Holds(reader,at)==expected &&
+        (AssessNativeStaticGroup(reader,device,at,input)==Result::Supported)==expected,what);
+    };
+    agrees(stack,true,"witness rejected an unchanged frame");
+    reader.StoreWord(device+10780,201); agrees(stack,true,"fence advance changed the witness");
+    reader.StoreWord(device+12188,0x30100); agrees(stack,true,"moved retired shader changed the witness");
+    reader.StoreWord(device+12272+4,old_texture+0x100); agrees(stack,true,"moved retired texture changed the witness");
+    reader.StoreWord(device+12272+4,textures+28+4-8); agrees(stack,false,"retired texture over a captured read was witnessed");
+    reader.StoreWord(device+12272+4,old_texture);
+    agrees(stack-0x1000,true,"another call depth changed the witness");
+    agrees(payload+16,false,"stack window over a captured read was witnessed");
+    agrees(2048,false,"stack without room for its window was witnessed");
+    reader.StoreWord(device+10780,0); agrees(stack,false,"unfenced retirement was witnessed");
+    reader.StoreWord(device+12188,0); reader.StoreWord(device+12272+4,0);
+    agrees(stack,true,"retirement-free unfenced frame was rejected");
+    // The program's own repeated slot needs the fence whatever the device holds.
+    captured(); reader.StoreWord(device+10780,200); reader.StoreWord(textures+28+8,0);
+    NativeRecordedReads repeated;
+    Require(AssessNativeStaticGroup(NativeRecordingReader(reader,repeated),device,stack,input,&witness)==Result::Supported &&
+      witness.fenced,"repeated texture slot's retirement was not witnessed");
+    reader.StoreWord(device+10780,0);
+    Require(repeated.Unchanged(reader) && !witness.Holds(reader,stack) &&
+      AssessNativeStaticGroup(reader,device,stack,input)==Result::RetirementMode,"unfenced repeated slot was witnessed");
+  }
   memory=seed;
   constexpr uint32_t defaults=0x28000,header=0x20000+872;
   reader.StoreWord(header+20,defaults-header);
@@ -565,7 +601,7 @@ void StaticWorldGroupCache() {
     return std::shared_ptr<const NativeSceneGroupMaterial>(std::move(group));
   };
   const auto material=publish(program);
-  Cache::Key key{.group=0x5000,.device=0x10000,.stack=0x70000,.vertex=0x100,.pixel=0x200,.material=material,
+  Cache::Key key{.group=0x5000,.device=0x10000,.vertex=0x100,.pixel=0x200,
     .program=material->program,.setup={0x1000,0x2000,0x3000,32,6,0x4000,0x100},.geometry=std::make_shared<const int>(7),
     .backend=std::make_shared<const int>(9),.view={1,2},.filtering=-1,.shaders=3};
   key.pass.render.words[0]=0x10001;
@@ -574,60 +610,103 @@ void StaticWorldGroupCache() {
   Cache cache;
   size_t resolves=0;
   NativeSceneView camera;
-  const auto lookup=[&](const Cache::Key& inputs,const std::vector<Constant>& constants) {
+  // The assessment's per-frame words: a retirement slot at 0x60 and the fence
+  // at 0x64, neither recorded; the alias-checked read is the recorded 0x80.
+  constexpr uint32_t frame_stack=0x70000;
+  const NativeStaticEligibilityWitness witness{{{0x80,16}},{0x60},0x64,false};
+  const auto lookup=[&](const Cache::Key& inputs,const std::vector<Constant>& constants,uint32_t stack=frame_stack) {
     auto* entry=cache.Candidate(inputs);
-    if(entry && entry->reads.Unchanged(guest) && Cache::Current(*entry,constants,nullptr,camera)) return entry->material.identity;
+    if(entry && entry->reads.Unchanged(guest) && entry->eligibility.Holds(guest,stack) &&
+       Cache::Current(*entry,constants,nullptr,camera)) return entry->material.identity;
     ++resolves;
     NativeRecordedReads reads;
     const NativeRecordingReader recorder(guest,reads);
     recorder.Word(0x40); recorder.Bytes(0x80,16);
-    return cache.Store(inputs,constants,std::move(reads),{},Material{std::make_shared<const int>(int(resolves))},nullptr,camera).material.identity;
+    return cache.Store(inputs,constants,std::move(reads),witness,{},Material{std::make_shared<const int>(int(resolves))},
+      nullptr,camera,{stack,nullptr}).material.identity;
   };
   const auto constants=material->constants;
   const auto identity=lookup(key,constants);
   Require(resolves==1 && cache.size()==1,"first group visit did not resolve and store");
   Require(lookup(key,constants)==identity && resolves==1,"cache hit resolved again or changed the material");
   Require(lookup(key,constants)==identity && resolves==1,"second cache hit resolved again");
-  // Every key component: a change is a different group, pass or publication.
-  const auto misses=[&](auto&& change,const char* what) { auto changed=key; change(changed); Require(!cache.Candidate(changed),what); };
-  misses([](Cache::Key& k) { k.group+=4; },"group address change hit");
-  misses([](Cache::Key& k) { k.device+=16; },"device change hit");
-  misses([](Cache::Key& k) { k.stack-=16; },"stack change hit");
-  misses([](Cache::Key& k) { k.vertex^=1; },"vertex id change hit");
-  misses([](Cache::Key& k) { k.pixel^=1; },"pixel id change hit");
-  misses([&](Cache::Key& k) { k.program=std::make_shared<NativeSceneMaterialProgram>(*program); },"program change hit");
-  misses([](Cache::Key& k) { k.setup.count+=3; },"geometry setup change hit");
-  misses([](Cache::Key& k) { k.setup.material+=4; },"guest material change hit");
-  misses([](Cache::Key& k) { k.geometry=std::make_shared<const int>(7); },"retained geometry change hit");
-  misses([](Cache::Key& k) { k.backend=std::make_shared<const int>(9); },"backend change hit");
-  misses([](Cache::Key& k) { k.pass.render.words[0]^=1; },"incoming render words change hit");
-  misses([](Cache::Key& k) { k.pass.samplers[3].words[1]^=1; },"incoming sampler pass change hit");
-  misses([](Cache::Key& k) { k.view.viewport^=1; },"pass viewport change hit");
-  misses([](Cache::Key& k) { k.view.targets^=1; },"pass targets change hit");
-  misses([](Cache::Key& k) { k.filtering=16; },"filtering change hit");
-  misses([](Cache::Key& k) { k.shaders+=1; },"shader registry change hit");
-  Require(cache.Candidate(key),"unchanged key missed");
+  // Every key component: a change is a different group, pass or program, and
+  // the miss diagnostic names exactly that component.
+  using M=NativeStaticWorldMiss;
+  const auto misses=[&](auto&& change,M component,const char* what) {
+    auto changed=key; change(changed);
+    Require(!cache.Candidate(changed),what);
+    Require(NativeStaticWorldKeyDifferences(key,changed)==NativeStaticWorldMissBit(component),"miss diagnostic named another component");
+  };
+  misses([](Cache::Key& k) { k.group+=4; },M::Absent,"group address change hit");
+  misses([](Cache::Key& k) { k.device+=16; },M::Device,"device change hit");
+  misses([](Cache::Key& k) { k.vertex^=1; },M::Vertex,"vertex id change hit");
+  misses([](Cache::Key& k) { k.pixel^=1; },M::Pixel,"pixel id change hit");
+  misses([&](Cache::Key& k) { k.program=std::make_shared<NativeSceneMaterialProgram>(*program); },M::Program,"program change hit");
+  misses([](Cache::Key& k) { k.setup.count+=3; },M::Setup,"geometry setup change hit");
+  misses([](Cache::Key& k) { k.setup.material+=4; },M::Setup,"guest material change hit");
+  misses([](Cache::Key& k) { k.geometry=std::make_shared<const int>(7); },M::Geometry,"retained geometry change hit");
+  misses([](Cache::Key& k) { k.backend=std::make_shared<const int>(9); },M::Backend,"backend change hit");
+  misses([](Cache::Key& k) { k.pass.render.words[0]^=1; },M::Pass,"incoming render words change hit");
+  misses([](Cache::Key& k) { k.pass.samplers[3].words[1]^=1; },M::Pass,"incoming sampler pass change hit");
+  misses([](Cache::Key& k) { k.view.viewport^=1; },M::View,"pass viewport change hit");
+  misses([](Cache::Key& k) { k.view.targets^=1; },M::View,"pass targets change hit");
+  misses([](Cache::Key& k) { k.filtering=16; },M::Filtering,"filtering change hit");
+  misses([](Cache::Key& k) { k.shaders+=1; },M::Shaders,"shader registry change hit");
+  Require(cache.Candidate(key) && !NativeStaticWorldKeyDifferences(key,key),"unchanged key missed");
+  Require(cache.Missed(NativeStaticWorldMissBit(M::Reads)|NativeStaticWorldMissBit(M::Stack))==1 &&
+    cache.missed[size_t(M::Reads)]==1 && cache.missed[size_t(M::Stack)]==1 && cache.missed[size_t(M::Pass)]==0 &&
+    cache.MissSummary().find("reads=1")!=std::string::npos,"miss diagnostic miscounted its components");
+  // The stack is not keyed: another call depth hits while the witness holds,
+  // and misses only where the assessment would decline (the 4 KB below it
+  // aliasing an alias-checked read, or no room for it).
+  Require(lookup(key,constants,frame_stack-0x230)==identity && resolves==1,"stack change alone resolved again");
+  Require(cache.Find(0x5000)->observed.stack==frame_stack,"a hit replaced the stored observation");
+  Require(lookup(key,constants,0x1000)!=identity && resolves==2,"stack window over a captured read reused eligibility");
+  Require(lookup(key,constants,0x800)!=identity && resolves==3,"stack without room for the window reused eligibility");
+  auto stacked=lookup(key,constants);
+  Require(stacked!=identity && resolves==3 && lookup(key,constants,frame_stack+0x100)==stacked && resolves==3,
+    "restored stack did not hit");
+  // Retirement slot and fence: per-frame words, checked as the predicate.
+  const auto word=[&](uint32_t at,uint32_t value) { guest.StoreWord(at,value); };
+  word(0x60,0xa0); // An old handle with no fence: the group would retire it through the queue.
+  Require(lookup(key,constants)!=stacked && resolves==4,"unfenced retirement reused eligibility");
+  word(0x64,200); stacked=lookup(key,constants);
+  Require(resolves==4,"fenced retirement of an unaliased handle resolved again");
+  word(0x64,201); word(0x60,0xb0);
+  Require(lookup(key,constants)==stacked && resolves==4,"fence advance or moved retired handle resolved again");
+  word(0x60,0x78); // Its fence store at 0x80 lands on a captured read.
+  Require(lookup(key,constants)!=stacked && resolves==5,"retirement aliasing a captured read reused eligibility");
+  word(0x60,0); word(0x64,0);
+  stacked=lookup(key,constants);
+  Require(resolves==5 && lookup(key,constants)==stacked && resolves==5,"retirement-free frame did not hit");
   // Constants: without a derivable camera every constant is compared.
   auto tinted=constants; tinted[0].registers[3]^=1;
-  Require(lookup(key,tinted)!=identity && resolves==2,"changed material constant reused the material");
+  Require(lookup(key,tinted)!=stacked && resolves==6,"changed material constant reused the material");
+  NativeStaticWorldMiss why{};
+  size_t differed=0;
+  Require(!Cache::Current(*cache.Find(0x5000),constants,nullptr,camera,&why,&differed) && why==M::Constants && differed==0,
+    "constant miss diagnostic named another constant");
   auto moved=constants; moved[1].registers[7]^=1;
-  Require(lookup(key,moved)!=identity && resolves==3,"underivable camera change reused the material");
+  Require(lookup(key,moved)!=stacked && resolves==7,"underivable camera change reused the material");
   const auto current=lookup(key,constants);
-  Require(resolves==4 && lookup(key,constants)==current && resolves==4,"restored constants did not hit");
+  Require(resolves==8 && lookup(key,constants)==current && resolves==8,"restored constants did not hit");
   // Eligibility: a changed guest byte the assessment read resolves again.
   memory[0x85]^=1;
-  Require(lookup(key,constants)!=current && resolves==5,"changed eligibility input reused the entry");
-  Require(cache.Candidate(key) && lookup(key,constants) && resolves==5,"revalidated eligibility did not hit");
-  // A program or constant republish is a new published object: the old
-  // entry no longer hits and the group resolves under the new one.
-  auto republished=key; republished.material=publish(program);
+  Require(lookup(key,constants)!=current && resolves==9,"changed eligibility input reused the entry");
+  Require(cache.Candidate(key) && lookup(key,constants) && resolves==9,"revalidated eligibility did not hit");
+  // A republish of the same program and constants (the preload's refresh of
+  // a constant the pass replaces or zeroes) is not keyed: it still hits. Its
+  // constants are compared, so a changed one misses.
   const auto before=lookup(key,constants);
-  Require(lookup(republished,constants)!=before && resolves==6,"republished material reused the old resolve");
-  Require(!cache.Candidate(key),"old publication hit after a republish");
+  const auto republished=publish(program);
+  Require(republished!=material && lookup(key,republished->constants)==before && resolves==9,
+    "republished group material with an unchanged program and constants resolved again");
+  auto retinted=republished->constants; retinted[0].registers[0]^=1;
+  Require(lookup(key,retinted)!=before && resolves==10,"republished changed constant reused the old resolve");
   auto reprogrammed=key;
   reprogrammed.program=std::make_shared<NativeSceneMaterialProgram>(*program);
-  reprogrammed.material=publish(reprogrammed.program);
-  Require(lookup(reprogrammed,constants) && resolves==7 && !cache.Candidate(republished),"republished program reused the old resolve");
+  Require(lookup(reprogrammed,constants) && resolves==11 && !cache.Candidate(key),"republished program reused the old resolve");
   cache.Invalidate(0x5000);
   Require(!cache.Candidate(reprogrammed) && cache.size()==0,"invalidated group survived");
   cache.Clear();
@@ -2104,15 +2183,33 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
     using Cache=NativeStaticWorldGroupCache<int,int>;
     Cache cache;
     Cache::Key key; key.group=1;
-    const auto& entry=cache.Store(key,camera_constants,{},{},0,moved.capture.material.get(),moved.capture.camera);
+    const auto& entry=cache.Store(key,camera_constants,{},{},{},0,moved.capture.material.get(),moved.capture.camera);
     Require(entry.derived,"a resolved capture's camera was not derivable");
+    Require(entry.world==std::vector<uint8_t>{1,0,0,0},"object world constant not marked as zeroed by the capture");
     NativeSceneView reused;
     Require(Cache::Current(entry,program_constants,resolved.capture.material.get(),reused) &&
       NativeSceneCameraIdentical(reused,resolved.capture.camera),"cache hit derived a camera other than a resolve's");
     auto tinted=program_constants; tinted[3].registers[3]^=1;
     Require(!Cache::Current(entry,tinted,resolved.capture.material.get(),reused),"non-camera constant change reused the material");
-    auto world=program_constants; world[0].registers[5]^=1;
-    Require(!Cache::Current(entry,world,resolved.capture.material.get(),reused),"g_mWorld constant change reused the material");
+    // g_mWorld (the preload refreshes it every tick from the last drawn
+    // object) is zeroed out of the image and replaced per instance: a moved
+    // world resolves to the same material, so it reuses the entry.
+    auto world=program_constants;
+    Word(world[0].registers,48,std::bit_cast<uint32_t>(3.f)); Word(world[0].registers,52,std::bit_cast<uint32_t>(-2.f));
+    const auto moved_world=material_program->Resolve(material_desc,false,world,pass_state,pass_samplers);
+    Require(moved_world.capture.material->Equivalent(*resolved.capture.material),"g_mWorld reached the material image");
+    Require(Cache::Current(entry,world,resolved.capture.material.get(),reused),"moved object world did not reuse the material");
+    // A NaN world makes the capture's self-comparison throw: never reused.
+    auto invalid_world=program_constants; Word(invalid_world[0].registers,20,0x7fc00000);
+    Reject([&] { material_program->Resolve(material_desc,false,invalid_world,pass_state,pass_samplers); });
+    NativeStaticWorldMiss why{};
+    Require(!Cache::Current(entry,invalid_world,resolved.capture.material.get(),reused,&why) && why==NativeStaticWorldMiss::World,
+      "NaN object world reused the material");
+    // Bytes past the matrix, and a pixel-stage constant of the same name, are still compared.
+    auto longer=program_constants; longer[0].registers.resize(80);
+    Require(!Cache::Current(entry,longer,resolved.capture.material.get(),reused),"resized world constant reused the material");
+    auto pixel_world=program_constants; pixel_world[0].pixel=true;
+    Require(!Cache::Current(entry,pixel_world,resolved.capture.material.get(),reused),"pixel g_mWorld reused the material");
   }
   NativeSceneMaterialPassState inherited{pass_state,pass_samplers};
   inherited.samplers[7].words[0]=0x12400;

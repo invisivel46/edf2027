@@ -1,11 +1,15 @@
 #pragma once
 #include "native_recorded_reads.h"
 #include "native_scene_adapter.h"
+#include "native_static_group_eligibility.h"
+#include <algorithm>
+#include <array>
 #include <bit>
 #include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -76,10 +80,14 @@ inline bool NativeSceneCameraIdentical(const NativeSceneView& a,const NativeScen
 // eligibility, chained pass state, resolved and interned material, pipeline
 // and world binding only while all of these match and Current accepts the
 // constants. Completeness, per cached computation:
-// - AssessNativeStaticGroup(reader,device,stack,setup): device, stack and
-//   setup are here; every guest byte it read is in the entry's
-//   NativeRecordedReads and compared before reuse (a deterministic reader of
-//   those bytes visits the same addresses and returns the same result).
+// - AssessNativeStaticGroup(reader,device,stack,setup,witness): device and
+//   setup are here; every guest byte it read through the recorder is in the
+//   entry's NativeRecordedReads and compared before reuse (a deterministic
+//   reader of those bytes visits the same addresses and returns the same
+//   result). The stack, fence and retirement slots are per-frame and not
+//   recorded: the entry's NativeStaticEligibilityWitness re-checks the
+//   predicate the outcome depends on (stack aliasing, zero/non-zero fence and
+//   retired-handle aliasing) against this pass's stack and words.
 // - CanDeferCpuActivation, pass.After(program) and its decode: program and
 //   pass (the incoming render words and sampler pass, the cursor it chains).
 // - program.Resolve: vertex/pixel ids and shaders (program), reverse depth
@@ -92,15 +100,16 @@ inline bool NativeSceneCameraIdentical(const NativeSceneView& a,const NativeScen
 // - ConfigureNativeQueuedWorldLocked: the resolved material, the program and
 //   the registered vertex shader bindings, which change only with shaders
 //   (the registry generation, advanced on every register and release).
-// material is the immutable published NativeSceneGroupMaterial: a program or
-// constant republish, or a new publication that changes the group, publishes a
-// new object, and the key holds the old one so its address is never reused.
-// geometry and backend are held for the same reason. A backend or device
-// replacement is a new backend pointer.
+// Not the published NativeSceneGroupMaterial object: the preload republishes
+// it whenever a refreshed constant moves (g_mWorld, the last drawn object's
+// world, moves every tick), and the resolve reads it only as its program (held
+// here) and its constants (compared by Current); its revision is checked per
+// instance against the live membership. program, geometry and backend are
+// held so their addresses are never reused. A backend or device replacement
+// is a new backend pointer.
 template<class View>
 struct NativeStaticWorldGroupKey {
-  uint32_t group=0,device=0,stack=0,vertex=0,pixel=0;
-  std::shared_ptr<const NativeSceneGroupMaterial> material;
+  uint32_t group=0,device=0,vertex=0,pixel=0;
   std::shared_ptr<const NativeSceneMaterialProgram> program;
   NativeSceneGeometrySource setup;
   std::shared_ptr<const void> geometry,backend;
@@ -109,10 +118,49 @@ struct NativeStaticWorldGroupKey {
   int filtering=-1;
   uint64_t shaders=0;
   bool operator==(const NativeStaticWorldGroupKey& other) const {
-    return group==other.group && device==other.device && stack==other.stack && vertex==other.vertex && pixel==other.pixel &&
-      material==other.material && program==other.program && setup==other.setup && geometry==other.geometry &&
+    return group==other.group && device==other.device && vertex==other.vertex && pixel==other.pixel &&
+      program==other.program && setup==other.setup && geometry==other.geometry &&
       backend==other.backend && pass==other.pass && view==other.view && filtering==other.filtering && shaders==other.shaders;
   }
+};
+// Why a group's lookup missed, for the pass's miss diagnostic. Key components
+// through Shaders; Reads/Witness are eligibility; Constants/Camera/World are
+// Current. Published and Stack are observations only (neither is compared):
+// the published group material object, or the pass stack, differed from the
+// stored resolve's.
+enum class NativeStaticWorldMiss : uint32_t {
+  Absent,Device,Vertex,Pixel,Program,Setup,Geometry,Backend,Pass,View,Filtering,Shaders,
+  Reads,Witness,Constants,Camera,World,Published,Stack,Count
+};
+inline constexpr std::array<const char*,size_t(NativeStaticWorldMiss::Count)> kNativeStaticWorldMissNames{
+  "absent","device","vertex","pixel","program","setup","geometry","backend","pass","view","filtering","shaders",
+  "reads","witness","constants","camera","world","published","stack"};
+constexpr uint32_t NativeStaticWorldMissBit(NativeStaticWorldMiss miss) { return 1u<<uint32_t(miss); }
+template<class View>
+uint32_t NativeStaticWorldKeyDifferences(const NativeStaticWorldGroupKey<View>& a,const NativeStaticWorldGroupKey<View>& b) {
+  using M=NativeStaticWorldMiss;
+  uint32_t mask=0;
+  const auto differ=[&](bool different,M miss) { if(different) mask|=NativeStaticWorldMissBit(miss); };
+  differ(a.group!=b.group,M::Absent); differ(a.device!=b.device,M::Device); differ(a.vertex!=b.vertex,M::Vertex);
+  differ(a.pixel!=b.pixel,M::Pixel); differ(a.program!=b.program,M::Program); differ(!(a.setup==b.setup),M::Setup);
+  differ(a.geometry!=b.geometry,M::Geometry); differ(a.backend!=b.backend,M::Backend); differ(!(a.pass==b.pass),M::Pass);
+  differ(!(a.view==b.view),M::View); differ(a.filtering!=b.filtering,M::Filtering); differ(a.shaders!=b.shaders,M::Shaders);
+  return mask;
+}
+// The first 64 bytes of a g_mWorld constant as the capture reads them back:
+// whether any of its 16 big-endian floats is NaN (CaptureNativeSceneMaterial's
+// `*value!=result.world` would then throw).
+inline bool NativeStaticWorldHasNaN(std::span<const uint8_t> registers) {
+  for(size_t i=0;i+4<=64 && i+4<=registers.size();i+=4) {
+    const auto value=std::bit_cast<float>(uint32_t(registers[i])<<24|uint32_t(registers[i+1])<<16|uint32_t(registers[i+2])<<8|registers[i+3]);
+    if(value!=value) return true;
+  }
+  return false;
+}
+// Diagnostic observations of a stored resolve; never compared for reuse.
+struct NativeStaticWorldObserved {
+  uint32_t stack=0;
+  std::shared_ptr<const void> published;
 };
 // Cross-frame per-group cache of the static world pass, one entry per group
 // address. Not synchronized: the pass uses it under the bridge lock.
@@ -121,17 +169,21 @@ class NativeStaticWorldGroupCache {
  public:
   using Key=NativeStaticWorldGroupKey<View>;
   using Constants=std::vector<NativeSceneMaterialInputs::Constant>;
+  using Observed=NativeStaticWorldObserved;
   struct Entry {
     Key key;
     // The pass constants the material was resolved with (camera and
-    // animation applied), and per constant whether it only reaches the
-    // capture as its camera (derived again from the new constants on reuse).
+    // animation applied); per constant whether it only reaches the capture as
+    // its camera (derived again from the new constants on reuse), and whether
+    // it is the object world whose 64 bytes the capture zeroes (see Store).
     Constants constants;
-    std::vector<uint8_t> camera;
+    std::vector<uint8_t> camera,world;
     bool derived=false;
     NativeRecordedReads reads;
+    NativeStaticEligibilityWitness eligibility;
     NativeSceneMaterialPassState next;
     Material material{};
+    Observed observed;
     uint64_t used=0;
   };
   // The group's entry when every key component matches, else null.
@@ -141,37 +193,75 @@ class NativeStaticWorldGroupCache {
     found->second.used=pass_;
     return &found->second;
   }
+  // The group's entry regardless of its key (diagnostics).
+  const Entry* Find(uint32_t group) const {
+    const auto found=entries_.find(group);
+    return found==entries_.end()?nullptr:&found->second;
+  }
   // Whether entry's material is the one these pass constants resolve to:
   // every constant equal except those that only feed the derived camera,
   // which is then derived from constants into camera (material is the
-  // cached capture's). A camera that cannot be derived is a miss.
+  // cached capture's), and the object world's zeroed 64 bytes. A camera that
+  // cannot be derived is a miss. miss, when given, receives why it missed.
   static bool Current(const Entry& entry,std::span<const NativeSceneMaterialInputs::Constant> constants,
-      const NativeSceneMaterial* material,NativeSceneView& camera) {
-    if(constants.size()!=entry.constants.size()) return false;
+      const NativeSceneMaterial* material,NativeSceneView& camera,NativeStaticWorldMiss* miss=nullptr,size_t* differed=nullptr) {
+    const auto fail=[&](NativeStaticWorldMiss why,size_t at) {
+      if(miss) *miss=why;
+      if(differed) *differed=at;
+      return false;
+    };
+    using M=NativeStaticWorldMiss;
+    if(constants.size()!=entry.constants.size()) return fail(M::Constants,constants.size());
     for(size_t i=0;i<constants.size();++i) {
       const auto& a=constants[i]; const auto& b=entry.constants[i];
+      const bool shape=a.pixel==b.pixel && a.global==b.global && a.name==b.name && a.registers.size()==b.registers.size();
       if(entry.derived && entry.camera[i]) {
-        if(a.pixel!=b.pixel || a.global!=b.global || a.name!=b.name || a.registers.size()!=b.registers.size()) return false;
-      } else if(!(a==b)) return false;
+        if(!shape) return fail(M::Camera,i);
+      } else if(!entry.world.empty() && entry.world[i]) {
+        if(!shape || !std::equal(a.registers.begin()+64,a.registers.end(),b.registers.begin()+64)) return fail(M::Constants,i);
+        if(NativeStaticWorldHasNaN(a.registers)) return fail(M::World,i);
+      } else if(!(a==b)) return fail(M::Constants,i);
     }
     if(!entry.derived) return true;
-    if(!material) return false;
+    if(!material) return fail(M::Camera,constants.size());
     const auto derived=NativeStaticCaptureCamera(*material,constants);
-    if(!derived) return false;
+    if(!derived) return fail(M::Camera,constants.size());
     camera.view=derived->view; camera.projection=derived->projection; camera.view_projection=derived->view_projection;
     return true;
   }
   // Records a resolve. The camera is derived on reuse only when deriving it
   // from these constants reproduces the resolved capture's (captured, camera)
-  // bit for bit; otherwise, or with no capture, every constant must match.
-  Entry& Store(Key key,Constants constants,NativeRecordedReads reads,NativeSceneMaterialPassState next,Material material,
-      const NativeSceneMaterial* captured,const NativeSceneView& camera) {
+  // bit for bit; otherwise, or with no capture, every camera constant must
+  // match. The object world is excluded when captured binds exactly one world
+  // matrix, in the vertex stage (the only kind the pass records): then every
+  // vertex g_mWorld constant's first 64 bytes land on that variable, which
+  // CaptureNativeSceneMaterial zeroes from the image and reads back only into
+  // capture.world - which the resolve replaces with each instance's published
+  // world - and its only other use is a self-comparison that fails on NaN
+  // (Current rejects a NaN world). Bytes past 64 are still compared.
+  Entry& Store(Key key,Constants constants,NativeRecordedReads reads,NativeStaticEligibilityWitness eligibility,
+      NativeSceneMaterialPassState next,Material material,const NativeSceneMaterial* captured,const NativeSceneView& camera,
+      Observed observed={}) {
     if(entries_.size()>=kLimit && !entries_.contains(key.group)) entries_.clear();
     Entry entry{std::move(key),std::move(constants)};
     const auto derived=captured?NativeStaticCaptureCamera(*captured,entry.constants,&entry.camera):std::nullopt;
     entry.derived=derived && NativeSceneCameraIdentical(*derived,camera);
     if(!entry.derived) entry.camera.clear();
-    entry.reads=std::move(reads); entry.next=std::move(next); entry.material=std::move(material); entry.used=pass_;
+    if(captured) {
+      size_t worlds=0; bool vertex=false;
+      for(const auto& image:captured->constants()) for(const auto& matrix:image.matrices)
+        if(matrix.source==NativeSceneMatrixSource::World) { ++worlds; vertex=image.stage==NativeBackendStage::Vertex; }
+      if(worlds==1 && vertex) {
+        entry.world.resize(entry.constants.size());
+        for(size_t i=0;i<entry.constants.size();++i) {
+          const auto& constant=entry.constants[i];
+          entry.world[i]=!constant.pixel && constant.name=="g_mWorld" && constant.registers.size()>=64 &&
+            !NativeStaticWorldHasNaN(constant.registers);
+        }
+      }
+    }
+    entry.reads=std::move(reads); entry.eligibility=std::move(eligibility); entry.next=std::move(next);
+    entry.material=std::move(material); entry.observed=std::move(observed); entry.used=pass_;
     const auto group=entry.key.group;
     ++stores;
     return entries_.insert_or_assign(group,std::move(entry)).first->second;
@@ -185,7 +275,21 @@ class NativeStaticWorldGroupCache {
     std::erase_if(entries_,[&](const auto& item) { return pass_-item.second.used>kAge; });
   }
   size_t size() const { return entries_.size(); }
-  uint64_t hits=0,misses=0,stores=0;
+  // Counts one miss with every reason in mask; returns the miss count.
+  uint64_t Missed(uint32_t mask) {
+    for(size_t i=0;i<missed.size();++i) if(mask>>i&1) ++missed[i];
+    return ++miss_events;
+  }
+  std::string MissSummary() const {
+    std::string text;
+    for(size_t i=0;i<missed.size();++i) {
+      if(!text.empty()) text+=' ';
+      text+=kNativeStaticWorldMissNames[i]; text+='='; text+=std::to_string(missed[i]);
+    }
+    return text;
+  }
+  uint64_t hits=0,misses=0,stores=0,miss_events=0;
+  std::array<uint64_t,size_t(NativeStaticWorldMiss::Count)> missed{};
  private:
   static constexpr size_t kLimit=16384;
   static constexpr uint64_t kAge=256;

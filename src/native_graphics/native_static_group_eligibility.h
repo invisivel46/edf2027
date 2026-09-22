@@ -4,12 +4,58 @@
 #include "native_scene_geometry.h"
 #include <algorithm>
 #include <array>
+#include <optional>
 
 namespace edf::native {
 enum class NativeStaticGroupEligibility {
   Supported, Geometry, TextureOrState, Alignment, RetirementMode, AliasedInput, PassState
 };
 struct NativeStaticReadRange { uint32_t address; size_t bytes; };
+// A word the assessment reads outside a recording reader's record
+// (NativeRecordingReader::Unrecorded); plain readers read it as usual.
+template<class Reader> uint32_t NativeUnrecordedWord(const Reader& reader,uint32_t address) {
+  if constexpr(requires { reader.Unrecorded(); }) return reader.Unrecorded().Word(address);
+  else return reader.Word(address);
+}
+// The per-frame inputs of a Supported assessment, kept as the predicate its
+// outcome depends on instead of their bytes. The device fence and its
+// retirement slots (the previous shaders', and each texture slot's previously
+// bound handle) move as frames retire, and the stack follows call depth. The
+// assessment uses them only as below, so with the same recorded bytes it
+// returns Supported again iff Holds:
+// - stack: stack>=4096 and [stack-4096,stack) aliases no alias-checked read;
+// - each retirement slot: zero, or the fence is non-zero and the 4 bytes at
+//   its value+8 alias no alias-checked read;
+// - fence: only zero or not, when a slot or the program's own repeated texture
+//   slot (fenced) retires a handle.
+// Every other alias-checked read and write follows from device and recorded
+// bytes (program tables, pass mirrors and texture descriptors are read through
+// the recorder and their addresses from recorded pointers), so `reads` is the
+// same list while those bytes are unchanged.
+struct NativeStaticEligibilityWitness {
+  std::vector<NativeStaticReadRange> reads;
+  std::vector<uint32_t> retirements;
+  uint32_t fence=0;
+  bool fenced=false;
+  template<class Reader> bool Holds(const Reader& reader,uint32_t stack) const {
+    const auto aliases=[&](uint64_t address,uint64_t bytes) {
+      for(const auto& read:reads)
+        if(uint64_t(read.address)<address+bytes && address<uint64_t(read.address)+read.bytes) return true;
+      return false;
+    };
+    if(stack<4096 || aliases(uint64_t(stack)-4096,4096)) return false;
+    try {
+      std::optional<bool> live;
+      const auto fence_set=[&] { if(!live) live=reader.Word(fence)!=0; return *live; };
+      if(fenced && !fence_set()) return false;
+      for(const auto slot:retirements) {
+        const auto previous=reader.Word(slot);
+        if(previous && (!fence_set() || aliases(reader.Add(previous,8),4))) return false;
+      }
+    } catch(const std::exception&) { return false; }
+    return true;
+  }
+};
 template<class Reader> struct NativeStaticReadTrace {
   const Reader& backing;
   std::vector<NativeStaticReadRange>& reads;
@@ -32,9 +78,12 @@ template<class Reader> struct NativeStaticReadTrace {
 // resolved by this material's own state operations; the cursor carries the
 // result forward. Only that resolved pass must be representable, not the
 // incoming one. This runs before deferring any CPU work, while inputs are intact.
+// witness, when given, receives a Supported outcome's per-frame predicate. The
+// fence and retirement slots are read unrecorded, so a caller recording this
+// assessment's bytes must keep the witness with them and check both.
 template<class Reader>
 NativeStaticGroupEligibility AssessNativeStaticGroup(const Reader& reader,uint32_t device,
-    uint32_t stack,const NativeSceneGeometrySource& geometry) {
+    uint32_t stack,const NativeSceneGeometrySource& geometry,NativeStaticEligibilityWitness* witness=nullptr) {
   using Result=NativeStaticGroupEligibility;
   if(!geometry.vertex || !geometry.index || !geometry.declaration || !geometry.material ||
      !geometry.count || geometry.count%3 || !geometry.stride || geometry.stride%4 || geometry.stride>2048)
@@ -47,7 +96,6 @@ NativeStaticGroupEligibility AssessNativeStaticGroup(const Reader& reader,uint32
   try { program=ReadNativeMaterialCpuProgram(trace,geometry.material,device); }
   catch(const std::exception&) { return Result::TextureOrState; }
   if(!program.vertex || !program.pixel || program.vertex!=geometry.shader) return Result::Geometry;
-  const auto word=[&](uint32_t offset) { return reader.Word(reader.Add(device,offset)); };
   std::vector<NativeStaticReadRange> writes;
   // Pass inputs through the same readers prepare and the state/texture
   // executors run: the live render pass (8200964C color scale check) and every
@@ -86,24 +134,40 @@ NativeStaticGroupEligibility AssessNativeStaticGroup(const Reader& reader,uint32
     }
   }
   writes.push_back({device,device_extent}); writes.push_back({stack-4096,4096});
-  const auto fence=word(10780);
-  for(uint32_t offset:{12188u,12164u,12420u,12416u}) {
-    const auto previous=word(offset);
-    if(!previous) continue;
-    if(!fence) return Result::RetirementMode;
+  // Fence and retirement slots are per-frame words: read unrecorded and used
+  // only as NativeStaticEligibilityWitness describes.
+  const auto fence_word=reader.Add(device,10780);
+  std::optional<uint32_t> fence;
+  bool fenced=false;
+  std::vector<uint32_t> retirements;
+  const auto retires=[&](uint32_t previous) {
+    if(!previous) return true;
+    if(!fence) fence=NativeUnrecordedWord(reader,fence_word);
+    if(!*fence) return false;
     writes.push_back({reader.Add(previous,8),4});
+    return true;
+  };
+  for(uint32_t offset:{12188u,12164u,12420u,12416u}) {
+    const auto slot=reader.Add(device,offset);
+    retirements.push_back(slot);
+    if(!retires(NativeUnrecordedWord(reader,slot))) return Result::RetirementMode;
   }
   // Texture binding: descriptor words, binding handle, dirty bank and the
-  // previous handle's fence. Repeated slots retire the handle bound earlier.
-  std::array<uint32_t,16> bound;
-  for(uint32_t slot=0;slot<16;++slot) bound[slot]=word(12272+slot*4);
+  // previous handle's fence. Repeated slots retire the handle bound earlier:
+  // the program's own (recorded) handle, not a device word.
+  std::array<std::optional<uint32_t>,16> bound;
   for(const auto& texture:program.textures) {
+    if(texture.slot>=bound.size()) return Result::TextureOrState;
     writes.push_back({reader.Add(device,1024+texture.slot*24),24});
     writes.push_back({reader.Add(device,12272+texture.slot*4),4});
     writes.push_back({reader.Add(device,16),8});
-    if(const auto previous=bound[texture.slot]) {
-      if(!fence) return Result::RetirementMode;
-      writes.push_back({reader.Add(previous,8),4});
+    if(const auto& previous=bound[texture.slot]) {
+      if(*previous) fenced=true;
+      if(!retires(*previous)) return Result::RetirementMode;
+    } else {
+      const auto slot=reader.Add(device,12272+texture.slot*4);
+      retirements.push_back(slot);
+      if(!retires(NativeUnrecordedWord(reader,slot))) return Result::RetirementMode;
     }
     if(texture.handle) reads.push_back({reader.Add(texture.handle,28),24});
     bound[texture.slot]=texture.handle;
@@ -114,6 +178,7 @@ NativeStaticGroupEligibility AssessNativeStaticGroup(const Reader& reader,uint32
   for(const auto& read:reads) for(const auto& write:writes)
     if(uint64_t(read.address)<uint64_t(write.address)+write.bytes &&
        uint64_t(write.address)<uint64_t(read.address)+read.bytes) return Result::AliasedInput;
+  if(witness) *witness=NativeStaticEligibilityWitness{std::move(reads),std::move(retirements),fence_word,fenced};
   return Result::Supported;
 }
 }

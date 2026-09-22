@@ -62,6 +62,8 @@ class NativeRecordingReader {
     return data;
   }
   uint32_t Word(uint32_t address) const { return GuestBlockWord(Bytes(address,4)); }
+  // For inputs a caller proves by predicate instead of recorded bytes.
+  const Reader& Unrecorded() const { return reader_; }
  private:
   const Reader& reader_;
   NativeRecordedReads& reads_;

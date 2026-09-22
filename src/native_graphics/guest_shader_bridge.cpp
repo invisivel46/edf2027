@@ -6487,8 +6487,11 @@ struct NativeStaticInstanceResolution {
 // of the material image. So every instance of a group shares one interned
 // material and differs only in the world applied to its copy of the capture,
 // which is what lets the renderer instance them (it batches by material identity).
+// Identified by the program, not the published group material: the preload
+// republishes that object whenever a constant moves, and the resolve reads it
+// only as program and constants.
 struct NativeStaticGroupMaterial {
-  const NativeSceneGroupMaterial* group=nullptr;
+  const NativeSceneMaterialProgram* program=nullptr;
   const NativeIndexedMesh::RetainedDraw* geometry=nullptr;
   NativeStaticPassView pass{};
   NativeSceneResolvedMaterial resolved;
@@ -6519,8 +6522,9 @@ struct NativeStaticInstanceWorld {
 // Never reads the live bound shaders, streams, index bindings or view; those
 // checks belong to the caller, through draw. Exceptions propagate. slot
 // carries the group's material between resolves against one
-// NativeStaticPassInputs; a different group, geometry or view resolves afresh
-// (under the QueuedResolve timing when timed).
+// NativeStaticPassInputs (or constants the caller proved resolve to the same
+// material: NativeStaticWorldGroupCache::Current); a different program,
+// geometry or view resolves afresh (under the QueuedResolve timing when timed).
 NativeStaticGroupResolution ResolveNativePublishedStaticGroupLocked(Bridge& state,const GuestReader& reader,
     const NativeScenePublication& publication,const NativeStaticGroupInputs& group,std::span<const uint32_t> instances,
     const NativeStaticPassInputs& pass,const NativeStaticDrawBindings* draw,std::optional<NativeStaticGroupMaterial>& slot,bool timed) {
@@ -6595,7 +6599,7 @@ NativeStaticGroupResolution ResolveNativePublishedStaticGroupLocked(Bridge& stat
   const auto& targets=result.pass.targets;
   const auto viewport=DecodeDrawViewport(result.pass.viewport);
   if(!targets.count) return decline(D::Targets);
-  if(!slot || slot->group!=group.material.get() || slot->geometry!=geometry.get() ||
+  if(!slot || slot->program!=&program || slot->geometry!=geometry.get() ||
      slot->pass.viewport!=result.pass.viewport || slot->pass.targets!=targets) {
     // Only the world pass shares a slot across resolves; its cache misses land here.
     HookTiming resolve_timing(HookPhase::QueuedResolve,timed);
@@ -6614,7 +6618,7 @@ NativeStaticGroupResolution ResolveNativePublishedStaticGroupLocked(Bridge& stat
     candidate.material=resolved.capture.material;
     candidate.published_material=group.material;
     ConfigureNativeQueuedWorldLocked(state,candidate);
-    slot=NativeStaticGroupMaterial{group.material.get(),geometry.get(),result.pass,std::move(resolved),
+    slot=NativeStaticGroupMaterial{&program,geometry.get(),result.pass,std::move(resolved),
       std::move(candidate.world_parameter),candidate.world_column_major};
   }
   if(!slot->world_parameter) return decline(D::WorldParameter);
@@ -12154,17 +12158,34 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     if(!material || !material->program || !setup) return F::Program;
     const auto& program=*material->program;
     if(!program.CanDeferCpuActivation()) return F::Scissor;
-    GroupCache::Key key{.group=group,.device=device,.stack=frame.r1.u32,.vertex=program.inputs.vertex,.pixel=program.inputs.pixel,
-      .material=material,.program=material->program,.setup=*setup,.geometry=retained,.backend=state.scene_backend,
+    GroupCache::Key key{.group=group,.device=device,.vertex=program.inputs.vertex,.pixel=program.inputs.pixel,
+      .program=material->program,.setup=*setup,.geometry=retained,.backend=state.scene_backend,
       .pass=cursor.material,.view=NativeStaticPassView{*cursor.viewport,cursor.targets},
       .filtering=REXCVAR_GET(edf_native_anisotropic_filtering),.shaders=state.shader_registry_generation};
+    // Miss diagnostic: why a group with an entry missed, per component, plus
+    // whether the published object or the stack moved (observed, not keyed).
+    using M=NativeStaticWorldMiss;
+    uint32_t missed=0;
+    std::optional<uint32_t> changed_read;
+    std::string changed_constant;
+    if(const auto* existing=cache.Find(group)) {
+      missed=NativeStaticWorldKeyDifferences(existing->key,key);
+      if(existing->observed.stack!=frame.r1.u32) missed|=NativeStaticWorldMissBit(M::Stack);
+      if(existing->observed.published!=material) missed|=NativeStaticWorldMissBit(M::Published);
+    } else missed=NativeStaticWorldMissBit(M::Absent);
     // A matching entry's eligibility holds while every guest byte its
-    // assessment read still holds what it read; otherwise assess again,
+    // assessment recorded still holds what it read and its per-frame witness
+    // (stack, fence, retirement slots) holds now; otherwise assess again,
     // recording what this assessment reads.
     auto* candidate=cache.Candidate(key);
-    if(candidate && !candidate->reads.Unchanged(reader)) candidate=nullptr;
+    if(candidate && !candidate->reads.Unchanged(reader)) {
+      missed|=NativeStaticWorldMissBit(M::Reads); changed_read=candidate->reads.FirstChange(reader); candidate=nullptr;
+    } else if(candidate && !candidate->eligibility.Holds(reader,frame.r1.u32)) {
+      missed|=NativeStaticWorldMissBit(M::Witness); candidate=nullptr;
+    }
     NativeRecordedReads reads;
-    if(!candidate && AssessNativeStaticGroup(NativeRecordingReader(reader,reads),device,frame.r1.u32,*setup)!=
+    NativeStaticEligibilityWitness witness;
+    if(!candidate && AssessNativeStaticGroup(NativeRecordingReader(reader,reads),device,frame.r1.u32,*setup,&witness)!=
        NativeStaticGroupEligibility::Supported) return F::Eligibility;
     eligibility_timing.Finish();
     HookTiming resolve_timing(HookPhase::QueuedResolve);
@@ -12186,10 +12207,28 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     // capture. A miss resolves into fresh with the first instance.
     std::optional<NativeStaticGroupMaterial> fresh;
     auto* shared=&fresh;
+    M stale=M::Constants;
+    size_t differed=0;
     if(candidate && candidate->material && GroupCache::Current(*candidate,constants,
-       candidate->material->resolved.capture.material.get(),candidate->material->resolved.capture.camera)) {
+       candidate->material->resolved.capture.material.get(),candidate->material->resolved.capture.camera,&stale,&differed)) {
       shared=&candidate->material; ++cache.hits;
-    } else ++cache.misses;
+    } else {
+      ++cache.misses;
+      if(candidate) {
+        missed|=NativeStaticWorldMissBit(stale);
+        if(differed<constants.size()) changed_constant=constants[differed].name;
+      }
+      const auto events=cache.Missed(missed);
+      if(events<=4 || events%10000==0) {
+        std::string reasons;
+        for(size_t i=0;i<kNativeStaticWorldMissNames.size();++i)
+          if(missed>>i&1) { if(!reasons.empty()) reasons+=','; reasons+=kNativeStaticWorldMissNames[i]; }
+        std::string read="-";
+        if(changed_read) read=*changed_read-device<0x4000?std::format("device+{:#x}",*changed_read-device):std::format("{:#x}",*changed_read);
+        REXLOG_INFO("Native static world cache miss: events={} group={:#x} reasons=[{}] read={} constant={} totals: {}",
+          events,group,reasons,read,changed_constant.empty()?std::string("-"):changed_constant,cache.MissSummary());
+      }
+    }
     resolve_timing.Finish();
     // Resolve every instance before recording: a decline returns the whole
     // group, with its selections restored, to the guest callback.
@@ -12225,7 +12264,9 @@ void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner) {
     if(shared==&fresh && fresh && fresh->geometry==retained.get()) {
       const auto captured=fresh->resolved.capture.material;
       const auto camera=fresh->resolved.capture.camera;
-      auto& stored=cache.Store(std::move(key),constants,candidate?std::move(candidate->reads):std::move(reads),next,std::move(fresh),captured.get(),camera);
+      if(candidate) { reads=std::move(candidate->reads); witness=std::move(candidate->eligibility); }
+      auto& stored=cache.Store(std::move(key),constants,std::move(reads),std::move(witness),next,std::move(fresh),captured.get(),camera,
+        {frame.r1.u32,material});
       // fresh moved into the entry: the resolution's material is the entry's.
       resolution.material=&*stored.material;
     }
