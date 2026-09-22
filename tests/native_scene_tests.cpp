@@ -1434,13 +1434,16 @@ void PreloadChangeSignals() {
   Require(reread.Unchanged(reader),"restored descriptor bytes were not recognized");
   Require(!NativeRecordedReads{}.Unchanged(reader),"an empty record proved a group unchanged");
 
-  // Material inputs: constant stores are untracked, so their bytes are compared.
+  // Material: the program (pass, shaders, textures, samplers, state) is proven
+  // by recorded bytes; constant values change per frame and are refreshed alone.
   NativeMaterialParameters::Groups schema;
   schema[0].push_back({"local",31000,1,0});
   schema[1].push_back({"global",31500,1,4});
+  schema[1].push_back({"g_mView",31600,4,8});
   reader.StoreWord(31004,31200); reader.StoreWord(31500,31400);
   reader.StoreWord(31400,31300); reader.StoreWord(31408,1);
   reader.StoreWord(31200,0x3f800000); reader.StoreWord(31300,0x40000000);
+  reader.StoreWord(31600,31700); reader.StoreWord(31700,31800); reader.StoreWord(31708,4);
   reader.StoreWord(29204,29440); reader.StoreWord(29444,29500);
   schema.textures[0].push_back({"local_image",30000});
   reader.StoreWord(30004,30300); reader.StoreWord(30008,2);
@@ -1448,30 +1451,54 @@ void PreloadChangeSignals() {
   reader.StoreWord(30344,0x3c0);
   reader.StoreWord(29096,30600); reader.StoreWord(29104,1);
   reader.StoreWord(30600,0x44); reader.StoreWord(30604,7);
-  const auto load_material=[&](NativeRecordedReads& reads) {
+  const auto required=[](bool,const std::string& name) { return name=="g_mView"?size_t(64):size_t(16); };
+  const auto uses=[](const std::string&) { return true; };
+  const auto layout=ResolveNativeSceneMaterialConstants(schema,required);
+  Require(layout.size()==3 && !layout[0].pass_owned && !layout[1].pass_owned && layout[2].pass_owned,
+    "material constant layout lost a parameter or its pass ownership");
+  const auto load_program=[&](NativeRecordedReads& reads) {
     const NativeRecordingReader recorder(reader,reads);
-    auto inputs=ReadNativeSceneMaterialInputs(recorder,29000,schema,
-      [](bool,const std::string&) { return size_t(16); },[](const std::string&) { return true; });
+    auto definition=ReadNativeSceneMaterialDefinition(recorder,29000,schema,uses);
     ReadNativeMaterialSamplerOperations(recorder,schema);
-    return inputs;
+    return definition;
   };
-  NativeRecordedReads material;
-  const auto inputs=load_material(material);
-  Require(material.Unchanged(reader),"unchanged material inputs were not proven");
+  NativeRecordedReads program;
+  const auto definition=load_program(program);
+  const auto constants=ReadNativeSceneMaterialConstants(reader,schema,layout);
+  const auto combined=ReadNativeSceneMaterialInputs(reader,29000,schema,required,uses);
+  Require(static_cast<const NativeSceneMaterialDefinition&>(combined)==definition && combined.constants==constants &&
+    constants.size()==3 && constants[2].registers.size()==64,"split material reads differ from the combined inputs");
+  Require(program.Unchanged(reader) && !RefreshNativeSceneMaterialConstants(reader,schema,layout,constants),
+    "unchanged material program or constants were reprocessed");
   reader.StoreWord(31320,9); reader.StoreWord(30608,0x48);
-  Require(material.Unchanged(reader),"bytes outside the material inputs invalidated the group");
+  Require(program.Unchanged(reader) && !RefreshNativeSceneMaterialConstants(reader,schema,layout,constants),
+    "bytes outside the material inputs invalidated the group");
+  // A constant moves, the program does not: only constant values are re-read.
   reader.StoreWord(31300,0x40400000);
-  Require(!material.Unchanged(reader),"changed global constant was not detected");
-  NativeRecordedReads refreshed;
-  const auto changed=load_material(refreshed);
-  Require(changed!=inputs && GuestBlockWord(changed.constants[1].registers.data())==0x40400000 && refreshed.Unchanged(reader),
-    "changed material constant was not re-read");
+  Require(program.Unchanged(reader),"changed constant value invalidated the material program");
+  CountingReader constant_reads{reader};
+  const auto refreshed=RefreshNativeSceneMaterialConstants(constant_reads,schema,layout,constants);
+  Require(refreshed && GuestBlockWord((*refreshed)[1].registers.data())==0x40400000 &&
+    (*refreshed)[0]==constants[0] && (*refreshed)[2]==constants[2] && constant_reads.reads==5,
+    "constant refresh re-read the program, read a pass-owned constant or missed the new value");
+  Require(!RefreshNativeSceneMaterialConstants(reader,schema,layout,*refreshed),"refreshed constants were not current");
+  // Pass-owned globals are replaced before every use; their values never republish.
+  reader.StoreWord(31800,0x3f800000);
+  Require(program.Unchanged(reader) && !RefreshNativeSceneMaterialConstants(reader,schema,layout,*refreshed),
+    "pass-owned camera constant republished the group");
+  reader.StoreWord(31408,0);
+  Reject([&] { RefreshNativeSceneMaterialConstants(reader,schema,layout,*refreshed); });
+  reader.StoreWord(31408,1);
+  Reject([&] { RefreshNativeSceneMaterialConstants(reader,schema,layout,std::vector<NativeSceneMaterialInputs::Constant>{}); });
+  // Program inputs still invalidate the program and are re-read.
   reader.StoreWord(30340,0x80000000);
-  Require(!refreshed.Unchanged(reader),"changed texture header was not detected");
+  Require(!program.Unchanged(reader),"changed texture header was not detected");
   reader.StoreWord(30340,0); reader.StoreWord(30604,8);
-  Require(!refreshed.Unchanged(reader),"changed material state override was not detected");
+  Require(!program.Unchanged(reader),"changed material state override was not detected");
+  NativeRecordedReads reprogram;
+  Require(load_program(reprogram).state_overrides[0][1]==8 && reprogram.Unchanged(reader),"changed material program was not re-read");
   reader.StoreWord(30604,7);
-  Require(refreshed.Unchanged(reader),"restored material inputs were not recognized");
+  Require(program.Unchanged(reader),"restored material program was not recognized");
 
   // Membership: identical observations keep the prune revision; erasing a group advances it.
   NativeSceneSources sources;

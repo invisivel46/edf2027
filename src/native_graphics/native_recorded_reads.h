@@ -1,5 +1,6 @@
 #pragma once
 #include "guest_block.h"
+#include <optional>
 #include <vector>
 
 namespace edf::native {
@@ -32,6 +33,16 @@ class NativeRecordedReads {
       }
     } catch(const std::exception&) { return false; }
     return true;
+  }
+  // Diagnostic: the first recorded range whose bytes differ, or cannot be read.
+  template<class Reader> std::optional<uint32_t> FirstChange(const Reader& reader) const {
+    size_t offset=0;
+    for(const auto& range:ranges_) {
+      try { if(std::memcmp(reader.Bytes(range.address,range.bytes),bytes_.data()+offset,range.bytes)) return range.address; }
+      catch(const std::exception&) { return range.address; }
+      offset+=range.bytes;
+    }
+    return {};
   }
   size_t ranges() const { return ranges_.size(); }
  private:

@@ -899,12 +899,16 @@ struct Bridge {
     uint32_t material=0;
     std::shared_ptr<const NativeMaterialParameters::Groups> schema;
     std::shared_ptr<const NativeSceneGroupMaterial> published;
-    NativeRecordedReads reads; // Material, pass, parameter and sampler bytes behind `published`.
+    // Program bytes only: pass, shader, texture, sampler and state inputs.
+    // Constant values change per frame and are refreshed through `constants`.
+    NativeRecordedReads reads;
+    NativeSceneMaterialConstantLayout constants;
   };
   std::map<uint32_t,SceneMaterialLoad> scene_material_loads;
   uint64_t scene_preload_group_revision=UINT64_MAX;
   uint64_t scene_geometry_loaded=0,scene_geometry_reused=0,scene_geometry_deferred=0;
   uint64_t scene_geometry_unchanged=0,scene_geometry_verified=0,scene_material_unchanged=0;
+  uint64_t scene_material_constants=0;
   std::set<std::string> scene_geometry_reasons;
   uint64_t scene_material_loaded=0,scene_material_reused=0,scene_material_deferred=0;
   uint64_t scene_material_constructed=0,scene_material_rejected=0;
@@ -3957,7 +3961,7 @@ REX_HOOK_RAW(sub_821D96D8) {
           }
           static std::set<std::string> changed_inputs;
           for(const auto& constant:group.pass_constants) {
-            if(constant.name=="g_mWorld") continue;
+            if(constant.name=="g_mWorld" || edf::native::NativeScenePassOwnedConstant(constant.global,constant.name)) continue;
             const auto& published=group.published_material->constants;
             const auto old=std::find_if(published.begin(),published.end(),[&](const auto& input) {
               return input.pixel==constant.pixel && input.global==constant.global && input.name==constant.name;
@@ -4251,9 +4255,10 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
 }
 void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing) {
   const NativeSceneCpuWindow reader(backing);
-  // Change signals: group revision, the descriptor's material, the published
-  // program, schema/shader/texture identities and every recorded input byte
-  // (constants included: their stores are untracked, so bytes are compared).
+  // Program change signals: group revision, the descriptor's material, the
+  // published program, schema/shader/texture identities and every recorded
+  // program byte. Constant values are not program inputs: they change per
+  // frame (untracked stores) and are refreshed on their own below.
   const auto current=[&](uint32_t address,const auto& group,const auto& load) {
     const auto geometry=state.scene_geometry_loads.find(address);
     if(load.revision!=group.revision || !load.published || geometry==state.scene_geometry_loads.end() ||
@@ -4281,7 +4286,25 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
   for(const auto& [address,group]:state.scene_sources.Groups()) {
     const auto cached=state.scene_material_loads.find(address);
     if(cached!=state.scene_material_loads.end() && current(address,group,cached->second)) {
-      ++state.scene_material_unchanged; continue;
+      // The program is unchanged; only constant values are re-read, and the
+      // program object is kept when one of them moved.
+      auto& load=cached->second;
+      bool refreshed=false;
+      try {
+        auto constants=RefreshNativeSceneMaterialConstants(reader,*load.schema,load.constants,load.published->constants);
+        if(constants) {
+          static std::set<std::string> reported;
+          for(size_t i=0;i<constants->size() && reported.size()<32;++i)
+            if((*constants)[i].registers!=load.published->constants[i].registers &&
+               reported.insert((*constants)[i].name).second)
+              REXLOG_INFO("Native scene material constant refreshed without a program change: {}",(*constants)[i].name);
+          state.scene_adapter.PublishGroupMaterial(address,group.revision,load.published->program,std::move(*constants));
+          load.published=state.scene_adapter.GroupMaterial(address,group.revision);
+          ++state.scene_material_constants;
+        } else ++state.scene_material_unchanged;
+        refreshed=load.published!=nullptr;
+      } catch(const std::exception&) {}
+      if(refreshed) continue;
     }
     try {
       const auto geometry=state.scene_geometry_loads.find(address);
@@ -4296,13 +4319,17 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
       const auto& ps=state.shaders.at(pixel);
       if(!vs.reversed_bindings) throw std::runtime_error("native material has no vertex variants");
       const auto schema=state.material_parameters.Get(material);
-      auto inputs=ReadNativeSceneMaterialInputs(recorder,material,*schema,[&](bool pixel_stage,const std::string& name) {
+      auto layout=ResolveNativeSceneMaterialConstants(*schema,[&](bool pixel_stage,const std::string& name) {
         return pixel_stage?ps.bindings->GuestFloatRegisterBytes(name):std::max(
           vs.bindings->GuestFloatRegisterBytes(name),vs.reversed_bindings->GuestFloatRegisterBytes(name));
-      },[&](const std::string& name) { return ps.bindings->ResolveResource(name).used(); });
+      });
+      auto definition=ReadNativeSceneMaterialDefinition(recorder,material,*schema,
+        [&](const std::string& name) { return ps.bindings->ResolveResource(name).used(); });
       auto sampler_operations=ReadNativeMaterialSamplerOperations(recorder,*schema);
+      // Values are not recorded: they are compared by the constant refresh.
+      auto constants=ReadNativeSceneMaterialConstants(reader,*schema,layout);
       std::vector<std::shared_ptr<NativeBackendTexture>> textures;
-      for(const auto& input:inputs.textures) {
+      for(const auto& input:definition.textures) {
         if(!input.handle) { textures.emplace_back(); continue; }
         const auto texture=state.textures.find(input.handle);
         if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
@@ -4310,18 +4337,26 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
         textures.push_back(texture->second.backend);
       }
       const auto previous=state.scene_adapter.GroupMaterial(address,group.revision);
-      if(previous && previous->program->inputs==inputs && previous->program->textures==textures &&
+      if(previous && previous->program->inputs==definition && previous->program->textures==textures &&
          previous->program->sampler_operations==sampler_operations &&
          previous->program->backend==state.scene_backend &&
          previous->program->vertex.bytecode==vs.bindings->shader().bytecode &&
          previous->program->reversed_vertex.bytecode==vs.reversed_bindings->shader().bytecode &&
          previous->program->pixel.bytecode==ps.bindings->shader().bytecode) {
-        state.scene_adapter.PublishGroupMaterial(address,group.revision,previous->program,std::move(inputs.constants));
+        // Recorded program bytes moved without changing the program: report
+        // where, so a per-frame program input can be moved out of `reads`.
+        if(cached!=state.scene_material_loads.end() && cached->second.revision==group.revision)
+          if(const auto changed=cached->second.reads.FirstChange(reader)) {
+            static std::set<uint32_t> reported;
+            if(reported.size()<16 && reported.insert(*changed).second)
+              REXLOG_INFO("Native scene material program bytes changed without a program change: group={:#x} material={:#x} address={:#x}",
+                address,material,*changed);
+          }
+        state.scene_adapter.PublishGroupMaterial(address,group.revision,previous->program,std::move(constants));
         ++state.scene_material_reused;
       } else {
         auto program=std::make_shared<NativeSceneMaterialProgram>();
-        auto constants=std::move(inputs.constants);
-        program->backend=state.scene_backend; program->inputs=std::move(inputs); program->textures=std::move(textures);
+        program->backend=state.scene_backend; program->inputs=std::move(definition); program->textures=std::move(textures);
         program->sampler_operations=std::move(sampler_operations);
         program->vertex=vs.bindings->shader(); program->reversed_vertex=vs.reversed_bindings->shader();
         program->pixel=ps.bindings->shader();
@@ -4329,7 +4364,7 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
         ++state.scene_material_loaded;
       }
       state.scene_material_loads[address]={group.revision,material,schema,
-        state.scene_adapter.GroupMaterial(address,group.revision),std::move(reads)};
+        state.scene_adapter.GroupMaterial(address,group.revision),std::move(reads),std::move(layout)};
     } catch(const std::exception& error) {
       state.scene_adapter.RetireGroupMaterial(address); ++state.scene_material_deferred;
       state.scene_material_loads.erase(address);
@@ -4338,9 +4373,9 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
     }
   }
   if(!state.scene_sources.Groups().empty() && state.scene_publication_tick%120==0)
-    REXLOG_INFO("Native scene material preload: groups={} ready={} loaded={} reused={} unchanged={} deferred={} (owned inputs; pass state still explicit)",
+    REXLOG_INFO("Native scene material preload: groups={} ready={} loaded={} reused={} constants={} unchanged={} deferred={} (owned inputs; pass state still explicit)",
       state.scene_sources.Groups().size(),state.scene_adapter.material_groups(),state.scene_material_loaded,
-      state.scene_material_reused,state.scene_material_unchanged,state.scene_material_deferred);
+      state.scene_material_reused,state.scene_material_constants,state.scene_material_unchanged,state.scene_material_deferred);
 }
 void PublishStaticScenePartsLocked(Bridge& state,const GuestReader& reader,uint32_t owner) {
   if(!state.scene_sources.HasOwner(owner)) return; // Nested initial model load precedes completed construction.

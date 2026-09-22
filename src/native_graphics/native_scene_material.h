@@ -3,6 +3,9 @@
 #include "native_scene_bindings.h"
 #include "native_material_sampler.h"
 #include "native_material_render_state.h"
+#include <algorithm>
+#include <optional>
+#include <string_view>
 
 namespace edf::native {
 // A material is a program over pass state, not the device state left by its
@@ -54,12 +57,85 @@ struct NativeSceneMaterialInputs : NativeSceneMaterialDefinition {
   bool operator==(const NativeSceneMaterialInputs&) const=default;
 };
 
+// Globals the scene pass always replaces (NativeScenePassCamera/Animation::Apply)
+// before any use; their published bytes are layout only, never values.
+inline bool NativeScenePassOwnedConstant(bool global,std::string_view name) {
+  return global && (name=="g_mProjection" || name=="g_mView" || name=="g_mViewTranspose" ||
+    name=="g_mViewProjection" || name=="m_WaterTime" || name=="g_SignalBrightness");
+}
+// Which schema parameters a program uploads, and their extents. A function of
+// the schema and native reflection only: it stays valid while both do.
+struct NativeSceneMaterialConstantSlot {
+  uint32_t group=0,parameter=0,bytes=0;
+  bool pass_owned=false;
+  bool operator==(const NativeSceneMaterialConstantSlot&) const=default;
+};
+using NativeSceneMaterialConstantLayout=std::vector<NativeSceneMaterialConstantSlot>;
 // Requirements come from native reflection. Unused parameters must not cause
 // reads of unused guest payloads, just as the ordinary native activation path.
-template<class Reader,class ConstantBytes,class UsesTexture>
-NativeSceneMaterialInputs ReadNativeSceneMaterialInputs(const Reader& reader,uint32_t material,
-    const NativeMaterialParameters::Groups& schema,ConstantBytes&& required,UsesTexture&& uses_texture) {
-  NativeSceneMaterialInputs result;
+template<class ConstantBytes>
+NativeSceneMaterialConstantLayout ResolveNativeSceneMaterialConstants(
+    const NativeMaterialParameters::Groups& schema,ConstantBytes&& required) {
+  NativeSceneMaterialConstantLayout layout;
+  for(uint32_t group=0;group<4;++group) for(uint32_t index=0;index<schema[group].size();++index) {
+    const auto& parameter=schema[group][index];
+    const auto bytes=required(group>=2,parameter.name);
+    if(!bytes) continue;
+    const bool global=(group&1)!=0;
+    // Globals use native reflection and the live backing vector's capacity.
+    // Locals follow the ordinary bridge's exact descriptor-sized upload.
+    if(bytes%16 || bytes>UINT32_MAX || (!global && bytes!=size_t(parameter.registers)*16))
+      throw std::runtime_error("native scene material parameter extent mismatch: "+parameter.name);
+    layout.push_back({group,index,uint32_t(bytes),NativeScenePassOwnedConstant(global,parameter.name)});
+  }
+  return layout;
+}
+template<class Reader>
+const uint8_t* ReadNativeSceneMaterialConstant(const Reader& reader,const NativeMaterialParameters::Groups& schema,
+    const NativeSceneMaterialConstantSlot& slot) {
+  if(slot.group>=4 || slot.parameter>=schema[slot.group].size()) throw std::runtime_error("native material constant slot is stale");
+  const auto& parameter=schema[slot.group][slot.parameter];
+  const bool global=(slot.group&1)!=0;
+  const auto value=parameter.ReadValue(reader,global);
+  if(global && (value.available>4096 || slot.bytes>size_t(value.available)*16))
+    throw std::runtime_error("native scene material global capacity mismatch: "+parameter.name);
+  return reader.Bytes(value.data,slot.bytes);
+}
+template<class Reader>
+std::vector<NativeSceneMaterialInputs::Constant> ReadNativeSceneMaterialConstants(const Reader& reader,
+    const NativeMaterialParameters::Groups& schema,const NativeSceneMaterialConstantLayout& layout) {
+  std::vector<NativeSceneMaterialInputs::Constant> result;
+  result.reserve(layout.size());
+  for(const auto& slot:layout) {
+    const auto* data=ReadNativeSceneMaterialConstant(reader,schema,slot);
+    result.push_back({slot.group>=2,schema[slot.group][slot.parameter].name,{data,data+slot.bytes},(slot.group&1)!=0});
+  }
+  return result;
+}
+// Per-tick refresh of an unchanged program: reads only the constant values and
+// allocates only when one differs. Pass-owned slots are not read. Returns the
+// replacement constants, or nothing when `published` is still current.
+template<class Reader>
+std::optional<std::vector<NativeSceneMaterialInputs::Constant>> RefreshNativeSceneMaterialConstants(const Reader& reader,
+    const NativeMaterialParameters::Groups& schema,const NativeSceneMaterialConstantLayout& layout,
+    const std::vector<NativeSceneMaterialInputs::Constant>& published) {
+  if(published.size()!=layout.size()) throw std::runtime_error("native material constants do not match their layout");
+  std::optional<std::vector<NativeSceneMaterialInputs::Constant>> result;
+  for(size_t i=0;i<layout.size();++i) {
+    if(layout[i].pass_owned) continue;
+    const auto* data=ReadNativeSceneMaterialConstant(reader,schema,layout[i]);
+    const auto& old=published[i].registers;
+    if(old.size()==layout[i].bytes && std::equal(old.begin(),old.end(),data)) continue;
+    if(!result) result=published;
+    (*result)[i].registers.assign(data,data+layout[i].bytes);
+  }
+  return result;
+}
+// Everything except constant values: the stable part of an owned program.
+template<class Reader,class UsesTexture>
+NativeSceneMaterialDefinition ReadNativeSceneMaterialDefinition(const Reader& reader,uint32_t material,
+    const NativeMaterialParameters::Groups& schema,UsesTexture&& uses_texture) {
+  NativeSceneMaterialDefinition result;
   const auto pass=reader.Word(reader.Add(material,108));
   result.vertex=reader.Word(reader.Word(pass));
   result.pixel=reader.Word(reader.Add(reader.Word(reader.Add(pass,4)),4));
@@ -69,26 +145,12 @@ NativeSceneMaterialInputs ReadNativeSceneMaterialInputs(const Reader& reader,uin
       throw std::runtime_error("invalid published vertex register range");
     result.vertex_registers.push_back({parameter.name,parameter.first,parameter.registers});
   }
-  for(size_t group=0;group<4;++group) for(const auto& parameter:schema[group]) {
-    const auto bytes=required(group>=2,parameter.name);
-    if(!bytes) continue;
-    const bool global=(group&1)!=0;
-    // Globals use native reflection and the live backing vector's capacity.
-    // Locals follow the ordinary bridge's exact descriptor-sized upload.
-    if(bytes%16 || (!global && bytes!=size_t(parameter.registers)*16))
-      throw std::runtime_error("native scene material parameter extent mismatch: "+parameter.name);
-    const auto value=parameter.ReadValue(reader,global);
-    if(global && (value.available>4096 || bytes>size_t(value.available)*16))
-      throw std::runtime_error("native scene material global capacity mismatch: "+parameter.name);
-    const auto* data=reader.Bytes(value.data,bytes);
-    result.constants.push_back({group>=2,parameter.name,{data,data+bytes},(group&1)!=0});
-  }
   for(size_t global=0;global<2;++global) for(const auto& parameter:schema.textures[global]) {
     if(!uses_texture(parameter.name)) continue;
     const auto value=parameter.ReadValue(reader,global!=0);
     if(value.slot>=16) throw std::runtime_error("native scene material texture slot is invalid");
     const auto settings=global?reader.Add(reader.Word(parameter.record),32):reader.Add(parameter.record,12);
-    NativeSceneMaterialInputs::Texture texture{parameter.name,value.handle,value.slot,ReadGuestWords<4>(reader,settings)};
+    NativeSceneMaterialDefinition::Texture texture{parameter.name,value.handle,value.slot,ReadGuestWords<4>(reader,settings)};
     texture.global=global!=0;
     if(value.handle) texture.lod_range=reader.Word(reader.Add(value.handle,44))&0x3fc;
     result.textures.push_back(std::move(texture));
@@ -96,6 +158,15 @@ NativeSceneMaterialInputs ReadNativeSceneMaterialInputs(const Reader& reader,uin
   const auto states=reader.Word(reader.Add(material,96)),count=reader.Word(reader.Add(material,104));
   if(count>4096) throw std::runtime_error("native scene material state count is invalid");
   for(uint32_t i=0;i<count;++i) result.state_overrides.push_back(ReadGuestWords<2>(reader,reader.Add(states,i*8)));
+  return result;
+}
+template<class Reader,class ConstantBytes,class UsesTexture>
+NativeSceneMaterialInputs ReadNativeSceneMaterialInputs(const Reader& reader,uint32_t material,
+    const NativeMaterialParameters::Groups& schema,ConstantBytes&& required,UsesTexture&& uses_texture) {
+  const auto layout=ResolveNativeSceneMaterialConstants(schema,required);
+  NativeSceneMaterialInputs result;
+  static_cast<NativeSceneMaterialDefinition&>(result)=ReadNativeSceneMaterialDefinition(reader,material,schema,uses_texture);
+  result.constants=ReadNativeSceneMaterialConstants(reader,schema,layout);
   return result;
 }
 
