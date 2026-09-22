@@ -11210,6 +11210,64 @@ REX_HOOK_RAW(sub_8242AF30) {
     if (++state.movie_upload_errors<=8) REXLOG_ERROR("Native movie upload: {}",error.what());
   }
 }
+namespace edf::native {
+namespace {
+// A Utility 3D / Vs_Particle list or strip that has passed its contract checks.
+struct NativeSceneImmediateDraw {
+  ShaderBindings& vertex;
+  ShaderBindings& pixel;
+  const NativeViewportState& viewport;
+  const RenderStateWords& state;
+  GuestShaderPair shaders{};
+  uint32_t declaration=0,element_count=0;
+  std::shared_ptr<const NativeDeclaration> owned_declaration;
+  uint32_t primitive=13,stride=0;
+};
+// Records the draw from vertices held in HOST memory, laid out as the guest
+// lays them out (big-endian words in declaration order): the DrawPrimitiveUP
+// hook passes the bytes it read at r6, the full-frame effect pass passes what
+// EncodeNativeEffectVertices built (native_full_frame_effects.h). The vertices
+// are never read from the guest here; reader and device serve only the blend
+// factor RecordDrawSetup reads and the direct path's render-state bind.
+template<class Reader>
+void RecordNativeSceneImmediate(Bridge& state,const Reader& reader,uint32_t device,
+                                const NativeSceneImmediateDraw& draw,std::span<const uint8_t> vertices) {
+  const bool strip=draw.primitive==6;
+  if(!draw.stride || vertices.size()%draw.stride) throw std::runtime_error("native immediate vertices are not whole vertices");
+  const auto count=uint32_t(vertices.size()/draw.stride);
+  if(count<3 || count>16384 || (!strip && count%4)) throw std::runtime_error("unsupported native immediate vertex count");
+  const auto owned_indices=state.generated_indices.Get(strip?NativeIndexPattern::Strip:NativeIndexPattern::Quads,count);
+  const auto indices=owned_indices->bytes();
+  HookTiming acquire_timing(HookPhase::ImmediateAcquire);
+  auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),draw.vertex.shader(),
+    ImmediateStreamKey(vertices.size(),draw.declaration,draw.shaders.vertex,draw.primitive,draw.viewport.reverse_depth),
+    {draw.owned_declaration->bytes().data(),draw.element_count*12},draw.stride,
+    vertices,indices,2,draw.owned_declaration,owned_indices,{},{},{},{},0,{},
+    // Where this mesh's dynamic vertices are rewritten when the draw
+    // is recorded; the immediate context does it otherwise.
+    EDF_NATIVE_FLAG(seam_draws)?&SceneRecorderLocked(state):nullptr);
+  acquire_timing.Finish();
+  auto render=state.render_states.find(draw.state);
+  if(render==state.render_states.end()) render=state.render_states.emplace(draw.state,
+    CreateNativeRenderState(state.device.Get(),draw.state)).first;
+  if(EDF_NATIVE_FLAG(seam_draws)) {
+    HookTiming record_timing(HookPhase::ImmediateRecord);
+    auto& recorder=RecordDrawSetup(state,reader,device,{
+      draw.vertex,draw.pixel,draw.viewport,draw.state,
+      mesh.input_layout().elements(),mesh.input_layout().fingerprint(),
+      (uint64_t(draw.shaders.vertex)<<1)|uint64_t(draw.viewport.reverse_depth?1:0),draw.shaders.pixel,
+      NativeBackendTopology::TriangleList});
+    mesh.DrawTransient(recorder,vertices,0,uint32_t(indices.size()/2));
+  } else {
+    BindActiveTarget(state);
+    BindGuestRenderState(render->second,*state.context.Get(),reader,device,&state.bind_generation);
+    draw.viewport.Bind(*state.context.Get());
+    draw.vertex.Bind(*state.context.Get()); draw.pixel.Bind(*state.context.Get());
+    mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
+  }
+}
+}  // namespace
+}  // namespace edf::native
 REX_EXTERN(__imp__sub_821FD8F8);
 REX_EXTERN(__imp__edf_native_immediate_cpu_tail);
 REX_HOOK_RAW(sub_821FD8F8) {
@@ -11697,38 +11755,12 @@ REX_HOOK_RAW(sub_821FD8F8) {
             throw std::runtime_error("Utility 3D missing texture inputs");
           if(edf::native::SamplesTarget(bindings,scene.color) || edf::native::SamplesTarget(ps,scene.color))
             throw std::runtime_error("native scene immediate samples its target");
-          const auto owned_indices=state.generated_indices.Get(strip?edf::native::NativeIndexPattern::Strip:
-            edf::native::NativeIndexPattern::Quads,ctx.r5.u32);
-          const auto indices=owned_indices->bytes();
+          // The one guest read of the vertices; recording takes host bytes.
           const size_t bytes=size_t(ctx.r5.u32)*stride;
           const std::span<const uint8_t> vertices{reader.Bytes(ctx.r6.u32,bytes),bytes};
-          edf::native::HookTiming acquire_timing(edf::native::HookPhase::ImmediateAcquire);
-          auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
-            edf::native::ImmediateStreamKey(vertices.size(),declaration,pair.vertex,ctx.r4.u32,viewport.reverse_depth),
-            {elements,element_count*12},stride,
-            vertices,indices,2,owned_declaration,owned_indices,{},{},{},{},0,{},
-            // Where this mesh's dynamic vertices are rewritten when the draw
-            // is recorded; the immediate context does it otherwise.
-            EDF_NATIVE_FLAG(seam_draws)?&edf::native::SceneRecorderLocked(state):nullptr);
-          acquire_timing.Finish();
           const auto key=edf::native::ReadAuditedRenderStateWords(reader,ctx.r3.u32);
-          auto render=state.render_states.find(key);
-          if(render==state.render_states.end()) render=state.render_states.emplace(key,
-            edf::native::CreateNativeRenderState(state.device.Get(),key)).first;
-          if(EDF_NATIVE_FLAG(seam_draws)) {
-            edf::native::HookTiming record_timing(edf::native::HookPhase::ImmediateRecord);
-            auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
-              bindings,ps,viewport,key,
-              mesh.input_layout().elements(),mesh.input_layout().fingerprint(),
-              (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),pair.pixel,
-              edf::native::NativeBackendTopology::TriangleList});
-            mesh.DrawTransient(recorder,vertices,0,uint32_t(indices.size()/2));
-          } else {
-            edf::native::BindActiveTarget(state);
-            edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
-            bindings.Bind(*state.context.Get()); ps.Bind(*state.context.Get());
-            mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
-          }
+          edf::native::RecordNativeSceneImmediate(state,reader,ctx.r3.u32,{
+            bindings,ps,viewport,key,pair,declaration,element_count,owned_declaration,ctx.r4.u32,stride},vertices);
           native_submitted=true; scene.frame_complete=false;
           auto& reported=state.scene_immediate_variants_reported[solid?0:textured?(strip?1:2):ps.shader().entry.name=="Ps_ZParticle"?4:3];
           if(++state.utility_3d_draws<=5 || !reported || state.utility_3d_draws%10000==0)

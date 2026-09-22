@@ -50,17 +50,19 @@ inline float NativeBucketSingle(uint32_t bits) { return std::bit_cast<float>(bit
 // Mode 1: fmadds(ctx40,ctx0,ctx4) then fmuls by object+56. Mode 2: fmuls
 // object+56 by 65536. Ordered clamp [0,65535]: f<min -> min, f>max -> max;
 // NaN passes both compares and converts to INT64_MIN (key 0).
+// depth_bits stands for context+40, the view-space z sub_821B0198 stored for
+// this object; a native walk that never ran the guest transform passes its own.
 template<class Reader>
-NativeBucketKey ComputeNativeBucketKey(const Reader& r,uint32_t context,uint32_t object) {
+NativeBucketKey ComputeNativeBucketKeyForDepth(const Reader& r,uint32_t context,uint32_t object,uint32_t depth_bits) {
   const auto single=[&](uint32_t at){ return double(NativeBucketSingle(r.Word(at))); };
   const auto mode=int32_t(r.Word(r.Add(object,52)));
   NativeBucketKey out;
   // lfs/stfs of the same register: the recomp's float(double(x)) round trip
   // is folded by the compiler, so the word is copied unchanged (as on PPC).
-  out.depth_bits=r.Word(r.Add(context,40));
+  out.depth_bits=depth_bits;
   double depth;
   if(mode==1) {
-    depth=double(float(std::fma(single(r.Add(context,40)),single(context),single(r.Add(context,4)))));
+    depth=double(float(std::fma(double(NativeBucketSingle(depth_bits)),single(context),single(r.Add(context,4)))));
     depth=double(float(depth*single(r.Add(object,56))));
   } else if(mode==2) {
     depth=double(float(single(r.Add(object,56))*single(kNativeBucketMode2Scale)));
@@ -72,6 +74,10 @@ NativeBucketKey ComputeNativeBucketKey(const Reader& r,uint32_t context,uint32_t
   out.key=uint16_t(uint64_t(NativeFctidz(depth)));
   out.low=uint8_t(out.key); out.high=uint8_t(out.key>>8);
   return out;
+}
+template<class Reader>
+NativeBucketKey ComputeNativeBucketKey(const Reader& r,uint32_t context,uint32_t object) {
+  return ComputeNativeBucketKeyForDepth(r,context,object,r.Word(r.Add(context,40)));
 }
 // Reads only: the addresses and values InsertNativeBucket will write.
 template<class Reader>

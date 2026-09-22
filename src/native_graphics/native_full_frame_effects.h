@@ -1,0 +1,535 @@
+#pragma once
+#include "native_graphics/native_bucket_dispatch.h"
+#include "native_graphics/native_scene_visibility.h"
+#include "native_graphics/native_transparent_items.h"
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
+#include <cstdint>
+#include <memory>
+#include <span>
+#include <stdexcept>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace edf::native {
+// Native generation of the effect draws the guest issues from each effect's
+// slot 4 when the bucket drain sub_821A3BA0 reaches it. The full-frame renderer
+// skips the guest render helper, so nothing else produces them.
+//
+// Every operation is single precision in the guest's order, and written the way
+// the recompiled C++ evaluates it: float(double op double), fmadds/fmsubs as
+// float(std::fma(...)) of doubles. Constants are read from the guest image.
+
+// Image constants (all lfs, single). Read once per walk.
+struct NativeEffectConstantAddress {
+  static constexpr uint32_t zero=0x820009A4,one=0x820008CC,half=0x820008D4,quarter=0x820021E4,
+    three_quarters=0x820024A0,fifth=0x820028E4,twelfth=0x8200751C,five=0x82002738,web_scale=0x82007638,
+    half_pi=0x820045EC,pi=0x82017668,three_half_pi=0x8201771C;
+};
+struct NativeEffectConstants {
+  float zero=0,one=1,half=.5f,quarter=.25f,three_quarters=.75f,fifth=.2f,twelfth=1.f/12,five=5,web_scale=2.6f;
+  float half_pi=0,pi=0,three_half_pi=0;
+};
+template<class Reader>
+NativeEffectConstants ReadNativeEffectConstants(const Reader& r) {
+  using A=NativeEffectConstantAddress;
+  const auto f=[&](uint32_t at) { return std::bit_cast<float>(r.Word(at)); };
+  return {f(A::zero),f(A::one),f(A::half),f(A::quarter),f(A::three_quarters),f(A::fifth),f(A::twelfth),
+          f(A::five),f(A::web_scale),f(A::half_pi),f(A::pi),f(A::three_half_pi)};
+}
+// Globals. [0x8257C034] is the effect-shader object every slot 4 passes as r3
+// to 821A7640/821A8628/821A8090; [0x8257C02C]+192 is the eye the ribbons face.
+inline constexpr uint32_t kNativeEffectShaderGlobal=0x8257C034;
+inline constexpr uint32_t kNativeEffectCameraGlobal=0x8257C02C;
+inline constexpr uint32_t kNativeEffectEyeOffset=192;
+// clEffectEtc02's slot 4 picks its blend from this byte: nonzero -> 1 (ONE/ONE).
+inline constexpr uint32_t kNativeEffectEtc02BlendGlobal=0x82554BF0;
+// clEffectEtc02's slot 4 decrements this word on every call (8217C4B0..C0) and
+// its slot 3 (8217C3A8) kills the object once it is <= 0: a lifetime counted
+// in draws. The native pass keeps the count, so this is its one guest write.
+inline constexpr uint32_t kNativeEffectEtc02Lifetime=612;
+
+inline float NativeFxAdd(float a,float b) { return float(double(a)+double(b)); }
+inline float NativeFxSub(float a,float b) { return float(double(a)-double(b)); }
+inline float NativeFxMul(float a,float b) { return float(double(a)*double(b)); }
+inline float NativeFxDiv(float a,float b) { return float(double(a)/double(b)); }
+inline float NativeFxSqrt(float a) { return float(std::sqrt(double(a))); }
+// fmadds a*c+b and fmsubs a*c-b.
+inline float NativeFxMadd(float a,float c,float b) { return float(std::fma(double(a),double(c),double(b))); }
+inline float NativeFxMsub(float a,float c,float b) { return float(std::fma(double(a),double(c),-double(b))); }
+using NativeFxVec3=std::array<float,3>;
+using NativeFxVec4=std::array<float,4>;
+// sub_821B0320: v scaled to `length`; a zero squared length stores the zero
+// constant (a NaN one does not compare equal and takes the division).
+inline NativeFxVec3 NativeFxSetLength(const NativeFxVec3& v,float length,const NativeEffectConstants& k) {
+  float sum=NativeFxMul(v[1],v[1]);
+  sum=NativeFxMadd(v[0],v[0],sum);
+  sum=NativeFxMadd(v[2],v[2],sum);
+  if(sum==k.zero) return {k.zero,k.zero,k.zero};
+  const float scale=NativeFxDiv(length,NativeFxSqrt(sum));
+  return {NativeFxMul(v[0],scale),NativeFxMul(v[1],scale),NativeFxMul(v[2],scale)};
+}
+template<class Reader> float ReadNativeFxFloat(const Reader& r,uint32_t at) { return std::bit_cast<float>(r.Word(at)); }
+template<class Reader> NativeFxVec3 ReadNativeFxVec3(const Reader& r,uint32_t at) {
+  return {ReadNativeFxFloat(r,at),ReadNativeFxFloat(r,r.Add(at,4)),ReadNativeFxFloat(r,r.Add(at,8))};
+}
+template<class Reader> NativeFxVec4 ReadNativeFxVec4(const Reader& r,uint32_t at) {
+  return {ReadNativeFxFloat(r,at),ReadNativeFxFloat(r,r.Add(at,4)),ReadNativeFxFloat(r,r.Add(at,8)),ReadNativeFxFloat(r,r.Add(at,12))};
+}
+
+// 821A7640's 48-byte record: +0..+8 position, +16..+28 RGBA, +32 radius, +36
+// angle. +12 and +40/+44 are never read.
+struct NativeParticleRecord {
+  NativeFxVec3 position{};
+  NativeFxVec4 colour{};
+  float radius=0,angle=0;
+};
+// Vs_Particle vertex, 44 bytes: position, UV, (angle, radius), colour.
+struct NativeParticleVertex {
+  NativeFxVec3 position{};
+  std::array<float,2> uv{};
+  float angle=0,radius=0;
+  NativeFxVec4 colour{};
+};
+// VS_3DTex/PS_Tex vertex, 36 bytes: position, UV, colour.
+struct NativeRibbonVertex {
+  NativeFxVec3 position{};
+  std::array<float,2> uv{};
+  NativeFxVec4 colour{};
+};
+static_assert(sizeof(NativeParticleVertex)==44 && sizeof(NativeRibbonVertex)==36);
+inline constexpr uint32_t kNativeParticleRecordBytes=48,kNativeParticleRecordsPerCall=1000;
+inline constexpr uint32_t kNativeRibbonPointBytes=32,kNativeRibbonPointLimit=100;
+template<class Reader>
+NativeParticleRecord ReadNativeParticleRecord(const Reader& r,uint32_t at) {
+  return {ReadNativeFxVec3(r,at),ReadNativeFxVec4(r,r.Add(at,16)),ReadNativeFxFloat(r,r.Add(at,32)),ReadNativeFxFloat(r,r.Add(at,36))};
+}
+// 821A7640's inner loop: four vertices per record, UVs (0,0) (1,0) (1,1) (0,1)
+// from the zero/one constants and the angle advanced by 0, pi/2, pi, 3pi/2.
+// Implemented in native_full_frame_effects.cpp.
+std::vector<NativeParticleVertex> ExpandNativeParticleRecords(std::span<const NativeParticleRecord> records,
+                                                             const NativeEffectConstants& k);
+
+// Ribbon input point, 32-byte stride: +0..+8 position, +20 the V coordinate.
+struct NativeRibbonPoint {
+  NativeFxVec3 position{};
+  float v=0;
+};
+template<class Reader>
+NativeRibbonPoint ReadNativeRibbonPoint(const Reader& r,uint32_t at) {
+  return {ReadNativeFxVec3(r,at),ReadNativeFxFloat(r,r.Add(at,20))};
+}
+// sub_821A8628: independent segments from point pairs (count/2 of them, at most
+// 100), each a camera-facing quad of `width`; primitive 13. Needs count >= 2.
+std::vector<NativeRibbonVertex> BuildNativeRibbonSegments(std::span<const NativeRibbonPoint> points,
+  const NativeFxVec4& colour,float width,const NativeFxVec3& eye,const NativeEffectConstants& k);
+// sub_821A8090: a strip through up to 100 points, two vertices per point, the
+// side taken from the averaged neighbouring directions; primitive 6.
+std::vector<NativeRibbonVertex> BuildNativeRibbonStrip(std::span<const NativeRibbonPoint> points,
+  const NativeFxVec4& colour,float width,const NativeFxVec3& eye,const NativeEffectConstants& k);
+
+// Technique objects in the effect-shader object: 821A7640 r8==0 -> +244 with
+// its texture into the sampler list at +272 (Ps_Particle), r8!=0 -> +288/+316
+// (Ps_ZParticle); 821A7C70 -> +188/+216 (VS_3DTex/PS_Tex).
+enum class NativeEffectTechnique : uint8_t { Particle, ZParticle, Ribbon };
+inline constexpr uint32_t NativeEffectTechniqueOffset(NativeEffectTechnique t) {
+  return t==NativeEffectTechnique::Particle?244:t==NativeEffectTechnique::ZParticle?288:188;
+}
+inline constexpr uint32_t NativeEffectSamplerListOffset(NativeEffectTechnique t) {
+  return t==NativeEffectTechnique::Particle?272:t==NativeEffectTechnique::ZParticle?316:216;
+}
+// Blend (r7 of 821A7640, r8 of 821A7C70): 0 = SRCALPHA/INVSRCALPHA (6/7),
+// 1 = ONE/ONE; any other value leaves the device's blend as it was.
+enum : int32_t { kNativeEffectBlendAlpha=0,kNativeEffectBlendAdditive=1 };
+struct NativeEffectDraw {
+  enum class Kind : uint8_t { Particles,RibbonQuads,RibbonStrip };
+  Kind kind=Kind::Particles;
+  NativeEffectTechnique technique=NativeEffectTechnique::Particle;
+  uint32_t effect=0,texture=0;
+  int32_t blend=kNativeEffectBlendAlpha;
+  // 821A7C70 only: sub_82135578 sets device+10420 bit 2 to (r9==1). The
+  // particle expander does not touch it.
+  bool sets_depth_write=false,depth_write=false;
+  std::vector<NativeParticleRecord> records;
+  std::vector<NativeParticleVertex> particle_vertices;
+  std::vector<NativeRibbonVertex> ribbon_vertices;
+  uint32_t primitive() const { return kind==Kind::RibbonStrip?6:13; }
+  uint32_t stride() const { return kind==Kind::Particles?44:36; }
+  uint32_t vertex_count() const {
+    return uint32_t(kind==Kind::Particles?particle_vertices.size():ribbon_vertices.size());
+  }
+  bool empty() const { return vertex_count()==0; }
+};
+// Vertex ranges of the guest's DrawPrimitiveUP calls for this draw: 821A7640
+// issues one per 1000 records, the ribbons one each. (first, count) pairs.
+std::vector<std::pair<uint32_t,uint32_t>> NativeEffectDrawCalls(const NativeEffectDraw& draw);
+// Vertices [first, first+count) as the guest would have them in memory: 32-bit
+// big-endian words in declaration order. This is what the immediate recording
+// path (and the mesh's declaration-driven conversion) consumes.
+std::vector<uint8_t> EncodeNativeEffectVertices(const NativeEffectDraw& draw,uint32_t first,uint32_t count);
+
+inline NativeEffectDraw MakeNativeParticleDraw(uint32_t effect,std::vector<NativeParticleRecord> records,
+    uint32_t texture,int32_t blend,uint32_t technique,const NativeEffectConstants& k) {
+  NativeEffectDraw draw;
+  draw.kind=NativeEffectDraw::Kind::Particles;
+  draw.technique=technique?NativeEffectTechnique::ZParticle:NativeEffectTechnique::Particle;  // cmpwi r30,0
+  draw.effect=effect; draw.texture=texture; draw.blend=blend;
+  draw.records=std::move(records);
+  draw.particle_vertices=ExpandNativeParticleRecords(draw.records,k);
+  return draw;
+}
+// 821A7C70 r7 texture, r8 blend, r9 depth-write flag.
+inline NativeEffectDraw MakeNativeRibbonDraw(uint32_t effect,NativeEffectDraw::Kind kind,
+    std::vector<NativeRibbonVertex> vertices,uint32_t texture,int32_t blend,uint32_t depth_flag) {
+  NativeEffectDraw draw;
+  draw.kind=kind; draw.technique=NativeEffectTechnique::Ribbon;
+  draw.effect=effect; draw.texture=texture; draw.blend=blend;
+  draw.sets_depth_write=true; draw.depth_write=depth_flag==1;
+  draw.ribbon_vertices=std::move(vertices);
+  return draw;
+}
+// 821A7640 compares its count signed against 0 and 1000; a negative count
+// would run the inner loop to 2^32, so it is refused rather than reproduced.
+template<class Reader>
+std::vector<NativeParticleRecord> ReadNativeParticleArray(const Reader& r,uint32_t array,uint32_t count_word) {
+  const auto count=int32_t(count_word);
+  if(count<0 || count>(1<<20)) throw std::runtime_error("native effect particle count out of range");
+  std::vector<NativeParticleRecord> records;
+  records.reserve(size_t(count));
+  for(int32_t i=0;i<count;++i) records.push_back(ReadNativeParticleRecord(r,r.Add(array,uint32_t(i)*kNativeParticleRecordBytes)));
+  return records;
+}
+
+// The effect classes, keyed by their slot 4 (vtable+16).
+enum class NativeEffectClass : uint8_t {
+  Unknown,Particle01Limit,Particle02,Glass,RocketAmmo01,AcidAmmo01,BeamAmmo01,RocketAmmo02,SolidAmmo01,LaserAmmo01,WebAmmo01,
+  EffectEtc02
+};
+inline NativeEffectClass ClassifyNativeEffect(uint32_t slot4) {
+  switch(slot4) {
+    case 0x8211D250: return NativeEffectClass::Particle01Limit;  // clParticle01_Limit, vtable 0x82004F6C
+    case 0x8211DB70: return NativeEffectClass::Particle02;       // clParticle02, 0x82007784
+    case 0x8217D6E0: return NativeEffectClass::Glass;            // clEffectGlass, 0x82012CC8
+    case 0x82119A10: return NativeEffectClass::RocketAmmo01;     // clRocketAmmo01, 0x820074F4
+    case 0x82113308: return NativeEffectClass::AcidAmmo01;       // clAcidAmmo01, 0x820072F0
+    case 0x82114A98: return NativeEffectClass::BeamAmmo01;       // clBeamAmmo01, 0x82007368
+    case 0x8211A0E8: return NativeEffectClass::RocketAmmo02;     // clRocketAmmo02, 0x82007524
+    case 0x8211B088: return NativeEffectClass::SolidAmmo01;      // clSolidAmmo01, 0x82007614
+    case 0x82117CD0: return NativeEffectClass::LaserAmmo01;      // clLaserAmmo01, 0x82007438
+    case 0x8211BB80: return NativeEffectClass::WebAmmo01;        // clWebAmmo01, 0x82007670
+    case 0x8217C4A0: return NativeEffectClass::EffectEtc02;      // clEffectEtc02, 0x82012C78
+    // Not built: clSpark01 (0x8211E7A0, strip via 821A8090) and clMuzzleFlash
+    // (0x821897A8, segments via 821A8628) reach the same producers but were not
+    // in scope; they count as unsupported.
+    default: return NativeEffectClass::Unknown;
+  }
+}
+struct NativeEffectInputs {
+  uint32_t effect=0;
+  NativeFxVec3 eye{};
+  NativeEffectConstants k{};
+};
+template<class Reader>
+NativeEffectInputs ReadNativeEffectInputs(const Reader& r) {
+  NativeEffectInputs in;
+  in.effect=r.Word(kNativeEffectShaderGlobal);
+  in.eye=ReadNativeFxVec3(r,r.Add(r.Word(kNativeEffectCameraGlobal),kNativeEffectEyeOffset));
+  in.k=ReadNativeEffectConstants(r);
+  return in;
+}
+
+// Per-class builders. Each returns the draws its slot 4 issues, in order.
+namespace native_effect_builders {
+// clAcidAmmo01 (82113308) and clBeamAmmo01 (82114A98) share the shape: eight
+// records copied forward from record 0, each moved by one step.
+template<class Reader>
+NativeFxVec3 Step(const Reader& r,uint32_t object,uint32_t direction,float size,const NativeEffectConstants& k) {
+  // ld/std of the 16 bytes, then sub_821B0320 with f1 = size*0.25.
+  return NativeFxSetLength(ReadNativeFxVec3(r,r.Add(object,direction)),NativeFxMul(size,k.quarter),k);
+}
+template<class Reader>
+NativeParticleRecord Head(const Reader& r,uint32_t object,uint32_t position,float radius,const NativeEffectConstants& k) {
+  // Position copied from `position`, colour from +656, the given radius, and
+  // the angle is the zero constant (stfs f13).
+  return {ReadNativeFxVec3(r,r.Add(object,position)),ReadNativeFxVec4(r,r.Add(object,656)),radius,k.zero};
+}
+template<class Reader>
+std::vector<NativeParticleRecord> Acid(const Reader& r,uint32_t object,const NativeEffectConstants& k) {
+  const float size=ReadNativeFxFloat(r,r.Add(object,676));
+  const auto step=Step(r,object,896,size,k);
+  std::vector<NativeParticleRecord> records{Head(r,object,912,size,k)};
+  for(uint32_t i=1;i<8;++i) {
+    auto next=records.back();                                  // 48-byte copy of the previous record
+    next.radius=NativeFxMul(next.radius,k.three_quarters);
+    next.position[1]=NativeFxSub(next.position[1],step[1]);
+    next.position[0]=NativeFxSub(next.position[0],step[0]);
+    next.position[2]=NativeFxSub(next.position[2],step[2]);
+    records.push_back(next);
+  }
+  return records;
+}
+template<class Reader>
+std::vector<NativeParticleRecord> Beam(const Reader& r,uint32_t object,const NativeEffectConstants& k) {
+  const float size=ReadNativeFxFloat(r,r.Add(object,676));
+  const auto step=Step(r,object,480,size,k);
+  std::vector<NativeParticleRecord> records{Head(r,object,544,size,k)};
+  for(uint32_t i=1;i<8;++i) {
+    auto next=records.back();
+    next.position[1]=NativeFxAdd(next.position[1],step[1]);   // fadds f11,f11,f13
+    next.position[0]=NativeFxAdd(step[0],next.position[0]);   // fadds f11,f12,f10
+    next.position[2]=NativeFxAdd(next.position[2],step[2]);
+    records.push_back(next);
+  }
+  return records;
+}
+// clRocketAmmo02 (8211A0E8): twelve records back from the head at +544 (the
+// +496 block's second 48), radius_i = fmadds(float(i)*(1/12), 0.2s - s, s).
+template<class Reader>
+std::vector<NativeParticleRecord> Rocket02(const Reader& r,uint32_t object,const NativeEffectConstants& k) {
+  const float size=ReadNativeFxFloat(r,r.Add(object,676));
+  const float tail=NativeFxMul(size,k.fifth);
+  const auto step=Step(r,object,480,size,k);
+  const float span=NativeFxSub(tail,size);
+  std::vector<NativeParticleRecord> records{Head(r,object,544,size,k)};
+  for(int32_t i=1;i<12;++i) {
+    auto next=records.back();
+    next.radius=NativeFxMadd(NativeFxMul(float(double(i)),k.twelfth),span,size);  // fcfid, frsp, fmuls, fmadds
+    next.position[1]=NativeFxSub(next.position[1],step[1]);
+    next.position[0]=NativeFxSub(next.position[0],step[0]);
+    next.position[2]=NativeFxSub(next.position[2],step[2]);
+    records.push_back(next);
+  }
+  return records;
+}
+// clSolidAmmo01 (8211B088): record 0 has radius 0.5s; then n = 11..1 with
+// radius fmadds(float(n)*(1/12), 0.5s - s, s), each moved forward by one step.
+template<class Reader>
+std::vector<NativeParticleRecord> Solid(const Reader& r,uint32_t object,const NativeEffectConstants& k) {
+  const float size=ReadNativeFxFloat(r,r.Add(object,676));
+  const float head=NativeFxMul(size,k.half);
+  const auto step=Step(r,object,480,size,k);
+  const float span=NativeFxSub(head,size);
+  std::vector<NativeParticleRecord> records{Head(r,object,544,head,k)};
+  for(int32_t n=11;n>0;--n) {
+    auto next=records.back();
+    next.radius=NativeFxMadd(NativeFxMul(float(double(n)),k.twelfth),span,size);
+    next.position[1]=NativeFxAdd(next.position[1],step[1]);
+    next.position[0]=NativeFxAdd(next.position[0],step[0]);
+    next.position[2]=NativeFxAdd(next.position[2],step[2]);
+    records.push_back(next);
+  }
+  return records;
+}
+}  // namespace native_effect_builders
+
+template<class Reader>
+std::vector<NativeEffectDraw> BuildNativeEffectDraws(const Reader& r,uint32_t object,NativeEffectClass type,
+                                                     const NativeEffectInputs& in) {
+  namespace b=native_effect_builders;
+  const auto& k=in.k;
+  const auto word=[&](uint32_t offset) { return r.Word(r.Add(object,offset)); };
+  const auto single=[&](uint32_t offset) { return ReadNativeFxFloat(r,r.Add(object,offset)); };
+  std::vector<NativeEffectDraw> draws;
+  const auto particles=[&](std::vector<NativeParticleRecord> records,uint32_t texture,int32_t blend) {
+    draws.push_back(MakeNativeParticleDraw(in.effect,std::move(records),texture,blend,0,k));
+  };
+  switch(type) {
+    case NativeEffectClass::Particle01Limit:   // r4 +396, r5 +404, r6 +424, r7 +444, r8 0
+      particles(ReadNativeParticleArray(r,word(396),word(404)),word(424),int32_t(word(444)));
+      break;
+    case NativeEffectClass::Particle02:        // beqlr on +620 == 0
+      if(word(620)) particles(ReadNativeParticleArray(r,word(604),word(620)),word(392),int32_t(word(420)));
+      break;
+    case NativeEffectClass::Glass:             // r5 +684, r4 +700, r6 +596, r7 0
+      particles(ReadNativeParticleArray(r,word(700),word(684)),word(596),kNativeEffectBlendAlpha);
+      break;
+    case NativeEffectClass::RocketAmmo01: {    // r5 = +924 unless it is (unsigned) above +888
+      const auto count=word(924),limit=word(888);
+      particles(ReadNativeParticleArray(r,word(896),count>limit?limit:count),word(908),kNativeEffectBlendAdditive);
+      break;
+    }
+    case NativeEffectClass::AcidAmmo01: particles(b::Acid(r,object,k),word(880),kNativeEffectBlendAlpha); break;
+    case NativeEffectClass::BeamAmmo01: particles(b::Beam(r,object,k),word(880),kNativeEffectBlendAdditive); break;
+    case NativeEffectClass::RocketAmmo02: particles(b::Rocket02(r,object,k),word(908),kNativeEffectBlendAdditive); break;
+    case NativeEffectClass::SolidAmmo01: particles(b::Solid(r,object,k),word(884),kNativeEffectBlendAdditive); break;
+    case NativeEffectClass::LaserAmmo01: {
+      // 821A8628(r4 = two stack points, r5 2, r7 +880, r8 &+656, r9 1, r10 0,
+      // f1 = +676 * +936). Each point: 16 bytes from +944/+960, +16/+20 = 0.5.
+      const float width=NativeFxMul(single(676),single(936));
+      const std::array<NativeRibbonPoint,2> points{{{ReadNativeFxVec3(r,r.Add(object,944)),k.half},
+                                                   {ReadNativeFxVec3(r,r.Add(object,960)),k.half}}};
+      const auto colour=ReadNativeFxVec4(r,r.Add(object,656));
+      draws.push_back(MakeNativeRibbonDraw(in.effect,NativeEffectDraw::Kind::RibbonQuads,
+        BuildNativeRibbonSegments(points,colour,width,in.eye,k),word(880),1,0));
+      if(r.Bytes(r.Add(object,976),1)[0]) {
+        // One record: position +912, colour +656 * 5, radius (+676 * +936) * 5.
+        NativeParticleRecord head{ReadNativeFxVec3(r,r.Add(object,912)),{},k.zero,k.zero};
+        for(size_t i=0;i<4;++i) head.colour[i]=NativeFxMul(colour[i],k.five);
+        head.radius=NativeFxMul(NativeFxMul(single(676),single(936)),k.five);
+        particles({head},word(880),kNativeEffectBlendAdditive);
+      }
+      break;
+    }
+    case NativeEffectClass::WebAmmo01: {
+      // 821A8090(r4 +784, r5 +792, r7 +796, r8 colour 1.0 x4, r9 0, r10 0,
+      // f1 = +484 * +780), then one record at the LAST point: array + count*32
+      // - 32, read even when the count is below 2 (the strip is then skipped).
+      const auto array=word(784),count=word(792);
+      const NativeFxVec4 white{k.one,k.one,k.one,k.one};
+      if(int32_t(count)>=2) {
+        const auto used=std::min<uint32_t>(count,kNativeRibbonPointLimit);
+        std::vector<NativeRibbonPoint> points;
+        points.reserve(used);
+        for(uint32_t i=0;i<used;++i) points.push_back(ReadNativeRibbonPoint(r,r.Add(array,i*kNativeRibbonPointBytes)));
+        draws.push_back(MakeNativeRibbonDraw(in.effect,NativeEffectDraw::Kind::RibbonStrip,
+          BuildNativeRibbonStrip(points,white,NativeFxMul(single(484),single(780)),in.eye,k),word(796),0,0));
+      }
+      const uint32_t last=array+(count<<5)-32;                  // rlwinm r10,r10,5,0,26; add; addi -32
+      NativeParticleRecord head{ReadNativeFxVec3(r,last),white,k.zero,k.zero};
+      head.radius=NativeFxMul(NativeFxMul(single(484),single(780)),k.web_scale);
+      particles({head},word(812),kNativeEffectBlendAlpha);
+      break;
+    }
+    case NativeEffectClass::EffectEtc02: {
+      // 8217C4A0: min(+544, 32) quads (signed; none when <= 0) from the 64-byte
+      // blocks at [+640], four points 16 bytes apart. UVs (+500,+504) (+508,+504)
+      // (+508,+512) (+500,+512), colour +592..+604 on all four; 821A7C70 with
+      // r4 13, r7 +528, r8 = byte [0x82554BF0] != 0, r9 0. The +612 decrement
+      // is CommitNativeEffectDraw's, not a builder's.
+      auto quads=int32_t(word(544));
+      if(quads>32) quads=32;
+      std::vector<NativeRibbonVertex> vertices;
+      if(quads>0) {
+        const NativeFxVec4 colour=ReadNativeFxVec4(r,r.Add(object,592));
+        const float u0=single(500),v0=single(504),u1=single(508),v1=single(512);
+        const std::array<std::array<float,2>,4> uv{{{u0,v0},{u1,v0},{u1,v1},{u0,v1}}};
+        const auto points=word(640);
+        vertices.reserve(size_t(quads)*4);
+        for(int32_t q=0;q<quads;++q) for(uint32_t v=0;v<4;++v)
+          vertices.push_back({ReadNativeFxVec3(r,r.Add(points,uint32_t(q)*64+v*16)),uv[v],colour});
+      }
+      const int32_t blend=r.Bytes(kNativeEffectEtc02BlendGlobal,1)[0]?kNativeEffectBlendAdditive:kNativeEffectBlendAlpha;
+      draws.push_back(MakeNativeRibbonDraw(in.effect,NativeEffectDraw::Kind::RibbonQuads,std::move(vertices),word(528),blend,0));
+      break;
+    }
+    case NativeEffectClass::Unknown: throw std::runtime_error("unsupported native effect class");
+  }
+  std::erase_if(draws,[](const NativeEffectDraw& draw) { return draw.empty(); });
+  return draws;
+}
+
+// One effect object filed into the transparent pass.
+struct NativeEffectItem {
+  uint16_t key=0;
+  uint32_t order=0,object=0,slot4=0;
+  NativeEffectClass type=NativeEffectClass::Unknown;
+  std::vector<NativeEffectDraw> draws;
+};
+// The guest state a slot 4 call changes besides the device: clEffectEtc02's
+// lifetime, lwz/addi -1/stw (wrapping), once per call, drawn or not (a count
+// <= 0 still reaches the store). Run once for every object whose slot 4 the
+// guest would have called this pass - each item CollectNativeEffects returns -
+// and never for a culled, hidden, duplicate or undrawn-key object.
+template<class Reader>
+void CommitNativeEffectDraw(const Reader& r,const NativeEffectItem& item) {
+  if(item.type!=NativeEffectClass::EffectEtc02) return;
+  const auto at=r.Add(item.object,kNativeEffectEtc02Lifetime);
+  r.StoreWord(at,r.Word(at)-1);
+}
+struct NativeEffectCollection {
+  std::vector<NativeEffectItem> items;      // key >= 256, descending, filing order on ties
+  std::vector<NativeEffectItem> immediate;  // mode 0: slot 4 runs inside the walk, before the drain
+  std::vector<uint32_t> unsupported_slots;  // slot 4 of objects no builder covers
+  uint32_t visited=0,duplicates=0,culled=0,hidden=0,undrawn_keys=0,unknown_modes=0,unsupported=0;
+};
+// clEffectObjectManager (vtable 0x820072D4) keeps its objects on the intrusive
+// list at +48; its slot 2 (sub_820D4850, shared with clGameBossObject_Manager)
+// walks it with sub_820B4038, the same culled walk the models use.
+struct NativeEffectList {
+  static constexpr uint32_t manager_vtable=0x820072D4,manager_offset=48,first=0,end=12,next=0,object=8;
+};
+
+// sub_820B4038 over one list, then sub_821C0C00 per surviving object. The one
+// guest write is CommitNativeEffectDraw's (clEffectEtc02 +612); the walk's +48
+// stamp, context+32..+44 and the bucket links are not written:
+//  - object+48 == context+12 skips an object already visited this pass (the
+//    walk stores the stamp); `visited`, shared by every walk of the pass,
+//    stands in for the stamp;
+//  - centre +288 through the camera matrix; -(z * context+8) > +76 culls; the
+//    sphere test with +352 and, when it intersects, the box at +288 (the model
+//    path's NativeVisibilitySphere/Box);
+//  - u16 +64 != 0 skips; +52 == 0 runs slot 4 at once; 1/2 file a key computed
+//    as sub_821C0C00 does with the transformed z as context+40.
+// No byte +36 test exists on this path: clGameObject_Manager::slot1 reads +36,
+// but that is the update walk, not the render walk.
+// `order` is the pass-wide filing counter (see NativeTransparentItem).
+template<class Reader>
+NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32_t context,uint32_t& order,
+                                            std::unordered_set<uint32_t>* visited=nullptr) {
+  NativeEffectCollection out;
+  const auto view=ReadNativeSceneVisibilityView(r,context);
+  const auto in=ReadNativeEffectInputs(r);
+  auto node=r.Word(r.Add(list,NativeEffectList::first));
+  const auto end=r.Word(r.Add(list,NativeEffectList::end));
+  for(uint32_t guard=0;node!=end;node=r.Word(r.Add(node,NativeEffectList::next))) {
+    if(++guard>(1u<<20)) throw std::runtime_error("native effect list does not terminate");
+    const auto object=r.Word(r.Add(node,NativeEffectList::object));
+    ++out.visited;
+    if(visited && !visited->insert(object).second) { ++out.duplicates; continue; }
+    const auto bound=ReadNativeSceneVisibility(r,object,false);
+    const auto center=NativeVisibilityTransform({bound.box[0],bound.box[1],bound.box[2],bound.box[3]},view.matrix);
+    const float depth=-float(center[2]*view.depth_scale);
+    auto visibility=depth>bound.distance?0u:NativeVisibilitySphere(view,center,bound.radius);
+    if(visibility==2) visibility=NativeVisibilityBox(view,bound.box);
+    if(!visibility) { ++out.culled; continue; }
+    const auto hidden=r.Bytes(r.Add(object,64),2);
+    if(hidden[0] || hidden[1]) { ++out.hidden; continue; }
+    const auto mode=int32_t(r.Word(r.Add(object,52)));
+    if(mode!=0 && mode!=1 && mode!=2) { ++out.unknown_modes; continue; }  // guest clamps an uninitialized float
+    NativeEffectItem item;
+    item.object=object;
+    item.slot4=r.Word(r.Add(r.Word(object),16));
+    item.type=ClassifyNativeEffect(item.slot4);
+    if(mode) {
+      item.key=ComputeNativeBucketKeyForDepth(r,context,object,std::bit_cast<uint32_t>(center[2])).key;
+      item.order=order++;
+    }
+    if(item.type==NativeEffectClass::Unknown) {
+      ++out.unsupported;
+      if(std::find(out.unsupported_slots.begin(),out.unsupported_slots.end(),item.slot4)==out.unsupported_slots.end())
+        out.unsupported_slots.push_back(item.slot4);
+      continue;
+    }
+    if(mode && !NativeTransparentKeyDrawn(item.key)) { ++out.undrawn_keys; continue; }
+    item.draws=BuildNativeEffectDraws(r,object,item.type,in);
+    CommitNativeEffectDraw(r,item);
+    (mode?out.items:out.immediate).push_back(std::move(item));
+  }
+  std::stable_sort(out.items.begin(),out.items.end(),[](const NativeEffectItem& a,const NativeEffectItem& b) {
+    return a.key!=b.key?a.key>b.key:a.order<b.order;
+  });
+  return out;
+}
+// The collection's filed items as transparent-pass items, for merging with the
+// models' and map effects'. `record(recorder, item)` records one item's draws
+// in order, each over NativeEffectDrawCalls with EncodeNativeEffectVertices.
+template<class Record>
+std::vector<NativeTransparentItem> NativeEffectTransparentItems(std::vector<NativeEffectItem> items,Record record) {
+  std::vector<NativeTransparentItem> out;
+  out.reserve(items.size());
+  for(auto& item:items) {
+    const auto shared=std::make_shared<const NativeEffectItem>(std::move(item));
+    out.push_back({shared->key,shared->order,[shared,record](NativeBackendRecorder& recorder) { record(recorder,*shared); }});
+  }
+  return out;
+}
+template<class Reader>
+NativeEffectCollection CollectNativeEffectManager(const Reader& r,uint32_t manager,uint32_t context,uint32_t& order,
+                                                  std::unordered_set<uint32_t>* visited=nullptr) {
+  if(r.Word(manager)!=NativeEffectList::manager_vtable) throw std::runtime_error("not a clEffectObjectManager");
+  return CollectNativeEffects(r,r.Add(manager,NativeEffectList::manager_offset),context,order,visited);
+}
+}
