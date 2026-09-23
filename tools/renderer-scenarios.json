@@ -15,6 +15,14 @@
       "capture_start": 4000,
       "seconds": {"ab": 420, "unlocked": 600, "soak-ab": 1950, "soak-unlocked": 1950}
     },
+    "benchmark-skipintro": {
+      "description": "The benchmark route (M202, Map01 City 1, fresh profile) with the Mission 1 intro skipped by one Start press at 85 s of game time: compares the street load (loading2) against the benchmark's, where the intro plays through; capture_start is the benchmark's less the ~2600 skipped intro frames",
+      "input": "tools/native-benchmark-skipintro-input.txt",
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 360, "unlocked": 540, "soak-ab": 1950, "soak-unlocked": 1950}
+    },
     "cave": {
       "description": "Mission 11 Infiltration (M301, Map08 Cave 2): underground nest, 110 ants at close range",
       "input": "tools/native-scenario-cave-input.txt",

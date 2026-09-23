@@ -1,0 +1,52 @@
+# The benchmark route (tools/native-benchmark-input.txt) with the Mission 1
+# intro skipped: the scenario benchmark-skipintro, for comparing the street
+# load ("loading2") with and without the intro having played.
+#
+# Clock: game ticks, as in the benchmark route. The game clock does not advance
+# on loading screens, so these times do not drift with load speed.
+clock game
+#
+# How the intro is skipped (guest code, not a guess at a button):
+#  - clMissionSequence::Begin (sub_820CD448) stores the phase at seq+708
+#    (0 = Before, the intro; 1 = Mission) and clears seq+712.
+#  - The phase's EndLoading (sub_820CBC08) sets seq+712 = 1: skippable. The
+#    intro's EndLoading runs at the start of Before.bvm, when "loading1" ends.
+#  - The pause handler (clNoguchiCallback::slot0, sub_820A6B10) does not open
+#    PauseMenu while seq+712 == 1 and seq+708 != 1; it calls sub_820C8790,
+#    which sets seq+712 = 2.
+#  - Every frame sub_820CD3D8 ends the phase when seq+712 == 2
+#    (sub_820CD298), and the sequence continues with Mission.bvm.
+# The pause button is Start (0x0010): the same press opens PauseMenu in
+# gameplay (tools/native-untiled-retry-input.txt). A presses do not skip: the
+# benchmark's A at 60-70 s land in the intro and it plays to the end.
+#
+# Menus: identical to the benchmark route (fresh profile, default Mission 1).
+20000 1000 0010
+25000 1000 0010
+30000 1000 1000
+35000 1000 1000
+40000 1000 1000
+45000 1000 1000
+50000 1000 1000
+55000 1000 1000
+60000 1000 1000
+65000 1000 1000
+70000 1000 1000
+# Skip. The intro starts at about 60 s of game time (loading1 ends ~66 s of
+# wall time after the first poll, and the clock stood still on the loading
+# screens before it) and lasts ~43 s, so 85 s is well inside it on either
+# side. ONE press only: after the skip, the street loads in ~5 s and a second
+# Start would open the pause menu in gameplay. The benchmark's late A presses
+# (150 s, 155 s) are dropped for the same reason: they would land in gameplay.
+85000 500 0010
+# Street gameplay starts ~5-9 s after the skip (teardown + loading2). Hold
+# fire from street entry +10 s for the benchmark's 300 s, no stick input, as
+# in the benchmark route.
+100000 300000 0000 0 255 0 0 0 0
+# Log markers: the skip is the frame where the intro stops and the teardown
+# starts (the model cleanup lines), then
+#   [NtCreateFile] FAILED: path='GAME:\MISSION\M202\MISSION.CAM'
+# and the presenter's first frame (caller=0x8219c828), then
+#   Native group order publication: ... groups=412 changes=4
+# when the street is published. With --edf_native_load_trace=true the
+# "Native load trace:" events bracket each phase (tools/load-trace-report.py).

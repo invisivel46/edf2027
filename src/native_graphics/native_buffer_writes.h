@@ -15,6 +15,7 @@
 #include <span>
 #include <exception>
 #include <thread>
+#include "native_interval_index.h"
 
 namespace edf::native {
 // Producer callbacks never acquire renderer locks or retain guest pointers.
@@ -126,9 +127,9 @@ class NativeBufferWrites {
       if(!subscription_pages_) subscription_pages_=std::make_unique<std::array<uint32_t,kPageCount>>();
       if(next_lifetime_==UINT64_MAX) { subscriptions_unknown_=true; return; }
       auto [at,inserted]=subscriptions_.try_emplace(owner,Subscription{});
-      if(!inserted) ChangePages(at->second.range,false);
+      if(!inserted) { ChangePages(at->second.range,false); subscription_index_.Remove(); }
       at->second={{*physical,bytes},{++next_lifetime_,0}}; ChangePages(at->second.range,true);
-      intervals_dirty_=true;
+      subscription_index_.Add(*physical,uint64_t(*physical)+bytes,owner,at->second.version.lifetime);
     } catch(const std::bad_alloc&) { subscriptions_unknown_=true; }
   }
   void Unsubscribe(uint32_t owner) {
@@ -547,13 +548,13 @@ class NativeBufferWrites {
     if(!bytes) return;
     const bool valid=physical<0x20000000u && bytes<=0x20000000u-physical;
     if(valid && RebuildIntervals()) {
-      auto at=std::lower_bound(subscription_intervals_.begin(),subscription_intervals_.end(),uint64_t(physical)+bytes,
-        [](const auto& interval,uint64_t end) { return interval.begin<end; });
-      while(at!=subscription_intervals_.begin()) {
-        --at;
-        if(at->prefix_end<=physical) break;
-        if(at->end>physical) visit(at->owner,*at->subscription);
-      }
+      // Resolve through the map: a stale entry's node may be gone.
+      Subscription* live=nullptr;
+      subscription_index_.Query(physical,bytes,[&](uint32_t owner,uint64_t lifetime) {
+        const auto found=subscriptions_.find(owner);
+        live=found!=subscriptions_.end() && found->second.version.lifetime==lifetime?&found->second:nullptr;
+        return live!=nullptr;
+      },[&](uint32_t owner,uint64_t) { visit(owner,*live); });
     } else for(auto& [owner,subscription]:subscriptions_) {
       const auto& range=subscription.range;
       if(!valid || (uint64_t(physical)+bytes>range.address && uint64_t(range.address)+range.bytes>physical))
@@ -569,7 +570,7 @@ class NativeBufferWrites {
     if(at==subscriptions_.end()) return;
     ChangePages(at->second.range,false); subscriptions_.erase(at);
     ++subscriptions_generation_; // Node addresses cached by TryReuseObservedSet die here.
-    intervals_dirty_=true;
+    subscription_index_.Remove();
   }
   bool TouchesSubscription(uint32_t address,uint32_t bytes) const {
     if(subscriptions_unknown_ || address>=0x20000000u || bytes>0x20000000u-address) return true;
@@ -584,30 +585,18 @@ class NativeBufferWrites {
     uint64_t audited_revision=0;
     uint64_t observations=0; // Snapshot observations in this subscription lifetime.
   };
-  struct SubscriptionInterval { uint64_t begin,end,prefix_end; Subscription* subscription; uint32_t owner; };
+  // Incremental overlap index (native_interval_index.h), tagged by lifetime:
+  // subscribe/unsubscribe no longer force a full sort before the next Record.
+  // False only on allocation failure; Record then uses the exact scan.
   bool RebuildIntervals() {
-    if(!intervals_dirty_) return true;
-    try {
-      subscription_intervals_.clear();
-      subscription_intervals_.reserve(subscriptions_.size());
-      for(auto& [owner,subscription]:subscriptions_) {
+    return subscription_index_.Refresh([&](auto add) {
+      for(const auto& [owner,subscription]:subscriptions_) {
         const auto& range=subscription.range;
-        subscription_intervals_.push_back({range.address,uint64_t(range.address)+range.bytes,0,&subscription,owner});
+        add(range.address,uint64_t(range.address)+range.bytes,owner,subscription.version.lifetime);
       }
-      std::sort(subscription_intervals_.begin(),subscription_intervals_.end(),
-        [](const auto& a,const auto& b) { return a.begin<b.begin; });
-      uint64_t end=0;
-      for(auto& interval:subscription_intervals_) {
-        end=(std::max)(end,interval.end); interval.prefix_end=end;
-      }
-      intervals_dirty_=false; return true;
-    } catch(const std::bad_alloc&) {
-      // Leave dirty: no stale pointer may be queried; Record uses exact scan.
-      subscription_intervals_.clear(); return false;
-    }
+    });
   }
-  std::vector<SubscriptionInterval> subscription_intervals_;
-  bool intervals_dirty_=true;
+  NativeIntervalIndex subscription_index_;
   std::map<uint32_t,Subscription> subscriptions_;
   // Bumped on every erase; see TryReuseObservedSet.
   uint64_t subscriptions_generation_=0,reuse_generation_=UINT64_MAX;
