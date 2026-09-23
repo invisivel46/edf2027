@@ -30,6 +30,9 @@ namespace edf::native {
 // batch+84, index count batch+140 drawn as floor(n/3)*3 triangles-list indices,
 // material *(batch+0) with pass count +24 and 112-byte pass records at *(+16).
 // Pose vectors keep begin/end at +4/+8 with 64-byte row-major matrices.
+// A layout decoded with pose_vector 0 is 821C9DA8's (native_render_instances.h):
+// one caller-supplied world, no pose, instance+12 unread; records with rec+48
+// set are neither uploaded nor drawn there, so they keep no batches.
 inline constexpr uint32_t kNativeModelMaxMeshes=4096,kNativeModelMaxBatches=1024,
   kNativeModelMaxPasses=64,kNativeModelMaxBones=1024,kNativeModelMaxIndices=0x01fffffeu;
 inline uint32_t NativeModelAddress(uint32_t base,uint64_t offset) {
@@ -56,7 +59,7 @@ struct NativeModelMeshLayout {
 // Immutable once registered. Identity, not a certificate that guest bytes stay put.
 struct NativeModelLayout {
   uint32_t instance=0,container=0,node=0,pose_vector=0,bones=0;
-  bool skinned=false;
+  bool skinned=false,single_world=false;
   std::vector<NativeModelMeshLayout> meshes;
   size_t Batches() const { size_t count=0; for(const auto& mesh:meshes) count+=mesh.batches.size(); return count; }
   bool operator==(const NativeModelLayout&) const=default;
@@ -138,8 +141,9 @@ NativeModelLayout DecodeNativeModelLayoutWith(const Reader& reader,uint32_t inst
   layout.node=reader.Word(NativeModelAddress(instance,4));
   if(!layout.container || !layout.node || layout.node%4 || layout.node==reader.Word(NativeModelAddress(layout.container,4)))
     throw std::runtime_error("native model instance names no model resource");
-  layout.skinned=reader.Bytes(NativeModelAddress(instance,12),1)[0]!=0;
-  layout.bones=ReadNativeModelPoseRange(reader,pose_vector).count;
+  layout.single_world=!pose_vector;
+  layout.skinned=!layout.single_world && reader.Bytes(NativeModelAddress(instance,12),1)[0]!=0;
+  layout.bones=layout.single_world?0:ReadNativeModelPoseRange(reader,pose_vector).count;
   if(layout.skinned && !layout.bones) throw std::runtime_error("native skinned model has an empty pose");
   const auto records=reader.Word(NativeModelAddress(layout.node,44)),count=reader.Word(NativeModelAddress(layout.node,52));
   if(count>kNativeModelMaxMeshes || (count && (!records || records%4)))
@@ -152,7 +156,10 @@ NativeModelLayout DecodeNativeModelLayoutWith(const Reader& reader,uint32_t inst
     mesh.bone=reader.Word(mesh.address+44);
     mesh.skinned=reader.Bytes(mesh.address+48,1)[0]!=0;
     mesh.uploads_bone=!layout.skinned || !mesh.skinned;
-    if(mesh.uploads_bone && mesh.bone>=layout.bones) throw std::runtime_error("native model mesh bone outside its pose");
+    if(layout.single_world) {
+      mesh.uploads_bone=!mesh.skinned;
+      if(mesh.skinned) continue;
+    } else if(mesh.uploads_bone && mesh.bone>=layout.bones) throw std::runtime_error("native model mesh bone outside its pose");
     const auto first=reader.Word(mesh.address+4),last=reader.Word(mesh.address+8);
     if(!first) { if(last) throw std::runtime_error("native model mesh batches have an end without storage"); continue; }
     if(first%4 || last<first || (last-first)%148 || (last-first)/148>kNativeModelMaxBatches)

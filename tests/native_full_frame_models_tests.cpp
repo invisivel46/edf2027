@@ -2,6 +2,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <algorithm>
 #include <iostream>
 #include <memory>
 #include <vector>
@@ -221,6 +222,46 @@ void Instancing() {
   const auto sorted=OrderNativeFullFrameModelDraws(plan.opaque,false);
   Require(sorted[0].item==0 && sorted[1].item==0 && sorted[1].draw.pass==0x3100 && sorted[2].item==1,"transparent draws stay in item order");
 }
+// 821C9DA8 sets: one item per world after the entry's own model, sharing its
+// route; the sphere draws of every world are adjacent in the opaque order.
+void InstancedWorlds() {
+  auto sphere=std::make_shared<NativeModelLayout>();
+  sphere->instance=0x9000; sphere->node=0x9100; sphere->single_world=true;
+  sphere->meshes={Mesh(0,false,true,{Batch(0x9200,{0x9300})}),Mesh(0,true,false,{})};
+  auto worlds=std::make_shared<std::vector<NativePoseMatrix>>(3);
+  for(size_t w=0;w<3;++w) for(size_t i=0;i<16;++i) (*worlds)[w][i]=float(w*1000+i);
+  auto mother=Entry(1,{0,0,100});
+  mother->instanced.push_back({{sphere->instance,sphere},worlds});
+  auto tree=Entry(2,{0,0,100});
+  NativeRenderRegistrySnapshot snapshot;
+  snapshot.entries.push_back(mother); snapshot.entries.push_back(tree);
+  const auto plan=PlanNativeFullFrameModels(snapshot,MakeCamera());
+  Require(plan.opaque.size()==5 && plan.stats.instances==3 && plan.stats.opaque==5,"the model, three worlds, then the next entry");
+  Require(plan.opaque[0].instanced==-1 && plan.opaque[1].instanced==0 && plan.opaque[1].world==0 && plan.opaque[3].world==2 &&
+    plan.opaque[3].entry==mother.get() && plan.opaque[4].entry==tree.get(),"worlds follow their entry in record order");
+  Require(&NativeFullFrameModelItemLayout(plan.opaque[2])==sphere.get() &&
+    &NativeFullFrameModelItemLayout(plan.opaque[0])==mother->models[0].layout.get(),"an instance item names the sphere layout");
+  const auto values=NativeFullFrameModelInstancedConstants(*sphere,(*worlds)[1]);
+  Require(!values.skinned && values.palette.empty() && values.worlds.size()==2 &&
+    values.worlds[0]==NativeModelWorldRegisters((*worlds)[1]) && values.worlds[1]==values.worlds[0],"every record uploads the one world");
+  bool rejected=false;
+  try { NativeFullFrameModelInstancedConstants(*mother->models[0].layout,(*worlds)[0]); } catch(const std::exception&) { rejected=true; }
+  Require(rejected,"a pose layout is not drawn as instances");
+  const auto draws=OrderNativeFullFrameModelDraws(plan.opaque,true);
+  Require(draws.size()==5,"one draw per world and one per model");
+  size_t first=draws.size();
+  for(size_t i=0;i<draws.size();++i) if(draws[i].draw.pass==0x9300) { first=std::min(first,i); Require(i-first<3,"sphere draws are adjacent"); }
+  Require(first<draws.size(),"the sphere draws");
+  // Without a pose the model is dropped, not its instances; an undecoded set draws nothing.
+  mother->pose=Pose(4);
+  auto undecoded=Entry(3,{0,0,100}); undecoded->instanced.push_back({{0x9400,nullptr},worlds});
+  NativeRenderRegistrySnapshot unposed;
+  unposed.entries.push_back(mother); unposed.entries.push_back(undecoded);
+  const auto partial=PlanNativeFullFrameModels(unposed,MakeCamera());
+  Require(partial.stats.no_pose==1 && partial.stats.no_instanced==1 && partial.opaque.size()==4 &&
+    partial.opaque[0].instanced==0 && partial.opaque[3].entry==undecoded.get() && partial.opaque[3].instanced==-1,
+    "instances survive a missing pose");
+}
 void BaseState() {
   NativeFullFrameModelTargets targets; targets.dsv_format=1;
   const auto state=NativeFullFrameModelBaseState(targets);
@@ -238,7 +279,7 @@ void BaseState() {
 }
 int main() {
   try {
-    Visibility(); Lod(); Constants(); SortKeys(); Instancing(); BaseState();
+    Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
     return 1;

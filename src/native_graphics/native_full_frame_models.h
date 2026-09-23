@@ -24,6 +24,12 @@ namespace edf::native {
 //   821C9C20 model draw        -> the layout's records/batches/passes with the
 //                                 snapshot pose (821A17D8 rigid world,
 //                                 821A1738 bone palette)
+//   821C9DA8 world draw        -> one item per published instanced world
+//                                 (NativeRenderEntry::instanced), every drawn
+//                                 record with that world; identical draws of
+//                                 the instances share one material and are
+//                                 adjacent in the opaque order, so the scene
+//                                 renderer draws them instanced
 // No guest function is called, no device state is read or handed off and no
 // guest-mirror eligibility is assessed. Each draw's render state is the pass
 // base state plus its own material's state operations (see
@@ -80,24 +86,34 @@ inline uint16_t NativeFullFrameModelKey(int32_t mode,float view_z,float sort_bia
   return uint16_t(uint64_t(NativeFctidz(depth)));
 }
 
-// One entry the frame draws: the LOD model chosen and its sort data. entry
-// points into the snapshot, which must outlive the plan.
+// One model the frame draws: the LOD model chosen, or with instanced >= 0 the
+// world `world` of entry->instanced[instanced], and the entry's sort data
+// (instances share their object's visibility, key and route, as 820EC180
+// draws them inside the one slot-4 call). entry points into the snapshot,
+// which must outlive the plan.
 struct NativeFullFrameModelItem {
   const NativeRenderEntry* entry=nullptr;
   uint32_t model=0;
   float depth=0,view_z=0;
   uint16_t key=0;
   bool transparent=false;
+  int32_t instanced=-1;
+  uint32_t world=0;
 };
+inline const NativeModelLayout& NativeFullFrameModelItemLayout(const NativeFullFrameModelItem& item) {
+  return item.instanced<0?*item.entry->models[item.model].layout:*item.entry->instanced[size_t(item.instanced)].model.layout;
+}
 struct NativeFullFrameModelPlan {
   struct Stats {
-    uint64_t entries=0,hidden=0,mode=0,distance=0,frustum=0,box=0,no_model=0,no_pose=0,bucket_zero=0,opaque=0,transparent=0;
+    uint64_t entries=0,hidden=0,mode=0,distance=0,frustum=0,box=0,no_model=0,no_pose=0,bucket_zero=0,opaque=0,transparent=0,
+      instances=0,no_instanced=0;
   };
   std::vector<NativeFullFrameModelItem> opaque;       // Snapshot order.
   std::vector<NativeFullFrameModelItem> transparent;  // Draw order: key descending, ties in snapshot order.
   Stats stats;
 };
-// Visibility, LOD and routing for every entry. Transparents follow 821A3BA0:
+// Visibility, LOD and routing for every entry: its posed LOD model, then each
+// instanced world in record order. Transparents follow 821A3BA0:
 // buckets by high key byte 255 down to 1, each by low byte descending, equal
 // keys in gather order. High bucket 0 (key < 256) is never traversed there,
 // so those entries are dropped (stats.bucket_zero). The registry snapshot is
@@ -120,6 +136,9 @@ struct NativeFullFrameModelConstants {
 };
 NativeFullFrameModelConstants NativeFullFrameModelConstantsFor(const NativeModelLayout& layout,
   std::span<const NativePoseMatrix> pose,uint32_t palette_limit);
+// 821C9DA8's constants: every record uploads the one world (records with
+// rec+48 set are not drawn and keep no batches in a single-world layout).
+NativeFullFrameModelConstants NativeFullFrameModelInstancedConstants(const NativeModelLayout& layout,const NativePoseMatrix& world);
 // Replaces every vertex global g_mWorldArray's registers with the palette over
 // zeroed registers of the same extent (the shader's reflected capacity).
 // False when one is not a vertex global or cannot hold the palette.

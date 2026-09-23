@@ -3,6 +3,7 @@
 #include "native_material_render_state.h"
 #include "native_model_pass.h"
 #include "native_model_publication.h"
+#include "native_render_instances.h"
 #include <array>
 #include <atomic>
 #include <bit>
@@ -52,30 +53,11 @@ struct NativeSkyNode { static constexpr uint32_t size=304,children=80,child_coun
 // Render context of 821A5080 (stack r1+80) and the scene fields the sky reads.
 struct NativeSkyScene { static constexpr uint32_t context_scene=16,world=224,translation=272,camera=416; };
 inline constexpr uint32_t kNativeSkyMaxNodes=4096,kNativeSkyMaxDepth=256;
-using NativeSkyMatrix=std::array<float,16>;
+using NativeSkyMatrix=NativeGuestMatrix;
 
-// 821C8198(out,a,b): out = a x b, row-vector, as the recompiled body computes
-// it. Each guest row is loaded byte-reversed, so host lane 0 is guest element
-// 3; b is transposed with unpacks and every element is one DPPS (imm 0xFF) of
-// a row and a column, whose hardware order is (l0+l1)+(l2+l3):
-// (a.w*b3 + a.z*b2) + (a.y*b1 + a.x*b0). One product or sum per statement, so
-// nothing contracts into a fused multiply-add. The body runs with the guest
-// flush mode enabled (denormal inputs and results flush to zero); that is not
-// modeled here.
-inline float NativeSkyDot(const float* row,const NativeSkyMatrix& b,size_t column) {
-  const float w=row[3]*b[12+column];
-  const float z=row[2]*b[8+column];
-  const float y=row[1]*b[4+column];
-  const float x=row[0]*b[column];
-  const float high=w+z;
-  const float low=y+x;
-  return high+low;
-}
-inline NativeSkyMatrix NativeSkyMultiply(const NativeSkyMatrix& a,const NativeSkyMatrix& b) {
-  NativeSkyMatrix out{};
-  for(size_t row=0;row<4;++row) for(size_t column=0;column<4;++column) out[row*4+column]=NativeSkyDot(a.data()+row*4,b,column);
-  return out;
-}
+// 821C8198(out,a,b): out = a x b, row-vector (NativeGuestMatrixMultiply,
+// native_render_instances.h, which documents the DPPS order).
+inline NativeSkyMatrix NativeSkyMultiply(const NativeSkyMatrix& a,const NativeSkyMatrix& b) { return NativeGuestMatrixMultiply(a,b); }
 template<class Reader>
 NativeSkyMatrix ReadNativeSkyMatrix(const Reader& reader,uint32_t address) {
   const auto* bytes=reader.Bytes(address,64);

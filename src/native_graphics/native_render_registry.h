@@ -10,9 +10,11 @@
 // - 821C0D70(obj,flag): Subscribed(obj,flag==1), the scene+100 membership that
 //   drives slot 2 (pose builds) in 821A4DE8.
 // - 821A4DE8 exit: Tick. Events are applied in hook order, then the tick
-//   re-reads only new objects, scene+100 members, objects waiting for their
-//   first layout (backed off) and a small round-robin refresh of the rest, and
-//   publishes a snapshot whose unchanged entries are the previous pointers.
+//   re-reads only new objects, scene+100 members, objects with instanced
+//   worlds (their inputs advance in slot 3, not through scene+100), objects
+//   waiting for their first layout (backed off) and a small round-robin
+//   refresh of the rest, and publishes a snapshot whose unchanged entries are
+//   the previous pointers.
 //
 // Cost per tick is O(re-read objects + changes), never O(entries): a re-read
 // builds into a reused scratch entry and compares it with the published one
@@ -26,6 +28,7 @@
 // entries are immutable.
 #include "native_model_publication.h"
 #include "native_render_entry.h"
+#include "native_render_instances.h"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -88,7 +91,7 @@ inline bool SameNativeRenderEntry(const NativeRenderEntry& a,const NativeRenderE
   if(a.object!=b.object || a.generation!=b.generation || a.type!=b.type || a.mode!=b.mode || a.hidden!=b.hidden ||
      bits(a.radius)!=bits(b.radius) || bits(a.cull_distance)!=bits(b.cull_distance) || bits(a.sort_bias)!=bits(b.sort_bias) ||
      a.pose!=b.pose || a.pose_vector!=b.pose_vector || a.lod_thresholds.size()!=b.lod_thresholds.size() ||
-     a.models.size()!=b.models.size() || a.attachments.size()!=b.attachments.size()) return false;
+     a.models.size()!=b.models.size() || a.attachments.size()!=b.attachments.size() || a.instanced.size()!=b.instanced.size()) return false;
   for(size_t i=0;i<4;++i) if(bits(a.centre[i])!=bits(b.centre[i])) return false;
   for(size_t i=0;i<a.lod_thresholds.size();++i) if(bits(a.lod_thresholds[i])!=bits(b.lod_thresholds[i])) return false;
   for(size_t i=0;i<a.models.size();++i) if(!same_models(a.models[i],b.models[i])) return false;
@@ -96,6 +99,8 @@ inline bool SameNativeRenderEntry(const NativeRenderEntry& a,const NativeRenderE
     const auto& x=a.attachments[i],&y=b.attachments[i];
     if(!same_models(x.model,y.model) || x.pose_vector!=y.pose_vector || x.pose!=y.pose) return false;
   }
+  for(size_t i=0;i<a.instanced.size();++i)
+    if(!same_models(a.instanced[i].model,b.instanced[i].model) || a.instanced[i].worlds!=b.instanced[i].worlds) return false;
   return true;
 }
 
@@ -104,7 +109,7 @@ class NativeRenderRegistry {
   struct Stats {
     uint64_t ticks=0,births=0,seeded=0,rebirths=0,deaths=0,unknown_deaths=0,subscriptions=0,unknown_subscriptions=0,
       unknown_classes=0,reclassified=0,deferred=0,foreign=0,builds=0,changed=0,unchanged=0,pose_reuses=0,read_failures=0,
-      layout_captures=0,layout_failures=0;
+      layout_captures=0,layout_failures=0,instanced_worlds=0;
     size_t records=0,subscribed=0,published=0,retrying=0;
   };
   // In-game check (edf_native_render_registry_audit): scene+84 against the
@@ -141,6 +146,7 @@ class NativeRenderRegistry {
     std::vector<uint32_t> work(pending_.begin(),pending_.end());
     pending_.clear();
     work.insert(work.end(),subscribed_.begin(),subscribed_.end());
+    work.insert(work.end(),animated_.begin(),animated_.end());
     for(auto at=retry_.begin();at!=retry_.end();) {
       if(at->second<=tick) { work.push_back(at->first); at=retry_.erase(at); } else ++at;
     }
@@ -190,7 +196,7 @@ class NativeRenderRegistry {
   }
   void Clear() {
     { std::lock_guard lock(events_mutex_); events_.clear(); }
-    records_.clear(); pending_.clear(); subscribed_.clear(); retry_.clear(); ring_.clear();
+    records_.clear(); pending_.clear(); subscribed_.clear(); animated_.clear(); retry_.clear(); ring_.clear();
     objects_=decltype(objects_){}; entries_.clear();
     cursor_=0; seeded_=false;
     { std::lock_guard lock(publish_mutex_); published_.reset(); }
@@ -241,7 +247,7 @@ class NativeRenderRegistry {
     ++stats_.births;
   }
   void Forget(uint32_t object) {
-    records_.erase(object); pending_.erase(object); subscribed_.erase(object); retry_.erase(object);
+    records_.erase(object); pending_.erase(object); subscribed_.erase(object); animated_.erase(object); retry_.erase(object);
     Unpublish(object);
   }
   struct EntryObject { uint32_t operator()(const std::shared_ptr<const NativeRenderEntry>& entry) const { return entry->object; } };
@@ -273,6 +279,7 @@ class NativeRenderRegistry {
         }
         record.vtable=vtable; record.type=FindNativeRenderClass(vtable); record.captures.clear();
         if(!record.type) ++stats_.unknown_classes;
+        if(record.type && (record.type->attachments&kNativeRenderMotherSpheres)) animated_.insert(object); else animated_.erase(object);
       }
       if(record.scene!=scene) ++stats_.foreign;
       else if(record.type && !record.type->scene_source && !record.type->effect) { Build(reader,object,record,decode,complete); built=true; }
@@ -294,7 +301,7 @@ class NativeRenderRegistry {
     const auto* previous=objects_.Find(object);
     const NativeRenderEntry* old=previous?previous->get():nullptr;
     auto* entry=&scratch_;
-    entry->lod_thresholds.clear(); entry->models.clear(); entry->attachments.clear();
+    entry->lod_thresholds.clear(); entry->models.clear(); entry->attachments.clear(); entry->instanced.clear();
     entry->pose.reset(); entry->pose_vector=0; entry->axes={};
     entry->object=object; entry->generation=record.generation; entry->type=&type;
     for(uint32_t i=0;i<4;++i) entry->centre[i]=NativeRenderFloat(reader,object+kNativeRenderObjectCentre+i*4);
@@ -342,6 +349,18 @@ class NativeRenderRegistry {
         attach(weapon+100,weapon+144);
       }
     }
+    // 820EC180: after the +1100 draw, obj+1172 once per record world. The
+    // worlds are shared with the published entry while bitwise unchanged.
+    if(type.attachments&kNativeRenderMotherSpheres) {
+      NativeRenderInstanced set;
+      set.model=Model(reader,record,object+NativeMotherSpheres::instance,0,decode,complete);
+      ReadNativeMotherSphereWorlds(reader,object,worlds_);
+      stats_.instanced_worlds+=worlds_.size();
+      if(old) for(const auto& earlier:old->instanced)
+        if(earlier.model.instance==set.model.instance && earlier.worlds && SameNativeModelPose(*earlier.worlds,worlds_)) { set.worlds=earlier.worlds; break; }
+      if(!set.worlds) set.worlds=std::make_shared<const std::vector<NativePoseMatrix>>(worlds_);
+      entry->instanced.push_back(std::move(set));
+    }
   }
   // The guest bytes are compared with the previous copy in place; only a
   // changed pose is decoded into a new shared copy.
@@ -358,11 +377,12 @@ class NativeRenderRegistry {
   // Captured once per (instance, container, node, pose vector, bone count),
   // and only when the model is assigned and its pose vector is sized: the
   // first tick after the constructor, after this tick's slot-2 pose build.
+  // vector 0 is a 821C9DA8 model (single world, no pose): assigned suffices.
   template<class Reader,class Decode>
   NativeRenderModel Model(const Reader& reader,Record& record,uint32_t instance,uint32_t vector,const Decode& decode,bool& complete) {
     NativeRenderModel model; model.instance=instance;
     const auto container=reader.Word(instance),node=reader.Word(instance+4);
-    const auto bones=ReadNativeModelPoseRange(reader,vector).count;
+    const auto bones=vector?ReadNativeModelPoseRange(reader,vector).count:0;
     auto capture=std::find_if(record.captures.begin(),record.captures.end(),[&](const Capture& c) { return c.instance==instance; });
     if(capture!=record.captures.end() && capture->container==container && capture->node==node && capture->pose_vector==vector &&
        (capture->rejected || (capture->layout && capture->layout->bones==bones))) {
@@ -372,7 +392,7 @@ class NativeRenderRegistry {
     if(capture==record.captures.end()) capture=record.captures.insert(record.captures.end(),Capture{instance});
     capture->container=container; capture->node=node; capture->pose_vector=vector;
     capture->layout.reset(); capture->rejected=false;
-    if(!container || !node || !bones) { complete=false; return model; }
+    if(!container || !node || (vector && !bones)) { complete=false; return model; }
     try {
       capture->layout=std::make_shared<const NativeModelLayout>(decode(instance,vector));
       ++stats_.layout_captures;
@@ -387,7 +407,7 @@ class NativeRenderRegistry {
   std::vector<Pending> events_;
   // Engine thread only.
   std::unordered_map<uint32_t,Record> records_;
-  std::unordered_set<uint32_t> pending_,subscribed_;
+  std::unordered_set<uint32_t> pending_,subscribed_,animated_;  // animated_: re-read every tick (instanced worlds)
   std::unordered_map<uint32_t,uint64_t> retry_;              // object -> next tick to retry
   std::vector<std::pair<uint32_t,uint64_t>> ring_;           // (object, generation), lazily pruned
   size_t cursor_=0;
@@ -396,6 +416,7 @@ class NativeRenderRegistry {
   NativeSharedMap<uint32_t,std::shared_ptr<const NativeRenderEntry>> objects_;
   NativeSharedVector<std::shared_ptr<const NativeRenderEntry>> entries_;  // objects_' values, same order
   NativeRenderEntry scratch_;
+  std::vector<NativePoseMatrix> worlds_;  // Instanced world scratch.
   Stats stats_;
   mutable std::mutex publish_mutex_;
   std::shared_ptr<const NativeRenderRegistrySnapshot> published_;

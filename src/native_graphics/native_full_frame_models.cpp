@@ -56,14 +56,30 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
       case C::Box: ++stats.box; continue;
     }
     const auto model=SelectNativeFullFrameModelLod(entry,visibility.depth);
-    if(!model) { ++stats.no_model; continue; }
-    const auto& layout=*entry.models[*model].layout;
-    if(!entry.pose || entry.pose->size()!=layout.bones) { ++stats.no_pose; continue; }
-    NativeFullFrameModelItem item{&entry,*model,visibility.depth,visibility.centre[2],0,entry.mode!=0};
-    if(!item.transparent) { plan.opaque.push_back(item); continue; }
-    item.key=NativeFullFrameModelKey(entry.mode,item.view_z,entry.sort_bias,camera.key_scale,camera.key_offset);
-    if(item.key<256) { ++stats.bucket_zero; continue; }
-    plan.transparent.push_back(item);
+    const bool posed=model && entry.pose && entry.pose->size()==entry.models[*model].layout->bones;
+    if(!model) ++stats.no_model;
+    else if(!posed) ++stats.no_pose;
+    // A set is drawable once its model decoded without a pose (821C9DA8).
+    const auto drawable=[](const NativeRenderInstanced& set) {
+      return set.model.instance && set.model.layout && set.model.layout->single_world && set.worlds;
+    };
+    size_t instances=0;
+    for(const auto& set:entry.instanced) { if(drawable(set)) instances+=set.worlds->size(); else ++stats.no_instanced; }
+    if(!posed && !instances) continue;
+    NativeFullFrameModelItem item{&entry,model.value_or(0),visibility.depth,visibility.centre[2],0,entry.mode!=0};
+    if(item.transparent) {
+      item.key=NativeFullFrameModelKey(entry.mode,item.view_z,entry.sort_bias,camera.key_scale,camera.key_offset);
+      if(item.key<256) { ++stats.bucket_zero; continue; }
+    }
+    auto& list=item.transparent?plan.transparent:plan.opaque;
+    if(posed) list.push_back(item);
+    for(size_t set=0;set<entry.instanced.size();++set) {
+      if(!drawable(entry.instanced[set])) continue;
+      for(uint32_t world=0;world<entry.instanced[set].worlds->size();++world) {
+        auto instance=item; instance.instanced=int32_t(set); instance.world=world;
+        list.push_back(instance); ++stats.instances;
+      }
+    }
   }
   std::stable_sort(plan.transparent.begin(),plan.transparent.end(),
     [](const auto& a,const auto& b) { return a.key>b.key; });
@@ -85,6 +101,12 @@ NativeFullFrameModelConstants NativeFullFrameModelConstantsFor(const NativeModel
   }
   return result;
 }
+NativeFullFrameModelConstants NativeFullFrameModelInstancedConstants(const NativeModelLayout& layout,const NativePoseMatrix& world) {
+  if(!layout.single_world) throw std::runtime_error("native full-frame instanced model has a pose layout");
+  NativeFullFrameModelConstants result;
+  result.worlds.assign(layout.meshes.size(),NativeModelWorldRegisters(world));
+  return result;
+}
 bool BindNativeFullFrameModelPalette(std::vector<NativeSceneMaterialInputs::Constant>& constants,std::span<const float> palette) {
   for(auto& constant:constants) {
     if(constant.name!="g_mWorldArray") continue;
@@ -97,7 +119,7 @@ bool BindNativeFullFrameModelPalette(std::vector<NativeSceneMaterialInputs::Cons
 std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::span<const NativeFullFrameModelItem> items,bool opaque) {
   std::vector<NativeFullFrameModelDrawRef> result;
   for(uint32_t item=0;item<items.size();++item) {
-    const auto& layout=*items[item].entry->models[items[item].model].layout;
+    const auto& layout=NativeFullFrameModelItemLayout(items[item]);
     const auto plan=NativeModelDrawPlan(layout);
     for(uint32_t index=0;index<plan.size();++index) {
       const auto& draw=plan[index];
@@ -109,7 +131,7 @@ std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::spa
   if(opaque) {
     const auto batch=[&](const NativeFullFrameModelDrawRef& ref) {
       const auto& item=items[ref.item];
-      return item.entry->models[item.model].layout->meshes[ref.draw.mesh].batches[ref.draw.batch].address;
+      return NativeFullFrameModelItemLayout(item).meshes[ref.draw.mesh].batches[ref.draw.batch].address;
     };
     std::stable_sort(result.begin(),result.end(),[&](const auto& a,const auto& b) {
       return std::tuple(a.pass_index,batch(a),a.draw.pass)<std::tuple(b.pass_index,batch(b),b.draw.pass);
@@ -196,10 +218,11 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     std::vector<std::vector<Resolved>> resolved(items.size());
     for(size_t index=0;index<items.size();++index) {
       const auto& item=items[index];
-      const auto& layout=*item.entry->models[item.model].layout;
+      const auto& layout=NativeFullFrameModelItemLayout(item);
       ++stats.items;
       try {
-        const auto values=NativeFullFrameModelConstantsFor(layout,*item.entry->pose,pass.palette_limit);
+        const auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,*item.entry->pose,pass.palette_limit):
+          NativeFullFrameModelInstancedConstants(layout,item.entry->instanced[size_t(item.instanced)].worlds->at(item.world));
         std::vector<Resolved> draws;
         bool complete=true;
         for(const auto& draw:NativeModelDrawPlan(layout)) {

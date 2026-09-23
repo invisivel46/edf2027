@@ -33,7 +33,9 @@ constexpr std::array kClasses{
   Character(0x82005198u,"clGiantAnt"),                               // 8210E6C0
   Character(0x820052C0u,"clUfoSmall01"),                             // 820E7FB8 -> 8210E6C0
   Character(0x820053F0u,"clUfoCarrier01"),                           // 820EA398 -> 8210E6C0
-  Rigid(0x820054D0u,"clUfoMother01_Dummy",1100,1144),                // 820EC180
+  // 820EC180: +1100 with pose +1144, then +1172 per record (821C9DA8).
+  NativeRenderClass{.vtable=0x820054D0u,.name="clUfoMother01_Dummy",.cadence=Cadence::Tick,.lod=Lod::None,
+    .instance=1100,.pose=1144,.attachments=kNativeRenderMotherSpheres},
   Character(0x82005678u,"clAlienTank01"),                            // 820ECCC0
   Character(0x820059D0u,"clGiantSpider"),                            // 8210E6C0
   Character(0x82005E14u,"clAlien4LegTank01"),                        // 820F5630

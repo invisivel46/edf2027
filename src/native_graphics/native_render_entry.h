@@ -32,8 +32,10 @@ struct NativeRenderClass {
 // obj+1636 when byte obj+1584 is set. Weapons: 820DE790 walks obj+1824 (count
 // +1832, stride 1408) when obj+1768 is zero; 820E1A80 draws w+100 with pose
 // w+144 when bytes w+1405 and w+1404 are set, w+108 is nonnull and not
-// (w+412==2 && w+804==0).
-enum NativeRenderAttachmentBit : uint8_t { kNativeRenderFace=1,kNativeRenderWeapons=2 };
+// (w+412==2 && w+804==0). MotherSpheres: 820EC180 draws obj+1172 through
+// 821C9DA8 once per 20-byte record at *(obj+1220) (count obj+1228), each with
+// its own world (native_render_instances.h); published as `instanced`.
+enum NativeRenderAttachmentBit : uint8_t { kNativeRenderFace=1,kNativeRenderWeapons=2,kNativeRenderMotherSpheres=4 };
 // One LOD choice: the object-relative model instance address and its layout.
 struct NativeRenderModel {
   uint32_t instance=0;          // guest address of the cl3D9_Model instance
@@ -45,6 +47,14 @@ struct NativeRenderAttachment {
   NativeRenderModel model;
   uint32_t pose_vector=0;       // guest address of the attachment's pose vector
   NativeRenderPose pose;
+};
+// A model drawn once per world through 821C9DA8, in guest draw order: the
+// layout is decoded without a pose vector (NativeModelLayout::single_world)
+// and worlds[i] is the one g_mWorld every drawn record of instance i uses.
+// The worlds are computed natively at tick time from the object's fields.
+struct NativeRenderInstanced {
+  NativeRenderModel model;
+  NativeRenderPose worlds;
 };
 // Immutable per-tick copy of what the frame needs from one render object.
 struct NativeRenderEntry {
@@ -70,6 +80,7 @@ struct NativeRenderEntry {
   std::shared_ptr<const std::vector<std::array<float,16>>> pose;
   uint32_t pose_vector=0;       // guest address of the pose vector (obj+type->pose)
   std::vector<NativeRenderAttachment> attachments;
+  std::vector<NativeRenderInstanced> instanced;  // Drawn after the model, as slot 4 does.
 };
 struct NativeRenderRegistrySnapshot {
   uint64_t tick=0;
