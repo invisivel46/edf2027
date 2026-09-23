@@ -10,6 +10,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -759,6 +760,11 @@ struct NativeEffectCollection {
   // (vtable, slot 4, objects) of the objects no builder covers, first-seen order
   // (the coverage census names them by class).
   std::vector<std::array<uint32_t,3>> unsupported_classes;
+  // Objects whose reads or draw build failed (a freed object, a count out of
+  // range): each is skipped alone, not drawn, and the walk goes on. vtable is
+  // 0 when the object cannot be read.
+  struct Failure { uint32_t object=0,vtable=0,slot4=0; std::string reason; };
+  std::vector<Failure> failures;
   uint32_t visited=0,duplicates=0,culled=0,hidden=0,undrawn_keys=0,unknown_modes=0,unsupported=0;
   uint32_t held=0;  // clEffectEtc02 lifetimes a render-only frame did not commit (commit false)
 };
@@ -789,6 +795,53 @@ struct NativeEffectList {
 // +612 lifetime, which the guest counts in draws, still counts once per
 // simulation tick (NativeTickGate) instead of once per render. The draws are
 // built from the same state either way; locked frames always commit.
+//
+// One object of the walk, past its list links and the visited stamp, into
+// `out`. Throws when a read or the draw build fails; the caller skips the
+// object alone (NativeEffectCollection::failures). A build failure throws only
+// after the commit: the guest calls this object's slot 4 either way, and the
+// commit is that call's one guest write, not the draw's. slot4 is set once read.
+template<class Reader,class View,class Inputs>
+void CollectNativeEffectObject(const Reader& r,uint32_t object,uint32_t context,const View& view,const Inputs& in,
+                               uint32_t& order,bool commit,NativeEffectCollection& out,uint32_t& slot4) {
+  const auto bound=ReadNativeSceneVisibility(r,object,false);
+  const auto center=NativeVisibilityTransform({bound.box[0],bound.box[1],bound.box[2],bound.box[3]},view.matrix);
+  const float depth=-float(center[2]*view.depth_scale);
+  auto visibility=depth>bound.distance?0u:NativeVisibilitySphere(view,center,bound.radius);
+  if(visibility==2) visibility=NativeVisibilityBox(view,bound.box);
+  if(!visibility) { ++out.culled; return; }
+  const auto hidden=r.Bytes(r.Add(object,64),2);
+  if(hidden[0] || hidden[1]) { ++out.hidden; return; }
+  const auto mode=int32_t(r.Word(r.Add(object,52)));
+  if(mode!=0 && mode!=1 && mode!=2) { ++out.unknown_modes; return; }  // guest clamps an uninitialized float
+  NativeEffectItem item;
+  item.object=object;
+  item.slot4=slot4=r.Word(r.Add(r.Word(object),16));
+  item.type=ClassifyNativeEffect(item.slot4);
+  if(mode) {
+    item.key=ComputeNativeBucketKeyForDepth(r,context,object,std::bit_cast<uint32_t>(center[2])).key;
+    item.order=order++;
+  }
+  if(item.type==NativeEffectClass::Unknown) {
+    ++out.unsupported;
+    if(std::find(out.unsupported_slots.begin(),out.unsupported_slots.end(),item.slot4)==out.unsupported_slots.end())
+      out.unsupported_slots.push_back(item.slot4);
+    const auto vtable=r.Word(object);
+    const auto known=std::find_if(out.unsupported_classes.begin(),out.unsupported_classes.end(),
+      [&](const auto& entry) { return entry[0]==vtable && entry[1]==item.slot4; });
+    if(known!=out.unsupported_classes.end()) ++(*known)[2];
+    else out.unsupported_classes.push_back({vtable,item.slot4,1u});
+    return;
+  }
+  if(mode && !NativeTransparentKeyDrawn(item.key)) { ++out.undrawn_keys; return; }
+  std::string failed;
+  try { item.draws=BuildNativeEffectDraws(r,object,item.type,in); }
+  catch(const std::exception& error) { failed=error.what(); if(failed.empty()) failed="native effect build failed"; }
+  if(commit) CommitNativeEffectDraw(r,item);
+  else if(item.type==NativeEffectClass::EffectEtc02) ++out.held;
+  if(!failed.empty()) throw std::runtime_error(failed);
+  (mode?out.items:out.immediate).push_back(std::move(item));
+}
 template<class Reader>
 NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32_t context,const std::array<uint32_t,16>& eye_view,
                                             uint32_t& order,std::unordered_set<uint32_t>* visited=nullptr,bool commit=true) {
@@ -802,40 +855,15 @@ NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32
     const auto object=r.Word(r.Add(node,NativeEffectList::object));
     ++out.visited;
     if(visited && !visited->insert(object).second) { ++out.duplicates; continue; }
-    const auto bound=ReadNativeSceneVisibility(r,object,false);
-    const auto center=NativeVisibilityTransform({bound.box[0],bound.box[1],bound.box[2],bound.box[3]},view.matrix);
-    const float depth=-float(center[2]*view.depth_scale);
-    auto visibility=depth>bound.distance?0u:NativeVisibilitySphere(view,center,bound.radius);
-    if(visibility==2) visibility=NativeVisibilityBox(view,bound.box);
-    if(!visibility) { ++out.culled; continue; }
-    const auto hidden=r.Bytes(r.Add(object,64),2);
-    if(hidden[0] || hidden[1]) { ++out.hidden; continue; }
-    const auto mode=int32_t(r.Word(r.Add(object,52)));
-    if(mode!=0 && mode!=1 && mode!=2) { ++out.unknown_modes; continue; }  // guest clamps an uninitialized float
-    NativeEffectItem item;
-    item.object=object;
-    item.slot4=r.Word(r.Add(r.Word(object),16));
-    item.type=ClassifyNativeEffect(item.slot4);
-    if(mode) {
-      item.key=ComputeNativeBucketKeyForDepth(r,context,object,std::bit_cast<uint32_t>(center[2])).key;
-      item.order=order++;
+    // Everything past the list links is the object's own: a read or build
+    // that fails skips this object only (NativeEffectCollection::failures).
+    uint32_t slot4=0;
+    try { CollectNativeEffectObject(r,object,context,view,in,order,commit,out,slot4); }
+    catch(const std::exception& error) {
+      NativeEffectCollection::Failure failure{object,0,slot4,error.what()};
+      try { failure.vtable=r.Word(object); } catch(const std::exception&) {}
+      out.failures.push_back(std::move(failure));
     }
-    if(item.type==NativeEffectClass::Unknown) {
-      ++out.unsupported;
-      if(std::find(out.unsupported_slots.begin(),out.unsupported_slots.end(),item.slot4)==out.unsupported_slots.end())
-        out.unsupported_slots.push_back(item.slot4);
-      const auto vtable=r.Word(object);
-      const auto known=std::find_if(out.unsupported_classes.begin(),out.unsupported_classes.end(),
-        [&](const auto& entry) { return entry[0]==vtable && entry[1]==item.slot4; });
-      if(known!=out.unsupported_classes.end()) ++(*known)[2];
-      else out.unsupported_classes.push_back({vtable,item.slot4,1u});
-      continue;
-    }
-    if(mode && !NativeTransparentKeyDrawn(item.key)) { ++out.undrawn_keys; continue; }
-    item.draws=BuildNativeEffectDraws(r,object,item.type,in);
-    if(commit) CommitNativeEffectDraw(r,item);
-    else if(item.type==NativeEffectClass::EffectEtc02) ++out.held;
-    (mode?out.items:out.immediate).push_back(std::move(item));
   }
   std::stable_sort(out.items.begin(),out.items.end(),[](const NativeEffectItem& a,const NativeEffectItem& b) {
     return a.key!=b.key?a.key>b.key:a.order<b.order;

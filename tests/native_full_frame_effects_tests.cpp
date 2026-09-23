@@ -953,6 +953,40 @@ void TestCollection() {
     Require(held==5,"the five render-only frames each withheld the one drawn clEffectEtc02");
     Require(m.Word(objects[10]+612)==5,"a culled clEffectEtc02 never decrements");
   }
+  // One object that cannot be read or built is skipped alone: the walk goes
+  // on, every other object is collected as before, the filing count is the
+  // guest's (the failed objects reached sub_821C0C00 and filed) and a
+  // clEffectEtc02 whose draws fail still commits (the guest calls its slot 4).
+  {
+    const auto reference=[&] { uint32_t filing=40; std::unordered_set<uint32_t> seen;
+      return CollectNativeEffectManager(m,manager,context,ViewWords(m),filing,&seen,false); }();
+    const uint32_t kUnmapped=0x7F000000,kFreed=0x7E000000;
+    const auto glass_records=m.Word(objects[2]+700),etc02_records=m.Word(objects[7]+640);
+    const auto hidden_object=m.Word(nodes+3*16+8);
+    m.StoreWord(objects[2]+700,kUnmapped);   // B: glass records unreadable
+    m.StoreWord(objects[7]+640,kUnmapped);   // I: clEffectEtc02 records unreadable
+    m.StoreWord(nodes+3*16+8,kFreed);        // D's node now holds an unreadable (freed) object
+    m.StoreWord(objects[7]+612,20);
+    uint32_t filing=40;
+    std::unordered_set<uint32_t> seen;
+    const auto c=CollectNativeEffectManager(m,manager,context,ViewWords(m),filing,&seen);
+    Require(c.failures.size()==3,"three objects failed, each alone ("+std::to_string(c.failures.size())+")");
+    Require(c.failures[0].object==objects[2] && c.failures[0].vtable==m.Word(objects[2]) && c.failures[0].slot4==0x8217D6E0 &&
+            c.failures[0].reason=="unmapped test read","B's failure names its class and reason");
+    Require(c.failures[1].object==kFreed && c.failures[1].vtable==0 && c.failures[1].slot4==0,"the freed object's failure");
+    Require(c.failures[2].object==objects[7] && c.failures[2].slot4==0x8217C4A0,"I's failure");
+    Require(c.items.size()==2 && c.items[0].object==objects[1] && c.items[1].object==objects[0],"C and A still filed and built");
+    Require(c.immediate.size()==1 && c.immediate[0].object==objects[6] && c.immediate[0].draws.size()==reference.immediate[0].draws.size(),
+            "the mode-0 object still built");
+    Require(c.items[0].draws.size()==reference.items[0].draws.size() && c.items[1].draws.size()==reference.items[2].draws.size(),
+            "the others' draws are unchanged");
+    Require(filing==40+6 && c.hidden==0 && c.unsupported==1 && c.culled==2,"the walk's other counts are the guest's");
+    Require(m.Word(objects[7]+612)==19,"a clEffectEtc02 whose draws failed still commits its slot 4 call");
+    m.StoreWord(objects[2]+700,glass_records); m.StoreWord(objects[7]+640,etc02_records); m.StoreWord(nodes+3*16+8,hidden_object);
+    uint32_t again=40;
+    std::unordered_set<uint32_t> fresh;
+    Require(CollectNativeEffectManager(m,manager,context,ViewWords(m),again,&fresh,false).failures.empty(),"restored: no failures");
+  }
 }
 }
 // The recording activates a run of adjacent draws once when this holds: it
