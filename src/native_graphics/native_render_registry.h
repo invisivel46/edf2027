@@ -298,6 +298,9 @@ class NativeRenderRegistry {
     entry->pose.reset(); entry->pose_vector=0; entry->axes={};
     entry->object=object; entry->generation=record.generation; entry->type=&type;
     for(uint32_t i=0;i<4;++i) entry->centre[i]=NativeRenderFloat(reader,object+kNativeRenderObjectCentre+i*4);
+    // The oriented half axes of the 821B2B00 bound (obj+304/+320/+336): the
+    // box 821C33E8 tests when the sphere is only partly inside.
+    for(uint32_t i=0;i<12;++i) entry->axes[i]=NativeRenderFloat(reader,object+304+i*4);
     entry->radius=NativeRenderFloat(reader,object+kNativeRenderObjectRadius);
     entry->cull_distance=NativeRenderFloat(reader,object+kNativeRenderObjectCull);
     entry->sort_bias=NativeRenderFloat(reader,object+kNativeRenderObjectBias);

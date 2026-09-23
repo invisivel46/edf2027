@@ -98,10 +98,12 @@ class NativeFrameHost {
   virtual void EndScene(const NativeFrameInputs&,bool output_ready)=0;
   virtual void Unimplemented(const char* pass) { (void)pass; }
 };
-// Stable pass order; timing phases frame.native.<name> follow it. The first
+// Stable pass order; timing phases frame.native.<name> follow it. The sky dome
+// goes first, as the guest's map-effect walk draws it before the world: drawn
+// after, its depth-tested dome covered everything beyond its radius. The first
 // kNativeFrameViewPassCount run per view, the rest once per frame.
 inline constexpr std::string_view kNativeFramePassOrder[]{
-  "static_world","models","sky","effects","transparent","post"};
+  "sky","static_world","models","effects","transparent","post"};
 inline constexpr size_t kNativeFrameViewPassCount=5;
 // What a full frame still runs as guest code, until each is native.
 inline constexpr std::string_view kNativeFrameRemainingGuestCalls[]{

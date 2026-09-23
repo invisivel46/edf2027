@@ -53,7 +53,7 @@ std::vector<std::string> Tail(bool with_finish=true) {
 int main() {
   int failures=0;
   auto check=[&](bool ok,const char* what) { if(!ok) { ++failures; std::cerr<<"failed: "<<what<<'\n'; } };
-  const std::vector<std::string> names{"static_world","models","sky","effects","transparent","post"};
+  const std::vector<std::string> names{"sky","static_world","models","effects","transparent","post"};
   // Default passes: the documented order; view passes are stubs, post finishes.
   {
     NativeFullFrame frame;
@@ -103,7 +103,7 @@ int main() {
     check(!frame.Replace(std::make_unique<NamedPass>("shadow")),"no such pass");
     TraceHost host; host.views={9};
     frame.Run(host);
-    check(host.trace[4]=="0:static_world" && host.trace[5]=="stub:replaced","replaced view pass runs first");
+    check(host.trace[6]=="1:static_world" && host.trace[7]=="stub:replaced","replaced view pass keeps its position");
     check(host.trace[host.trace.size()-3]=="stub:replaced" && !host.output_ready,"replaced post runs in the frame");
   }
   // Routing: full frame only on the native side with bridge and host; guest

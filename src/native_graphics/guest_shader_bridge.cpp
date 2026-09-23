@@ -373,8 +373,8 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        RenderGatherClassify, RenderGatherVisibility, RenderGatherLod, RenderGatherPush, RenderGatherGuest,
                        QueuedEligibility, QueuedResolve, QueuedInstances, QueuedRecord,
                        QueuedHandoff, QueuedHandoffBinds, QueuedHandoffReplays,
-                       FrameNative, FrameNativeBegin, FrameNativeStaticWorld, FrameNativeModels,
-                       FrameNativeSky, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
+                       FrameNative, FrameNativeBegin, FrameNativeSky, FrameNativeStaticWorld,
+                       FrameNativeModels, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
                        FrameNativeEnd, FrameNativeOverlays, FrameNativePhases,
                        SimRegistry, SimStaticWalk, SimPreloadGeometry, SimPreloadMaterial,
                        SimTrees, SimMembership, SimPublish, SimPoses, SimLockWait,
@@ -434,8 +434,8 @@ class HookTiming {
       "render.gather.classify","render.gather.visibility","render.gather.lod","render.gather.push","render.gather.guest_dispatch",
       "render.queued.eligibility","render.queued.resolve","render.queued.instances","render.queued.record",
       "render.queued.handoff","render.queued.handoff_binds","render.queued.handoff_replays",
-      "frame.native","frame.native.begin","frame.native.static_world","frame.native.models",
-      "frame.native.sky","frame.native.effects","frame.native.transparent","frame.native.post",
+      "frame.native","frame.native.begin","frame.native.sky","frame.native.static_world",
+      "frame.native.models","frame.native.effects","frame.native.transparent","frame.native.post",
       "frame.native.end","frame.native.view_overlays","frame.native.phases",
       "sim.registry","sim.static_walk","sim.preload_geometry","sim.preload_material",
       "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait",
@@ -6449,7 +6449,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   }
   // (c) Per-pass timing: frame.native.<name>, in kNativeFramePassOrder order.
   void RunPass(size_t index,edf::native::NativeFramePass& pass,edf::native::NativeFrameContext& context) override {
-    constexpr auto first=size_t(edf::native::HookPhase::FrameNativeStaticWorld);
+    constexpr auto first=size_t(edf::native::HookPhase::FrameNativeSky);
     constexpr auto count=size_t(edf::native::HookPhase::FrameNativeEnd)-first;
     static_assert(count==std::size(edf::native::kNativeFramePassOrder));
     edf::native::HookTiming timing(index<count?edf::native::HookPhase(first+index):edf::native::HookPhase::FrameNative,index<count);
