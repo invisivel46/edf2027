@@ -164,6 +164,17 @@ class NativeIndexedMesh {
                      uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
   void DrawLinesTransient(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
                           uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
+  // DrawTransient / DrawLinesTransient recorded without the index buffer: the
+  // converted vertices written out in index order and drawn as a non-indexed
+  // list (ExpandIndexedVertices), the same primitives from the same vertex
+  // values in the same order. Being non-indexed from vertex 0 is what lets a
+  // packet recorder append the next identical-state draw to this one; a
+  // generated index buffer only covers its own draw's vertices. For a vertex
+  // shader that does not read SV_VertexID (the pipeline's transient_batchable
+  // says so), and list topologies only.
+  void DrawTransientExpanded(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                             uint32_t first_index,uint32_t index_count,NativeBackendTopology topology,
+                             int32_t base_vertex=0) const;
   // Vertex stride and index width, for a caller building the draw itself.
   uint32_t stride() const { return stride_; }
   void ValidateLineDraw(uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;

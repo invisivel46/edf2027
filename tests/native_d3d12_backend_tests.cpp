@@ -3,7 +3,12 @@
 // real backend can be built behind rather than a shape that merely compiles.
 #include "native_graphics/d3d12_backend.h"
 #include "native_graphics/native_render_backend.h"
+#include "native_graphics/native_parallel_recorder.h"
+#include "native_graphics/native_transient_batching.h"
 #include <windows.h>
+#include <d3d11shader.h>
+#include <map>
+#include <optional>
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <cstring>
@@ -35,6 +40,457 @@ ComPtr<ID3DBlob> Compile(const char* source, const char* entry, const char* prof
 std::span<const uint8_t> Bytes(ID3DBlob& blob) {
   return {static_cast<const uint8_t*>(blob.GetBufferPointer()), blob.GetBufferSize()};
 }
+
+// ---------------------------------------------------------------------------
+// Transient batching (NativeParallelRecorder::TryAppendTransient).
+//
+// A command list that does what a GPU front end does with what it is given:
+// every draw becomes the primitives it assembles, each carrying the complete
+// state it is drawn under and the bytes of its own vertices. Two recordings
+// whose primitive lists are equal draw the same thing - the same vertices, in
+// the same order, under the same state - whatever their draw calls were.
+struct FakeTexture final : NativeBackendTexture {
+  uint32_t width() const override { return 1; }
+  uint32_t height() const override { return 1; }
+};
+struct FakeTarget final : NativeBackendRenderTarget {
+  uint32_t width() const override { return 1; }
+  uint32_t height() const override { return 1; }
+};
+struct FakeBuffer final : NativeBackendBuffer {
+  std::vector<uint8_t> data;
+  size_t bytes() const override { return data.size(); }
+};
+struct Primitive {
+  std::vector<uint8_t> state;     // Everything bound, serialized.
+  std::vector<uint8_t> vertices;  // This primitive's vertices, in assembly order.
+  bool operator==(const Primitive&) const = default;
+};
+class FrontEndRecorder final : public NativeBackendRecorder {
+ public:
+  std::vector<Primitive> primitives;
+  uint32_t draws = 0;
+  // A new command list starts with nothing bound.
+  void Reset() {
+    pipeline_ = nullptr; topology_ = NativeBackendTopology::TriangleList; blend_.reset();
+    streams_ = {}; indices_ = nullptr; index_offset_ = 0;
+    constants_.clear(); textures_.clear(); samplers_.clear();
+    colors_.clear(); depth_ = nullptr; viewport_ = {}; scissor_ = {}; scissor_enabled_ = false;
+  }
+  void SetPipeline(NativeBackendPipeline& pipeline) override { pipeline_ = &pipeline; }
+  void SetVertexBuffer(uint32_t slot, NativeBackendBuffer& buffer, uint32_t stride, uint32_t offset) override {
+    auto& fake = static_cast<FakeBuffer&>(buffer);
+    streams_.at(slot) = {std::vector<uint8_t>(fake.data.begin() + offset, fake.data.end()), stride};
+  }
+  void SetIndexBuffer(NativeBackendBuffer& buffer, NativeBackendIndexFormat format, uint32_t offset) override {
+    if (format != NativeBackendIndexFormat::Uint16) throw std::runtime_error("front end: 16-bit indices only");
+    indices_ = &static_cast<FakeBuffer&>(buffer); index_offset_ = offset;
+  }
+  void SetTransientVertices(uint32_t slot, std::span<const uint8_t> bytes, uint32_t stride) override {
+    streams_.at(slot) = {std::vector<uint8_t>(bytes.begin(), bytes.end()), stride};
+  }
+  void SetTopology(NativeBackendTopology topology) override { topology_ = topology; }
+  void SetBlendFactor(const std::array<float, 4>& factor) override { blend_ = factor; }
+  void SetConstants(NativeBackendStage stage, uint32_t slot, std::span<const uint8_t> bytes) override {
+    constants_[{uint32_t(stage), slot}] = std::vector<uint8_t>(bytes.begin(), bytes.end());
+  }
+  void SetTexture(NativeBackendStage stage, uint32_t slot, NativeBackendTexture* texture) override {
+    textures_[{uint32_t(stage), slot}] = texture;
+  }
+  void SetSampler(NativeBackendStage stage, uint32_t slot, NativeBackendSampler* sampler) override {
+    samplers_[{uint32_t(stage), slot}] = sampler;
+  }
+  void SetRenderTargets(std::span<NativeBackendRenderTarget* const> colors, NativeBackendRenderTarget* depth) override {
+    colors_.assign(colors.begin(), colors.end()); depth_ = depth;
+  }
+  void SetViewport(const NativeBackendViewport& viewport) override { viewport_ = viewport; }
+  void SetScissor(const NativeBackendScissor& scissor, bool enabled) override {
+    scissor_ = scissor; scissor_enabled_ = enabled;
+  }
+  void ClearColor(NativeBackendRenderTarget&, const std::array<float, 4>&) override {}
+  void ClearDepthStencil(NativeBackendRenderTarget&, bool, bool, float, uint8_t) override {}
+  void Draw(uint32_t count, uint32_t first) override {
+    ++draws;
+    std::vector<uint32_t> order(count);
+    for (uint32_t i = 0; i < count; ++i) order[i] = first + i;
+    Assemble(order);
+  }
+  void DrawIndexed(uint32_t count, uint32_t first, int32_t base) override {
+    ++draws;
+    if (!indices_) throw std::runtime_error("front end: no index buffer bound");
+    std::vector<uint32_t> order(count);
+    for (uint32_t i = 0; i < count; ++i) {
+      const size_t at = index_offset_ + (size_t(first) + i) * 2;
+      if (at + 2 > indices_->data.size()) throw std::runtime_error("front end: index outside its buffer");
+      uint16_t value; std::memcpy(&value, indices_->data.data() + at, 2);
+      order[i] = uint32_t(int64_t(value) + base);
+    }
+    Assemble(order);
+  }
+  // The packet replay issues every indexed draw as a one-instance draw.
+  void DrawIndexedInstanced(uint32_t count, uint32_t instances, uint32_t first, int32_t base,
+                            uint32_t first_instance) override {
+    if (instances != 1 || first_instance) throw std::runtime_error("front end: instancing is not what this test records");
+    DrawIndexed(count, first, base);
+  }
+  void CopyTexture(NativeBackendTexture&, NativeBackendTexture&) override {}
+  void CopyToShared(NativeBackendSharedSurface&, NativeBackendRenderTarget&) override {}
+  void ResolveTarget(NativeBackendTexture&, NativeBackendRenderTarget&) override {}
+  void UpdateBuffer(NativeBackendBuffer& buffer, uint32_t offset, std::span<const uint8_t> bytes) override {
+    auto& fake = static_cast<FakeBuffer&>(buffer);
+    std::copy(bytes.begin(), bytes.end(), fake.data.begin() + offset);
+  }
+  void UpdateTexture(NativeBackendTexture&, std::span<const uint8_t>) override {}
+  void BeginQuery(NativeBackendQuery&) override {}
+  void EndQuery(NativeBackendQuery&) override {}
+  void PushState() override {}
+  void PopState() override {}
+
+ private:
+  struct Stream { std::vector<uint8_t> bytes; uint32_t stride = 0; };
+  template <class T> static void Put(std::vector<uint8_t>& out, const T& value) {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
+    out.insert(out.end(), bytes, bytes + sizeof(T));
+  }
+  std::vector<uint8_t> State() const {
+    std::vector<uint8_t> out;
+    Put(out, pipeline_); Put(out, topology_); Put(out, blend_.value_or(std::array<float, 4>{-1, -1, -1, -1}));
+    Put(out, colors_.size()); for (auto* color : colors_) Put(out, color);
+    Put(out, depth_); Put(out, viewport_); Put(out, scissor_); Put(out, scissor_enabled_);
+    for (const auto& [key, bytes] : constants_) {
+      Put(out, key); Put(out, bytes.size()); out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+    for (const auto& [key, texture] : textures_) { Put(out, key); Put(out, texture); }
+    for (const auto& [key, sampler] : samplers_) { Put(out, key); Put(out, sampler); }
+    return out;
+  }
+  void Assemble(const std::vector<uint32_t>& order) {
+    if (!pipeline_) throw std::runtime_error("front end: draw with no pipeline");
+    const auto& stream = streams_[0];
+    if (!stream.stride) throw std::runtime_error("front end: draw with no vertices");
+    const auto state = State();
+    auto emit = [&](std::initializer_list<uint32_t> indices) {
+      Primitive primitive{state, {}};
+      for (const auto index : indices) {
+        const size_t at = size_t(index) * stream.stride;
+        // A draw reading past what was staged for it is exactly what a wrong
+        // append would produce; the GPU would read garbage, this refuses.
+        if (at + stream.stride > stream.bytes.size()) throw std::runtime_error("front end: vertex outside its stream");
+        primitive.vertices.insert(primitive.vertices.end(), stream.bytes.begin() + at,
+                                  stream.bytes.begin() + at + stream.stride);
+      }
+      primitives.push_back(std::move(primitive));
+    };
+    const size_t n = order.size();
+    switch (topology_) {
+      case NativeBackendTopology::TriangleList:
+        for (size_t i = 0; i + 3 <= n; i += 3) emit({order[i], order[i + 1], order[i + 2]});
+        break;
+      case NativeBackendTopology::LineList:
+        for (size_t i = 0; i + 2 <= n; i += 2) emit({order[i], order[i + 1]});
+        break;
+      case NativeBackendTopology::PointList:
+        for (size_t i = 0; i < n; ++i) emit({order[i]});
+        break;
+      case NativeBackendTopology::TriangleStrip:
+        for (size_t i = 0; i + 3 <= n; ++i) {
+          if (i & 1) emit({order[i + 1], order[i], order[i + 2]});
+          else emit({order[i], order[i + 1], order[i + 2]});
+        }
+        break;
+    }
+  }
+  NativeBackendPipeline* pipeline_ = nullptr;
+  NativeBackendTopology topology_ = NativeBackendTopology::TriangleList;
+  std::optional<std::array<float, 4>> blend_;
+  std::array<Stream, 16> streams_{};
+  FakeBuffer* indices_ = nullptr;
+  uint32_t index_offset_ = 0;
+  std::map<std::pair<uint32_t, uint32_t>, std::vector<uint8_t>> constants_;
+  std::map<std::pair<uint32_t, uint32_t>, NativeBackendTexture*> textures_;
+  std::map<std::pair<uint32_t, uint32_t>, NativeBackendSampler*> samplers_;
+  std::vector<NativeBackendRenderTarget*> colors_;
+  NativeBackendRenderTarget* depth_ = nullptr;
+  NativeBackendViewport viewport_{};
+  NativeBackendScissor scissor_{};
+  bool scissor_enabled_ = false;
+};
+struct FrontEndRun {
+  std::vector<Primitive> primitives;
+  uint32_t draws = 0;
+  NativeParallelRecorder::Statistics statistics;
+};
+// The resources both recordings bind: the same objects, so the serialized
+// state of equal bindings is equal bytes.
+struct UiObjects {
+  NativeBackendPipeline brush, lines, opaque;
+  FakeTexture atlas, other;
+  FakeTarget target;
+  FakeBuffer update_target, quad_indices;
+  UiObjects() {
+    brush.transient_batchable = lines.transient_batchable = true;
+    opaque.transient_batchable = false;  // Say, a shader reading SV_VertexID.
+    update_target.data.resize(16);
+    for (const uint16_t index : {0, 1, 2, 0, 2, 3}) {
+      quad_indices.data.push_back(uint8_t(index)); quad_indices.data.push_back(uint8_t(index >> 8));
+    }
+  }
+};
+// Vertices whose bytes say which draw and which vertex they are, so a
+// primitive assembled from the wrong vertices cannot compare equal.
+std::vector<uint8_t> TaggedVertices(uint32_t draw, uint32_t count, uint32_t stride) {
+  std::vector<uint8_t> bytes(size_t(count) * stride);
+  for (uint32_t vertex = 0; vertex < count; ++vertex)
+    for (uint32_t byte = 0; byte < stride; ++byte)
+      bytes[size_t(vertex) * stride + byte] = uint8_t(draw * 31 + vertex * 7 + byte);
+  return bytes;
+}
+// The bridge's recording of a UI phase, reduced to the calls that matter: runs
+// that should become one draw, and every kind of difference that must not.
+FrontEndRun RecordUiPhase(UiObjects& objects, bool batching, uint32_t minimum_draws) {
+  FrontEndRecorder serial, first, second;
+  FrontEndRun run;
+  NativeParallelRecorder recorder({&serial, &first, &second}, [&](bool) {
+    // Submission order: the serial list, then each worker's.
+    for (auto* list : {&serial, &first, &second}) {
+      run.primitives.insert(run.primitives.end(), list->primitives.begin(), list->primitives.end());
+      run.draws += list->draws;
+      list->primitives.clear(); list->draws = 0; list->Reset();
+    }
+  }, minimum_draws);
+  NativeBackendRenderTarget* colors[] = {&objects.target};
+  const std::array<uint8_t, 16> projection{1, 2, 3, 4}, projection_copy = projection, moved{9, 9, 9, 9};
+  std::vector<uint8_t> scratch;
+  uint32_t tag = 0;
+  auto transient = [&](uint32_t count, uint32_t stride) {
+    scratch = TaggedVertices(++tag, count, stride);
+    recorder.SetTransientVerticesOwned(0, scratch, stride);
+  };
+  auto draw = [&](NativeBackendTopology topology, uint32_t count, uint32_t stride = 8) {
+    transient(count, stride);
+    recorder.SetTopology(topology);
+    recorder.Draw(count, 0);
+  };
+  constexpr auto list = NativeBackendTopology::TriangleList;
+  recorder.Reset();
+  recorder.SetTransientBatching(batching);
+  recorder.SetRenderTargets(colors, nullptr);
+  recorder.SetViewport({0, 0, 1280, 720, 0, 1});
+  recorder.SetScissor({0, 0, 1280, 720}, false);
+  recorder.SetPipeline(objects.brush);
+  recorder.SetConstants(NativeBackendStage::Vertex, 0, projection);
+  recorder.SetTexture(NativeBackendStage::Pixel, 0, &objects.atlas);
+  // A run of brushes: one draw when batched (4 appends).
+  for (int i = 0; i < 5; ++i) draw(list, 6);
+  // New constants split the run; the same bytes sent again (a new image, as
+  // after a bind-generation bump) do not (1 append).
+  recorder.SetConstants(NativeBackendStage::Vertex, 0, moved);
+  draw(list, 6);
+  recorder.SetConstants(NativeBackendStage::Vertex, 0, moved);
+  draw(list, 12);
+  recorder.SetConstants(NativeBackendStage::Vertex, 0, projection_copy);
+  draw(list, 6);
+  // A different texture splits it, and so does a scissor change (1 append).
+  recorder.SetTexture(NativeBackendStage::Pixel, 0, &objects.other);
+  draw(list, 6);
+  recorder.SetScissor({0, 0, 640, 360}, true);
+  draw(list, 6);
+  draw(list, 6);
+  // A partial triangle's leftover vertex must not pair up with the next draw's.
+  draw(list, 4);
+  draw(list, 3);
+  // Strips never append: their primitives share vertices across the seam.
+  draw(NativeBackendTopology::TriangleStrip, 4);
+  draw(NativeBackendTopology::TriangleStrip, 4);
+  // Lines append among themselves, under their own pipeline (2 appends).
+  recorder.SetPipeline(objects.lines);
+  for (int i = 0; i < 3; ++i) draw(NativeBackendTopology::LineList, 4, 20);
+  // A different stride under the same pipeline is a different stream.
+  draw(NativeBackendTopology::LineList, 2, 12);
+  // A pipeline not marked batchable never appends.
+  recorder.SetPipeline(objects.opaque);
+  draw(list, 3);
+  draw(list, 3);
+  // The Utility path's old indexed draw does not append, and nothing appends
+  // to it.
+  recorder.SetPipeline(objects.brush);
+  transient(4, 8);
+  recorder.SetIndexBuffer(objects.quad_indices, NativeBackendIndexFormat::Uint16, 0);
+  recorder.SetTopology(list);
+  recorder.DrawIndexed(6, 0, 0);
+  draw(list, 6);
+  // The same image drawn twice is two draws of it; then new images append to
+  // a copy, and the first draw of it still reads only its own vertices
+  // (2 appends).
+  recorder.Draw(6, 0);
+  draw(list, 6);
+  draw(list, 6);
+  // A flush boundary (a buffer update) after a draw that starts its own
+  // packet. The draw after it redraws that image without restaging it, which
+  // the serial replay skips re-staging because it compares image identity;
+  // then a new image appends. Had the append grown that image in place, the
+  // replay would draw twelve vertices from the six it staged (41 appends).
+  recorder.SetScissor({0, 0, 1280, 720}, false);
+  draw(list, 6);
+  recorder.UpdateBuffer(objects.update_target, 0, projection);
+  recorder.Draw(6, 0);
+  draw(list, 6);
+  for (int i = 0; i < 40; ++i) draw(list, 6);
+  recorder.Flush(false);
+  run.statistics = recorder.statistics();
+  return run;
+}
+void TestTransientBatching() {
+  UiObjects objects;
+  // Every draw on the serial list, every flush on the workers, and a mix.
+  for (const uint32_t minimum : {1u, 4u, 1000u}) {
+    const auto label = " (worker minimum " + std::to_string(minimum) + ")";
+    try {
+      const auto plain = RecordUiPhase(objects, false, minimum);
+      const auto batched = RecordUiPhase(objects, true, minimum);
+      Check(plain.statistics.transient_appends == 0, "appends were made with batching off" + label);
+      Check(!plain.primitives.empty() && plain.primitives == batched.primitives,
+            "batched recording assembles different primitives than the unbatched one" + label + ": " +
+            std::to_string(plain.primitives.size()) + " vs " + std::to_string(batched.primitives.size()));
+      Check(plain.draws - batched.draws == batched.statistics.transient_appends,
+            "draws saved (" + std::to_string(plain.draws) + " - " + std::to_string(batched.draws) +
+            ") differ from appends counted (" + std::to_string(batched.statistics.transient_appends) + ")" + label);
+      Check(batched.statistics.transient_appends == 51,
+            "unexpected number of appends: " + std::to_string(batched.statistics.transient_appends) + label);
+    } catch (const std::exception& error) {
+      Check(false, std::string("transient batching recording failed") + label + ": " + error.what());
+    }
+  }
+  // What makes a pipeline eligible.
+  const NativeBackendInputElement slot_zero[] = {{"POSITION", 0, 0, 0, 0, false, 0}, {"COLOR", 0, 0, 0, 8, false, 0}};
+  const NativeBackendInputElement two_streams[] = {{"POSITION", 0, 0, 0, 0, false, 0}, {"COLOR", 0, 0, 1, 0, false, 0}};
+  const NativeBackendInputElement instanced[] = {{"POSITION", 0, 0, 0, 0, true, 1}};
+  Check(NativeInputLayoutSlotZeroOnly(slot_zero), "a slot-0 per-vertex layout was refused");
+  Check(!NativeInputLayoutSlotZeroOnly(two_streams), "a two-stream layout was accepted");
+  Check(!NativeInputLayoutSlotZeroOnly(instanced), "a per-instance layout was accepted");
+  const char* kShaders = R"(
+struct V { float4 position : SV_POSITION; float4 color : COLOR0; };
+V VsPlain(float2 p : POSITION, float4 c : COLOR0) { V v; v.position = float4(p, 0, 1); v.color = c; return v; }
+V VsNumbered(float2 p : POSITION, uint id : SV_VertexID) { V v; v.position = float4(p, 0, 1); v.color = id; return v; }
+float4 PsPlain(V v) : SV_TARGET { return v.color; }
+float4 PsNumbered(V v, uint id : SV_PrimitiveID) : SV_TARGET { return v.color * id; }
+)";
+  auto reflect = [&](const char* entry, const char* profile) {
+    const auto code = Compile(kShaders, entry, profile);
+    ComPtr<ID3D11ShaderReflection> reflection;
+    if (FAILED(D3DReflect(code->GetBufferPointer(), code->GetBufferSize(), __uuidof(ID3D11ShaderReflection),
+                          reinterpret_cast<void**>(reflection.GetAddressOf()))))
+      throw std::runtime_error("reflection failed");
+    return reflection;
+  };
+  const auto vs = reflect("VsPlain", "vs_5_0"), vs_id = reflect("VsNumbered", "vs_5_0");
+  const auto ps = reflect("PsPlain", "ps_5_0"), ps_id = reflect("PsNumbered", "ps_5_0");
+  Check(NativePipelineTransientBatchable(slot_zero, vs.Get(), ps.Get()), "a plain pipeline was not batchable");
+  Check(!NativePipelineTransientBatchable(slot_zero, vs_id.Get(), ps.Get()), "an SV_VertexID pipeline was batchable");
+  Check(!NativePipelineTransientBatchable(slot_zero, vs.Get(), ps_id.Get()), "an SV_PrimitiveID pipeline was batchable");
+  Check(!NativePipelineTransientBatchable(slot_zero, nullptr, ps.Get()), "an unreflected shader was batchable");
+  Check(!NativePipelineTransientBatchable(two_streams, vs.Get(), ps.Get()), "a two-stream pipeline was batchable");
+  // An indexed quad list written out in index order is the same primitives.
+  {
+    const auto vertices = TaggedVertices(7, 8, 12);
+    const std::vector<uint32_t> quads{0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7};
+    std::vector<uint8_t> expanded;
+    ExpandIndexedVertices(vertices, 12, quads, 0, 12, 0, expanded);
+    bool same = expanded.size() == 12 * 12;
+    for (size_t i = 0; same && i < quads.size(); ++i)
+      same = std::equal(expanded.begin() + i * 12, expanded.begin() + (i + 1) * 12,
+                        vertices.begin() + quads[i] * 12);
+    Check(same, "expanded quad vertices are not the indexed ones in index order");
+    ExpandIndexedVertices(vertices, 12, quads, 6, 6, -4, expanded);
+    Check(expanded.size() == 72 && std::equal(expanded.begin(), expanded.begin() + 12, vertices.begin()),
+          "a first index and base vertex were not applied");
+    bool refused = false;
+    try { ExpandIndexedVertices(vertices, 12, quads, 6, 6, 1, expanded); }
+    catch (const std::runtime_error&) { refused = true; }
+    Check(refused, "an index past the vertices was expanded");
+  }
+  std::cout << "transient batching: front-end comparisons done\n";
+}
+// The same on the real backend: a scene backend with geometry workers (the
+// game's configuration), overlapping triangles whose colour travels in their
+// vertices so a whole run shares its state, drawn with and without batching
+// and read back. Opaque and overlapping, so any change of order, any vertex
+// from the wrong draw and any dropped triangle changes pixels.
+void TestTransientBatchingPixels() {
+  const char* kSource = R"(
+struct V { float4 position : SV_POSITION; float4 color : COLOR0; };
+V VS(float2 p : POSITION, float4 c : COLOR0) { V v; v.position = float4(p, 0, 1); v.color = c; return v; }
+float4 PS(V v) : SV_TARGET { return v.color; }
+)";
+  const auto vertex = Compile(kSource, "VS", "vs_5_0");
+  const auto pixel = Compile(kSource, "PS", "ps_5_0");
+  constexpr uint32_t kSize = 64;
+  auto render = [&](bool batching, uint64_t& appends) {
+    auto backend = CreateNativeD3D12SceneBackend(true, 2);
+    NativeBackendTextureDesc target_desc{};
+    target_desc.width = target_desc.height = kSize;
+    target_desc.levels = 1;
+    target_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    target_desc.render_target = true;
+    const auto target = backend->CreateRenderTarget(target_desc);
+    const NativeBackendInputElement layout[] = {
+        {"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0, false, 0},
+        {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 8, false, 0}};
+    NativeBackendPipelineDesc desc{};
+    desc.vertex = Bytes(*vertex.Get());
+    desc.pixel = Bytes(*pixel.Get());
+    desc.vertex_id = 0x71; desc.pixel_id = 0x72;
+    desc.input_layout = layout; desc.input_layout_id = 0x73;
+    desc.state = {0x10001, 0, 0, 0, 15, 0};
+    desc.topology = NativeBackendTopology::TriangleList;
+    desc.render_targets = 1;
+    desc.rtv_format[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    auto& pipeline = backend->CreatePipeline(desc);
+    pipeline.transient_batchable = true;
+    NativeBackendRenderTarget* colors[] = {target.get()};
+    backend->BeginFrame();
+    auto& recorder = backend->Recorder();
+    recorder.SetTransientBatching(batching);
+    recorder.SetRenderTargets(colors, nullptr);
+    recorder.SetViewport({0, 0, float(kSize), float(kSize), 0, 1});
+    recorder.ClearColor(*target, {0, 0, 0, 1});
+    recorder.SetPipeline(pipeline);
+    recorder.SetTopology(NativeBackendTopology::TriangleList);
+    // 48 draws of two overlapping triangles each, shifted and recoloured per
+    // draw: later draws cover parts of earlier ones.
+    std::vector<uint8_t> scratch;
+    for (uint32_t draw = 0; draw < 48; ++draw) {
+      std::vector<float> v;
+      const float x = -1.0f + float(draw % 8) * 0.22f, y = -1.0f + float(draw / 8) * 0.3f;
+      const float r = float(draw % 5) / 4.0f, g = float(draw % 7) / 6.0f, b = float(draw % 3) / 2.0f;
+      for (int t = 0; t < 2; ++t) {
+        const float s = t ? 0.6f : 0.9f;
+        for (const auto& corner : {std::array<float, 2>{0, 0}, std::array<float, 2>{s, 0}, std::array<float, 2>{0, s}})
+          v.insert(v.end(), {x + corner[0], y + corner[1], t ? b : r, g, t ? r : b, 1});
+      }
+      scratch.assign(reinterpret_cast<const uint8_t*>(v.data()), reinterpret_cast<const uint8_t*>(v.data() + v.size()));
+      recorder.SetTransientVerticesOwned(0, scratch, 24);
+      recorder.Draw(6, 0);
+    }
+    backend->Submit();
+    appends = backend->Statistics().geometry_transient_appends;
+    for (const auto& message : backend->DrainValidationMessages())
+      Check(false, "D3D12 validation error in transient batching: " + message);
+    return backend->ReadRenderTarget(*target);
+  };
+  uint64_t plain_appends = 0, batched_appends = 0;
+  const auto plain = render(false, plain_appends);
+  const auto batched = render(true, batched_appends);
+  Check(plain_appends == 0 && batched_appends == 47,
+        "WARP transient appends: " + std::to_string(plain_appends) + " unbatched, " +
+        std::to_string(batched_appends) + " batched (want 0 and 47)");
+  Check(plain.size() == size_t(kSize) * kSize * 4 && plain == batched,
+        "batched and unbatched transient draws produced different pixels");
+  size_t lit = 0;
+  for (size_t i = 0; i + 3 < plain.size(); i += 4) lit += plain[i] || plain[i + 1] || plain[i + 2];
+  Check(lit > kSize * kSize / 4, "the transient batching scene drew almost nothing: " + std::to_string(lit));
+  std::cout << "transient batching: WARP pixels equal, " << batched_appends << " appends, " << lit << " lit\n";
+}
 }  // namespace
 
 int main() {
@@ -44,6 +500,8 @@ int main() {
   HWND present_window = nullptr;
   WNDCLASSEXW present_class{};
   try {
+    TestTransientBatching();
+    TestTransientBatchingPixels();
     RegisterNativeD3D12Backend();
     const auto& names = NativeRenderBackendNames();
     Check(std::find(names.begin(), names.end(), "d3d12") != names.end(),

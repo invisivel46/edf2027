@@ -1325,6 +1325,7 @@ class D3D12Backend final : public NativeRenderBackend {
       out.geometry_record_ns=geometry.record_ns; out.geometry_wait_ns=geometry.wait_ns;
       out.geometry_serial_draws=geometry.serial_draws; out.geometry_serial_flushes=geometry.serial_flushes;
       out.geometry_instanced_draws=geometry.instanced_draws; out.geometry_folded_draws=geometry.folded_draws;
+      out.geometry_transient_appends=geometry.transient_appends;
       out.geometry_world_constant_reuses=geometry.world_constant_reuses;
       out.geometry_constant_snapshot_bytes=geometry.constant_snapshot_bytes;
     }

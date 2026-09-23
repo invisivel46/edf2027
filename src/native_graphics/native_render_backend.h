@@ -69,6 +69,15 @@ class NativeBackendPipeline {
   // Backend-owned alternate pipeline, valid for this pipeline's lifetime.
   NativeBackendPipeline* world_instanced=nullptr;
   uint32_t instance_world_slot=0,instance_world_offset=0;
+  // Set by the owner that has the shaders' reflection: neither stage reads a
+  // value that numbers vertices or primitives (SV_VertexID, SV_PrimitiveID,
+  // SV_InstanceID). Only such a pipeline's list draws can be concatenated
+  // into one draw by a packet recorder, because for it a list draw's result
+  // depends on nothing but its vertices, its state and their order.
+  bool transient_batchable=false;
+  // Whether the owner has decided transient_batchable for this pipeline yet;
+  // the answer depends only on what the pipeline is cached by, so once.
+  bool transient_batchable_known=false;
 };
 class NativeBackendRenderTarget {
  public:
@@ -126,6 +135,8 @@ struct NativeBackendStatistics {
   // than the worker minimum, and how many such flushes there were.
   uint64_t geometry_serial_draws=0,geometry_serial_flushes=0;
   uint64_t geometry_instanced_draws=0,geometry_folded_draws=0;
+  // Transient list draws a packet recorder appended to the draw before them.
+  uint64_t geometry_transient_appends=0;
   uint64_t geometry_world_constant_reuses=0,geometry_constant_snapshot_bytes=0;
   uint32_t geometry_max_concurrent=0;
   // Times a frame had to wait for the GPU to give back upload memory or
@@ -169,6 +180,10 @@ class NativeBackendRecorder {
   virtual void SetPipeline(NativeBackendPipeline& pipeline)=0;
   // Only packet recorders combine draws. Direct recorders keep ordinary draws.
   virtual void SetWorldInstancing(bool enabled,bool reuse_constants=true) {}
+  // Packet recorders may append a non-indexed transient list draw to the
+  // draw recorded just before it when nothing else differs (see
+  // NativeParallelRecorder). Direct recorders draw every call as given.
+  virtual void SetTransientBatching(bool enabled) {}
   virtual void SetVertexBuffer(uint32_t slot,NativeBackendBuffer& buffer,uint32_t stride,uint32_t offset)=0;
   virtual void SetIndexBuffer(NativeBackendBuffer& buffer,NativeBackendIndexFormat format,uint32_t offset)=0;
   // Vertex data that lives only for this frame, bound at `slot` from wherever

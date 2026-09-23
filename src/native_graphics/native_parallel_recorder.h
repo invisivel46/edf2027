@@ -16,6 +16,8 @@ class NativeParallelRecorder final : public NativeBackendRecorder {
     uint64_t serial_draws=0,serial_flushes=0;
     uint64_t instanced_draws=0,folded_draws=0;
     uint64_t world_constant_reuses=0,constant_snapshot_bytes=0;
+    // Transient list draws appended to the draw before them (TryAppendTransient).
+    uint64_t transient_appends=0;
     uint32_t max_concurrent=0;
   };
   // Recorder 0 holds ordered non-draw work. Workers own recorders 1..N.
@@ -29,6 +31,7 @@ class NativeParallelRecorder final : public NativeBackendRecorder {
   Statistics statistics() const;
   void SetPipeline(NativeBackendPipeline&) override;
   void SetWorldInstancing(bool,bool reuse_constants=true) override;
+  void SetTransientBatching(bool) override;
   void SetVertexBuffer(uint32_t,NativeBackendBuffer&,uint32_t,uint32_t) override;
   void SetIndexBuffer(NativeBackendBuffer&,NativeBackendIndexFormat,uint32_t) override;
   void SetTransientVertices(uint32_t,std::span<const uint8_t>,uint32_t) override;

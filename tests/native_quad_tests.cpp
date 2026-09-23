@@ -31,6 +31,67 @@ std::vector<uint8_t> Guest(std::span<const float> values) {
   }
   return bytes;
 }
+// What a GPU front end assembles from a recorded draw: each primitive's vertex
+// bytes in assembly order. The bound index buffer's values are given by the
+// test, which generated them; a backend buffer cannot be read back here.
+struct AssemblyRecorder final : NativeBackendRecorder {
+  std::vector<uint8_t> vertices;
+  uint32_t stride=0,draws=0,indexed_draws=0;
+  NativeBackendTopology topology=NativeBackendTopology::TriangleList;
+  std::vector<uint32_t> index_values;
+  std::vector<std::vector<uint8_t>> primitives;
+  void Assemble(const std::vector<uint32_t>& order) {
+    const size_t width=topology==NativeBackendTopology::LineList?2:3;
+    if(topology!=NativeBackendTopology::LineList && topology!=NativeBackendTopology::TriangleList)
+      throw std::runtime_error("assembly: list topologies only");
+    for(size_t first=0;first+width<=order.size();first+=width) {
+      std::vector<uint8_t> primitive{uint8_t(topology)};
+      for(size_t i=first;i<first+width;++i) {
+        const size_t at=size_t(order[i])*stride;
+        if(at+stride>vertices.size()) throw std::runtime_error("assembly: vertex outside its stream");
+        primitive.insert(primitive.end(),vertices.begin()+at,vertices.begin()+at+stride);
+      }
+      primitives.push_back(std::move(primitive));
+    }
+  }
+  void SetTransientVertices(uint32_t slot,std::span<const uint8_t> bytes,uint32_t s) override {
+    if(slot) throw std::runtime_error("assembly: slot 0 only");
+    vertices.assign(bytes.begin(),bytes.end()); stride=s;
+  }
+  void SetTopology(NativeBackendTopology t) override { topology=t; }
+  void Draw(uint32_t count,uint32_t first) override {
+    ++draws; std::vector<uint32_t> order(count);
+    for(uint32_t i=0;i<count;++i) order[i]=first+i;
+    Assemble(order);
+  }
+  void DrawIndexed(uint32_t count,uint32_t first,int32_t base) override {
+    ++indexed_draws; std::vector<uint32_t> order(count);
+    for(uint32_t i=0;i<count;++i) order[i]=uint32_t(int64_t(index_values.at(size_t(first)+i))+base);
+    Assemble(order);
+  }
+  void SetPipeline(NativeBackendPipeline&) override {}
+  void SetVertexBuffer(uint32_t,NativeBackendBuffer&,uint32_t,uint32_t) override { throw std::runtime_error("assembly: transient only"); }
+  void SetIndexBuffer(NativeBackendBuffer&,NativeBackendIndexFormat,uint32_t) override {}
+  void SetBlendFactor(const std::array<float,4>&) override {}
+  void SetConstants(NativeBackendStage,uint32_t,std::span<const uint8_t>) override {}
+  void SetTexture(NativeBackendStage,uint32_t,NativeBackendTexture*) override {}
+  void SetSampler(NativeBackendStage,uint32_t,NativeBackendSampler*) override {}
+  void SetRenderTargets(std::span<NativeBackendRenderTarget* const>,NativeBackendRenderTarget*) override {}
+  void SetViewport(const NativeBackendViewport&) override {}
+  void SetScissor(const NativeBackendScissor&,bool) override {}
+  void ClearColor(NativeBackendRenderTarget&,const std::array<float,4>&) override {}
+  void ClearDepthStencil(NativeBackendRenderTarget&,bool,bool,float,uint8_t) override {}
+  void DrawIndexedInstanced(uint32_t,uint32_t,uint32_t,int32_t,uint32_t) override { throw std::runtime_error("assembly: no instancing"); }
+  void CopyTexture(NativeBackendTexture&,NativeBackendTexture&) override {}
+  void CopyToShared(NativeBackendSharedSurface&,NativeBackendRenderTarget&) override {}
+  void ResolveTarget(NativeBackendTexture&,NativeBackendRenderTarget&) override {}
+  void UpdateBuffer(NativeBackendBuffer&,uint32_t,std::span<const uint8_t>) override { throw std::runtime_error("assembly: no buffer updates"); }
+  void UpdateTexture(NativeBackendTexture&,std::span<const uint8_t>) override {}
+  void BeginQuery(NativeBackendQuery&) override {}
+  void EndQuery(NativeBackendQuery&) override {}
+  void PushState() override {}
+  void PopState() override {}
+};
 int main() {
   try {
     ComPtr<ID3D11Device> device;
@@ -1489,6 +1550,38 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
       utility_mesh.DrawLines(*context.Get(),0,2);
       D3D11_PRIMITIVE_TOPOLOGY utility_topology{}; context->IAGetPrimitiveTopology(&utility_topology);
       Require(utility_topology==D3D11_PRIMITIVE_TOPOLOGY_LINELIST,"Utility line draw used triangle topology");
+      // The recorded Utility draw as the bridge makes it with transient
+      // batching on (DrawTransientExpanded: the converted vertices written out
+      // in index order, drawn non-indexed) against the indexed transient draw
+      // it replaces: the same primitives from the same converted vertices, in
+      // the same order, for quads and for lines, over two quads' vertices.
+      {
+        NativeMeshCache dynamic_meshes(4*1024*1024,256,true);
+        auto two_quads=utility_vertices;
+        two_quads.insert(two_quads.end(),utility_vertices.rbegin(),utility_vertices.rend());
+        for(const bool lines:{false,true}) {
+          const auto pattern=generated_indices.Get(lines?NativeIndexPattern::Lines:NativeIndexPattern::Quads,8);
+          AssemblyRecorder indexed,expanded;
+          for(size_t at=0;at<pattern->bytes().size();at+=2)
+            indexed.index_values.push_back((uint32_t(pattern->bytes()[at])<<8)|pattern->bytes()[at+1]);
+          auto& mesh=dynamic_meshes.Acquire(*backend,utility_vs.shader(),{61,62,63,lines?2u:13u,0},
+            converted_declaration->bytes(),uint32_t(stride),two_quads,pattern->bytes(),2,converted_declaration,pattern,
+            {},{},{},{},0,{},&indexed);
+          const auto count=uint32_t(pattern->bytes().size()/2);
+          if(lines) mesh.DrawLinesTransient(indexed,two_quads,0,count);
+          else mesh.DrawTransient(indexed,two_quads,0,count);
+          mesh.DrawTransientExpanded(expanded,two_quads,0,count,
+            lines?NativeBackendTopology::LineList:NativeBackendTopology::TriangleList);
+          Require(indexed.indexed_draws==1 && indexed.draws==0 && expanded.draws==1 && expanded.indexed_draws==0 &&
+            expanded.stride==indexed.stride,"expanded Utility draw was not one non-indexed draw of the same stride");
+          Require(indexed.primitives.size()==4 && indexed.primitives==expanded.primitives,
+            "expanded Utility draw assembles different primitives than the indexed one");
+          bool refused=false;
+          try { mesh.DrawTransientExpanded(expanded,two_quads,0,count,NativeBackendTopology::TriangleStrip); }
+          catch(const std::runtime_error&) { refused=true; }
+          Require(refused,"an expanded transient draw accepted a strip");
+        }
+      }
       // Scene overlays have a real depth attachment, unlike ordinary output.
       // Exercise both clip-space variants with enabled depth testing, including
       // an opposite comparison that must reject every fragment.
