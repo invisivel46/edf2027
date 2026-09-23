@@ -6588,15 +6588,19 @@ void NativeFullFrameDeclined(const char* pass,const std::string& reason) {
   if(reported.size()<64 && reported.insert(std::string(pass)+": "+reason).second)
     REXLOG_INFO("Native full frame {} declined: {}",pass,reason);
 }
-// What the Models and Effects passes of one view hand to its Transparent
-// pass: the models' transparent batches (one item each, keyed), the effects'
-// filed items, and the models' filing count, from which the effects' filing
-// order continues (the registry is unordered, so every model is taken as filed
-// before every effect; only equal keys can tell).
+// What the Models, Sky (map effects) and Effects passes of one view hand to its
+// Transparent pass: the models' transparent batches (one item each, keyed),
+// the map effects' and the effects' filed items, and the filing counts that
+// place them in one sequence (the registry is unordered, so every model is
+// taken as filed before every effect; the two managers file in world-list
+// order, NativeMapEffectFilingBases; only equal keys can tell).
 struct NativeFullFrameModelsShared {
   std::shared_ptr<edf::native::NativeFullFrameModelFrame> transparent;
   std::vector<edf::native::NativeEffectItem> effects;
+  std::vector<edf::native::NativeEffectItem> map_effects;  // orders from 0 within the map-effect walk
   uint32_t model_order=0;
+  uint32_t map_effect_filings=0,effect_filings=0;
+  bool map_effects_first=true;  // clMapEffectManager precedes clEffectObjectManager on the world list
 };
 // The full frame's Models pass: NativeFullFrameModels::Build over the
 // renderable registry snapshot and the view's camera; the opaque batches are
@@ -6812,10 +6816,13 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     shared_->effects.clear();
+    shared_->effect_filings=0;
     if(!context.renderer || !context.owner || !context.guest_context || !native_scene_pass_camera) return;
     const auto manager=FindNativeWorldListObject(reader_,context.owner,NativeEffectList::manager_vtable);
     if(!manager) { ++absent_; return; }
-    uint32_t order=shared_->model_order;
+    // After the map effects' filings when their manager is earlier on the list.
+    const auto first=NativeMapEffectFilingBases(shared_->map_effects_first,shared_->model_order,shared_->map_effect_filings,0).effects;
+    uint32_t order=first;
     if(!context.inputs.tick_frame) ++held_frames_;
     NativeEffectCollection collection;
     // The ribbons' eye is the pass camera's (NativeEffectEyeFromView), not
@@ -6834,6 +6841,7 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
       for(size_t i=0;i<3;++i) same=same && std::bit_cast<uint32_t>(derived[i])==std::bit_cast<uint32_t>(guest[i]);
       if(!same) ++stale_eyes_;
     }
+    shared_->effect_filings=order-first;
     for(const auto slot:collection.unsupported_slots)
       if(unsupported_.insert(slot).second) {
         const auto* name=NativeEffectSlotName(slot);
@@ -6878,8 +6886,15 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     using namespace edf::native;
     auto frame=std::move(shared_->transparent);
     auto effects=std::move(shared_->effects);
-    shared_->effects.clear();
-    if(((!frame || frame->batches.empty()) && effects.empty()) || !context.renderer || !native_scene_pass_camera) return;
+    auto map_effects=std::move(shared_->map_effects);
+    shared_->effects.clear(); shared_->map_effects.clear();
+    // clGrassMap's items (the map-effect walk's filings) into the pass's one
+    // filing sequence, after the models, before or after the effects' as the
+    // two managers sit on the world list.
+    const auto map_base=NativeMapEffectFilingBases(shared_->map_effects_first,shared_->model_order,
+      shared_->map_effect_filings,shared_->effect_filings).map_effects;
+    for(auto& item:map_effects) item.order+=map_base;
+    if(((!frame || frame->batches.empty()) && effects.empty() && map_effects.empty()) || !context.renderer || !native_scene_pass_camera) return;
     auto& state=State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -6899,22 +6914,25 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
         ++state.bind_generation;
         state.recorded={};
       }});
-    const auto model_count=models.size(),effect_count=effects.size();
+    const auto model_count=models.size(),effect_count=effects.size(),map_effect_count=map_effects.size();
     // Per effect draw: recorded, or declined (reported once per reason).
     uint64_t effect_draws=0,effect_declined=0;
-    auto effect_items=NativeEffectTransparentItems(std::move(effects),[&](NativeBackendRecorder&,const NativeEffectItem& item) {
-      // One item's draws in a row; a model batch may run between items.
+    const auto record_item=[&](NativeBackendRecorder&,const NativeEffectItem& item) {
+      // One item's draws in a row (a run of alike draws activated once); a
+      // model batch may run between items.
       effect_draws+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,camera,viewport,formats,report,
         [&](const std::exception& error) { report(error.what()); ++effect_declined; });
-    });
+    };
+    auto effect_items=NativeEffectTransparentItems(std::move(effects),record_item);
+    auto map_effect_items=NativeEffectTransparentItems(std::move(map_effects),record_item);
     std::vector<std::vector<NativeTransparentItem>> sources;
-    sources.push_back(std::move(models)); sources.push_back(std::move(effect_items));
+    sources.push_back(std::move(models)); sources.push_back(std::move(effect_items)); sources.push_back(std::move(map_effect_items));
     const auto sequence=MergeNativeTransparentItems(std::move(sources));
     RecordNativeTransparentItems(sequence,SceneRecorderLocked(state));
     if(frame) state.scene_recorded_frames.push_back(std::move(frame));
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame transparent: frames={} model_batches={} effect_items={} merged_items={} effect_draws={} effect_declined={}",
-        frames_,model_count,effect_count,sequence.size(),effect_draws,effect_declined);
+      REXLOG_INFO("Native full frame transparent: frames={} model_batches={} effect_items={} map_effect_items={} merged_items={} effect_draws={} effect_declined={}",
+        frames_,model_count,effect_count,map_effect_count,sequence.size(),effect_draws,effect_declined);
   }
  private:
   const edf::native::GuestReader reader_;
@@ -6929,65 +6947,74 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
 // A palette-skinned sky declines (none is known).
 //
 // The pass is the guest's map-effect walk (820B35A0 over clMapEffectManager's
-// +48 list, native_map_effects.h), in list order: the sky where the list holds
-// it, clElectricWire's mode-0 strips (BuildNativeElectricWireDraws) drawn
-// immediately as 821C0C00 runs its slot 4 inside the walk. clGrassMap (mode 2,
-// not ported: see NativeGrassMapSupport), a filed wire and any other class are
-// declared unsupported, once each, and not drawn. Without a manager on the
-// world list the sky is drawn alone, as before.
+// +48 list, PlanNativeMapEffects in native_map_effects.h), in list order: the
+// sky where the list holds it, clElectricWire's mode-0 strips
+// (BuildNativeElectricWireDraws) drawn immediately as 821C0C00 runs its slot 4
+// inside the walk, and clGrassMap (mode 2, key 65535: BuildNativeGrassMapDraws)
+// filed for the Transparent pass, where 821A3BA0 would reach its slot 4. A
+// filed wire, a mode-1 grass map and any other class are declared
+// unsupported, once each, and not drawn. Without a manager on the world list
+// the sky is drawn alone, as before.
 class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
  public:
-  explicit NativeFullFrameSkyPass(uint8_t* base):reader_(base) {}
+  NativeFullFrameSkyPass(uint8_t* base,std::shared_ptr<NativeFullFrameModelsShared> shared)
+    :reader_(base),shared_(std::move(shared)) {}
   const char* name() const override { return "sky"; }
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
+    // This view's filings, whatever happens below (the Transparent pass
+    // reads them after the Effects pass).
+    shared_->map_effects.clear();
+    shared_->map_effect_filings=0;
+    shared_->map_effects_first=true;
     const auto sky=NativeSkyObjects().Current();
     if(!context.renderer || !native_scene_pass_camera) return;
-    // The walk's reads (world list, members, wire records and constants) go
-    // through one page window: no guest code runs during the pass.
+    // The walk's reads (world list, members, wire and grass records and
+    // constants) go through one page window: no guest code runs during the pass.
     const NativeSceneCpuWindow walk(reader_);
     std::vector<NativeMapEffectMember> members;
     uint32_t manager=0;
     try {
       if(context.owner) manager=FindNativeWorldListObject(walk,context.owner,kNativeMapEffectManagerVtable);
-      if(manager) members=CollectNativeMapEffectMembers(walk,manager);
+      if(manager) {
+        members=CollectNativeMapEffectMembers(walk,manager);
+        shared_->map_effects_first=NativeMapEffectsFiledBeforeEffects(walk,context.owner);
+      }
     } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); manager=0; members.clear(); }
     if(!manager) { if(sky) RecordSky(context,sky); return; }
-    // Mode-0 wire draws since the last sky, recorded in list order around it.
-    std::vector<NativeEffectDraw> pending;
-    std::optional<NativeEffectInputs> inputs;
-    NativeElectricWireStats wires;
-    for(const auto& member:members) {
-      if(member.kind==NativeMapEffectKind::Sky) {
-        // The sky pass reads its own hidden word (RecordNativeSky).
-        if(member.object!=sky) continue;
-        RecordMapEffectDraws(context,pending); pending.clear();
-        RecordSky(context,sky);
-        continue;
-      }
-      if(member.hidden) continue;  // 821C0C00: lhz 64 nonzero returns.
-      if(member.kind==NativeMapEffectKind::ElectricWire && member.mode==0) {
-        try {
-          // The wire's eye is the pass camera's, as for the effects pass.
-          if(!inputs) inputs=ReadNativeEffectInputs(walk,native_scene_pass_camera->view);
-          for(auto& draw:BuildNativeElectricWireDraws(walk,member.object,context.view.scene,*inputs,&wires)) pending.push_back(std::move(draw));
-        } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); }
-        continue;
-      }
+    // The walk's routes in list order: the sky, runs of immediate draws
+    // around it (recorded here), and the filed grass maps (Transparent).
+    // The wires' eye is the pass camera's, as for the effects pass.
+    auto plan=PlanNativeMapEffects(walk,members,sky,context.view.scene,context.guest_context,native_scene_pass_camera->view,
+      [](const std::string& reason) { NativeFullFrameDeclined("map effects",reason); });
+    for(const auto& segment:plan.segments) {
+      if(segment.sky) RecordSky(context,sky);
+      else RecordMapEffectDraws(context,segment.draws);
+    }
+    for(const auto& member:plan.unsupported)
       if(unsupported_.insert({member.vtable,member.mode}).second) {
         const auto* name=NativeMapEffectClassName(member.vtable);
-        REXLOG_INFO("Native full frame map effects: unsupported {} {:#x} mode {} (slot 4 {:#x}){}; not drawn",
-          name?name:"class",member.vtable,member.mode,member.render,
-          member.kind==NativeMapEffectKind::GrassMap?" - clGrassMap is not ported (native_map_effects.h)":"");
+        REXLOG_INFO("Native full frame map effects: unsupported {} {:#x} mode {} (slot 4 {:#x}); not drawn",
+          name?name:"class",member.vtable,member.mode,member.render);
       }
-    }
-    RecordMapEffectDraws(context,pending);
+    const auto& wires=plan.wires;
+    const auto& grass=plan.grass;
+    uint64_t grass_draws=0;
+    for(const auto& item:plan.filed) grass_draws+=item.draws.size();
+    grass_filed_+=plan.filed.size(); grass_draws_+=grass_draws;
+    shared_->map_effect_filings=plan.filings;
+    shared_->map_effects=std::move(plan.filed);
     if(++walks_<=4 || walks_%1000==0)
-      REXLOG_INFO("Native full frame map effects: walks={} manager={:#x} members={} wire_records={} disabled={} distant={} culled={} strips={} recorded={}",
-        walks_,manager,members.size(),wires.records,wires.disabled,wires.distant,wires.culled,wires.drawn,map_effect_draws_);
+      REXLOG_INFO("Native full frame map effects: walks={} manager={:#x} members={} wire_records={} disabled={} distant={} culled={} strips={} recorded={} "
+        "grass_maps={} grass_skipped={} grass_cells={} grass_outside={} grass_empty={} grass_culled={} blades={} blades_culled={} blades_faded={} "
+        "blades_drawn={} grass_draws={} filed={} undrawn_keys={} map_first={} (total filed={} draws={})",
+        walks_,manager,members.size(),wires.records,wires.disabled,wires.distant,wires.culled,wires.drawn,map_effect_draws_,
+        grass.objects,grass.skipped,grass.cells,grass.outside,grass.empty,grass.culled,grass.blades,grass.blade_culled,grass.faded,
+        grass.drawn,grass.draws,plan.filings,plan.undrawn_keys,shared_->map_effects_first,grass_filed_,grass_draws_);
   }
  private:
-  // Immediate map-effect draws (the wires' strips), on the open scene.
+  // Immediate map-effect draws (the wires' strips, a mode-0 grass map's
+  // quads), on the open scene.
   void RecordMapEffectDraws(edf::native::NativeFrameContext& context,const std::vector<edf::native::NativeEffectDraw>& draws) {
     using namespace edf::native;
     if(draws.empty()) return;
@@ -6999,7 +7026,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) return;
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("map effects",reason); };
-    // The wires' strips all activate alike: one activation for the run.
+    // A run of alike draws (the wires' strips) activates once.
     map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,*native_scene_pass_camera,viewport,formats,report,
       [&](const std::exception& error) { report(error.what()); });
   }
@@ -7139,7 +7166,8 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
   edf::native::NativeSkyPassState sky_;  // Cached hierarchy and layout.
   SkyMaterials sky_materials_;
   std::set<std::pair<uint32_t,int32_t>> unsupported_;  // (vtable, mode) reported.
-  uint64_t frames_=0,declined_=0,ids_=0,walks_=0,map_effect_draws_=0;
+  std::shared_ptr<NativeFullFrameModelsShared> shared_;  // The filed grass maps, for Transparent.
+  uint64_t frames_=0,declined_=0,ids_=0,walks_=0,map_effect_draws_=0,grass_filed_=0,grass_draws_=0;
 };
 // The full frame's StaticWorld pass: SelectNativeFullFrameStaticWorld +
 // NativeFullFrameStaticWorld::Build over the frame's publication and the view's
@@ -7770,7 +7798,7 @@ REX_HOOK_RAW(sub_821A5080) {
       const auto models=std::make_shared<NativeFullFrameModelsShared>();
       return full_frame.Replace(std::make_unique<NativeFullFrameStaticWorldPass>(base)) &&
         full_frame.Replace(std::make_unique<NativeFullFrameModelsPass>(base,models)) &&
-        full_frame.Replace(std::make_unique<NativeFullFrameSkyPass>(base)) &&
+        full_frame.Replace(std::make_unique<NativeFullFrameSkyPass>(base,models)) &&
         full_frame.Replace(std::make_unique<NativeFullFrameEffectsPass>(base,models)) &&
         full_frame.Replace(std::make_unique<NativeFullFrameTransparentPass>(base,models));
     }();

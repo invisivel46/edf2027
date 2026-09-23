@@ -135,6 +135,14 @@ std::vector<std::pair<uint32_t,uint32_t>> NativeEffectDrawCalls(const NativeEffe
   std::vector<std::pair<uint32_t,uint32_t>> calls;
   const auto total=draw.vertex_count();
   if(!total) return calls;
+  // clGrassMap's 8218D3F0 draws a cell's whole list of one blade type in one
+  // DrawPrimitiveUP; its quads are independent, so ranges of whole quads under
+  // the immediate path's vertex limit draw the same pixels in the same order.
+  if(draw.technique==NativeEffectTechnique::Utility3DTexA) {
+    for(uint32_t first=0;first<total;first+=kNativeGrassMapCallVertices)
+      calls.push_back({first,std::min(kNativeGrassMapCallVertices,total-first)});
+    return calls;
+  }
   if(draw.kind!=NativeEffectDraw::Kind::Particles) { calls.push_back({0,total}); return calls; }
   constexpr uint32_t chunk=kNativeParticleRecordsPerCall*4;
   for(uint32_t first=0;first<total;first+=chunk) calls.push_back({first,std::min(chunk,total-first)});
