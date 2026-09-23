@@ -378,6 +378,7 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        FrameNativeModels, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
                        FrameNativeEnd, FrameNativeOverlays, FrameNativePhases,
                        FrameNativeModelsVisibility, FrameNativeModelsPrograms, FrameNativeModelsResolve, FrameNativeModelsRecord,
+                       FrameNativeStaticWorldSelect, FrameNativeStaticWorldBuild, FrameNativeStaticWorldRecord,
                        SimRegistry, SimStaticWalk, SimPreloadGeometry, SimPreloadMaterial,
                        SimTrees, SimMembership, SimPublish, SimPoses, SimLockWait,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
@@ -440,6 +441,7 @@ class HookTiming {
       "frame.native.models","frame.native.effects","frame.native.transparent","frame.native.post",
       "frame.native.end","frame.native.view_overlays","frame.native.phases",
       "frame.native.models.visibility","frame.native.models.programs","frame.native.models.resolve","frame.native.models.record",
+      "frame.native.static_world.select","frame.native.static_world.build","frame.native.static_world.record",
       "sim.registry","sim.static_walk","sim.preload_geometry","sim.preload_material",
       "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
@@ -6331,9 +6333,16 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     // the material: one slice each (the resolver's intern runs inside it).
     const auto resolver=NativeFullFrameStaticResolver(pass,
       [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); });
-    const auto frame=world_.Build(*publication,camera,std::cref(routes),pass,[&](const auto&... arguments) {
+    // Sub-phases: frame.native.static_world.select (tree walk, visibility,
+    // LOD, live route words), .build (group materials and instance worlds,
+    // with any resolve slices), .record (the recording slice, its wait included).
+    std::optional<edf::native::HookTiming> timing(std::in_place,edf::native::HookPhase::FrameNativeStaticWorldSelect);
+    world_.Select(*publication,camera,std::cref(routes));
+    timing.emplace(edf::native::HookPhase::FrameNativeStaticWorldBuild);
+    const auto& frame=world_.BuildSelected(*publication,camera,pass,[&](const auto&... arguments) {
       return slices([&] { return resolver(arguments...); });
     });
+    timing.emplace(edf::native::HookPhase::FrameNativeStaticWorldRecord);
     uint64_t drawn=0;
     // Recorded only onto the targets the draws were resolved for: re-validated,
     // since the locks were released while building.
@@ -6352,14 +6361,17 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
       state.recorded={};
       return true;
     });
+    timing.reset();
     if(!current) ++stale_;
     const auto& selected=frame.selection.stats;
     const auto& built=frame.stats;
+    const auto& cached=world_.selection_cache.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame static world: frames={} skipped={} stale={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
+      REXLOG_INFO("Native full frame static world: frames={} skipped={} stale={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={} camera_only={} reused_draws={} reused_frame={} list_hits={} list_builds={} list_invalidations={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
         frames_,skipped_,stale_,routes.reads,routes.slot_reads,routes.failures,selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,
         selected.unrouted,selected.not_direct,selected.unpublished,selected.undrawable,built.groups,built.draws,built.instances,drawn,
         built.resolves,built.cache_hits,built.declined,built.missing_group,built.missing_material,built.missing_geometry,built.world_declines,
+        built.camera_only,built.reused_draws,built.reused_frame,cached.list_hits,cached.list_builds,cached.invalidations,
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:

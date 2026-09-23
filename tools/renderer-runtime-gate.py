@@ -80,6 +80,10 @@ PHASES = ('engine.render_helper', 'render.queued', 'render.material_group', 'ren
           # sources, material resolve and scene objects, and the opaque recording.
           'frame.native.models.visibility', 'frame.native.models.programs', 'frame.native.models.resolve',
           'frame.native.models.record',
+          # Sub-phases of frame.native.static_world: the tree walk with
+          # visibility and LOD, the per-group materials and instance worlds,
+          # and the recording through the scene renderer.
+          'frame.native.static_world.select', 'frame.native.static_world.build', 'frame.native.static_world.record',
           # The simulation-step publication (821A4DE8 exit, 820B4250 post-hook)
           # inside engine.simulation_dispatch. Inclusive of each step's own
           # lock waits; sim.lock_wait isolates the bridge-lock acquisitions.

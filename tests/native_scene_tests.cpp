@@ -1235,9 +1235,10 @@ void FullFrameStaticWorld() {
   for(const auto group:{G1,G2,G3}) {
     const auto revision=publication.sources->FindGroup(group)->revision;
     auto material=std::make_shared<NativeSceneGroupMaterial>(); material->group=group; material->revision=revision; material->program=program;
-    publication.group_materials.push_back(material);
+    // Sorted and unique by group, as NativeSceneAdapter publishes them.
+    publication.group_materials.Assign(material,NativeSceneGroupKey{});
     auto geometry=std::make_shared<NativeSceneGroupGeometry>(); geometry->group=group; geometry->revision=revision;
-    publication.group_geometry.push_back(geometry);
+    publication.group_geometry.Assign(geometry,NativeSceneGroupKey{});
   }
   NativeFullFrameStaticPass pass;
   pass.targets.dsv_format=DXGI_FORMAT_D24_UNORM_S8_UINT; pass.targets.rtv_format[0]=DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1272,9 +1273,63 @@ void FullFrameStaticWorld() {
   const auto again=pass_world.Build(publication,near_camera,routes,pass,resolve);
   Require(resolved.size()==2 && again.stats.cache_hits==again.stats.groups-again.stats.missing_group && !again.stats.resolves,
     "a moved camera re-resolved cached group materials");
+  const auto same_draws=[](const NativeFullFrameStaticFrame& a,const NativeFullFrameStaticFrame& b) {
+    if(a.draws.size()!=b.draws.size()) return false;
+    for(size_t i=0;i<a.draws.size();++i) {
+      const auto& x=a.draws[i]; const auto& y=b.draws[i];
+      if(x.group!=y.group || x.material!=y.material || x.geometry!=y.geometry || x.instances.size()!=y.instances.size()) return false;
+      for(size_t j=0;j<x.instances.size();++j) if(x.instances[j]!=y.instances[j]) return false;
+    }
+    return true;
+  };
+  // Nothing moved: the previous frame whole.
+  const auto still=pass_world.Build(publication,near_camera,routes,pass,resolve);
+  Require(still.stats.reused_frame && same_draws(still,again) && resolved.size()==2,
+    "an unchanged frame was built again");
+  // Only the pass camera moved: each group's accepted constants (no camera
+  // constant here) and its instances are reused.
+  auto turned_camera=near_camera; turned_camera.pass.view[0]=0x3f800000;
+  const auto turned=pass_world.Build(publication,turned_camera,routes,pass,resolve);
+  Require(!turned.stats.reused_frame && turned.stats.camera_only==turned.stats.draws &&
+    turned.stats.reused_draws==turned.stats.draws && turned.stats.cache_hits==turned.stats.draws && !turned.stats.resolves &&
+    turned.stats.instances==again.stats.instances && same_draws(turned,again),"a moved pass camera rebuilt unchanged groups");
   auto other=pass; other.targets.reverse_depth=true;
   pass_world.Build(publication,camera,routes,other,resolve);
   Require(resolved.size()==4,"changed targets reused a cached material");
+  // The selection cache changes what a selection costs, never what it is.
+  const auto same_selection=[](const NativeFullFrameStaticSelection& a,const NativeFullFrameStaticSelection& b) {
+    if(a.objects!=b.objects || a.owners.size()!=b.owners.size() || std::memcmp(&a.stats,&b.stats,sizeof(a.stats))) return false;
+    for(size_t i=0;i<a.owners.size();++i) {
+      const auto& x=a.owners[i]; const auto& y=b.owners[i];
+      if(x.owner!=y.owner || x.groups.size()!=y.groups.size()) return false;
+      for(size_t g=0;g<x.groups.size();++g) if(x.groups[g].group!=y.groups[g].group || x.groups[g].instances!=y.groups[g].instances) return false;
+    }
+    return true;
+  };
+  NativeFullFrameStaticSelectCache select_cache;
+  Require(same_selection(SelectNativeFullFrameStaticWorld(publication,camera,routes,&select_cache),selection),
+    "a cached full-frame selection differs");
+  const auto builds=select_cache.stats.list_builds;
+  for(const auto* view:{&near_camera,&camera,&near_camera})
+    Require(same_selection(SelectNativeFullFrameStaticWorld(publication,*view,routes,&select_cache),
+      SelectNativeFullFrameStaticWorld(publication,*view,routes)),"a cached full-frame selection differs");
+  Require(builds==3 && select_cache.stats.list_builds==builds && select_cache.stats.list_hits>=9 &&
+    select_cache.stats.invalidations==1,"the selection cache rebuilt unchanged lists");
+  // A world republish: a new sources generation with the same candidates keeps the lists.
+  sources.PublishWorld(A,NativeSceneSources::World{});
+  auto republished=publication; republished.sources=sources.AcquireSnapshot();
+  Require(republished.sources!=publication.sources && republished.sources->SameCandidates(*publication.sources) &&
+    same_selection(SelectNativeFullFrameStaticWorld(republished,camera,routes,&select_cache),selection) &&
+    select_cache.stats.invalidations==1 && select_cache.stats.list_builds==builds,"a world republish invalidated the selection cache");
+  const NativeSceneSources copied=*republished.sources;
+  Require(!copied.SameCandidates(*republished.sources),"a copied source producer kept its lineage");
+  // Route words are never cached: a live write routes E natively through a warm cache.
+  live[E].mode=0;
+  const auto direct=SelectNativeFullFrameStaticWorld(republished,camera,routes,&select_cache);
+  Require(same_selection(direct,SelectNativeFullFrameStaticWorld(republished,camera,routes)) &&
+    select_cache.stats.list_builds==builds && std::ranges::count(direct.objects,NativeFullFrameStaticSelection::Object{E,0})==1,
+    "a cached selection used stale route words");
+  live[E].mode=1;
 }
 // NativeAddressFilter: every added address answers true; addresses never
 // added are almost all false (two bits of a 4 Mi-bit table).

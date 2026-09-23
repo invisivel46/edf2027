@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <span>
@@ -26,7 +27,7 @@ class NativeSceneSources {
       auto result=std::make_shared<NativeSceneSources>();
       result->owners_=owners_; result->parts_=parts_; result->groups_=groups_;
       result->group_revision_=group_revision_; result->next_=next_;
-      result->candidate_revision_=candidate_revision_;
+      result->candidate_revision_=candidate_revision_; result->lineage_.value=lineage_.value;
       snapshot_=std::move(result);
     }
     return snapshot_;
@@ -55,6 +56,11 @@ class NativeSceneSources {
   // retirement, changed parts or visibility). Copied into every snapshot, so
   // equal revisions mean equal candidates. World registers do not move it.
   uint64_t CandidateRevision() const { return candidate_revision_; }
+  // Whether every FindCandidate(View) answer here equals other's: snapshots of
+  // one producer (a copy is a new lineage) at the same candidate revision.
+  bool SameCandidates(const NativeSceneSources& other) const {
+    return lineage_.value==other.lineage_.value && candidate_revision_==other.candidate_revision_;
+  }
   uint64_t Born(uint32_t owner) {
     if(!owner || next_==UINT64_MAX) throw std::runtime_error("invalid native scene source lifetime");
     Retire(owner);
@@ -212,6 +218,15 @@ class NativeSceneSources {
   NativeSharedMap<uint32_t,Source> parts_;
   GroupMap groups_;
   uint64_t group_revision_=0,candidate_revision_=0;
+  // One producer's identity, shared only by its snapshots: a copied or
+  // assigned object takes a fresh one, as its revisions no longer follow ours.
+  struct Lineage {
+    uint64_t value=Next();
+    Lineage()=default;
+    Lineage(const Lineage&):value(Next()) {}
+    Lineage& operator=(const Lineage&) { value=Next(); return *this; }
+    static uint64_t Next() { static std::atomic<uint64_t> next{1}; return next.fetch_add(1,std::memory_order_relaxed); }
+  } lineage_;
   void RemoveGroupPart(const Part& part) {
     if(!part.group) return;
     auto* group=groups_.Mutable(part.group);
