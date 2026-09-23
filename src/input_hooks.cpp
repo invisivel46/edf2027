@@ -14,6 +14,17 @@
 #include "frame_stats.h"
 #include "core_logic.h"
 #include "native_graphics/native_renderer_preset.h"
+#include "scripted_input_logic.h"
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <psapi.h>
+#endif
 using rex::be;
 REXCVAR_DECLARE(bool, edf_trace_input);
 REXCVAR_DECLARE(bool, edf_rumble);
@@ -106,6 +117,32 @@ REX_HOOK_RAW(sub_820A6B10) {
 // frames already over budget must not receive another full period of delay.
 REXCVAR_DECLARE(int32_t, edf_fps_cap);
 REXCVAR_DECLARE(bool, edf_frametime_log);
+REXCVAR_DECLARE(bool, edf_native_memory_log);
+namespace {
+// One "Native memory" line for tools/soak-report.py: process private bytes
+// (commit charge), working set and its peak, handle count, and the engine's
+// simulation ticks (the scripted pad's game clock, so a soak window can be
+// placed on the input script's timeline).
+void LogProcessMemory(double t_s) {
+#ifdef _WIN32
+  PROCESS_MEMORY_COUNTERS_EX counters{};
+  counters.cb = sizeof(counters);
+  DWORD handles = 0;
+  const HANDLE process = GetCurrentProcess();
+  if (!K32GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters)))
+    return;
+  GetProcessHandleCount(process, &handles);
+  constexpr double kMiB = 1024.0 * 1024.0;
+  REXLOG_INFO("Native memory: private_mb={:.1f} working_set_mb={:.1f} peak_working_set_mb={:.1f} "
+              "pagefile_mb={:.1f} handles={} sim_ticks={} t={:.0f} s",
+              counters.PrivateUsage / kMiB, counters.WorkingSetSize / kMiB, counters.PeakWorkingSetSize / kMiB,
+              counters.PagefileUsage / kMiB, handles,
+              edf::SimulationTicks().load(std::memory_order_relaxed), t_s);
+#else
+  (void)t_s;
+#endif
+}
+}  // namespace
 namespace edf {
 FrameStats& CurrentFrameStats() { static FrameStats s; return s; }
 }
@@ -156,6 +193,7 @@ REX_HOOK_RAW(sub_82151460) {
     st.low_1_percent_ms.store(low_1_percent_ms, std::memory_order_relaxed);
     st.total_frames.store(total, std::memory_order_relaxed);
     REXLOG_INFO("FPS: {:.1f} (frames {} over {:.1f} s, t={:.0f} s)", frames / dt, frames, dt, std::chrono::duration<double>(now - t0).count());
+    if (REXCVAR_GET(edf_native_memory_log)) LogProcessMemory(std::chrono::duration<double>(now - t0).count());
     if (REXCVAR_GET(edf_frametime_log))
       REXLOG_INFO("FRAMETIME: avg {:.2f} ms min {:.2f} max {:.2f} 1%-low {:.2f} ms (cap {})", average_ms, minimum_ms, maximum_ms, low_1_percent_ms, cap);
     frame_ms.clear(); frames = 0; last_report = now;

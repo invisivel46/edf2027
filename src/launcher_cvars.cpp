@@ -13,6 +13,8 @@ REXCVAR_DEFINE_STRING(edf_aspect, "native", "EDF2027", "Aspect handling: native,
     .allowed({"native", "ultrawide", "letterbox", "stretch"});
 REXCVAR_DEFINE_BOOL(edf_show_fps, false, "EDF2027", "Show the frame-rate overlay");
 REXCVAR_DEFINE_BOOL(edf_frametime_log, false, "EDF2027", "Log frame-time statistics (min/avg/max/1% low) every 5 s");
+REXCVAR_DEFINE_BOOL(edf_native_memory_log, false, "EDF2027",
+                    "Log process memory (private bytes, working set, handles) and the simulation tick count every 5 s beside the FPS line, for soak runs (tools/soak-report.py)");
 REXCVAR_DEFINE_BOOL(edf_trace_input, false, "EDF2027", "Log verbose guest input and XAM diagnostics");
 REXCVAR_DEFINE_BOOL(edf_rumble, true, "EDF2027", "Enable controller vibration");
 REXCVAR_DEFINE_INT32(edf_frame_pacer_spin_us, 250, "EDF2027", "Busy-wait portion of the frame limiter in microseconds").range(0, 2000);

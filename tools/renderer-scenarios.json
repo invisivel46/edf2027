@@ -1,0 +1,79 @@
+{
+  "_comment": [
+    "Renderer validation scenarios for tools/run-renderer-scenario.ps1 (read by tests/test_renderer_scenarios.py).",
+    "input: the scripted-pad file. seed: tools/make-edf-save.py arguments, or null for a fresh profile (Mission 1).",
+    "mission: the id renderer-runtime-gate.py --expect-mission checks (MISSION.CAM lookup).",
+    "capture_start: indexed output frame (3D frames since the first scene draw, pre-mission scene included) where",
+    "A/B captures begin; estimated, see each input file. seconds: how long each variant runs before it is stopped."
+  ],
+  "scenarios": {
+    "benchmark": {
+      "description": "Mission 1 (M202, Map01 City 1) from a fresh profile, standing fire down the street: the existing benchmark route",
+      "input": "tools/native-benchmark-input.txt",
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 4000,
+      "seconds": {"ab": 420, "unlocked": 600, "soak-ab": 1950, "soak-unlocked": 1950}
+    },
+    "cave": {
+      "description": "Mission 11 Infiltration (M301, Map08 Cave 2): underground nest, 110 ants at close range",
+      "input": "tools/native-scenario-cave-input.txt",
+      "seed": ["--mission", "11", "--armour", "100000"],
+      "mission": "M301",
+      "capture_start": 6000,
+      "seconds": {"ab": 420, "unlocked": 600, "soak-ab": 1950, "soak-unlocked": 1950}
+    },
+    "ufo-swarm": {
+      "description": "Mission 6 Airforce (M212, Map02 City 2): the mothership's gunship swarm filling the sky",
+      "input": "tools/native-scenario-ufo-swarm-input.txt",
+      "seed": ["--mission", "6", "--armour", "100000"],
+      "mission": "M212",
+      "capture_start": 6000,
+      "seconds": {"ab": 420, "unlocked": 600, "soak-ab": 1950, "soak-unlocked": 1950}
+    },
+    "vehicle": {
+      "description": "Mission 9 Tsugawa (M211, Map05 Mountains): enter the tank at the spawn, drive and fire among Walking Arms",
+      "input": "tools/native-scenario-vehicle-input.txt",
+      "seed": ["--mission", "9", "--armour", "100000"],
+      "mission": "M211",
+      "capture_start": 12000,
+      "seconds": {"ab": 540, "unlocked": 720, "soak-ab": 1950, "soak-unlocked": 1950}
+    },
+    "soak": {
+      "description": "Mission 1 Arrival (M202) through the seeded route with 1200200 stamina: 30 minutes of gameplay",
+      "input": "tools/native-scenario-soak-input.txt",
+      "seed": ["--mission", "1", "--armour", "1000000"],
+      "mission": "M202",
+      "capture_start": 4000,
+      "seconds": {"ab": 420, "unlocked": 600, "soak-ab": 1950, "soak-unlocked": 1950}
+    }
+  },
+  "variants": {
+    "ab": {
+      "description": "locked frame rate, guest and native frames alternating every frame, 64 consecutive output captures from capture_start",
+      "args": ["--edf_native_renderer=native", "--edf_native_ab_alternate=1",
+               "--edf_native_output_capture_interval=1", "--edf_native_output_capture_limit=64"],
+      "captures": true
+    },
+    "unlocked": {
+      "description": "native renderer, unlocked at a 120 FPS cap without vsync, frame times and GPU pass timings",
+      "args": ["--edf_native_renderer=native", "--edf_native_unlock_framerate=true", "--edf_fps_cap=120",
+               "--edf_native_vsync=false", "--edf_native_frame_times=true", "--edf_native_gpu_timings=true"],
+      "captures": false
+    },
+    "soak-ab": {
+      "description": "A/B every frame for the whole soak; one output capture every 701 frames (odd, so captures alternate guest/native), 128 captures = 89,000 frames, about 25 minutes at 60 FPS; memory log and frame times on",
+      "args": ["--edf_native_renderer=native", "--edf_native_ab_alternate=1",
+               "--edf_native_output_capture_interval=701", "--edf_native_output_capture_limit=128",
+               "--edf_native_frame_times=true", "--edf_native_memory_log=true"],
+      "captures": true
+    },
+    "soak-unlocked": {
+      "description": "native renderer unlocked at 120 FPS for the whole soak with frame times, GPU timings and the memory log: the soak-report.py input",
+      "args": ["--edf_native_renderer=native", "--edf_native_unlock_framerate=true", "--edf_fps_cap=120",
+               "--edf_native_vsync=false", "--edf_native_frame_times=true", "--edf_native_gpu_timings=true",
+               "--edf_native_memory_log=true"],
+      "captures": false
+    }
+  }
+}
