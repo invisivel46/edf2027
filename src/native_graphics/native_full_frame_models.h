@@ -39,6 +39,10 @@ namespace edf::native {
 //                                 the instances share one material and are
 //                                 adjacent in the opaque order, so the scene
 //                                 renderer draws them instanced
+//   821A1730 before a draw  -> the item's per-object constants (g_Highlight,
+//                                 g_Time, g_Scroll; NativeRenderEntry::constants)
+//                                 bound over the pass constants' globals of
+//                                 those names (NativeFullFrameModelObjectConstants)
 // No guest function is called, no device state is read or handed off and no
 // guest-mirror eligibility is assessed. Each draw's render state is the pass
 // base state plus its own material's state operations (see
@@ -132,6 +136,12 @@ inline std::pair<const NativeRenderPose*,const NativeRenderPoseMotion*> NativeFu
   }
   return {&item.entry->pose,&item.entry->motion};
 }
+// The per-object constants in effect at an item's draw: its attachment's, or
+// the entry's (the LOD model and the instanced sets drawn after it).
+inline const NativeRenderConstants& NativeFullFrameModelItemConstants(const NativeFullFrameModelItem& item) {
+  if(item.attachment>=0) return item.entry->attachments[size_t(item.attachment)].constants;
+  return item.entry->constants;
+}
 struct NativeFullFrameModelPlan {
   struct Stats {
     uint64_t entries=0,hidden=0,mode=0,distance=0,frustum=0,box=0,no_model=0,no_pose=0,bucket_zero=0,opaque=0,transparent=0,
@@ -179,12 +189,22 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
 //    uploaded bone or, before any, the identity (the guest would see the
 //    previous object's world; nothing native can reproduce that).
 //  palette: skinned only, PackNativeBonePalette(pose,limit): bones*12 floats.
+//  objects: the item's per-object pool constants (NativeFullFrameModelItemConstants),
+//    which 821A1730 stored before the draw: part of the item's constants key.
 struct NativeFullFrameModelConstants {
   std::vector<std::array<uint8_t,64>> worlds;
   std::vector<float> palette;
   uint32_t bones=0;
   bool skinned=false;
+  std::vector<NativeRenderObjectConstant> objects;
 };
+// The pass constants an item's per-object constants replace, in pass order:
+// each global whose name is one of theirs, with its first register (16
+// bytes) the object's value, as 821A16D8 stores one float4 over the pool
+// value that global reads; the rest of the global keeps its published bytes.
+// Empty when the material reads none of them (a draw of another shader).
+std::vector<NativeSceneMaterialInputs::Constant> NativeFullFrameModelObjectConstants(
+  std::span<const NativeSceneMaterialInputs::Constant> pass,std::span<const NativeRenderObjectConstant> objects);
 NativeFullFrameModelConstants NativeFullFrameModelConstantsFor(const NativeModelLayout& layout,
   std::span<const NativePoseMatrix> pose,uint32_t palette_limit);
 // 821C9DA8's constants: every record uploads the one world (records with
@@ -324,7 +344,8 @@ struct NativeFullFrameModelFrame {
     uint64_t items=0,drawn=0,draws=0,resolves=0,memo_hits=0,missing_program=0,missing_geometry=0,
       scissor=0,palette=0,failed=0,cache_hits=0,captures=0,palettes=0,source_hits=0,source_fetches=0,
       programs=0,geometries=0,reused=0,derived=0,sourced=0,rows=0,camera_rows=0,
-      blended=0;  // Drawn items whose pose or world is blended this frame (NativeRenderPoseBlender).
+      blended=0,  // Drawn items whose pose or world is blended this frame (NativeRenderPoseBlender).
+      object_constants=0;  // Draw objects made this frame with per-object constants bound (a capture each).
   };
   NativeFullFrameModelPlan plan;
   std::vector<NativeFullFrameModelBatch> batches;  // Opaque, then transparent.
@@ -353,6 +374,7 @@ struct NativeFullFrameModelItemState {
   // The blend the constants were made with (NativeRenderBlendOf): the previous
   // pose and fraction, or no previous pose when they are the pose's own.
   NativeRenderBlend blend;
+  NativeRenderConstants constants;  // The per-object constants the values were made with.
   uint32_t world=0,palette_limit=0;
   uint64_t generation=kNativeFullFrameModelUnversioned;  // Source generation of the draws' sources.
   bool sourced=false,valued=false;
@@ -380,6 +402,11 @@ struct NativeFullFrameModelRowState {
   std::string error;
   NativeSceneMaterialCapture capture;
   std::shared_ptr<NativeScenePaletteCapture> palette;
+  // A rigid row's pipeline half this frame, for the draws that capture their
+  // per-object constants against it (NativeFullFrameModelObjectConstants).
+  NativeBackendPipeline* pipeline=nullptr;
+  std::vector<NativeBackendSampler*> samplers;
+  std::optional<std::array<float,4>> blend_factor;
   NativeSceneView view;
   bool scissor=false;
 };

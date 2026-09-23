@@ -21,6 +21,17 @@
 // (native_model_hierarchy.h), so their layout is captured with the tree's
 // bone count and never waits for the guest pose vector to be sized.
 //
+// Per-object constants (NativeRenderClass::constants, parts): the float4s a
+// slot 4 stores into shared effect-pool parameters before its draws
+// (821A1730: g_Highlight and g_Time for the UFO, alien-tank and mothership
+// classes, g_Scroll for the C_Tank treads) are read at the tick with the pool
+// name of each handle and published with the draw they precede
+// (NativeRenderEntry::constants, NativeRenderAttachment::constants); the
+// models pass binds them over the material's globals of those names. Their
+// objects are re-read every tick like the instanced ones. Across objects the
+// pool is sticky in the guest (a draw that stores nothing sees the previous
+// object's value); natively such a draw sees the pool as last published.
+//
 // Pose motion (NativeRenderPoseMotion, native_render_motion.h): every pose a
 // re-read publishes (the model's, each attachment's and each instanced set's
 // worlds) carries the previous tick's pose while the object was read on
@@ -95,6 +106,48 @@ size_t WalkNativeRenderList(const Reader& reader,uint32_t list,const Visit& visi
 template<class Reader> float NativeRenderFloat(const Reader& reader,uint32_t address) {
   return std::bit_cast<float>(reader.Word(address));
 }
+// Shared effect pool (the std::map at *(8257C02C)+4, NativePostToneLayout's):
+// a handle 821A20C0 returns is node+40; the node's key std::string is at
+// node+12 (text inline at +4 below capacity 16, else at *(+4); size +20,
+// capacity +24); the value holds the float4 data pointer at +0 and the
+// float4 count at +8.
+inline constexpr uint32_t kNativeRenderPoolValue=40,kNativeRenderPoolKey=12,kNativeRenderPoolCount=8,
+  kNativeRenderPoolKeyMax=64;
+template<class Reader> std::string ReadNativeRenderPoolName(const Reader& reader,uint32_t handle) {
+  if(handle<kNativeRenderPoolValue) throw std::runtime_error("invalid native render pool handle");
+  const auto key=handle-kNativeRenderPoolValue+kNativeRenderPoolKey;
+  const auto size=reader.Word(key+20),capacity=reader.Word(key+24);
+  if(size>capacity || size>kNativeRenderPoolKeyMax) throw std::runtime_error("invalid native render pool key");
+  if(!size) throw std::runtime_error("native render pool key is empty");
+  const auto data=capacity>=16?reader.Word(key+4):key+4;
+  const auto* text=reader.Bytes(data,size);
+  return std::string(reinterpret_cast<const char*>(text),size);
+}
+// One 821A1730(pool, *(base+handle), value) store as the draws after it see
+// it (NativeRenderConstantSource), merged into `constants`: a name already
+// there takes the new value in place (the pool entry is one register block).
+// Nothing for a null handle or a zero count (821A16D8 stores min(1, count)).
+template<class Reader>
+void ReadNativeRenderConstant(const Reader& reader,uint32_t base,const NativeRenderConstantSource& source,
+    std::vector<NativeRenderObjectConstant>& constants) {
+  if(!source.handle) return;
+  const auto handle=reader.Word(base+source.handle);
+  if(!handle || !reader.Word(handle+kNativeRenderPoolCount)) return;
+  NativeRenderObjectConstant constant;
+  constant.name=ReadNativeRenderPoolName(reader,handle);
+  if(source.scroll) {
+    // 821E7C50: fneg of the float at base+value, then 0.0 [820009A4], 0.0, 1.0 [820008CC].
+    const auto x=reader.Word(base+source.value)^0x80000000u;
+    const std::array<uint32_t,4> words{x,0u,0u,0x3F800000u};
+    for(size_t i=0;i<16;++i) constant.registers[i]=uint8_t(words[i/4]>>(24-(i%4)*8));
+  } else {
+    const auto* bytes=reader.Bytes(base+source.value,16);
+    std::copy(bytes,bytes+16,constant.registers.begin());
+  }
+  const auto same=std::find_if(constants.begin(),constants.end(),[&](const auto& c) { return c.name==constant.name; });
+  if(same!=constants.end()) same->registers=constant.registers;
+  else constants.push_back(std::move(constant));
+}
 // Bitwise equality; the pose, layout and entry pointers compare by identity
 // because the registry shares them whenever their content is unchanged (pose
 // motions too: previous by identity, tick and render_dependent by value).
@@ -105,14 +158,16 @@ inline bool SameNativeRenderEntry(const NativeRenderEntry& a,const NativeRenderE
   };
   if(a.object!=b.object || a.generation!=b.generation || a.type!=b.type || a.mode!=b.mode || a.hidden!=b.hidden ||
      bits(a.radius)!=bits(b.radius) || bits(a.cull_distance)!=bits(b.cull_distance) || bits(a.sort_bias)!=bits(b.sort_bias) ||
-     a.pose!=b.pose || a.motion!=b.motion || a.pose_vector!=b.pose_vector || a.lod_thresholds.size()!=b.lod_thresholds.size() ||
+     a.pose!=b.pose || a.motion!=b.motion || a.pose_vector!=b.pose_vector || a.constants!=b.constants ||
+     a.lod_thresholds.size()!=b.lod_thresholds.size() ||
      a.models.size()!=b.models.size() || a.attachments.size()!=b.attachments.size() || a.instanced.size()!=b.instanced.size()) return false;
   for(size_t i=0;i<4;++i) if(bits(a.centre[i])!=bits(b.centre[i])) return false;
   for(size_t i=0;i<a.lod_thresholds.size();++i) if(bits(a.lod_thresholds[i])!=bits(b.lod_thresholds[i])) return false;
   for(size_t i=0;i<a.models.size();++i) if(!same_models(a.models[i],b.models[i])) return false;
   for(size_t i=0;i<a.attachments.size();++i) {
     const auto& x=a.attachments[i],&y=b.attachments[i];
-    if(!same_models(x.model,y.model) || x.pose_vector!=y.pose_vector || x.pose!=y.pose || x.motion!=y.motion) return false;
+    if(!same_models(x.model,y.model) || x.pose_vector!=y.pose_vector || x.pose!=y.pose || x.motion!=y.motion ||
+       x.constants!=y.constants) return false;
   }
   for(size_t i=0;i<a.instanced.size();++i)
     if(!same_models(a.instanced[i].model,b.instanced[i].model) || a.instanced[i].worlds!=b.instanced[i].worlds ||
@@ -127,7 +182,8 @@ class NativeRenderRegistry {
     // idle_ticks: refresh-false ticks that read and published nothing.
     uint64_t ticks=0,light_ticks=0,idle_ticks=0,births=0,seeded=0,rebirths=0,deaths=0,unknown_deaths=0,subscriptions=0,unknown_subscriptions=0,
       unknown_classes=0,reclassified=0,deferred=0,foreign=0,builds=0,changed=0,unchanged=0,pose_reuses=0,read_failures=0,
-      layout_captures=0,layout_failures=0,instanced_worlds=0,frame_poses=0,frame_pose_reuses=0,frame_pose_failures=0;
+      layout_captures=0,layout_failures=0,instanced_worlds=0,frame_poses=0,frame_pose_reuses=0,frame_pose_failures=0,
+      constant_changes=0;  // Per-object constant sets published anew (NativeRenderEntry::constants and attachments').
     size_t records=0,subscribed=0,published=0,retrying=0;
   };
   // In-game check (edf_native_render_registry_audit): scene+84 against the
@@ -331,8 +387,12 @@ class NativeRenderRegistry {
         record.hierarchy.Reset(); record.frame_pose.reset();
         if(!record.type) ++stats_.unknown_classes;
         // Re-read every tick: inputs that advance outside scene+100 (instanced
-        // worlds in slot 3, a frame-posed root).
-        if(record.type && ((record.type->attachments&kNativeRenderMotherSpheres) || record.type->frame_root)) animated_.insert(object);
+        // worlds in slot 3, a frame-posed root, per-object constants).
+        // Per-object constants too: the float4s slot 4 stores (g_Highlight,
+        // g_Time, g_Scroll) are object fields whose writers are not traced to
+        // scene+100 (vector stores through computed addresses), so every tick.
+        if(record.type && ((record.type->attachments&kNativeRenderMotherSpheres) || record.type->frame_root ||
+           NativeRenderClassHasConstants(*record.type))) animated_.insert(object);
         else animated_.erase(object);
       }
       if(record.scene!=scene) ++stats_.foreign;
@@ -364,7 +424,7 @@ class NativeRenderRegistry {
       return AdvanceNativeRenderPoseMotion(pose,published,published_motion,same_generation && same_layout,read,tick);
     };
     entry->lod_thresholds.clear(); entry->models.clear(); entry->attachments.clear(); entry->instanced.clear();
-    entry->pose.reset(); entry->pose_vector=0; entry->axes={}; entry->motion={};
+    entry->pose.reset(); entry->pose_vector=0; entry->axes={}; entry->motion={}; entry->constants.reset();
     entry->object=object; entry->generation=record.generation; entry->type=&type;
     for(uint32_t i=0;i<4;++i) entry->centre[i]=NativeRenderFloat(reader,object+kNativeRenderObjectCentre+i*4);
     // The oriented half axes of the 821B2B00 bound (obj+304/+320/+336): the
@@ -377,6 +437,11 @@ class NativeRenderRegistry {
     const auto* hidden=reader.Bytes(object+kNativeRenderObjectHidden,2);
     entry->hidden=(hidden[0]|hidden[1])!=0;
     if(!type.instance || !type.pose) return; // Tracked, no model: visibility only.
+    // The pool constants slot 4 stores before its first draw (821A1730), in
+    // effect for every later draw of this slot 4 until one is stored again.
+    constants_.clear();
+    for(const auto& source:type.constants) ReadNativeRenderConstant(reader,object,source,constants_);
+    entry->constants=ShareConstants(old?old->constants:nullptr);
     entry->pose_vector=object+type.pose;
     if(type.frame_root) {
       // A tree the walk rejects publishes the entry unposed (visibility and
@@ -414,6 +479,7 @@ class NativeRenderRegistry {
       attachment.pose=ReadPose(reader,vector,earlier?earlier->pose:nullptr);
       attachment.motion=motion(attachment.pose,earlier?&earlier->pose:nullptr,earlier?&earlier->motion:nullptr,
         earlier && earlier->model.instance==attachment.model.instance && earlier->model.layout==attachment.model.layout);
+      attachment.constants=ShareConstants(earlier?earlier->constants:nullptr);
       entry->attachments.push_back(std::move(attachment));
     };
     if((type.attachments&kNativeRenderFace) && reader.Bytes(object+kNativeRenderFaceFlag,1)[0])
@@ -428,6 +494,24 @@ class NativeRenderRegistry {
         if(int32_t(reader.Word(weapon+412))==2 && !reader.Word(weapon+804)) continue;
         attach(weapon+100,weapon+144);
       }
+    }
+    // Vehicle weapon groups (82199DD8 / 821E4E90): 820E1A80 on element+64.
+    for(const auto& group:type.weapon_groups) {
+      if(!group.group) continue;
+      const auto first=reader.Word(object+group.group+group.array),count=reader.Word(object+group.group+group.count);
+      if(count>kNativeRenderWeaponMax || (count && !first)) throw std::runtime_error("invalid native render vehicle weapon array");
+      for(uint32_t i=0;i<count;++i) {
+        const auto weapon=first+i*kNativeRenderVehicleWeaponStride+kNativeRenderVehicleWeaponOffset;
+        if(!reader.Bytes(weapon+1404,1)[0] || !reader.Word(weapon+108)) continue;
+        if(int32_t(reader.Word(weapon+412))==2 && !reader.Word(weapon+804)) continue;
+        attach(weapon+100,weapon+144);
+      }
+    }
+    // Parts (820F01E8 / 821E7C50): each stores its constants, then draws.
+    for(uint32_t i=0;i<type.parts.count;++i) {
+      const auto part=object+type.parts.base+i*type.parts.stride;
+      for(const auto& source:type.parts.constants) ReadNativeRenderConstant(reader,part,source,constants_);
+      attach(part+type.parts.instance,part+type.parts.pose);
     }
     // 820EC180: after the +1100 draw, obj+1172 once per record world. The
     // worlds are shared with the published entry while bitwise unchanged.
@@ -444,6 +528,14 @@ class NativeRenderRegistry {
         earlier && earlier->model.layout==set.model.layout);
       entry->instanced.push_back(std::move(set));
     }
+  }
+  // The constants in effect (constants_) as a shared value: the published
+  // one while equal, null when there are none.
+  NativeRenderConstants ShareConstants(const NativeRenderConstants& previous) {
+    if(constants_.empty()) return nullptr;
+    if(previous && *previous==constants_) return previous;
+    ++stats_.constant_changes;
+    return std::make_shared<const std::vector<NativeRenderObjectConstant>>(constants_);
   }
   // The guest bytes are compared with the previous copy in place; only a
   // changed pose is decoded into a new shared copy.
@@ -525,6 +617,7 @@ class NativeRenderRegistry {
   NativeSharedVector<std::shared_ptr<const NativeRenderEntry>> entries_;  // objects_' values, same order
   NativeRenderEntry scratch_;
   std::vector<NativePoseMatrix> worlds_;  // Instanced world scratch.
+  std::vector<NativeRenderObjectConstant> constants_;  // Constants in effect during one Build.
   Stats stats_;
   mutable std::mutex publish_mutex_;
   std::shared_ptr<const NativeRenderRegistrySnapshot> published_;

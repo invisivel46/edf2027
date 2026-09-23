@@ -332,6 +332,196 @@ void CharacterLodAndAttachments() {
   Require(entry->attachments.empty(),"face and weapon gates");
 }
 
+// The class facts the audit recovered from the slot-4 bodies (addresses in
+// native_render_registry.cpp): per-object constants, vehicle weapon groups
+// and parts.
+void ClassConstantsAndParts() {
+  const auto constants=[](uint32_t vtable,uint32_t handle,uint32_t highlight,uint32_t time) {
+    const auto* type=FindNativeRenderClass(vtable);
+    Require(type && type->lod==NativeRenderLodKind::Character && type->instance==1168 && type->pose==1088,"a character row");
+    Require(type->constants[0].handle==handle && type->constants[0].value==highlight && !type->constants[0].scroll &&
+      type->constants[1].handle==handle+4 && type->constants[1].value==time && !type->constants[1].scroll,
+      "g_Highlight and g_Time follow the slot-4 821A1730 calls");
+    Require(NativeRenderClassHasConstants(*type) && !type->parts.count && !type->weapon_groups[0].group,"constants only");
+  };
+  constants(0x820052C0u,2288,2336,2352);    // clUfoSmall01 820E7FB8
+  constants(0x820053F0u,1648,1696,1712);    // clUfoCarrier01 820EA398
+  constants(0x82005E14u,2384,2432,2448);    // clAlien4LegTank01 820F5630
+  for(const auto vtable:{0x82005EF8u,0x82005F70u,0x82006098u,0x82006128u})
+    constants(vtable,1296,1264,1280);       // 820FC528
+  constants(0x820063C4u,1984,2032,2048);    // clMonster01Mech 820FFFC0
+  constants(0x820065A4u,1248,1296,1312);    // clUfoMother01 82100D00
+  for(const auto vtable:{0x820066CCu,0x820068B0u,0x820068ECu,0x82006A04u,0x82006A74u})
+    constants(vtable,1360,1408,1424);       // 82108BE8
+  const auto* tank=FindNativeRenderClass(0x82005678u);        // clAlienTank01 820ECCC0 / 820F01E8
+  Require(tank && tank->constants[0].handle==5024 && tank->constants[0].value==5072 && tank->constants[1].handle==5028 &&
+    tank->constants[1].value==5088 && tank->parts.base==1920 && tank->parts.count==2 && tank->parts.stride==1488 &&
+    tank->parts.instance==108 && tank->parts.pose==152 && tank->parts.constants[0].handle==1120 &&
+    tank->parts.constants[0].value==1168 && tank->parts.constants[1].handle==1124 && tank->parts.constants[1].value==1184,
+    "clAlienTank01 draws two turrets after its model");
+  for(const auto vtable:{0x82015E94u,0x82015F24u,0x82016434u}) {  // 8219A2D0 -> 82199DD8
+    const auto* vehicle=FindNativeRenderClass(vtable);
+    Require(vehicle && vehicle->weapon_groups[0].group==1824 && vehicle->weapon_groups[0].array==36 &&
+      vehicle->weapon_groups[0].count==44 && !vehicle->weapon_groups[1].group && !NativeRenderClassHasConstants(*vehicle),
+      "C_VehicleBase weapons");
+  }
+  const auto* heli=FindNativeRenderClass(0x8202032Cu);        // 821E2250 -> 821E4E90 twice
+  Require(heli && heli->weapon_groups[0].group==1536 && heli->weapon_groups[1].group==1580 &&
+    heli->weapon_groups[0].array==28 && heli->weapon_groups[0].count==36 && !heli->parts.count,"C_Helicopter weapons");
+  const auto* ctank=FindNativeRenderClass(0x82020674u);       // 821E5810 -> 821E4E90, 821E7C50 twice
+  Require(ctank && ctank->weapon_groups[0].group==2208 && ctank->weapon_groups[0].array==28 && ctank->parts.base==4216 &&
+    ctank->parts.count==2 && ctank->parts.stride==92 && ctank->parts.instance==0 && ctank->parts.pose==72 &&
+    ctank->parts.constants[0].handle==88 && ctank->parts.constants[0].value==60 && ctank->parts.constants[0].scroll &&
+    !ctank->parts.constants[1].handle && NativeRenderClassHasConstants(*ctank),"C_Tank weapons and treads");
+  // Every other row stores nothing and draws nothing extra.
+  size_t with=0;
+  for(const auto& type:NativeRenderClasses()) with+=NativeRenderClassHasConstants(type);
+  Require(with==16,"sixteen classes store per-object constants");
+}
+// A shared effect pool node (the 821A20C0 map): key std::string at +12, value
+// at +40 (data +0, count +8). A key of capacity 16 or more lives out of line.
+uint32_t BuildPoolNode(const Memory& memory,uint32_t node,std::string_view name,uint32_t data,uint32_t count=1) {
+  const auto key=node+12;
+  const bool inline_text=name.size()<16;
+  const auto text=inline_text?key+4:node+0x80;
+  if(!inline_text) memory.StoreWord(key+4,text);
+  for(size_t i=0;i<name.size();++i) memory.StoreByte(text+uint32_t(i),uint8_t(name[i]));
+  memory.StoreWord(key+20,uint32_t(name.size())); memory.StoreWord(key+24,inline_text?15:31);
+  memory.StoreWord(node+40,data); memory.StoreWord(node+48,count);
+  return node+40;
+}
+void StoreVector(const Memory& memory,uint32_t at,std::array<float,4> value) {
+  for(uint32_t i=0;i<4;++i) memory.StoreFloat(at+i*4,value[i]);
+}
+std::array<float,4> VectorOf(const NativeRenderObjectConstant& constant) {
+  std::array<float,4> value{};
+  for(size_t i=0;i<4;++i) {
+    uint32_t word=0; for(size_t b=0;b<4;++b) word=(word<<8)|constant.registers[i*4+b];
+    value[i]=std::bit_cast<float>(word);
+  }
+  return value;
+}
+// 821A1730 before 8210AE48 (clUfoSmall01): both constants published with the
+// entry, re-read every tick, shared while unchanged; a null handle or a zero
+// count stores nothing; an out-of-line pool key reads through its pointer.
+void ObjectConstants() {
+  std::vector<uint8_t> bytes(0x40000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kUfo=0x4000,kPool=0x20000;
+  const auto highlight=BuildPoolNode(memory,kPool,"g_Highlight",0x21000);
+  const auto time=BuildPoolNode(memory,kPool+0x100,"g_TimeWithALongerName",0x21100);
+  Require(ReadNativeRenderPoolName(memory,time)=="g_TimeWithALongerName","an out-of-line pool key");
+  BuildObject(memory,kUfo,0x820052C0u,false);
+  BuildInstance(memory,kUfo+1168); BuildPose(memory,kUfo+1088,0x9000,2,1.0f);
+  memory.StoreWord(kUfo+2288,highlight); memory.StoreWord(kUfo+2292,time);
+  StoreVector(memory,kUfo+2336,{1,.5f,.25f,0}); StoreVector(memory,kUfo+2352,{3,0,0,1});
+  registry.Born(kUfo);
+  auto first=EntryOf(*registry.Tick(memory,kScene,1,decode),kUfo);
+  Require(first && first->constants && first->constants->size()==2 && (*first->constants)[0].name=="g_Highlight" &&
+    VectorOf((*first->constants)[0])==std::array<float,4>{1,.5f,.25f,0} && (*first->constants)[1].name=="g_TimeWithALongerName" &&
+    VectorOf((*first->constants)[1])==std::array<float,4>{3,0,0,1},"both constants in slot-4 order");
+  // Unsubscribed and no refresh budget, yet re-read every tick.
+  auto same=EntryOf(*registry.Tick(memory,kScene,2,decode),kUfo);
+  Require(same==first,"unchanged constants keep the entry");
+  StoreVector(memory,kUfo+2352,{4,0,0,1});
+  auto moved=EntryOf(*registry.Tick(memory,kScene,3,decode),kUfo);
+  Require(moved!=first && moved->constants!=first->constants && VectorOf((*moved->constants)[1])[0]==4.0f &&
+    moved->pose==first->pose && registry.stats().constant_changes==2,"a moved g_Time republishes the constants, not the pose");
+  memory.StoreWord(kPool+0x100+48,0);                          // 821A16D8: min(1, count 0) stores nothing.
+  memory.StoreWord(kUfo+2288,0);                               // A null handle stores nothing.
+  auto none=EntryOf(*registry.Tick(memory,kScene,4,decode),kUfo);
+  Require(none && !none->constants && none->models.size()==1,"no stored constant, no constants");
+}
+// clAlienTank01: its constants, the model, then per turret (820F01E8) its
+// own constants and model; the pool keeps the last store, so each turret's
+// set is the entry's with its own values over them.
+void AlienTankTurrets() {
+  std::vector<uint8_t> bytes(0x40000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kTank=0x4000,kPool=0x20000;
+  const auto highlight=BuildPoolNode(memory,kPool,"g_Highlight",0x21000);
+  const auto time=BuildPoolNode(memory,kPool+0x100,"g_Time",0x21100);
+  BuildObject(memory,kTank,0x82005678u,true);
+  BuildInstance(memory,kTank+1168); BuildPose(memory,kTank+1088,0x9000,2,1.0f);
+  memory.StoreWord(kTank+5024,highlight); memory.StoreWord(kTank+5028,time);
+  StoreVector(memory,kTank+5072,{1,0,0,0}); StoreVector(memory,kTank+5088,{10,0,0,1});
+  for(uint32_t i=0;i<2;++i) {
+    const auto part=kTank+1920+i*1488;
+    BuildInstance(memory,part+108); BuildPose(memory,part+152,0x9400+i*0x100,1,float(20+i));
+    memory.StoreWord(part+1120,highlight); memory.StoreWord(part+1124,i?0:time);  // Turret 1 stores no g_Time.
+    StoreVector(memory,part+1168,{float(2+i),0,0,0}); StoreVector(memory,part+1184,{float(30+i),0,0,1});
+  }
+  registry.Born(kTank);
+  const auto entry=EntryOf(*registry.Tick(memory,kScene,1,decode),kTank);
+  Require(entry && entry->attachments.size()==2 && entry->attachments[0].model.instance==kTank+1920+108 &&
+    entry->attachments[0].pose_vector==kTank+1920+152 && entry->attachments[1].model.instance==kTank+1920+1488+108 &&
+    (*entry->attachments[1].pose)[0][0]==21.0f,"two turrets after the model");
+  Require(VectorOf((*entry->constants)[0])[0]==1.0f && VectorOf((*entry->constants)[1])[0]==10.0f,"the body's constants");
+  const auto& first=*entry->attachments[0].constants,&second=*entry->attachments[1].constants;
+  Require(first.size()==2 && VectorOf(first[0])[0]==2.0f && VectorOf(first[1])[0]==30.0f,"turret 0 stores both");
+  Require(second.size()==2 && second[0].name=="g_Highlight" && VectorOf(second[0])[0]==3.0f && second[1].name=="g_Time" &&
+    VectorOf(second[1])[0]==30.0f,"turret 1 keeps turret 0's g_Time (the pool is sticky)");
+}
+// Vehicle weapon groups (820E1A80 on element+64, 1504 apart, no w+1405
+// test) and the C_Tank treads' g_Scroll (-x, 0, 0, 1).
+void VehicleWeaponsAndTreads() {
+  std::vector<uint8_t> bytes(0x40000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kTank=0x4000,kHeli=0x8000,kBike=0xC000,kPool=0x20000,kWeapons=0x28000;
+  const auto scroll=BuildPoolNode(memory,kPool,"g_Scroll",0x21000);
+  uint32_t next=kWeapons;
+  const auto weapons=[&](uint32_t owner,uint32_t group,uint32_t array,uint32_t count_at,uint32_t count) {
+    const auto first=next; next+=count*kNativeRenderVehicleWeaponStride;
+    memory.StoreWord(owner+group+array,first); memory.StoreWord(owner+group+count_at,count);
+    for(uint32_t i=0;i<count;++i) {
+      const auto w=first+i*kNativeRenderVehicleWeaponStride+kNativeRenderVehicleWeaponOffset;
+      memory.StoreByte(w+1404,1); memory.StoreByte(w+1405,0); memory.StoreWord(w+108,0x1234);
+      BuildInstance(memory,w+100); BuildPose(memory,w+144,0x30000+(w-kWeapons)/4,1,float(i));
+    }
+    return first;
+  };
+  const auto character=[&](uint32_t object,uint32_t vtable) {
+    BuildObject(memory,object,vtable,true); BuildInstance(memory,object+1168); BuildPose(memory,object+1088,object+0x1800,2,1.0f);
+  };
+  character(kTank,0x82020674u);
+  const auto tank_weapons=weapons(kTank,2208,28,36,1);
+  for(uint32_t i=0;i<2;++i) {
+    const auto tread=kTank+4216+i*92;
+    BuildInstance(memory,tread); BuildPose(memory,tread+72,kTank+0x1A00+i*0x40,1,float(40+i));
+    memory.StoreWord(tread+88,scroll); memory.StoreFloat(tread+60,float(i)+.5f);
+  }
+  character(kHeli,0x8202032Cu);
+  const auto rotor=weapons(kHeli,1536,28,36,2),gun=weapons(kHeli,1580,28,36,1);
+  memory.StoreWord(rotor+kNativeRenderVehicleWeaponStride+64+412,2);  // Mode 2 with w+804 zero: not drawn.
+  character(kBike,0x82015F24u);
+  const auto bike=weapons(kBike,1824,36,44,2);
+  memory.StoreByte(bike+64+1404,0);                                      // Not drawn.
+  registry.Born(kTank); registry.Born(kHeli); registry.Born(kBike);
+  const auto snapshot=registry.Tick(memory,kScene,1,decode);
+  const auto tank=EntryOf(*snapshot,kTank),heli=EntryOf(*snapshot,kHeli),bike_entry=EntryOf(*snapshot,kBike);
+  Require(tank && tank->attachments.size()==3 && tank->attachments[0].model.instance==tank_weapons+64+100 &&
+    tank->attachments[0].pose_vector==tank_weapons+64+144 && !tank->attachments[0].constants && !tank->constants,
+    "C_Tank: the weapon draws before the treads, with no constant stored yet");
+  for(uint32_t i=0;i<2;++i) {
+    const auto& tread=tank->attachments[1+i];
+    Require(tread.model.instance==kTank+4216+i*92 && tread.pose_vector==kTank+4216+i*92+72 && tread.model.layout &&
+      tread.constants && tread.constants->size()==1 && (*tread.constants)[0].name=="g_Scroll" &&
+      VectorOf((*tread.constants)[0])==std::array<float,4>{-(float(i)+.5f),0,0,1},"a tread draws with (-x,0,0,1)");
+  }
+  Require(heli && heli->attachments.size()==2 && heli->attachments[0].model.instance==rotor+64+100 &&
+    heli->attachments[1].model.instance==gun+64+100,"C_Helicopter: both groups in order, without w+1405");
+  Require(bike_entry && bike_entry->attachments.size()==1 &&
+    bike_entry->attachments[0].model.instance==bike+kNativeRenderVehicleWeaponStride+64+100,"C_Bike: +1824 elements, w+1404 gate");
+  // A later tread value is re-read without a subscription change.
+  memory.StoreFloat(kTank+4216+60,7.0f);
+  const auto moved=EntryOf(*registry.Tick(memory,kScene,2,decode),kTank);
+  Require(VectorOf((*moved->attachments[1].constants)[0])[0]==-7.0f && moved->attachments[2].constants==tank->attachments[2].constants,
+    "only the moved tread's constants are new");
+}
+
 void AuditCountsMismatches() {
   std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
   constexpr uint32_t kEarly=0x2000,kUnseen=0x3000,kPhantom=0x4000;
@@ -882,6 +1072,10 @@ int main() {
     RenderOnlyTicks();
     LayoutCaptureWaitsForSizedPose();
     CharacterLodAndAttachments();
+    ClassConstantsAndParts();
+    ObjectConstants();
+    AlienTankTurrets();
+    VehicleWeaponsAndTreads();
     AuditCountsMismatches();
     GuestTrigMatchesTheRecompiledBodies();
     MotherSphereWorldsMatchTheGuest();
