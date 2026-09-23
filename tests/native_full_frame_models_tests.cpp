@@ -1,6 +1,9 @@
 #include "native_graphics/native_full_frame_models.h"
+#include "native_graphics/d3d11_backend.h"
+#include "native_graphics/d3d12_backend.h"
 #include <array>
 #include <bit>
+#include <cstring>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -458,6 +461,204 @@ void BrokenObjects() {
     !NativeFullFrameModelDispatched(ClassifyNativeFullFrameModel(*bucket_zero,camera.visibility),*bucket_zero,camera),
     "a filed object's slot 4 runs only from a traversed bucket");
 }
+// A skinned program: a column_major float4x3 palette (3 registers per bone, 4
+// components) sharing $Globals with the world and camera matrices the capture
+// zeroes, a float3 array (padded registers), a pixel local and a texture.
+struct SkinnedFixture {
+  using Constant=NativeSceneMaterialInputs::Constant;
+  std::shared_ptr<NativeRenderBackend> backend;
+  std::shared_ptr<NativeSceneMaterialProgram> program=std::make_shared<NativeSceneMaterialProgram>();
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+  std::vector<Constant> constants;
+  explicit SkinnedFixture(std::shared_ptr<NativeRenderBackend> with):backend(std::move(with)) {
+    Effect effect;
+    effect.source=R"(
+      float4x3 g_mWorldArray[8];
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float3 g_vLights[4];
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0) {
+        V o; int bone=int(abs(position.z*7))%8;
+        float3 skinned=mul(float4(position,1),g_mWorldArray[bone]);
+        o.position=mul(mul(float4(skinned,1),g_mWorld),g_mViewProjection);
+        o.color=float4(g_vLights[bone%4],1); return o;
+      }
+      float4 tint;
+      Texture2D image; SamplerState imageSampler;
+      float4 PS(V v):SV_Target { return v.color*tint*image.Sample(imageSampler,float2(.5,.5)); }
+    )";
+    program->backend=backend;
+    program->vertex=program->reversed_vertex=CompileNativeShader(nullptr,effect,{false,"VS","vs_3_0"},"palette-test.fx");
+    program->pixel=CompileNativeShader(nullptr,effect,{true,"PS","ps_3_0"},"palette-test.fx");
+    std::vector<uint8_t> declaration(12),vertices(48),indices{0,0,0,1,0,2,0,0,0,2,0,3};
+    Word(declaration,4,0x2a23b9);
+    const float points[]{-.125f,-.25f,.5f, -.125f,.25f,.5f, .125f,.25f,.5f, .125f,-.25f,.5f};
+    for(size_t i=0;i<12;++i) Word(vertices,i*4,std::bit_cast<uint32_t>(points[i]));
+    NativeIndexedMesh mesh(*backend,program->vertex,declaration,12,vertices,indices,2);
+    geometry=std::make_shared<const NativeIndexedMesh::RetainedDraw>(mesh.RetainDraw(backend,0,6));
+    NativeBackendTextureDesc texture; texture.width=texture.height=1; texture.format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    const uint8_t white[]{255,255,255,255};
+    program->inputs.textures.push_back({"image"}); program->inputs.textures.push_back({"imageSampler"});
+    program->textures={backend->CreateTexture(texture,white),{}};
+    // The published palette is whatever the last object left (never read).
+    constants.push_back({false,"g_mWorldArray",std::vector<uint8_t>(32*16,0xcd),true});
+    constants.push_back({false,"g_mWorld",Floats({1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}),true});
+    constants.push_back({false,"g_mViewProjection",Floats({2,0,0,0, 0,2,0,0, 0,0,1,0, 0,0,0,1}),true});
+    std::vector<uint8_t> lights(4*16);
+    for(size_t i=0;i<16;++i) Word(lights,i*4,std::bit_cast<uint32_t>(float(i)+.5f));
+    constants.push_back({false,"g_vLights",lights,true});
+    constants.push_back({true,"tint",Floats({1,.5f,.25f,1}),false});
+  }
+  static void Word(std::vector<uint8_t>& bytes,size_t offset,uint32_t word) {
+    for(size_t i=0;i<4;++i) bytes[offset+i]=uint8_t(word>>(24-i*8));
+  }
+  static std::vector<uint8_t> Floats(std::initializer_list<float> values) {
+    std::vector<uint8_t> bytes(values.size()*4);
+    size_t i=0; for(const auto value:values) Word(bytes,4*i++,std::bit_cast<uint32_t>(value));
+    return bytes;
+  }
+  NativeFullFrameModelPass Pass() const {
+    NativeFullFrameModelPass pass;
+    pass.targets.rtv_format[0]=DXGI_FORMAT_R8G8B8A8_UNORM; pass.targets.dsv_format=DXGI_FORMAT_D32_FLOAT;
+    return pass;
+  }
+  // The per-draw capture the palette capture replaces: every constant bound by
+  // name into fresh bindings with the palette bound, then CaptureNativeSceneMaterial.
+  NativeSceneMaterialCapture Full(NativeBackendPipeline& pipeline,std::vector<Constant> bound,std::span<const float> palette,
+      std::span<NativeBackendSampler* const> samplers,std::optional<std::array<float,4>> blend) const {
+    Require(BindNativeFullFrameModelPalette(bound,palette),"the palette fits");
+    return program->Capture(pipeline,false,bound,samplers,blend,true);
+  }
+};
+bool SameCapture(const NativeSceneMaterialCapture& a,const NativeSceneMaterialCapture& b) {
+  return a.material && b.material && a.material!=b.material && a.material->Equivalent(*b.material) &&
+    a.material->fingerprint()==b.material->fingerprint() && !std::memcmp(a.world.data(),b.world.data(),sizeof(a.world)) &&
+    NativeSceneCameraIdentical(a.camera,b.camera);
+}
+std::vector<float> Palette(uint32_t bones,float seed) {
+  std::vector<float> palette(size_t(bones)*kNativeBonePaletteFloats);
+  for(size_t i=0;i<palette.size();++i) palette[i]=seed+float(i)*.25f;
+  return palette;
+}
+// NativeScenePaletteCapture::With is Capture of the same constants with the
+// palette bound, byte for byte, in any order of palettes; it never shares.
+void PaletteCapture(std::shared_ptr<NativeRenderBackend> backend) {
+  SkinnedFixture fixture(backend);
+  const auto& program=*fixture.program;
+  NativeBackendPipelineDesc desc;
+  desc.vertex_id=0x500; desc.pixel_id=0x501;
+  desc.input_layout=fixture.geometry->input_layout().elements(); desc.input_layout_id=fixture.geometry->input_layout().fingerprint();
+  desc.render_targets=1; desc.rtv_format=fixture.Pass().targets.rtv_format; desc.dsv_format=DXGI_FORMAT_D32_FLOAT;
+  NativeMaterialRenderPass render; render.words={0x10001,0,0,0,15,0}; render.color_targets[0]=1;
+  const auto resolved=program.Resolve(desc,false,fixture.constants,render,{},-1,true);
+  auto& pipeline=*resolved.capture.material->pipeline();
+  const auto blend=resolved.capture.material->blend_factor();
+  NativeBackendSampler* sampler=resolved.capture.material->samplers().at(0).second;
+  const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
+  NativeScenePaletteCapture palette(program,pipeline,false,fixture.constants,samplers,blend);
+  Require(palette.capture().material->Equivalent(*resolved.capture.material),"the row capture is Resolve's capture");
+  std::vector<SkinnedFixture::Constant> replaced;
+  for(const auto& constant:fixture.constants) if(constant.name=="g_mWorldArray") replaced.push_back(constant);
+  NativeSceneMaterialCapture previous;
+  for(const auto& [bones,seed]:{std::pair{3u,1.f},std::pair{8u,-7.f},std::pair{1u,40.f},std::pair{3u,1.f},std::pair{0u,0.f}}) {
+    const auto values=Palette(bones,seed);
+    Require(BindNativeFullFrameModelPalette(replaced[0],values),"the palette binds");
+    const auto derived=palette.With(replaced);
+    const auto full=fixture.Full(pipeline,fixture.constants,values,samplers,blend);
+    Require(SameCapture(derived,full),"a derived palette material is the full capture's, byte for byte");
+    Require(derived.material!=palette.capture().material,"every draw has its own material");
+    if(previous.material && bones)
+      Require(!previous.material->Equivalent(*derived.material),"the palette reaches the image");
+    previous=derived;
+  }
+  // A padded (float3) array and the pixel local rebind the same way.
+  auto lights=fixture.constants[3]; lights.registers[5]=0x42;
+  auto tint=fixture.constants[4]; tint.registers[0]=0x3e;
+  const std::vector<SkinnedFixture::Constant> all{replaced[0],lights,tint};
+  auto bound=fixture.constants; bound[0]=replaced[0]; bound[3]=lights; bound[4]=tint;
+  Require(SameCapture(palette.With(all),program.Capture(pipeline,false,bound,samplers,blend,true)),
+    "any non-matrix constant is rebound as Capture binds it");
+  // Recorded matrices are world or camera, not image bytes: refused.
+  auto world=fixture.constants[1]; world.registers[0]^=0x40;
+  bool refused=false;
+  try { palette.With(std::span(&world,1)); } catch(const std::exception&) { refused=true; }
+  Require(refused,"a captured matrix is not rebindable");
+  auto shortened=replaced[0]; shortened.registers.resize(16);
+  refused=false;
+  try { palette.With(std::span(&shortened,1)); } catch(const std::exception&) { refused=true; }
+  Require(refused,"a palette smaller than the shader array is refused as Capture refuses it");
+}
+// Build's skinned draws against full captures over frames: a miss resolves
+// the row once, later frames reuse it with new palettes and a moved camera,
+// and a moved published constant recaptures it; every draw's material, world
+// and camera are the full capture's.
+void SkinnedBuild(std::shared_ptr<NativeRenderBackend> backend) {
+  SkinnedFixture fixture(backend);
+  // Record 0 palette-skinned, record 1 uploads bone 1 (a g_mWorld of its own).
+  const auto layout=Layout(0x1000,true,3,{Mesh(0,true,false,{Batch(0x2000,{0x3000})}),Mesh(1,false,true,{Batch(0x2100,{0x3000})})});
+  NativeRenderRegistrySnapshot snapshot;
+  std::vector<std::shared_ptr<NativeRenderEntry>> entries;
+  for(uint32_t i=0;i<3;++i) { entries.push_back(Entry(i+1,{float(i),0,100},1,layout)); snapshot.entries.push_back(entries.back()); }
+  auto camera=MakeCamera();
+  const auto vp=[&](float scale) {
+    for(size_t i=0;i<16;++i) camera.pass.view_projection[i]=std::bit_cast<uint32_t>(i%5?0.f:scale);
+  };
+  vp(1.5f);
+  const auto pass=fixture.Pass();
+  uint64_t generation=1;
+  auto published=std::make_shared<NativeSceneGroupMaterial>();
+  published->program=fixture.program; published->constants=fixture.constants;
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t) { return std::shared_ptr<const NativeSceneGroupMaterial>(published); };
+  sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { return fixture.geometry; };
+  sources.generation=[&] { return generation; };
+  NativeFullFrameModels models;
+  const auto check=[&](const char* frame_name,uint64_t resolves,uint64_t captures,uint64_t hits) {
+    const auto frame=models.Build(snapshot,camera,pass,sources);
+    const auto& stats=frame.stats;
+    Require(stats.drawn==3 && stats.draws==6 && stats.palettes==6 && stats.palette==0 && stats.failed==0,frame_name);
+    Require(stats.resolves==resolves && stats.captures==captures && stats.cache_hits==hits,frame_name);
+    auto constants=published->constants;
+    for(auto& constant:constants) camera.pass.Apply(constant);
+    std::vector<std::pair<const NativeSceneInstance*,const NativeSceneView*>> drawn;
+    for(const auto& batch:frame.batches) for(const auto& object:batch.snapshot.instances) drawn.emplace_back(object.get(),&batch.view);
+    const auto refs=OrderNativeFullFrameModelDraws(frame.plan.opaque,true);
+    Require(drawn.size()==refs.size(),"every draw is drawn in order");
+    std::vector<const NativeSceneMaterial*> materials;
+    for(size_t d=0;d<refs.size();++d) {
+      const auto& item=frame.plan.opaque[refs[d].item];
+      const auto values=NativeFullFrameModelConstantsFor(*layout,*item.entry->pose,pass.palette_limit);
+      const auto& material=*drawn[d].first->object.material;
+      NativeBackendSampler* sampler=material.samplers().at(0).second;
+      const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
+      auto full=fixture.Full(*material.pipeline(),constants,values.palette,samplers,material.blend_factor());
+      if(NativeSceneCaptureBindsWorld(full)) ApplyNativeScenePublishedWorld(full,values.worlds[refs[d].draw.mesh]);
+      NativeSceneMaterialCapture built{drawn[d].first->object.material,drawn[d].first->object.world,*drawn[d].second};
+      Require(SameCapture(built,full),"a skinned draw's material, world and camera are the full capture's");
+      materials.push_back(&material);
+    }
+    std::sort(materials.begin(),materials.end());
+    Require(std::unique(materials.begin(),materials.end())==materials.end(),"skinned draws never share a material");
+  };
+  const auto pose=[&](float seed) {
+    for(size_t e=0;e<entries.size();++e) {
+      auto moved=std::make_shared<std::vector<NativePoseMatrix>>(3);
+      for(size_t b=0;b<3;++b) for(size_t i=0;i<16;++i) (*moved)[b][i]=seed+float(e*100+b*16+i)*.125f;
+      entries[e]->pose=moved;
+    }
+  };
+  pose(1);
+  check("the first frame resolves the row",1,0,0);
+  pose(2);
+  check("new palettes reuse the row",0,0,1);
+  pose(3); vp(3.f);
+  check("a moved camera is derived",0,0,1);
+  auto republished=std::make_shared<NativeSceneGroupMaterial>(*published);
+  republished->constants[3].registers[7]^=0x10;
+  published=republished; ++generation;
+  check("a moved published constant recaptures the row",0,1,0);
+}
 }
 // clSky's registry row says another pass draws it (the sky pass): an entry of
 // such a class is never planned, even visible, posed and in either route.
@@ -476,6 +677,13 @@ int main() {
   try {
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
     SourceTable(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
+    // The skinned material path against full captures, on both backends (WARP).
+    for(int backend=0;backend<2;++backend) {
+      NativeD3D12Options options; options.prefer_warp=true;
+      const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
+        std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
+      PaletteCapture(device); SkinnedBuild(device);
+    }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
     return 1;

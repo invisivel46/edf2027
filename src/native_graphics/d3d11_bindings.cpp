@@ -182,6 +182,11 @@ ShaderBindings::FloatRegisterBinding ShaderBindings::ResolveFloatRegisters(const
   result.variable_=variable; result.slots_=slots; result.components_=components;
   return result;
 }
+ShaderBindings::FloatRegisterRange ShaderBindings::Range(const FloatRegisterBinding& binding) const {
+  if(!Owns(binding)) throw std::runtime_error("foreign native constant range binding");
+  if(!binding.slots_) return {};
+  return {buffers_.at(binding.variable_.buffer).slot,binding.variable_.offset,binding.variable_.size};
+}
 bool ShaderBindings::SetGuestFloatRegisters(const FloatRegisterBinding& binding,std::span<const uint8_t> registers) {
   if(!Owns(binding)) throw std::runtime_error("foreign native constant binding");
   if(!binding.slots_) return false;

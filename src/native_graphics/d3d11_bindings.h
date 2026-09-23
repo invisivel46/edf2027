@@ -29,6 +29,12 @@ class ShaderBindings {
     size_t slots_=0,components_=0;
   };
   FloatRegisterBinding ResolveFloatRegisters(const std::string& name) const;
+  // Where SetGuestFloatRegisters(binding) writes: its buffer's slot and the
+  // variable's byte range in that buffer's image. Nothing outside the range
+  // moves (a short last element's padding stops at the variable's size).
+  // Empty (size 0) for a name the compiler optimized out.
+  struct FloatRegisterRange { UINT slot=0,offset=0,size=0; };
+  FloatRegisterRange Range(const FloatRegisterBinding& binding) const;
   class ResourceBinding {
    public:
     bool used() const { return texture_.has_value() || sampler_.has_value(); }

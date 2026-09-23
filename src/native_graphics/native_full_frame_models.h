@@ -165,6 +165,8 @@ NativeFullFrameModelConstants NativeFullFrameModelInstancedConstants(const Nativ
 // zeroed registers of the same extent (the shader's reflected capacity).
 // False when one is not a vertex global or cannot hold the palette.
 bool BindNativeFullFrameModelPalette(std::vector<NativeSceneMaterialInputs::Constant>& constants,std::span<const float> palette);
+// The same for one g_mWorldArray constant (whatever its name).
+bool BindNativeFullFrameModelPalette(NativeSceneMaterialInputs::Constant& constant,std::span<const float> palette);
 
 // One draw of one item: record, batch and pass of the item's layout;
 // index is its position in NativeModelDrawPlan, pass_index its position in the
@@ -234,13 +236,15 @@ enum class NativeFullFrameModelPhase : uint8_t { Visibility, Programs, Resolve, 
 // The pipeline half of one resolve, which no constant reaches: the pipeline,
 // the sampler objects in program texture order, the blend factor and whether
 // the resolved state enables scissor. capture is the rigid draw's interned
-// capture (skinned draws capture per draw).
+// capture; palette is a skinned row's capture of its pass constants, from
+// which each draw derives its own with its palette bound (With).
 struct NativeFullFrameModelResolve {
   NativeBackendPipeline* pipeline=nullptr;
   std::vector<NativeBackendSampler*> samplers;
   std::optional<std::array<float,4>> blend_factor;
   bool scissor=false;
   NativeSceneMaterialCapture capture;
+  std::shared_ptr<NativeScenePaletteCapture> palette;
 };
 using NativeFullFrameModelSourcePair=std::pair<std::shared_ptr<const NativeSceneGroupMaterial>,
   std::shared_ptr<const NativeIndexedMesh::RetainedDraw>>;
@@ -260,11 +264,13 @@ struct NativeFullFrameModelBatch {
 struct NativeFullFrameModelFrame {
   struct Stats {
     // resolves: full program.Resolve calls (cache misses); captures: captures
-    // against a cached pipeline half (skinned draws, rigid constant changes);
-    // cache_hits: draws whose cached row served; source_hits/fetches: the
+    // against a cached pipeline half (rigid constant changes, a skinned row's
+    // pass constants moving); cache_hits: rigid draws and skinned rows whose
+    // cached row served; palettes: skinned draws derived from their row's
+    // capture (NativeScenePaletteCapture::With); source_hits/fetches: the
     // program and geometry side table.
     uint64_t items=0,drawn=0,draws=0,resolves=0,memo_hits=0,missing_program=0,missing_geometry=0,
-      scissor=0,palette=0,failed=0,cache_hits=0,captures=0,source_hits=0,source_fetches=0;
+      scissor=0,palette=0,failed=0,cache_hits=0,captures=0,palettes=0,source_hits=0,source_fetches=0;
   };
   NativeFullFrameModelPlan plan;
   std::vector<NativeFullFrameModelBatch> batches;  // Opaque, then transparent.
@@ -277,8 +283,11 @@ struct NativeFullFrameModelFrame {
 // memoized within a frame, so identical entries share one material object
 // and instance with their own worlds; per frame only the camera (derived from
 // the pass constants) and each instance's world change. Skinned materials
-// carry their palette: each draw captures against its row's cached pipeline
-// half and never shares. Not synchronized.
+// carry their palette, so they never share: a skinned row keeps, with the
+// same constants rule, one capture of its pass constants (any palette), and
+// each draw derives its material from it with only its palette's registers
+// rebound (NativeScenePaletteCapture), which is what a full capture of the
+// palette-bound constants makes. Not synchronized.
 class NativeFullFrameModels {
  public:
   // Everything is resolved before anything is recorded. An entry any of whose

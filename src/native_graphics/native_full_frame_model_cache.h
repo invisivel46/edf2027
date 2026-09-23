@@ -90,8 +90,8 @@ struct NativeFullFrameModelMaterialKey {
 // cache does for its camera constants). The rigid world is not a constant
 // here: the program provider never refreshes g_mWorld, and each instance
 // carries its own world (instanced like the static pass). Skinned rows keep
-// no constants: the palette changes every frame, so their draws capture per
-// draw against the row's pipeline half. Not synchronized.
+// the same: their pass constants before any palette is bound, and the capture
+// of those each draw derives its palette-bound material from. Not synchronized.
 template<class Material>
 class NativeFullFrameModelMaterialCache {
  public:
