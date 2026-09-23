@@ -1,7 +1,11 @@
 """Runtime acceptance gate for the native renderer.
 
 Compares a candidate game.log against a baseline game.log from the same input
-script. Passes only when the candidate's game FPS in the measured window is
+script. A guest-renderer baseline must be run with --edf_native_renderer=off:
+since 361f80b the executable's default is native, the full-frame renderer
+(tools/run-renderer-ab.ps1 and start-native-binding-validation.ps1 pass it,
+-BaselineRenderer / -Renderer off by default). Each log's
+"Native renderer: preset=..." line says which one it ran. Passes only when the candidate's game FPS in the measured window is
 not worse than the baseline and, when --min-native-groups is set, enough
 nonempty static groups executed with zero compatibility calls.
 

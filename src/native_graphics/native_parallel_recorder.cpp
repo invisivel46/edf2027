@@ -263,10 +263,14 @@ struct NativeParallelRecorder::Impl {
   // blended in the same order. Only a pipeline marked transient_batchable is
   // eligible - one reading slot 0 alone, per vertex, and nothing that numbers
   // vertices or primitives, which a merged draw would number differently.
+  // Never across a GPU timestamp marker taken after the previous draw: the
+  // appended vertices would be drawn before the marker, inside the span
+  // before it rather than the one after.
   bool TryAppendTransient(bool indexed,uint32_t count,uint32_t instances,uint32_t first,
                           uint32_t first_instance,const Bindings* bindings) {
     if(!transient_batching || indexed || instances!=1 || first || first_instance ||
-       packets.empty() || !queries.empty() || state.world.active) return false;
+       packets.empty() || !queries.empty() || state.world.active ||
+       (!markers.empty() && markers.back().before==packets.size())) return false;
     const auto* pipeline=bindings->pipeline;
     if(!pipeline->transient_batchable || !bindings->topology) return false;
     uint32_t primitive=0;

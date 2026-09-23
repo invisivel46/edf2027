@@ -908,6 +908,15 @@ class GuestReader {
     InterlockedExchange(reinterpret_cast<volatile LONG*>(const_cast<uint8_t*>(data)),
                         static_cast<LONG>(std::byteswap(value)));
   }
+  // Atomically replaces the big-endian word at `address` with `desired` when
+  // it holds `expected`; true when it did. The guest word is byte-swapped, as
+  // StoreWord's interlocked exchange stores it.
+  bool CompareExchangeWord(uint32_t address,uint32_t expected,uint32_t desired) const {
+    const auto* data=WritableBytes(address,4,4);
+    const auto want=static_cast<LONG>(std::byteswap(expected));
+    return InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(const_cast<uint8_t*>(data)),
+                                      static_cast<LONG>(std::byteswap(desired)),want)==want;
+  }
   void StoreByte(uint32_t address,uint8_t value) const {
     const auto aligned=address&~3u;
     auto* data=const_cast<uint8_t*>(WritableBytes(aligned,4,4));
@@ -6903,8 +6912,9 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
     shared_->effect_filings=order-first;
     for(const auto slot:collection.unsupported_slots)
       if(unsupported_.insert(slot).second) {
-        const auto* name=NativeEffectSlotName(slot);
-        REXLOG_INFO("Native full frame effects: unsupported class {} (slot 4 {:#x}, not drawn)",name?name:"unknown",slot);
+        const auto* known=FindNativeEffectUnbuiltSlot(slot);
+        REXLOG_INFO("Native full frame effects: unsupported class {} (slot 4 {:#x}, {})",known?known->name:"unknown",slot,
+          known && known->model?"no effect builder; drawn by the models pass":"not drawn");
       }
     uint64_t drawn=0;
     if(!collection.immediate.empty()) {
@@ -7936,6 +7946,21 @@ REX_HOOK_RAW(sub_821A5080) {
 // store. Every other render, and every call outside a render helper, runs the
 // original alone. The full frame's effects pass does the same through
 // CollectNativeEffects(commit) and never calls this slot.
+// The helper runs on its own thread beside the step (821A6508: kick
+// 821D58E8, step dispatch 821A4BA0, join 821D5800), so slot 3 (8217C3A8)
+// can run while this draw does. That is safe:
+// - The object stays allocated until after the join. Slot 3 at +612 <= 0
+//   only marks it (821C0ED8: byte +36, halfword +212) and queues it
+//   (821A6AA8); the queue is freed by 821A5A10 (slot 1 8217CE60, the
+//   destructor), whose only callers run it after the join: 821A6508 at
+//   821A663C after 821D5800 at 821A65F8, and 821A6158 after its own
+//   821D5800. A new object at the same address is therefore constructed
+//   after the join too.
+// - Nothing else writes +612 while the helper runs: its only writers are
+//   the constructor 8217C840 and this slot (every other stw to +612 in the
+//   image is in another class's code); slot 3 only reads it.
+// Even so the put-back is a compare-and-swap from the draw's value
+// (NativeRenderStepOncePerTick), so a concurrent write would be kept.
 // The HUD phase loop (owner+140..+144 x listener +16) runs every render, and
 // all its phases are draws: the XUI clock (clXuiManager slot4 82173CD8, Sato
 // phase 1) and timers (slot5 82173A58 -> 823F79F8, phase 3) already advance by
@@ -7943,8 +7968,10 @@ REX_HOOK_RAW(sub_821A5080) {
 // Two draws advance a counter by a fixed step per call instead; on an unlocked
 // render that dispatched no step (native_render_tick_frame false) the fields
 // are put back, so they step once per tick as at the retail 60 Hz. Each is put
-// back only when the call made exactly that one step, so any other writer
-// (the tick-side arming or reset) is never undone.
+// back only when the call made exactly that one step, and atomically (a
+// compare-and-swap from the value the draw stored), so any other writer (the
+// tick-side arming or reset, which may run on the simulation thread during
+// the render) is never undone.
 // clGaugeRader::slot3 (Noguchi phase 0): while +296 != 0 and byte
 // [8257C030]+2260 is clear, 821768A0..B0 store +296 - 1 (the damage shake's
 // frames left, armed with 30 by slot2 82175FFC) and +300 * [r31+28] (the
@@ -14231,8 +14258,9 @@ REX_HOOK_RAW(sub_821FD8F8) {
               (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),pair.pixel,
               lines?edf::native::NativeBackendTopology::LineList
                    :edf::native::NativeBackendTopology::TriangleList});
-            if(REXCVAR_GET(edf_native_transient_batching))
-              mesh.DrawTransientExpanded(recorder,vertices,0,uint32_t(indices.size()/2),
+            // state.recorded.pipeline: the pipeline RecordDrawSetup just bound.
+            if(REXCVAR_GET(edf_native_transient_batching) && state.recorded.pipeline)
+              mesh.DrawTransientExpanded(recorder,*state.recorded.pipeline,vertices,0,uint32_t(indices.size()/2),
                 lines?edf::native::NativeBackendTopology::LineList:edf::native::NativeBackendTopology::TriangleList);
             else if(lines) mesh.DrawLinesTransient(recorder,vertices,0,uint32_t(indices.size()/2));
             else mesh.DrawTransient(recorder,vertices,0,uint32_t(indices.size()/2));
@@ -14828,7 +14856,12 @@ void ResolveNativeRendererPreset() {
   const auto& name=REXCVAR_GET(edf_native_renderer);
   const auto preset=ParseNativeRendererPreset(name);
   if(!preset) throw std::runtime_error("edf_native_renderer must be off, world, full or native, not '"+std::string(name)+"'");
-  native_renderer_preset_mask.store(NativeRendererPresetMask(*preset),std::memory_order_relaxed);
+  const auto& scene_backend=REXCVAR_GET(edf_native_scene_backend);
+  const auto resolved=ResolveNativeRendererPresetForBackend(*preset,scene_backend);
+  if(resolved.backend_fallback)
+    REXLOG_WARN("Native renderer: preset {} needs the d3d12 scene backend (the full frame has never run on '{}'); using preset off, the guest renderer",
+      std::string(name),std::string(scene_backend));
+  native_renderer_preset_mask.store(NativeRendererPresetMask(resolved.preset),std::memory_order_relaxed);
   // Effective values, in NativeRendererFlag order.
   const bool effective[kNativeRendererFlagCount]{
     EDF_NATIVE_FLAG(host),EDF_NATIVE_FLAG(shader_bridge),EDF_NATIVE_FLAG(seam_draws),
@@ -14846,7 +14879,8 @@ void ResolveNativeRendererPreset() {
     if(!list.empty()) list+=',';
     list+=kNativeRendererFlagNames[i];
   }
-  REXLOG_INFO("Native renderer: preset={} on=[{}] off=[{}]",name.empty()?std::string("off"):std::string(name),on,off);
+  REXLOG_INFO("Native renderer: preset={}{} on=[{}] off=[{}]",name.empty()?std::string("off"):std::string(name),
+    resolved.backend_fallback?" (off on this scene backend)":"",on,off);
 }
 namespace {
 void LogNativeStaticWorldGroup(uint32_t group,uint64_t recorded) {

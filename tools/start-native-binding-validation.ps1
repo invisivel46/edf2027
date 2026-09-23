@@ -26,6 +26,18 @@ param(
   # such as a save from tools/make-edf-save.py that unlocks a later mission.
   # Without it every run starts from an empty profile (Mission 1 only).
   [string]$SaveSeed = '',
+  # The renderer preset, passed as --edf_native_renderer. Since 361f80b the
+  # executable's own default is native (the full-frame renderer), so this
+  # launcher passes the preset explicitly and defaults to off, the guest
+  # renderer that every run it documents was made against: a baseline stays a
+  # guest baseline, and individual --edf_native_* flags in -ExtraArgs add to the
+  # guest renderer as they did before the flip. Pass -Renderer native (or
+  # --edf_native_renderer=... in -ExtraArgs, which replaces this) for the
+  # native renderer, and -Renderer default to pass nothing. An executable
+  # built before the preset existed (42823d7) has no such option and only the
+  # guest route by default, so off is omitted for it and any other preset is
+  # refused.
+  [ValidateSet('off','world','full','native','default')][string]$Renderer = 'off',
   # Anything else this run needs, passed through verbatim. The options above
   # are the ones every run chooses between; this is for a flag that exists to
   # answer one question, such as a port's A/B control.
@@ -38,6 +50,12 @@ if (Get-Process edf2027* -ErrorAction SilentlyContinue) {
 }
 if (-not [IO.Path]::IsPathRooted($Executable)) { $Executable = Join-Path $workspace $Executable }
 $candidate = (Resolve-Path -LiteralPath $Executable).Path
+# Whether the executable knows --edf_native_renderer: its cvar name is in the
+# image as a NUL-terminated string (ISO-8859-1 maps each byte to one char).
+function Test-ExecutableOption([string]$Path, [string]$Name) {
+  $image = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($Path))
+  return $image.IndexOf($Name + [char]0, [StringComparison]::Ordinal) -ge 0
+}
 $assets = (Resolve-Path -LiteralPath $GameData).Path
 $scriptPath = $null
 if (-not $ManualInput) {
@@ -79,6 +97,14 @@ $arguments = @(
   ('--edf_native_loading_trace=' + $LoadingTrace.IsPresent.ToString().ToLowerInvariant()),
   ('--edf_native_load_timings=' + $LoadTimings.IsPresent.ToString().ToLowerInvariant())
 )
+$rendererOverride = @($ExtraArgs | Where-Object { (($_ -split '=', 2)[0]) -eq '--edf_native_renderer' }).Count -gt 0
+if ($Renderer -ne 'default' -and -not $rendererOverride) {
+  if (Test-ExecutableOption $candidate 'edf_native_renderer') {
+    $arguments += '--edf_native_renderer=' + $Renderer
+  } elseif ($Renderer -ne 'off') {
+    throw "$candidate predates --edf_native_renderer (42823d7); it cannot run -Renderer $Renderer"
+  }
+}
 if ($SceneCapture) {
   $arguments += '--edf_native_scene_capture="' + (Join-Path $runRoot 'cap') + '"'
 }
@@ -118,6 +144,7 @@ try {
   $windowStyle = if ($ManualInput) { 'Normal' } else { 'Hidden' }
   $game = Start-Process -FilePath $candidate -WorkingDirectory (Split-Path $candidate) -WindowStyle $windowStyle -ArgumentList $arguments -PassThru
   [pscustomobject]@{ Id=$game.Id; Executable=$candidate; Log=$log; RunDirectory=$runRoot; SaveSeed=$SaveSeed
+    Renderer=$(if ($rendererOverride) { 'extra-args' } else { $Renderer }); Arguments=$arguments
     CapturePrefix=$(if ($SceneCapture) { Join-Path $runRoot 'cap' } else { $null }) }
 } finally {
   $env:EDF_INPUT_SCRIPT = $previousScript

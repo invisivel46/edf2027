@@ -68,6 +68,8 @@ if ($captureDir) {
   if (Test-Path -LiteralPath $captureDir) { throw "Capture directory exists; pick another -Tag: $captureDir" }
   New-Item -ItemType Directory -Path $captureDir | Out-Null
 }
+# Every variant names its preset in its args (--edf_native_renderer=native),
+# which replaces the launcher's -Renderer default (off).
 $launch = @{ Executable = $Executable; InputScript = $entry.input; ExtraArgs = $gameArgs }
 if ($seedDir) { $launch.SaveSeed = $seedDir }
 $run = & (Join-Path $PSScriptRoot 'start-native-binding-validation.ps1') @launch

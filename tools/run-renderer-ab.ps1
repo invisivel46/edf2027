@@ -12,6 +12,14 @@
 # executable name inside out/build/win-amd64-release (edf2027-baseline-6e9c94b).
 # -BaselineArgs/-CandidateArgs go to start-native-binding-validation.ps1 as
 # -ExtraArgs, so each entry replaces the launcher's option of the same name.
+# -BaselineRenderer (default off, the guest renderer) and -CandidateRenderer
+# (default native, the full-frame renderer) go to it as -Renderer, which
+# passes --edf_native_renderer explicitly: since 361f80b the executable's own
+# default is native, so a baseline that passed nothing would no longer be a
+# guest baseline. A candidate that tests individual --edf_native_* flags on the
+# guest-helper route needs -CandidateRenderer off (or world/full); 'default'
+# passes nothing. An executable older than the preset (42823d7, such as
+# edf2027-baseline-6e9c94b) runs off with the option omitted.
 # -GateArgs goes verbatim to the gate (for example '--min-native-groups','40').
 # With -HookTimings, both runs log "Native hook timing" lines and the gate adds
 # a "phases" section (ms per frame and per call for engine.render_helper and
@@ -64,6 +72,8 @@ param(
   [Parameter(Mandatory=$true)][string]$Candidate,
   [string[]]$BaselineArgs = @(),
   [string[]]$CandidateArgs = @(),
+  [ValidateSet('off','world','full','native','default')][string]$BaselineRenderer = 'off',
+  [ValidateSet('off','world','full','native','default')][string]$CandidateRenderer = 'native',
   [string]$Script = 'tools/native-flicker-input.txt',
   [ValidateRange(1,7200)][int]$Seconds = 360,
   [ValidateRange(1,50)][int]$Repeat = 1,
@@ -162,9 +172,9 @@ function Invoke-ImagePostprocess($Base, $Cand, [int]$Index) {
   $result.Report
 }
 
-function Invoke-Run([string]$Role, [int]$Index, [string]$Executable, [string[]]$Extra) {
+function Invoke-Run([string]$Role, [int]$Index, [string]$Executable, [string[]]$Extra, [string]$Renderer) {
   Assert-NoGame
-  $launch = @{ Executable=$Executable; InputScript=$Script; ExtraArgs=$Extra }
+  $launch = @{ Executable=$Executable; InputScript=$Script; ExtraArgs=$Extra; Renderer=$Renderer }
   if ($HookTimings) { $launch.HookTimings = $true }
   if ($Capture) { $launch.SceneCapture = $true }
   $started = Get-Date
@@ -194,7 +204,7 @@ function Invoke-Run([string]$Role, [int]$Index, [string]$Executable, [string[]]$
   }
   if ($exitedEarly) { Write-Warning "$Role run $Index exited after $([int]$elapsed) s, before the $Seconds s budget" }
   [pscustomobject]@{
-    role=$Role; index=$Index; executable=$run.Executable; args=$Extra; pid=$run.Id
+    role=$Role; index=$Index; executable=$run.Executable; args=$Extra; renderer=$run.Renderer; pid=$run.Id
     log=$run.Log; run_directory=$run.RunDirectory; capture_prefix=$run.CapturePrefix; log_exists=(Test-Path -LiteralPath $run.Log)
     started=$started.ToString('o'); seconds=[Math]::Round($elapsed, 1)
     exited_early=$exitedEarly; stopped_by_runner=$stopped
@@ -217,8 +227,8 @@ $pairs = @()
 $aborted = $null
 try {
   for ($i = 1; $i -le $Repeat; $i++) {
-    $runs += Invoke-Run 'baseline' $i $baseExe $baselineRunArgs
-    $runs += Invoke-Run 'candidate' $i $candExe $candidateRunArgs
+    $runs += Invoke-Run 'baseline' $i $baseExe $baselineRunArgs $BaselineRenderer
+    $runs += Invoke-Run 'candidate' $i $candExe $candidateRunArgs $CandidateRenderer
   }
 } catch {
   # Keep whatever already ran: those logs are still worth gating and saving.
@@ -298,6 +308,7 @@ $summary = [pscustomobject]@{
   name=$Name; created=(Get-Date).ToString('o'); output_directory=$outDir
   args=[pscustomobject]@{
     baseline=$baseExe; candidate=$candExe; baseline_args=$BaselineArgs; candidate_args=$CandidateArgs
+    baseline_renderer=$BaselineRenderer; candidate_renderer=$CandidateRenderer
     script=$Script; seconds=$Seconds; repeat=$Repeat; hook_timings=$HookTimings.IsPresent; gate_args=$GateArgs
     capture=[bool]$Capture; capture_start_frame=$(if ($Capture) { $CaptureStartFrame } else { $null })
     capture_interval=$(if ($Capture) { $CaptureInterval } else { $null })

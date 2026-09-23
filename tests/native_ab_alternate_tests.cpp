@@ -85,6 +85,29 @@ int main() {
     edf::native::native_renderer_preset_mask = full;
     check(edf::native::NativeFlag(NativeRendererFlag::post_finish, false));
     edf::native::native_renderer_preset_mask = 0;
+    // Preset x scene backend: native needs the D3D12 scene backend, and falls
+    // back to off (the guest renderer) on anything else; other presets and
+    // native on D3D12 pass through unchanged.
+    using edf::native::ResolveNativeRendererPresetForBackend;
+    for (const char* backend : {"d3d12", "d3d12-warp"}) {
+      const auto native = ResolveNativeRendererPresetForBackend(NativeRendererPreset::native, backend);
+      check(native.preset == NativeRendererPreset::native && !native.backend_fallback);
+      check(NativeRendererPresetMask(native.preset) & NativeRendererFlagBit(NativeRendererFlag::full_frame));
+    }
+    for (const char* backend : {"d3d11", "d3d11-warp", "", "D3D12", "vulkan"}) {
+      const auto native = ResolveNativeRendererPresetForBackend(NativeRendererPreset::native, backend);
+      check(native.preset == NativeRendererPreset::off && native.backend_fallback);
+      check(!(NativeRendererPresetMask(native.preset) & NativeRendererFlagBit(NativeRendererFlag::full_frame)));
+      for (auto preset : {NativeRendererPreset::off, NativeRendererPreset::world, NativeRendererPreset::full}) {
+        const auto other = ResolveNativeRendererPresetForBackend(preset, backend);
+        check(other.preset == preset && !other.backend_fallback);
+      }
+    }
+    for (auto preset : {NativeRendererPreset::off, NativeRendererPreset::world, NativeRendererPreset::full}) {
+      const auto other = ResolveNativeRendererPresetForBackend(preset, "d3d12");
+      check(other.preset == preset && !other.backend_fallback);
+    }
+    static_assert(ResolveNativeRendererPresetForBackend(NativeRendererPreset::native, "d3d11").preset == NativeRendererPreset::off);
   }
   if (failures) std::cerr << failures << " native A/B alternate checks failed\n";
   return failures ? 1 : 0;
