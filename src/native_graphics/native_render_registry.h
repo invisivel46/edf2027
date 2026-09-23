@@ -180,6 +180,8 @@ inline bool SameNativeRenderEntry(const NativeRenderEntry& a,const NativeRenderE
      a.lod_thresholds.size()!=b.lod_thresholds.size() ||
      a.models.size()!=b.models.size() || a.attachments.size()!=b.attachments.size() || a.instanced.size()!=b.instanced.size()) return false;
   for(size_t i=0;i<4;++i) if(bits(a.centre[i])!=bits(b.centre[i])) return false;
+  // The box half axes feed the partial-sphere box test (ClassifyNativeFullFrameModel).
+  for(size_t i=0;i<a.axes.size();++i) if(bits(a.axes[i])!=bits(b.axes[i])) return false;
   for(size_t i=0;i<a.lod_thresholds.size();++i) if(bits(a.lod_thresholds[i])!=bits(b.lod_thresholds[i])) return false;
   for(size_t i=0;i<a.models.size();++i) if(!same_models(a.models[i],b.models[i])) return false;
   for(size_t i=0;i<a.attachments.size();++i) {

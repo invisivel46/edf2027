@@ -1068,9 +1068,19 @@ void RenderOnlyTicks() {
   Require(first && first->entries.size()==2 && fresh.stats().seeded==2,"a first render-only tick seeds and publishes");
 }
 
+// The box half axes decide the partial-sphere box test: a change to them alone
+// must publish a new entry, not keep the old one.
+void EntryEqualityCoversAxes() {
+  NativeRenderEntry a; a.object=0x2000; a.generation=1;
+  auto b=a;
+  Require(SameNativeRenderEntry(a,b),"identical entries are the same");
+  b.axes[7]=1.0f;
+  Require(!SameNativeRenderEntry(a,b),"an axes-only change is a new entry");
+}
+
 int main() {
   try {
-    ClassTableLookup();
+    ClassTableLookup(); EntryEqualityCoversAxes();
     BirthAndDeath();
     SkyIsNotPublished();
     ResolvesClassAfterDerivedConstructor();
