@@ -424,6 +424,47 @@ inline size_t PostIssueChainEnd(const PostFinishPlan& plan,const std::vector<Pos
   return end;
 }
 
+// The tone history on the guest route. PS_Downsample_Tone blends its own
+// previous resolve (m_OldTone) by a fixed 0.025 per DRAW (NativePostHistory in
+// native_full_frame_post.h), so an unlocked render that dispatched no
+// simulation step (native_render_tick_frame false) would adapt the eye again.
+// A held render drops that pass whole: begin 821B8828, its setters,
+// activation, quad and end 821B88B0 (the resolve). Its record then keeps the
+// tick frame's resolve, which the Tone pass (m_Tone_Sampler) and the bloom
+// read. The pass's setters write only the DownsampleTone effect (this+76),
+// which nothing else draws, and the tone constants are pool values that no
+// setter of the chain writes. Begin and end go together, so the target stack
+// stays balanced, and every later pass begins, sets and activates its own.
+// The index of the plan's DownsampleTone pass, if it has one.
+inline std::optional<size_t> PostToneHistoryPass(const PostFinishPlan& plan) {
+  std::optional<size_t> found;
+  for(size_t p=0;p<plan.passes.size();++p) {
+    if(plan.passes[p].kind!=PostPassKind::DownsampleTone) continue;
+    if(found) throw std::runtime_error("post finish issue: more than one DownsampleTone pass");
+    found=p;
+  }
+  return found;
+}
+// `steps` without the steps of plan pass `pass` (a chain pass: none of its
+// steps is the kept guest body's). Step pass indexes still refer to `plan`.
+inline std::vector<PostIssueStep> PostIssueWithoutPass(const PostFinishPlan& plan,const std::vector<PostIssueStep>& steps,size_t pass) {
+  if(pass+1>=plan.passes.size()) throw std::runtime_error("post finish issue: only a chain pass can be held");
+  std::vector<PostIssueStep> kept;
+  kept.reserve(steps.size());
+  for(const auto& step:steps) {
+    if(step.pass!=pass) { kept.push_back(step); continue; }
+    if(step.guest) throw std::runtime_error("post finish issue: a held pass has a guest step");
+  }
+  return kept;
+}
+// What the guest route observes on a held render: the plan without `pass`,
+// for the self-audit's ComparePostFinish.
+inline PostFinishPlan PostPlanWithoutPass(PostFinishPlan plan,size_t pass) {
+  if(pass>=plan.passes.size()) throw std::runtime_error("post finish plan: no such pass");
+  plan.passes.erase(plan.passes.begin()+std::ptrdiff_t(pass));
+  return plan;
+}
+
 // Why a frame's native loop gave the frame back to the original. Counted per
 // reason; each is decided before anything is issued except Midway and Bloom.
 enum class PostFinishFallback:uint8_t {
