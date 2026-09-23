@@ -259,9 +259,11 @@ struct NativeSceneMaterialProgram {
   NativeSceneResolvedMaterial Resolve(NativeBackendPipelineDesc desc,bool reversed,
       std::span<const NativeSceneMaterialInputs::Constant> constants,
       NativeMaterialRenderPass render,std::array<NativeMaterialSamplerPass,16> samplers,
-      int filtering_override=-1,bool palette=false) const {
+      int filtering_override=-1,bool palette=false,std::span<const std::array<uint32_t,2>> after={}) const {
     if(!backend) throw std::runtime_error("native material has no backend");
     render=ResolveRenderState(std::move(render));
+    // Pass-owned state applied after the material's own operations.
+    for(const auto& operation:after) ApplyNativeMaterialState(render,operation[0],operation[1]);
     samplers=ResolveSamplers(std::move(samplers));
     const auto& selected=reversed?reversed_vertex:vertex;
     const auto bytes=[](const auto& code) -> std::span<const uint8_t> {

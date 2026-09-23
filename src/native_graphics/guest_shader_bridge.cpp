@@ -6479,10 +6479,9 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
           // dome depth failed every world pixel beyond its radius (buildings cut
           // along the dome, the road ending past the footbridge). Z write off is
           // appended after the material's own state operations.
-          auto sky_program=program;
-          sky_program.inputs.state_overrides.push_back({0x30,0});
-          auto result=sky_program.Resolve(desc,formats.reverse_depth,constants,before,base.samplers,
-            REXCVAR_GET(edf_native_anisotropic_filtering));
+          static constexpr std::array<std::array<uint32_t,2>,1> kNoDepthWrite{{{0x30,0}}};
+          auto result=program.Resolve(desc,formats.reverse_depth,constants,before,base.samplers,
+            REXCVAR_GET(edf_native_anisotropic_filtering),false,kNoDepthWrite);
           result.capture.material=state.scene_adapter.InternMaterial(std::move(result.capture.material));
           ApplyNativeScenePublishedWorld(result.capture,world);
           auto object=std::make_shared<NativeSceneInstance>();
