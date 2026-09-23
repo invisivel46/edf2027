@@ -86,6 +86,19 @@ class NativeBackendPipeline {
   // (native_shadow_render.h) name a draw's pipeline by it, which is stable for
   // one description where the object's address is not across runs.
   uint64_t identity_vertex=0,identity_pixel=0,identity_layout=0,identity=0;
+  // The description's render state words and target formats as stamped (render
+  // targets, RTV 0 format, DSV format, sample count, topology), so a draw list
+  // can say WHICH part of two pipelines differs instead of only that the hashes
+  // do. A backend that does not key its cache on a word (D3D12 on the scissor
+  // enable, word 5) keeps the first description's value for it.
+  RenderStateWords identity_state{};
+  std::array<uint32_t,5> identity_format{};
+  // The binding slots the two shaders read (bit n = slot n), from their
+  // reflection, when the backend that created the pipeline reflected them
+  // (D3D12, ValidateAgainstRootLayout). Diagnostics only: the shadow render's
+  // tap lists just these, not a slot an earlier draw left bound.
+  bool used_slots_known=false;
+  uint32_t used_vertex_constants=0,used_pixel_constants=0,used_pixel_textures=0,used_pixel_samplers=0;
 };
 class NativeBackendRenderTarget {
  public:
@@ -434,6 +447,8 @@ inline void StampNativeBackendPipelineIdentity(NativeBackendPipeline& pipeline,c
   add(&desc.dsv_format,sizeof(desc.dsv_format)); add(&desc.sample_count,sizeof(desc.sample_count));
   pipeline.identity_vertex=desc.vertex_id; pipeline.identity_pixel=desc.pixel_id;
   pipeline.identity_layout=desc.input_layout_id; pipeline.identity=hash;
+  pipeline.identity_state=desc.state;
+  pipeline.identity_format={desc.render_targets,desc.rtv_format[0],desc.dsv_format,desc.sample_count,topology};
 }
 
 struct NativeBackendBufferDesc {

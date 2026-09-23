@@ -54,7 +54,10 @@ struct NativeD3D12RootLayout {
 // above. The disc shaders were measured; the renderer's own UI, font, movie and
 // post HLSL was not, so this is the check that keeps an unmeasured shader from
 // silently losing a binding.
-void ValidateAgainstRootLayout(std::span<const uint8_t> bytecode, bool pixel, const std::string& name);
+// Returns the slots the shader reads (bit n = slot n), which the reflection
+// lists already.
+struct NativeShaderSlots { uint32_t constant_buffers=0,textures=0,samplers=0; };
+NativeShaderSlots ValidateAgainstRootLayout(std::span<const uint8_t> bytecode, bool pixel, const std::string& name);
 
 // The serialized (version 1.0) root signature every pipeline is built against.
 // Its bytes are part of every persistent pipeline key: a manifest written for a

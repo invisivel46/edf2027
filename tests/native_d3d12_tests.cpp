@@ -210,8 +210,23 @@ float4 PS(float4 position : SV_POSITION) : SV_TARGET { return image.Sample(filte
 )";
       const auto vertex = Compile(kSource, "VS", "vs_5_0");
       const auto pixel = Compile(kSource, "PS", "ps_5_0");
-      ValidateAgainstRootLayout(Bytes(*vertex.Get()), false, "VS");
-      ValidateAgainstRootLayout(Bytes(*pixel.Get()), true, "PS");
+      const auto vertex_slots = ValidateAgainstRootLayout(Bytes(*vertex.Get()), false, "VS");
+      const auto pixel_slots = ValidateAgainstRootLayout(Bytes(*pixel.Get()), true, "PS");
+      // The slots each stage reads, which the shadow render's draw lists keep
+      // (and nothing an earlier draw left bound in another slot).
+      Check(vertex_slots.constant_buffers == 1 && vertex_slots.textures == 0 && vertex_slots.samplers == 0,
+            "the vertex shader's reflected slots are wrong");
+      Check(pixel_slots.constant_buffers == 1 && pixel_slots.textures == 1 && pixel_slots.samplers == 1,
+            "the pixel shader's reflected slots are wrong");
+      const char* kSparse = R"(
+Texture2D unused : register(t1);
+Texture2D used : register(t3);
+SamplerState filtering : register(s2);
+float4 PS(float4 position : SV_POSITION) : SV_TARGET { return used.Sample(filtering, position.xy); }
+)";
+      const auto sparse = ValidateAgainstRootLayout(Bytes(*Compile(kSparse, "PS", "ps_5_0").Get()), true, "Sparse");
+      Check(sparse.textures == (1u << 3) && sparse.samplers == (1u << 2) && sparse.constant_buffers == 0,
+            "a declared but unread texture was listed, or a read one was not");
 
       // A shader outside the measured shape must be refused by name and slot,
       // not quietly built into a pipeline whose binding goes nowhere. The disc

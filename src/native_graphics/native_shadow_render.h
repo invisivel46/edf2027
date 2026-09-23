@@ -69,6 +69,12 @@ namespace edf::native {
 //   again with the same tick and input, which leaves it unchanged.
 // - owner stamps object+48 = serial (820B4038's visited stamp): only ever
 //   compared for equality with the current pass's serial, which only grows.
+// - the shared shader bindings' samplers: the guest route's activations
+//   decode the guest's sampler words into them, and the full-frame post reads
+//   its samplers back from them (it binds fallbacks only where they are
+//   empty). Every registered shader's sampler slots are saved and put back
+//   ("samplers_restored" in the metadata), so the native frames after a shadow
+//   post exactly as before it and later shadow frames compare the native post.
 // Nothing the native frame left in the bridge is lost: the active scene,
 // output and target, the scene counters and the owner+104 texture entry are
 // restored, and the native output is swapped back before the HUD draws.
@@ -150,9 +156,17 @@ struct NativeDrawTexture {
   uint32_t width=0,height=0;
   bool operator==(const NativeDrawTexture&) const=default;
 };
+struct NativeDrawSampler {
+  uint32_t stage=0,slot=0;
+  uint64_t id=0;  // The backend's sampler object: deduplicated on its description, so equal ids are equal states.
+  bool operator==(const NativeDrawSampler&) const=default;
+};
 struct NativeDrawConstant {
   uint32_t stage=0,slot=0,bytes=0;
   uint64_t hash=0;
+  // The bytes themselves, only when the tap records them
+  // (edf_native_shadow_render_constants): which registers differ.
+  std::vector<uint8_t> data;
   bool operator==(const NativeDrawConstant&) const=default;
 };
 enum class NativeDrawKind : uint32_t { Draw, Indexed, Instanced };
@@ -165,6 +179,7 @@ struct NativeDrawRecord {
   uint32_t count=0,first=0,instances=1,first_instance=0;
   int32_t base=0;
   std::vector<NativeDrawTexture> textures;
+  std::vector<NativeDrawSampler> samplers;
   std::vector<NativeDrawConstant> constants;
   uint64_t constant_hash=0;  // Over every bound constant's (stage, slot, hash).
   std::optional<std::array<float,16>> world;  // The pipeline's g_mWorld registers, when it declares them.
@@ -173,7 +188,30 @@ struct NativeDrawRecord {
   std::array<float,6> viewport{};
   std::optional<std::array<float,4>> blend;
   std::string geometry;  // "t:<hash>:<bytes>" transient vertices, "b:<id>+<offset>" a buffer, per slot.
+  // The pipeline's stamped description (NativeBackendPipeline::identity_state
+  // and identity_format), when it has one: two paths that build the same GPU
+  // state from different guest words get different pipeline identities, and
+  // these say which part differs.
+  std::optional<RenderStateWords> state;
+  std::array<uint32_t,5> format{};  // render targets, RTV 0, DSV, samples, topology
+  std::optional<NativeBackendScissor> scissor;  // Set and enabled for the draw; nullopt when disabled.
+  // Textures, samplers and constants are only the slots the pipeline's shaders
+  // read (its reflection); otherwise every bound slot.
+  bool reflected=false;
 };
+// The decoded render state as one canonical text (tools/shadow-diff.py splits
+// it on spaces): equal texts are equal GPU state even where the guest words
+// differ in bits the decoder ignores.
+inline std::string NativeShadowStateText(const RenderStateWords& words) {
+  try {
+    const auto d=DecodeNativeRenderState(words);
+    return std::format("blend={}:{}/{}/{}:{}/{}/{} mask={} depth={}/{}/{} raster={}/{}/{}/{}",
+      int(d.blend_enable),d.src_color,d.dst_color,d.color_op,d.src_alpha,d.dst_alpha,d.alpha_op,uint32_t(d.write_mask),
+      int(d.depth_enable),int(d.depth_write),d.depth_func,d.fill,d.cull,int(d.front_counter_clockwise),int(d.depth_clip));
+  } catch(const std::exception&) {
+    return "undecodable";
+  }
+}
 
 // JSON Lines: a header object, then one object per draw in record order.
 inline std::string NativeShadowJsonString(std::string_view text) {
@@ -209,10 +247,22 @@ inline std::string SerializeNativeDrawRecord(const NativeDrawRecord& draw) {
     const auto& t=draw.textures[i];
     out+=std::format("{}{{\"stage\":{},\"slot\":{},\"id\":{},\"w\":{},\"h\":{}}}",i?",":"",t.stage,t.slot,NativeShadowHex(t.id),t.width,t.height);
   }
+  out+="],\"samplers\":[";
+  for(size_t i=0;i<draw.samplers.size();++i) {
+    const auto& s=draw.samplers[i];
+    out+=std::format("{}{{\"stage\":{},\"slot\":{},\"id\":{}}}",i?",":"",s.stage,s.slot,NativeShadowHex(s.id));
+  }
   out+="],\"constants\":[";
   for(size_t i=0;i<draw.constants.size();++i) {
     const auto& c=draw.constants[i];
-    out+=std::format("{}{{\"stage\":{},\"slot\":{},\"bytes\":{},\"hash\":{}}}",i?",":"",c.stage,c.slot,c.bytes,NativeShadowHex(c.hash));
+    out+=std::format("{}{{\"stage\":{},\"slot\":{},\"bytes\":{},\"hash\":{}",i?",":"",c.stage,c.slot,c.bytes,NativeShadowHex(c.hash));
+    if(!c.data.empty()) {
+      out+=",\"data\":\"";
+      static constexpr char digits[]="0123456789abcdef";
+      for(const auto byte:c.data) { out+=digits[byte>>4]; out+=digits[byte&15]; }
+      out+="\"";
+    }
+    out+="}";
   }
   out+=std::format("],\"constant_hash\":{},\"world\":",NativeShadowHex(draw.constant_hash));
   if(draw.world) {
@@ -230,7 +280,18 @@ inline std::string SerializeNativeDrawRecord(const NativeDrawRecord& draw) {
     for(size_t i=0;i<4;++i) out+=(i?",":"")+NativeShadowJsonFloat((*draw.blend)[i]);
     out+="]";
   } else out+="null";
-  out+=std::format(",\"geometry\":{}}}",NativeShadowJsonString(draw.geometry));
+  out+=std::format(",\"geometry\":{}",NativeShadowJsonString(draw.geometry));
+  if(draw.state) {
+    const auto& w=*draw.state;
+    out+=std::format(",\"state\":[\"{:08x}\",\"{:08x}\",\"{:08x}\",\"{:08x}\",\"{:08x}\",\"{:08x}\"],\"decoded\":{}",
+      w[0],w[1],w[2],w[3],w[4],w[5],NativeShadowJsonString(NativeShadowStateText(w)));
+    out+=std::format(",\"format\":[{},{},{},{},{}]",draw.format[0],draw.format[1],draw.format[2],draw.format[3],draw.format[4]);
+  }
+  if(draw.reflected) out+=",\"reflected\":true";
+  out+=",\"scissor\":";
+  if(draw.scissor) out+=std::format("[{},{},{},{}]",draw.scissor->left,draw.scissor->top,draw.scissor->right,draw.scissor->bottom);
+  else out+="null";
+  out+="}";
   return out;
 }
 inline std::string SerializeNativeDrawList(std::string_view side,uint64_t frame,const std::vector<NativeDrawRecord>& draws) {
@@ -259,6 +320,9 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
   // capture's submit closes the frame; the bridge binds everything again).
   void ResetState() { state_={}; stack_.clear(); }
   void SetLabel(std::string label) { label_=std::move(label); }
+  // Also keep every draw's constant bytes (large: a diagnostic for which
+  // registers differ, not for every run).
+  void RecordConstantBytes(bool enabled) { record_constant_bytes_=enabled; }
   const std::string& label() const { return label_; }
   bool recording() const { return armed_ && !paused_ && std::this_thread::get_id()==thread_; }
   size_t size() const { return draws_.size(); }
@@ -298,7 +362,10 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
     if(uint32_t(stage)<kStages && slot<kSlots) state_.textures[uint32_t(stage)][slot]=texture;
     Inner().SetTexture(stage,slot,texture);
   }
-  void SetSampler(NativeBackendStage stage,uint32_t slot,NativeBackendSampler* sampler) override { Inner().SetSampler(stage,slot,sampler); }
+  void SetSampler(NativeBackendStage stage,uint32_t slot,NativeBackendSampler* sampler) override {
+    if(uint32_t(stage)<kStages && slot<kSlots) state_.samplers[uint32_t(stage)][slot]=sampler;
+    Inner().SetSampler(stage,slot,sampler);
+  }
   void SetRenderTargets(std::span<NativeBackendRenderTarget* const> colors,NativeBackendRenderTarget* depth) override {
     state_.targets.clear();
     for(auto* color:colors) state_.targets.push_back(uint64_t(reinterpret_cast<uintptr_t>(color)));
@@ -309,7 +376,10 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
     state_.viewport={viewport.x,viewport.y,viewport.width,viewport.height,viewport.min_depth,viewport.max_depth};
     Inner().SetViewport(viewport);
   }
-  void SetScissor(const NativeBackendScissor& scissor,bool enabled) override { Inner().SetScissor(scissor,enabled); }
+  void SetScissor(const NativeBackendScissor& scissor,bool enabled) override {
+    state_.scissor=enabled?std::optional(scissor):std::nullopt;
+    Inner().SetScissor(scissor,enabled);
+  }
   void ClearColor(NativeBackendRenderTarget& target,const std::array<float,4>& color) override { Inner().ClearColor(target,color); }
   void ClearDepthStencil(NativeBackendRenderTarget& target,bool depth,bool stencil,float value,uint8_t stencil_value) override {
     Inner().ClearDepthStencil(target,depth,stencil,value,stencil_value);
@@ -355,6 +425,8 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
     uint32_t topology=0;
     std::array<std::array<Constant,kSlots>,kStages> constants{};
     std::array<std::array<NativeBackendTexture*,kSlots>,kStages> textures{};
+    std::array<std::array<NativeBackendSampler*,kSlots>,kStages> samplers{};
+    std::optional<NativeBackendScissor> scissor;
     std::array<std::string,kSlots> geometry{};
     std::string indices;
     std::vector<uint64_t> targets;
@@ -379,6 +451,7 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
       draw.pipeline=pipeline->identity?pipeline->identity:uint64_t(reinterpret_cast<uintptr_t>(pipeline));
       draw.vertex_shader=pipeline->identity_vertex; draw.pixel_shader=pipeline->identity_pixel;
       draw.layout=pipeline->identity_layout;
+      if(pipeline->identity) { draw.state=pipeline->identity_state; draw.format=pipeline->identity_format; }
       if(pipeline->world_instanced && pipeline->instance_world_slot<kSlots) {
         const auto& world=state_.constants[uint32_t(NativeBackendStage::Vertex)][pipeline->instance_world_slot];
         if(world.bound && pipeline->instance_world_offset+64<=world.bytes.size()) {
@@ -390,13 +463,30 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
     }
     draw.topology=state_.topology; draw.kind=kind;
     draw.count=count; draw.first=first; draw.base=base; draw.instances=instances; draw.first_instance=first_instance;
+    // Only the slots the pipeline's shaders read, where the backend reflected
+    // them: a slot an earlier draw left bound is not this draw's input.
+    const auto* used=state_.pipeline && state_.pipeline->used_slots_known?state_.pipeline:nullptr;
+    draw.reflected=used!=nullptr;
+    enum class Binding { Texture, Sampler, Constants };
+    const auto reads=[used](uint32_t stage,uint32_t slot,Binding binding) {
+      if(!used) return true;
+      const auto bit=1u<<slot;
+      if(stage==uint32_t(NativeBackendStage::Vertex)) return binding==Binding::Constants && (used->used_vertex_constants&bit)!=0;
+      if(stage!=uint32_t(NativeBackendStage::Pixel)) return false;
+      const auto mask=binding==Binding::Texture?used->used_pixel_textures:
+                      binding==Binding::Sampler?used->used_pixel_samplers:used->used_pixel_constants;
+      return (mask&bit)!=0;
+    };
     uint64_t combined=14695981039346656037ull;
     for(uint32_t stage=0;stage<kStages;++stage) for(uint32_t slot=0;slot<kSlots;++slot) {
-      if(auto* texture=state_.textures[stage][slot])
+      if(auto* texture=state_.textures[stage][slot]; texture && reads(stage,slot,Binding::Texture))
         draw.textures.push_back({stage,slot,uint64_t(reinterpret_cast<uintptr_t>(texture)),texture->width(),texture->height()});
+      if(auto* sampler=state_.samplers[stage][slot]; sampler && reads(stage,slot,Binding::Sampler))
+        draw.samplers.push_back({stage,slot,uint64_t(reinterpret_cast<uintptr_t>(sampler))});
       const auto& constant=state_.constants[stage][slot];
-      if(!constant.bound) continue;
-      draw.constants.push_back({stage,slot,uint32_t(constant.bytes.size()),constant.hash});
+      if(!constant.bound || !reads(stage,slot,Binding::Constants)) continue;
+      draw.constants.push_back({stage,slot,uint32_t(constant.bytes.size()),constant.hash,
+                                record_constant_bytes_?constant.bytes:std::vector<uint8_t>{}});
       const uint64_t key[3]{stage,slot,constant.hash};
       combined=NativeShadowHash(key,sizeof(key),combined);
     }
@@ -405,6 +495,7 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
       draw.geometry+=std::format("{}{}={}",draw.geometry.empty()?"":" ",slot,state_.geometry[slot]);
     if(kind!=NativeDrawKind::Draw && !state_.indices.empty()) draw.geometry+=(draw.geometry.empty()?"":" ")+state_.indices;
     draw.targets=state_.targets; draw.depth=state_.depth; draw.viewport=state_.viewport; draw.blend=state_.blend;
+    draw.scissor=state_.scissor;
     draws_.push_back(std::move(draw));
   }
   NativeBackendRecorder* inner_=nullptr;
@@ -412,6 +503,7 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
   // Read by every thread that records while the tap is installed; the thread
   // id and label only by the arming thread once armed.
   std::atomic<bool> armed_=false,paused_=false;
+  bool record_constant_bytes_=false;
   std::string label_;
   State state_;
   std::vector<State> stack_;

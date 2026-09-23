@@ -349,7 +349,8 @@ change-driven behaviour (`665e3e1`) has no cvar.
 | `edf_native_shadow_render` | 0 (int, 0..100000) | Shadow render: every Nth indexed output frame, after the native full frame, the guest helper path renders the same state into offscreen targets; both pre-HUD images and both draw lists are written (see `shadow-diff.py`). 0 is off, and off the frame path is unchanged | the full frame (native side of A/B) |
 | `edf_native_shadow_render_start_frame` | 0 | First frame a shadow render may take; shadow frames are start, start+N, ... | `edf_native_shadow_render` |
 | `edf_native_shadow_render_limit` | 16 (0..4096) | Shadow frames written per run | `edf_native_shadow_render` |
-| `edf_native_shadow_render_prefix` | `native-shadow/shadow` | Output prefix: `<prefix>.<F>.native.bmp`, `.guest.bmp`, `.native.draws.jsonl`, `.guest.draws.jsonl`, `.shadow.json`; the directory is created | `edf_native_shadow_render` |
+| `edf_native_shadow_render_prefix` | `native-shadow/shadow` | Output prefix: `<prefix>.<F>.native.bmp`, `.guest.bmp`, `.native.scene.bmp`, `.guest.scene.bmp` (the resolved HDR scene each post read, clamped), `.native.draws.jsonl`, `.guest.draws.jsonl`, `.shadow.json`; the directory is created | `edf_native_shadow_render` |
+| `edf_native_shadow_render_constants` | false | Also write every draw's constant bytes into the draw lists, so `shadow-diff.py` names the differing registers (large) | `edf_native_shadow_render` |
 
 **Audits of the guest-helper route (diagnostic, all default false)**
 
@@ -401,15 +402,38 @@ change-driven behaviour (`665e3e1`) has no cvar.
   `src/native_graphics/native_shadow_render.h`): the same simulation state
   rendered natively and by the guest helper path in one helper call, both
   captured before the HUD. Images are compared per pixel, exactly and with
-  `--pixel-tolerance`/`--max-pixels`. Draw lists are aligned by structure
-  (pipeline identity, shaders, counts, texture slots; instanced draws expanded)
-  and reported as missing, extra, reordered or differing (constants, world
-  matrix with `--float-tolerance`, viewport, blend, one-to-one texture and
-  target identities; geometry with `--strict-geometry`), grouped by material
-  and by recording label. `--allow FILE` (JSON) excuses known differences.
-  Exits 1 on anything beyond the allow list. Not run in game yet.
-  `python tools/shadow-diff.py native-shadow` (a directory, a `.shadow.json`
-  or a `<prefix>.<F>` stem)
+  `--pixel-tolerance`/`--max-pixels`, with the signed mean (a tone or exposure
+  shift) and a histogram; the pre-post scene images when the capture has them.
+  Draw lists are aligned by material, topology, kind and counts (instanced
+  draws expanded), pairing on textures and world first, and reported as
+  missing, extra, reordered (within a native pass; the pass order is reported
+  once) or differing (constants with the differing registers when the bytes
+  were kept, world matrix with `--float-tolerance`, viewport, blend, scissor,
+  texture sizes, texture and target identities, samplers, the decoded render
+  state and target formats; geometry with `--strict-geometry`), grouped by
+  material, recording label, native pass and field. The pipeline identity is
+  not part of the key: the guest builds its pipelines from the live guest
+  registers and the native passes from owned state, so every identity
+  differed on the first run (`--strict-pipeline` compares them for captures
+  without the decoded state). `--allow FILE` (JSON) excuses known
+  differences; `tools/shadow-diff-allow.json` holds the expected exclusions.
+  Exits 1 on anything beyond the allow list.
+  `python tools/shadow-diff.py native-shadow --allow tools/shadow-diff-allow.json`
+  (a directory, a `.shadow.json` or a `<prefix>.<F>` stem).
+  First run (`out/renderer-ab/shadow-next`, 16 frames, build `40309c2`): with
+  the fixed key 1951 of 2734 draws match per frame and sky, static world and
+  post align completely. Beyond the allow list: every model draw's vertex
+  constants differ (the player's weapon edge and thin wires differ by up to 76,
+  models by +-1), and frame 4000 has a full-frame bloom/exposure difference
+  (signed mean -0.57, max 54) that frames 4060-4900 do not. The likely cause is
+  the native post's samplers: the post reads them back from the shared shader
+  bindings and binds point/linear clamp fallbacks where they are empty, which
+  then stay there, so native play posts with the fallbacks throughout (log:
+  `fallback_samplers=10` from frame 1 on); the frame-4000 shadow's guest route
+  decoded the guest's post samplers into the same bindings for the first time,
+  and every later native frame posted with those. The shadow now restores every
+  sampler slot, and the draw lists now record samplers, so the next run shows
+  the native post as it renders without a shadow and names the samplers.
 - `tools/compare-renderer-ab-captures.py` is the image-correctness gate next
   to the FPS gate. It reads the captures of an `edf_native_ab_alternate` run
   and takes each frame's side from the `ab_alternate frame=F native=0|1` log
