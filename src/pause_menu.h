@@ -10,7 +10,8 @@
 //   mouse / keyboard  -> ImGui only. The native K/M driver releases its capture the
 //                        moment the menu opens (native_kbm_driver.h) and the guest-side
 //                        merge drops everything (native_kbm.cpp).
-//   pad               -> ImGui only. The dialog reads SDL gamepads itself; the guest's
+//   pad               -> ImGui only. The dialog reads the physical pads itself, SDL or
+//                        XInput (menu_gamepad.h RawPads); the guest's
 //                        XInputGetState result is blanked (input_hooks.cpp) and the SDK
 //                        drivers are told the game is inactive (edf2017_app.h).
 // After the menu closes each source stays withheld from the game until it has been seen

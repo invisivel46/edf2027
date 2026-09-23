@@ -32,6 +32,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "controller_logic.h"
 #include "keybind_logic.h"
 #include "launcher.h"
 #include "menu_gamepad.h"
@@ -62,10 +63,10 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     std::function<bool()> paused;                   // the game is paused under the menu
   };
 
-  SettingsDialog(rex::ui::ImGuiDrawer* drawer, std::filesystem::path config_path, std::string pad_name, Hooks hooks,
+  SettingsDialog(rex::ui::ImGuiDrawer* drawer, std::filesystem::path config_path, Hooks hooks,
                  bool opened_by_pad = false)
-      : ImGuiDialog(drawer), config_path_(std::move(config_path)), pad_name_(std::move(pad_name)),
-        hooks_(std::move(hooks)), focus_request_(opened_by_pad) {
+      : ImGuiDialog(drawer), config_path_(std::move(config_path)), hooks_(std::move(hooks)),
+        focus_request_(opened_by_pad) {
     const auto [w, h] = CurrentWindowSize();
     custom_w_ = w;
     custom_h_ = h;
@@ -73,6 +74,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     render_custom_h_ = GetInt(Pending("edf_native_render_height"), 0);
     if (!render_custom_w_ || !render_custom_h_) { render_custom_w_ = 1920; render_custom_h_ = 1080; }
     gamepad_.Reset();
+    ui::RawPads::StopRumble();  // a paused game would otherwise leave the motors running
   }
   static SettingsDialog*& Current() { static SettingsDialog* s = nullptr; return s; }
   void Dismiss() { Close(); }
@@ -93,13 +95,19 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   // events carry VirtualKey values, which are already the vocabulary the keybind_*
   // cvars are written in, and routing them here lets Escape cancel a capture instead of
   // closing the menu (Edf2017App::OnKeyDown) and lets F1/F2 be bound like any other key.
-  bool capturing() const { return !capture_cvar_.empty(); }
+  // A controller-remap capture (pad_capture_target_) waits for a controller button instead;
+  // while it runs every key is swallowed too, and Escape cancels it.
+  bool capturing() const { return !capture_cvar_.empty() || pad_capture_target_ >= 0; }
 
   // Returns true if the key was consumed. `key` is a name from the SDK's key table, or
   // empty for a key it does not know; kNone/unknown keys are swallowed so a stray
   // modifier press does not end the capture.
   bool FeedCapturedKey(const std::string& key, bool shift, bool ctrl, bool alt, bool cancel) {
     if (!capturing()) return false;
+    if (pad_capture_target_ >= 0) {
+      if (cancel) pad_capture_target_ = -1;
+      return true;
+    }
     if (cancel) { capture_cvar_.clear(); return true; }
     if (key.empty() || key == "Shift" || key == "Control" || key == "Alt") return true;
     const std::string token = FormatBindToken(shift, ctrl, alt, key);
@@ -134,8 +142,12 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     ui::ScopedFont body_font(ui::FontRole::kBody, metrics_);
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
 
-    const auto pad = gamepad_.Poll(io);
+    // While a remap capture waits for a button, the pad drives the capture, not the menu.
+    const auto pad = gamepad_.Poll(io, pad_capture_target_ < 0);
     pad_connected_ = pad.connected;
+    last_pad_raw_ = pad.raw;
+    if (pad_capture_target_ >= 0 && section_ != kControlsSection) pad_capture_target_ = -1;
+    if (pad_capture_target_ >= 0) UpdatePadCapture(pad.raw);
     bool close = false;
     if (!capturing() && !revert_.active()) {
       if (pad.pressed & menu::kPadStart) close = true;
@@ -182,6 +194,7 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
 
  private:
   static constexpr int kSectionCount = 6;
+  static constexpr int kControlsSection = 3;
   struct Section { const char* icon; const char* label; };
   static constexpr std::array<Section, kSectionCount> kSections{{
       {ui::icon::kDisplay, "Display"}, {ui::icon::kGraphics, "Graphics"}, {ui::icon::kPerformance, "Performance"},
@@ -748,9 +761,28 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   // ---- Controls ------------------------------------------------------------------------
   void DrawControls() {
     ui::SectionHeading("Controller", metrics_);
-    BeginRow("Controller");
-    ImGui::TextDisabled("%s", pad_name_.c_str());
-    EndRow("Controllers are detected automatically.");
+    BeginRow("Controller API", Exists("input_backend") ? "input_backend" : nullptr);
+    {
+      const std::string backend = Pending("input_backend");
+      int index = backend == "xinput" ? 1 : 0;
+      const std::vector<const char*> items{"SDL (default)", "XInput"};
+#if defined(_WIN32)
+      const std::vector<bool> disabled{false, false};
+#else
+      const std::vector<bool> disabled{false, true};
+#endif
+      ImGui::BeginDisabled(!Exists("input_backend"));
+      if (Combo("##backend", &index, items, disabled)) ApplyOne("input_backend", index == 1 ? "xinput" : "sdl");
+      ImGui::EndDisabled();
+    }
+    EndRow("How the game talks to controllers. SDL handles most controllers (Xbox, PlayStation, Switch Pro and "
+           "others). XInput talks to Xbox-compatible controllers directly, up to four. Both support plugging "
+           "controllers in and out, vibration, remapping and the dead zones below. Takes effect after a restart.");
+
+    BeginRow("Connected");
+    DrawConnectedPads();
+    EndRow("Controllers can be plugged in and out at any time. The first controller connected plays as player 1, "
+           "the next as player 2, and each keeps its player until it is unplugged.");
 
     BeginRow("Open this menu with");
     const std::string chord = Get("edf_menu_pad_chord");
@@ -764,10 +796,23 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
                                    [&](const auto& o) { return chord == o.value; });
     if (Combo("##chord", &chord_index, chord_labels, {}, known ? nullptr : chord_custom.c_str()))
       rex::cvar::SetFlagByName("edf_menu_pad_chord", menu::kChordOptions[size_t(chord_index)].value);
-    EndRow("The controller buttons that open this menu, held together. The game does not see them once the second "
-           "one is down. F1 always works on the keyboard.");
+    EndRow("The controller buttons that open this menu, held together. These are the physical buttons, before any "
+           "remapping below. The game does not see them once the second one is down. F1 always works on the "
+           "keyboard.");
 
     CheckboxRow("Vibration", "edf_rumble", "Controller rumble. Applies immediately.");
+
+    ui::SectionHeading("Sticks and triggers", metrics_);
+    PercentSliderRow("Left stick dead zone", "edf_pad_left_deadzone",
+                     "Stick travel from the centre that is ignored, for a stick that drifts. The rest of the travel "
+                     "is stretched so the stick still reaches full speed. Off leaves only the game's own dead zone.");
+    PercentSliderRow("Right stick dead zone", "edf_pad_right_deadzone",
+                     "Stick travel from the centre that is ignored, for a stick that drifts or aim that creeps. The "
+                     "rest of the travel is stretched so the stick still reaches full speed.");
+    PercentSliderRow("Trigger threshold", "edf_pad_trigger_threshold",
+                     "How far a trigger must be pulled before it counts. The rest of the pull is stretched to the full "
+                     "range.");
+    DrawControllerRemap();
 
     ui::SectionHeading("Keyboard and mouse", metrics_);
     CheckboxRow("Keyboard and mouse", "edf_kbm",
@@ -788,7 +833,165 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     DrawKeybinds(kbm);
   }
 
+  void DrawConnectedPads() {
+    const auto backend = ui::RawPads::Active();
+    const auto& pads = gamepad_.pads();
+    if (backend == ui::RawPads::Backend::kNone) {
+      ImGui::TextDisabled("Controllers start with the game");
+      return;
+    }
+    std::string text;
+    for (const auto& pad : pads) text += (text.empty() ? "" : ", ") + pad.name;
+    if (pads.empty()) ImGui::TextDisabled("None (%s)", ui::RawPads::BackendName(backend));
+    else ImGui::TextWrapped("%s  (%s)", text.c_str(), ui::RawPads::BackendName(backend));
+  }
+
+  void PercentSliderRow(const char* label, const char* cvar, const char* help) {
+    BeginRow(label);
+    int value = std::clamp(GetInt(Get(cvar), 0), 0, 90);
+    if (ImGui::SliderInt("##percent", &value, 0, 90, value == 0 ? "Off" : "%d%%", ImGuiSliderFlags_AlwaysClamp))
+      rex::cvar::SetFlagByName(cvar, std::to_string(value));
+    EndRow(help);
+  }
+
+  // ---- Controller remapping (controller_logic.h) ---------------------------------------
+  static pad::PadRemap Remap(int player) { return pad::ParseRemap(Get(pad::kRemapCvars[size_t(player)])); }
+  static void SetRemap(int player, const pad::PadRemap& remap) {
+    rex::cvar::SetFlagByName(pad::kRemapCvars[size_t(player)], pad::SerializeRemap(remap));
+  }
+  static constexpr double kPadCaptureSeconds = 8.0;
+
+  void BeginPadCapture(int target) {
+    capture_cvar_.clear();
+    pad_capture_target_ = target;
+    pad_capture_player_ = remap_player_;
+    pad_capture_started_ = ImGui::GetTime();
+    pad_capture_ignore_ = pad::PressedControls(last_pad_raw_);  // what is held now does not count
+  }
+  // Menu frame, while capturing: the first control pressed after the capture began, on
+  // any connected controller, from the raw pad (the game sees nothing while the menu is
+  // open). Controls already held then count once released and pressed again.
+  void UpdatePadCapture(const menu::PadSnapshot& raw) {
+    const uint32_t held = pad::PressedControls(raw);
+    pad_capture_ignore_ &= held;
+    const int control = pad::FirstControl(held & ~pad_capture_ignore_);
+    if (control != pad::kNoSource) {
+      SetRemap(pad_capture_player_, pad::AssignSource(Remap(pad_capture_player_), pad_capture_target_, control));
+      pad_capture_target_ = -1;
+      gamepad_.MaskHeld();  // the button stays out of the menu until it is let go
+      return;
+    }
+    if (ImGui::GetTime() - pad_capture_started_ > kPadCaptureSeconds) pad_capture_target_ = -1;
+  }
+
+  void DrawControllerRemap() {
+    ImGui::Dummy(ImVec2(0, 4.0f * metrics_.scale));
+    ui::SectionHeading("Controller mapping", metrics_);
+    {
+      ui::ScopedFont small_font(ui::FontRole::kSmall, metrics_);
+      ImGui::TextDisabled("Which controller button drives each game control. Set, then press the button. Setting a "
+                          "button another control uses swaps the two. Applies immediately.");
+    }
+    BeginRow("Player");
+    {
+      int player = remap_player_;
+      const std::vector<const char*> players{"Player 1 (first controller)", "Player 2 (second controller)"};
+      ImGui::BeginDisabled(pad_capture_target_ >= 0);
+      if (Combo("##player", &player, players)) remap_player_ = std::clamp(player, 0, pad::kRemapPlayers - 1);
+      ImGui::EndDisabled();
+    }
+    EndRow("Each player has a mapping of their own. Player 2 is for split screen.");
+
+    pad::PadRemap remap = Remap(remap_player_);
+    bool changed = false;
+    BeginRow("Swap sticks");
+    changed |= ImGui::Checkbox("##swap", &remap.swap_sticks);
+    EndRow("The left stick aims and the right stick moves.");
+    const auto invert_row = [&](const char* label, bool* x, bool* y, const char* help) {
+      BeginRow(label);
+      changed |= ImGui::Checkbox("Horizontal", x);
+      ImGui::SameLine();
+      changed |= ImGui::Checkbox("Vertical", y);
+      EndRow(help);
+    };
+    invert_row("Invert left stick", &remap.invert_lx, &remap.invert_ly,
+               "Reverse the stick the game uses as its left stick (after swapping).");
+    invert_row("Invert right stick", &remap.invert_rx, &remap.invert_ry,
+               "Reverse the stick the game uses as its right stick (after swapping). Vertical inverts aim.");
+    if (changed) SetRemap(remap_player_, remap);
+
+    constexpr ImGuiTableFlags kFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
+                                       ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_PadOuterX;
+    if (ImGui::BeginTable("pad_remap", 3, kFlags)) {
+      ImGui::TableSetupColumn("Game control", ImGuiTableColumnFlags_WidthStretch, 0.38f);
+      ImGui::TableSetupColumn("Controller button", ImGuiTableColumnFlags_WidthStretch, 0.34f);
+      ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 0.28f);
+      for (int target = 0; target < pad::kTargetCount; ++target) {
+        if (target == pad::kControlCount) {
+          ImGui::TableNextRow();
+          ImGui::TableSetColumnIndex(0);
+          ImGui::TextColored(ui::color::kGreen, "Extra actions");
+        }
+        DrawRemapRow(remap, target);
+      }
+      ImGui::EndTable();
+    }
+    if (const uint32_t unused = pad::UnusedSources(remap)) {
+      std::string names;
+      for (int c = 0; c < pad::kControlCount; ++c)
+        if (unused & (1u << unsigned(c))) names += (names.empty() ? "" : ", ") + std::string(pad::kControls[size_t(c)].token);
+      ui::ScopedFont small_font(ui::FontRole::kSmall, metrics_);
+      ImGui::TextColored(ui::color::kOrange, "%s  Buttons that do nothing: %s", ui::icon::kWarning, names.c_str());
+    }
+    const std::string label = std::string(ui::icon::kReset) + "  Reset controller mapping to defaults";
+    if (ImGui::Button(label.c_str())) {
+      pad_capture_target_ = -1;
+      SetRemap(remap_player_, pad::PadRemap::Default());
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+      ImGui::SetTooltip("Every button back to itself for this player, sticks unswapped and uninverted.");
+  }
+
+  void DrawRemapRow(const pad::PadRemap& remap, int target) {
+    const int source = remap.source[size_t(target)];
+    const bool capturing_this = pad_capture_target_ == target && pad_capture_player_ == remap_player_;
+    ImGui::TableNextRow();
+    ImGui::TableSetColumnIndex(0);
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(pad::TargetLabel(target));
+    ImGui::TableSetColumnIndex(1);
+    ImGui::AlignTextToFramePadding();
+    if (capturing_this) {
+      const int left = std::max(0, int(kPadCaptureSeconds - (ImGui::GetTime() - pad_capture_started_) + 0.99));
+      ImGui::TextColored(ui::color::kOrange, "Press a button (%d s, Esc cancels)", left);
+    } else if (source == pad::kNoSource) {
+      ImGui::TextDisabled("(unbound)");
+    } else if (source != pad::PadRemap::DefaultSource(target)) {
+      ImGui::TextColored(ui::color::kOrange, "%s", pad::kControls[size_t(source)].label);
+    } else {
+      ImGui::TextUnformatted(pad::kControls[size_t(source)].label);
+    }
+    ImGui::TableSetColumnIndex(2);
+    ImGui::PushID(target);
+    ImGui::BeginDisabled(capturing() && !capturing_this);
+    ImGui::BeginDisabled(!capturing_this && !pad_connected_);
+    if (ImGui::Button(capturing_this ? "Cancel" : "Set")) {
+      if (capturing_this) pad_capture_target_ = -1;
+      else BeginPadCapture(target);
+    }
+    ImGui::EndDisabled();
+    if (!pad_connected_ && ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip | ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip("Connect a controller to set a button.");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(source == pad::kNoSource);
+    if (ImGui::Button("Clear")) SetRemap(remap_player_, pad::AssignSource(remap, target, pad::kNoSource));
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    ImGui::PopID();
+  }
+
   void BeginCapture(const char* cvar, bool replace) {
+    pad_capture_target_ = -1;
     capture_cvar_ = cvar;
     capture_replace_ = replace;
   }
@@ -964,10 +1167,13 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
           ResetOne(cvar);
         break;
       case 3:
-        for (const char* cvar : {"edf_menu_pad_chord", "edf_rumble", "edf_kbm", "edf_kbm_mouse_look",
-                                 "edf_kbm_invert_y", "edf_kbm_sensitivity"})
+        for (const char* cvar : {"input_backend", "edf_menu_pad_chord", "edf_rumble", "edf_pad_left_deadzone",
+                                 "edf_pad_right_deadzone", "edf_pad_trigger_threshold", "edf_pad_remap_p1",
+                                 "edf_pad_remap_p2", "edf_kbm", "edf_kbm_mouse_look", "edf_kbm_invert_y",
+                                 "edf_kbm_sensitivity"})
           ResetOne(cvar);
         capture_cvar_.clear();
+        pad_capture_target_ = -1;
         ResetKeyboardDefaults();
         break;
       case 4:
@@ -1045,7 +1251,6 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   }
 
   std::filesystem::path config_path_;
-  std::string pad_name_;
   Hooks hooks_;
   ui::MenuMetrics metrics_;
   ui::MenuGamepad gamepad_;
@@ -1063,6 +1268,14 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
   std::string revert_what_;
   std::string capture_cvar_;      // empty when not rebinding
   bool capture_replace_ = true;   // Set replaces the binding, Add appends an alternative
+  // Controller remap (DrawControllerRemap): the player whose table is shown, and the row
+  // waiting for a button (-1: none), for which player, since when, and the controls that
+  // were already held when it began.
+  int remap_player_ = 0;
+  int pad_capture_target_ = -1, pad_capture_player_ = 0;
+  double pad_capture_started_ = 0;
+  uint32_t pad_capture_ignore_ = 0;
+  menu::PadSnapshot last_pad_raw_;
 };
 
 }  // namespace edf

@@ -26,6 +26,21 @@ REXCVAR_DEFINE_BOOL(edf_menu_pause_audio_engine, false, "EDF2027",
                     "Also suspend the audio engine while the F1 menu pauses the game, so music resumes where it stopped (experimental)");
 REXCVAR_DEFINE_STRING(edf_menu_pad_chord, "back+start", "EDF2027",
                       "Controller buttons that open the settings menu, joined by '+' (a b x y start back lb rb ls rs up down left right), or off");
+// Controller dead zones and remapping (controller_logic.h), applied by the pad hook in
+// input_hooks.cpp under either input backend.
+REXCVAR_DEFINE_INT32(edf_pad_left_deadzone, 0, "EDF2027",
+                     "Left stick inner dead zone in percent of full travel (0 = the game's own only); rescaled")
+    .range(0, 90);
+REXCVAR_DEFINE_INT32(edf_pad_right_deadzone, 0, "EDF2027",
+                     "Right stick inner dead zone in percent of full travel (0 = the game's own only); rescaled")
+    .range(0, 90);
+REXCVAR_DEFINE_INT32(edf_pad_trigger_threshold, 0, "EDF2027",
+                     "Trigger travel in percent that reads as released (0 = off); rescaled")
+    .range(0, 90);
+REXCVAR_DEFINE_STRING(edf_pad_remap_p1, "", "EDF2027",
+                      "Player 1 controller remap: comma-separated target=source (a b x y lb rb lt rt ls rs back start "
+                      "up down left right, none; targets also reload), swap_sticks, invert_lx/ly/rx/ry. Empty = default");
+REXCVAR_DEFINE_STRING(edf_pad_remap_p2, "", "EDF2027", "Player 2 controller remap, same grammar as edf_pad_remap_p1");
 REXCVAR_DEFINE_DOUBLE(edf_menu_scale, 1.0, "EDF2027", "Size of the settings menu and overlay relative to the window height")
     .range(0.5, 2.0);
 REXCVAR_DEFINE_INT32(edf_perf_overlay_detail, 1, "EDF2027",

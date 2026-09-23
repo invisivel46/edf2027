@@ -376,9 +376,7 @@ class Edf2017App : public rex::ReXApp {
       else rex::cvar::SetFlagByName("audio_mute", mute ? "true" : "false");
     };
     hooks.paused = [this]() { return pause_.holding() && edf::menu::Engine().holding.load(); };
-    auto* dlg = new edf::SettingsDialog(imgui_drawer(), config_path_,
-                                        "SDL3 gamepad (auto-detected; XInput via --input_backend xinput)",
-                                        std::move(hooks), by_pad);
+    auto* dlg = new edf::SettingsDialog(imgui_drawer(), config_path_, std::move(hooks), by_pad);
     edf::SettingsDialog::Current() = dlg;
     imgui_drawer()->AddDialog(dlg);
   }

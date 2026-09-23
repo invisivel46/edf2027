@@ -142,8 +142,15 @@ Extracted game: `<same folder>\game\`. Delete the config file to run setup again
 ## Controls
 
 Any gamepad SDL3 recognizes (Xbox, PlayStation, Switch Pro, …) works out of the
-box; `gamecontrollerdb.txt` adds community mappings. Prefer XInput with
-`--input_backend xinput`.
+box; `gamecontrollerdb.txt` adds community mappings. XInput (Xbox-compatible
+pads, up to four) is the alternative: *Controls > Controller API* in F1 settings,
+or `--input_backend xinput`; it takes effect after a restart. Both support
+hot-plugging (first pad connected is player 1, the next player 2), vibration,
+navigating the F1 menu with the pad, per-stick dead zones and a trigger
+threshold, and a per-player button remap (*Controls > Controller mapping*: swap
+or clear buttons and triggers, swap sticks, invert axes; saved as
+`edf_pad_remap_p1` / `edf_pad_remap_p2`). The pad chord that opens F1 always
+uses the physical buttons.
 
 Keyboard & mouse are native, not a pretend gamepad: keys go straight into the
 game's own input channels, and the mouse is added to the soldier's aim as an

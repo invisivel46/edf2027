@@ -1,3 +1,4 @@
+#include "controller_logic.h"
 #include "core_logic.h"
 #include "scripted_input_logic.h"
 #include "keybind_logic.h"
@@ -764,6 +765,221 @@ void TestGuestPadRouting() {
   release.join();
   CHECK(!Engine().holding.load() && Engine().holds.load() == 1);
 }
+void TestControllerRemap() {
+  using namespace edf::pad;
+  using edf::menu::PadSnapshot;
+  namespace m = edf::menu;
+  // Tokens: unique across controls and synthetic actions, and each round-trips.
+  for (int a = 0; a < kTargetCount; ++a) {
+    CHECK(TargetFromToken(TargetToken(a)) == a);
+    for (int b = a + 1; b < kTargetCount; ++b) CHECK(std::string_view(TargetToken(a)) != TargetToken(b));
+  }
+  CHECK(TargetOf(SyntheticAction::kReload) == kControlCount);
+  CHECK(IsSyntheticTarget(TargetOf(SyntheticAction::kReload)) && !IsSyntheticTarget(kA));
+
+  // The default table is the identity and leaves the pad untouched (Guide passes through).
+  const PadRemap identity = PadRemap::Default();
+  CHECK(identity.IsDefault() && UnusedSources(identity) == 0);
+  PadSnapshot pad;
+  pad.buttons = m::kPadA | m::kPadUp | 0x0400;
+  pad.left_trigger = 100; pad.right_trigger = 20;
+  pad.lx = 1000; pad.ly = -2000; pad.rx = 3000; pad.ry = -32768;
+  auto r = ApplyRemap(pad, identity);
+  CHECK(r.game.buttons == pad.buttons && r.synthetic == 0);
+  CHECK(r.game.left_trigger == 100 && r.game.right_trigger == 20);
+  CHECK(r.game.lx == 1000 && r.game.ly == -2000 && r.game.rx == 3000 && r.game.ry == -32768);
+
+  // Swapping A and B is two assignments' worth of swap: Set A <- B.
+  PadRemap ab = AssignSource(identity, kA, kB);
+  CHECK(ab.source[kA] == kB && ab.source[kB] == kA && UnusedSources(ab) == 0);
+  pad = {};
+  pad.buttons = m::kPadA;
+  CHECK(ApplyRemap(pad, ab).game.buttons == m::kPadB);
+  pad.buttons = m::kPadB | m::kPadX;
+  CHECK(ApplyRemap(pad, ab).game.buttons == (m::kPadA | m::kPadX));
+  // Assigning the source a row already has changes nothing.
+  CHECK(AssignSource(ab, kA, kB) == ab);
+  // Out-of-range rows and sources are ignored.
+  CHECK(AssignSource(ab, kTargetCount, kA) == ab && AssignSource(ab, kA, kControlCount) == ab);
+
+  // Triggers mapped to each other stay analogue.
+  PadRemap triggers = AssignSource(identity, kLT, kRT);
+  CHECK(triggers.source[kLT] == kRT && triggers.source[kRT] == kLT);
+  pad = {};
+  pad.left_trigger = 17; pad.right_trigger = 200;
+  r = ApplyRemap(pad, triggers);
+  CHECK(r.game.left_trigger == 200 && r.game.right_trigger == 17 && r.game.buttons == 0);
+
+  // A trigger driving a digital button: pressed from the XInput threshold on. The button
+  // it displaced drives the trigger all-or-nothing.
+  PadRemap rt_to_rb = AssignSource(identity, kRB, kRT);
+  CHECK(rt_to_rb.source[kRB] == kRT && rt_to_rb.source[kRT] == kRB);
+  pad = {};
+  pad.right_trigger = kTriggerPressThreshold - 1;
+  r = ApplyRemap(pad, rt_to_rb);
+  CHECK(r.game.buttons == 0 && r.game.right_trigger == 0);
+  pad.right_trigger = kTriggerPressThreshold;
+  r = ApplyRemap(pad, rt_to_rb);
+  CHECK(r.game.buttons == m::kPadRightShoulder && r.game.right_trigger == 0);
+  pad = {};
+  pad.buttons = m::kPadRightShoulder;
+  r = ApplyRemap(pad, rt_to_rb);
+  CHECK(r.game.buttons == 0 && r.game.right_trigger == 255);
+
+  // Clearing a row: the physical button then does nothing, and says so.
+  PadRemap cleared = AssignSource(identity, kY, kNoSource);
+  CHECK(cleared.source[kY] == kNoSource && UnusedSources(cleared) == (1u << kY));
+  pad = {};
+  pad.buttons = m::kPadY;
+  CHECK(ApplyRemap(pad, cleared).game.buttons == 0);
+
+  // Synthetic action: taking a button frees it from its game control.
+  const int reload = TargetOf(SyntheticAction::kReload);
+  PadRemap with_reload = AssignSource(identity, reload, kLS);
+  CHECK(with_reload.source[reload] == kLS && with_reload.source[kLS] == kNoSource);
+  pad = {};
+  pad.buttons = m::kPadLeftThumb | m::kPadA;
+  r = ApplyRemap(pad, with_reload);
+  CHECK(r.game.buttons == m::kPadA && r.synthetic == (1u << unsigned(SyntheticAction::kReload)));
+  // Taking the button back for its control unbinds the action again.
+  PadRemap back = AssignSource(with_reload, kLS, kLS);
+  CHECK(back.source[kLS] == kLS && back.source[reload] == kNoSource && back.IsDefault());
+  // A trigger can drive an action too.
+  r = ApplyRemap(PadSnapshot{0, 0, 255, 0, 0, 0, 0}, AssignSource(identity, reload, kRT));
+  CHECK(r.synthetic == 1u && r.game.right_trigger == 0);
+
+  // Sticks: swap first, then invert what the game sees; -32768 inverts to +32767.
+  PadRemap sticks = identity;
+  sticks.swap_sticks = true;
+  sticks.invert_ry = true;
+  pad = {};
+  pad.lx = 100; pad.ly = -32768; pad.rx = 300; pad.ry = 400;
+  r = ApplyRemap(pad, sticks);
+  CHECK(r.game.lx == 300 && r.game.ly == 400 && r.game.rx == 100 && r.game.ry == 32767);
+  sticks = identity;
+  sticks.invert_lx = sticks.invert_ly = sticks.invert_rx = true;
+  r = ApplyRemap(pad, sticks);
+  CHECK(r.game.lx == -100 && r.game.ly == 32767 && r.game.rx == -300 && r.game.ry == 400);
+
+  // Capture helpers: pressed controls, including triggers, and the lowest one.
+  pad = {};
+  pad.buttons = m::kPadB | m::kPadDown;
+  pad.left_trigger = 200;
+  const uint32_t pressed = PressedControls(pad);
+  CHECK(pressed == ((1u << kB) | (1u << kDown) | (1u << kLT)));
+  CHECK(FirstControl(pressed) == kB && FirstControl(0) == kNoSource);
+  CHECK(FirstControl(pressed & ~(1u << kB)) == kLT);
+
+  // Process-wide synthetic state, as the pad hook publishes it.
+  PublishSynthetic(1, 1u << unsigned(SyntheticAction::kReload));
+  CHECK(SyntheticActionHeld(1, SyntheticAction::kReload) && !SyntheticActionHeld(0, SyntheticAction::kReload));
+  PublishSynthetic(1, 0);
+  CHECK(!SyntheticActionHeld(1, SyntheticAction::kReload));
+  PublishSynthetic(9, 1);  // out of range: ignored
+  CHECK(!SyntheticActionHeld(9, SyntheticAction::kReload));
+}
+
+void TestControllerRemapPersistence() {
+  using namespace edf::pad;
+  CHECK(SerializeRemap(PadRemap::Default()).empty());
+  CHECK(ParseRemap("").IsDefault());
+  PadRemap remap = AssignSource(PadRemap::Default(), kA, kB);
+  remap = AssignSource(remap, kLT, kRT);
+  remap = AssignSource(remap, TargetOf(SyntheticAction::kReload), kBack);
+  remap = AssignSource(remap, kUp, kNoSource);
+  remap.swap_sticks = true;
+  remap.invert_ly = true;
+  remap.invert_rx = true;
+  const std::string text = SerializeRemap(remap);
+  CHECK(text == "a=b,b=a,lt=rt,rt=lt,back=none,up=none,reload=back,swap_sticks,invert_ly,invert_rx");
+  CHECK(ParseRemap(text) == remap);
+  // Nothing a TOML string would need escaped.
+  CHECK(text.find_first_of("\"\\\n") == std::string::npos);
+  // Every single-row change round-trips, for every row and source.
+  for (int target = 0; target < kTargetCount; ++target)
+    for (int source = kNoSource; source < kControlCount; ++source) {
+      const PadRemap one = AssignSource(PadRemap::Default(), target, source);
+      CHECK(ParseRemap(SerializeRemap(one)) == one);
+    }
+  // Lenient reading: spaces, case, empty and unknown tokens (a newer build's action) are
+  // skipped; the rest still applies.
+  const PadRemap lenient = ParseRemap(" A = B , ,B=a,future_action=x,x=bogus,nonsense,SWAP_STICKS ");
+  CHECK(lenient.source[kA] == kB && lenient.source[kB] == kA && lenient.source[kX] == kX && lenient.swap_sticks);
+  // Through the config writer, as the settings menu saves it, and back.
+  using edf::settings::ConfigOverride;
+  const std::vector<ConfigOverride> overrides{{"edf_pad_remap_p1", "\"" + text + "\"", false}};
+  const std::string config = edf::settings::ApplyConfigOverrides("edf_pad_remap_p1 = \"\"\n", overrides);
+  CHECK(config == "edf_pad_remap_p1 = \"" + text + "\"\n");
+  const size_t open = config.find('"'), close = config.rfind('"');
+  CHECK(ParseRemap(std::string_view(config).substr(open + 1, close - open - 1)) == remap);
+  // The remap and dead-zone cvars apply live; the input backend needs a restart.
+  CHECK(!edf::settings::NeedsRestart("edf_pad_remap_p1") && !edf::settings::NeedsRestart("edf_pad_left_deadzone"));
+  CHECK(edf::settings::NeedsRestart("input_backend"));
+}
+
+void TestDeadzones() {
+  using namespace edf::pad;
+  using edf::menu::PadSnapshot;
+  // Off: untouched, extremes included.
+  int16_t x = -32768, y = 32767;
+  ApplyStickDeadzone(x, y, 0.0f);
+  CHECK(x == -32768 && y == 32767);
+  // Inside the radius: centred. The radius is round, not per axis.
+  x = 5000; y = 5000;  // magnitude ~0.216
+  ApplyStickDeadzone(x, y, 0.25f);
+  CHECK(x == 0 && y == 0);
+  x = 7000; y = 7000;  // magnitude ~0.302: outside, though each axis alone is inside
+  ApplyStickDeadzone(x, y, 0.25f);
+  CHECK(x > 0 && y > 0 && x == y);
+  // Rescaled: just past the edge is small, full travel stays full, direction is kept.
+  x = int16_t(0.26f * 32767); y = 0;
+  ApplyStickDeadzone(x, y, 0.25f);
+  CHECK(x > 0 && x < 600 && y == 0);
+  x = 32767; y = 0;
+  ApplyStickDeadzone(x, y, 0.25f);
+  CHECK(x == 32767 && y == 0);
+  x = 0; y = -32768;
+  ApplyStickDeadzone(x, y, 0.25f);
+  CHECK(x == 0 && y == -32767);
+  x = -16384; y = 0;  // half travel with a 20% zone: (0.5 - 0.2) / 0.8 = 0.375
+  ApplyStickDeadzone(x, y, 0.2f);
+  CHECK(std::abs(x - int(-0.375 * 32767)) <= 2 && y == 0);
+  x = 23170; y = 23170;  // corner of a square-gated stick: clamped to the unit circle
+  ApplyStickDeadzone(x, y, 0.1f);
+  CHECK(std::sqrt(double(x) * x + double(y) * y) <= 32767.5 && x == y);
+  // The zone is capped at 90%.
+  x = int16_t(0.95f * 32767); y = 0;
+  ApplyStickDeadzone(x, y, 5.0f);
+  CHECK(x > 0);
+
+  // Triggers.
+  CHECK(ApplyTriggerDeadzone(0, 0.0f) == 0 && ApplyTriggerDeadzone(255, 0.0f) == 255 &&
+        ApplyTriggerDeadzone(77, 0.0f) == 77);
+  CHECK(ApplyTriggerDeadzone(51, 0.2f) == 0);   // 20% of 255 = 51
+  CHECK(ApplyTriggerDeadzone(52, 0.2f) == 1);
+  CHECK(std::abs(ApplyTriggerDeadzone(153, 0.2f) - 128) <= 1);  // (153 - 51) * 255 / 204 = 127.5
+  CHECK(ApplyTriggerDeadzone(255, 0.2f) == 255);
+
+  // Percent cvars to fractions, clamped.
+  const auto zones = Deadzones::FromPercent(10, 200, -5);
+  CHECK(std::abs(zones.left - 0.1f) < 1e-6f && zones.right == kMaxDeadzone && zones.trigger == 0.0f);
+
+  // The whole pad: dead zones on the physical sticks, then the table (the swap moves the
+  // already dead-zoned stick), and a trigger under the threshold does not press a button.
+  PadRemap remap = AssignSource(PadRemap::Default(), kA, kLT);
+  remap.swap_sticks = true;
+  PadSnapshot pad;
+  pad.lx = 3000; pad.rx = 32767; pad.left_trigger = 60;
+  auto r = ProcessPad(pad, Deadzones::FromPercent(20, 0, 20), &remap);
+  CHECK(r.game.rx == 0 && r.game.lx == 32767);  // the left stick's drift is gone, on the right
+  CHECK(r.game.buttons == 0);                   // 60 -> 11 after a 20% threshold: under 30
+  pad.left_trigger = 120;
+  r = ProcessPad(pad, Deadzones::FromPercent(20, 0, 20), &remap);
+  CHECK(r.game.buttons == edf::menu::kPadA);
+  // No table (players 3 and 4): dead zones only.
+  r = ProcessPad(pad, Deadzones::FromPercent(20, 0, 0), nullptr);
+  CHECK(r.game.lx == 0 && r.game.rx == 32767 && r.game.left_trigger == 120 && r.synthetic == 0);
+}
 }  // namespace
 
 int main() {
@@ -786,6 +1002,9 @@ int main() {
   TestMenuInputGate();
   TestPadChord();
   TestGuestPadRouting();
+  TestControllerRemap();
+  TestControllerRemapPersistence();
+  TestDeadzones();
   if (failures) std::cerr << failures << " test assertion(s) failed\n";
   else std::cout << "All unit tests passed\n";
   return failures ? 1 : 0;

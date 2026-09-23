@@ -1,8 +1,13 @@
 // Guest-side input hook: overrides the game's XInputGetState wrapper
-// (sub_8212EA20: r3=user, r4=X_INPUT_STATE*) so we can see exactly what the
-// game polls/receives. Keyboard and mouse do not pass through here; see native_kbm.cpp.
+// (sub_8212EA20: r3=user, r4=X_INPUT_STATE*), the game's only pad read (it imports
+// XamInputGetState and XamInputSetState, no keystroke or capability calls). Every pad the
+// game sees passes here, under either input backend: the F1 menu chord and gate, then the
+// dead zones and the player's remap table (controller_logic.h). Keyboard and mouse do not
+// pass through here; see native_kbm.cpp.
 #include <chrono>
 #include <algorithm>
+#include <array>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <thread>
@@ -17,6 +22,7 @@
 #include "native_graphics/native_renderer_preset.h"
 #include "scripted_input_logic.h"
 #include "pause_menu.h"
+#include "controller_logic.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -32,22 +38,72 @@ REXCVAR_DECLARE(bool, edf_trace_input);
 REXCVAR_DECLARE(bool, edf_rumble);
 REXCVAR_DECLARE(int32_t, edf_frame_pacer_spin_us);
 REXCVAR_DECLARE(std::string, edf_menu_pad_chord);
+REXCVAR_DECLARE(int32_t, edf_pad_left_deadzone);
+REXCVAR_DECLARE(int32_t, edf_pad_right_deadzone);
+REXCVAR_DECLARE(int32_t, edf_pad_trigger_threshold);
+REXCVAR_DECLARE(std::string, edf_pad_remap_p1);
+REXCVAR_DECLARE(std::string, edf_pad_remap_p2);
 
 namespace {
 uint32_t g_calls = 0, g_last_rc = 0xFFFFFFFF;
 uint16_t g_last_btn = 0xFFFF;
 
+// The players' remap tables, parsed again only when their cvar text changes (the settings
+// menu edits them live). Guest pad polls can come from more than one thread.
+struct RemapTables {
+  std::mutex mutex;
+  std::array<std::string, edf::pad::kRemapPlayers> text;
+  std::array<edf::pad::PadRemap, edf::pad::kRemapPlayers> table{edf::pad::PadRemap::Default(),
+                                                                 edf::pad::PadRemap::Default()};
+};
+RemapTables& Remaps() { static RemapTables tables; return tables; }
+
+// Dead zones, then the remap table of guest user `user`; users past the tables get the
+// dead zones only. Returns the synthetic actions held.
+uint32_t RemapPad(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
+  const auto zones = edf::pad::Deadzones::FromPercent(
+      REXCVAR_GET(edf_pad_left_deadzone), REXCVAR_GET(edf_pad_right_deadzone), REXCVAR_GET(edf_pad_trigger_threshold));
+  edf::pad::PadRemap table;
+  const bool has_table = user < uint32_t(edf::pad::kRemapPlayers);
+  if (has_table) {
+    const std::string text = user == 0 ? REXCVAR_GET(edf_pad_remap_p1) : REXCVAR_GET(edf_pad_remap_p2);
+    auto& remaps = Remaps();
+    std::lock_guard lock(remaps.mutex);
+    if (text != remaps.text[user]) {
+      remaps.text[user] = text;
+      remaps.table[user] = edf::pad::ParseRemap(text);
+      REXLOG_INFO("Controller remap, player {}: \"{}\"", user + 1, edf::pad::SerializeRemap(remaps.table[user]));
+    }
+    table = remaps.table[user];
+  }
+  const edf::menu::PadSnapshot raw{pad.buttons, pad.left_trigger, pad.right_trigger,
+                                   pad.thumb_lx, pad.thumb_ly, pad.thumb_rx, pad.thumb_ry};
+  const auto result = edf::pad::ProcessPad(raw, zones, has_table ? &table : nullptr);
+  pad.buttons = result.game.buttons;
+  pad.left_trigger = result.game.left_trigger;
+  pad.right_trigger = result.game.right_trigger;
+  pad.thumb_lx = result.game.lx;
+  pad.thumb_ly = result.game.ly;
+  pad.thumb_rx = result.game.rx;
+  pad.thumb_ry = result.game.ry;
+  return result.synthetic;
+}
+
 // F1 menu (pause_menu.h): the pad chord that opens it, and while it is open - and until
-// the pad has been let go after it closes - the game sees an untouched pad.
-void RoutePadForMenu(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
+// the pad has been let go after it closes - the game sees an untouched pad. The chord and
+// the drain look at the RAW pad, before dead zones and remapping, so no remap can make the
+// menu unreachable. Then the player's dead zones and remap table.
+void RoutePad(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
   const edf::menu::PadSnapshot snapshot{pad.buttons, pad.left_trigger, pad.right_trigger,
                                         pad.thumb_lx, pad.thumb_ly, pad.thumb_rx, pad.thumb_ry};
   const auto routed = edf::menu::RouteGuestPad(snapshot, REXCVAR_GET(edf_menu_pad_chord), user == 0);
   if (routed.blank) {
     pad = rex::input::X_INPUT_GAMEPAD{};
+    edf::pad::PublishSynthetic(int(user), 0);
     return;
   }
-  pad.buttons = routed.buttons;
+  pad.buttons = routed.buttons;  // the chord's buttons taken out, as raw buttons
+  edf::pad::PublishSynthetic(int(user), RemapPad(user, pad));
 }
 }  // namespace
 
@@ -61,6 +117,7 @@ REX_HOOK_RAW(sub_8212EA20) {
     if (REXCVAR_GET(edf_trace_input) && user == 0 && rc != g_last_rc)
       REXLOG_INFO("XInputGetState hook: user={} rc={:#x} state={:#x}", user, rc, ptr);
     g_last_rc = rc;
+    edf::pad::PublishSynthetic(int(user), 0);  // no pad: nothing held
     return;
   }
   auto* st = reinterpret_cast<rex::input::X_INPUT_STATE*>(base + ptr);
@@ -72,7 +129,7 @@ REX_HOOK_RAW(sub_8212EA20) {
                 (uint32_t)st->packet_number, g_calls);
     g_last_rc = rc; g_last_btn = btn;
   }
-  RoutePadForMenu(user, st->gamepad);
+  RoutePad(user, st->gamepad);
 }
 
 // Gate the game's XInputSetState wrapper so the option applies equally to the

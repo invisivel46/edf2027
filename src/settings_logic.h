@@ -141,6 +141,7 @@ inline constexpr std::array<std::string_view, 16> kRestartCvars{
 inline bool NeedsRestart(std::string_view cvar, std::string_view description = {}) {
   for (auto name : kRestartCvars)
     if (name == cvar) return true;
+  if (cvar == "input_backend") return true;  // the SDK creates its input drivers once, at boot
   if (cvar.starts_with("present_") || cvar == "swap_post_effect") return true;  // classic presenter
   std::string lower(description);
   std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return char(std::tolower(c)); });
