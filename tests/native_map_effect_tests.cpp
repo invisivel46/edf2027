@@ -1,10 +1,14 @@
 #include "native_graphics/native_map_effects.h"
+#include <emmintrin.h>
 #include <array>
 #include <bit>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -144,9 +148,9 @@ void TestCensus() {
 }
 
 // ---- clElectricWire: the native builder against a transcription of the guest ----
-// Heap at [0, 0x10000) and the image's .rdata/.data from 0x82000000, big-endian.
+// Heap at [0, 0x40000) and the image's .rdata/.data from 0x82000000, big-endian.
 struct ImageMemory {
-  static constexpr uint32_t heap=0x10000,image=0x82000000u,image_size=0x580000;
+  static constexpr uint32_t heap=0x40000,image=0x82000000u,image_size=0x580000;
   mutable std::vector<uint8_t> bytes=std::vector<uint8_t>(heap+image_size);
   static uint32_t Add(uint32_t at,uint32_t offset) { return at+offset; }
   static size_t Map(uint32_t at,size_t size) {
@@ -666,13 +670,835 @@ void TestMapEffectMembers() {
   m.StoreWord(manager,0x82000000);
   bool refused=false;
   try { CollectNativeMapEffectMembers(m,manager); } catch(const std::exception&) { refused=true; }
-  Require(refused && kNativeGrassMapSupport==NativeGrassMapSupport::Unsupported,"non-manager walked");
+  Require(refused,"non-manager walked");
+}
+
+// ---- clGrassMap: the native builder against a transcription of the guest ----
+// Registers as the recompiled bodies hold them: GPRs as 64-bit values, rotates
+// as the recompiler writes rlwinm/rotlwi, fctiwz with its NaN/INT_MAX guards
+// in front of cvttsd2si, divw with its zero/overflow guard.
+uint64_t Rot(uint64_t r,int n) { const uint64_t v=uint64_t(uint32_t(r))|(r<<32); return (v<<n)|(v>>(64-n)); }
+uint32_t Fctiwz(double f) {
+  if(std::isnan(f)) return 0x80000000u;
+  if(f>=double(INT_MAX)) return uint32_t(INT_MAX);
+  return uint32_t(_mm_cvttsd_si32(_mm_load_sd(&f)));
+}
+uint32_t Divw(uint32_t a,uint32_t b) {
+  return (int32_t(b) && !(int32_t(a)==INT32_MIN && int32_t(b)==-1))?uint32_t(int32_t(a)/int32_t(b)):0;
+}
+uint32_t Lhz(const ImageMemory& m,uint32_t at) { const auto* p=m.Bytes(at,2); return uint32_t(p[0])<<8|p[1]; }
+uint32_t Lbz(const ImageMemory& m,uint32_t at) { return m.Bytes(at,1)[0]; }
+[[noreturn]] void Trap() { throw std::runtime_error("twi"); }
+// What 8218D440 binds and 8218D3F0 draws: the Utility object (r3), the
+// texture (8218D440's r4), 821FD8F8's primitive, vertex count and the bytes at
+// its r6 (stride 36).
+struct GuestGrassDraw { uint32_t utility=0,texture=0,primitive=0,count=0,vertices=0; std::vector<uint8_t> bytes; };
+struct GuestGrassLog {
+  std::vector<std::array<int32_t,2>> cells;
+  std::vector<GuestGrassDraw> draws;
+  uint32_t texture=0,utility=0;
+  uint32_t blend_src=0,blend_dst=0,depth_write=2,pushed=0;
+};
+// sub_821B0198 (r3 out, r4 vec4, r5 matrix).
+void Guest821B0198(const ImageMemory& m,uint32_t r3,uint32_t r4,uint32_t r5) {
+  double f0=Lfs(m,r4+8),f6=Lfs(m,r5+36);
+  f6=F(f6*f0);
+  double f13=Lfs(m,r4+4),f3=Lfs(m,r5+20),f12=Lfs(m,r4+12),f31=Lfs(m,r5+52),f11=Lfs(m,r4+0),f10=Lfs(m,r5+4);
+  double f5=Lfs(m,r5+40),f4=Lfs(m,r5+44);
+  f5=F(f5*f0); f4=F(f4*f0);
+  double f2=Lfs(m,r5+24),f7=Lfs(m,r5+0);
+  f6=F(std::fma(f3,f13,f6));
+  double f1=Lfs(m,r5+28),f30=Lfs(m,r5+56),f29=Lfs(m,r5+60),f9=Lfs(m,r5+8),f8=Lfs(m,r5+12);
+  f5=F(std::fma(f2,f13,f5));
+  f4=F(std::fma(f1,f13,f4));
+  f6=F(std::fma(f31,f12,f6));
+  f5=F(std::fma(f30,f12,f5));
+  f4=F(std::fma(f29,f12,f4));
+  f10=F(std::fma(f10,f11,f6));
+  f6=Lfs(m,r5+32);
+  f0=F(f0*f6);
+  f6=Lfs(m,r5+16);
+  f9=F(std::fma(f9,f11,f5));
+  f5=Lfs(m,r5+48);
+  f8=F(std::fma(f8,f11,f4));
+  Stfs(m,r3+4,f10); Stfs(m,r3+8,f9); Stfs(m,r3+12,f8);
+  f0=F(std::fma(f11,f7,f0));
+  f0=F(std::fma(f6,f13,f0));
+  f0=F(std::fma(f5,f12,f0));
+  Stfs(m,r3+0,f0);
+}
+// sub_82171BD8 (r3 grass, f1 limit): r3 of the return.
+uint32_t Guest82171BD8(const ImageMemory& m,uint32_t r3,double f1) {
+  const uint32_t r31=r3;
+  const double f31=f1;
+  const uint32_t r4=r31+288;
+  uint32_t r11=m.Word(r31+1228);
+  const uint32_t r3b=r11+32;
+  const uint32_t r30=m.Word(r11+16);
+  Guest821B0198(m,r3b,r4,r30+96);
+  r11=m.Word(r31+1228);
+  const uint32_t r4b=r11+32;
+  double f0=Lfs(m,r11+8);
+  const double f13=Lfs(m,r4b+8);
+  f0=F(f0*f13);
+  f0=std::bit_cast<double>(std::bit_cast<uint64_t>(f0)^0x8000000000000000ull);
+  if(f0>f31) return 0;
+  const bool r3c=Guest821C2FD0(m,r30+288,r4b,Lfs(m,r31+352));
+  return uint32_t(r3c?1:0);   // clrlwi; cntlzw; rlwinm 27,31,31; xori 1
+}
+// sub_821B03C8 (r3 vector): f1.
+double Guest821B03C8(const ImageMemory& m,uint32_t r3) {
+  double f13=Lfs(m,r3+4);
+  f13=F(f13*f13);
+  double f0=Lfs(m,r3+0);
+  const double f12=Lfs(m,r3+8);
+  const double f1=Lfs(m,0x820009A4);
+  f0=F(std::fma(f0,f0,f13));
+  f0=F(std::fma(f12,f12,f0));
+  if(f0==f1) return f1;
+  return F(std::sqrt(f0));
+}
+// sub_8218D440 (r3 Utility, r4 texture): 821BC4C8 and 821B94E8 bind, then
+// the declaration traps.
+void Guest8218D440(const ImageMemory& m,uint32_t r3,uint32_t r4,GuestGrassLog& log) {
+  log.utility=r3; log.texture=r4;
+  const uint32_t r11=m.Word(r3+60);
+  if(r11==0) Trap();
+  const uint32_t r10=m.Word(r3+64);
+  if(r10==m.Word(r11+4)) Trap();
+}
+// sub_8218D3F0 (r3 Utility, r4 primitive, r5 vertices, r6 count): 821FD8F8
+// (r4 primitive, r5 = table[r4].a * count + table[r4].b, r6 vertices, r7 36).
+void Guest8218D3F0(const ImageMemory& m,uint32_t r3,uint32_t r4,uint32_t r5,uint32_t r6,GuestGrassLog& log) {
+  const uint32_t r11=uint32_t(Rot(r4,3)&0xFFFFFFF8u);
+  const uint32_t r9=r6,r6b=r5,r7=36;
+  const uint32_t r10=0x82010000u-30584u;
+  const uint32_t r8=r10+4;
+  const uint32_t r5b=m.Word(r11+r10),r10b=m.Word(r11+r8);
+  const uint32_t r11b=uint32_t(int64_t(int32_t(r5b))*int64_t(int32_t(r9)));
+  const uint32_t r5c=r11b+r10b;
+  GuestGrassDraw draw{r3,log.texture,r4,r9,r5c,{}};
+  if(log.utility!=r3) Trap();
+  const auto* bytes=m.Bytes(r6b,size_t(r5c)*r7);
+  draw.bytes.assign(bytes,bytes+size_t(r5c)*r7);
+  log.draws.push_back(std::move(draw));
+}
+// sub_82171F58 (r3 grass, r4 x, r5 z), its frame at `stack` (r1 after stwu -544).
+void Guest82171F58(const ImageMemory& m,uint32_t r3,uint32_t r4,uint32_t r5,uint32_t stack,GuestGrassLog& log) {
+  log.cells.push_back({int32_t(r4),int32_t(r5)});
+  const uint32_t r31=r3;
+  uint32_t r29=r5;
+  if(int32_t(r4)<0) return;
+  uint32_t r11=m.Word(r31+1208);
+  if(!(int32_t(r4)<int32_t(r11))) return;
+  if(int32_t(r29)<0) return;
+  uint32_t r10=m.Word(r31+1212);
+  if(!(int32_t(r29)<int32_t(r10))) return;
+  r11=uint32_t(int64_t(int32_t(r11))*int64_t(int32_t(r29)));
+  r10=m.Word(r31+1176);
+  r11=r11+r4;
+  r11=uint32_t(Rot(r11,2)&0xFFFFFFFCu);
+  uint32_t r30=m.Word(r11+r10);
+  if(int32_t(r30)<0) return;
+  int64_t r9=int32_t(r29);                              // extsw r9,r29
+  r11=m.Word(r31+1216);
+  r10=uint32_t(Rot(r30,3)&0xFFFFFFF8u);
+  double f12=Lfs(m,r31+1152),f0=Lfs(m,r31+1144);
+  r11=r11+r10;
+  const double f9=Lfs(m,r31+1128);
+  double f11=Lfs(m,r31+1140);
+  const int64_t s112=r9;                                // std r9,112(r1)
+  const double f7=Lfs(m,r31+1148),f5=Lfs(m,r31+1124);
+  double f13=Lfs(m,r11+0);
+  const double f25=Lfs(m,0x820008CC);
+  const int64_t r10s=int32_t(r4);                       // extsw r10,r4
+  double f10=Lfs(m,r11+4);
+  Stfs(m,r31+300,f25);
+  const int64_t s80=r10s;                               // std r10,80(r1)
+  const double f26=Lfs(m,0x820008D4);
+  double f8=double(s112);                               // lfd; fcfid
+  const double f6=double(s80);
+  f8=F(f8);
+  const double f16=F(f6);
+  f0=F(std::fma(f0,f8,f12));
+  f11=F(std::fma(f11,f16,f7));
+  f12=F(f0+f9); Stfs(m,r31+296,f12);
+  f0=F(f10-f13);
+  f12=F(f11+f5); Stfs(m,r31+288,f12);
+  f0=F(f0*f26);
+  f13=F(f13+f0); Stfs(m,r31+292,f13);
+  f12=Lfs(m,r31+1148);
+  f10=F(f12*f12);
+  f13=Lfs(m,r31+1152);
+  Stfs(m,r31+344,f13);
+  Stfs(m,r31+324,f0);
+  f11=Lfs(m,r31+1156);
+  Stfs(m,r31+304,f12);
+  f13=F(std::fma(f13,f13,f10));
+  f0=F(std::fma(f0,f0,f13));
+  f0=F(std::sqrt(f0));
+  Stfs(m,r31+352,f0);
+  double f1=F(f11+f0);
+  if(Guest82171BD8(m,r31,f1)==0) return;
+  uint32_t r8=m.Word(r31+1188);
+  uint32_t r28=r31+920;
+  f0=Lfs(m,r31+1128); f13=Lfs(m,r31+1112);
+  uint32_t r7=stack+180;
+  m.StoreWord(stack+176,0);
+  uint32_t r6=r28;
+  r11=m.Word(r31+1200);
+  r9=int64_t(int32_t(r11))*int64_t(int32_t(r29));
+  r9=int32_t(r9);                                        // extsw
+  const uint32_t r4b=uint32_t(int64_t(int32_t(r11))*int64_t(int32_t(r11)));
+  const int64_t s80b=r9;
+  uint32_t r9u=uint32_t(int64_t(int32_t(r4b))*int64_t(int32_t(r30)));
+  r9u=uint32_t(Rot(r9u,2)&0xFFFFFFFCu);
+  r29=r9u+r8;
+  f12=double(s80b); f12=F(f12);
+  double f19=F(std::fma(f12,f13,f0));
+  for(uint32_t ctr=15;ctr;--ctr) { m.StoreWord(r7,0); r7+=4; }
+  r10=0;
+  do { const uint32_t w=m.Word(r6); r6+=12; m.StoreWord(r10+stack+244,w); r10+=4; } while(int32_t(r10)<60);
+  uint32_t r25=0;
+  if(int32_t(r11)>0) {
+    const uint32_t r27=0x82550000u+17536u;
+    const double f17=Lfs(m,0x82000000u+8676u),f18=Lfs(m,0x82000000u+9376u),f20=Lfs(m,0x82010000u+9424u),
+      f21=Lfs(m,0x82000000u+20472u),f22=Lfs(m,0x82010000u+9420u),f24=Lfs(m,0x82010000u-27052u);
+    do {
+      r11=m.Word(r31+1200); f12=Lfs(m,r31+1108); f0=Lfs(m,r31+1124);
+      uint32_t r26=0;
+      const int64_t n80=int32_t(r11);
+      f13=double(n80); f13=F(f13); f13=F(f13*f12);
+      double f23=F(std::fma(f13,f16,f0));
+      if(int32_t(r11)>0) do {
+        uint64_t r10v=Lhz(m,r29);
+        uint64_t r30v=Rot(r10v,20)&0xFFFFF;
+        if(int32_t(r30v)!=0) {
+          uint64_t r9v=Rot(r10v,24)&0xF;
+          uint64_t r8v=Lhz(m,r29+2);
+          uint64_t r11v=Rot(r30v,3)&0xFFFFFFF8u;
+          double f11b=Lfs(m,r31+1112);
+          r9v=uint32_t(r9v)&0xFFFF;
+          r10v=uint64_t(int64_t(int16_t(uint16_t(r10v))));
+          double f0b=Lfs(m,uint32_t(r11v)+r27);
+          const int64_t s112b=int64_t(r9v);
+          r9v=uint64_t(int64_t(int16_t(uint16_t(r8v))));
+          const uint32_t r8b=r27+4;
+          const int64_t s152=int64_t(r9v);
+          double f10b=Lfs(m,uint32_t(r11v)+r8b);
+          r11v=Rot(r10v,24)&0xFF000000u;
+          r10v=Rot(r10v,28)&0xF0000000u;
+          f10b=F(f10b-f0b);
+          r11v=uint64_t(int64_t(int32_t(r11v)>>28));
+          Stfs(m,r31+300,f25);
+          r10v=uint64_t(int64_t(int32_t(r10v)>>28));
+          const int64_t s160=int64_t(int32_t(r11v)),s144=int64_t(int32_t(r10v));
+          double f13b=double(s112b);
+          double f9b=double(s152);
+          f13b=F(f13b); f9b=F(f9b);
+          double f8b=double(s144);
+          f10b=F(f10b*f13b);
+          double f28=F(f13b*f22);
+          const double f31=F(f9b*f24);
+          f9b=double(s160);
+          f8b=F(f8b);
+          const double f27=F(std::fma(f10b,f21,f0b));
+          f9b=F(f9b);
+          f13b=F(f8b*f11b);
+          f0b=F(f9b*f12);
+          const double f29=F(std::fma(f13b,f24,f19)); Stfs(m,r31+296,f29);
+          const double f30=F(std::fma(f0b,f24,f23)); Stfs(m,r31+288,f30);
+          f0b=F(f27*f26);
+          f13b=F(f0b+f31); Stfs(m,r31+292,f13b);
+          f13b=F(f0b*f20);
+          double f1b=Lfs(m,r31+1156);
+          Stfs(m,r31+304,f0b); Stfs(m,r31+324,f0b); Stfs(m,r31+344,f0b); Stfs(m,r31+352,f13b);
+          if(Guest82171BD8(m,r31,f1b)!=0) {
+            f0b=Lfs(m,r31+1232);
+            const uint32_t r3v=stack+128;
+            f13b=Lfs(m,r31+1236);
+            f0b=F(f30-f0b); Stfs(m,stack+128,f0b);
+            f0b=F(f31-f13b);
+            double f12b=Lfs(m,r31+1240);
+            Stfs(m,stack+132,f0b);
+            f0b=F(f29-f12b); Stfs(m,stack+136,f0b);
+            Stfs(m,stack+140,f25);
+            f1b=Guest821B03C8(m,r3v);
+            f0b=Lfs(m,r31+1156);
+            f13b=F(f0b*f17);
+            f0b=F(-std::fma(f0b,f18,-f1b));
+            f0b=F(f0b/f13b);
+            if(!(f0b>f25)) {
+              f0b=F(f25-f0b);
+              if(f0b>f25) f0b=f25;
+              uint32_t r10c=uint32_t(Rot(r30v,4)&0xFFFFFFF0u);
+              f1b=f28;
+              uint32_t r11c=stack+96;
+              r10c=r10c+r31; r10c=r10c+396;
+              { const uint32_t a=m.Word(r10c),b=m.Word(r10c+4),c=m.Word(r10c+8),d=m.Word(r10c+12);
+                m.StoreWord(r11c,a); m.StoreWord(r11c+4,b); m.StoreWord(r11c+8,c); m.StoreWord(r11c+12,d); }
+              f13b=Lfs(m,stack+108);
+              f0b=F(f13b*f0b); Stfs(m,stack+108,f0b);
+              f1b=NativeGuestSin(f1b);
+              f0b=f1b; f1b=f28;
+              f0b=F(f0b); f0b=F(f0b*f27); f28=F(f0b*f26);
+              f1b=NativeGuestCos(f1b);
+              f13b=F(f1b);
+              uint32_t r11=stack+96;
+              const uint32_t r10=uint32_t(Rot(r30v,2)&0xFFFFFFFCu);
+              f12b=F(f30-f28);
+              const uint32_t r4=stack+240;
+              f0b=F(f27+f31);
+              uint32_t r9=stack+96;
+              f11b=F(f28+f30);
+              uint32_t r8=m.Word(r11+0),r7=m.Word(r11+4),r6=m.Word(r11+8),r5=m.Word(r11+12);
+              r11=m.Word(r10+r4);
+              f13b=F(f13b*f27);
+              uint32_t r3=m.Word(r9+0),r30=m.Word(r9+4),r24=m.Word(r9+8),r23=m.Word(r9+12);
+              r9=r11+20;
+              Stfs(m,r11+0,f12b); Stfs(m,r11+4,f0b);
+              m.StoreWord(r9+0,r8); m.StoreWord(r9+4,r7);
+              r7=stack+96;
+              f13b=F(f13b*f26);
+              m.StoreWord(r9+8,r6); m.StoreWord(r9+12,r5);
+              r6=stack+96; r5=stack+96;
+              f10b=F(f29-f13b); Stfs(m,r11+8,f10b);
+              r11+=36;
+              f9b=F(f13b+f29);
+              r9=r11+20;
+              Stfs(m,r11+0,f11b); Stfs(m,r11+8,f9b);
+              m.StoreWord(r9+0,r3);
+              Stfs(m,r11+4,f0b);
+              m.StoreWord(r9+4,r30);
+              r11+=36;
+              m.StoreWord(r9+8,r24);
+              f8b=f10b;
+              m.StoreWord(r9+12,r23);
+              r9=stack+96;
+              r8=r11+20;
+              f10b=F(f29-f28);
+              Stfs(m,r11+8,f9b);
+              f9b=f12b;
+              Stfs(m,r11+0,f11b);
+              f12b=F(f30-f13b);
+              Stfs(m,r11+4,f31);
+              r3=m.Word(r9+0);
+              r11+=36;
+              f11b=F(f28+f29);
+              f13b=F(f13b+f30);
+              r30=m.Word(r9+4);
+              r23=r11+20;
+              r24=m.Word(r9+8);
+              uint32_t r22=m.Word(r9+12);
+              r9=r23;
+              m.StoreWord(r8+0,r3);
+              r23=m.Word(r7+0);
+              m.StoreWord(r8+4,r30); m.StoreWord(r8+8,r24); m.StoreWord(r8+12,r22);
+              r8=m.Word(r7+4);
+              Stfs(m,r11+0,f9b);
+              r3=m.Word(r7+8);
+              Stfs(m,r11+4,f31);
+              r7=m.Word(r7+12);
+              Stfs(m,r11+8,f8b);
+              m.StoreWord(r9+0,r23);
+              r11+=36;
+              r30=m.Word(r6+0);
+              m.StoreWord(r9+4,r8); m.StoreWord(r9+8,r3); m.StoreWord(r9+12,r7);
+              r9=r11+20;
+              r24=m.Word(r6+4); r22=m.Word(r6+8);
+              Stfs(m,r11+0,f12b);
+              r6=m.Word(r6+12);
+              Stfs(m,r11+4,f0b); Stfs(m,r11+8,f11b);
+              r11+=36;
+              m.StoreWord(r9+0,r30); m.StoreWord(r9+4,r24);
+              r8=r11+20;
+              m.StoreWord(r9+8,r22); m.StoreWord(r9+12,r6);
+              r9=stack+96;
+              const uint32_t r21=m.Word(r5+0),r20=m.Word(r5+4);
+              Stfs(m,r11+0,f13b); Stfs(m,r11+4,f0b);
+              const uint32_t r19=m.Word(r5+8);
+              Stfs(m,r11+8,f10b);
+              r5=m.Word(r5+12);
+              r11+=36;
+              r3=m.Word(r9+0);
+              m.StoreWord(r8+0,r21);
+              r7=r11+20;
+              m.StoreWord(r8+4,r20);
+              r24=m.Word(r9+4);
+              m.StoreWord(r8+8,r19);
+              r23=m.Word(r9+8);
+              m.StoreWord(r8+12,r5);
+              r9=m.Word(r9+12);
+              r5=stack+176;
+              Stfs(m,r11+0,f13b);
+              m.StoreWord(r7+0,r3);
+              Stfs(m,r11+4,f31);
+              m.StoreWord(r7+4,r24);
+              Stfs(m,r11+8,f10b);
+              r11+=36;
+              m.StoreWord(r7+8,r23);
+              r8=stack+96;
+              m.StoreWord(r7+12,r9);
+              r9=m.Word(r10+r5);
+              r30=r11+36;
+              r6=r11+20;
+              Stfs(m,r11+0,f12b); Stfs(m,r11+4,f31);
+              r22=m.Word(r8+0);
+              Stfs(m,r11+8,f11b);
+              r11=r9+2;
+              r3=m.Word(r8+4); r24=m.Word(r8+8); r8=m.Word(r8+12);
+              m.StoreWord(r10+r4,r30);
+              m.StoreWord(r10+r5,r11);
+              m.StoreWord(r6+0,r22); m.StoreWord(r6+4,r3); m.StoreWord(r6+8,r24); m.StoreWord(r6+12,r8);
+              m.StoreWord(r31+1168,m.Word(r31+1168)+1);
+            }
+          }
+        }
+        r11=m.Word(r31+1200);
+        ++r26;
+        f12=Lfs(m,r31+1108);
+        r29+=4;
+        f23=F(f12+f23);
+      } while(int32_t(r26)<int32_t(r11));
+      r11=m.Word(r31+1200);
+      ++r25;
+      f0=Lfs(m,r31+1112);
+      f19=F(f0+f19);
+    } while(int32_t(r25)<int32_t(r11));
+  }
+  r25=stack+180;
+  r29=r31+668;
+  uint32_t r26=15;
+  do {
+    const uint32_t r27=m.Word(r25);
+    if(r27!=0) {
+      const uint32_t r30b=r31+1256;
+      Guest8218D440(m,r30b,m.Word(r29),log);
+      Guest8218D3F0(m,r30b,13,m.Word(r28),r27,log);
+    }
+    --r26; r29+=16; r28+=12; r25+=4;
+  } while(r26!=0);
+}
+// sub_82172698 (r3 grass, r4 context), its frame at `stack` (after stwu -288)
+// and 82171F58's at `inner`.
+void Guest82172698(const ImageMemory& m,uint32_t r3,uint32_t r4,uint32_t stack,uint32_t inner,GuestGrassLog& log) {
+  const uint32_t r31=r3;
+  uint32_t r30=0;
+  uint32_t r11=Lbz(m,r31+1164);
+  m.StoreWord(r31+1168,r30);
+  if(r11==0) return;
+  r11=Lbz(m,r31+1248);
+  if(r11==0) return;
+  r11=m.Word(r4+16);
+  uint32_t r10=stack+96;
+  r11+=416;
+  for(uint32_t ctr=8;ctr;--ctr) {
+    const uint32_t hi=m.Word(r11),lo=m.Word(r11+4);
+    r11+=8; m.StoreWord(r10,hi); m.StoreWord(r10+4,lo); r10+=8;
+  }
+  double f13=Lfs(m,r31+1112),f11=Lfs(m,r31+1108);
+  m.StoreWord(r31+1228,r4);
+  double f0=Lfs(m,0x82000000u+2252u);
+  double f12=F(f0/f13);
+  f13=Lfs(m,r31+1156);
+  f0=F(f0/f11);
+  Copy16(m,stack+144,r31+1232);
+  f11=F(f13*f12);
+  f13=F(f0*f13);
+  m.StoreWord(stack+84,Fctiwz(f11));
+  m.StoreWord(stack+80,Fctiwz(f13));
+  r10=m.Word(stack+80);
+  r11=m.Word(stack+84);
+  if(int32_t(r10)<int32_t(r11)) r10=r11;
+  f11=Lfs(m,r31+1124);
+  f13=Lfs(m,r31+1232);
+  r11=m.Word(r31+1200);
+  f13=F(f13-f11);
+  const double f10=Lfs(m,r31+1128);
+  f11=Lfs(m,r31+1240);
+  r10=r11+r10;
+  f11=F(f11-f10);
+  const uint32_t r19=r31+1256;
+  if(r11==0) Trap();                                     // twllei r11,0 (x3)
+  f0=F(f13*f0);
+  f13=F(f11*f12);
+  m.StoreWord(stack+80,Fctiwz(f0));
+  uint32_t r9=r10-1;
+  const uint32_t f0w=Fctiwz(f13);
+  r10=(r9<<1)|(r9>>31);                                  // rotlwi r10,r9,1
+  const uint32_t r20=Divw(r9,r11);
+  r9=m.Word(stack+80);
+  r10=r10-1;
+  r10=r11&~r10;
+  uint32_t r29=Divw(r9,r11);
+  if(r10==0xFFFFFFFFu) Trap();
+  r10=(r9<<1)|(r9>>31);
+  m.StoreWord(stack+80,f0w);
+  r9=m.Word(stack+80);
+  r10=r10-1;
+  uint32_t r28=Divw(r9,r11);
+  r10=r11&~r10;
+  if(r10==0xFFFFFFFFu) Trap();
+  r10=(r9<<1)|(r9>>31);
+  r10=r10-1;
+  r11=r11&~r10;
+  if(r11==0xFFFFFFFFu) Trap();
+  ++log.pushed;                                          // 8218D380
+  log.blend_src=6; log.blend_dst=7; log.depth_write=0;   // 8218D398(r19, 0, 0)
+  (void)r19;
+  Guest82171F58(m,r31,r29,r28,inner,log);
+  uint32_t r22=1;
+  if(!(int32_t(r20)<1)) {
+    uint32_t r25=r29+1;
+    const uint32_t r24=r28-1,r23=r29-1,r21=r28-r29,r18=uint32_t(-1)-r29;
+    do {
+      r11=r30-1;
+      if(!(int32_t(r11)>int32_t(r22))) {
+        r11=r22-r30;
+        const uint32_t r27=r24+r30,r26=r21+r25;
+        r29=r23+r30;
+        r28=r11+2;
+        do {
+          Guest82171F58(m,r31,r29,r27,inner,log);
+          Guest82171F58(m,r31,r29,r26,inner,log);
+          --r28; ++r29;
+        } while(r28!=0);
+      }
+      r10=r18+r25;
+      if(!(int32_t(r30)>int32_t(r10))) {
+        r11=r24+r30;
+        r10=r10-r30;
+        const uint32_t r27=r23+r30;
+        r29=r11+1;
+        r28=r10+1;
+        do {
+          Guest82171F58(m,r31,r27,r29,inner,log);
+          Guest82171F58(m,r31,r25,r29,inner,log);
+          --r28; ++r29;
+        } while(r28!=0);
+      }
+      ++r22; --r30; ++r25;
+    } while(!(int32_t(r22)>int32_t(r20)));
+  }
+  --log.pushed;                                          // 8218D430
+  r11=m.Word(r31+1168);
+  r10=m.Word(r31+1172);
+  if(int32_t(r11)>int32_t(r10)) m.StoreWord(r31+1172,r11);
+}
+// A grass world: the camera `camera_at` looking along +z rotated by `yaw`
+// (row-vector view matrix, translation -camera * R), the wire world's frustum
+// (near 1, far 1000, 45-degree sides), depth scale -1 (depth = view z), and a
+// 7 x 7 grid of 4 x 4 sub-cells of 1 unit from (-14, -14).
+struct GrassWorld {
+  static constexpr uint32_t context=0x1000,scene=0x1400,grass=0x2000,declarations=0x2800,slots=0x3000,heights=0x3400,
+    blades=0x4000,lists=0x20000,list_bytes=0x2000,stack=0xC000,inner=0xD000;
+  static constexpr uint32_t width=7,depth=7,n=4;
+  static constexpr uint32_t utility() { return grass+NativeGrassMap::utility; }
+};
+void GrassConstants(const ImageMemory& m) {
+  m.StoreWord(0x820009A4,0x00000000u); m.StoreWord(0x820008CC,0x3f800000u); m.StoreWord(0x820008D4,0x3f000000u);
+  m.StoreWord(0x820021E4,0x3e800000u); m.StoreWord(0x820024A0,0x3f400000u); m.StoreWord(0x82004FF8,0x3d888889u);
+  m.StoreWord(0x82009654,0x3d800000u); m.StoreWord(0x820124CC,0x3ed67750u); m.StoreWord(0x820124D0,0x3fddb3d7u);
+  m.StoreWord(0x82019A20,0x47800000u); m.StoreWord(0x82018EB4,0x477fff00u);   // 821C0C00's mode-2 scale and clamp
+  m.StoreWord(0x82008888+13*8,4); m.StoreWord(0x82008888+13*8+4,0);   // quad list: 4 per primitive
+}
+void GrassCamera(const ImageMemory& m,std::array<float,3> at,float yaw) {
+  using W=GrassWorld;
+  const float c=std::cos(yaw),s=std::sin(yaw);
+  const float r[3][3]{{c,0,-s},{0,1,0},{s,0,c}};
+  float view[16]{r[0][0],r[0][1],r[0][2],0, r[1][0],r[1][1],r[1][2],0, r[2][0],r[2][1],r[2][2],0, 0,0,0,1};
+  for(int j=0;j<3;++j) view[12+j]=-(at[0]*r[0][j]+at[1]*r[1][j]+at[2]*r[2][j]);
+  for(uint32_t i=0;i<16;++i) m.StoreFloat(W::scene+96+i*4,view[i]);
+  constexpr float side=0.70710678f;
+  float frustum[26]{};
+  frustum[8]=side; frustum[10]=-side; frustum[12]=-side; frustum[14]=-side;
+  frustum[17]=side; frustum[18]=-side; frustum[21]=-side; frustum[22]=-side; frustum[24]=1; frustum[25]=1000;
+  for(uint32_t i=0;i<26;++i) m.StoreFloat(W::scene+288+i*4,frustum[i]);
+  // The camera world (scene+416): its translation row is what 82172698 copies.
+  const float world[16]{1,0,0,0, 0,1,0,0, 0,0,1,0, at[0],at[1],at[2],1};
+  for(uint32_t i=0;i<16;++i) m.StoreFloat(W::scene+416+i*4,world[i]);
+  m.StoreWord(W::context+16,W::scene);
+  m.StoreFloat(W::context+8,-1.0f);
+}
+void BuildGrassWorld(const ImageMemory& m,std::mt19937& random) {
+  using W=GrassWorld; using G=NativeGrassMap;
+  GrassConstants(m);
+  std::uniform_real_distribution<float> unit(0.f,1.f);
+  const uint32_t g=W::grass;
+  m.StoreWord(g,G::vtable); m.StoreWord(g+52,2); m.StoreFloat(g+56,1.0f);
+  m.StoreByte(g+G::loaded,1); m.StoreByte(g+G::enabled,1);
+  m.StoreFloat(g+G::sub_x,1.0f); m.StoreFloat(g+G::sub_z,1.0f);
+  m.StoreFloat(g+G::origin_x,-14.f); m.StoreFloat(g+G::origin_z,-14.f);
+  m.StoreFloat(g+G::cell_x,4.f); m.StoreFloat(g+G::cell_z,4.f); m.StoreFloat(g+G::half_x,2.f); m.StoreFloat(g+G::half_z,2.f);
+  m.StoreFloat(g+G::reach,9.f);
+  m.StoreWord(g+G::subcells,W::n); m.StoreWord(g+G::width,W::width); m.StoreWord(g+G::depth,W::depth);
+  m.StoreWord(g+G::slots,W::slots); m.StoreWord(g+G::heights,W::heights); m.StoreWord(g+G::blades,W::blades);
+  m.StoreWord(g+1168,0); m.StoreWord(g+1172,0);
+  // The Utility object's declaration iterator (8218D440's traps pass).
+  m.StoreWord(W::utility()+G::declarations,W::declarations); m.StoreWord(W::declarations+4,0x1111);
+  m.StoreWord(W::utility()+G::declaration,0x2222);
+  // Slots: row-major, a few empty (-1); each with a height pair and n*n blades.
+  uint32_t slot=0;
+  for(uint32_t z=0;z<W::depth;++z) for(uint32_t x=0;x<W::width;++x) {
+    const bool empty=(x*3+z*5)%7==2;
+    m.StoreWord(W::slots+(z*W::width+x)*4,empty?0xFFFFFFFFu:slot);
+    if(empty) continue;
+    const float lo=-1.f+unit(random),hi=lo+0.5f+3*unit(random);
+    m.StoreFloat(W::heights+slot*8,lo); m.StoreFloat(W::heights+slot*8+4,hi);
+    for(uint32_t b=0;b<W::n*W::n;++b) {
+      const uint32_t type=random()%5==0?0:1+random()%15;
+      const uint32_t hw=type<<12|(random()%16)<<8|(random()%16)<<4|random()%16;
+      const int16_t height=int16_t(int32_t(random()%72)-16);
+      const uint32_t at=W::blades+(slot*W::n*W::n+b)*4;
+      m.StoreByte(at,uint8_t(hw>>8)); m.StoreByte(at+1,uint8_t(hw));
+      m.StoreByte(at+2,uint8_t(uint16_t(height)>>8)); m.StoreByte(at+3,uint8_t(uint16_t(height)));
+    }
+    ++slot;
+  }
+  // Per type: colour and (base, top) sizes; per list: texture and a vertex
+  // vector whose UV words are arbitrary (they are the vector's, not rebuilt).
+  for(uint32_t t=1;t<=G::types;++t) {
+    for(uint32_t c=0;c<4;++c) m.StoreFloat(g+G::colours+t*16+c*4,0.1f+0.9f*unit(random));
+    const float base=0.2f+unit(random),top=base+unit(random)*2;
+    m.StoreFloat(G::blade_table+t*8,base); m.StoreFloat(G::blade_table+t*8+4,top);
+  }
+  for(uint32_t i=0;i<G::types;++i) {
+    m.StoreWord(g+G::textures+i*16,0x9000+i);
+    const uint32_t begin=W::lists+i*W::list_bytes;
+    m.StoreWord(g+G::lists+i*12,begin); m.StoreWord(g+G::lists+i*12+4,begin); m.StoreWord(g+G::lists+i*12+8,begin+W::list_bytes);
+    for(uint32_t v=0;v<W::list_bytes/36;++v) {
+      m.StoreFloat(begin+v*36+12,unit(random)); m.StoreFloat(begin+v*36+16,unit(random));
+      m.StoreWord(begin+v*36+0,0xDEADBEEF);   // positions and colours the guest overwrites
+    }
+  }
+}
+// One grass build, native and guest, compared draw for draw and byte for byte.
+NativeGrassMapStats CompareGrass(const ImageMemory& m,std::set<uint32_t>& textures) {
+  using W=GrassWorld;
+  NativeGrassMapStats stats;
+  std::vector<std::array<int32_t,2>> cells;
+  const auto before=m.bytes;
+  const auto draws=BuildNativeGrassMapDraws(m,W::grass,W::context,&stats,&cells);
+  Require(m.bytes==before,"native grass build wrote guest memory");
+  GuestGrassLog log;
+  Guest82172698(m,W::grass,W::context,W::stack,W::inner,log);
+  Require(log.pushed==0 && log.blend_src==6 && log.blend_dst==7 && log.depth_write==0,"guest grass state bracket");
+  Require(cells==log.cells,"native grass cells differ from the guest's ring walk");
+  Require(draws.size()==log.draws.size() && stats.draws==draws.size(),"native grass draw count");
+  Require(stats.drawn==m.Word(W::grass+1168),"native grass blades drawn differ from +1168");
+  for(size_t i=0;i<draws.size();++i) {
+    const auto& draw=draws[i];
+    const auto& call=log.draws[i];
+    Require(draw.kind==NativeEffectDraw::Kind::RibbonQuads && draw.technique==NativeEffectTechnique::Utility3DTexA &&
+      draw.effect==call.utility && draw.texture==call.texture && draw.primitive()==call.primitive &&
+      draw.vertex_count()==call.vertices && call.vertices==call.count*4 && draw.stride()==36 &&
+      draw.blend==kNativeEffectBlendAlpha && draw.sets_depth_write && !draw.depth_write && draw.state_before_activation(),
+      "native grass draw contract");
+    Require(EncodeNativeEffectVertices(draw,0,draw.vertex_count())==call.bytes,"native grass vertices differ from the guest's");
+    const auto calls=NativeEffectDrawCalls(draw);
+    Require(calls.size()==1 && calls[0]==std::pair<uint32_t,uint32_t>{0,draw.vertex_count()},"native grass draw call");
+    textures.insert(draw.texture);
+  }
+  return stats;
+}
+void TestGrassMapRings() {
+  // Against the ring's geometry: the camera's cell, then per ring the top and
+  // bottom rows pairwise (x ascending), then the two columns pairwise; every
+  // cell of the (2r+1)^2 square once. Negative and far-off centres included.
+  for(const auto& [cx,cz]:std::vector<std::array<int32_t,2>>{{0,0},{3,-2},{-5,7},{100000,-100000}})
+    for(int32_t rings=-1;rings<=5;++rings) {
+      std::vector<std::array<int32_t,2>> got,expected{{cx,cz}};
+      WalkNativeGrassMapRings(cx,cz,rings,[&](int32_t x,int32_t z) { got.push_back({x,z}); });
+      for(int32_t ring=1;ring<=rings;++ring) {
+        for(int32_t x=cx-ring;x<=cx+ring;++x) { expected.push_back({x,cz-ring}); expected.push_back({x,cz+ring}); }
+        for(int32_t z=cz-ring+1;z<=cz+ring-1;++z) { expected.push_back({cx-ring,z}); expected.push_back({cx+ring,z}); }
+      }
+      Require(got==expected,"grass ring order");
+      std::set<std::array<int32_t,2>> unique(got.begin(),got.end());
+      const size_t side=size_t(std::max(rings,0))*2+1;
+      Require(unique.size()==got.size() && got.size()==side*side,"grass rings visit a cell twice or miss one");
+    }
+  // The fctiwz/divw edges 82172698 relies on.
+  Require(NativeGuestFctiwz(std::nan(""))==INT32_MIN && NativeGuestFctiwz(3e9)==INT32_MAX && NativeGuestFctiwz(-3e9)==INT32_MIN &&
+    NativeGuestFctiwz(-2147483648.5)==INT32_MIN && NativeGuestFctiwz(-7.9)==-7 && NativeGuestFctiwz(7.9)==7,"fctiwz edges");
+  Require(NativeGrassMapDivw(-7,4)==-1 && NativeGrassMapDivw(7,-4)==-1,"divw truncates toward zero");
+  bool zero=false,overflow=false;
+  try { NativeGrassMapDivw(5,0); } catch(const std::exception&) { zero=true; }
+  try { NativeGrassMapDivw(INT32_MIN,-1); } catch(const std::exception&) { overflow=true; }
+  Require(zero && overflow,"divw traps not refused");
+}
+void TestGrassMap() {
+  using W=GrassWorld; using G=NativeGrassMap;
+  ImageMemory m;
+  std::mt19937 random(0x82171F58u);
+  BuildGrassWorld(m,random);
+  std::set<uint32_t> textures;
+  NativeGrassMapStats total;
+  uint32_t visible_cells=0;
+  // Cameras: off the grid's edge (the rings leave it), centred, and rotated
+  // so the frustum culls cells on either side.
+  const std::array<std::array<float,4>,8> cameras{{
+    {-7.5f,1.25f,0.3f,0.f},{-7.5f,1.25f,0.3f,1.1f},{0.2f,0.75f,-1.7f,-0.6f},{9.9f,2.5f,11.3f,3.0f},
+    {-13.1f,0.5f,-13.4f,0.8f},{3.3f,1.5f,4.4f,-2.2f},{0.f,1.f,0.f,0.3f},{-20.f,1.f,-20.f,0.785f}}};
+  for(const auto& camera:cameras) {
+    GrassCamera(m,{camera[0],camera[1],camera[2]},camera[3]);
+    const auto stats=CompareGrass(m,textures);
+    visible_cells+=stats.cells-stats.outside-stats.empty-stats.culled;
+    total.cells+=stats.cells; total.outside+=stats.outside; total.empty+=stats.empty; total.culled+=stats.culled;
+    total.blades+=stats.blades; total.blade_culled+=stats.blade_culled; total.faded+=stats.faded; total.drawn+=stats.drawn;
+    Require(stats.blades==stats.blade_culled+stats.faded+stats.drawn,"grass blade tally");
+  }
+  Require(total.outside && total.empty && total.culled && visible_cells>=4,"grass cells did not reach every decision");
+  Require(total.blade_culled && total.faded && total.drawn,"grass blades did not reach every decision");
+  Require(textures.size()==G::types,"grass draws did not cover every texture batch");
+  // +1172 keeps the peak across builds.
+  Require(m.Word(W::grass+1172)>=m.Word(W::grass+1168),"guest grass peak");
+  // Not loaded or not enabled: nothing, and the guest draws nothing either.
+  for(const uint32_t flag:{G::loaded,G::enabled}) {
+    m.StoreByte(W::grass+flag,0);
+    NativeGrassMapStats stats;
+    GuestGrassLog log;
+    Guest82172698(m,W::grass,W::context,W::stack,W::inner,log);
+    Require(BuildNativeGrassMapDraws(m,W::grass,W::context,&stats).empty() && stats.skipped==1 && log.draws.empty() && log.cells.empty(),
+      "disabled grass drew");
+    m.StoreByte(W::grass+flag,1);
+  }
+  // A zero sub-cell count traps in both.
+  m.StoreWord(W::grass+G::subcells,0);
+  bool native=false,guest=false;
+  try { BuildNativeGrassMapDraws(m,W::grass,W::context); } catch(const std::exception&) { native=true; }
+  try { GuestGrassLog log; Guest82172698(m,W::grass,W::context,W::stack,W::inner,log); } catch(const std::exception&) { guest=true; }
+  Require(native && guest,"zero sub-cell count not trapped");
+  m.StoreWord(W::grass+G::subcells,W::n);
+  // The declaration traps of 8218D440, once something draws.
+  GrassCamera(m,{-7.5f,1.25f,0.3f},0.f);
+  m.StoreWord(W::utility()+G::declaration,m.Word(W::declarations+4));
+  native=false;
+  try { BuildNativeGrassMapDraws(m,W::grass,W::context); } catch(const std::exception&) { native=true; }
+  Require(native,"grass draw without a declaration");
+  m.StoreWord(W::utility()+G::declaration,0x2222);
+  // The Utility technique: +172, material [+188], sampler list +200.
+  Require(NativeEffectTechniqueOffset(NativeEffectTechnique::Utility3DTexA)==172 &&
+    NativeEffectSamplerListOffset(NativeEffectTechnique::Utility3DTexA)==200,"utility technique offsets");
+  m.StoreWord(W::utility()+188,0x5000);
+  Require(NativeEffectTechniqueMaterial(m,W::utility(),NativeEffectTechnique::Utility3DTexA)==0x5000,"utility technique material");
+  m.StoreWord(W::utility()+200+4,0x5100); m.StoreWord(W::utility()+200+12,1); m.StoreWord(0x5100,0x5200);
+  BindNativeEffectTexture(m,W::utility(),NativeEffectTechnique::Utility3DTexA,0x9003);
+  Require(m.Word(0x5200+4)==0x9003,"utility texture not bound into its sampler list");
+  // A call past the immediate limit is split on whole quads.
+  NativeEffectDraw big=MakeNativeGrassMapDraw(W::utility(),std::vector<NativeRibbonVertex>(kNativeGrassMapCallVertices+8),1);
+  const auto calls=NativeEffectDrawCalls(big);
+  Require(calls.size()==2 && calls[0]==std::pair<uint32_t,uint32_t>{0,kNativeGrassMapCallVertices} &&
+    calls[1]==std::pair<uint32_t,uint32_t>{kNativeGrassMapCallVertices,8},"grass call split");
+}
+// The map-effect walk's routes in list order, and where the filed grass map
+// lands among the transparent items.
+void TestMapEffectPlan() {
+  using W=GrassWorld;
+  ImageMemory m;
+  constexpr uint32_t effect=0x6000,camera=0x6800,wire=0x7000,records=0x7400,grass2=0x8000,sky=0x8800,other_sky=0x8900;
+  BuildWireWorld(m,W::context,W::scene,effect,camera);   // effect globals and wire constants
+  std::mt19937 random(0x820B35A0u);
+  BuildGrassWorld(m,random);
+  GrassCamera(m,{-7.5f,1.25f,0.3f},0.f);
+  // A wire record in front of the grass camera (view z 3..6).
+  m.StoreWord(wire,NativeElectricWire::vtable);
+  m.StoreFloat(wire+400,0.5f);
+  WireRecord(m,records,true,{-8.5f,1.5f,3.5f},{-6.5f,1.5f,6.5f},{-7.5f,1.5f,5.f},4,0.3f);
+  m.StoreWord(wire+388,records); m.StoreWord(wire+392,records+96);
+  // A second grass map whose key (+56 * 65536 = 65.5) is below 256: filed, never drawn.
+  m.StoreWord(grass2,NativeGrassMap::vtable); m.StoreWord(grass2+52,2); m.StoreFloat(grass2+56,0.001f);
+  const auto member=[](uint32_t object,uint32_t vtable,uint32_t render,int32_t mode,bool hidden) {
+    NativeMapEffectMember out;
+    out.object=object; out.vtable=vtable; out.render=render; out.mode=mode; out.hidden=hidden;
+    out.kind=ClassifyNativeMapEffect(vtable);
+    return out;
+  };
+  const std::vector<NativeMapEffectMember> members{
+    member(wire,0x82002744,0x820B8D28,0,false),        // A: immediate strip
+    member(W::grass,0x820124DC,0x82172698,2,false),    // G1: filed, key 65535
+    member(other_sky,0x8200284C,0x820BB270,0,false),   // not the current sky: skipped
+    member(sky,0x8200284C,0x820BB270,0,false),         // the sky
+    member(wire,0x82002744,0x820B8D28,0,true),         // hidden
+    member(W::grass,0x820124DC,0x82172698,0,false),    // G2: mode 0, drawn inside the walk
+    member(wire,0x82002744,0x820B8D28,1,false),        // filed wire: unsupported
+    member(W::grass,0x820124DC,0x82172698,1,false),    // mode-1 grass: unsupported
+    member(grass2,0x820124DC,0x82172698,2,false),      // undrawn key
+  };
+  std::vector<std::string> failures;
+  const auto before=m.bytes;
+  const auto plan=PlanNativeMapEffects(m,members,sky,W::scene,W::context,[&](const std::string& what) { failures.push_back(what); });
+  Require(m.bytes==before && failures.empty(),"map-effect plan wrote memory or failed");
+  const auto wire_draws=BuildNativeElectricWireDraws(m,wire,W::scene,ReadNativeEffectInputs(m));
+  const auto grass_draws=BuildNativeGrassMapDraws(m,W::grass,W::context);
+  Require(!wire_draws.empty() && !grass_draws.empty(),"plan fixture draws nothing");
+  const auto same=[](const std::vector<NativeEffectDraw>& a,const std::vector<NativeEffectDraw>& b) {
+    if(a.size()!=b.size()) return false;
+    for(size_t i=0;i<a.size();++i)
+      if(a[i].texture!=b[i].texture || a[i].technique!=b[i].technique ||
+         EncodeNativeEffectVertices(a[i],0,a[i].vertex_count())!=EncodeNativeEffectVertices(b[i],0,b[i].vertex_count())) return false;
+    return true;
+  };
+  Require(plan.segments.size()==3 && !plan.segments[0].sky && same(plan.segments[0].draws,wire_draws) &&
+    plan.segments[1].sky && plan.segments[1].draws.empty() && !plan.segments[2].sky && same(plan.segments[2].draws,grass_draws),
+    "map-effect segments: wire strips, then the sky, then the mode-0 grass");
+  Require(plan.filings==2 && plan.undrawn_keys==1 && plan.filed.size()==1,"map-effect filings");
+  const auto& item=plan.filed[0];
+  Require(item.object==W::grass && item.key==0xFFFF && item.order==0 && item.slot4==0x82172698 &&
+    item.type==NativeEffectClass::GrassMap && same(item.draws,grass_draws),"filed grass item");
+  Require(plan.unsupported.size()==2 && plan.unsupported[0].vtable==0x82002744 && plan.unsupported[0].mode==1 &&
+    plan.unsupported[1].vtable==0x820124DC && plan.unsupported[1].mode==1,"unsupported members");
+  Require(plan.grass.objects==2 && plan.wires.records==1,"plan statistics");
+  // No context: the grass maps fail (reported), the rest is unchanged.
+  const auto bare=PlanNativeMapEffects(m,members,sky,W::scene,0,[&](const std::string& what) { failures.push_back(what); });
+  Require(failures.size()==3 && bare.filed.empty() && bare.segments.size()==2,"grass without a context");
+  // The world list decides where the map effects' filings fall.
+  constexpr uint32_t owner=0x0800,manager_object=0x0A00,effects_object=0x0A80,n0=0x0900,n1=0x0940,n2=0x0980,end=0x09C0;
+  m.StoreWord(manager_object,kNativeMapEffectManagerVtable); m.StoreWord(effects_object,NativeEffectList::manager_vtable);
+  const auto world=[&](uint32_t first,uint32_t second) {
+    m.StoreWord(owner+44,n0); m.StoreWord(owner+56,end);
+    m.StoreWord(n0,n1); m.StoreWord(n0+8,0);
+    m.StoreWord(n1,n2); m.StoreWord(n1+8,first);
+    m.StoreWord(n2,end); m.StoreWord(n2+8,second);
+  };
+  world(manager_object,effects_object);
+  Require(NativeWorldListIndex(m,owner,kNativeMapEffectManagerVtable)==1 && NativeWorldListIndex(m,owner,NativeEffectList::manager_vtable)==2 &&
+    NativeWorldListIndex(m,owner,0x82000000)==-1 && NativeMapEffectsFiledBeforeEffects(m,owner),"map effects first");
+  world(effects_object,manager_object);
+  Require(!NativeMapEffectsFiledBeforeEffects(m,owner),"effects first");
+  world(manager_object,0x0B00);
+  m.StoreWord(0x0B00,0x82000000);
+  Require(NativeMapEffectsFiledBeforeEffects(m,owner),"no effects manager");
+  // Models (3 filings), the map effects (2) and the effects (4) in one sequence.
+  const auto first=NativeMapEffectFilingBases(true,3,2,4),second=NativeMapEffectFilingBases(false,3,2,4);
+  Require(first.map_effects==3 && first.effects==5 && second.map_effects==7 && second.effects==3,"filing bases");
+  // Key 65535 ties go by filing order; the grass item draws before every lower key.
+  for(const bool map_first:{true,false}) {
+    const auto bases=NativeMapEffectFilingBases(map_first,3,2,4);
+    std::map<std::pair<uint16_t,uint32_t>,std::string> tags;
+    const auto tagged=[&](uint16_t key,uint32_t order,std::string tag) {
+      tags[{key,order}]=std::move(tag);
+      return NativeTransparentItem{key,order,{}};
+    };
+    std::vector<std::vector<NativeTransparentItem>> sources(3);
+    sources[0].push_back(tagged(300,1,"model 300")); sources[0].push_back(tagged(0xFFFF,0,"model 65535"));
+    sources[1].push_back(tagged(0xFFFF,bases.effects,"effect 65535")); sources[1].push_back(tagged(500,bases.effects+1,"effect 500"));
+    sources[2].push_back(tagged(item.key,item.order+bases.map_effects,"grass"));
+    sources[2].push_back(tagged(65,1+bases.map_effects,"undrawn"));
+    const auto sequence=MergeNativeTransparentItems(std::move(sources));
+    std::vector<std::string> drawn;
+    for(const auto& entry:sequence) drawn.push_back(tags.at({entry.key,entry.order}));
+    const std::vector<std::string> expected=map_first?
+      std::vector<std::string>{"model 65535","grass","effect 65535","effect 500","model 300"}:
+      std::vector<std::string>{"model 65535","effect 65535","grass","effect 500","model 300"};
+    Require(drawn==expected,"transparent order of the grass item");
+  }
 }
 }
 int main() {
   try {
     TestOrder(); TestMutation(); TestCensus(); TestElectricWire(); TestElectricWirePointsEquivalence(); TestElectricWireRandomized();
-    TestMapEffectMembers();
+    TestMapEffectMembers(); TestGrassMapRings(); TestGrassMap(); TestMapEffectPlan();
   } catch(const std::exception& error) {
     std::cerr<<"native map effect tests failed: "<<error.what()<<"\n";
     return 1;

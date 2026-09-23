@@ -108,6 +108,9 @@ struct NativeColourVertex {
 static_assert(sizeof(NativeParticleVertex)==44 && sizeof(NativeRibbonVertex)==36 && sizeof(NativeColourVertex)==16);
 inline constexpr uint32_t kNativeParticleRecordBytes=48,kNativeParticleRecordsPerCall=1000;
 inline constexpr uint32_t kNativeRibbonPointBytes=32,kNativeRibbonPointLimit=100;
+// The most vertices one clGrassMap call carries (whole quads; the immediate
+// recording refuses more than 16384).
+inline constexpr uint32_t kNativeGrassMapCallVertices=16384;
 template<class Reader>
 NativeParticleRecord ReadNativeParticleRecord(const Reader& r,uint32_t at) {
   return {ReadNativeFxVec3(r,at),ReadNativeFxVec4(r,r.Add(at,16)),ReadNativeFxFloat(r,r.Add(at,32)),ReadNativeFxFloat(r,r.Add(at,36))};
@@ -169,13 +172,19 @@ std::vector<NativeColourVertex> BuildNativeColourStrip(std::span<const NativeFxV
 // its texture into the sampler list at +272 (Ps_Particle), r8!=0 -> +288/+316
 // (Ps_ZParticle); 821A7C70 -> +188/+216 (VS_3DTex/PS_Tex); 821A7B58 -> +160
 // (VS_3D/PS_Main, lwz r3,176(r27)), untextured: it never calls 821BC4C8.
-enum class NativeEffectTechnique : uint8_t { Particle, ZParticle, Ribbon, Solid };
+// Utility3DTexA is clGrassMap's (native_map_effects.h): its draw's `effect` is
+// the cl3D9_Utility object at grass+1256 (constructed by 8218D8F0, techniques
+// set up by 8218D4C8), and 8218D440 binds the technique at +172
+// ("Utility_3DTexA", 821BE5D8/821BD5B0) with its sampler list at +200
+// (821BC4C8(r3 +172, r4 +200, r5 texture)) and activates 821B94E8([+188]).
+enum class NativeEffectTechnique : uint8_t { Particle, ZParticle, Ribbon, Solid, Utility3DTexA };
 inline constexpr uint32_t NativeEffectTechniqueOffset(NativeEffectTechnique t) {
   return t==NativeEffectTechnique::Particle?244:t==NativeEffectTechnique::ZParticle?288:
-         t==NativeEffectTechnique::Solid?160:188;
+         t==NativeEffectTechnique::Solid?160:t==NativeEffectTechnique::Utility3DTexA?172:188;
 }
 inline constexpr uint32_t NativeEffectSamplerListOffset(NativeEffectTechnique t) {
-  return t==NativeEffectTechnique::Particle?272:t==NativeEffectTechnique::ZParticle?316:216;
+  return t==NativeEffectTechnique::Particle?272:t==NativeEffectTechnique::ZParticle?316:
+         t==NativeEffectTechnique::Utility3DTexA?200:216;
 }
 // The technique object is not itself a material: 821A7640 activates
 // 821B94E8([technique+16]) (lwz r3,16(r30), r30 = +244/+288) and 821A7C70
@@ -221,10 +230,11 @@ struct NativeEffectDraw {
   uint32_t primitive() const { return kind==Kind::RibbonStrip || kind==Kind::ColourStrip?6:13; }
   // 821A7C70 and 821A7B58 set blend and depth write (82135078/82135108/
   // 82135578) before their 821B94E8, so the technique's own state operations
-  // win over them; 821A7640 sets its blend after the activation, so the
-  // draw's blend wins.
+  // win over them; so does clGrassMap (8218D398 before every 8218D440);
+  // 821A7640 sets its blend after the activation, so the draw's blend wins.
   bool state_before_activation() const {
-    return technique==NativeEffectTechnique::Ribbon || technique==NativeEffectTechnique::Solid;
+    return technique==NativeEffectTechnique::Ribbon || technique==NativeEffectTechnique::Solid ||
+           technique==NativeEffectTechnique::Utility3DTexA;
   }
   uint32_t stride() const { return kind==Kind::Particles?44:kind==Kind::ColourStrip?16:36; }
   uint32_t vertex_count() const {
@@ -296,7 +306,10 @@ std::vector<NativeParticleRecord> ReadNativeParticleArray(const Reader& r,uint32
 // The effect classes, keyed by their slot 4 (vtable+16).
 enum class NativeEffectClass : uint8_t {
   Unknown,Particle01Limit,Particle02,Glass,RocketAmmo01,AcidAmmo01,BeamAmmo01,RocketAmmo02,SolidAmmo01,LaserAmmo01,WebAmmo01,
-  EffectEtc02,Spark01,MuzzleFlash,Empty,Spark02,EffectEtc01,SmokeLine
+  EffectEtc02,Spark01,MuzzleFlash,Empty,Spark02,EffectEtc01,SmokeLine,
+  // clGrassMap: a map effect (clMapEffectManager's list, native_map_effects.h),
+  // filed as an item of this type; never classified from an effect list.
+  GrassMap
 };
 // A known effect class's slot 4 that has no builder, named for the log
 // (classnames.txt); null otherwise. Every class named so far has a builder.
@@ -616,6 +629,7 @@ std::vector<NativeEffectDraw> BuildNativeEffectDraws(const Reader& r,uint32_t ob
       break;
     }
     case NativeEffectClass::Empty: break;
+    case NativeEffectClass::GrassMap: throw std::runtime_error("clGrassMap is a map effect (BuildNativeGrassMapDraws)");
     case NativeEffectClass::Unknown: throw std::runtime_error("unsupported native effect class");
   }
   std::erase_if(draws,[](const NativeEffectDraw& draw) { return draw.empty(); });
