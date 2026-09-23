@@ -130,10 +130,18 @@ class NativeFrameHost {
 // goes first, as the guest's map-effect walk draws it before the world: drawn
 // after, its depth-tested dome covered everything beyond its radius. "sky" is
 // that whole walk (clMapEffectManager's list in order: the sky and the
-// electric wires' strips; native_map_effects.h). The first
+// electric wires' strips; native_map_effects.h). The models come before the
+// static world, as the world-list walk (owner+44) draws them: the object
+// managers' slot 2s gather and draw their mode-0 objects, then the map object
+// manager's (820B4310) its list and then the octree, whose cells are the
+// static world. Order is visible there: mode-0 materials with alpha-blended,
+// depth-writing passes (the trees' and hedges' leaves) blend over what is
+// already drawn and then hide what the static world would draw behind them.
+// Objects the octree gathers (NativeFullFrameModelGather::unlisted), which the
+// guest draws inside that walk, are drawn with the rest. The first
 // kNativeFrameViewPassCount run per view, the rest once per frame.
 inline constexpr std::string_view kNativeFramePassOrder[]{
-  "sky","static_world","models","effects","transparent","post"};
+  "sky","models","static_world","effects","transparent","post"};
 inline constexpr size_t kNativeFrameViewPassCount=5;
 // What a full frame still runs as guest code, until each is native.
 inline constexpr std::string_view kNativeFrameRemainingGuestCalls[]{

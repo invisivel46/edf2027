@@ -145,6 +145,7 @@ class NativeGuestSnapshot {
 };
 
 // One draw as a recorder saw it, for the draw-list diff (tools/shadow-diff.py).
+inline constexpr size_t kNativeShadowTransientBytes=4096;
 inline uint64_t NativeShadowHash(const void* data,size_t size,uint64_t hash=14695981039346656037ull) {
   const auto* bytes=static_cast<const uint8_t*>(data);
   for(size_t i=0;i<size;++i) { hash^=bytes[i]; hash*=1099511628211ull; }
@@ -188,6 +189,11 @@ struct NativeDrawRecord {
   std::array<float,6> viewport{};
   std::optional<std::array<float,4>> blend;
   std::string geometry;  // "t:<hash>:<bytes>" transient vertices, "b:<id>+<offset>" a buffer, per slot.
+  // The transient vertex bytes themselves, per slot, only when the tap records
+  // bytes (edf_native_shadow_render_constants) and a slot's upload is at most
+  // kNativeShadowTransientBytes: which vertex and component of an immediate
+  // draw differs (the wires' strips, a post quad), not just that its hash does.
+  std::vector<std::pair<uint32_t,std::vector<uint8_t>>> vertices;
   // The pipeline's stamped description (NativeBackendPipeline::identity_state
   // and identity_format), when it has one: two paths that build the same GPU
   // state from different guest words get different pipeline identities, and
@@ -288,6 +294,16 @@ inline std::string SerializeNativeDrawRecord(const NativeDrawRecord& draw) {
     out+=std::format(",\"format\":[{},{},{},{},{}]",draw.format[0],draw.format[1],draw.format[2],draw.format[3],draw.format[4]);
   }
   if(draw.reflected) out+=",\"reflected\":true";
+  if(!draw.vertices.empty()) {
+    out+=",\"vertices\":[";
+    static constexpr char digits[]="0123456789abcdef";
+    for(size_t i=0;i<draw.vertices.size();++i) {
+      out+=std::format("{}{{\"slot\":{},\"data\":\"",i?",":"",draw.vertices[i].first);
+      for(const auto byte:draw.vertices[i].second) { out+=digits[byte>>4]; out+=digits[byte&15]; }
+      out+="\"}";
+    }
+    out+="]";
+  }
   out+=",\"scissor\":";
   if(draw.scissor) out+=std::format("[{},{},{},{}]",draw.scissor->left,draw.scissor->top,draw.scissor->right,draw.scissor->bottom);
   else out+="null";
@@ -320,8 +336,9 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
   // capture's submit closes the frame; the bridge binds everything again).
   void ResetState() { state_={}; stack_.clear(); }
   void SetLabel(std::string label) { label_=std::move(label); }
-  // Also keep every draw's constant bytes (large: a diagnostic for which
-  // registers differ, not for every run).
+  // Also keep every draw's constant bytes and its small transient vertex
+  // uploads (large: a diagnostic for which registers or vertices differ, not
+  // for every run).
   void RecordConstantBytes(bool enabled) { record_constant_bytes_=enabled; }
   const std::string& label() const { return label_; }
   bool recording() const { return armed_ && !paused_ && std::this_thread::get_id()==thread_; }
@@ -332,7 +349,10 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
   void SetWorldInstancing(bool enabled,bool reuse_constants=true) override { Inner().SetWorldInstancing(enabled,reuse_constants); }
   void SetTransientBatching(bool enabled) override { Inner().SetTransientBatching(enabled); }
   void SetVertexBuffer(uint32_t slot,NativeBackendBuffer& buffer,uint32_t stride,uint32_t offset) override {
-    if(slot<kSlots) state_.geometry[slot]=std::format("b:{:x}+{}/{}",uint64_t(reinterpret_cast<uintptr_t>(&buffer)),offset,stride);
+    if(slot<kSlots) {
+      state_.geometry[slot]=std::format("b:{:x}+{}/{}",uint64_t(reinterpret_cast<uintptr_t>(&buffer)),offset,stride);
+      state_.transient[slot].clear();
+    }
     Inner().SetVertexBuffer(slot,buffer,stride,offset);
   }
   void SetIndexBuffer(NativeBackendBuffer& buffer,NativeBackendIndexFormat format,uint32_t offset) override {
@@ -428,6 +448,7 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
     std::array<std::array<NativeBackendSampler*,kSlots>,kStages> samplers{};
     std::optional<NativeBackendScissor> scissor;
     std::array<std::string,kSlots> geometry{};
+    std::array<std::vector<uint8_t>,kSlots> transient{};  // Bytes of a small transient upload (record_constant_bytes_).
     std::string indices;
     std::vector<uint64_t> targets;
     uint64_t depth=0;
@@ -439,8 +460,11 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
     return *inner_;
   }
   void NoteTransient(uint32_t slot,std::span<const uint8_t> bytes,uint32_t stride) {
-    if(slot<kSlots && armed_)
-      state_.geometry[slot]=std::format("t:{:016x}:{}/{}",NativeShadowHash(bytes.data(),bytes.size()),bytes.size(),stride);
+    if(slot>=kSlots || !armed_) return;
+    state_.geometry[slot]=std::format("t:{:016x}:{}/{}",NativeShadowHash(bytes.data(),bytes.size()),bytes.size(),stride);
+    auto& kept=state_.transient[slot];
+    if(record_constant_bytes_ && bytes.size()<=kNativeShadowTransientBytes) kept.assign(bytes.begin(),bytes.end());
+    else kept.clear();
   }
   void Note(NativeDrawKind kind,uint32_t count,uint32_t first,int32_t base,uint32_t instances,uint32_t first_instance) {
     if(!recording()) return;
@@ -491,8 +515,10 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
       combined=NativeShadowHash(key,sizeof(key),combined);
     }
     draw.constant_hash=combined;
-    for(uint32_t slot=0;slot<kSlots;++slot) if(!state_.geometry[slot].empty())
+    for(uint32_t slot=0;slot<kSlots;++slot) if(!state_.geometry[slot].empty()) {
       draw.geometry+=std::format("{}{}={}",draw.geometry.empty()?"":" ",slot,state_.geometry[slot]);
+      if(!state_.transient[slot].empty()) draw.vertices.emplace_back(slot,state_.transient[slot]);
+    }
     if(kind!=NativeDrawKind::Draw && !state_.indices.empty()) draw.geometry+=(draw.geometry.empty()?"":" ")+state_.indices;
     draw.targets=state_.targets; draw.depth=state_.depth; draw.viewport=state_.viewport; draw.blend=state_.blend;
     draw.scissor=state_.scissor;

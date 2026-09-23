@@ -276,6 +276,43 @@ void Instancing() {
   // Transparent lists keep each entry's draws together in guest order.
   const auto sorted=OrderNativeFullFrameModelDraws(plan.opaque,false);
   Require(sorted[0].item==0 && sorted[1].item==0 && sorted[1].draw.pass==0x3100 && sorted[2].item==1,"transparent draws stay in item order");
+  // A blending draw keeps its guest place: B's pass blends, so A's draws of
+  // items 0 (before B) and 2, 3 (after it) are grouped only on their side.
+  const auto blended=OrderNativeFullFrameModelDraws(plan.opaque,true,[](const NativeFullFrameModelDrawRef& ref) { return ref.draw.pass==0x3800; });
+  const std::array<std::pair<uint32_t,uint32_t>,7> kept{{
+    {0,0x3000},{0,0x3100},{1,0x3800},{2,0x3000},{3,0x3000},{2,0x3100},{3,0x3100}}};
+  Require(blended.size()==kept.size(),"every draw is ordered");
+  for(size_t i=0;i<kept.size();++i)
+    Require(blended[i].item==kept[i].first && blended[i].draw.pass==kept[i].second,"no draw crosses a blending draw");
+}
+// NativeFullFrameModelOpaqueOrder: runs between blending draws are stably
+// ordered by (pass index, batch, pass record); blending draws stay in place.
+void OpaqueOrderAroundBlending() {
+  using K=NativeFullFrameModelOrderKey;
+  const std::vector<K> none{};
+  Require(NativeFullFrameModelOpaqueOrder(none).empty(),"no draws, no order");
+  // Guest order: two opaque draws, a blending one, three opaque, two blending
+  // in a row, one opaque.
+  const std::vector<K> keys{
+    {1,0x20,0x31,false},{0,0x20,0x30,false},{0,0x10,0x40,true},{1,0x10,0x31,false},{0,0x30,0x30,false},{0,0x10,0x30,false},
+    {0,0x10,0x30,true},{0,0x00,0x00,true},{0,0x00,0x00,false}};
+  const auto order=NativeFullFrameModelOpaqueOrder(keys);
+  const std::vector<uint32_t> expected{1,0,2,5,4,3,6,7,8};
+  Require(order==expected,"each opaque run sorts on its own; blending draws and the order around them are the guest's");
+  // Without blending draws it is the stable sort over the whole list.
+  std::vector<K> opaque=keys;
+  for(auto& key:opaque) key.blends=false;
+  std::vector<uint32_t> stable(opaque.size());
+  for(uint32_t i=0;i<stable.size();++i) stable[i]=i;
+  std::stable_sort(stable.begin(),stable.end(),[&](uint32_t a,uint32_t b) {
+    return std::tie(opaque[a].pass_index,opaque[a].batch,opaque[a].pass)<std::tie(opaque[b].pass_index,opaque[b].batch,opaque[b].pass);
+  });
+  Require(NativeFullFrameModelOpaqueOrder(opaque)==stable,"all opaque: one stable sort");
+  // All blending: the guest order.
+  std::vector<K> blending=keys;
+  for(auto& key:blending) key.blends=true;
+  const auto kept=NativeFullFrameModelOpaqueOrder(blending);
+  for(uint32_t i=0;i<kept.size();++i) Require(kept[i]==i,"all blending: guest order");
 }
 // 821C9DA8 sets: one item per world after the entry's own model, sharing its
 // route; the sphere draws of every world are adjacent in the opaque order.
@@ -1213,6 +1250,45 @@ ObjectFixture MakeObjectFixture(std::shared_ptr<NativeRenderBackend> backend) {
   const auto layout=Layout(0x1000,false,1,{Mesh(0,false,true,{Batch(0x2000,{0x3000})})});
   fixture.program=program; fixture.geometry=geometry; fixture.published=published; fixture.layout=layout;
   return fixture;
+}
+// Build's opaque order keeps a blending draw in its guest place: entries A, B,
+// A, A where B's pass record resolves to a material that blends (op 0x3c,
+// 821352E8's alpha blend enable). Grouped on (pass index, batch, pass record)
+// alone B would draw last, over every A; kept, the A before it draws first
+// and the two after it are grouped (adjacent: one instanced draw).
+void BlendingKeepsItsPlace(std::shared_ptr<NativeRenderBackend> backend) {
+  auto fixture=MakeObjectFixture(backend);
+  auto blending_program=std::make_shared<NativeSceneMaterialProgram>(*fixture.program);
+  blending_program->inputs.state_overrides={{0x3c,1},{0x48,6},{0x4c,7}};  // Enable; SRCALPHA/INVSRCALPHA as the effects set them.
+  auto blending=std::make_shared<NativeSceneGroupMaterial>(*fixture.published);
+  blending->program=blending_program;
+  const auto a=fixture.layout;
+  const auto b=Layout(0x1800,false,1,{Mesh(0,false,true,{Batch(0x2800,{0x3800})})});
+  NativeRenderRegistrySnapshot snapshot;
+  for(uint32_t i=0;i<4;++i) snapshot.entries.push_back(Entry(i+1,{float(i),0,100},1,i==1?b:a));
+  const auto camera=MakeCamera();
+  SkinnedFixture skinned(backend);
+  auto pass=skinned.Pass();
+  pass.gather.objects={1,2,3,4};
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t record) {
+    return std::shared_ptr<const NativeSceneGroupMaterial>(record==0x3800?blending:fixture.published);
+  };
+  sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { return fixture.geometry; };
+  sources.generation=[] { return uint64_t(1); };
+  NativeFullFrameModels models;
+  for(int frame_index=0;frame_index<2;++frame_index) {  // Resolved, then from the cached rows.
+    const auto frame=models.Build(snapshot,camera,pass,sources);
+    Require(frame.stats.drawn==4 && frame.stats.draws==4 && frame.stats.failed==0,"four entries drawn");
+    std::vector<bool> blends;
+    for(const auto& batch:frame.batches) for(const auto& object:batch.snapshot.instances)
+      blends.push_back(DecodeNativeRenderState(object->object.material->pipeline()->identity_state).blend_enable);
+    Require(blends==std::vector<bool>{false,true,false,false},"the blending draw keeps its guest place");
+    const auto refs=OrderNativeFullFrameModelDraws(frame.plan.opaque,true,
+      [](const NativeFullFrameModelDrawRef& ref) { return ref.draw.pass==0x3800; });
+    Require(refs.size()==4 && refs[0].item==0 && refs[1].item==1 && refs[2].item==2 && refs[3].item==3,
+      "Build's order is OrderNativeFullFrameModelDraws' with the blending draws named");
+  }
 }
 // Build with per-object constants against full captures: a rigid draw
 // captures the row's constants with the pool's values at its slot 4 bound
@@ -2820,7 +2896,7 @@ int main(int argc,char** argv) {
       UfoFrames(device);
       return 0;
     }
-    Visibility(); MovingVisibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
+    Visibility(); MovingVisibility(); Lod(); Constants(); SortKeys(); Instancing(); OpaqueOrderAroundBlending(); InstancedWorlds(); BaseState();
     SourceTable(); SourceMemo(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
     AttachmentsFollowTheModel(); PoseSource(); ObjectConstantOverrides(); PoolCallOrder(); PoolCarry(); GatherWalk();
     // The skinned material path against full captures, on both backends (WARP).
@@ -2828,7 +2904,7 @@ int main(int argc,char** argv) {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); UnpublishedMaterial(device); ObjectConstantBuild(device); ObjectPatches(device); PoolCarryFrames(device); ModelFrames(device); VelocityBuild(device);
+      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); UnpublishedMaterial(device); BlendingKeepsItsPlace(device); ObjectConstantBuild(device); ObjectPatches(device); PoolCarryFrames(device); ModelFrames(device); VelocityBuild(device);
       ReuseOffFrames(device); UfoFrames(device);
     }
   } catch(const std::exception& error) {

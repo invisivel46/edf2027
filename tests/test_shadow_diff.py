@@ -203,19 +203,49 @@ class ShadowDiffTests(unittest.TestCase):
         code, _, _ = self.report('--ignore-order')
         self.assertEqual(code, 0)
 
-    def test_pass_order_is_not_a_draw_difference(self):
+    def test_pass_order_is_one_difference(self):
         # The native passes group draws by kind where the guest callbacks
-        # interleave them: a different pass order is reported once, as the
-        # pass order, not per draw (unless --strict-order).
+        # interleave them: a pass the native frame starts before one the guest
+        # starts first is one "pass_order" difference, not one per draw
+        # (unless --strict-order).
         self.frame.native[0], self.frame.native[1] = self.frame.native[1], self.frame.native[0]
         code, report, text = self.report()
-        self.assertEqual(code, 0, text)
-        order = report['frames'][0]['draws']['pass_order']
+        self.assertEqual(code, 1, text)
+        draws = report['frames'][0]['draws']
+        order = draws['pass_order']
         self.assertEqual([k for k, _ in order['guest']], ['native.sky', 'native.models', 'native.post'])
         self.assertEqual([k for k, _ in order['native']], ['native.models', 'native.sky', 'native.post'])
-        self.assertEqual(report['frames'][0]['draws']['classes']['guest.view_begin'], {'native.sky': 1})
+        self.assertEqual(draws['classes']['guest.view_begin'], {'native.sky': 1})
+        self.assertEqual(draws['counts'], {'pass_order': 1})
+        difference = draws['differences'][0]
+        self.assertEqual((difference['label'], difference['pass'], difference['fields']),
+                         ('native.sky > native.models > native.post', 'native.models > native.sky > native.post', []))
+        allow = self.root / 'allow.json'
+        allow.write_text(json.dumps({'draws': [{'kind': 'pass_order', 'field': 'opaque', 'reason': 'opaque only'}]}),
+                         encoding='utf-8')
+        code, _, text = self.report('--allow', allow)
+        self.assertEqual(code, 0, text)
+        # A blending draw in a moved pass: "blended", which an opaque rule does not excuse.
+        for side in (self.frame.native, self.frame.guest):
+            for draw_ in side:
+                draw_['decoded'] = 'blend=0:2/1/1:2/1/1 mask=15 depth=1/1/4 raster=3/1/1/1'
+                draw_['format'] = [1, 10, 0, 1, 0]
+        self.frame.native[0]['decoded'] = self.frame.guest[1]['decoded'] = 'blend=1:5/6/1:5/6/1 mask=15 depth=1/1/4 raster=3/1/1/1'
+        code, report, _ = self.report('--allow', allow)
+        self.assertEqual(code, 1)
+        self.assertEqual(report['frames'][0]['draws']['differences'][0]['fields'], ['blended'])
         code, report, _ = self.report('--strict-order')
         self.assertEqual(report['frames'][0]['draws']['counts'], {'reordered': 1})
+
+    def test_pass_interleaving_is_not_a_difference(self):
+        # The guest reaches the sky again after the models; the native frame
+        # draws both sky draws first. Which pass starts first is the same.
+        self.frame.guest.insert(2, draw(5, 'guest.world:82002214', vs=3, ps=4, count=12, targets=('g0',), depth='gd'))
+        self.frame.native.insert(1, draw(5, 'native.sky', vs=3, ps=4, count=12))
+        code, report, text = self.report()
+        self.assertEqual(code, 0, text)
+        self.assertEqual([k for k, _ in report['frames'][0]['draws']['pass_order']['guest']],
+                         ['native.sky', 'native.models', 'native.sky', 'native.post'])
 
     def test_pipeline_identity_is_not_the_key(self):
         # Every guest pipeline is built from the live guest words, every native
@@ -373,6 +403,108 @@ class ShadowDiffTests(unittest.TestCase):
         self.assertEqual(report['frames'][0]['draws']['guest'], 5)
         code, _, _ = self.report('--no-expand-instances')
         self.assertEqual(code, 1)
+
+    def test_instance_stream_checked_against_paired_worlds(self):
+        # The native pass instances three guest draws: its transient instance
+        # stream (the tap's slot-15 hash) must be their worlds in instance order.
+        import struct
+        worlds = [[float(i * 16 + k) for k in range(16)] for i in range(3)]
+        stream = b''.join(struct.pack('<16f', *w) for w in worlds)
+        guest_mesh = [draw(i + 1, 'guest.world:8200427c', targets=('g0',), depth='gd', world=worlds[i]) for i in range(3)]
+        self.frame.guest = [self.frame.guest[0]] + guest_mesh + [self.frame.guest[2]]
+        self.frame.native[1] = draw(1, kind='instanced', instances=3, vs=(1 << 63) | 1)
+        self.frame.native[1]['geometry'] = f'0=b:1+0/32 15=t:{sd.fnv1a64(stream):016x}:{len(stream)}/64'
+        code, report, text = self.report()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(report['frames'][0]['draws']['instance_streams'], {'verified': 3})
+        # Another stream: every instance's world differs.
+        self.frame.native[1]['geometry'] = f'0=b:1+0/32 15=t:{sd.fnv1a64(stream[::-1]):016x}:{len(stream)}/64'
+        code, report, _ = self.report()
+        self.assertEqual(code, 1)
+        draws = report['frames'][0]['draws']
+        self.assertEqual(draws['instance_streams'], {'differs': 3})
+        self.assertEqual(draws['groups']['field'], {'world.instances': 3})
+
+    def test_meshes_on_objects_pair_by_their_registers(self):
+        # Two skinned draws of one mesh on two objects (no recorded world), in
+        # the opposite order on the native side: paired by their first palette
+        # bone, so neither is a register difference; the tails past the
+        # palette (native zero, guest (0,0,0,1) fill) are named.
+        import struct
+        def image(bone0, tail_fill):
+            registers = [struct.pack('<4f', 9, 9, 9, 9)] * 4          # g_mWorld: not read by a skinned shader
+            registers += [struct.pack('<4f', bone0, 0, 0, 1)] * 3     # bone 0
+            registers += [struct.pack('<4f', 0, 0, 0, 1) if tail_fill else bytes(16)] * (208 - 7)
+            registers += [struct.pack('<4f', 2, 0, 0, 0)] * (238 - 208)
+            return b''.join(registers).hex()
+        def constants(bone0, tail_fill):
+            return [{'stage': 0, 'slot': 0, 'bytes': 3808, 'hash': f'{bone0}{tail_fill}', 'data': image(bone0, tail_fill)}]
+        self.frame.guest[1:2] = [draw(1, 'guest.world:8200427c', targets=('g0',), depth='gd', constants=constants(1, True)),
+                                 draw(2, 'guest.world:8200427c', targets=('g0',), depth='gd', constants=constants(2, True))]
+        self.frame.native[1:2] = [draw(1, constants=constants(2, False)), draw(2, constants=constants(1, False))]
+        code, report, text = self.report('--ignore-order')
+        self.assertEqual(code, 1, text)
+        differences = report['frames'][0]['draws']['differences']
+        self.assertEqual(sorted((d['guest'], d['native']) for d in differences), [(1, 2), (2, 1)])
+        for difference in differences:
+            self.assertEqual(difference['fields'], ['constants.vs0.g_mWorldArray.tail'])
+            self.assertEqual(difference['details']['constants.vs0.g_mWorldArray.tail']['registers'], 'c7-c207')
+            self.assertTrue(difference['constant_bytes'])
+        allow = self.root / 'allow.json'
+        allow.write_text(json.dumps({'draws': [{'kind': 'differing', 'pass': 'native.models',
+                                                'field': 'constants.vs0.g_mWorldArray.tail', 'reason': 'tail'}]}),
+                         encoding='utf-8')
+        self.assertEqual(self.report('--ignore-order', '--allow', allow)[0], 0)
+
+    def test_vertex_register_classes(self):
+        import struct
+        zero, fill = bytes(16), struct.pack('<4f', 0, 0, 0, 1)
+        def image(values):
+            return b''.join(values.get(r, zero) for r in range(238))
+        live = {r: struct.pack('<4f', r, 1, 2, 3) for r in range(4, 13)}
+        guest = image({**live, 0: fill, 13: fill, 14: fill, 210: fill, 230: fill})
+        native = image({**live, 0: fill, 11: struct.pack('<4f', 5, 5, 5, 5), 210: zero, 230: zero})
+        groups = sd.classify_vertex_registers(guest, native, instanced=False)
+        # c11 is inside the native palette (a live bone differs), c13/c14 past it.
+        self.assertEqual(groups, {'g_mWorldArray': [11], 'g_mWorldArray.tail': [13, 14], 'g_mView': [210], 'material': [230]})
+        self.assertEqual(sd.classify_vertex_registers(struct.pack('<4f', 1, 0, 0, 0) + native[16:], native,
+                                                      instanced=True), {'g_mWorld.instanced': [0]})
+
+    def test_constant_bytes_rule(self):
+        # A rule with constant_bytes=false excuses only differences between
+        # draws whose constants were not recorded.
+        self.frame.native[1]['constants'] = [{'stage': 0, 'slot': 0, 'bytes': 64, 'hash': 'c2'}]
+        allow = self.root / 'allow.json'
+        allow.write_text(json.dumps({'draws': [{'kind': 'differing', 'field': 'constants.vs0', 'constant_bytes': False,
+                                                'reason': 'unrecorded'}]}), encoding='utf-8')
+        self.assertEqual(self.report('--allow', allow)[0], 0)
+        self.frame.native[1]['constants'] = [{'stage': 0, 'slot': 0, 'bytes': 64, 'hash': 'c2', 'data': '00' * 64}]
+        self.frame.guest[1]['constants'] = [{'stage': 0, 'slot': 0, 'bytes': 64, 'hash': 'c1', 'data': '01' * 64}]
+        code, report, _ = self.report('--allow', allow)
+        self.assertEqual(code, 1)
+        self.assertTrue(report['frames'][0]['draws']['differences'][0]['constant_bytes'])
+
+    def test_transient_vertices_are_content(self):
+        # An immediate draw's transient vertices are compared by hash; with the
+        # bytes, the tool says which words differ. The instance stream slot is not.
+        import struct
+        guest = struct.pack('<7f', 1, 2, 3, .25, .25, .25, 1) * 2
+        native = struct.pack('<7f', 1, 2, 3.0000002, .25, .25, .25, 1) + struct.pack('<7f', 1, 2, 3, .25, .25, .25, 1)
+        self.frame.guest[0]['geometry'] = f'0=t:{sd.fnv1a64(guest):016x}:56/28 15=t:aa:64/64'
+        self.frame.native[0]['geometry'] = f'0=t:{sd.fnv1a64(native):016x}:56/28 15=t:bb:64/64'
+        code, report, _ = self.report()
+        self.assertEqual(code, 1)
+        difference = report['frames'][0]['draws']['differences'][0]
+        self.assertEqual(difference['fields'], ['geometry.transient.0'])
+        self.assertNotIn('details', difference)
+        self.frame.guest[0]['vertices'] = [{'slot': 0, 'data': guest.hex()}]
+        self.frame.native[0]['vertices'] = [{'slot': 0, 'data': native.hex()}]
+        _, report, text = self.report()
+        detail = report['frames'][0]['draws']['differences'][0]['details']['geometry.transient.0']
+        self.assertEqual(detail['registers'], '1 words in 1 vertices, first vertex 0 +8, max 1 ulp')
+        self.assertIn('geometry.transient.0', text)
+        self.frame.native[0]['geometry'] = self.frame.guest[0]['geometry'].replace('15=t:aa', '15=t:cc')
+        self.assertEqual(self.report()[0], 0)
 
     def test_geometry_only_when_strict(self):
         self.frame.native[1]['geometry'] = '0=b:aaaa+0/32'
