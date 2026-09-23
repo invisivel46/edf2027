@@ -20,7 +20,12 @@ class NativeUiTicker {
         while(!stop.stop_requested()) {
           if(!state->pending.exchange(true)) {
             state->requested=false;
+            // Just-in-time presentation (edf_low_latency): the display wait happens here,
+            // on this thread, so the paint starts right after the flip and the UI thread,
+            // which also delivers input, never sleeps on the display.
+            const auto before=state->before_dispatch;
             lock.unlock();
+            if(before) before();
             if(!dispatch([state,paint] {
               struct Done { std::shared_ptr<State> state; ~Done(){
                 std::lock_guard guard(state->mutex);
@@ -48,6 +53,12 @@ class NativeUiTicker {
     state_->occluded=value;
     state_->period=value?250000000:16666667;
   }
+  // Runs on the ticker thread before each paint is dispatched (never while the lock is held).
+  // It may block for about a display refresh; Stop waits for it to return.
+  void SetBeforeDispatch(std::function<void()> before) {
+    std::lock_guard lock(state_->mutex);
+    state_->before_dispatch=std::move(before);
+  }
   // Safe to retain after Stop/destruction; requests coalesce while painting.
   std::function<void()> FrameReadyCallback() const {
     return [weak=std::weak_ptr<State>(state_)] {
@@ -65,6 +76,7 @@ class NativeUiTicker {
     std::mutex mutex;
     std::condition_variable_any wake;
     bool requested=false,occluded=false;
+    std::function<void()> before_dispatch;
   };
   std::shared_ptr<State> state_;
   std::jthread thread_;

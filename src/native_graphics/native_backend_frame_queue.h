@@ -53,9 +53,13 @@ class NativeBackendFrameQueue {
     lock.unlock();
     if(notify) notify();
   }
+  // Copies the oldest ready image (FIFO, primed with two), or with `newest`
+  // (edf_low_latency) the newest one at once, discarding the older ready images:
+  // a presenter that can show one image per refresh shows the latest instead of
+  // working through a backlog that only adds refreshes of delay.
   bool Visit(uint64_t after_sequence,
       const std::function<NativeBackendFrameCopied(const NativeBackendPublishedFrame&)>& copy,
-      NativeBackendFrameVisitTiming* timing=nullptr) {
+      NativeBackendFrameVisitTiming* timing=nullptr,bool newest=false) {
     const auto entered=timing?Clock::now():Clock::time_point{};
     std::unique_lock lock(mutex_); Check();
     const auto acquired=timing?Clock::now():Clock::time_point{};
@@ -65,8 +69,11 @@ class NativeBackendFrameQueue {
     while(!ready_.empty() && slots_[ready_.front()].frame.sequence<=after_sequence) {
       Discard(slots_[ready_.front()]); ready_.pop_front(); changed_.notify_all();
     }
+    if(newest) {
+      while(ready_.size()>1) { Discard(slots_[ready_.front()]); ready_.pop_front(); ++skipped_; changed_.notify_all(); }
+    }
     if(ready_.empty()) { primed_=false; return false; }
-    if(!primed_ && ready_.size()<2) return false;
+    if(!newest && !primed_ && ready_.size()<2) return false;
     primed_=true;
     auto& slot=slots_[ready_.front()];
     try {
@@ -104,6 +111,9 @@ class NativeBackendFrameQueue {
       return true;
     } catch(...) { failure_=std::current_exception(); changed_.notify_all(); throw; }
   }
+  size_t ready() const { std::lock_guard lock(mutex_); return ready_.size(); }
+  // Ready images the presenter dropped for a newer one (newest mode).
+  uint64_t skipped() const { std::lock_guard lock(mutex_); return skipped_; }
   void SetActive(bool active) {
     std::lock_guard lock(mutex_);
     if(active_==active) return;
@@ -138,12 +148,12 @@ class NativeBackendFrameQueue {
     for(const auto index:ready_) Discard(slots_[index]);
     ready_.clear();
   }
-  std::mutex mutex_;
+  mutable std::mutex mutex_;
   std::condition_variable changed_;
   std::array<Slot,kSlots> slots_;
   std::deque<size_t> ready_;
   size_t next_=0;
-  uint64_t last_sequence_=0;
+  uint64_t last_sequence_=0,skipped_=0;
   bool active_=true,primed_=false;
   std::exception_ptr failure_;
   std::function<void()> ready_callback_;

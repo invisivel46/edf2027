@@ -623,3 +623,123 @@ Final build and targeted checks pass (`out/unlock-final-checks-build.log`):
 stopped. Remaining broader regression work includes all missions/weapons,
 precise A/V synchronization and detailed collision comparisons; these are not
 represented as completed by the smoke checks above.
+
+## Input latency with VSync on, uncapped (2026-09-23)
+
+Report: noticeable keyboard/mouse delay with VSync on, "Uncapped" (unlock on, cap 0),
+D3D12. Nothing below was measured in a game run; the numbers come from reading the code
+and from the fake-clock pipeline model in `tests/input_latency_tests.cpp`, which drives the
+real `NativeBackendFrameQueue`. Measure with the trace (below) before trusting them.
+
+### Where the time goes (legacy path, frames faster than the display, P = refresh period)
+
+1. UI-thread delivery. Keyboard and mouse events arrive on the SDL UI thread
+   (rexglue `windowed_app_context_sdl.cpp:90`, `SDL_WaitEvent`), which is also the thread
+   the presenter paints on. The legacy Present waits for the frame-latency object inside
+   the paint (`d3d12_backend.cpp:1681`), so the UI thread sleeps on the display for most
+   of every refresh and events queue behind it: about P/2 added on average (8.3 ms at
+   60 Hz, 3.5 ms at 144 Hz). The trace reports it as `ui_block_pct`/`ui_block_delay_ms`.
+2. Waiting for the next simulation step. The mouse accumulates in `SharedInput`
+   (`native_kbm.cpp`, `AddMouseDelta`) and is taken by the pad poll at the start of each
+   60 Hz step (`sub_821B09A0` -> `MergeIntoDevice`); the step's callback slot 0
+   (clNoguchiCallback `sub_820A6B10` -> `sub_8219E6A8` -> the input manager) runs before
+   the object list whose soldier aim update (`sub_820DC890`, `InjectAim`) applies it,
+   both inside `sub_821A4BA0`. Uniform input waits 0-16.7 ms, 8.3 ms mean. Motion
+   arriving between that poll and the aim update waited a further tick.
+3. The engine loop's own pipeline. `821A6508` presents the previous frame (+24 ->
+   `edf_native_swap_wait`), kicks the render helper for this frame, runs the steps, joins
+   the helper, ends the frame (+20; the scene image's slot `Reserve`,
+   `guest_shader_bridge.cpp:2383`), then `821A4DE8` publishes the camera for the NEXT
+   render. A step's input is therefore rendered one loop later and submitted/published at
+   the start of the loop after that (`SubmitSceneFrameLocked`, `:2454`): about 2 loops.
+4. Presentation queue. Three slots, FIFO, primed with two (`native_backend_frame_queue.h:20`,
+   `:76`). With frames faster than the display the producer blocks in `Reserve` and every
+   image waits behind the ready ones: about 3P.
+5. Presenter. The paint takes the oldest image right after its previous Present returned,
+   then waits for the frame-latency object inside Present (maximum latency 1,
+   `d3d12_backend.cpp:1604`), and the flip lands a refresh after that: about 2P from
+   acquisition to photon.
+6. Interpolation. The camera (`native_camera_history.h`, sampled at
+   `guest_shader_bridge.cpp:8443`) and model poses render `lerp(tick-1, tick, fraction)`,
+   so a step's rotation ramps in over one tick: half of it shows ~8.3 ms later, all of it
+   16.7 ms later, independent of the display.
+7. Frame credit. `edf_native_frame_latency=2` (`NativeFrameFlight`) lets the CPU run one
+   GPU frame ahead; with frames faster than the display it never waits (the queue
+   backpressures first). When the GPU is the limit it adds up to one GPU frame.
+8. Frame limiter. Cap 0 returns at once (`input_hooks.cpp:244`) and the before-present
+   placement needs a cap and VSync off (`:277`): no cost here.
+9. Mouse mapping. On foot the counts become an exact angle per tick
+   (`native_kbm_logic.h:179`, `AimInputForCounts`): linear, no smoothing, acceleration
+   or clamp; one tick of accumulation (item 2). Vehicles use a right-stick fallback
+   (`kStickPerCount`, clamped to +-1 per poll, `native_kbm_logic.h:213`): a rate with
+   saturation, not an angle. SDL relative mode delivers raw counts; the SDK scales them by
+   the display density (`window_sdl.cpp:562`), a sensitivity factor, not a delay.
+
+Model, pad poll to photon, loop work 0.4P: legacy 7.0P (116.7 ms at 60 Hz, 48.6 ms at
+144 Hz). Adding items 1, 2 and 6 (about 8 + 8 + 8-17 ms), legacy input-to-photon at 60 Hz
+is on the order of 140-150 ms; at 144 Hz about 70-80 ms.
+
+### edf_low_latency (F1 > Performance > Low latency; off by default)
+
+- Presenter just in time, off the UI thread: the ticker thread waits for the frame-latency
+  object before dispatching a paint (`ui_ticker.h`, `NativeBackendHost::Create`); Present
+  spends that wait as a credit (`native_present_slot.h`) instead of waiting. The paint
+  starts right after a flip and the UI thread never sleeps on the display.
+- Newest image: the presenter takes the newest ready image and drops older ones, no
+  priming (`NativeBackendFrameQueue::Visit(..., newest)`), so nothing queues behind the
+  display.
+- Frame credit (`NativeFrameCreditPolicy`): two frames in flight while the loop keeps up
+  with the display, one frame while the GPU is the limit and the loop is slower than the
+  display refresh (measured from the just-in-time waits). A fixed latency 1 was modelled
+  and rejected as the default: it lengthens the loop by every frame's GPU tail, and the
+  loop's render lag makes that cost twice (36.7 vs 41.3 ms with an 8.3 ms GPU at 60 Hz),
+  while it wins once the GPU cannot keep up (62.9 vs 74.7 ms at 21.7 ms). Applied live
+  after each submit; with frame latency 1 the swap polls by yielding for its first 4 ms.
+- Mouse: the aim update also takes motion that arrived after the step's pad poll
+  (`MouseRouter::OnAim` with a late sample), only when that poll routed the mouse to the
+  on-foot aim.
+- Rejected: pacing the producer to the display (start the next loop only once the
+  presenter took the previous image). The model shows it adds a refresh (3.0P vs 2.0P),
+  because the render lags its step by one loop; with the newest-image presenter, frames
+  do not pile up anyway.
+
+Model with low latency: 2.0P pad poll to photon (33.3 ms at 60 Hz, 13.9 ms at 144 Hz)
+versus 7.0P, item 1 removed and item 2 shortened for motion near the tick. The cost: with
+frames faster than the display, the ones it cannot show are dropped rather than queued
+(they were rendered for nothing either way); a cap saves that GPU work.
+
+### Camera late latch: designed, not implemented
+
+Rotating the rendered view by the mouse counts accumulated since the tick that produced
+the camera would remove the interpolation ramp (item 6) for mouse rotation. Where it would
+go: the camera's derived matrices, frustum and culling data are built on the engine thread
+in the `sub_821CDDF8` hook at publication (`guest_shader_bridge.cpp:8443`), from the pose
+the interpolation hands the guest builder. Rotating that pose there, before the builder
+runs, would carry the latch into the view, the guest frustum at camera+288 that the full
+frame's static and model culling read, the motion vectors and FSR (both derive from the
+published camera) and the interpolation (the latch is recomputed from the authoritative
+pose at every publication, so nothing accumulates, and a camera cut resets the history
+and with it the latch); the crosshair is screen-centred and lands where the next tick aims.
+Why it is not done:
+- the latest point it can apply is publication, one loop before the render, so it gains
+  only the counts that arrive during one loop's work plus the ramp;
+- EDF's camera is third person: the view orbits the soldier, so a rotation about the eye
+  is not what the next tick does; it would draw the soldier a few pixels off where the sim
+  puts it, snapping back every tick (visible jitter while turning);
+- the pitch clamp, the weapon zoom divisor (unit+896) and vehicle cameras each need the
+  latch to reproduce guest behaviour exactly, and none of it can be checked without
+  running the game. Revisit with the trace: if `tick_record` plus the half-tick ramp
+  dominate after low latency, implement it in that hook, orbiting the soldier's pivot,
+  behind `edf_camera_late_latch`.
+
+### Measuring it
+
+`--edf_native_input_latency_trace=true` logs `Input latency:` lines every 5 s per input
+kind: p50/p90/p99/max per stage (input_tick, tick_record, record_submit, submit_acquire,
+acquire_present, present_photon, total) plus the UI-thread block. Photons are DXGI frame
+statistics when the swap chain reports them, else the next blocking return of the
+frame-latency object (counted in photon_estimated). `--edf_native_input_latency_csv=PATH`
+also writes every event. `--edf_kbm_test_sweep=N` stands in for a mouse: N counts/ms,
+right 500 ms, still, left, still, from a 1 kHz thread, only while the soldier's aim update
+runs. `python tools/latency-report.py game.log [after.log --compare]` summarises (exact
+percentiles from the CSV, count-weighted window percentiles from the log).

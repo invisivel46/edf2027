@@ -6,6 +6,7 @@
 #include "../scripted_input_logic.h"
 #include "../frame_stats.h"
 #include "../pause_menu.h"
+#include "../input_latency.h"
 #include "native_backend_frame.h"
 #include "native_backend_frame_queue.h"
 #include "native_frame_flight.h"
@@ -2454,6 +2455,7 @@ void SubmitSceneFrameLocked(Bridge& state) {
         {queued.texture_handle(),queued.fence_handle(),queued.value(),state.scene_shared_sequence,
          state.scene_shared_generation,queued.width(),queued.height(),queued.format(),state.scene_shared_gamma},
         state.scene_shared);
+      edf::latency::OnFrameSubmitted(state.scene_shared_sequence);
       state.scene_shared_slot.reset();
       if(state.presentation_frames && !REXCVAR_GET(edf_native_scene_backend).starts_with("d3d12")) {
         const auto& source=*state.scene_shared;
@@ -2601,7 +2603,7 @@ NativeRenderBackend* EnsureNativeRenderBackend() {
 bool VisitNativeBackendFrame(uint64_t after_sequence,
     const std::function<NativeBackendFrameCopied(const NativeBackendPublishedFrame&)>& copy,
     NativeBackendFrameVisitTiming* timing) {
-  return State().scene_frame_queue.Visit(after_sequence,copy,timing);
+  return State().scene_frame_queue.Visit(after_sequence,copy,timing,edf::latency::LowLatency());
 }
 bool VisitNativeBackendFrameMirror(uint64_t after_sequence,
     const std::function<NativeBackendFrameCopied(const NativeBackendPublishedFrame&)>& copy) {
@@ -7945,6 +7947,7 @@ REX_HOOK_RAW(sub_821A5080) {
     native_render_budget=motion.published;
     native_render_publication=motion.publication;
   }
+  edf::latency::OnFrameRecorded(native_render_budget.tick);
   NativeLoopTrace trace("helper_dispatch",ctx.r3.u32,ctx.lr);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceHelper);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::RenderHelper);
@@ -9905,21 +9908,41 @@ REX_EXTERN(edf_native_swap_wait) {
   HookTiming gpu_timing(HookPhase::SwapGpuWait);
   // Bound CPU lead with presentation credits. Real guest resource fences and
   // worker callbacks retain their independent GPU completion queues.
-  const auto latency=uint32_t(std::clamp(REXCVAR_GET(edf_native_frame_latency),1,3));
+  // edf_low_latency: one frame of GPU work in flight while the GPU is the limit, two while it
+  // keeps up (NativeFrameCreditPolicy). Live; edf_native_frame_latency alone needs a restart.
+  const bool low_latency=edf::latency::LowLatency();
+  static NativeFrameCreditPolicy credit_policy;  // swaps are serialized by state.submissions
+  const auto latency=low_latency?uint32_t(credit_policy.Limit())
+                                :uint32_t(std::clamp(REXCVAR_GET(edf_native_frame_latency),1,3));
   std::unique_ptr<NativeCompletionQueue> barrier;
   if(state.scene_backend->name()=="d3d12") {
     if(!timing.flight) timing.flight=std::make_unique<NativeFrameFlight>(latency);
     timing.flight->Submit(state.scene_backend->MarkCompletion());
+    timing.flight->SetLimit(latency);  // after the Submit: a lower limit only waits longer
   } else {
     barrier=CreateCompletionQueueLocked(state,1); barrier->Submit(2);
   }
-  const auto gpu_deadline=NativePacingClock::Clock::now()+std::chrono::seconds(10);
+  const auto gpu_entry=NativePacingClock::Clock::now();
+  const auto gpu_deadline=gpu_entry+std::chrono::seconds(10);
+  bool gpu_waited=false;
   while(timing.flight?!timing.flight->Ready():barrier->Poll(true)!=2) {
+    gpu_waited=true;
     if(NativePacingClock::Clock::now()>=gpu_deadline)
       throw std::runtime_error("native swap GPU completion timed out");
     lock.unlock();
-    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // Latency 1 waits for this very frame, so a millisecond sleep would be added to each
+    // frame: poll by yielding for the first few milliseconds instead.
+    if(low_latency && NativePacingClock::Clock::now()-gpu_entry<std::chrono::milliseconds(4))
+      std::this_thread::yield();
+    else std::this_thread::sleep_for(std::chrono::milliseconds(1));
     lock.lock();
+  }
+  if(low_latency && timing.flight) {
+    static NativePacingClock::Clock::time_point previous_swap{};
+    const auto loop=previous_swap==NativePacingClock::Clock::time_point{}?0:
+      std::chrono::duration_cast<std::chrono::nanoseconds>(gpu_entry-previous_swap).count();
+    previous_swap=gpu_entry;
+    credit_policy.Observe(gpu_waited,loop,edf::latency::DisplayRefreshNs());
   }
   gpu_timing.Finish();
   frame_trace.Mark(3);
@@ -10760,6 +10783,7 @@ REX_HOOK_RAW(sub_821BEAB0) {
   sub_821FAC28(ctx,base);
   const auto simulation_steps=edf::native::NativePacingResult(steps);
   native_loop_budget={unlocked,simulation_steps,current,state.clock.Fraction(sampled_at),divisor};
+  edf::latency::OnHeartbeat(current);
   // The retail outer loop treats zero as "skip all normal work". Its render
   // token stays nonzero; the actual step dispatcher receives the real budget.
   ctx.r3.u64=unlocked?1:simulation_steps;

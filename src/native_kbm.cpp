@@ -14,9 +14,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -26,6 +29,7 @@
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
 
+#include "input_latency.h"
 #include "manual_reload.h"
 #include "native_kbm.h"
 #include "native_kbm_logic.h"
@@ -46,6 +50,11 @@ REXCVAR_DEFINE_INT32(edf_kbm_test_counts, 0, "EDF2027",
                      "Pretend the mouse moved this many counts to the right every poll (diagnostic)")
     .range(-1000, 1000);
 REXCVAR_DEFINE_BOOL(edf_kbm_test_forward, false, "EDF2027", "Pretend the move-forward key is held (diagnostic)");
+REXCVAR_DEFINE_INT32(edf_kbm_test_sweep, 0, "EDF2027",
+                     "Pretend the mouse sweeps right, stops, sweeps left and stops (500 ms each) at this many counts "
+                     "per millisecond, from a 1 kHz thread, while the soldier is on foot: timed input for "
+                     "edf_native_input_latency_trace with nobody at the mouse (diagnostic)")
+    .range(0, 50);
 REXCVAR_DECLARE(std::string, edf_mouse_left);
 REXCVAR_DECLARE(std::string, edf_mouse_right);
 REXCVAR_DECLARE(std::string, edf_mouse_middle);
@@ -174,6 +183,45 @@ ActionState ReadActions(GuestSide& guest, const KeyState& keys, const std::array
   return actions;
 }
 
+// The player's on-foot aim update last ran (steady-clock ns), for the diagnostic sweep.
+std::atomic<int64_t> g_last_player_aim_ns{0};
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+void PlayerAimed() { g_last_player_aim_ns.store(SteadyNowNs(), std::memory_order_relaxed); }
+
+// edf_kbm_test_sweep: a host thread standing in for a mouse. It adds its counts through
+// AddMouseDelta like the window does, so the latency trace times them as input events. It
+// emits only while the player's on-foot aim update keeps running (menus and vehicles would
+// read it as a stick) and sleeps otherwise; started on the first poll that finds the cvar set.
+void AddMouseDeltaFromSweep(float dx);
+void EnsureSweepThread() {
+  if (!REXCVAR_GET(edf_kbm_test_sweep)) return;
+  static std::once_flag started;
+  static std::atomic<bool> stop{false};
+  std::call_once(started, [] {
+    std::atexit([] { stop.store(true, std::memory_order_relaxed); });
+    std::thread([] {
+      const auto begin = std::chrono::steady_clock::now();
+      double last_ms = 0.0;
+      while (!stop.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const double now_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - begin).count();
+        const int32_t rate = REXCVAR_GET(edf_kbm_test_sweep);
+        const bool on_foot = SteadyNowNs() - g_last_player_aim_ns.load(std::memory_order_relaxed) < 100'000'000;
+        if (rate > 0 && on_foot) {
+          const float counts = SweepCounts(last_ms, now_ms, float(rate));
+          if (counts != 0.0f && !stop.load(std::memory_order_relaxed)) AddMouseDeltaFromSweep(counts);
+        }
+        last_ms = now_ms;
+      }
+    }).detach();
+    REXLOG_INFO("Native K/M: diagnostic mouse sweep thread started (edf_kbm_test_sweep)");
+  });
+}
+
 void MergeIntoDevice(uint8_t* base, uint32_t device) {
   KeyState keys;
   std::array<bool, 3> mouse_buttons;
@@ -189,9 +237,10 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
     shared.dx = shared.dy = 0.0f;
     game_owns_input = shared.game_owns_input;
   }
+  EnsureSweepThread();  // after Shared() exists, so its exit handler runs before Shared() is destroyed
   const int32_t test_counts = REXCVAR_GET(edf_kbm_test_counts);
   const bool test_forward = REXCVAR_GET(edf_kbm_test_forward);
-  if (test_counts || test_forward) game_owns_input = true;
+  if (test_counts || test_forward || REXCVAR_GET(edf_kbm_test_sweep)) game_owns_input = true;
   dx += static_cast<float>(test_counts);
 
   GuestSide& guest = Guest();
@@ -199,6 +248,7 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
   if (!game_owns_input) {
     guest.router.Reset();
     edf::reload::ResetKeyboard();
+    edf::latency::OnInputDiscarded();
     return;
   }
   // F1 menu (pause_menu.h): nothing reaches the game while it is open, nor after it
@@ -209,8 +259,11 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
   if (edf::menu::BlockGameInput(edf::menu::MenuInputGate::kKeyboardMouse, idle)) {
     guest.router.Reset();
     edf::reload::ResetKeyboard();
+    edf::latency::OnInputDiscarded();
     return;
   }
+  // Input latency trace: this poll gives the game everything received so far.
+  edf::latency::OnInputConsumed();
   ActionState actions = ReadActions(guest, keys, mouse_buttons);
   // Manual reload (optional): a request on the press edge and nothing written to the pad
   // channels, so an action sharing the key keeps it. A no-op with edf_manual_reload off.
@@ -312,11 +365,26 @@ void InjectAim(uint8_t* base, uint32_t unit) {
   const uint32_t profile = Load32(base, unit + kUnitProfile);
   if (!profile || Load32(base, profile + kProfileControlType) != kControlTypeTechnical) return;
 
+  PlayerAimed();
   float dx, dy;
   {
     GuestSide& guest = Guest();
     std::lock_guard lock(guest.mutex);
-    guest.router.OnAim(dx, dy);
+    if (edf::latency::LowLatency() && REXCVAR_GET(edf_kbm_mouse_look)) {
+      // edf_low_latency: the motion that arrived since this step's pad poll too (no smoothing,
+      // no acceleration: the counts as they came, turned into an exact angle below).
+      guest.router.OnAim(dx, dy, [](float& late_x, float& late_y) {
+        SharedInput& shared = Shared();
+        std::lock_guard shared_lock(shared.mutex);
+        if (!shared.game_owns_input) return;
+        late_x = shared.dx;
+        late_y = shared.dy;
+        shared.dx = shared.dy = 0.0f;
+      });
+      if (guest.router.late_allowed()) edf::latency::OnInputConsumed();
+    } else {
+      guest.router.OnAim(dx, dy);
+    }
   }
   if (dx == 0.0f && dy == 0.0f) return;
   const float sensitivity = static_cast<float>(REXCVAR_GET(edf_kbm_sensitivity));
@@ -345,9 +413,14 @@ bool MouseLookWanted() { return REXCVAR_GET(edf_kbm) && REXCVAR_GET(edf_kbm_mous
 
 void SetKey(uint16_t vk, bool down) {
   if (vk >= 256) return;
-  SharedInput& shared = Shared();
-  std::lock_guard lock(shared.mutex);
-  shared.keys[vk] = down;
+  bool pressed = false;
+  {
+    SharedInput& shared = Shared();
+    std::lock_guard lock(shared.mutex);
+    pressed = down && !shared.keys[vk];
+    shared.keys[vk] = down;
+  }
+  if (pressed) edf::latency::OnInput(edf::latency::InputKind::kKey);
 }
 void SetMouseButton(int button, bool down) {
   if (button < 0 || button >= 3) return;
@@ -356,11 +429,17 @@ void SetMouseButton(int button, bool down) {
   shared.mouse_buttons[static_cast<size_t>(button)] = down;
 }
 void AddMouseDelta(float dx, float dy) {
-  SharedInput& shared = Shared();
-  std::lock_guard lock(shared.mutex);
-  shared.dx += dx;
-  shared.dy += dy;
+  {
+    SharedInput& shared = Shared();
+    std::lock_guard lock(shared.mutex);
+    shared.dx += dx;
+    shared.dy += dy;
+  }
+  if (dx != 0.0f || dy != 0.0f) edf::latency::OnInput(edf::latency::InputKind::kMouse);
 }
+namespace {
+void AddMouseDeltaFromSweep(float dx) { AddMouseDelta(dx, 0.0f); }
+}  // namespace
 void ClearInput() {
   SharedInput& shared = Shared();
   std::lock_guard lock(shared.mutex);
