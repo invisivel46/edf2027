@@ -54,10 +54,14 @@ std::optional<uint32_t> SelectNativeFullFrameModelLod(const NativeRenderEntry& e
   return chosen;
 }
 NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera,
-    const NativeFullFrameModelGather& gather,const NativeFrameMotion& motion) {
+    const NativeFullFrameModelGather& gather,bool census,const NativeFrameMotion& motion) {
   using C=NativeFullFrameModelCull;
   NativeFullFrameModelPlan plan;
   auto& stats=plan.stats;
+  // A census mark for the entry (its class; null names resolve by vtable).
+  const auto mark=[&](const NativeRenderEntry& entry,NativeCoverageStatus status,const char* reason) {
+    if(census) plan.census.push_back({status,entry.type?entry.type->vtable:0u,entry.type?entry.type->name:nullptr,reason});
+  };
   // Gather order: a listed object at 2i+1, the unlisted at 2*unlisted (before
   // objects[unlisted]), ties (the unlisted) in snapshot order.
   std::vector<std::pair<uint64_t,const NativeRenderEntry*>> order;
@@ -87,7 +91,7 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
     switch(visibility.cull) {
       case C::Visible: break;
       case C::Hidden: ++stats.hidden; continue;
-      case C::Mode: ++stats.mode; continue;
+      case C::Mode: ++stats.mode; mark(entry,NativeCoverageStatus::Uncovered,"models_unknown_mode"); continue;
       case C::Distance: ++stats.distance; continue;
       case C::Frustum: ++stats.frustum; continue;
       case C::Box: ++stats.box; continue;
@@ -102,14 +106,17 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
     }
     const auto model=SelectNativeFullFrameModelLod(entry,visibility.depth);
     const bool posed=model && entry.pose && entry.pose->size()==entry.models[*model].layout->bones;
-    if(!model) ++stats.no_model;
-    else if(!posed) ++stats.no_pose;
+    if(!model) { ++stats.no_model; mark(entry,NativeCoverageStatus::Uncovered,"models_no_model"); }
+    else if(!posed) { ++stats.no_pose; mark(entry,NativeCoverageStatus::Uncovered,"models_no_pose"); }
     // A set is drawable once its model decoded without a pose (821C9DA8).
     const auto drawable=[](const NativeRenderInstanced& set) {
       return set.model.instance && set.model.layout && set.model.layout->single_world && set.worlds;
     };
     size_t instances=0;
-    for(const auto& set:entry.instanced) { if(drawable(set)) instances+=set.worlds->size(); else ++stats.no_instanced; }
+    for(const auto& set:entry.instanced) {
+      if(drawable(set)) instances+=set.worlds->size();
+      else { ++stats.no_instanced; mark(entry,NativeCoverageStatus::Uncovered,"models_no_instanced"); }
+    }
     // An attachment (820DB268 face, 820E1A80 weapon) draws once its model
     // decoded for its own pose vector and the pose is that size.
     const auto attached=[](const NativeRenderAttachment& attachment) {
@@ -117,12 +124,16 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
         attachment.pose && attachment.pose->size()==attachment.model.layout->bones;
     };
     size_t attachments=0;
-    for(const auto& attachment:entry.attachments) { if(attached(attachment)) ++attachments; else ++stats.no_attachment; }
+    for(const auto& attachment:entry.attachments) {
+      if(attached(attachment)) ++attachments;
+      else { ++stats.no_attachment; mark(entry,NativeCoverageStatus::Uncovered,"models_no_attachment"); }
+    }
     if(!posed && !instances && !attachments) continue;
     NativeFullFrameModelItem item{&entry,model.value_or(0),visibility.depth,visibility.centre[2],0,entry.mode!=0};
     if(item.transparent) {
       item.key=NativeFullFrameModelKey(entry.mode,item.view_z,entry.sort_bias,camera.key_scale,camera.key_offset);
-      if(item.key<256) { ++stats.bucket_zero; continue; }
+      // 821A3BA0 never drains bucket 0: the guest does not draw it either.
+      if(item.key<256) { ++stats.bucket_zero; mark(entry,NativeCoverageStatus::Parity,"bucket_zero"); continue; }
     }
     auto& list=item.transparent?plan.transparent:plan.opaque;
     if(posed) list.push_back(item);
@@ -347,8 +358,17 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     }
     ++frames_;
   }
+  if(!NativeReuseAllowed()) {
+    // Reuse off (native_reuse.h): every draw state, carried object, material
+    // row, cached resolve and side-table answer is dropped and made again
+    // below, as on a first frame, in every view; poses_ (pose motion) is kept
+    // and asked afresh (its own predicate). The ids keep counting, and so
+    // does the per-frame aging, over what this view rebuilds.
+    items_.clear(); rows_.clear(); sources_.Clear(); materials_.Clear();
+    provided_programs_.clear(); provided_geometry_.clear(); provided_generation_=kNativeFullFrameModelUnversioned;
+  }
   enter(Phase::Visibility);
-  frame.plan=PlanNativeFullFrameModels(snapshot,camera,pass.gather,pass.motion);
+  frame.plan=PlanNativeFullFrameModels(snapshot,camera,pass.gather,pass.census,pass.motion);
   // The pool carry: what each slot-4 call finds in the pool, from the pool as
   // this view starts (NativeFullFrameModelPass::tick_frame, view,
   // guest_frames). Renders whose slot 4s were the guest's left their stores
@@ -368,6 +388,12 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     if(std::find(pool_names_.begin(),pool_names_.end(),constant.name)==pool_names_.end()) {
       pool_names_.push_back(constant.name); ++pool_names_version_;
     }
+  // A census mark for one planned item (its entry's class).
+  const auto mark=[&](const NativeFullFrameModelItem& item,NativeCoverageStatus status,const char* reason) {
+    if(!pass.census) return;
+    const auto* type=item.entry->type;
+    frame.census.push_back({status,type?type->vtable:0u,type?type->name:nullptr,reason});
+  };
   // Programs: each drawn item's draw state, found by (object, generation, LOD
   // model or instanced world). Its draws and their program and geometry are
   // gathered only when the state is new, its layout object changed or the
@@ -378,7 +404,8 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
   // generation a program is a function of its pass record and a geometry of
   // its batch and pass record. Missing answers are asked again.
   enter(Phase::Programs);
-  const auto generation=sources.generation?sources.generation():kNativeFullFrameModelUnversioned;
+  // Reuse off: unversioned, so every draw asks the providers and no answer is kept.
+  const auto generation=sources.generation && NativeReuseAllowed()?sources.generation():kNativeFullFrameModelUnversioned;
   const bool versioned=generation!=kNativeFullFrameModelUnversioned;
   if(generation!=provided_generation_ || !versioned) {
     provided_programs_.clear(); provided_geometry_.clear(); provided_generation_=generation;
@@ -448,8 +475,12 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
               if(fetched.first && fetched.first->program && sources.geometry) fetched.second=geometry_of(batch,draw.draw.pass);
               return fetched;
             },[](const NativeFullFrameModelSourcePair& value) { return value.first && value.first->program && value.second; });
-            if(!source.first || !source.first->program) { ++stats.missing_program; complete=false; break; }
-            if(!source.second) { ++stats.missing_geometry; complete=false; break; }
+            if(!source.first || !source.first->program) {
+              ++stats.missing_program; complete=false; mark(item,NativeCoverageStatus::Uncovered,"models_missing_program"); break;
+            }
+            if(!source.second) {
+              ++stats.missing_geometry; complete=false; mark(item,NativeCoverageStatus::Uncovered,"models_missing_geometry"); break;
+            }
             // Other sources are another row: the object is made again.
             if(source!=draw.source) { draw.object.reset(); draw.made_from.reset(); draw.source=std::move(source); }
           }
@@ -458,7 +489,7 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           for(const auto& draw:state->draws)
             sources.audit(layout.meshes[draw.draw.mesh].batches[draw.draw.batch],draw.draw.pass,draw.source);
         }
-      } catch(const std::exception&) { ++stats.failed; state->sourced=false; }
+      } catch(const std::exception&) { ++stats.failed; state->sourced=false; mark(item,NativeCoverageStatus::Uncovered,"models_failed"); }
       if(state->sourced) states[list][index]=state;
     }
   }
@@ -535,6 +566,8 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         if(cached) derived=cached->capture().camera;
         if(cached && Cache::Current(*entry,row.constants,cached->capture().material.get(),derived)) {
           row.palette=entry->material.palette; row.scissor=entry->material.scissor;
+          row.pipeline=entry->material.pipeline; row.samplers=entry->material.samplers;
+          row.blend_factor=entry->material.blend_factor;
           ++materials_.hits; ++stats.cache_hits;
         } else {
           NativeFullFrameModelResolve half;
@@ -551,9 +584,11 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           ++(entry?stats.captures:stats.resolves);
           ++materials_.misses;
           row.palette=half.palette; row.scissor=half.scissor; derived=half.palette->capture().camera;
+          row.pipeline=half.pipeline; row.samplers=half.samplers; row.blend_factor=half.blend_factor;
           materials_.Store(std::move(cache_key),row.constants,std::move(half),row.palette->capture().material.get(),derived);
         }
-        row.capture={}; row.pipeline=nullptr; row.samplers.clear(); row.blend_factor.reset();
+        // The pipeline half stays for reuse-off draws' full captures.
+        row.capture={};
       } else {
         if(entry) derived=entry->material.capture.camera;
         if(entry && Cache::Current(*entry,row.constants,entry->material.capture.material.get(),derived)) {
@@ -660,8 +695,10 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         for(size_t d=0;d<state->draws.size() && complete;++d) {
           auto& draw=state->draws[d];
           auto& row=row_of(layout.skinned,draw.draw,draw.source);
-          if(!row.deferrable) { ++stats.scissor; complete=false; break; }
-          if(!row.same_backend) { ++stats.missing_geometry; complete=false; break; }
+          if(!row.deferrable) { ++stats.scissor; complete=false; mark(item,NativeCoverageStatus::Uncovered,"models_scissor"); break; }
+          if(!row.same_backend) {
+            ++stats.missing_geometry; complete=false; mark(item,NativeCoverageStatus::Uncovered,"models_missing_geometry"); break;
+          }
           auto bound=bound_of(row);
           if(layout.skinned) {
             if(draw.object && draw.made_from.get()==row.palette.get() && draw.bound==bound) ++stats.reused;
@@ -671,17 +708,35 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
               // as BindNativeFullFrameModelPalette over the whole set.
               for(auto& constant:row.palette_constants)
                 if(!BindNativeFullFrameModelPalette(constant,values.palette)) { complete=false; break; }
-              if(!complete) { ++stats.palette; break; }
+              if(!complete) { ++stats.palette; mark(item,NativeCoverageStatus::Uncovered,"models_palette"); break; }
               // Pool constants rebind like the palette (after it: none is
               // g_mWorldArray, and the last of a name wins in With).
               auto objects=bound;
               if(!objects.empty()) {
-                objects.insert(objects.begin(),row.palette_constants.begin(),row.palette_constants.end());
                 ++stats.object_constants;
                 if(carried(bound)) ++stats.carried;
               }
-              auto capture=row.palette->With(objects.empty()?std::span<const NativeSceneMaterialInputs::Constant>(row.palette_constants):
-                std::span<const NativeSceneMaterialInputs::Constant>(objects));
+              NativeSceneMaterialCapture capture;
+              if(!NativeReuseAllowed()) {
+                // Reuse off (native_reuse.h): the full capture With stands
+                // for, of the row's pass constants with this draw's palette
+                // and pool constants bound, against its pipeline half.
+                if(!row.pipeline) throw std::runtime_error("native full-frame model row has no pipeline half");
+                auto full=row.constants;
+                size_t next=0;
+                for(auto& constant:full)
+                  if(constant.name=="g_mWorldArray" && next<row.palette_constants.size()) constant=row.palette_constants[next++];
+                for(const auto& object:objects)
+                  for(auto& constant:full)
+                    if(constant.global && constant.pixel==object.pixel && constant.name==object.name) constant=object;
+                exclusive([&] {
+                  capture=row.program->Capture(*row.pipeline,pass.targets.reverse_depth,full,row.samplers,row.blend_factor,true);
+                });
+              } else {
+                if(!objects.empty()) objects.insert(objects.begin(),row.palette_constants.begin(),row.palette_constants.end());
+                capture=row.palette->With(objects.empty()?std::span<const NativeSceneMaterialInputs::Constant>(row.palette_constants):
+                  std::span<const NativeSceneMaterialInputs::Constant>(objects));
+              }
               // g_mWorld as 821A17D8 stores it; a palette shader need not declare it.
               if(NativeSceneCaptureBindsWorld(capture)) ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
               draw.object=make(draw,capture); draw.made_from=row.palette; draw.bound=std::move(bound);
@@ -714,9 +769,9 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           }
           drawn[d]=&row.view;
         }
-        if(complete) ++stats.drawn;
+        if(complete) { ++stats.drawn; mark(item,NativeCoverageStatus::Covered,"models"); }
         else drawn.clear();
-      } catch(const std::exception&) { ++stats.failed; views[index].clear(); }
+      } catch(const std::exception&) { ++stats.failed; views[index].clear(); mark(item,NativeCoverageStatus::Uncovered,"models_failed"); }
     }
     // OrderNativeFullFrameModelDraws over the drawn items (a stable order of a
     // subsequence is the subsequence of the stable order), from the states.

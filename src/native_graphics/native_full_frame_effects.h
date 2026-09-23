@@ -350,9 +350,56 @@ enum class NativeEffectClass : uint8_t {
   // filed as an item of this type; never classified from an effect list.
   GrassMap
 };
-// A known effect class's slot 4 that has no builder, named for the log
-// (classnames.txt); null otherwise. Every class named so far has a builder.
-inline const char* NativeEffectSlotName(uint32_t) { return nullptr; }
+// The classes that register with the "Effect" manager (their constructors
+// pass the string at 0x82004460 to 821C0AE0) and whose slot 4 no effect
+// builder covers. The full frame never calls these slot 4s. Audit of each
+// slot 4 and everything it calls, for state that simulation reads (lifetimes,
+// counters, flags):
+//   clBombAmmo01     82007394 821152D0  b 821C9C20 (model draw)
+//   clCentryGun01    820073C4 82115AE8  b 821C9C20
+//   clGrenadeAmmo01  8200740C 82117298  b 821C9C20
+//   clMissileAmmo01  82007478 82118648  b 821C9C20
+//   clBrokenPiece    820077F4 82120168  b 821C9C20
+//   clShellCase01    82014D4C 8218A658  b 821C9C20
+//     821C9C20 stores only the draw's shader constants: 821A1738 and
+//     821C8000 (via 821A17D8) write matrices into the constant blocks it is
+//     handed, 821B2C28 sets device state and draws. None is a simulation field.
+//     These six are model classes: the models pass draws them from the render
+//     registry (native_render_registry.cpp, Rigid).
+//   clBrokenObject   820077D8 8211FAA8  +712 = +708, then 821C8C58/821C9478
+//     (pose) and 821C9C20. Its slot 3 8211FAF8 releases the object once
+//     +708 - +712 > 10, so +712 is simulation state: the models pass stores
+//     it natively for every object whose slot 4 the guest would call
+//     (NativeFullFrameBrokenObjects). A copy, so a repeated render is a no-op
+//     and it needs no per-tick gate.
+//   clIKTest         82007050 8210E220  debug lines through 821A8CF0 ->
+//   clDrawTestObject 82020578 821E5558  821A7B58 (device state and a draw);
+//     every other store is to the stack. Test objects.
+// The other members are built: the blr slot 4 8252B718 (clAcidAmmo02,
+// clFireAmmo01, clPlasmaAmmo01, clMuzzleSmoke01, clFriendPeople_Generator)
+// is Empty, clParticle01 shares clParticle01_Limit's 8211D250, and of the
+// builders only clEffectEtc02 writes simulation state (+612,
+// CommitNativeEffectDraw). So no class left unbuilt here advances state that
+// the full frame drops.
+struct NativeEffectUnbuiltSlot {
+  uint32_t slot4;
+  const char* name;
+  bool model;  // Drawn by the models pass (the render registry).
+};
+inline constexpr NativeEffectUnbuiltSlot kNativeEffectUnbuiltSlots[]{
+  {0x8210E220,"clIKTest",false},{0x821152D0,"clBombAmmo01",true},{0x82115AE8,"clCentryGun01",true},
+  {0x82117298,"clGrenadeAmmo01",true},{0x82118648,"clMissileAmmo01",true},{0x8211FAA8,"clBrokenObject",true},
+  {0x82120168,"clBrokenPiece",true},{0x8218A658,"clShellCase01",true},{0x821E5558,"clDrawTestObject",false}};
+inline const NativeEffectUnbuiltSlot* FindNativeEffectUnbuiltSlot(uint32_t slot4) {
+  for(const auto& slot:kNativeEffectUnbuiltSlots) if(slot.slot4==slot4) return &slot;
+  return nullptr;
+}
+// A known effect-manager class's slot 4 that has no effect builder, named for
+// the log; null otherwise.
+inline const char* NativeEffectSlotName(uint32_t slot4) {
+  const auto* slot=FindNativeEffectUnbuiltSlot(slot4);
+  return slot?slot->name:nullptr;
+}
 inline NativeEffectClass ClassifyNativeEffect(uint32_t slot4) {
   switch(slot4) {
     case 0x8211D250: return NativeEffectClass::Particle01Limit;  // clParticle01_Limit, vtable 0x82004F6C
@@ -709,6 +756,9 @@ struct NativeEffectCollection {
   std::vector<NativeEffectItem> items;      // key >= 256, descending, filing order on ties
   std::vector<NativeEffectItem> immediate;  // mode 0: slot 4 runs inside the walk, before the drain
   std::vector<uint32_t> unsupported_slots;  // slot 4 of objects no builder covers
+  // (vtable, slot 4, objects) of the objects no builder covers, first-seen order
+  // (the coverage census names them by class).
+  std::vector<std::array<uint32_t,3>> unsupported_classes;
   uint32_t visited=0,duplicates=0,culled=0,hidden=0,undrawn_keys=0,unknown_modes=0,unsupported=0;
   uint32_t held=0;  // clEffectEtc02 lifetimes a render-only frame did not commit (commit false)
 };
@@ -774,6 +824,11 @@ NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32
       ++out.unsupported;
       if(std::find(out.unsupported_slots.begin(),out.unsupported_slots.end(),item.slot4)==out.unsupported_slots.end())
         out.unsupported_slots.push_back(item.slot4);
+      const auto vtable=r.Word(object);
+      const auto known=std::find_if(out.unsupported_classes.begin(),out.unsupported_classes.end(),
+        [&](const auto& entry) { return entry[0]==vtable && entry[1]==item.slot4; });
+      if(known!=out.unsupported_classes.end()) ++(*known)[2];
+      else out.unsupported_classes.push_back({vtable,item.slot4,1u});
       continue;
     }
     if(mode && !NativeTransparentKeyDrawn(item.key)) { ++out.undrawn_keys; continue; }

@@ -1,4 +1,5 @@
 #include "native_graphics/native_ab_alternate.h"
+#include "native_graphics/native_reuse.h"
 #include "native_graphics/native_renderer_preset.h"
 #include <iostream>
 #include <thread>
@@ -46,6 +47,40 @@ int main() {
   }
   check(edf::native::NativeAbNativeSide());
   {
+    // edf_native_reuse_off_alternate=N follows AbSide: reuse off on the
+    // reference side (native=0), so compare-renderer-ab-captures.py pairs the
+    // frames by the same rule (--period N --start S) or the logged tags.
+    using edf::native::NativeReuseOffSide; using edf::native::NativeReuseAllowed;
+    for (uint64_t frame = 0; frame < 100; ++frame) {
+      check(!NativeReuseOffSide(frame, 0, 0) && !NativeReuseOffSide(frame, 600, -1));
+      for (int64_t period : {1, 2, 5})
+        for (int64_t start : {int64_t(0), int64_t(7), int64_t(-3)})
+          check(NativeReuseOffSide(frame, start, period) == !AbSide(frame, start, period));
+    }
+    check(NativeReuseOffSide(599, 600, 1) && NativeReuseOffSide(600, 600, 1) && !NativeReuseOffSide(601, 600, 1));
+    // The predicate: the thread's latch or the process-wide switch.
+    check(NativeReuseAllowed());
+    {
+      edf::native::NativeReuseOffLatch outer(true);
+      check(!NativeReuseAllowed());
+      { edf::native::NativeReuseOffLatch inner(false); check(NativeReuseAllowed()); }
+      check(!NativeReuseAllowed());
+      bool other = false;
+      std::thread thread([&] { other = NativeReuseAllowed(); });
+      thread.join();
+      check(other);  // Another thread does not see this frame's latch.
+    }
+    check(NativeReuseAllowed());
+    edf::native::native_reuse_off_all = true;
+    bool other = true;
+    std::thread thread([&] { other = NativeReuseAllowed(); });
+    thread.join();
+    check(!other && !NativeReuseAllowed());  // edf_native_reuse_off reaches every thread.
+    { edf::native::NativeReuseOffLatch latch(false); check(!NativeReuseAllowed()); }
+    edf::native::native_reuse_off_all = false;
+    check(NativeReuseAllowed());
+  }
+  {
     // edf_native_renderer preset -> flag mapping.
     using edf::native::NativeRendererFlag; using edf::native::NativeRendererPreset;
     using edf::native::NativeRendererPresetMask; using edf::native::NativeRendererFlagBit;
@@ -85,6 +120,29 @@ int main() {
     edf::native::native_renderer_preset_mask = full;
     check(edf::native::NativeFlag(NativeRendererFlag::post_finish, false));
     edf::native::native_renderer_preset_mask = 0;
+    // Preset x scene backend: native needs the D3D12 scene backend, and falls
+    // back to off (the guest renderer) on anything else; other presets and
+    // native on D3D12 pass through unchanged.
+    using edf::native::ResolveNativeRendererPresetForBackend;
+    for (const char* backend : {"d3d12", "d3d12-warp"}) {
+      const auto native = ResolveNativeRendererPresetForBackend(NativeRendererPreset::native, backend);
+      check(native.preset == NativeRendererPreset::native && !native.backend_fallback);
+      check(NativeRendererPresetMask(native.preset) & NativeRendererFlagBit(NativeRendererFlag::full_frame));
+    }
+    for (const char* backend : {"d3d11", "d3d11-warp", "", "D3D12", "vulkan"}) {
+      const auto native = ResolveNativeRendererPresetForBackend(NativeRendererPreset::native, backend);
+      check(native.preset == NativeRendererPreset::off && native.backend_fallback);
+      check(!(NativeRendererPresetMask(native.preset) & NativeRendererFlagBit(NativeRendererFlag::full_frame)));
+      for (auto preset : {NativeRendererPreset::off, NativeRendererPreset::world, NativeRendererPreset::full}) {
+        const auto other = ResolveNativeRendererPresetForBackend(preset, backend);
+        check(other.preset == preset && !other.backend_fallback);
+      }
+    }
+    for (auto preset : {NativeRendererPreset::off, NativeRendererPreset::world, NativeRendererPreset::full}) {
+      const auto other = ResolveNativeRendererPresetForBackend(preset, "d3d12");
+      check(other.preset == preset && !other.backend_fallback);
+    }
+    static_assert(ResolveNativeRendererPresetForBackend(NativeRendererPreset::native, "d3d11").preset == NativeRendererPreset::off);
   }
   if (failures) std::cerr << failures << " native A/B alternate checks failed\n";
   return failures ? 1 : 0;

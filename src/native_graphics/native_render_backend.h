@@ -1,6 +1,7 @@
 #pragma once
 #include "native_render_state_decode.h"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -78,6 +79,12 @@ class NativeBackendPipeline {
   // Whether the owner has decided transient_batchable for this pipeline yet;
   // the answer depends only on what the pipeline is cached by, so once.
   bool transient_batchable_known=false;
+  // What the pipeline was created from (NativeBackendPipelineDesc's shader,
+  // layout, state, topology and target identities), stamped by the backend
+  // that created it. Diagnostics only: the shadow render's draw lists
+  // (native_shadow_render.h) name a draw's pipeline by it, which is stable for
+  // one description where the object's address is not across runs.
+  uint64_t identity_vertex=0,identity_pixel=0,identity_layout=0,identity=0;
 };
 class NativeBackendRenderTarget {
  public:
@@ -138,6 +145,12 @@ struct NativeBackendStatistics {
   // Transient list draws a packet recorder appended to the draw before them.
   uint64_t geometry_transient_appends=0;
   uint64_t geometry_world_constant_reuses=0,geometry_constant_snapshot_bytes=0;
+  // Constant binds that reused an image the frame already held, the bytes not
+  // copied; worker ranges handed over before their flush; constant images
+  // staged in upload memory and binds that reused a staged image.
+  uint64_t geometry_constant_interned=0,geometry_constant_interned_bytes=0;
+  uint64_t geometry_streamed_jobs=0;
+  uint64_t geometry_constant_uploads=0,geometry_constant_upload_reuses=0;
   uint32_t geometry_max_concurrent=0;
   // Times a frame had to wait for the GPU to give back upload memory or
   // shader-visible descriptors. Anything but zero is a budget that is too small
@@ -199,6 +212,18 @@ struct NativeBackendScissor {
   int32_t left=0,top=0,right=0,bottom=0;
 };
 
+// Constant bytes a packet recorder owns for a whole frame and may bind many
+// times, from several recording threads. A backend that stages constants in
+// fenced upload memory may stage an image once per submission and bind that
+// slice again (SetConstantImage): `staged_address` is valid for the
+// submission `staged_frame` names. Recorders write the pair (address first,
+// frame with release); the owner calls Invalidate whenever `bytes` change.
+struct NativeBackendConstantImage {
+  std::vector<uint8_t> bytes;
+  mutable std::atomic<uint64_t> staged_frame{0},staged_address{0};
+  void Invalidate() { staged_frame.store(0,std::memory_order_relaxed); }
+};
+
 // Records work for one thread. On D3D11 this wraps the immediate context and
 // there is exactly one; on a second backend there may be several, which is the
 // entire point of the migration. Nothing here reads device state back.
@@ -253,6 +278,12 @@ class NativeBackendRecorder {
   // is a backend decision (UpdateSubresource here, an upload ring with fencing
   // on a second backend) and callers must not depend on either.
   virtual void SetConstants(NativeBackendStage stage,uint32_t slot,std::span<const uint8_t> bytes)=0;
+  // The same bind from a frame-owned image (see NativeBackendConstantImage).
+  // The shader reads exactly image.bytes either way; only where they are
+  // staged may differ.
+  virtual void SetConstantImage(NativeBackendStage stage,uint32_t slot,const NativeBackendConstantImage& image) {
+    SetConstants(stage,slot,image.bytes);
+  }
   virtual void SetTexture(NativeBackendStage stage,uint32_t slot,NativeBackendTexture* texture)=0;
   virtual void SetSampler(NativeBackendStage stage,uint32_t slot,NativeBackendSampler* sampler)=0;
 
@@ -306,6 +337,14 @@ class NativeBackendRecorder {
   virtual void PushState()=0;
   virtual void PopState()=0;
 };
+// Diagnostics only (edf_native_shadow_render's draw lists): a recorder that
+// forwards every call to the one it wraps, observing what passes. While a
+// backend has one (NativeRenderBackend::recorder_tap), Recorder() hands it
+// out wrapping Recorder(0); Recorder(index) is unchanged. Null: no effect.
+class NativeBackendRecorderTap : public NativeBackendRecorder {
+ public:
+  virtual void Wrap(NativeBackendRecorder& inner)=0;
+};
 
 // Sampler state, neutral because D3D12 packs the three filters into one
 // encoded value and Vulkan does not. A backend encodes it however its API
@@ -350,6 +389,25 @@ struct NativeBackendPipelineDesc {
   uint32_t dsv_format=0;
   uint32_t sample_count=1;
 };
+
+// FNV-1a over the fields a backend keys its pipeline cache on; see
+// NativeBackendPipeline::identity.
+inline void StampNativeBackendPipelineIdentity(NativeBackendPipeline& pipeline,const NativeBackendPipelineDesc& desc) {
+  uint64_t hash=14695981039346656037ull;
+  const auto add=[&hash](const void* data,size_t size) {
+    const auto* bytes=static_cast<const uint8_t*>(data);
+    for(size_t i=0;i<size;++i) { hash^=bytes[i]; hash*=1099511628211ull; }
+  };
+  add(&desc.vertex_id,sizeof(desc.vertex_id)); add(&desc.pixel_id,sizeof(desc.pixel_id));
+  add(&desc.input_layout_id,sizeof(desc.input_layout_id));
+  add(desc.state.data(),desc.state.size()*sizeof(uint32_t));
+  const auto topology=uint32_t(desc.topology); add(&topology,sizeof(topology));
+  add(&desc.render_targets,sizeof(desc.render_targets));
+  add(desc.rtv_format.data(),desc.rtv_format.size()*sizeof(uint32_t));
+  add(&desc.dsv_format,sizeof(desc.dsv_format)); add(&desc.sample_count,sizeof(desc.sample_count));
+  pipeline.identity_vertex=desc.vertex_id; pipeline.identity_pixel=desc.pixel_id;
+  pipeline.identity_layout=desc.input_layout_id; pipeline.identity=hash;
+}
 
 struct NativeBackendBufferDesc {
   size_t bytes=0;
@@ -435,7 +493,14 @@ class NativeRenderBackend {
   // 0 always exists. A backend with one recorder is not a broken backend; it
   // is D3D11, and callers must ask rather than assume.
   virtual NativeBackendRecorder& Recorder(uint32_t index)=0;
-  NativeBackendRecorder& Recorder() { return Recorder(0); }
+  NativeBackendRecorder& Recorder() {
+    if(!recorder_tap) return Recorder(0);
+    recorder_tap->Wrap(Recorder(0));
+    return *recorder_tap;
+  }
+  // See NativeBackendRecorderTap. Set and cleared by its owner under the lock
+  // that serializes scene recording; null in every normal run.
+  NativeBackendRecorderTap* recorder_tap=nullptr;
   virtual uint32_t RecorderCount() const=0;
   virtual bool SupportsParallelRecording() const=0;
 

@@ -51,6 +51,7 @@
 #include "native_shader_binding.h"
 #include "native_frame_dispatch.h"
 #include "native_full_frame.h"
+#include "native_coverage_census.h"
 #include "native_frame_times.h"
 #include "native_disk_cache.h"
 #include "native_gpu_pass_timings.h"
@@ -98,6 +99,7 @@
 #include "native_profile_result.h"
 #include "native_capture_policy.h"
 #include "native_ab_alternate.h"
+#include "native_shadow_render.h"
 #include "native_post_finish_plan.h"
 #include "native_full_frame_post.h"
 #include "native_constant_ownership.h"
@@ -114,6 +116,7 @@
 #include "movie_effect.h"
 #include "xui_effect.h"
 #include "native_transient_batching.h"
+#include "native_reuse.h"
 #include "native_immediate_classify.h"
 #include "font_effect.h"
 #include <rex/cvar.h>
@@ -205,6 +208,14 @@ REXCVAR_DEFINE_INT32(edf_native_output_capture_start_frame,0,"EDF2027",
                     "Positive indexed frame starts interval captures and disables startup milestones; 0 preserves defaults (development)");
 REXCVAR_DEFINE_BOOL(edf_native_output_capture_scene_color,false,"EDF2027",
                    "Also capture scene color at each selected output frame to diagnose post-processing differences (development)");
+REXCVAR_DEFINE_INT32(edf_native_shadow_render,0,"EDF2027",
+                    "Shadow render: every Nth indexed output frame, after the native full frame, also render the guest helper path for the same state into offscreen targets and write both pre-HUD images and draw lists (tools/shadow-diff.py); 0 off (development)").range(0,100000);
+REXCVAR_DEFINE_INT32(edf_native_shadow_render_start_frame,0,"EDF2027",
+                    "First indexed output frame a shadow render may take; shadow frames are start, start+N, ... (development)").range(0,100000000);
+REXCVAR_DEFINE_INT32(edf_native_shadow_render_limit,16,"EDF2027",
+                    "Maximum shadow frames written per run (development)").range(0,4096);
+REXCVAR_DEFINE_STRING(edf_native_shadow_render_prefix,"native-shadow/shadow","EDF2027",
+                     "Path prefix of shadow render output: <prefix>.<frame>.native.bmp/.guest.bmp, .native.draws.jsonl/.guest.draws.jsonl and .shadow.json; its directory is created (development)");
 REXCVAR_DEFINE_BOOL(edf_native_pixel_centers,true,"EDF2027",
                    "Apply the guest PA_SU_VTX_CNTL half-pixel offset to the audited retail post passes; false restores the unshifted viewport for regression diagnosis");
 REXCVAR_DEFINE_INT32(edf_native_loop_trace,0,"EDF2027",
@@ -318,14 +329,27 @@ REXCVAR_DEFINE_BOOL(edf_native_world_constant_reuse,true,"EDF2027",
                    "Retain shared vertex constants when only an instance world matrix changes");
 REXCVAR_DEFINE_BOOL(edf_native_transient_batching,true,"EDF2027",
                    "Record a UI/immediate list draw (XUI brush, font run, Utility 2D quad or line) as the continuation of the draw before it when the two differ only in their vertices; the Utility 2D path then records its quads non-indexed. Set false to record every draw as its own");
+REXCVAR_DEFINE_BOOL(edf_native_reuse_off,false,"EDF2027",
+                   "Correctness diagnostics: disable every cross-frame reuse of the full-frame renderer (native_reuse.h): the models' draw states, carried objects, material rows and caches, source memo and pose-blend cache; the static world's frame, group memos, material cache, instance reuse, selection cache, flattened tree, cluster cull and uniform recording; the sky's material, layout and hierarchy caches; the registry's render-only light ticks, frame-pose memo and unchanged-entry/constant pointer sharing; shared effect activation, transient batching (implies edf_native_transient_batching off) and the UI lookup memos. Output should be identical, only slower (development)");
+REXCVAR_DEFINE_INT32(edf_native_reuse_off_alternate,0,"EDF2027",
+  "Correctness diagnostics: render with reuse off (edf_native_reuse_off) in runs of N indexed output frames from the capture start frame, the edf_native_ab_alternate rule: even runs (the reference, logged reuse_alternate frame=F native=0) reuse off, odd runs (judged, native=1) reuse on; 0 off, ignored while edf_native_ab_alternate is on (development)").range(0,1000);
 REXCVAR_DEFINE_BOOL(edf_native_prepared_geometry,true,"EDF2027",
                    "Reuse prepared queued geometry after guarded snapshot validation");
+// Transient batching (edf_native_transient_batching), off whenever reuse is
+// (native_reuse.h): a batched run is recorded as its separate draws.
+static bool NativeTransientBatchingEnabled() {
+  return REXCVAR_GET(edf_native_transient_batching) && edf::native::NativeReuseAllowed();
+}
 REXCVAR_DEFINE_INT32(edf_native_hook_sample_period,0,"EDF2027",
   "Sample one in N bridge timing scopes (0 disables); independent of full hook/load instrumentation").range(0,4096);
 REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
                    "Log inclusive CPU wall times for native/original graphics hook phases (development)");
 REXCVAR_DEFINE_BOOL(edf_native_gpu_timings, false, "EDF2027",
                    "Log GPU time per full-frame pass (sky, static_world, models, effects, transparent, post, view overlays, HUD phases) and per frame from scene-backend timestamps, read back frames later without stalling (development)");
+REXCVAR_DEFINE_BOOL(edf_native_coverage_census, false, "EDF2027",
+                   "Full-frame coverage census: count, per class and reason, what the native passes draw and every object, pass or view they skip that the guest render helper would have drawn; logs 'Native coverage' summaries every edf_native_coverage_census_interval seconds and at exit (tools/coverage-report.py; development)");
+REXCVAR_DEFINE_INT32(edf_native_coverage_census_interval,30,"EDF2027",
+  "Seconds between edf_native_coverage_census summaries").range(1,3600);
 REXCVAR_DEFINE_BOOL(edf_native_frame_times, false, "EDF2027",
                    "Log present-to-present frame-time percentiles and one line per spike frame (over 25 ms or twice the rolling median) with its pipeline, shader, geometry and texture creations, declined passes and largest hook phases (development)");
 REXCVAR_DEFINE_INT32(edf_native_thread_qos,1,"EDF2027",
@@ -907,6 +931,15 @@ class GuestReader {
     // Permission lookup is optimized, not publication semantics.
     InterlockedExchange(reinterpret_cast<volatile LONG*>(const_cast<uint8_t*>(data)),
                         static_cast<LONG>(std::byteswap(value)));
+  }
+  // Atomically replaces the big-endian word at `address` with `desired` when
+  // it holds `expected`; true when it did. The guest word is byte-swapped, as
+  // StoreWord's interlocked exchange stores it.
+  bool CompareExchangeWord(uint32_t address,uint32_t expected,uint32_t desired) const {
+    const auto* data=WritableBytes(address,4,4);
+    const auto want=static_cast<LONG>(std::byteswap(expected));
+    return InterlockedCompareExchange(reinterpret_cast<volatile LONG*>(const_cast<uint8_t*>(data)),
+                                      static_cast<LONG>(std::byteswap(desired)),want)==want;
   }
   void StoreByte(uint32_t address,uint8_t value) const {
     const auto aligned=address&~3u;
@@ -2472,7 +2505,7 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
   auto& backend=EnsureSceneBackendLocked(state);
   auto& recorder=SceneRecorderLocked(state);
   recorder.SetWorldInstancing(draw.world_instancing,REXCVAR_GET(edf_native_world_constant_reuse));
-  recorder.SetTransientBatching(REXCVAR_GET(edf_native_transient_batching));
+  recorder.SetTransientBatching(NativeTransientBatchingEnabled());
   const auto targets=ActiveTargetsLocked(state);
   if(!targets.count) throw std::runtime_error("a recorded draw has no colour target to record into");
   ++state.recorded_draws;
@@ -2619,8 +2652,11 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
 // always ask for the key they asked for last.
 NativeRenderState& RenderStateLocked(Bridge& state,const RenderStateWords& key) {
   auto& memo=state.render_state_memo;
-  if(memo[0].value && memo[0].key==key) return *memo[0].value;
-  if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return *memo[0].value; }
+  // Reuse off (native_reuse.h): the map is searched (the memo still records).
+  if(NativeReuseAllowed()) {
+    if(memo[0].value && memo[0].key==key) return *memo[0].value;
+    if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return *memo[0].value; }
+  }
   auto found=state.render_states.find(key);
   if(found==state.render_states.end())
     found=state.render_states.emplace(key,CreateNativeRenderState(state.device.Get(),key)).first;
@@ -2630,8 +2666,10 @@ NativeRenderState& RenderStateLocked(Bridge& state,const RenderStateWords& key) 
 // samplers[key], created on the scene backend on first use; memoized likewise.
 NativeBackendSampler* SamplerLocked(Bridge& state,const SamplerStateWords& key) {
   auto& memo=state.sampler_memo;
-  if(memo[0].value && memo[0].key==key) return memo[0].value;
-  if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return memo[0].value; }
+  if(NativeReuseAllowed()) {
+    if(memo[0].value && memo[0].key==key) return memo[0].value;
+    if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return memo[0].value; }
+  }
   auto found=state.samplers.find(key);
   if(found==state.samplers.end()) {
     const auto desc=DecodeNativeGuestSampler(key);
@@ -2977,6 +3015,11 @@ void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t d
                 state.texture_missing, state.texture_binding_errors,state.sampler_bindings,state.samplers.size());
 }
 }
+void LogNativeCoverageCensusFinal() {
+  static std::atomic<bool> logged=false;
+  if(!REXCVAR_GET(edf_native_coverage_census) || !CoverageCensus().Totals().frames || logged.exchange(true)) return;
+  for(const auto& line:CoverageCensus().Summary("final")) REXLOG_INFO("{}",line);
+}
 void SetNativeMeshWatchAudit(std::weak_ptr<GuestMeshWatchAudit> audit) {
   auto& state=State();
   std::lock_guard lock(state.mutex);
@@ -3201,7 +3244,7 @@ edf::native::NativeBackendRecorder& SceneRecorderLocked(Bridge& state) {
   ++state.scene_frame_operations;
   // One producer captures immutable draw packets. The D3D12 scene backend
   // distributes contiguous packet ranges to its recording workers.
-  return backend.Recorder(0);
+  return backend.Recorder();  // Recorder(0), or the shadow render's draw-list tap wrapping it.
 }
 void PublishSceneSharedLocked(Bridge& state,const NativeRenderTarget& output,NativeFrameKind kind) {
   if(state.scene_shared_refused || !state.scene_backend || !output.backend_surface) return;
@@ -3330,6 +3373,9 @@ void SubmitSceneFrameLocked(Bridge& state) {
       counts.geometry_transient_appends);
     REXLOG_INFO("Native world constants: reused={}, snapshot_bytes={} (full immutable constant images copied by the producer)",
       counts.geometry_world_constant_reuses,counts.geometry_constant_snapshot_bytes);
+    REXLOG_INFO("Native constant images: interned={}, interned_bytes={}, uploads={}, upload_reuses={}, streamed_jobs={} (binds of an image the frame already held and the bytes not copied; images staged once per submission and binds of a staged image; worker ranges handed over before their flush)",
+      counts.geometry_constant_interned,counts.geometry_constant_interned_bytes,
+      counts.geometry_constant_uploads,counts.geometry_constant_upload_reuses,counts.geometry_streamed_jobs);
     REXLOG_INFO("Native scene backend spend: frames={}, splits={}, operations_last_frame={}, "
       "upload_stalls={}, descriptor_stalls={}, pipelines={} (hits={}, misses={}), "
       "sampler_tables={} (hits={}, misses={}, evictions={}), retiring={}, "
@@ -3798,6 +3844,14 @@ thread_local uint64_t native_render_publication=0;
 // clEffectEtc02 slot 4 hook (8217C4A0) keeps +612 on such a render. The full
 // frame reads NativeFrameInputs::tick_frame instead.
 thread_local bool native_render_tick_frame=true;
+// The shadow render's guest side (edf_native_shadow_render,
+// native_shadow_render.h) on this thread; null outside it, always null with
+// the cvar off. Counts what its guest route held back.
+struct NativeShadowGuest {
+  uint64_t tone_holds=0;      // PS_Downsample_Tone draws skipped (the immediate draw hook)
+  uint64_t lifetime_holds=0;  // clEffectEtc02 +612 put back (the 8217C4A0 hook)
+};
+thread_local NativeShadowGuest* native_shadow_guest=nullptr;
 struct NativeModelRenderContext {
   uint32_t source=0;
   const std::vector<edf::native::NativePoseMatrix>* poses=nullptr;
@@ -6617,8 +6671,48 @@ uint32_t NativeFullFramePaletteLimit(const Reader& reader) {
   const auto descriptor=reader.Word(reader.Add(reader.Word(0x8257c02c),36));
   return descriptor?reader.Word(reader.Add(descriptor,16)):edf::native::kNativeBonePaletteShaderBones;
 }
+// edf_native_coverage_census (native_coverage_census.h): the full frame's
+// counting sites. Off, each site costs this one cvar read.
+bool NativeCoverageCensusOn() { return REXCVAR_GET(edf_native_coverage_census); }
+double NativeCoverageNow() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// An object's vtable and slot 4 (vtable+16) as the census names its class;
+// zeros when the object cannot be read.
+template<class Reader>
+std::pair<uint32_t,uint32_t> NativeCoverageClassOf(const Reader& reader,uint32_t object) {
+  try {
+    const auto vtable=object?reader.Word(object):0u;
+    return {vtable,vtable?reader.Word(reader.Add(vtable,16)):0u};
+  } catch(const std::exception&) { return {0u,0u}; }
+}
+// The world list (owner+44) of one view: every manager whose slot 2 the guest
+// helper calls (821A51D8), covered when a native pass replaces that manager's
+// walk (NativeCoverageWorldListPass), else uncovered with its slot 2.
+template<class Reader>
+void CensusNativeWorldList(const Reader& reader,uint32_t owner) {
+  using namespace edf::native;
+  std::vector<NativeCoverageMark> marks;
+  try {
+    const auto end=reader.Word(reader.Add(owner,NativeWorldList::end));
+    uint32_t guard=0;
+    for(auto node=reader.Word(reader.Add(owner,NativeWorldList::head));node!=end;node=reader.Word(reader.Add(node,NativeWorldList::next))) {
+      if(++guard>NativeWorldList::limit) throw std::runtime_error("native world list does not terminate");
+      const auto object=reader.Word(reader.Add(node,NativeWorldList::object));
+      const auto vtable=object?reader.Word(object):0u;
+      if(NativeCoverageWorldListPass(vtable)) marks.push_back({NativeCoverageStatus::Covered,vtable,nullptr,"world_list"});
+      else marks.push_back({NativeCoverageStatus::Uncovered,vtable,nullptr,"world_list_unhandled",vtable?reader.Word(reader.Add(vtable,8)):0u});
+    }
+  } catch(const std::exception& error) {
+    CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"world_list","world_list_unreadable",1,error.what());
+  }
+  CoverageCensus().Add(marks);
+}
 void NativeFullFrameDeclined(const char* pass,const std::string& reason) {
   edf::native::FrameEventCounters().pass_declines.fetch_add(1,std::memory_order_relaxed);
+  // Every decline drops the draw (or the pass) it was for.
+  if(NativeCoverageCensusOn())
+    edf::native::CoverageCensus().Add(edf::native::NativeCoverageStatus::Uncovered,0,std::string("pass:")+pass,"declined",1,reason);
   static std::mutex mutex;
   static std::set<std::string> reported;
   std::lock_guard lock(mutex);
@@ -6713,6 +6807,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
         return registers;
       } catch(const std::exception&) { return std::nullopt; }
     };
+    pass.census=NativeCoverageCensusOn();
     auto& state=State();
     // The bridge locks in short holds (NativeLockSlices): the targets, each use
     // of the model pass caches (program, geometry) and each resolve with its
@@ -6726,7 +6821,11 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,pass.targets,pass.viewport,pass.scissor,viewport);
       backend=state.scene_backend;
       return state.active_scene==context.renderer && targets.count && targets.depth && backend;
-    })) { ++empty_; return; }
+    })) {
+      ++empty_;
+      if(pass.census) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:models","no_targets");
+      return;
+    }
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("models",reason); };
     // The providers, each inside its own slice: the model pass program of a
@@ -6737,9 +6836,18 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto fetch_geometry=[&](const NativeModelBatchLayout& batch,uint32_t record) {
       return slices([&] { return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,batch,record),batch); });
     };
+    // Reuse off (native_reuse.h): the providers are asked directly, past the
+    // source memo, and the generation is unversioned, so Build re-sources
+    // every draw and keeps no answer; the memo is left as it was and
+    // validates itself at the next reuse-on frame.
+    const bool reuse=NativeReuseAllowed();
     NativeFullFrameModelSources sources{
-      [&](uint32_t record) { return source_memo_.ProgramFor(record,[&] { return fetch_program(record); }); },
+      [&](uint32_t record) {
+        if(!reuse) return fetch_program(record);
+        return source_memo_.ProgramFor(record,[&] { return fetch_program(record); });
+      },
       [&](const NativeModelBatchLayout& batch,uint32_t record) {
+        if(!reuse) return fetch_geometry(batch,record);
         const GeometryInput input{batch,record};
         return source_memo_.GeometryFor(SourceGeometryKey(input),input,[&] { return fetch_geometry(batch,record); });
       },
@@ -6756,6 +6864,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       // just asked for. The providers are called directly here, the locks
       // held once per chunk.
       [&] {
+        if(!reuse) return kNativeFullFrameModelUnversioned;
         return source_memo_.Validate(
           [&] { return SourceHost{state.shader_registry_generation,state.scene_backend.get()}; },
           [&](uint32_t record) { return NativeModelPassProgramLocked(state,window,record,true,report); },
@@ -6802,6 +6911,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     };
     auto frame=std::make_shared<NativeFullFrameModelFrame>(models_.Build(*registry,camera,pass,sources,phase));
     stage.reset();
+    if(pass.census) { CoverageCensus().Add(frame->plan.census); CoverageCensus().Add(frame->census); }
     auto transparent=std::make_shared<NativeFullFrameModelFrame>();
     for(auto& batch:frame->batches) if(batch.transparent) transparent->batches.push_back(std::move(batch));
     std::erase_if(frame->batches,[](const NativeFullFrameModelBatch& batch) { return batch.transparent; });
@@ -6822,7 +6932,11 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       state.scene_recorded_frames.push_back(registry);
       return true;
     });
-    if(!current) ++stale_;
+    if(!current) {
+      ++stale_;
+      // Nothing of this view's models was recorded (the targets moved).
+      if(pass.census) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:models","stale");
+    }
     else if(!transparent->batches.empty()) shared_->transparent=std::move(transparent);
     shared_->model_order=uint32_t(frame->plan.transparent.size());
     const auto& built=frame->stats;
@@ -6904,10 +7018,12 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
       if(!same) ++stale_eyes_;
     }
     shared_->effect_filings=order-first;
+    if(NativeCoverageCensusOn()) CensusEffects(collection);
     for(const auto slot:collection.unsupported_slots)
       if(unsupported_.insert(slot).second) {
-        const auto* name=NativeEffectSlotName(slot);
-        REXLOG_INFO("Native full frame effects: unsupported class {} (slot 4 {:#x}, not drawn)",name?name:"unknown",slot);
+        const auto* known=FindNativeEffectUnbuiltSlot(slot);
+        REXLOG_INFO("Native full frame effects: unsupported class {} (slot 4 {:#x}, {})",known?known->name:"unknown",slot,
+          known && known->model?"no effect builder; drawn by the models pass":"not drawn");
       }
     uint64_t drawn=0;
     if(!collection.immediate.empty()) {
@@ -6922,7 +7038,8 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
         for(const auto& item:collection.immediate)
           drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,*native_scene_pass_camera,viewport,formats,report,
             [&](const std::exception& error) { report(error.what()); });
-      }
+      } else if(NativeCoverageCensusOn())
+        CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:effects","no_targets",collection.immediate.size());
     }
     if(++frames_<=4 || frames_%1000==0)
       REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} absent={} stale_guest_eye={} held_frames={}",
@@ -6932,6 +7049,26 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
   }
  private:
   const edf::native::GuestReader reader_;
+  // The coverage census of one collection: each drawn object's class
+  // (covered; an empty slot 4 is parity), each class no builder covers, and
+  // the objects left as the guest leaves them (a key below 256) or of an
+  // unknown sort mode.
+  void CensusEffects(const edf::native::NativeEffectCollection& collection) {
+    using namespace edf::native;
+    auto& census=CoverageCensus();
+    std::vector<NativeCoverageMark> marks;
+    for(const auto* list:{&collection.immediate,&collection.items})
+      for(const auto& item:*list) {
+        const auto vtable=NativeCoverageClassOf(reader_,item.object).first;
+        marks.push_back(item.type==NativeEffectClass::Empty?NativeCoverageMark{NativeCoverageStatus::Parity,vtable,nullptr,"empty_slot4",item.slot4}:
+          NativeCoverageMark{NativeCoverageStatus::Covered,vtable,nullptr,"effects"});
+      }
+    census.Add(marks);
+    for(const auto& [vtable,slot4,count]:collection.unsupported_classes)
+      census.Add(NativeCoverageStatus::Uncovered,vtable,{},"effect_no_builder",count,std::format("slot=0x{:08X}",slot4));
+    census.Add(NativeCoverageStatus::Uncovered,0,"effect_object","effect_unknown_mode",collection.unknown_modes);
+    census.Add(NativeCoverageStatus::Parity,0,"effect_object","undrawn_key",collection.undrawn_keys);
+  }
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   std::set<uint32_t> unsupported_;
   uint64_t frames_=0,absent_=0,stale_eyes_=0,held_frames_=0;
@@ -6962,7 +7099,13 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     std::lock_guard lock(state.mutex);
     NativeFullFramePassTargets formats; NativeBackendViewport backend_viewport; NativeBackendScissor scissor; NativeViewportState viewport;
     const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
-    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) return;
+    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) {
+      // Every filed item of the view is dropped.
+      if(NativeCoverageCensusOn())
+        CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:transparent","no_targets",
+          (frame?frame->batches.size():0)+effects.size()+map_effects.size());
+      return;
+    }
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("transparent",reason); };
     const auto& camera=*native_scene_pass_camera;
@@ -7034,6 +7177,10 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     // The walk's reads (world list, members, wire and grass records and
     // constants) go through one page window: no guest code runs during the pass.
     const NativeSceneCpuWindow walk(reader_);
+    const bool census=NativeCoverageCensusOn();
+    // The helper's world callbacks this view would run (the sky pass is the
+    // first pass of every accepted view).
+    if(census && context.owner) CensusNativeWorldList(walk,context.owner);
     std::vector<NativeMapEffectMember> members;
     uint32_t manager=0;
     try {
@@ -7043,7 +7190,11 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
         shared_->map_effects_first=NativeMapEffectsFiledBeforeEffects(walk,context.owner);
       }
     } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); manager=0; members.clear(); }
-    if(!manager) { if(sky) RecordSky(context,sky); return; }
+    if(!manager) {
+      if(census && sky) CoverageCensus().Add(NativeCoverageStatus::Covered,0x8200284Cu,{},"sky");
+      if(sky) RecordSky(context,sky);
+      return;
+    }
     // The walk's routes in list order: the sky, runs of immediate draws
     // around it (recorded here), and the filed grass maps (Transparent).
     // The wires' eye is the pass camera's, as for the effects pass.
@@ -7053,6 +7204,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
       if(segment.sky) RecordSky(context,sky);
       else RecordMapEffectDraws(context,segment.draws);
     }
+    if(census) CensusMapEffects(members,sky,plan);
     for(const auto& member:plan.unsupported)
       if(unsupported_.insert({member.vtable,member.mode}).second) {
         const auto* name=NativeMapEffectClassName(member.vtable);
@@ -7091,6 +7243,36 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     // A run of alike draws (the wires' strips) activates once.
     map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,*native_scene_pass_camera,viewport,formats,report,
       [&](const std::exception& error) { report(error.what()); });
+  }
+  // The coverage census of one map-effect walk, member by member as
+  // PlanNativeMapEffects routes it: the current sky, mode-0 wires and grass
+  // maps, and filed grass maps are covered; a hidden member does nothing in
+  // the guest either; a mode-2 grass map left unfiled has a key the drain
+  // never reaches or no draws (parity; a build failure is also a decline);
+  // anything else is unsupported, as is a sky that is not the current one.
+  void CensusMapEffects(const std::vector<edf::native::NativeMapEffectMember>& members,uint32_t sky,
+      const edf::native::NativeMapEffectPlan& plan) {
+    using namespace edf::native;
+    std::vector<NativeCoverageMark> marks;
+    for(const auto& member:members) {
+      NativeCoverageMark mark{NativeCoverageStatus::Covered,member.vtable,nullptr,"map_effects"};
+      if(member.kind==NativeMapEffectKind::Sky) {
+        if(member.object==sky) mark.reason="sky";
+        else { mark.status=NativeCoverageStatus::Uncovered; mark.reason="sky_not_current"; mark.slot=member.render; }
+      } else if(member.hidden) continue;
+      else if(member.kind==NativeMapEffectKind::ElectricWire && member.mode==0) {}
+      else if(member.kind==NativeMapEffectKind::GrassMap && member.mode==0) {}
+      else if(member.kind==NativeMapEffectKind::GrassMap && member.mode==2) {
+        const bool filed=std::any_of(plan.filed.begin(),plan.filed.end(),[&](const auto& item) { return item.object==member.object; });
+        if(!filed) { mark.status=NativeCoverageStatus::Parity; mark.reason="grass_not_filed"; }
+      } else {
+        mark.status=NativeCoverageStatus::Uncovered; mark.slot=member.render;
+        mark.reason=member.mode==0?"map_effect_unsupported_mode0":member.mode==1?"map_effect_unsupported_mode1":
+          member.mode==2?"map_effect_unsupported_mode2":"map_effect_unsupported_mode_other";
+      }
+      marks.push_back(mark);
+    }
+    CoverageCensus().Add(marks);
   }
   void RecordSky(edf::native::NativeFrameContext& context,uint32_t sky) {
     using namespace edf::native;
@@ -7167,7 +7349,8 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
           key.pass=NativeSceneMaterialPassState{before,base.samplers}; key.view=formats; key.filtering=filtering;
           key.shaders=state.shader_registry_generation;
           SkyResolve resolve;
-          auto* entry=sky_materials_.Candidate(key);
+          // Reuse off (native_reuse.h): resolved again and stored.
+          auto* entry=NativeReuseAllowed()?sky_materials_.Candidate(key):nullptr;
           NativeSceneView derived;
           if(entry) derived=entry->material.capture.camera;
           if(entry && SkyMaterials::Current(*entry,constants,entry->material.capture.material.get(),derived)) {
@@ -7249,7 +7432,12 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     const auto& publication=context.inputs.publication;
-    if(!publication || !native_scene_pass_camera || !context.renderer) { ++skipped_; return; }
+    if(!publication || !native_scene_pass_camera || !context.renderer) {
+      ++skipped_;
+      // No static world this view.
+      if(NativeCoverageCensusOn() && !publication) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:static_world","no_publication");
+      return;
+    }
     const auto scene=context.view.scene;
     NativeFullFrameStaticCamera camera;
     camera.visibility.matrix=ReadNativeVisibilityFloats<16>(reader_,reader_.Add(scene,96));
@@ -7273,9 +7461,15 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
       targets=ActiveTargetsLocked(state);
       backend=state.scene_backend;
       return state.active_scene==context.renderer && targets.count && targets.depth && backend;
-    })) { ++skipped_; return; }
+    })) {
+      ++skipped_;
+      if(NativeCoverageCensusOn()) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:static_world","no_targets");
+      return;
+    }
     const NativeSceneCpuWindow window(reader_);
     const NativeFullFrameLiveRoutes routes(window);
+    const bool census=NativeCoverageCensusOn();
+    world_.selection_cache.census=census;
     const auto& v=context.viewport;
     const auto viewport=MakeNativeDrawViewport(v.x,v.y,v.width,v.height,v.min_depth,v.max_depth,false,{});
     NativeFullFrameStaticPass pass;
@@ -7315,7 +7509,8 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
         // worlds (the same calls, no read of the instance objects); an
         // unchanged group's worlds are last frame's array. (Without geometry or
         // material Render refuses the draw, as before.)
-        if(draw.worlds && draw.geometry && draw.material) {
+        // Reuse off (native_reuse.h): Render over the snapshot instead.
+        if(draw.worlds && draw.geometry && draw.material && NativeReuseAllowed()) {
           drawn+=state.scene_renderer.RenderUniform(*state.scene_backend,*draw.geometry,*draw.material,*draw.worlds,draw.view).draws;
           ++uniform_;
         } else drawn+=state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),draw.view,1).draws;
@@ -7327,6 +7522,7 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     });
     timing.reset();
     if(!current) ++stale_;
+    if(census) CensusStaticWorld(window,frame,current);
     const auto& selected=frame.selection.stats;
     const auto& built=frame.stats;
     const auto& cached=world_.selection_cache.stats;
@@ -7339,6 +7535,63 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
+  // The coverage census of one static world frame. Selected objects are
+  // covered by class. A skipped member (NativeFullFrameStaticSelection::
+  // skipped) whose class the registry's table holds is the models pass's to
+  // draw and count, one whose slot 4 is a bare blr draws nothing in the guest
+  // either (parity), and any other is uncovered, named by its class and slot
+  // 4. The build's group-level drops (no group, material or geometry; a
+  // scissor or declined material) and instance declines, lists without a
+  // published membership and worlds without a published group order are
+  // uncovered; groups outside a published order are parity (821C3BB8 never
+  // reaches them). A stale frame recorded nothing.
+  template<class Reader>
+  static void CensusStaticWorld(const Reader& reader,const edf::native::NativeFullFrameStaticFrame& frame,bool current) {
+    using namespace edf::native;
+    using Skip=NativeFullFrameStaticSelection::Skip;
+    auto& census=CoverageCensus();
+    std::unordered_map<uint32_t,std::pair<uint32_t,uint32_t>> classes;  // owner -> (vtable, slot 4), this frame
+    const auto class_of=[&](uint32_t owner) {
+      auto [found,inserted]=classes.try_emplace(owner);
+      if(inserted) found->second=NativeCoverageClassOf(reader,owner);
+      return found->second;
+    };
+    std::vector<NativeCoverageMark> marks;
+    marks.reserve(frame.selection.objects.size()+frame.selection.skipped.size());
+    for(const auto& object:frame.selection.objects)
+      marks.push_back({NativeCoverageStatus::Covered,class_of(object.owner).first,nullptr,"static_world"});
+    for(const auto& skipped:frame.selection.skipped) {
+      const auto [vtable,slot4]=class_of(skipped.owner);
+      const auto owner=NativeCoverageSlotOwner(vtable,slot4);
+      if(owner==NativeCoverageOwner::Models) continue;
+      if(owner==NativeCoverageOwner::Empty) { marks.push_back({NativeCoverageStatus::Parity,vtable,nullptr,"empty_slot4",slot4}); continue; }
+      const char* reason="static_unpublished";
+      switch(skipped.reason) {
+        case Skip::Unpublished: reason="static_unpublished"; break;
+        case Skip::Unrouted: reason="static_unrouted"; break;
+        case Skip::Virtual: reason="static_other_slot4"; break;
+        case Skip::Bucket: reason="static_bucket_route"; break;
+        case Skip::UnknownMode: reason="static_unknown_mode"; break;
+        case Skip::RouteMismatch: reason="static_route_mismatch"; break;
+        case Skip::MissingLod: reason="static_missing_lod"; break;
+        case Skip::Undrawable: reason="static_undrawable"; break;
+      }
+      marks.push_back({NativeCoverageStatus::Uncovered,vtable,nullptr,reason,slot4});
+    }
+    census.Add(marks);
+    const auto& selected=frame.selection.stats;
+    const auto& built=frame.stats;
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_list","static_missing_list",selected.missing_lists);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_world_owner","static_missing_order",selected.missing_orders);
+    census.Add(NativeCoverageStatus::Parity,0,"static_group","unordered_group",selected.unordered_parts);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_missing_group",built.missing_group);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_missing_material",built.missing_material);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_missing_geometry",built.missing_geometry);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_scissor",built.scissor);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_declined",built.declined);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_instance","static_world_declined",built.world_declines);
+    if(!current) census.Add(NativeCoverageStatus::Uncovered,0,"pass:static_world","stale");
+  }
   const edf::native::GuestReader reader_;
   edf::native::NativeFullFrameStaticWorld world_;  // Cross-frame material cache and instance reuse.
   uint64_t frames_=0,skipped_=0,stale_=0,uniform_=0;
@@ -7413,11 +7666,317 @@ struct GpuPassSpan {
   GpuPassSpan& operator=(const GpuPassSpan&)=delete;
   int span;
 };
+// edf_native_shadow_render: one shadow frame (native_shadow_render.h has the
+// design and the side-effect handling). Begin (the 821A5080 hook, before the
+// native frame) arms the draw-list tap on the scene backend; the host's
+// Label names the native pass recording; Run (NativeFullFrameHost::Phases,
+// after the native post, before the HUD) captures the native image, renders
+// the guest route into the shadow's own targets, captures that, puts every
+// guest word and bridge field back and writes the files. The destructor
+// removes the tap on every exit.
+}
+namespace edf::native {
+namespace {
+class NativeShadowFrame {
+ public:
+  using GuestCall=std::function<void(uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr)>;
+  static std::unique_ptr<NativeShadowFrame> Begin(uint8_t* base,uint32_t owner) {
+    const NativeShadowSchedule schedule{REXCVAR_GET(edf_native_shadow_render),REXCVAR_GET(edf_native_shadow_render_start_frame),
+      uint64_t((std::max)(0,REXCVAR_GET(edf_native_shadow_render_limit)))};
+    static uint64_t taken=0,last_frame=0;  // 821A6508 joins each helper call before the next.
+    auto& state=State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto frame=state.indexed_output_frames+1;
+    if(frame==last_frame || !NativeShadowRenderDue(frame,schedule,taken)) return nullptr;
+    last_frame=frame; ++taken;
+    std::unique_ptr<NativeShadowFrame> shadow(new NativeShadowFrame(base,owner,frame));
+    try {
+      auto& backend=EnsureSceneBackendLocked(state);
+      if(backend.recorder_tap) throw std::runtime_error("the scene backend already has a recorder tap");
+      shadow->tap_.Arm("native.begin");
+      backend.recorder_tap=&shadow->tap_;
+      shadow->backend_=&backend;
+    } catch(const std::exception& error) {
+      REXLOG_ERROR("Native shadow render frame={}: not armed: {}",frame,error.what());
+      return nullptr;
+    }
+    REXLOG_INFO("Native shadow render: frame={} armed (every {} from {}, {} of {})",frame,schedule.period,schedule.start,taken,schedule.limit);
+    return shadow;
+  }
+  ~NativeShadowFrame() { Disarm(); }
+  NativeShadowFrame(const NativeShadowFrame&)=delete;
+  NativeShadowFrame& operator=(const NativeShadowFrame&)=delete;
+  void Label(std::string label) { tap_.SetLabel(std::move(label)); }
+  // After the native finish stage, before the HUD: `context` is the helper's
+  // guest frame context (the host's), `views` the views BeginView accepted.
+  void Run(const NativeFrameContext& frame,uint32_t context,uint32_t views,const GuestCall& guest);
+
+ private:
+  NativeShadowFrame(uint8_t* base,uint32_t owner,uint64_t frame)
+    :base_(base),reader_(base),owner_(owner),frame_(frame),serial_before_(reader_.Word(reader_.Add(owner,136))) {}
+  // The shadow's own scene color, depth and ordinary output, matching the
+  // native scene's so the guest scene begin and 8219C930 reuse them. Leaked,
+  // as other backend-lifetime caches here, so no exit order can free them late.
+  struct Targets {
+    NativeRenderBackend* backend=nullptr;
+    uint32_t width=0,height=0,samples=0,output_format=0;
+    NativeRenderTarget color,output;
+    NativeDepthTarget depth;
+  };
+  static Targets& ShadowTargets() { static auto* targets=new Targets; return *targets; }
+  void Disarm() {
+    if(!backend_) return;
+    auto& state=State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    if(state.scene_backend.get()==backend_ && backend_->recorder_tap==&tap_) backend_->recorder_tap=nullptr;
+    backend_=nullptr;
+  }
+  std::string GuestLabel(uint32_t lr,uint32_t object) const {
+    switch(lr) {
+      case 0x821A515C: return "guest.view_begin";
+      case 0x821A51DC: {
+        uint32_t vtable=0;
+        try { vtable=reader_.Word(object); } catch(const std::exception&) {}
+        return std::format("guest.world:{:08x}",vtable);
+      }
+      case 0x821A520C: return "guest.buckets";
+      case 0x821A5268: return "guest.overlays";
+      case 0x821A5294: return "guest.view16";
+      case 0x821A52AC: return "guest.view_end";
+      case 0x821A52E8: return "guest.finish";
+      case 0x821A52FC: return "guest.finish16";
+      default: return std::format("guest.{:08x}",lr);
+    }
+  }
+  void CaptureGuestWords(NativeGuestSnapshot& snapshot,const NativeFrameInputs& inputs) const {
+    const auto capture=[&](std::string name,uint32_t address,uint32_t words) {
+      try { snapshot.Capture(reader_,std::move(name),address,words); }
+      catch(const std::exception& error) { REXLOG_WARN("Native shadow render: {} at {:#x} not snapshot: {}",name,address,error.what()); }
+    };
+    capture("serial",reader_.Add(owner_,136),1);
+    capture("buckets",reader_.Add(owner_,168),512);  // owner+168..+2215: heads and the drain's buckets
+    if(const auto pool=reader_.Word(NativeViewGlobalsLayout::kPoolGlobal)) {
+      capture("pool.copies",reader_.Add(pool,NativeViewGlobalsLayout::kProjectionCopy),36);  // +64..+207
+      for(uint32_t offset=32;offset<=56;offset+=4) {
+        const auto record=reader_.Word(reader_.Add(pool,offset));
+        if(!record) continue;
+        const auto data=reader_.Word(reader_.Add(record,NativeViewGlobalsLayout::kValueData));
+        const auto count=reader_.Word(reader_.Add(record,NativeViewGlobalsLayout::kValueCount));
+        if(data && count && count<=1024) capture(std::format("pool.record+{}",offset),data,count*4);
+      }
+    }
+    if(inputs.registry) for(const auto& entry:inputs.registry->entries) {
+      try {
+        if(!entry || reader_.Word(entry->object)!=NativeBrokenObject::vtable) continue;
+      } catch(const std::exception&) { continue; }
+      capture(std::format("broken+712:{:08x}",entry->object),reader_.Add(entry->object,NativeBrokenObject::drawn),1);
+    }
+  }
+  void Write(const std::string& suffix,std::string_view bytes) const {
+    const auto path=std::filesystem::path(prefix_+"."+std::to_string(frame_)+suffix);
+    std::ofstream file(path,std::ios::binary|std::ios::trunc);
+    file.write(bytes.data(),std::streamsize(bytes.size()));
+    file.close();
+    if(!file) throw std::runtime_error("shadow render write failed: "+path.string());
+  }
+
+  uint8_t* base_;
+  const GuestReader reader_;
+  uint32_t owner_;
+  uint64_t frame_;
+  uint32_t serial_before_;
+  std::string prefix_;
+  NativeRenderBackend* backend_=nullptr;
+  NativeDrawListRecorder tap_;
+};
+void NativeShadowFrame::Run(const NativeFrameContext& frame,uint32_t context,uint32_t views,const GuestCall& guest) {
+  auto& state=State();
+  prefix_=REXCVAR_GET(edf_native_shadow_render_prefix);
+  if(prefix_.empty()) prefix_="native-shadow/shadow";
+  const auto renderer=reader_.Word(0x8257bfb4);
+  std::vector<NativeDrawRecord> native_draws,guest_draws;
+  std::vector<uint8_t> native_bmp,guest_bmp;
+  std::string skipped;
+  // 1. The native frame as the post left it (pre-HUD), and its draw list.
+  {
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    native_draws=tap_.Take();
+    const auto scene=renderer?state.scenes.find(renderer):state.scenes.end();
+    if(!frame.output_ready) skipped="the native post left no output";
+    else if(!views) skipped="no view was rendered";
+    else if(scene==state.scenes.end() || state.active_output!=renderer || !scene->second.output.content_valid)
+      skipped="the native output is not active and valid";
+    else if(state.scene_backend.get()!=backend_) skipped="the scene backend changed";
+    else {
+      try { native_bmp=CaptureOutputBmp(state,scene->second); }
+      catch(const std::exception& error) { skipped=std::string("native capture: ")+error.what(); }
+      tap_.ResetState();
+    }
+  }
+  if(!skipped.empty()) {
+    REXLOG_WARN("Native shadow render frame={}: skipped: {}",frame_,skipped);
+    Disarm();
+    return;
+  }
+  // 2. Guest words the guest route writes and game state keeps.
+  NativeGuestSnapshot snapshot;
+  CaptureGuestWords(snapshot,frame.inputs);
+  // 3. The shadow's targets in place of the native scene's, and the bridge
+  // fields the guest scene begin and finish rewrite.
+  struct Saved {
+    uint32_t active_scene=0,active_output=0,active_target=0,timer_owner=0,color_surface=0;
+    bool full_frame=false,timer_resolved=false,frame_complete=false;
+    uint64_t indexed_start=0;
+    std::vector<std::pair<uint32_t,uint32_t>> target_stack;
+    std::vector<DrawVisibility> visibility;
+    uint32_t resolved_handle=0;
+    std::optional<NativeTexture> resolved;
+  } saved;
+  auto& targets=ShadowTargets();
+  const auto swap_targets=[&](NativeScene& scene) {
+    std::swap(scene.color,targets.color); std::swap(scene.depth,targets.depth); std::swap(scene.output,targets.output);
+  };
+  {
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    auto& scene=state.scenes.at(renderer);
+    const auto width=scene.color.sampled.width,height=scene.color.sampled.height;
+    if(targets.backend!=backend_ || targets.width!=width || targets.height!=height || targets.samples!=scene.samples ||
+       targets.output_format!=scene.output.format) {
+      targets.color=CreateNativeRenderTarget(*backend_,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,scene.samples);
+      targets.depth=CreateNativeDepthTarget(*backend_,width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,scene.samples);
+      targets.output=CreateNativeRenderTarget(*backend_,scene.output.sampled.width,scene.output.sampled.height,DXGI_FORMAT(scene.output.format));
+      targets.backend=backend_; targets.width=width; targets.height=height; targets.samples=scene.samples;
+      targets.output_format=scene.output.format;
+      REXLOG_INFO("Native shadow render targets: {}x{} samples={} output_format={}",width,height,scene.samples,scene.output.format);
+    }
+    saved.active_scene=state.active_scene; saved.active_output=state.active_output; saved.active_target=state.active_target;
+    saved.timer_owner=state.scene_gpu_timer_owner; saved.timer_resolved=state.scene_gpu_timer_resolved;
+    saved.full_frame=state.scene_full_frame; saved.indexed_start=state.scene_indexed_start;
+    saved.target_stack=state.target_stack; saved.visibility=std::move(state.visibility); state.visibility.clear();
+    saved.color_surface=scene.color_surface; saved.frame_complete=scene.frame_complete;
+    saved.resolved_handle=reader_.Word(reader_.Add(renderer,104));
+    if(const auto found=state.textures.find(saved.resolved_handle);found!=state.textures.end()) saved.resolved=found->second;
+    swap_targets(scene);
+    targets.output.content_valid=false;  // The shadow output starts undefined, as a new frame's does.
+    ++state.bind_generation; state.recorded={};
+  }
+  // 4. The guest route for the same state: scene begin (clSgsCoreRender +0),
+  // the view loop and the finish stage, no phase loop.
+  NativeShadowGuest held;
+  std::exception_ptr failure;
+  {
+    const NativeAbSideLatch guest_side(false);
+    struct Scope {
+      bool tick_frame=native_render_tick_frame;
+      NativeShadowGuest* shadow=native_shadow_guest;
+      uint32_t animation_owner=native_scene_animation_owner;
+      std::optional<NativeScenePassCamera> camera=native_scene_pass_camera;
+      std::optional<NativeScenePassAnimation> animation=native_scene_pass_animation;
+      ~Scope() {
+        native_render_tick_frame=tick_frame; native_shadow_guest=shadow; native_scene_animation_owner=animation_owner;
+        native_scene_pass_camera=std::move(camera); native_scene_pass_animation=std::move(animation);
+      }
+    } scope;
+    native_render_tick_frame=false;  // The 8217C4A0 hook puts clEffectEtc02 +612 back.
+    native_shadow_guest=&held;       // The immediate draw hook holds PS_Downsample_Tone.
+    native_scene_animation_owner=0; native_scene_pass_camera.reset(); native_scene_pass_animation.reset();
+    {
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      tap_.Arm("guest.scene_begin");
+    }
+    try {
+      reader_.StoreWord(reader_.Add(owner_,136),serial_before_);  // The native views' serials.
+      const auto core=reader_.Word(reader_.Add(owner_,132));
+      guest(reader_.Word(reader_.Word(core)),core,0,0,0x821A6508);
+      {
+        std::lock_guard submission(state.submissions);
+        std::lock_guard lock(state.mutex);
+        if(state.active_scene!=renderer) throw std::runtime_error("the guest scene begin did not open the scene");
+      }
+      DispatchNativeFrame(reader_,owner_,context,[&](uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr) {
+        tap_.SetLabel(GuestLabel(lr,object));
+        guest(function,object,argument,index,lr);
+      },false);
+    } catch(...) { failure=std::current_exception(); }
+  }
+  // 5. The guest image, then the native scene back and every bridge field.
+  std::string guest_error;
+  {
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    guest_draws=tap_.Take();
+    auto& scene=state.scenes.at(renderer);
+    if(failure) guest_error="the guest route threw";
+    else if(state.active_output!=renderer || !scene.output.content_valid) guest_error="the guest post left no valid output";
+    else {
+      try { guest_bmp=CaptureOutputBmp(state,scene); }
+      catch(const std::exception& error) { guest_error=std::string("guest capture: ")+error.what(); }
+    }
+    swap_targets(scene);
+    scene.color_surface=saved.color_surface; scene.frame_complete=saved.frame_complete;
+    state.active_scene=saved.active_scene; state.active_output=saved.active_output; state.active_target=saved.active_target;
+    state.scene_gpu_timer_owner=saved.timer_owner; state.scene_gpu_timer_resolved=saved.timer_resolved;
+    state.scene_full_frame=saved.full_frame; state.scene_indexed_start=saved.indexed_start;
+    state.target_stack=std::move(saved.target_stack); state.visibility=std::move(saved.visibility);
+    if(saved.resolved) state.textures.insert_or_assign(saved.resolved_handle,*saved.resolved);
+    ++state.bind_generation; state.recorded={};
+    tap_.ResetState();
+    BindActiveTarget(state);
+  }
+  Disarm();
+  // 6. Every guest word back as the native frame left it.
+  const auto restored=snapshot.Restore(reader_);
+  // 7. The files.
+  uint32_t restored_words=0;
+  std::string ranges;
+  for(const auto& range:restored) {
+    restored_words+=range.changed;
+    ranges+=std::format("{}{{\"name\":{},\"address\":\"{:08x}\",\"words\":{},\"changed\":{}}}",ranges.empty()?"":",",
+      NativeShadowJsonString(range.name),range.address,range.words,range.changed);
+  }
+  std::string excluded;
+  for(const auto& item:kNativeShadowExclusions) excluded+=(excluded.empty()?"":",")+NativeShadowJsonString(item);
+  const auto& motion=frame.inputs.motion;
+  const auto stem=std::filesystem::path(prefix_+"."+std::to_string(frame_)).filename().string();
+  const auto meta=std::format("{{\"format\":\"edf-shadow-frame\",\"version\":1,\"frame\":{},\"owner\":\"{:08x}\",\"renderer\":\"{:08x}\","
+    "\"views\":{},\"serial\":{},\"motion\":{{\"tick\":{},\"fraction\":{},\"steps\":{},\"unlocked\":{},\"interpolate\":{}}},\"tick_frame\":{},"
+    "\"native\":{{\"image\":{},\"draws\":{},\"count\":{}}},\"guest\":{{\"image\":{},\"draws\":{},\"count\":{},\"error\":{}}},"
+    "\"held\":{{\"tone\":{},\"lifetime\":{}}},\"restored_words\":{},\"restored\":[{}],\"excluded\":[{}]}}\n",
+    frame_,owner_,renderer,views,serial_before_,motion.tick,NativeShadowJsonFloat(motion.fraction),motion.steps,motion.unlocked,
+    motion.interpolate,frame.inputs.tick_frame,
+    NativeShadowJsonString(stem+".native.bmp"),NativeShadowJsonString(stem+".native.draws.jsonl"),native_draws.size(),
+    guest_bmp.empty()?std::string("null"):NativeShadowJsonString(stem+".guest.bmp"),NativeShadowJsonString(stem+".guest.draws.jsonl"),
+    guest_draws.size(),guest_error.empty()?std::string("null"):NativeShadowJsonString(guest_error),
+    held.tone_holds,held.lifetime_holds,restored_words,ranges,excluded);
+  try {
+    if(const auto directory=std::filesystem::path(prefix_).parent_path();!directory.empty())
+      std::filesystem::create_directories(directory);
+    Write(".native.bmp",{reinterpret_cast<const char*>(native_bmp.data()),native_bmp.size()});
+    if(!guest_bmp.empty()) Write(".guest.bmp",{reinterpret_cast<const char*>(guest_bmp.data()),guest_bmp.size()});
+    Write(".native.draws.jsonl",SerializeNativeDrawList("native",frame_,native_draws));
+    Write(".guest.draws.jsonl",SerializeNativeDrawList("guest",frame_,guest_draws));
+    Write(".shadow.json",meta);
+  } catch(const std::exception& error) { REXLOG_ERROR("Native shadow render frame={}: {}",frame_,error.what()); }
+  REXLOG_INFO("Native shadow render: frame={} prefix={} native_draws={} guest_draws={} tone_holds={} lifetime_holds={} restored_words={} guest_error={}",
+    frame_,prefix_,native_draws.size(),guest_draws.size(),held.tone_holds,held.lifetime_holds,restored_words,
+    guest_error.empty()?"none":guest_error);
+  if(failure) std::rethrow_exception(failure);
+}
+}
+}
+namespace {
 class NativeFullFrameHost final : public edf::native::NativeFrameHost {
  public:
   using GuestCall=std::function<void(uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr)>;
   NativeFullFrameHost(uint8_t* base,uint32_t owner,uint32_t context,GuestCall guest)
     :base_(base),reader_(base),owner_(owner),context_(context),guest_(std::move(guest)) {}
+  // edf_native_shadow_render: this frame's shadow (null on every other frame).
+  void SetShadow(edf::native::NativeShadowFrame* shadow) { shadow_=shadow; }
   // (a) One generation of publication, published cameras and world animations
   // under the producer lock, as the hook acquires them; the motion budget and
   // its publication were already acquired by the hook, which restores all of
@@ -7521,11 +8080,15 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
       if(++skipped<=4 || !(skipped&(skipped-1)))
         REXLOG_INFO("Native full frame view skipped: renderer={:#x} active_scene={:#x} skipped={} (no scene from 8219C7A8)",
           renderer,state.active_scene,skipped);
+      // No view pass runs: everything the guest would draw in the view is dropped.
+      if(NativeCoverageCensusOn())
+        edf::native::CoverageCensus().Add(edf::native::NativeCoverageStatus::Uncovered,0,"frame","view_skipped");
       return false;
     }
     context.renderer=renderer;
     state.scene_full_frame=true;  // Counts as the scene's indexed draws for output frames and captures.
     context.owner=owner_; context.guest_context=context_;
+    ++views_begun_;
     const auto width=reader_.Word(reader_.Add(renderer,84)),height=reader_.Word(reader_.Add(renderer,88));
     const auto rect=edf::native::ReadGuestWords<4>(reader_,reader_.Add(scene,480));
     const auto extent=[](uint32_t word,uint32_t limit) {
@@ -7569,6 +8132,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     static_assert(count==std::size(edf::native::kNativeFramePassOrder));
     edf::native::HookTiming timing(index<count?edf::native::HookPhase(first+index):edf::native::HookPhase::FrameNative,index<count);
     const GpuPassSpan gpu(pass.name());
+    if(shadow_) shadow_->Label(std::string("native.")+pass.name());
     pass.Record(context);
   }
   // REMAINING GUEST CALLS, per view, in the helper's order: the overlay
@@ -7585,6 +8149,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     native_render_tick_frame=context.inputs.tick_frame;
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeOverlays);
     const GpuPassSpan gpu("view_overlays");
+    if(shadow_) shadow_->Label("native.overlays");
     RemainingGuestCall(0);
     const auto sentinel=[&] { return Word(2232); };
     for(auto node=reader_.Word(sentinel());node!=sentinel();) {
@@ -7683,6 +8248,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // output (clNoguchiCallback 820A4DD0, clSatoCallback 8216E630); each draw
   // is translated by the per-draw hooks (821FD8F8). The output is bound first.
   void Phases(edf::native::NativeFrameContext& context) override {
+    // edf_native_shadow_render: the guest route for this frame's state, after
+    // the native post and before the HUD, into the shadow's own targets.
+    if(shadow_) shadow_->Run(context,context_,views_begun_,guest_);
     // The HUD's two draw-counted advances (clGaugeRader 82176708, the window
     // cursor fade 8218ED68) follow this frame's tick gate; see their hooks.
     native_render_tick_frame=context.inputs.tick_frame;
@@ -7750,6 +8318,8 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   const edf::native::GuestReader reader_;
   uint32_t owner_,context_;
   GuestCall guest_;
+  edf::native::NativeShadowFrame* shadow_=nullptr;
+  uint32_t views_begun_=0;
 };
 }
 namespace {
@@ -7787,6 +8357,32 @@ REX_HOOK_RAW(sub_821A5080) {
       REXLOG_INFO("ab_alternate frame={} native={}",frame,ab_native?1:0);
   }
   const edf::native::NativeAbSideLatch ab_latch(ab_native);
+  // Reuse off (native_reuse.h): the process-wide switch, mirrored for the
+  // other threads' sites, and this frame's side of the reuse alternation,
+  // latched for this helper call like the A/B side and tagged the same way
+  // (reuse_alternate frame=F native=0 for a reuse-off reference frame, 1 for
+  // a reuse-on judged frame; F is the indexed output frame the capture names).
+  edf::native::native_reuse_off_all.store(REXCVAR_GET(edf_native_reuse_off),std::memory_order_relaxed);
+  bool reuse_off=false;
+  if(const auto reuse_period=REXCVAR_GET(edf_native_reuse_off_alternate); reuse_period>0) {
+    if(REXCVAR_GET(edf_native_ab_alternate)>0) {
+      static std::atomic<bool> reported=false;
+      if(!reported.exchange(true)) REXLOG_WARN("edf_native_reuse_off_alternate ignored: edf_native_ab_alternate is on");
+    } else {
+      uint64_t frame=0;
+      {
+        auto& state=edf::native::State();
+        std::lock_guard submission(state.submissions);
+        std::lock_guard lock(state.mutex);
+        frame=state.indexed_output_frames+1;
+      }
+      reuse_off=edf::native::NativeReuseOffSide(frame,REXCVAR_GET(edf_native_output_capture_start_frame),reuse_period);
+      static std::atomic<uint64_t> reuse_logged=0;
+      if(reuse_logged.exchange(frame,std::memory_order_relaxed)!=frame)
+        REXLOG_INFO("reuse_alternate frame={} native={}",frame,reuse_off?0:1);
+    }
+  }
+  const edf::native::NativeReuseOffLatch reuse_latch(reuse_off);
   native_render_frames.fetch_add(1,std::memory_order_relaxed);
   struct RestoreTickFrame {
     bool saved=native_render_tick_frame;
@@ -7881,11 +8477,24 @@ REX_HOOK_RAW(sub_821A5080) {
         work.ctr.u64=function; work.lr=lr;
         rex::runtime::ResolveIndirectFunction(function)(work,base);
       });
+    // edf_native_shadow_render (native_shadow_render.h): null unless this
+    // frame takes a shadow render; the tap it arms is removed on every exit.
+    std::unique_ptr<edf::native::NativeShadowFrame> shadow;
+    if(REXCVAR_GET(edf_native_shadow_render)>0) {
+      shadow=edf::native::NativeShadowFrame::Begin(base,ctx.r3.u32);
+      host.SetShadow(shadow.get());
+    }
     {
       edf::native::HookTiming frame_timing(edf::native::HookPhase::FrameNative);
       GpuPassFrameBegin();
       full_frame.Run(host);
       GpuPassFrameEnd();
+    }
+    if(NativeCoverageCensusOn()) {
+      auto& census=edf::native::CoverageCensus();
+      const auto now=NativeCoverageNow();
+      census.EndFrame(now);
+      for(const auto& line:census.Poll(now,double(REXCVAR_GET(edf_native_coverage_census_interval)))) REXLOG_INFO("{}",line);
     }
     const auto frames=full_frame.frames();
     if(frames<=4 || frames%1000==0)
@@ -7939,6 +8548,21 @@ REX_HOOK_RAW(sub_821A5080) {
 // store. Every other render, and every call outside a render helper, runs the
 // original alone. The full frame's effects pass does the same through
 // CollectNativeEffects(commit) and never calls this slot.
+// The helper runs on its own thread beside the step (821A6508: kick
+// 821D58E8, step dispatch 821A4BA0, join 821D5800), so slot 3 (8217C3A8)
+// can run while this draw does. That is safe:
+// - The object stays allocated until after the join. Slot 3 at +612 <= 0
+//   only marks it (821C0ED8: byte +36, halfword +212) and queues it
+//   (821A6AA8); the queue is freed by 821A5A10 (slot 1 8217CE60, the
+//   destructor), whose only callers run it after the join: 821A6508 at
+//   821A663C after 821D5800 at 821A65F8, and 821A6158 after its own
+//   821D5800. A new object at the same address is therefore constructed
+//   after the join too.
+// - Nothing else writes +612 while the helper runs: its only writers are
+//   the constructor 8217C840 and this slot (every other stw to +612 in the
+//   image is in another class's code); slot 3 only reads it.
+// Even so the put-back is a compare-and-swap from the draw's value
+// (NativeRenderStepOncePerTick), so a concurrent write would be kept.
 // The HUD phase loop (owner+140..+144 x listener +16) runs every render, and
 // all its phases are draws: the XUI clock (clXuiManager slot4 82173CD8, Sato
 // phase 1) and timers (slot5 82173A58 -> 823F79F8, phase 3) already advance by
@@ -7946,8 +8570,10 @@ REX_HOOK_RAW(sub_821A5080) {
 // Two draws advance a counter by a fixed step per call instead; on an unlocked
 // render that dispatched no step (native_render_tick_frame false) the fields
 // are put back, so they step once per tick as at the retail 60 Hz. Each is put
-// back only when the call made exactly that one step, so any other writer
-// (the tick-side arming or reset) is never undone.
+// back only when the call made exactly that one step, and atomically (a
+// compare-and-swap from the value the draw stored), so any other writer (the
+// tick-side arming or reset, which may run on the simulation thread during
+// the render) is never undone.
 // clGaugeRader::slot3 (Noguchi phase 0): while +296 != 0 and byte
 // [8257C030]+2260 is clear, 821768A0..B0 store +296 - 1 (the damage shake's
 // frames left, armed with 30 by slot2 82175FFC) and +300 * [r31+28] (the
@@ -7974,8 +8600,9 @@ REX_EXTERN(__imp__sub_8217C4A0);
 REX_HOOK_RAW(sub_8217C4A0) {
   if(native_render_tick_frame) { __imp__sub_8217C4A0(ctx,base); return; }
   const edf::native::GuestReader reader(base);
-  edf::native::NativeRenderStepOncePerTick(reader,false,reader.Add(ctx.r3.u32,edf::native::kNativeEffectEtc02Lifetime),0xFFFFFFFFu,
+  const bool held=edf::native::NativeRenderStepOncePerTick(reader,false,reader.Add(ctx.r3.u32,edf::native::kNativeEffectEtc02Lifetime),0xFFFFFFFFu,
     std::array<uint32_t,0>{},[&] { __imp__sub_8217C4A0(ctx,base); });
+  if(held && native_shadow_guest) ++native_shadow_guest->lifetime_holds;
 }
 REX_EXTERN(__imp__sub_820B2510);
 REX_HOOK_RAW(sub_820B2510) {
@@ -8381,7 +9008,12 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool re
     // light tick left until its probe reaches them or the next step. It
     // publishes nothing and moves no pose motion, so it cannot itself mark
     // the poses it reports render-dependent.
-    const bool light=render_only && REXCVAR_GET(edf_native_render_registry_idle_skip);
+    // Reuse off (native_reuse.h, edf_native_reuse_off only: the registry ticks
+    // per iteration, not per rendered frame): full ticks (so no probe or live
+    // set either: every update member is read), and no frame-pose memo or
+    // unchanged-entry and constant pointer sharing inside Tick.
+    edf::native::native_reuse_off_all.store(REXCVAR_GET(edf_native_reuse_off),std::memory_order_relaxed);
+    const bool light=render_only && REXCVAR_GET(edf_native_render_registry_idle_skip) && edf::native::NativeReuseAllowed();
     auto snapshot=registry.Tick(window,scene,tick,decode,!light);
     if(light && REXCVAR_GET(edf_native_render_registry_idle_audit)) {
       const auto changes=registry.AuditLight(window,scene,tick,decode);
@@ -8392,6 +9024,28 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool re
           tick,changes,audited,mismatched,changed);
       else if(!changes && (audited<=4 || audited%1000==0))
         REXLOG_INFO("Native render registry idle audit: audited={} mismatched={} total_changed={}",audited,mismatched,changed);
+    }
+    // Coverage census: the resolved objects of classes the registry's table
+    // does not hold, which no native pass draws unless their slot 4 is one the
+    // static world or effect builders take (NativeCoverageSlotOwner). Present
+    // objects, not visibility-tested: counted into every full frame while they exist.
+    static bool census_population=false;
+    if(REXCVAR_GET(edf_native_coverage_census)) {
+      std::vector<edf::native::NativeCoverageCensus::Population> population;
+      for(const auto& [vtable,count]:registry.UnknownClasses()) {
+        uint32_t slot4=0;
+        try { slot4=window.Word(window.Add(vtable,16)); } catch(const std::exception&) {}
+        const auto owner=edf::native::NativeCoverageSlotOwner(vtable,slot4);
+        if(owner!=edf::native::NativeCoverageOwner::None && owner!=edf::native::NativeCoverageOwner::Empty) continue;
+        const bool empty=owner==edf::native::NativeCoverageOwner::Empty;
+        population.push_back({empty?edf::native::NativeCoverageStatus::Parity:edf::native::NativeCoverageStatus::Uncovered,vtable,{},
+          empty?"empty_slot4":"registry_unknown_class",std::format("slot=0x{:08X}",slot4),count});
+      }
+      edf::native::CoverageCensus().SetPopulation("registry",std::move(population));
+      census_population=true;
+    } else if(census_population) {
+      edf::native::CoverageCensus().SetPopulation("registry",{});
+      census_population=false;
     }
     static uint64_t ticks=0;
     const bool report=++ticks<=4 || ticks%1000==0;
@@ -8467,7 +9121,8 @@ REX_HOOK_RAW(sub_821A4DE8) {
   // without A/B guest frames makes only if a guest phase still draws a model.
   // With nothing registered there, neither the dirty-pose capture nor the pose
   // publication runs; a later registration is seeded at the next publication.
-  const bool full_frame_only=EDF_NATIVE_FLAG(full_frame) && REXCVAR_GET(edf_native_ab_alternate)<=0;
+  const bool full_frame_only=EDF_NATIVE_FLAG(full_frame) && REXCVAR_GET(edf_native_ab_alternate)<=0 &&
+    REXCVAR_GET(edf_native_shadow_render)<=0;
   const bool model_flag=EDF_NATIVE_FLAG(model_publication);
   const bool model_publication=model_flag && (!full_frame_only || ModelPublications().size());
   std::vector<uint32_t> dirty_poses;
@@ -13617,7 +14272,8 @@ uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& rea
   const NativeEffectDraw* activated=nullptr;
   for(const auto& draw:draws) {
     try {
-      if(!activation || !NativeEffectDrawsShareActivation(*activated,draw)) {
+      // Reuse off (native_reuse.h): every draw activates on its own.
+      if(!activation || !NativeReuseAllowed() || !NativeEffectDrawsShareActivation(*activated,draw)) {
         activation.reset();
         activation=ActivateNativeFullFrameEffectLocked(state,reader,window,draw,camera,viewport,formats,report);
         activated=&draw;
@@ -14235,8 +14891,9 @@ REX_HOOK_RAW(sub_821FD8F8) {
               (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),pair.pixel,
               lines?edf::native::NativeBackendTopology::LineList
                    :edf::native::NativeBackendTopology::TriangleList});
-            if(REXCVAR_GET(edf_native_transient_batching))
-              mesh.DrawTransientExpanded(recorder,vertices,0,uint32_t(indices.size()/2),
+            // state.recorded.pipeline: the pipeline RecordDrawSetup just bound.
+            if(NativeTransientBatchingEnabled() && state.recorded.pipeline)
+              mesh.DrawTransientExpanded(recorder,*state.recorded.pipeline,vertices,0,uint32_t(indices.size()/2),
                 lines?edf::native::NativeBackendTopology::LineList:edf::native::NativeBackendTopology::TriangleList);
             else if(lines) mesh.DrawLinesTransient(recorder,vertices,0,uint32_t(indices.size()/2));
             else mesh.DrawTransient(recorder,vertices,0,uint32_t(indices.size()/2));
@@ -14479,7 +15136,13 @@ REX_HOOK_RAW(sub_821FD8F8) {
         const float center_offset=REXCVAR_GET(edf_native_pixel_centers)
           ? edf::native::GuestPixelCenterOffset(centers_word) : 0.f;
         const bool shift_centers=initialized && center_offset!=0.f;
-        if(post_seam) {
+        // The shadow render's guest post (edf_native_shadow_render) holds the
+        // tone history: the target already holds this frame's value from the
+        // native post, so the 0.025-per-draw blend is not applied twice.
+        const bool shadow_tone_hold=native_shadow_guest && !output_draw && target.content_valid &&
+          pixel.shader().entry.name=="PS_Downsample_Tone";
+        if(shadow_tone_hold) ++native_shadow_guest->tone_holds;
+        else if(post_seam) {
           auto shifted=viewport;
           if(shift_centers) {
             shifted.viewport.TopLeftX+=center_offset;
@@ -14520,7 +15183,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         }
         native_submitted=true;
         ++state.native_quad_draws;
-        target.content_valid=initialized;
+        if(!shadow_tone_hold) target.content_valid=initialized;
         if (output_draw && ++state.output_draws<=5)
           REXLOG_INFO("Native final bloom: draws={}, initialized={}, frame_complete=false",state.output_draws,initialized);
         const auto bloom_now=std::chrono::steady_clock::now();
@@ -14832,7 +15495,12 @@ void ResolveNativeRendererPreset() {
   const auto& name=REXCVAR_GET(edf_native_renderer);
   const auto preset=ParseNativeRendererPreset(name);
   if(!preset) throw std::runtime_error("edf_native_renderer must be off, world, full or native, not '"+std::string(name)+"'");
-  native_renderer_preset_mask.store(NativeRendererPresetMask(*preset),std::memory_order_relaxed);
+  const auto& scene_backend=REXCVAR_GET(edf_native_scene_backend);
+  const auto resolved=ResolveNativeRendererPresetForBackend(*preset,scene_backend);
+  if(resolved.backend_fallback)
+    REXLOG_WARN("Native renderer: preset {} needs the d3d12 scene backend (the full frame has never run on '{}'); using preset off, the guest renderer",
+      std::string(name),std::string(scene_backend));
+  native_renderer_preset_mask.store(NativeRendererPresetMask(resolved.preset),std::memory_order_relaxed);
   // Effective values, in NativeRendererFlag order.
   const bool effective[kNativeRendererFlagCount]{
     EDF_NATIVE_FLAG(host),EDF_NATIVE_FLAG(shader_bridge),EDF_NATIVE_FLAG(seam_draws),
@@ -14850,7 +15518,8 @@ void ResolveNativeRendererPreset() {
     if(!list.empty()) list+=',';
     list+=kNativeRendererFlagNames[i];
   }
-  REXLOG_INFO("Native renderer: preset={} on=[{}] off=[{}]",name.empty()?std::string("off"):std::string(name),on,off);
+  REXLOG_INFO("Native renderer: preset={}{} on=[{}] off=[{}]",name.empty()?std::string("off"):std::string(name),
+    resolved.backend_fallback?" (off on this scene backend)":"",on,off);
 }
 namespace {
 void LogNativeStaticWorldGroup(uint32_t group,uint64_t recorded) {

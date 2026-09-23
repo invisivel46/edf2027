@@ -1557,6 +1557,11 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
       // the same order, for quads and for lines, over two quads' vertices.
       {
         NativeMeshCache dynamic_meshes(4*1024*1024,256,true);
+        // The pipelines the bridge binds: batchable (decided, no SV_VertexID),
+        // one that numbers its vertices, and one not yet decided.
+        NativeBackendPipeline batchable,numbered,undecided;
+        batchable.transient_batchable=batchable.transient_batchable_known=true;
+        numbered.transient_batchable_known=true;
         auto two_quads=utility_vertices;
         two_quads.insert(two_quads.end(),utility_vertices.rbegin(),utility_vertices.rend());
         for(const bool lines:{false,true}) {
@@ -1570,14 +1575,26 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
           const auto count=uint32_t(pattern->bytes().size()/2);
           if(lines) mesh.DrawLinesTransient(indexed,two_quads,0,count);
           else mesh.DrawTransient(indexed,two_quads,0,count);
-          mesh.DrawTransientExpanded(expanded,two_quads,0,count,
-            lines?NativeBackendTopology::LineList:NativeBackendTopology::TriangleList);
+          const auto topology=lines?NativeBackendTopology::LineList:NativeBackendTopology::TriangleList;
+          Require(mesh.DrawTransientExpanded(expanded,batchable,two_quads,0,count,topology),
+            "a batchable pipeline's Utility draw was not expanded");
           Require(indexed.indexed_draws==1 && indexed.draws==0 && expanded.draws==1 && expanded.indexed_draws==0 &&
             expanded.stride==indexed.stride,"expanded Utility draw was not one non-indexed draw of the same stride");
           Require(indexed.primitives.size()==4 && indexed.primitives==expanded.primitives,
             "expanded Utility draw assembles different primitives than the indexed one");
+          // A pipeline that is not batchable (reads SV_VertexID, or is not yet
+          // decided) takes the indexed draw instead: the same primitives,
+          // and the vertex numbering the shader expects.
+          for(const auto* pipeline:{&numbered,&undecided}) {
+            AssemblyRecorder fallback;
+            fallback.index_values=indexed.index_values;
+            Require(!mesh.DrawTransientExpanded(fallback,*pipeline,two_quads,0,count,topology),
+              "a non-batchable pipeline's Utility draw was expanded");
+            Require(fallback.indexed_draws==1 && fallback.draws==0 && fallback.primitives==indexed.primitives,
+              "a non-batchable pipeline's Utility draw was not the indexed draw");
+          }
           bool refused=false;
-          try { mesh.DrawTransientExpanded(expanded,two_quads,0,count,NativeBackendTopology::TriangleStrip); }
+          try { mesh.DrawTransientExpanded(expanded,batchable,two_quads,0,count,NativeBackendTopology::TriangleStrip); }
           catch(const std::runtime_error&) { refused=true; }
           Require(refused,"an expanded transient draw accepted a strip");
         }

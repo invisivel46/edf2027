@@ -739,6 +739,7 @@ class D3D11Backend final : public NativeRenderBackend {
     pipeline->topology=Topology(desc.topology);
     pipeline->requires_blend_factor_=decoded.requires_blend_factor;
     pipeline->replicate_blend_alpha=decoded.replicate_blend_alpha;
+    StampNativeBackendPipelineIdentity(*pipeline,desc);
 
     auto& stored=pipelines_.emplace(std::move(key),std::move(pipeline)).first->second;
     return *stored;

@@ -4,6 +4,7 @@
 #include "native_input_layout.h"
 #include "native_declarations.h"
 #include "native_generated_indices.h"
+#include "native_reuse.h"
 #include "native_transient_batching.h"
 #include <array>
 #include <algorithm>
@@ -448,12 +449,20 @@ void NativeIndexedMesh::DrawLinesTransient(NativeBackendRecorder& recorder,std::
   ValidateLineDraw(first,count,base);
   BindTransientAndDraw(recorder,guest_vertices,first,count,base,NativeBackendTopology::LineList);
 }
-void NativeIndexedMesh::DrawTransientExpanded(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+bool NativeIndexedMesh::DrawTransientExpanded(NativeBackendRecorder& recorder,const NativeBackendPipeline& pipeline,
+                                              std::span<const uint8_t> guest_vertices,
                                               uint32_t first,uint32_t count,NativeBackendTopology topology,
                                               int32_t base) const {
   if(topology==NativeBackendTopology::TriangleList) ValidateDraw(first,count,base);
   else if(topology==NativeBackendTopology::LineList) ValidateLineDraw(first,count,base);
   else throw std::runtime_error("an expanded transient draw is for list topologies");
+  // The precondition is the pipeline's, not the caller's: a vertex stage
+  // reading SV_VertexID (or a second stream) would number or fetch the
+  // expanded vertices differently, so such a pipeline draws indexed.
+  if(!pipeline.transient_batchable_known || !pipeline.transient_batchable) {
+    BindTransientAndDraw(recorder,guest_vertices,first,count,base,topology);
+    return false;
+  }
   if(!vertex_storage_->dynamic_vertices_)
     throw std::runtime_error("transient vertices are for a dynamic mesh; an immutable one draws its own buffer");
   static thread_local std::vector<uint8_t> converted,expanded;
@@ -462,6 +471,7 @@ void NativeIndexedMesh::DrawTransientExpanded(NativeBackendRecorder& recorder,st
   recorder.SetTransientVerticesOwned(0,expanded,stride_);
   recorder.SetTopology(topology);
   recorder.Draw(count,0);
+  return true;
 }
 void NativeIndexedMesh::BindTransientAndDraw(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
                                              uint32_t first,uint32_t count,int32_t base,
@@ -639,8 +649,9 @@ NativeIndexedMesh& NativeMeshCache::Acquire(NativeRenderBackend& backend,const N
   std::shared_ptr<const NativeIndexBuffer> rejected_index;
   std::shared_ptr<NativeVertexBuffer> rejected_vertex;
   auto found=entries_.end();
-  Entry* candidate=last_entry_ && last_key_==key?last_entry_:nullptr;
-  if(!candidate) {
+  // Reuse off (native_reuse.h): the map is searched, not the lookup memos.
+  Entry* candidate=last_entry_ && last_key_==key && NativeReuseAllowed()?last_entry_:nullptr;
+  if(!candidate && NativeReuseAllowed()) {
     const auto& recent=recent_[RecentSlot(key)];
     if(recent.entry && recent.key==key) candidate=recent.entry;
   }

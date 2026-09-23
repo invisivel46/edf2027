@@ -230,6 +230,7 @@ class Edf2017App : public rex::ReXApp {
 
   void OnShutdown() override {
 #if defined(_WIN32)
+    edf::native::LogNativeCoverageCensusFinal();
     edf::native::SetNativeMeshWatchAudit({});
     native_mesh_audit_.reset();
     if(native_backend_host_) native_backend_host_->Stop();
@@ -241,6 +242,7 @@ class Edf2017App : public rex::ReXApp {
   }
   bool OnWindowCloseRequested() override {
 #if defined(_WIN32)
+    edf::native::LogNativeCoverageCensusFinal();
     if(native_backend_host_) native_backend_host_->Stop();
     native_backend_host_.reset(); native_backend_immediate_=nullptr;
     if(native_host_) native_host_->Stop();

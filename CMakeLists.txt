@@ -253,6 +253,11 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
     add_test(NAME edf_soak_report_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_soak_report)
     set_tests_properties(edf_soak_report_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_custom_target(edf_coverage_report_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_coverage_report
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_coverage_report_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_coverage_report)
+    set_tests_properties(edf_coverage_report_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_custom_target(edf_renderer_scenario_tests
         COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_scenarios
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
@@ -263,6 +268,11 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
     add_test(NAME edf_renderer_image_compare_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_compare_renderer_images)
     set_tests_properties(edf_renderer_image_compare_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_custom_target(edf_shadow_diff_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_shadow_diff
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_shadow_diff_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_shadow_diff)
+    set_tests_properties(edf_shadow_diff_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_custom_target(edf_renderer_ab_capture_tests
         COMMAND ${Python3_EXECUTABLE} -m unittest tools.test_compare_renderer_ab_captures
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)

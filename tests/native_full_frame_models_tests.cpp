@@ -146,10 +146,10 @@ void MovingVisibility() {
   Require(ClassifyNativeFullFrameModelMoving(*entry,view,later).cull==C::Frustum,"a bound motion of an earlier tick is stationary");
   NativeRenderRegistrySnapshot snapshot;
   snapshot.entries.push_back(entry);
-  const auto plan=PlanNativeFullFrameModels(snapshot,camera,{},interpolated);
+  const auto plan=PlanNativeFullFrameModels(snapshot,camera,{},false,interpolated);
   Require(plan.opaque.size()==1 && plan.opaque[0].model==2 && plan.opaque[0].depth==300 && plan.calls.empty() &&
     plan.stats.previous==1 && plan.stats.frustum==0,"the previous bound draws with the tick's LOD and is no slot-4 call");
-  const auto still=PlanNativeFullFrameModels(snapshot,camera,{},locked);
+  const auto still=PlanNativeFullFrameModels(snapshot,camera,{},false,locked);
   Require(still.opaque.empty() && still.stats.frustum==1 && !still.stats.previous,"locked mode planned a previous bound");
   // Visible at the tick: unchanged, whatever the previous bound.
   entry->centre={0,0,300,1}; entry->bound_motion.centre={500,0,300,1};
@@ -243,6 +243,11 @@ void SortKeys() {
   const auto plan=PlanNativeFullFrameModels(snapshot,camera);
   Require(plan.opaque.size()==1 && plan.opaque[0].entry->object==7,"mode 0 is opaque");
   Require(plan.stats.bucket_zero==1 && plan.transparent.size()==5,"bucket 0 keys are dropped");
+  // Coverage census: the bucket-0 entry is parity (821A3BA0 skips it too); off, no marks.
+  Require(plan.census.empty(),"no census marks unless asked");
+  const auto counted=PlanNativeFullFrameModels(snapshot,camera,{},true);
+  Require(counted.census.size()==1 && counted.census[0].status==NativeCoverageStatus::Parity &&
+    std::string_view(counted.census[0].reason)=="bucket_zero","bucket 0 is a parity mark");
   const std::array<uint32_t,5> order{4,2,6,5,1};
   for(size_t i=0;i<order.size();++i) Require(plan.transparent[i].entry->object==order[i],"transparents draw key descending, ties in gather order");
   Require(plan.transparent[0].key==65535 && plan.transparent[3].key==655,"transparent keys are recorded");
@@ -335,6 +340,17 @@ void AttachmentsFollowTheModel() {
   for(const auto& entry:{opaque,filed,unposed,after}) snapshot.entries.push_back(entry);
   const auto plan=PlanNativeFullFrameModels(snapshot,MakeCamera());
   Require(plan.stats.attachments==6 && plan.stats.no_attachment==6 && plan.stats.no_pose==1,"attachments counted");
+  {
+    // Coverage census: one uncovered mark per attachment left undrawn and per unposed model.
+    const auto counted=PlanNativeFullFrameModels(snapshot,MakeCamera(),{},true);
+    size_t attachments=0,poses=0;
+    for(const auto& mark:counted.census) {
+      Require(mark.status==NativeCoverageStatus::Uncovered,"plan skips are uncovered");
+      attachments+=std::string_view(mark.reason)=="models_no_attachment";
+      poses+=std::string_view(mark.reason)=="models_no_pose";
+    }
+    Require(counted.census.size()==7 && attachments==6 && poses==1,"census marks for the plan's skips");
+  }
   Require(plan.opaque.size()==6,"model, face and weapon; face and weapon without the model; the next entry");
   Require(plan.opaque[0].entry==opaque.get() && plan.opaque[0].attachment==-1 &&
     plan.opaque[1].entry==opaque.get() && plan.opaque[1].attachment==0 &&
@@ -1220,6 +1236,44 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
   // and 1 now bind it as well; entry 2 sees only its own.
   check("the previous frame's stores reach the next frame's first draws",2,1,2,2);
   check("an unchanged frame carries them",0,3,0,0);
+  {
+    // Coverage census: every drawn item is a covered mark; a pass record
+    // without a program leaves each item uncovered (missing program).
+    auto counted=pass; counted.census=true;
+    NativeFullFrameModels counting;
+    const auto frame=counting.Build(snapshot,camera,counted,sources);
+    Require(frame.census.size()==3 && std::all_of(frame.census.begin(),frame.census.end(),[](const NativeCoverageMark& mark) {
+      return mark.status==NativeCoverageStatus::Covered && std::string_view(mark.reason)=="models";
+    }),"drawn items are covered marks");
+    Require(NativeFullFrameModels{}.Build(snapshot,camera,pass,sources).census.empty(),"no build marks unless asked");
+    NativeFullFrameModels missing;
+    auto without=sources;
+    without.program=[](uint32_t) { return std::shared_ptr<const NativeSceneGroupMaterial>(); };
+    const auto dropped=missing.Build(snapshot,camera,counted,without);
+    Require(dropped.stats.drawn==0 && dropped.census.size()==3 && std::all_of(dropped.census.begin(),dropped.census.end(),
+      [](const NativeCoverageMark& mark) {
+        return mark.status==NativeCoverageStatus::Uncovered && std::string_view(mark.reason)=="models_missing_program";
+      }),"items without a program are uncovered marks");
+    // Interpolating, entries outside the frustum at their tick's bound but
+    // inside at the previous tick's are drawn: covered marks, and no plan mark.
+    NativeRenderRegistrySnapshot moved;
+    for(const auto& entry:entries) {
+      auto copy=std::make_shared<NativeRenderEntry>(*entry);
+      copy->bound_motion={true,21,copy->centre,copy->axes,copy->radius};
+      copy->centre[0]+=100000;
+      moved.entries.push_back(copy);
+    }
+    auto interpolated=counted; interpolated.motion={21,.5f,1,true,true};
+    NativeFullFrameModels previous;
+    const auto drawn=previous.Build(moved,camera,interpolated,sources);
+    Require(drawn.stats.drawn==3 && drawn.plan.stats.previous==3 && drawn.plan.calls.empty() && drawn.plan.census.empty() &&
+      drawn.census.size()==3 && std::all_of(drawn.census.begin(),drawn.census.end(),[](const NativeCoverageMark& mark) {
+        return mark.status==NativeCoverageStatus::Covered && std::string_view(mark.reason)=="models";
+      }),"entries drawn at their previous bound are covered marks");
+    auto locked=counted; locked.motion={21,.5f,1,false,false};
+    const auto culled=NativeFullFrameModels{}.Build(moved,camera,locked,sources);
+    Require(culled.stats.drawn==0 && culled.census.empty() && culled.plan.stats.frustum==3,"locked mode drew a previous bound");
+  }
   entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{1,0,0,1})});
   check("a new set of equal values carries its object",0,3,0,0);
   entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{.5f,0,0,1})});
@@ -1954,6 +2008,71 @@ void ModelFrames(std::shared_ptr<NativeRenderBackend> backend) {
       <<" rows="<<double(totals.rows)/frames<<" camera_rows="<<double(totals.camera_rows)/frames<<"\n";
   }
 }
+// edf_native_reuse_off (native_reuse.h) across gameplay-like frames with pose
+// interpolation: one instance with reuse on, one with every frame's reuse off
+// and one alternating (off on even frames, as edf_native_reuse_off_alternate=1
+// runs it) build the same inputs; every frame of all three is the same frame.
+// Reuse-off frames carry, reuse and memoize nothing (no carried object, cache
+// hit, side-table hit or pose-blend reuse), and an alternating instance's
+// reuse-on frames, built on state its reuse-off frames rebuilt, still match.
+void ReuseOffFrames(std::shared_ptr<NativeRenderBackend> backend) {
+  ModelsScene scene(backend);
+  const auto sources=scene.Sources();
+  auto pass=scene.Pass();
+  NativeFullFrameModels on,off,alternating;
+  // Each pose object's motion, made when it is first seen: the object's last
+  // pose and the tick that published it, so it blends over its tick's frames.
+  std::map<const void*,std::pair<NativeRenderPose,NativeRenderPoseMotion>> motions;  // Holds the pose: no address reuse.
+  std::map<uint32_t,NativeRenderPose> last;
+  uint64_t off_reused=0,alternating_reuses=0;
+  for(uint32_t frame=0;frame<24;++frame) {
+    scene.Step();
+    const uint64_t tick=scene.frame/2;
+    NativeRenderRegistrySnapshot snapshot;
+    snapshot.generation=scene.generation;
+    for(const auto& entry:scene.entries) {
+      auto moving=std::make_shared<NativeRenderEntry>(*entry);
+      if(entry->pose) {
+        auto [found,inserted]=motions.try_emplace(entry->pose.get());
+        if(inserted) {
+          const auto previous=last.find(entry->object);
+          found->second={entry->pose,{previous!=last.end() && previous->second->size()==entry->pose->size()?previous->second:nullptr,tick,false}};
+        }
+        moving->motion=found->second.second;
+        last[entry->object]=entry->pose;
+      }
+      snapshot.entries.push_back(std::move(moving));
+    }
+    pass.motion={tick,frame%2?.6f:.2f,1,true,true};
+    const auto reused=on.Build(snapshot,scene.camera,pass,sources);
+    NativeFullFrameModelFrame fresh;
+    {
+      const NativeReuseOffLatch latch(true);
+      Require(!NativeReuseAllowed(),"the latch turns reuse off");
+      fresh=off.Build(snapshot,scene.camera,pass,sources);
+    }
+    Require(NativeReuseAllowed(),"the latch restores reuse");
+    NativeFullFrameModelFrame mixed;
+    {
+      const NativeReuseOffLatch latch(frame%2==0);
+      mixed=alternating.Build(snapshot,scene.camera,pass,sources);
+    }
+    const auto& s=fresh.stats;
+    Require(s.failed==0 && s.draws>100 && (frame<2 || s.blended>0),"the reuse-off scene draws and blends");
+    Require(s.reused==0 && s.derived==s.draws,"a reuse-off frame carries no object");
+    Require(s.cache_hits==0 && s.camera_rows==0,"a reuse-off frame reuses no material row or resolve");
+    Require(s.source_hits==0 && s.sourced==s.items,"a reuse-off frame sources every item from the providers");
+    off_reused+=off.poses().stats().reused;
+    if(frame%2) alternating_reuses+=mixed.stats.reused;
+    for(const auto* built:{&fresh,&mixed}) {
+      const auto reason=SameModelFrame(reused,*built);
+      if(!reason.empty())
+        throw std::runtime_error("a reuse-off models frame differs from the reuse-on frame: "+reason+" (frame "+std::to_string(frame)+")");
+    }
+  }
+  Require(off_reused==0,"a reuse-off frame never reuses a pose blend");
+  Require(alternating_reuses>0 && on.poses().stats().reused>0,"the reuse-on frames did reuse");
+}
 }
 // clSky's registry row says another pass draws it (the sky pass): an entry of
 // such a class is never planned, even visible, posed and in either route.
@@ -1985,6 +2104,7 @@ int main(int argc,char** argv) {
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
       PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ObjectConstantBuild(device); PoolCarryFrames(device); ModelFrames(device);
+      ReuseOffFrames(device);
     }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";

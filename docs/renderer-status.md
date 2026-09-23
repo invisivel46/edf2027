@@ -29,6 +29,10 @@ One switch, `--edf_native_renderer=off|world|full|native`, replaces setting
 the individual cvars in section 6. Since `361f80b` the default is `native`:
 the full-frame renderer runs unless `--edf_native_renderer=off` restores the
 guest renderer. Before `361f80b` the default was `off`.
+The full frame has only run on the D3D12 scene backend: with
+`--edf_native_scene_backend` other than `d3d12`/`d3d12-warp` (the settings
+dialog offers `d3d11`), the `native` preset resolves to `off` and logs a
+warning once at startup; `world` and `full` are left as asked.
 
 - `world`: `edf_native_host`, `shader_bridge`, `seam_draws`,
   `material_activation`, `scene_queued`, `scene_preload`, the six
@@ -342,6 +346,10 @@ change-driven behaviour (`665e3e1`) has no cvar.
 | Cvar | Default | Purpose | Requires |
 |---|---|---|---|
 | `edf_native_ab_alternate` | 0 (int, 0..1000) | Alternate guest and native frames in runs of N indexed output frames from the capture start frame; odd runs are native, 0 is off. With the full frame, guest-side frames run the guest helper | scene capture settings for the paired captures (see `compare-renderer-ab-captures.py`) |
+| `edf_native_shadow_render` | 0 (int, 0..100000) | Shadow render: every Nth indexed output frame, after the native full frame, the guest helper path renders the same state into offscreen targets; both pre-HUD images and both draw lists are written (see `shadow-diff.py`). 0 is off, and off the frame path is unchanged | the full frame (native side of A/B) |
+| `edf_native_shadow_render_start_frame` | 0 | First frame a shadow render may take; shadow frames are start, start+N, ... | `edf_native_shadow_render` |
+| `edf_native_shadow_render_limit` | 16 (0..4096) | Shadow frames written per run | `edf_native_shadow_render` |
+| `edf_native_shadow_render_prefix` | `native-shadow/shadow` | Output prefix: `<prefix>.<F>.native.bmp`, `.guest.bmp`, `.native.draws.jsonl`, `.guest.draws.jsonl`, `.shadow.json`; the directory is created | `edf_native_shadow_render` |
 
 **Audits of the guest-helper route (diagnostic, all default false)**
 
@@ -377,11 +385,31 @@ change-driven behaviour (`665e3e1`) has no cvar.
 - `tools/run-renderer-ab.ps1` runs baseline and candidate exes interleaved on
   the same script, gates each pair and writes
   `out/renderer-ab/<timestamp>-<Name>/summary.json`. Only one game may run at
-  a time; `-Seconds` (default 360) must cover loading plus 150 s.
+  a time; `-Seconds` (default 360) must cover loading plus 150 s. It passes
+  `--edf_native_renderer` explicitly: `-BaselineRenderer` defaults to `off`
+  (the guest renderer) and `-CandidateRenderer` to `native`, because since
+  `361f80b` an executable given no preset runs `native`. The launcher
+  `start-native-binding-validation.ps1` does the same with `-Renderer`
+  (default `off`); an `--edf_native_renderer=...` in `-ExtraArgs` replaces it,
+  and an executable older than the preset (`42823d7`) gets no option.
   `powershell -File tools/run-renderer-ab.ps1 -Baseline <o2-baseline> -Candidate win-amd64-release -Script tools/native-benchmark-input.txt -Repeat 2`
 - `tools/compare-renderer-images.py` compares one guest image with one native
   image (BMP/PNG): share of pixels over `--threshold`, max difference, PSNR,
   optional `--mask`; exits nonzero above `--limit`.
+- `tools/shadow-diff.py` compares the two sides of shadow-render frames
+  (`edf_native_shadow_render`, design and side-effect handling in
+  `src/native_graphics/native_shadow_render.h`): the same simulation state
+  rendered natively and by the guest helper path in one helper call, both
+  captured before the HUD. Images are compared per pixel, exactly and with
+  `--pixel-tolerance`/`--max-pixels`. Draw lists are aligned by structure
+  (pipeline identity, shaders, counts, texture slots; instanced draws expanded)
+  and reported as missing, extra, reordered or differing (constants, world
+  matrix with `--float-tolerance`, viewport, blend, one-to-one texture and
+  target identities; geometry with `--strict-geometry`), grouped by material
+  and by recording label. `--allow FILE` (JSON) excuses known differences.
+  Exits 1 on anything beyond the allow list. Not run in game yet.
+  `python tools/shadow-diff.py native-shadow` (a directory, a `.shadow.json`
+  or a `<prefix>.<F>` stem)
 - `tools/compare-renderer-ab-captures.py` is the image-correctness gate next
   to the FPS gate. It reads the captures of an `edf_native_ab_alternate` run
   and takes each frame's side from the `ab_alternate frame=F native=0|1` log

@@ -61,6 +61,26 @@ constexpr std::optional<NativeRendererPreset> ParseNativeRendererPreset(std::str
   if(name=="native") return NativeRendererPreset::native;
   return std::nullopt;
 }
+// The full frame has only ever run on the D3D12 scene backend
+// (edf_native_scene_backend d3d12 or d3d12-warp); the settings dialog also
+// offers d3d11, where it has never run. So the native preset on any other scene
+// backend resolves to off, the default every preset had on D3D11 before
+// 361f80b made native the default (no other preset has been run on D3D11
+// in game either). Only the native preset is changed: an explicit world or
+// full, or an individual edf_native_* cvar, still applies as asked.
+constexpr bool NativeSceneBackendIsD3D12(std::string_view scene_backend) {
+  return scene_backend=="d3d12" || scene_backend=="d3d12-warp";
+}
+struct NativeRendererPresetResolution {
+  NativeRendererPreset preset=NativeRendererPreset::off;
+  bool backend_fallback=false;  // The native preset was lowered for the backend.
+};
+constexpr NativeRendererPresetResolution ResolveNativeRendererPresetForBackend(NativeRendererPreset preset,
+                                                                               std::string_view scene_backend) {
+  if(preset==NativeRendererPreset::native && !NativeSceneBackendIsD3D12(scene_backend))
+    return {NativeRendererPreset::off,true};
+  return {preset,false};
+}
 
 // Preset bits resolved at startup; zero until then.
 inline std::atomic<uint32_t> native_renderer_preset_mask{0};

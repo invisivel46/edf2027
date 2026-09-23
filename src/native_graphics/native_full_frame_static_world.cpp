@@ -130,6 +130,9 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
     const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRouteRead& route,NativeFullFrameStaticSelectCache* cache) {
   SelectCache local;
   auto& c=cache?*cache:local;
+  // Reuse off (native_reuse.h): the image walk instead of the flattened tree,
+  // and every published member tested one by one instead of the cluster cull.
+  const bool reuse=NativeReuseAllowed();
   NativeFullFrameStaticSelection result;
   auto& stats=result.stats;
   const auto* membership=publication.membership.get();
@@ -191,7 +194,7 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
       if(!queues.tree.Build(NativeSceneTreeImageReader(*image),owner)) NativeSceneTreeImageReader::Build(*image,queues.index);
     }
     lists.clear();
-    if(queues.tree.valid) {
+    if(queues.tree.valid && reuse) {
       // The walk of WalkNativeSceneTree over the flattened image.
       const auto& tree=queues.tree;
       ++stats.flat_walks;
@@ -210,7 +213,8 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
       };
       for(const auto root:tree.roots) walk(walk,root,false);
     } else {
-      const NativeSceneTreeImageReader tree(*image,&queues.index);
+      // The flat index exists only for an image that could not be flattened.
+      const NativeSceneTreeImageReader tree(*image,queues.index.empty()?nullptr:&queues.index);
       WalkNativeSceneTree(tree,owner,[&](uint32_t node) {
         ++stats.nodes_classified;
         return ClassifyNativeSceneTreeNode(tree,node,view).result;
@@ -234,12 +238,15 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
         ++c.stats.list_builds;
       } else ++c.stats.list_hits;
       stats.members+=entry.candidates.size(); stats.unpublished+=entry.unpublished;
+      if(c.census && entry.unpublished)
+        for(const auto& candidate:entry.candidates)
+          if(!candidate.published) result.skipped.push_back({candidate.owner,NativeFullFrameStaticSelection::Skip::Unpublished});
       // The members culling may keep, in list order: every published member
       // outside the clusters the conservative test drops whole.
       auto& pending=c.pending;
       pending.clear();
       if(!entry.clusters.empty()) {
-        if(cull.valid()) {
+        if(cull.valid() && reuse) {
           auto& stack=c.stack;
           stack.assign(1,0u);
           while(!stack.empty()) {
@@ -265,18 +272,24 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
         // here only drops objects, so the order changes no selection).
         ++stats.route_reads;
         const auto words=route(candidate.owner);
-        if(!words) { ++stats.unrouted; continue; }
-        if(ClassifyNativeStaticWalk(words->hidden,words->mode,words->direct || words->fixed)!=NativeStaticWalkRoute::Direct) {
-          ++stats.not_direct; continue;
+        using Skip=NativeFullFrameStaticSelection::Skip;
+        const auto skip=[&](Skip reason) { if(c.census) result.skipped.push_back({candidate.owner,reason}); };
+        if(!words) { ++stats.unrouted; skip(Skip::Unrouted); continue; }
+        if(const auto walk=ClassifyNativeStaticWalk(words->hidden,words->mode,words->direct || words->fixed);walk!=NativeStaticWalkRoute::Direct) {
+          ++stats.not_direct;
+          // Hidden: 821C0C00 returns before any slot 4, as here.
+          if(walk!=NativeStaticWalkRoute::Hidden)
+            skip(walk==NativeStaticWalkRoute::Virtual?Skip::Virtual:walk==NativeStaticWalkRoute::Bucket?Skip::Bucket:Skip::UnknownMode);
+          continue;
         }
         // 820B2670 picks the LOD record; 820BAF90 publishes its one +396 record,
         // which its source files as LOD 0 whatever the depth.
-        if(words->fixed!=candidate.view.fixed) { ++stats.route_mismatch; continue; }
+        if(words->fixed!=candidate.view.fixed) { ++stats.route_mismatch; skip(Skip::RouteMismatch); continue; }
         ++stats.visible;
         const auto lod=words->fixed?0u:selection.lod;
         const auto parts=candidate.view.Lod(lod);
-        if(!parts) { ++stats.missing_lod; continue; }
-        if(!candidate.drawable[lod]) { ++stats.undrawable; continue; }
+        if(!parts) { ++stats.missing_lod; skip(Skip::MissingLod); continue; }
+        if(!candidate.drawable[lod]) { ++stats.undrawable; skip(Skip::Undrawable); continue; }
         for(const auto& part:*parts) {
           const auto slot=queues.slots.Find(part.group);
           if(slot==SelectCache::Slots::kNone) { ++queues.unordered[part.group]; continue; }
@@ -314,7 +327,8 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
 }
 const NativeFullFrameStaticSelection& NativeFullFrameStaticWorld::Select(const NativeScenePublication& publication,
     const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRouteRead& route) {
-  auto next=SelectNativeFullFrameStaticWorld(publication,camera,route,&selection_cache);
+  // Reuse off: selected with a frame-local cache, selection_cache left as it was.
+  auto next=SelectNativeFullFrameStaticWorld(publication,camera,route,NativeReuseAllowed()?&selection_cache:nullptr);
   // Whether BuildSelected would draw the same groups and instances as it drew last.
   const auto& last=frame_.selection.owners;
   same_selection_=built_.valid && std::ranges::equal(next.owners,last,[](const auto& a,const auto& b) {

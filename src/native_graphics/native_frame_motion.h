@@ -51,10 +51,24 @@ class NativeTickGate {
 // One guest draw that steps a counter word by a fixed `step` per call (and may
 // store other words with it, `also`), made to step once per tick: `call` runs
 // the original; on a held render (tick_frame false) the counter and `also` are
-// put back afterwards, but only when the call made exactly its own step, so a
-// different writer is never undone. Returns whether it put them back. On a
-// tick frame it is the call alone (locked mode unchanged). Memory: Word and
-// StoreWord on guest addresses (GuestReader).
+// put back afterwards. Returns whether it put the counter back. On a tick
+// frame it is the call alone (locked mode unchanged).
+//
+// The simulation may write these words from another thread while the held
+// render runs (the tick-side arming or reset), so every put-back is a
+// compare-and-swap from the value the draw stored to the value before it,
+// never a plain store: a concurrent write that lands at any point is kept.
+// - The counter is put back only when it still holds exactly the draw's step
+//   (before+step), atomically; otherwise another writer owns it and nothing
+//   is put back.
+// - Each `also` word is read right after the call (the value the draw stored)
+//   and put back from exactly that value, atomically, only once the counter
+//   was put back. The one write this cannot tell from the draw's own is one
+//   landing between the draw's store and that read, i.e. while the draw is
+//   still returning.
+// Memory: Word(address) and CompareExchangeWord(address,expected,desired)
+// (true when it stored desired) on guest addresses (GuestReader: an
+// interlocked compare-exchange on the byte-swapped big-endian word).
 template<class Memory,class Call,size_t N>
 bool NativeRenderStepOncePerTick(const Memory& memory,bool tick_frame,uint32_t counter,uint32_t step,
                                  const std::array<uint32_t,N>& also,Call&& call) {
@@ -63,9 +77,11 @@ bool NativeRenderStepOncePerTick(const Memory& memory,bool tick_frame,uint32_t c
   std::array<uint32_t,N> saved{};
   for(size_t i=0;i<N;++i) saved[i]=memory.Word(also[i]);
   call();
-  if(memory.Word(counter)!=uint32_t(before+step)) return false;
-  memory.StoreWord(counter,before);
-  for(size_t i=0;i<N;++i) memory.StoreWord(also[i],saved[i]);
+  std::array<uint32_t,N> stored{};
+  for(size_t i=0;i<N;++i) stored[i]=memory.Word(also[i]);
+  if(!memory.CompareExchangeWord(counter,uint32_t(before+step),before)) return false;
+  for(size_t i=0;i<N;++i)
+    if(stored[i]!=saved[i]) memory.CompareExchangeWord(also[i],stored[i],saved[i]);
   return true;
 }
 // The HUD's two draw-counted advances (the HUD phase loop runs every render;

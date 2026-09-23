@@ -16,6 +16,7 @@
 #include "guest_block.h"
 #include "native_model_publication.h"
 #include "native_render_instances.h"
+#include "native_reuse.h"
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -108,7 +109,9 @@ class NativeModelHierarchyCache {
     const bool bind=reader.Bytes(reader.Add(tree,NativeModelTree::bind),1)[0]!=0;
     const bool same=cached_ && cached_->tree==tree && cached_->roots==header[0] && cached_->root_count==header[2] &&
       cached_->bone_table==header[3] && cached_->bone_count==header[5] && cached_->bind==bind;
-    if(same && (!verify_interval || ++uses_<verify_interval)) return *cached_;
+    // Reuse off (native_reuse.h): every acquire reads the tree again and keeps
+    // the cached one only when it is the same (a verification).
+    if(same && (!verify_interval || ++uses_<verify_interval) && NativeReuseAllowed()) return *cached_;
     auto fresh=ReadNativeModelHierarchy(reader,tree);
     if(same) {
       ++verifications_;

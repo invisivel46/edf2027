@@ -1267,6 +1267,21 @@ void FullFrameStaticWorld() {
   // Route words are read once per object culling keeps, in walk order: never
   // for C (distance), D (frustum), H (culled leaf) or the duplicate A.
   Require(route_reads==std::vector<uint32_t>{A,B,E,F,G,I,J},"full-frame route words read for culled or duplicate objects");
+  // Coverage census: the members dropped where the guest would go on to slot
+  // 4, in walk order - E (mode 1, filed for the drain) and J (unreadable) -
+  // but not the hidden F; nothing without the cache's census flag.
+  {
+    Require(selection.skipped.empty(),"full-frame selection lists skips without the census");
+    const auto reads=route_reads;
+    NativeFullFrameStaticSelectCache census_cache;
+    census_cache.census=true;
+    const auto counted=SelectNativeFullFrameStaticWorld(publication,camera,routes,&census_cache);
+    using Skip=NativeFullFrameStaticSelection::Skip;
+    Require(counted.skipped.size()==2 && counted.skipped[0].owner==E && counted.skipped[0].reason==Skip::Bucket &&
+      counted.skipped[1].owner==J && counted.skipped[1].reason==Skip::Unrouted,"full-frame census skips");
+    Require(counted.objects==selection.objects,"the census changes no selection");
+    route_reads=reads;
+  }
   // Live semantics: a mode written after the step (no publication) routes E
   // natively on the next frame, and a hidden write drops A.
   live[E].mode=0; live[A].hidden=1;
@@ -1725,6 +1740,11 @@ void FullFrameStaticWorldFrames(bool rotating) {
   auto& f=camera.visibility.frustum;
   f[8]=1; f[10]=-1; f[12]=-1; f[14]=-1; f[17]=1; f[18]=-1; f[21]=-1; f[22]=-1; f[24]=1; f[25]=1000;
   NativeFullFrameStaticWorld cached;
+  // edf_native_reuse_off (native_reuse.h): one instance with every frame's
+  // reuse off, one alternating (off on even frames, as
+  // edf_native_reuse_off_alternate=1 runs it); both must draw the reuse-on frame.
+  NativeFullFrameStaticWorld reuse_off,alternating;
+  uint64_t alternating_reused=0;
   const auto same_frame=[](const NativeFullFrameStaticFrame& a,const NativeFullFrameStaticFrame& b) {
     if(a.selection.objects!=b.selection.objects || a.draws.size()!=b.draws.size()) return false;
     // The selection itself: owners, their groups in order and each group's
@@ -1842,7 +1862,27 @@ void FullFrameStaticWorldFrames(bool rotating) {
     NativeFullFrameStaticWorld fresh;
     Require(same_frame(built,fresh.Build(publication,camera,routes,pass,resolve)),
       "a cached full-frame static world frame differs from a fresh build");
+    if(bench) continue;
+    {
+      const NativeReuseOffLatch latch(true);
+      const auto& off=reuse_off.Build(publication,camera,routes,pass,resolve);
+      const auto& o=off.stats;
+      const auto& w=off.selection.stats;
+      Require(o.reused_frame==0 && o.reused_draws==0 && o.reused_instances==0 && o.reused_moved==0 && o.camera_only==0 &&
+        o.keyed==0 && o.cache_hits==0 && w.flat_walks==0 && w.culled_bulk==0 && w.clusters==0,
+        "a reuse-off static world frame reused something");
+      Require(reuse_off.selection_cache.stats.list_builds==0 && reuse_off.selection_cache.lists.empty(),
+        "a reuse-off selection used the kept selection cache");
+      Require(same_frame(built,off),"a reuse-off full-frame static world frame differs from the reuse-on frame");
+    }
+    {
+      const NativeReuseOffLatch latch(frame%2==0);
+      const auto& mixed=alternating.Build(publication,camera,routes,pass,resolve);
+      if(frame%2) alternating_reused+=mixed.stats.reused_instances;
+      Require(same_frame(built,mixed),"an alternating reuse-off/on static world frame differs from the reuse-on frame");
+    }
   }
+  Require(bench || alternating_reused>0,"the alternating instance's reuse-on frames never reused");
   Require(totals.draws>frames*100 && totals.instances>frames*1000 && uniform>=totals.draws*9/10,"full-frame frames fixture drew too little");
   if(bench)
     std::cout<<"static world frames ("<<(rotating?"rotating":"sliding")<<"): select_ms="<<select_ms/(frames-2)
