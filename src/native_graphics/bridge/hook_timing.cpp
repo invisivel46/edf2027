@@ -7,10 +7,6 @@
 
 namespace edf::native {
 thread_local uint32_t texture_loader_depth=0;
-FrameHookPhases& FrameHookPhaseTotals() {
-  static FrameHookPhases totals;
-  return totals;
-}
 thread_local EngineRegionTotals* native_engine_region=nullptr;
 thread_local uint32_t native_guest_wait_function=0;
 std::atomic<int> native_render_helper_active{0};

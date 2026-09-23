@@ -1,7 +1,8 @@
 #pragma once
 // Bridge CPU timing: hook phases and their timing scopes (HookTiming), the engine-thread region probe,
 // the engine/render-helper thread QoS and the timed bridge locks (BridgeMutex, BridgeGate). Moved from
-// guest_shader_bridge.cpp unchanged; its variables and functions are defined in hook_timing.cpp.
+// guest_shader_bridge.cpp unchanged; its variables and functions are defined in hook_timing.cpp, except
+// FrameHookPhaseTotals, inline here (HookTiming::Finish calls it from every translation unit).
 #include "../native_load_trace.h"
 #include "native_cvars.h"
 #include <rex/logging.h>
@@ -111,7 +112,10 @@ struct FrameHookPhases {
   std::array<std::atomic<uint64_t>,static_cast<size_t>(HookPhase::Count)> nanos{};
   std::array<std::atomic<const char*>,static_cast<size_t>(HookPhase::Count)> names{};
 };
-FrameHookPhases& FrameHookPhaseTotals();
+inline FrameHookPhases& FrameHookPhaseTotals() {
+  static FrameHookPhases totals;
+  return totals;
+}
 // Engine-thread region probe (edf_native_hook_timings only; nothing runs when
 // off). The step dispatch 821A4BA0 and the frame transition 821A4DE8 run guest
 // code on the engine thread, and their inclusive timings say how long they

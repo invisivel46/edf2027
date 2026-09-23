@@ -330,6 +330,9 @@ if(BUILD_TESTING)
       COMMAND ${CMAKE_COMMAND}
         -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/guest_shader_bridge.cpp
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/audit-native-hook-boundaries.cmake)
+    add_test(NAME edf_native_cvar_defaults_audit
+      COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/audit-native-cvar-defaults.cmake)
     add_executable(edf_native_display_gamma_tests tests/native_display_gamma_tests.cpp)
     set(_worker_callback_fixture ${CMAKE_CURRENT_BINARY_DIR}/native_worker_callback_audit_fixture.inc)
     add_custom_command(OUTPUT ${_worker_callback_fixture}
