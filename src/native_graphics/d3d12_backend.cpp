@@ -1,4 +1,5 @@
 #include "d3d12_backend.h"
+#include "d3d12_buffer_pool.h"
 #include "d3d12_pipeline.h"
 #include "native_parallel_recorder.h"
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -841,12 +843,20 @@ class D3D12Backend final : public NativeRenderBackend {
   explicit D3D12Backend(const NativeD3D12Options& options)
       : gpu_(options),
         signature_(CreateNativeD3D12RootSignature(*gpu_.device())),
-        pipelines_(*gpu_.device(),*signature_.Get()),
+        pipelines_(*gpu_.device(),*signature_.Get(),PipelineOptions(gpu_,options)),
         texture_views_(*gpu_.device(),D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,4096),
         render_target_views_(*gpu_.device(),D3D12_DESCRIPTOR_HEAP_TYPE_RTV,256),
         depth_views_(*gpu_.device(),D3D12_DESCRIPTOR_HEAP_TYPE_DSV,64) {
     for(uint32_t index=0;index<gpu_.recorders();++index)
       recorders_.push_back(std::make_unique<D3D12Recorder>(gpu_,*signature_.Get(),index));
+    if(options.buffer_pool_heap_bytes && options.buffer_pool_max_buffer_bytes)
+      pool_=std::make_unique<NativeD3D12BufferPool>(*gpu_.device(),options.buffer_pool_heap_bytes,
+                                                    options.buffer_pool_max_buffer_bytes,
+                                                    options.buffer_pool_reserve_heaps);
+    // The sampler combinations the last run used, written now so the first
+    // draw that asks for one finds it.
+    for(const auto& combination:pipelines_.loaded_samplers()) gpu_.samplers().Prewarm(combination);
+    saved_sampler_tables_=gpu_.samplers().tables();
     // One null descriptor, written once, for every texture slot a draw leaves
     // unbound. Creating it per draw would be pure waste on the hottest path.
     null_texture_=texture_views_.Allocate();
@@ -876,6 +886,8 @@ class D3D12Backend final : public NativeRenderBackend {
     frame_latency_=nullptr;
   }
   ~D3D12Backend() override {
+    // Whatever this run added to the manifest, written before the device goes.
+    try { PersistCaches(false); } catch(...) {}
     gpu_.before_resource_destroy={};
     if(open_) { try { Submit(); } catch(...) {} }
     parallel_.reset();
@@ -895,14 +907,22 @@ class D3D12Backend final : public NativeRenderBackend {
     if(!desc.bytes) throw std::runtime_error("a zero-byte buffer cannot be created");
     TrackedResource tracked(gpu_);
     *tracked.state=D3D12_RESOURCE_STATE_COMMON;
-    const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-                                     D3D12_MEMORY_POOL_UNKNOWN,0,0};
-    const D3D12_RESOURCE_DESC description{D3D12_RESOURCE_DIMENSION_BUFFER,0,desc.bytes,1,1,1,
-                                          DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                                          D3D12_RESOURCE_FLAG_NONE};
-    Require(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
-                                                   *tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
-            "buffer creation");
+    // Placed in the pool only when this call writes every byte (see
+    // NativeD3D12BufferPool): a committed buffer starts zeroed and a placed one
+    // does not, so a partially initialised or dynamic buffer stays committed
+    // and nothing can ever read memory the pool reused.
+    if(pool_ && !desc.dynamic && initial.size()==desc.bytes) tracked.resource=pool_->Create(desc.bytes);
+    if(!tracked.resource) {
+      const D3D12_HEAP_PROPERTIES heap{D3D12_HEAP_TYPE_DEFAULT,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                       D3D12_MEMORY_POOL_UNKNOWN,0,0};
+      const D3D12_RESOURCE_DESC description{D3D12_RESOURCE_DIMENSION_BUFFER,0,desc.bytes,1,1,1,
+                                            DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                            D3D12_RESOURCE_FLAG_NONE};
+      Require(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
+                                                     *tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
+              "buffer creation");
+      buffers_committed_.fetch_add(1,std::memory_order_relaxed);
+    }
     auto buffer=std::make_unique<D3D12Buffer>(std::move(tracked),desc.bytes,desc.dynamic);
     buffers_created_.fetch_add(1,std::memory_order_relaxed);
     buffer_bytes_created_.fetch_add(desc.bytes,std::memory_order_relaxed);
@@ -1197,6 +1217,18 @@ class D3D12Backend final : public NativeRenderBackend {
   void Submit() override {
     if(parallel_failure_) std::rethrow_exception(parallel_failure_);
     if(parallel_) parallel_->Flush(false); else SubmitRecorded();
+    // Every ~1,800 frames (seconds, at this game's rates) the manifest is
+    // brought up to date if this run added to it. The snapshot is taken here;
+    // encoding and the file write happen on a background thread.
+    if(++submits_%kPersistInterval==0) PersistCaches(true);
+  }
+  void PersistCaches(bool background) {
+    const auto tables=gpu_.samplers().tables();
+    if(!pipelines_.dirty() && tables==saved_sampler_tables_) return;
+    saved_sampler_tables_=tables;
+    auto samplers=gpu_.samplers().Combinations();
+    if(background) pipelines_.SaveInBackground(std::move(samplers));
+    else pipelines_.Save(std::move(samplers));
   }
   void SubmitRecorded() {
     if(!open_) throw std::runtime_error("Submit with no frame open");
@@ -1418,9 +1450,23 @@ class D3D12Backend final : public NativeRenderBackend {
     }
     out.upload_stalls=gpu_.upload_stalls();
     out.descriptor_stalls=gpu_.descriptor_stalls();
+    const auto pipeline_stats=pipelines_.statistics();
     out.pipelines=pipelines_.size();
-    out.pipeline_hits=pipelines_.hits()+wrapper_hits_;
-    out.pipeline_misses=pipelines_.misses();
+    out.pipeline_hits=pipeline_stats.hits+wrapper_hits_;
+    out.pipeline_misses=pipeline_stats.misses;
+    out.pipeline_prebuilt=pipeline_stats.prebuilt;
+    out.pipeline_content_hits=pipeline_stats.content_hits;
+    out.pipeline_waits=pipeline_stats.waits;
+    out.pipeline_wait_ns=pipeline_stats.wait_ns;
+    out.pipeline_manifest_entries=pipeline_stats.manifest_entries;
+    out.sampler_prewarmed=gpu_.samplers().prewarmed();
+    out.buffers_committed=buffers_committed_.load(std::memory_order_relaxed);
+    if(pool_) {
+      const auto pool=pool_->statistics();
+      out.buffers_placed=pool.placed;
+      out.buffer_heaps=pool.heaps;
+      out.buffer_heap_bytes=pool.heap_bytes;
+    }
     out.sampler_tables=gpu_.samplers().tables();
     out.sampler_hits=gpu_.samplers().hits();
     out.sampler_misses=gpu_.samplers().misses();
@@ -1570,6 +1616,21 @@ class D3D12Backend final : public NativeRenderBackend {
 
   NativeD3D12Device& gpu() { return gpu_; }
   const NativeD3D12PipelineCache& pipelines() const { return pipelines_; }
+  std::string DescribeCaches() const override {
+    const auto pipelines=pipelines_.statistics();
+    std::string out="pipeline manifest "+pipelines_.manifest_status()+
+      (pipelines.adapter_changed?" (written on another adapter or driver; rebuilt from descriptions)":"")+
+      ", entries="+std::to_string(pipelines.manifest_entries)+", prebuilt="+std::to_string(pipelines.prebuilt)+
+      ", prebuild_failures="+std::to_string(pipelines.prebuild_failures)+", saves="+std::to_string(pipelines.saves)+
+      ", sampler_tables_prewarmed="+std::to_string(gpu_.samplers().prewarmed());
+    if(pool_) {
+      const auto pool=pool_->statistics();
+      out+=", buffer_pool placed="+std::to_string(pool.placed)+" live="+std::to_string(pool.live)+
+        " heaps="+std::to_string(pool.heaps)+" heap_mb="+std::to_string(pool.heap_bytes>>20)+
+        " refused="+std::to_string(pool.refused);
+    }
+    return out;
+  }
 
  private:
   // A texture upload is not a buffer copy: rows land on a 256-byte pitch that
@@ -1627,7 +1688,22 @@ class D3D12Backend final : public NativeRenderBackend {
   struct PendingUpload { std::weak_ptr<void> alive; D3D12Buffer* buffer; std::vector<uint8_t> bytes; };
   struct PendingTexture { std::weak_ptr<void> alive; D3D12Texture* texture; std::vector<uint8_t> bytes; };
 
+  static NativeD3D12PipelineCacheOptions PipelineOptions(const NativeD3D12Device& gpu,
+                                                         const NativeD3D12Options& options) {
+    NativeD3D12PipelineCacheOptions out;
+    out.manifest=options.pipeline_manifest;
+    out.prewarm_threads=options.pipeline_prewarm_threads;
+    out.adapter={gpu.adapter_vendor(),gpu.adapter_device(),gpu.adapter_subsystem(),gpu.adapter_revision(),
+                 gpu.adapter_driver()};
+    return out;
+  }
+  static constexpr uint64_t kPersistInterval=1800;
+
   NativeD3D12Device gpu_;
+  std::unique_ptr<NativeD3D12BufferPool> pool_;
+  uint64_t submits_=0;
+  uint32_t saved_sampler_tables_=0;
+  std::atomic<uint64_t> buffers_committed_{0};
   ComPtr<ID3D12Fence> completion_fence_;
   uint64_t completion_value_=0;
   ComPtr<ID3D12RootSignature> signature_;
@@ -1680,6 +1756,8 @@ std::atomic<bool>& DebugLayer() {
   static std::atomic<bool> enabled{false};
   return enabled;
 }
+std::mutex& SceneCacheMutex() { static std::mutex mutex; return mutex; }
+std::filesystem::path& SceneCacheDirectory() { static std::filesystem::path directory; return directory; }
 NativeD3D12Options RegistryOptions() {
   NativeD3D12Options options;
   if(const auto megabytes=UploadMegabytes().load(std::memory_order_relaxed))
@@ -1694,6 +1772,10 @@ void SetNativeD3D12UploadMegabytes(uint32_t megabytes) {
 void SetNativeD3D12DebugLayer(bool enabled) {
   DebugLayer().store(enabled,std::memory_order_relaxed);
 }
+void SetNativeD3D12SceneCacheDirectory(std::filesystem::path directory) {
+  std::lock_guard lock(SceneCacheMutex());
+  SceneCacheDirectory()=std::move(directory);
+}
 std::unique_ptr<NativeRenderBackend> CreateNativeD3D12SceneBackend(bool warp,uint32_t workers) {
   auto options=RegistryOptions();
   options.prefer_warp=warp; options.debug_layer|=warp;
@@ -1704,6 +1786,15 @@ std::unique_ptr<NativeRenderBackend> CreateNativeD3D12SceneBackend(bool warp,uin
   // Descriptors remain fence-retired; this provides room for overlapping frames.
   options.view_descriptors=(std::min)(1u<<20,options.view_descriptors*(workers?workers+1:1));
   options.geometry_workers=workers;
+  // The scene backend creates the mission's static world in one burst; one
+  // heap made now keeps even the first heap off that frame.
+  options.buffer_pool_heap_bytes=64u<<20;
+  options.buffer_pool_reserve_heaps=1;
+  {
+    std::lock_guard lock(SceneCacheMutex());
+    if(!SceneCacheDirectory().empty())
+      options.pipeline_manifest=SceneCacheDirectory()/(warp?"d3d12_pipelines_warp.bin":"d3d12_pipelines.bin");
+  }
   return CreateNativeD3D12Backend(options);
 }
 void RegisterNativeD3D12Backend() {

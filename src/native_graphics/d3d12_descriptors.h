@@ -108,6 +108,16 @@ class NativeD3D12SamplerCache {
   D3D12_GPU_DESCRIPTOR_HANDLE Table(std::span<const D3D12_SAMPLER_DESC> samplers,
                                     uint64_t used,uint64_t completed);
 
+  // Writes a table for a combination an earlier run used, before any draw
+  // asks for it, so the first draw that does is a hit. Stamped as never used,
+  // so it is the first to give its slots back if the heap fills. Returns false
+  // when the combination is already present, is too wide, or would need an
+  // eviction (a warm start never displaces a table this run has used).
+  bool Prewarm(std::span<const D3D12_SAMPLER_DESC> samplers);
+  // Every combination currently held, for the persistent manifest.
+  std::vector<std::vector<D3D12_SAMPLER_DESC>> Combinations();
+  uint64_t prewarmed() const { return prewarmed_; }
+
   ID3D12DescriptorHeap* heap() const { return heap_.Get(); }
   uint32_t tables() const { return static_cast<uint32_t>(tables_.size()); }
   uint32_t capacity() const { return max_tables_; }
@@ -133,6 +143,7 @@ class NativeD3D12SamplerCache {
   D3D12_CPU_DESCRIPTOR_HANDLE cpu_start_{};
   D3D12_GPU_DESCRIPTOR_HANDLE gpu_start_{};
   uint32_t increment_=0,slots_per_table_=0,max_tables_=0;
-  uint64_t hits_=0,misses_=0,evictions_=0;
+  uint64_t hits_=0,misses_=0,evictions_=0,prewarmed_=0;
+  void Write(std::span<const D3D12_SAMPLER_DESC> samplers,uint32_t index);
 };
 }  // namespace edf::native

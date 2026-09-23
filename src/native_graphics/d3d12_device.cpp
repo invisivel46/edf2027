@@ -108,7 +108,14 @@ NativeD3D12Device::NativeD3D12Device(const NativeD3D12Options& options) {
   }
   if(adapter) {
     DXGI_ADAPTER_DESC1 description{};
-    if(SUCCEEDED(adapter->GetDesc1(&description))) adapter_name_=Narrow(description.Description);
+    if(SUCCEEDED(adapter->GetDesc1(&description))) {
+      adapter_name_=Narrow(description.Description);
+      adapter_vendor_=description.VendorId; adapter_device_=description.DeviceId;
+      adapter_subsystem_=description.SubSysId; adapter_revision_=description.Revision;
+    }
+    LARGE_INTEGER driver{};
+    if(SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice),&driver)))
+      adapter_driver_=uint64_t(driver.QuadPart);
   }
 
   // Only errors and corruption. Warnings on WARP are noisy about things that

@@ -52,6 +52,7 @@
 #include "native_frame_dispatch.h"
 #include "native_full_frame.h"
 #include "native_frame_times.h"
+#include "native_disk_cache.h"
 #include "native_gpu_pass_timings.h"
 #include "native_full_frame_static_world.h"
 #include "native_full_frame_models.h"
@@ -271,6 +272,8 @@ REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
                      "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
 REXCVAR_DEFINE_STRING(edf_native_scene_backend, "d3d12", "EDF2027",
                      "Scene rendering backend: d3d12 (default) or d3d11 for comparison. D3D12 publishes a fenced GPU snapshot through the host compositor, preserving display gamma and overlays. D3D11 is an explicit fallback; backend initialization failures do not silently change this setting");
+REXCVAR_DEFINE_STRING(edf_native_cache_dir, "", "EDF2027",
+                     "Directory for the renderer's persistent caches: compiled shader bytecode (shaders/<sha256>.dxbc) and the scene backend's D3D12 pipeline manifest (d3d12_pipelines.bin), which the next run prebuilds in the background. Empty (default) uses native_cache beside the executable; off disables both, leaving only this run's in-memory caches. Entries are keyed by SHA-256 of everything their output depends on, so a stale file is a miss, never a wrong shader or pipeline");
 REXCVAR_DEFINE_INT32(edf_native_upload_megabytes, 256, "EDF2027",
                     "Upload-ring megabytes for a D3D12 backend. Every recorded draw stages its constants here and the ring is retired by fence, so it has to hold every frame still in flight. A frame that does not fit is refused with the high water it reached, which is what to set this from");
 REXCVAR_DEFINE_INT32(edf_native_geometry_workers, 4, "EDF2027",
@@ -3073,12 +3076,26 @@ NativeViewportState ReadNativeDrawViewport(const Reader& reader,uint32_t device)
   return DecodeDrawViewport(ReadNativeDrawViewportWords(reader,device));
 }
 namespace {
+// The persistent cache root from --edf_native_cache_dir, applied before the
+// first shader compile and the first D3D12 device. Idempotent.
+void ApplyNativeCacheDirectory() {
+  static std::once_flag once;
+  std::call_once(once,[] {
+    const std::string setting=REXCVAR_GET(edf_native_cache_dir);
+    std::filesystem::path directory;
+    if(setting!="off") directory=setting.empty()?edf::native::NativeDefaultCacheDirectory():std::filesystem::path(setting);
+    edf::native::SetNativeCacheDirectory(directory);
+    edf::native::SetNativeD3D12SceneCacheDirectory(directory);
+    REXLOG_INFO("Native persistent caches: {}",directory.empty()?std::string("off"):directory.string());
+  });
+}
 // The D3D12 options the cvars carry, applied before anything can build a D3D12
 // device. Every site that registers the backend goes through here, because the
 // debug layer is a process-wide switch that only the first device gets to throw
 // and the presenter's device is usually the first: setting it later - which is
 // what the scene backend used to do - removes the device that already exists.
 void RegisterD3D12BackendLocked() {
+  ApplyNativeCacheDirectory();
   edf::native::SetNativeD3D12DebugLayer(REXCVAR_GET(edf_native_d3d12_debug_layer));
   // Sized from a measured frame, not from a guess; see the cvar.
   edf::native::SetNativeD3D12UploadMegabytes(
@@ -3147,6 +3164,8 @@ edf::native::NativeRenderBackend& EnsureSceneBackendLocked(Bridge& state) {
     std::string(state.scene_backend->name()),name,
     name=="d3d11"?"This renderer's own device, so ported and unported draw paths share the same resources."
                  :"A separate device: every draw path that samples a scene resource must already be ported, or it will have nothing to bind.");
+  if(const auto caches=state.scene_backend->DescribeCaches();!caches.empty())
+    REXLOG_INFO("Native scene caches: {}",caches);
   for(const auto& message:state.scene_backend->DrainValidationMessages())
     REXLOG_WARN("Native scene backend validation: {}",message);
   return *state.scene_backend;
@@ -3320,11 +3339,24 @@ void SubmitSceneFrameLocked(Bridge& state) {
       counts.pipeline_misses,counts.sampler_tables,counts.sampler_hits,counts.sampler_misses,
       counts.sampler_evictions,counts.retiring,counts.frame_waits,
       counts.frame_waits?counts.frame_wait_ns/counts.frame_waits/1000:0);
+    const auto shaders=edf::native::GetNativeShaderCacheStatistics();
+    REXLOG_INFO("Native first-use caches: pipelines prebuilt={} content_hits={} waits={} ({}us) manifest_entries={}; "
+      "sampler_tables_prewarmed={}; buffers committed={} placed={} heaps={} ({} MB); "
+      "shaders compiled={} memory_hits={} disk_hits={} disk_stores={} disk_rejects={}",
+      counts.pipeline_prebuilt,counts.pipeline_content_hits,counts.pipeline_waits,counts.pipeline_wait_ns/1000,
+      counts.pipeline_manifest_entries,counts.sampler_prewarmed,counts.buffers_committed,counts.buffers_placed,
+      counts.buffer_heaps,counts.buffer_heap_bytes>>20,shaders.compiles,shaders.memory_hits,shaders.disk_hits,
+      shaders.disk_stores,shaders.disk_rejects);
+    if(state.scene_frames%6000==0)
+      if(const auto caches=state.scene_backend->DescribeCaches();!caches.empty())
+        REXLOG_INFO("Native scene caches: {}",caches);
   }
 }
 }  // namespace
 
 void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
+  // Before anything can compile a shader.
+  ApplyNativeCacheDirectory();
   REXLOG_INFO("Native render-state consumption: owned={}, audit={}",
     REXCVAR_GET(edf_native_owned_render_state),REXCVAR_GET(edf_native_render_state_audit));
   if(REXCVAR_GET(edf_native_preview_window) && !REXCVAR_GET(edf_native_publish_frames))
@@ -9515,9 +9547,13 @@ void RecordNativeFrameTimeLocked(std::chrono::steady_clock::time_point entry) {
   auto& events=edf::native::FrameEventCounters();
   const edf::native::NativeFrameCounter counters[]{
     {"pipelines",stats.pipeline_misses},
+    {"pipeline_waits",stats.pipeline_waits},
+    {"pipeline_content_hits",stats.pipeline_content_hits},
     {"shader_compiles",events.shader_compiles.load(std::memory_order_relaxed)},
+    {"shader_cache_hits",events.shader_cache_hits.load(std::memory_order_relaxed)},
     {"mesh_builds",state.meshes.builds()},
     {"buffers",stats.buffers_created},
+    {"buffers_committed",stats.buffers_committed},
     {"buffer_kb",stats.buffer_bytes_created/1024},
     {"textures",stats.textures_created},
     {"texture_kb",stats.texture_bytes_created/1024},
