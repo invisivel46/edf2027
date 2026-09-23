@@ -34,14 +34,14 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
     for(const auto list:lists) {
       ++stats.lists;
       const NativeSceneMembership::Snapshot* members=nullptr;
-      if(membership) if(const auto found=membership->lists.find(list);found!=membership->lists.end()) members=found->second.get();
+      if(membership) if(const auto* found=membership->lists.Find(list)) members=found->get();
       if(!members) { ++stats.missing_lists; continue; }
       for(const auto& member:members->members) {
         ++stats.members;
         if(!seen.insert(member.owner).second) { ++stats.duplicates; continue; }
-        const auto route=routes.find(member.owner);
-        if(route==routes.end()) { ++stats.unrouted; continue; }
-        if(ClassifyNativeStaticWalk(route->second.hidden,route->second.mode,route->second.direct)!=NativeStaticWalkRoute::Direct) {
+        const auto* route=routes.Find(member.owner);
+        if(!route) { ++stats.unrouted; continue; }
+        if(ClassifyNativeStaticWalk(route->hidden,route->mode,route->direct)!=NativeStaticWalkRoute::Direct) {
           ++stats.not_direct; continue;
         }
         const auto candidate=sources?sources->FindCandidateView(member.owner):NativeSceneSources::CandidateView{};

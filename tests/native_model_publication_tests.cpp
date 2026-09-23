@@ -414,6 +414,26 @@ struct FreeingReader {
     return memory.Bytes(at,size);
   }
 };
+// The registry's unchanged-pose test: guest bytes against a decoded pose,
+// bitwise (signed zero and NaN payloads differ), without decoding.
+void PoseBytesCompareBitwise() {
+  std::vector<uint8_t> bytes(0x1000); const Memory memory{bytes};
+  constexpr uint32_t kStorage=0x100;
+  for(uint32_t i=0;i<32;++i) memory.StoreFloat(kStorage+i*4,float(i)*0.5f);
+  const auto decoded=ReadNativeModelPose(memory,[&] {
+    memory.StoreWord(0x80+4,kStorage); memory.StoreWord(0x80+8,kStorage+128); return 0x80u; }());
+  const auto* raw=memory.Bytes(kStorage,128);
+  Require(decoded.size()==2 && SameNativeModelPoseBytes(raw,2,decoded),"equal pose bytes compare different");
+  Require(!SameNativeModelPoseBytes(raw,1,decoded) && SameNativeModelPoseBytes(nullptr,0,{}),"pose sizes not compared");
+  memory.StoreFloat(kStorage+4,-0.0f);
+  auto zero=decoded; zero[0][1]=0.0f;
+  Require(!SameNativeModelPoseBytes(raw,2,zero),"signed zero compared equal");
+  memory.StoreWord(kStorage+124,0x7FC00001u);
+  auto nan=decoded; nan[0][1]=-0.0f; nan[1][15]=std::bit_cast<float>(0x7FC00001u);
+  Require(SameNativeModelPoseBytes(raw,2,nan),"a NaN payload copied bitwise compared different");
+  nan[1][15]=std::bit_cast<float>(0x7FC00002u);
+  Require(!SameNativeModelPoseBytes(raw,2,nan),"a different NaN payload compared equal");
+}
 void CaptureRacesWithFree() {
   std::vector<uint8_t> bytes(0x20000);
   const Memory memory{bytes};
@@ -496,6 +516,7 @@ int main() {
     ModelPassDrawPlanFollowsGuestOrder();
     ModelWorldMatchesGuestUpload();
     CaptureRacesWithFree();
+    PoseBytesCompareBitwise();
   } catch(const std::exception& error) {
     std::cerr<<"native model publication test failed: "<<error.what()<<"\n";
     return 1;

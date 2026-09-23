@@ -21,6 +21,7 @@
 #include "native_graphics/native_static_world_pass.h"
 #include "native_graphics/native_static_world_cache.h"
 #include "native_graphics/native_full_frame_static_world.h"
+#include "native_graphics/native_address_filter.h"
 #include "native_graphics/native_texture_binding.h"
 #include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d12_backend.h"
@@ -1032,7 +1033,12 @@ void StaticWalkPlan() {
     "world registers moved the candidate revision or a snapshot lost it");
   const auto find=[&](uint32_t object) { return sources.FindCandidate(object); };
   NativeStaticWalkPlans plans;
+  const auto anchors=std::make_unique<NativeAddressFilter>();
+  plans.SetAnchorFilter(anchors.get());
+  Require(!anchors->MayContain(leaf) && !anchors->MayContain(first),"empty anchor filter holds a list");
   plans.Publish(r,owner,1,sources.CandidateRevision(),find);
+  Require(anchors->MayContain(leaf) && anchors->MayContain(first) && anchors->MayContain(second) &&
+    anchors->MayContain(world_list),"a planned list header or member node is missing from the anchor filter");
   const auto built=plans.Acquire(leaf);
   Require(built && plans.Acquire(world_list) && plans.Acquire(world_list)->members.empty() && plans.stats().builds==2,
     "static walk plan did not cover the leaves and world+372");
@@ -1143,7 +1149,7 @@ void FullFrameStaticWorld() {
     for(size_t i=0;i<16;++i) for(size_t byte=0;byte<4;++byte)
       registers[i*4+byte]=uint8_t(std::bit_cast<uint32_t>(matrix[i])>>(24-byte*8));
     sources.PublishWorld(owner,registers);
-    if(route) routes[owner]=*route;
+    if(route) routes.Set(owner,*route);
   };
   using P=NativeSceneSources::Part;
   object(A,{0,0,50},1000,2,{P{0x7000,0,0,0,G1},P{0x7100,1,0,0,G1}});
@@ -1160,7 +1166,7 @@ void FullFrameStaticWorld() {
   const auto list=[&](uint32_t address,std::vector<uint32_t> owners) {
     auto snapshot=std::make_shared<NativeSceneMembership::Snapshot>(); snapshot->end=address+8;
     for(const auto owner:owners) snapshot->members.push_back({owner+0x10,owner});
-    lists->lists[address]=std::move(snapshot);
+    lists->lists.Set(address,std::move(snapshot));
   };
   list(root0+120,{A,B,C,D,E,F}); list(root1+120,{H}); list(child_a+120,{A,G}); list(world+372,{I,J});
   NativeScenePublication publication;
@@ -1250,6 +1256,64 @@ void FullFrameStaticWorld() {
   auto other=pass; other.targets.reverse_depth=true;
   pass_world.Build(publication,camera,routes,other,resolve);
   Require(resolved.size()==4,"changed targets reused a cached material");
+}
+// NativeAddressFilter: every added address answers true; addresses never
+// added are almost all false (two bits of a 4 Mi-bit table).
+void AddressFilter() {
+  const auto filter=std::make_unique<NativeAddressFilter>();
+  for(uint32_t i=0;i<4096;++i) Require(!filter->MayContain(0x40000000u+i*16),"empty address filter holds an address");
+  for(uint32_t i=0;i<20000;++i) filter->Add(0x40000000u+i*16);
+  for(uint32_t i=0;i<20000;++i) Require(filter->MayContain(0x40000000u+i*16),"address filter lost an added address");
+  size_t false_positives=0;
+  for(uint32_t i=0;i<100000;++i) false_positives+=filter->MayContain(0x50000000u+i*16+4);
+  Require(false_positives<100,"address filter answers true for too many absent addresses");
+  filter->Add(0);
+  Require(filter->MayContain(0),"address zero is an address like any other");
+  for(const auto address:{0u,1u,0x82000000u,0xFFFFFFFFu})
+    for(const auto bit:NativeAddressFilter::Bits(address)) Require(bit<NativeAddressFilter::kBits,"address filter bit out of range");
+}
+// NativeFullFrameRouteTable: slots follow the plans' membership, a refresh
+// touches the published map only for changed routes, unchanged steps share
+// the published spine, and retirement drops the world's owners.
+void FullFrameRouteTable() {
+  const auto plan=[](uint32_t list,uint64_t membership,std::vector<uint32_t> owners) {
+    auto result=std::make_shared<NativeStaticWalkList>();
+    result->list=list; result->world=0x1000; result->membership=membership;
+    for(const auto owner:owners) {
+      NativeStaticWalkMember member; member.node=owner+0x10; member.owner=owner; member.vtable=0x7000; member.direct=true;
+      result->members.push_back(member);
+    }
+    return std::shared_ptr<const NativeStaticWalkList>(std::move(result));
+  };
+  std::map<uint32_t,NativeFullFrameStaticRoute> live{{0xA000,{true,0,0}},{0xB000,{true,1,0}},{0xC000,{false,0,0}}};
+  size_t reads=0;
+  const auto read=[&](const NativeStaticWalkMember& member) { ++reads; return live.at(member.owner); };
+  NativeFullFrameRouteTable table;
+  NativeFullFrameRouteTable::Plans plans{plan(0x100,1,{0xA000,0xB000}),plan(0x200,2,{0xA000,0xC000})};
+  Require(!table.Current(0x1000,plans),"an unseen world is current");
+  table.Rebuild(0x1000,plans);
+  Require(table.Current(0x1000,plans) && table.Refresh(0x1000,read)==3 && reads==4 && table.routes().size()==3 &&
+    table.routes().Find(0xB000)->mode==1 && !table.routes().Find(0xC000)->direct,"first refresh did not publish every owner once");
+  const auto published=std::make_shared<const NativeFullFrameStaticRoutes>(table.routes());
+  Require(!table.Refresh(0x1000,read) && table.routes().Shares(*published),"an unchanged step changed the published routes");
+  // Unhooked writers: mode and hidden change without a membership event.
+  live[0xB000].mode=0; live[0xC000].hidden=1;
+  Require(table.Refresh(0x1000,read)==2 && !table.routes().Shares(*published) && table.routes().Find(0xB000)->mode==0 &&
+    table.routes().Find(0xC000)->hidden==1 && published->Find(0xB000)->mode==1,"a route change was missed or mutated a publication");
+  // A source refresh (new plan objects, same membership) keeps the layout.
+  NativeFullFrameRouteTable::Plans refreshed{plan(0x100,1,{0xA000,0xB000}),plan(0x200,2,{0xA000,0xC000})};
+  Require(table.Current(0x1000,refreshed),"a source refresh relaid the route slots");
+  // A Touch-rebuilt list: C leaves, D joins; known routes are kept.
+  live[0xD000]={true,0,0};
+  NativeFullFrameRouteTable::Plans moved{plan(0x100,1,{0xA000,0xB000}),plan(0x200,3,{0xA000,0xD000})};
+  Require(!table.Current(0x1000,moved),"a membership stamp move kept the old slots");
+  table.Rebuild(0x1000,moved);
+  Require(!table.routes().Find(0xC000) && table.Refresh(0x1000,read)==1 && table.routes().Find(0xD000) &&
+    table.routes().size()==3,"rebuild kept an unlisted owner or refreshed known routes");
+  Require(table.Retire(0x1000) && table.routes().empty() && !table.Retire(0x1000) && table.stats().retired==1,
+    "retirement kept the world's routes");
+  Reject([&] { table.Rebuild(0x1000,plans); table.Refresh(0x1000,[](const NativeStaticWalkMember&)->NativeFullFrameStaticRoute {
+    throw std::runtime_error("unreadable header"); }); });
 }
 void GroupOrder() {
   std::vector<uint8_t> memory(0x1000);
@@ -1602,6 +1666,8 @@ void Visibility() {
   Require(membership.Acquire(100)==original,"unchanged membership publication was copied");
   membership.InsertAfter(200,1000,10);
   const auto moved=membership.AcquirePublication();
+  Require(moved!=lists && moved->lists.size()==2 && !moved->lists.Shares(lists->lists) &&
+    lists->lists.size()==2 && *lists->lists.Find(100)==original,"incremental publication changed an acquired generation");
   Require(!membership.Current(*lists) && membership.Current(*moved) &&
     lists->lists.at(100)->members.size()==3 && moved->lists.at(100)->members.size()==2,
     "cross-list mutation failed to invalidate the scene membership generation");
@@ -2835,6 +2901,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
+    AddressFilter(); FullFrameRouteTable();
     GroupOrder(); FullFrameStaticWorld(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };

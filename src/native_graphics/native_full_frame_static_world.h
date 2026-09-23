@@ -6,6 +6,7 @@
 #include "native_static_world_cache.h"
 #include "native_queued_scene.h"
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <span>
@@ -49,10 +50,88 @@ struct NativeFullFrameStaticRoute {
   uint16_t hidden=0;
   bool operator==(const NativeFullFrameStaticRoute&) const=default;
 };
-using NativeFullFrameStaticRoutes=std::unordered_map<uint32_t,NativeFullFrameStaticRoute>;
+// Shared chunks: a publication copies it in O(1) and a changed route clones one chunk.
+using NativeFullFrameStaticRoutes=NativeSharedMap<uint32_t,NativeFullFrameStaticRoute>;
 inline void CollectNativeFullFrameStaticRoutes(const NativeStaticWalkList& plan,NativeFullFrameStaticRoutes& routes) {
-  for(const auto& member:plan.members) routes[member.owner]={member.direct,member.mode,member.hidden};
+  for(const auto& member:plan.members) routes.Set(member.owner,{member.direct,member.mode,member.hidden});
 }
+// The step's route words, kept per world in the order of its static walk plans
+// (820B4250 post-hook, sim thread). +52 and +64 have unhooked writers (inline
+// stw/sth), so every member's header is re-read each step, but that is one
+// 68-byte read per member compared against its slot: nothing is allocated or
+// rehashed, and only a changed route touches the published map. The slot
+// layout is rebuilt only when a plan's membership stamp moves (a Touch or a
+// header change), never for a source refresh. Not synchronized.
+class NativeFullFrameRouteTable {
+ public:
+  using Plans=std::vector<std::shared_ptr<const NativeStaticWalkList>>;
+  struct Stats { uint64_t refreshes=0,rebuilds=0,reads=0,changes=0,retired=0; };
+  // The world's slots were laid out from these plans (same lists, same membership).
+  bool Current(uint32_t world,const Plans& plans) const {
+    const auto found=worlds_.find(world);
+    if(found==worlds_.end() || found->second.plans.size()!=plans.size()) return false;
+    for(size_t i=0;i<plans.size();++i) {
+      const auto& a=*found->second.plans[i];const auto& b=*plans[i];
+      if(a.list!=b.list || a.membership!=b.membership) return false;
+    }
+    return true;
+  }
+  // Lays the world's slots out from its plans, keeping the known routes of
+  // owners it still lists; owners it no longer lists leave the routes.
+  void Rebuild(uint32_t world,Plans plans) {
+    auto& entry=worlds_[world];
+    std::unordered_map<uint32_t,NativeFullFrameStaticRoute> known;
+    for(const auto& slot:entry.slots) if(slot.valid) known.emplace(slot.member->owner,slot.route);
+    std::vector<Slot> slots;
+    for(const auto& plan:plans) for(const auto& member:plan->members) {
+      Slot slot{&member};
+      if(const auto found=known.find(member.owner);found!=known.end()) { slot.route=found->second; slot.valid=true; }
+      slots.push_back(slot);
+    }
+    std::unordered_set<uint32_t> listed;
+    for(const auto& slot:slots) listed.insert(slot.member->owner);
+    for(const auto& [object,route]:known) if(!listed.contains(object)) routes_.Erase(object);
+    entry.plans=std::move(plans); entry.slots=std::move(slots);
+    ++stats_.rebuilds;
+  }
+  // read(member) returns the live route of member.owner. Returns how many
+  // published routes changed.
+  template<class Read>
+  size_t Refresh(uint32_t world,Read&& read) {
+    const auto found=worlds_.find(world);
+    if(found==worlds_.end()) return 0;
+    size_t changed=0;
+    for(auto& slot:found->second.slots) {
+      const NativeFullFrameStaticRoute route=read(*slot.member);
+      ++stats_.reads;
+      if(slot.valid && slot.route==route) continue;
+      slot.route=route; slot.valid=true;
+      const auto* published=routes_.Find(slot.member->owner);
+      if(!published || !(*published==route)) { routes_.Set(slot.member->owner,route); ++changed; }
+    }
+    ++stats_.refreshes; stats_.changes+=changed;
+    return changed;
+  }
+  bool Retire(uint32_t world) {
+    const auto found=worlds_.find(world);
+    if(found==worlds_.end()) return false;
+    for(const auto& slot:found->second.slots) routes_.Erase(slot.member->owner);
+    worlds_.erase(found); ++stats_.retired;
+    return true;
+  }
+  const NativeFullFrameStaticRoutes& routes() const { return routes_; }
+  const Stats& stats() const { return stats_; }
+ private:
+  struct Slot {
+    const NativeStaticWalkMember* member=nullptr;  // In World::plans, which keep it alive.
+    NativeFullFrameStaticRoute route;
+    bool valid=false;
+  };
+  struct World { Plans plans; std::vector<Slot> slots; };
+  std::map<uint32_t,World> worlds_;
+  NativeFullFrameStaticRoutes routes_;
+  Stats stats_;
+};
 // Addresses of the published tree image only: every read is a captured byte,
 // and anything else throws rather than reaching guest memory.
 class NativeSceneTreeImageReader {

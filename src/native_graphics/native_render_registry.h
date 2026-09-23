@@ -14,6 +14,12 @@
 //   first layout (backed off) and a small round-robin refresh of the rest, and
 //   publishes a snapshot whose unchanged entries are the previous pointers.
 //
+// Cost per tick is O(re-read objects + changes), never O(entries): a re-read
+// builds into a reused scratch entry and compares it with the published one
+// (the pose against the guest bytes, without decoding), so only an entry that
+// changed allocates; `objects` and `entries` are shared-chunk containers, so a
+// snapshot copies neither and a change clones one chunk of each.
+//
 // Threading: hooks may run on any thread (loaders construct objects) and only
 // append to a locked event list. Tick, AuditScene, Clear and stats run on the
 // engine thread. AcquireSnapshot is safe from any thread; snapshots and their
@@ -97,7 +103,7 @@ class NativeRenderRegistry {
  public:
   struct Stats {
     uint64_t ticks=0,births=0,seeded=0,rebirths=0,deaths=0,unknown_deaths=0,subscriptions=0,unknown_subscriptions=0,
-      unknown_classes=0,reclassified=0,deferred=0,foreign=0,builds=0,changed=0,read_failures=0,
+      unknown_classes=0,reclassified=0,deferred=0,foreign=0,builds=0,changed=0,unchanged=0,pose_reuses=0,read_failures=0,
       layout_captures=0,layout_failures=0;
     size_t records=0,subscribed=0,published=0,retrying=0;
   };
@@ -152,13 +158,7 @@ class NativeRenderRegistry {
       if(found!=records_.end()) Update(reader,scene,tick,object,found->second,decode);
     }
     auto snapshot=std::make_shared<NativeRenderRegistrySnapshot>();
-    snapshot->tick=tick; snapshot->generation=++publications_; snapshot->objects=objects_;
-    if(changes_ || publications_==1) {
-      dense_.clear(); dense_.reserve(objects_.size());
-      for(const auto& [object,entry]:objects_) dense_.push_back(entry);
-      changes_=0;
-    }
-    snapshot->entries=dense_;
+    snapshot->tick=tick; snapshot->generation=++publications_; snapshot->objects=objects_; snapshot->entries=entries_;
     std::shared_ptr<const NativeRenderRegistrySnapshot> result=std::move(snapshot);
     { std::lock_guard lock(publish_mutex_); published_=result; }
     return result;
@@ -191,8 +191,8 @@ class NativeRenderRegistry {
   void Clear() {
     { std::lock_guard lock(events_mutex_); events_.clear(); }
     records_.clear(); pending_.clear(); subscribed_.clear(); retry_.clear(); ring_.clear();
-    objects_=decltype(objects_){}; dense_.clear();
-    cursor_=0; changes_=0; seeded_=false;
+    objects_=decltype(objects_){}; entries_.clear();
+    cursor_=0; seeded_=false;
     { std::lock_guard lock(publish_mutex_); published_.reset(); }
     active_.store(false,std::memory_order_relaxed);
   }
@@ -242,8 +242,13 @@ class NativeRenderRegistry {
   }
   void Forget(uint32_t object) {
     records_.erase(object); pending_.erase(object); subscribed_.erase(object); retry_.erase(object);
-    if(objects_.Erase(object)) ++changes_;
+    Unpublish(object);
   }
+  struct EntryObject { uint32_t operator()(const std::shared_ptr<const NativeRenderEntry>& entry) const { return entry->object; } };
+  void Publish(uint32_t object,std::shared_ptr<const NativeRenderEntry> entry) {
+    entries_.Assign(entry,EntryObject{}); objects_.Set(object,std::move(entry));
+  }
+  bool Unpublish(uint32_t object) { entries_.Erase(object,EntryObject{}); return objects_.Erase(object); }
   // An unsubscribe still gets one last read: the final pose stays published.
   void Subscribe(uint32_t object,Record& record,bool subscribed) {
     record.subscribed=subscribed;
@@ -253,8 +258,7 @@ class NativeRenderRegistry {
   template<class Reader,class Decode>
   void Update(const Reader& reader,uint32_t scene,uint64_t tick,uint32_t object,Record& record,const Decode& decode) {
     ++stats_.builds;
-    std::shared_ptr<NativeRenderEntry> built;
-    bool complete=true;
+    bool built=false,complete=true;
     try {
       const auto vtable=reader.Word(object);
       // The derived constructor has not stored its vtable yet: resolve next tick.
@@ -271,22 +275,27 @@ class NativeRenderRegistry {
         if(!record.type) ++stats_.unknown_classes;
       }
       if(record.scene!=scene) ++stats_.foreign;
-      else if(record.type && !record.type->scene_source && !record.type->effect) built=Build(reader,object,record,decode,complete);
-    } catch(const std::exception&) { ++stats_.read_failures; built.reset(); complete=false; }
+      else if(record.type && !record.type->scene_source && !record.type->effect) { Build(reader,object,record,decode,complete); built=true; }
+    } catch(const std::exception&) { ++stats_.read_failures; built=false; complete=false; }
     if(complete) { record.retries=0; retry_.erase(object); }
     else retry_[object]=tick+(uint64_t(1)<<std::min<uint32_t>(record.retries++,10));
     const auto* previous=objects_.Find(object);
-    if(!built) { if(previous && objects_.Erase(object)) ++changes_; return; }
-    if(previous && SameNativeRenderEntry(**previous,*built)) return;
-    objects_.Set(object,std::move(built));
-    ++changes_; ++stats_.changed;
+    if(!built) { if(previous) Unpublish(object); return; }
+    if(previous && SameNativeRenderEntry(**previous,scratch_)) { ++stats_.unchanged; return; }
+    // Changed: the one allocation (and chunk clone) per changed entry.
+    Publish(object,std::make_shared<const NativeRenderEntry>(scratch_));
+    ++stats_.changed;
   }
+  // Fills scratch_ (vectors keep their capacity across builds); poses equal
+  // to the published entry's are that entry's shared pointers.
   template<class Reader,class Decode>
-  std::shared_ptr<NativeRenderEntry> Build(const Reader& reader,uint32_t object,Record& record,const Decode& decode,bool& complete) {
+  void Build(const Reader& reader,uint32_t object,Record& record,const Decode& decode,bool& complete) {
     const auto& type=*record.type;
     const auto* previous=objects_.Find(object);
     const NativeRenderEntry* old=previous?previous->get():nullptr;
-    auto entry=std::make_shared<NativeRenderEntry>();
+    auto* entry=&scratch_;
+    entry->lod_thresholds.clear(); entry->models.clear(); entry->attachments.clear();
+    entry->pose.reset(); entry->pose_vector=0; entry->axes={};
     entry->object=object; entry->generation=record.generation; entry->type=&type;
     for(uint32_t i=0;i<4;++i) entry->centre[i]=NativeRenderFloat(reader,object+kNativeRenderObjectCentre+i*4);
     entry->radius=NativeRenderFloat(reader,object+kNativeRenderObjectRadius);
@@ -295,7 +304,7 @@ class NativeRenderRegistry {
     entry->mode=int32_t(reader.Word(object+kNativeRenderObjectMode));
     const auto* hidden=reader.Bytes(object+kNativeRenderObjectHidden,2);
     entry->hidden=(hidden[0]|hidden[1])!=0;
-    if(!type.instance || !type.pose) return entry; // Tracked, no model: visibility only.
+    if(!type.instance || !type.pose) return; // Tracked, no model: visibility only.
     entry->pose_vector=object+type.pose;
     entry->pose=ReadPose(reader,entry->pose_vector,old?old->pose:nullptr);
     entry->models.push_back(Model(reader,record,object+type.instance,entry->pose_vector,decode,complete));
@@ -330,13 +339,18 @@ class NativeRenderRegistry {
         attach(weapon+100,weapon+144);
       }
     }
-    return entry;
   }
+  // The guest bytes are compared with the previous copy in place; only a
+  // changed pose is decoded into a new shared copy.
   template<class Reader>
-  static NativeRenderPose ReadPose(const Reader& reader,uint32_t vector,const NativeRenderPose& previous) {
-    auto matrices=ReadNativeModelPose(reader,vector);
-    if(previous && SameNativeModelPose(*previous,matrices)) return previous;
-    return std::make_shared<const std::vector<NativePoseMatrix>>(std::move(matrices));
+  NativeRenderPose ReadPose(const Reader& reader,uint32_t vector,const NativeRenderPose& previous) {
+    const auto range=ReadNativeModelPoseRange(reader,vector);
+    const auto* bytes=range.count?reader.Bytes(range.begin,size_t(range.count)*64):nullptr;
+    if(previous && SameNativeModelPoseBytes(bytes,range.count,*previous)) { ++stats_.pose_reuses; return previous; }
+    auto matrices=std::make_shared<std::vector<NativePoseMatrix>>(range.count);
+    for(size_t bone=0;bone<range.count;++bone) for(size_t i=0;i<16;++i)
+      (*matrices)[bone][i]=std::bit_cast<float>(GuestBlockWord(bytes+bone*64+i*4));
+    return matrices;
   }
   // Captured once per (instance, container, node, pose vector, bone count),
   // and only when the model is assigned and its pose vector is sized: the
@@ -373,11 +387,12 @@ class NativeRenderRegistry {
   std::unordered_set<uint32_t> pending_,subscribed_;
   std::unordered_map<uint32_t,uint64_t> retry_;              // object -> next tick to retry
   std::vector<std::pair<uint32_t,uint64_t>> ring_;           // (object, generation), lazily pruned
-  size_t cursor_=0,changes_=0;
+  size_t cursor_=0;
   bool seeded_=false;
   uint64_t generation_=0,publications_=0;
   NativeSharedMap<uint32_t,std::shared_ptr<const NativeRenderEntry>> objects_;
-  std::vector<std::shared_ptr<const NativeRenderEntry>> dense_;
+  NativeSharedVector<std::shared_ptr<const NativeRenderEntry>> entries_;  // objects_' values, same order
+  NativeRenderEntry scratch_;
   Stats stats_;
   mutable std::mutex publish_mutex_;
   std::shared_ptr<const NativeRenderRegistrySnapshot> published_;

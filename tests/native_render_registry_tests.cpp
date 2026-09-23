@@ -176,11 +176,13 @@ void SubscriptionDrivesRereads() {
   BuildTree(memory,kStill); BuildTree(memory,kMoving);
   registry.Born(kStill); registry.Born(kMoving);
   const auto first=registry.Tick(memory,kScene,1,decode);
-  Require(first->entries.size()==2,"two entries");
+  Require(first->entries.size()==2 && first->entries[0]->object==kStill && first->entries[1]->object==kMoving,
+    "two entries, ordered by object");
   // Not subscribed: not re-read (refresh budget 0).
   BuildPose(memory,kStill+400,kStill+0x600,2,100.0f);
   const auto second=registry.Tick(memory,kScene,2,decode);
-  Require(EntryOf(*second,kStill)==EntryOf(*first,kStill) && second->objects.Shares(first->objects),"unsubscribed entry is not re-read");
+  Require(EntryOf(*second,kStill)==EntryOf(*first,kStill) && second->objects.Shares(first->objects) &&
+    second->entries.Shares(first->entries),"unsubscribed entry is not re-read");
   // 821C0D70(obj,1): re-read every tick.
   registry.Subscribed(kMoving,true); Link(memory,kUpdatesList,kMoving+120,kMoving);
   memory.StoreWord(kMoving+kNativeRenderObjectSubscribed,1);
@@ -190,9 +192,14 @@ void SubscriptionDrivesRereads() {
   Require(moved!=EntryOf(*second,kMoving) && (*moved->pose)[0][0]==50.0f && (*EntryOf(*second,kMoving)->pose)[0][0]==1.0f,
     "subscribed pose re-read; old snapshot unchanged");
   Require(moved->models[0].layout==EntryOf(*second,kMoving)->models[0].layout,"layout kept across pose changes");
-  Require(EntryOf(*third,kStill)==EntryOf(*first,kStill),"unchanged entry shared into the new snapshot");
+  Require(EntryOf(*third,kStill)==EntryOf(*first,kStill) && third->entries[0]==first->entries[0] && third->entries[1]==moved &&
+    second->entries[1]==EntryOf(*second,kMoving),"unchanged entry shared into the new snapshot, or an old snapshot changed");
+  const auto unchanged=registry.stats().unchanged,pose_reuses=registry.stats().pose_reuses,changed=registry.stats().changed;
   const auto fourth=registry.Tick(memory,kScene,4,decode);
-  Require(EntryOf(*fourth,kMoving)==moved && fourth->objects.Shares(third->objects),"unchanged subscribed entry is the same pointer");
+  Require(EntryOf(*fourth,kMoving)==moved && fourth->objects.Shares(third->objects) && fourth->entries.Shares(third->entries),
+    "unchanged subscribed entry is the same pointer");
+  Require(registry.stats().unchanged==unchanged+1 && registry.stats().pose_reuses==pose_reuses+1 &&
+    registry.stats().changed==changed,"an unchanged re-read allocated an entry or decoded its pose"); 
   Require(!registry.AuditScene(memory,kScene).mismatches(),"subscription matches scene+100");
   // Unsubscribe: one last read, then frozen.
   registry.Subscribed(kMoving,false); Unlink(memory,kMoving+120);

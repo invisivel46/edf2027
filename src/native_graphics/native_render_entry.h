@@ -73,7 +73,9 @@ struct NativeRenderEntry {
 };
 struct NativeRenderRegistrySnapshot {
   uint64_t tick=0;
-  std::vector<std::shared_ptr<const NativeRenderEntry>> entries; // dense, unordered
+  // Dense, ordered by object. Shared chunks like `objects`: a publication
+  // copies it in O(1) and a changed entry clones one chunk, not every pointer.
+  NativeSharedVector<std::shared_ptr<const NativeRenderEntry>> entries;
   // Registry publication counter, and the same entries keyed by object. The
   // map shares every chunk an older snapshot did not see change, and an entry
   // pointer is carried over unchanged when its object did not change: pointer

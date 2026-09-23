@@ -328,6 +328,13 @@ NativeSceneTreePublications& TreePublications() {
   static NativeSceneTreePublications publications;
   return publications;
 }
+// Lock-free prefilters for hot simulation hooks (NativeAddressFilter): list
+// headers and member nodes the static walk plans or the scene membership
+// track, and owners the scene sources have seen born. A hook whose addresses
+// are absent skips the bridge lock, which the full frame's passes hold for
+// milliseconds on the render thread. Leaked: hooks may run during shutdown.
+NativeAddressFilter& SceneAnchors() { static auto* value=new NativeAddressFilter; return *value; }
+NativeAddressFilter& SceneSourceOwners() { static auto* value=new NativeAddressFilter; return *value; }
 // Capture at renderer initialization. Saving a new F1 choice must not change
 // live UI scaling while the current render targets still have the old size.
 const std::array<int32_t,2>& NativeRenderDimensions() {
@@ -369,6 +376,8 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        FrameNative, FrameNativeBegin, FrameNativeStaticWorld, FrameNativeModels,
                        FrameNativeSky, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
                        FrameNativeEnd, FrameNativeOverlays, FrameNativePhases,
+                       SimRegistry, SimStaticWalk, SimPreloadGeometry, SimPreloadMaterial,
+                       SimTrees, SimMembership, SimPublish, SimPoses, SimLockWait,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
@@ -428,6 +437,8 @@ class HookTiming {
       "frame.native","frame.native.begin","frame.native.static_world","frame.native.models",
       "frame.native.sky","frame.native.effects","frame.native.transparent","frame.native.post",
       "frame.native.end","frame.native.view_overlays","frame.native.phases",
+      "sim.registry","sim.static_walk","sim.preload_geometry","sim.preload_material",
+      "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
       "load.shader.registration","load.shader.lock","load.shader.entry",
       "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
@@ -925,8 +936,12 @@ struct Bridge {
   NativeSceneMembership scene_membership;
   NativeStaticWalkPlans static_walk_plans;
   // edf_native_full_frame: sub_821C0C00's route words per world as of its last
-  // step (PublishStaticWalkPlans), and their union the frame acquires.
-  std::map<uint32_t,NativeFullFrameStaticRoutes> full_frame_world_routes;
+  // step (PublishStaticWalkPlans), and the published union the frame acquires.
+  // The table has its own lock (full_frame_route_mutex, taken alone or inside
+  // this mutex, never around it), so the step refreshes it off the bridge lock.
+  std::mutex full_frame_route_mutex;
+  NativeFullFrameRouteTable full_frame_route_table;
+  std::shared_ptr<const NativeFullFrameStaticRoutes> full_frame_routes_published;  // Under full_frame_route_mutex.
   std::shared_ptr<const NativeFullFrameStaticRoutes> full_frame_routes=std::make_shared<const NativeFullFrameStaticRoutes>();
   NativeStaticWalkAudit static_walk_audit;
   uint64_t static_walk_lists=0,static_walk_misses=0,static_walk_stale=0,static_walk_members=0;
@@ -3274,6 +3289,10 @@ edf::native::NativeModelPublications& ModelPublications() { static auto* value=n
 // Pose vectors rebuilt by 821C9478 during this thread's 821A4DE8 dirty walk
 // (slot +8 after the helper join); null outside that walk.
 thread_local std::vector<uint32_t>* native_model_dirty_poses=nullptr;
+// World owners whose tree the 820B4250 post-hook published (current at the
+// time) since this thread's last 821A4DE8 publication, which skips them while
+// they are still current instead of comparing every tree byte a second time.
+thread_local std::vector<uint32_t> native_step_trees;
 thread_local NativeLoopBudget native_render_budget;
 thread_local uint64_t native_render_publication=0;
 struct NativeModelRenderContext {
@@ -4124,65 +4143,123 @@ bool NativeStaticWalkPlansEnabled() {
   return REXCVAR_GET(edf_native_scene_static_walk) || REXCVAR_GET(edf_native_scene_static_walk_audit) ||
     EDF_NATIVE_FLAG(full_frame);
 }
-// Rebuilds the frame's route union after one world's routes changed.
-void PublishFullFrameRoutesLocked(Bridge& state) {
-  NativeFullFrameStaticRoutes all;
-  for(const auto& [world,routes]:state.full_frame_world_routes) all.insert(routes.begin(),routes.end());
-  state.full_frame_routes=std::make_shared<const NativeFullFrameStaticRoutes>(std::move(all));
+// Drops one world's route words and republishes the union; the caller holds
+// the bridge lock (the route lock is taken inside it, never around it).
+void RetireFullFrameRoutesLocked(Bridge& state,uint32_t owner) {
+  std::lock_guard routes(state.full_frame_route_mutex);
+  if(!state.full_frame_route_table.Retire(owner)) return;
+  state.full_frame_routes_published=std::make_shared<const NativeFullFrameStaticRoutes>(state.full_frame_route_table.routes());
+  state.full_frame_routes=state.full_frame_routes_published;
 }
 void RetireStaticWalkPlans(uint32_t owner) {
   if(!NativeStaticWalkPlansEnabled()) return;
   auto& state=State();
   std::lock_guard lock(state.mutex);
   state.static_walk_plans.Retire(owner);
-  if(state.full_frame_world_routes.erase(owner)) PublishFullFrameRoutesLocked(state);
+  RetireFullFrameRoutesLocked(state,owner);
 }
 // After a guest link/unlink: each anchor is a list header or a member node,
-// so the list it belongs to (by the plan's node index) loses its plan.
+// so the list it belongs to (by the plan's node index) loses its plan. The
+// caller holds the bridge lock.
+void TouchStaticWalkPlansLocked(Bridge& state,std::initializer_list<uint32_t> anchors) {
+  if(!NativeStaticWalkPlansEnabled()) return;
+  for(const auto anchor:anchors) state.static_walk_plans.Touch(anchor);
+}
 void TouchStaticWalkPlans(std::initializer_list<uint32_t> anchors) {
   if(!NativeStaticWalkPlansEnabled()) return;
   auto& state=State();
   std::lock_guard lock(state.mutex);
-  for(const auto anchor:anchors) state.static_walk_plans.Touch(anchor);
+  TouchStaticWalkPlansLocked(state,anchors);
 }
 // 820B4250 post-hook: the world's plan, published after its tree.
+//
+// Plans are published under the bridge lock (they read the scene sources);
+// with plans reused that is two header words per list through a page window.
+// The full frame's route words are then refreshed off the bridge lock, under
+// the route table's own lock: one header read per member compared with its
+// slot (the words have unhooked writers, so each step re-reads them), and the
+// bridge lock is taken again only to swap in a changed union, which shares
+// every unchanged chunk.
+//
+// Full frame without the static walk (and without its audit): the plans'
+// source candidates are consumed only by the 820B4038 walk, which the full
+// frame replaces, so plans are built without them (constant revision, empty
+// find): no FindCandidate per member and no refresh of every member when the
+// candidate revision moves.
 void PublishStaticWalkPlans(uint8_t* base,uint32_t owner) {
   if(!NativeStaticWalkPlansEnabled()) return;
+  HookTiming timing(HookPhase::SimStaticWalk);
   auto& state=State();
   const auto epoch=TreePublications().Epoch();
-  std::lock_guard lock(state.mutex);
-  try {
-    const GuestReader reader(base);
-    const auto& sources=state.scene_sources;
-    state.static_walk_plans.Publish(reader,owner,epoch,sources.CandidateRevision(),
-      [&](uint32_t object) { return sources.FindCandidate(object); });
-    const auto& stats=state.static_walk_plans.stats();
-    if(stats.publications<=4 || stats.publications%1000==0)
-      REXLOG_INFO("Native static walk plan: owner={:#x} publications={} collections={} builds={} reuses={} refreshes={} touches={} lists={} nodes={}",
-        owner,stats.publications,stats.collections,stats.builds,stats.reuses,stats.refreshes,stats.touches,
-        state.static_walk_plans.lists(),state.static_walk_plans.nodes());
-    if(EDF_NATIVE_FLAG(full_frame)) {
-      // sub_821C0C00's route words as of this step, for the full frame's
-      // static world. Membership comes from the plans; the header words are
-      // read live here because a reused plan's copies are advisory.
-      NativeFullFrameStaticRoutes routes;
-      state.static_walk_plans.ForEachPlan(owner,[&](const NativeStaticWalkList& plan) {
-        for(const auto& member:plan.members) {
-          const auto vtable=reader.Word(member.owner);
-          routes[member.owner]={PlannedNativeStaticDirect(member,vtable,
-              [&](uint32_t table) { return reader.Word(reader.Add(table,16)); }),
-            reader.Word(reader.Add(member.owner,52)),uint16_t(reader.Word(reader.Add(member.owner,64))>>16)};
-        }
-      });
-      auto& previous=state.full_frame_world_routes[owner];
-      if(previous!=routes) { previous=std::move(routes); PublishFullFrameRoutesLocked(state); }
-    }
-  } catch(const std::exception& error) {
-    state.static_walk_plans.Retire(owner);
-    if(state.full_frame_world_routes.erase(owner)) PublishFullFrameRoutesLocked(state);
+  const bool candidates=REXCVAR_GET(edf_native_scene_static_walk) || REXCVAR_GET(edf_native_scene_static_walk_audit);
+  const bool full_frame=EDF_NATIVE_FLAG(full_frame);
+  const GuestReader backing(base);
+  const NativeSceneCpuWindow reader(backing);
+  const auto deferred=[](const std::exception& error) {
     static std::set<std::string> reported;
+    static std::mutex reported_mutex;
+    std::lock_guard lock(reported_mutex);
     if(reported.insert(error.what()).second) REXLOG_INFO("Native static walk plan deferred: {}",error.what());
+  };
+  NativeFullFrameRouteTable::Plans plans;
+  {
+    HookTiming wait(HookPhase::SimLockWait);
+    std::lock_guard lock(state.mutex);
+    wait.Finish();
+    try {
+      state.static_walk_plans.SetAnchorFilter(&SceneAnchors());
+      const auto& sources=state.scene_sources;
+      if(candidates) state.static_walk_plans.Publish(reader,owner,epoch,sources.CandidateRevision(),
+        [&](uint32_t object) { return sources.FindCandidate(object); });
+      else state.static_walk_plans.Publish(reader,owner,epoch,0,[](uint32_t) { return NativeSceneSources::Candidate{}; });
+      const auto& stats=state.static_walk_plans.stats();
+      if(stats.publications<=4 || stats.publications%1000==0)
+        REXLOG_INFO("Native static walk plan: owner={:#x} publications={} collections={} builds={} reuses={} refreshes={} touches={} lists={} nodes={} candidates={}",
+          owner,stats.publications,stats.collections,stats.builds,stats.reuses,stats.refreshes,stats.touches,
+          state.static_walk_plans.lists(),state.static_walk_plans.nodes(),candidates);
+      if(full_frame) plans=state.static_walk_plans.AcquirePlans(owner);
+    } catch(const std::exception& error) {
+      state.static_walk_plans.Retire(owner);
+      RetireFullFrameRoutesLocked(state,owner);
+      deferred(error);
+      return;
+    }
   }
+  if(!full_frame) return;
+  // sub_821C0C00's route words as of this step, for the full frame's static
+  // world: membership from the plans, the header words read live because a
+  // reused plan's copies are advisory.
+  std::shared_ptr<const NativeFullFrameStaticRoutes> published;
+  bool failed=false;
+  {
+    std::lock_guard routes(state.full_frame_route_mutex);
+    auto& table=state.full_frame_route_table;
+    try {
+      if(!table.Current(owner,plans)) table.Rebuild(owner,std::move(plans));
+      table.Refresh(owner,[&](const NativeStaticWalkMember& member) {
+        const auto* header=reader.Bytes(member.owner,68);  // +0 vtable, +52 mode, +64 hidden.
+        const auto vtable=GuestBlockWord(header);
+        return NativeFullFrameStaticRoute{PlannedNativeStaticDirect(member,vtable,
+            [&](uint32_t table_address) { return reader.Word(reader.Add(table_address,16)); }),
+          GuestBlockWord(header+52),uint16_t(GuestBlockWord(header+64)>>16)};
+      });
+    } catch(const std::exception& error) { table.Retire(owner); failed=true; deferred(error); }
+    // The table's map shares its spine with the last publication unless a route changed.
+    if(!state.full_frame_routes_published || !table.routes().Shares(*state.full_frame_routes_published))
+      state.full_frame_routes_published=published=std::make_shared<const NativeFullFrameStaticRoutes>(table.routes());
+    const auto& stats=table.stats();
+    if(stats.refreshes<=4 || stats.refreshes%1000==0)
+      REXLOG_INFO("Native full frame routes: owner={:#x} refreshes={} rebuilds={} reads={} changes={} retired={} routes={}",
+        owner,stats.refreshes,stats.rebuilds,stats.reads,stats.changes,stats.retired,table.routes().size());
+  }
+  if(!failed && !published) return;
+  HookTiming wait(HookPhase::SimLockWait);
+  std::lock_guard lock(state.mutex);
+  wait.Finish();
+  if(failed) state.static_walk_plans.Retire(owner);
+  // Newest first: a retire under the bridge lock may have published since.
+  std::lock_guard routes(state.full_frame_route_mutex);
+  state.full_frame_routes=state.full_frame_routes_published;
 }
 }
 #define EDF_TREE_MUTATION(address) \
@@ -4300,8 +4377,14 @@ REX_HOOK_RAW(sub_820B4250) {
   }
   __imp__sub_820B4250(ctx,base);
   if(EDF_NATIVE_FLAG(scene_tree_published)) {
+    edf::native::HookTiming trees(edf::native::HookPhase::SimTrees);
     try {
-      if(edf::native::TreePublications().Publish(edf::native::GuestReader(base),owner)) {
+      // Node and region reads go through one page window: each bare read is a
+      // committed-page query, and an unchanged tree is every region compared.
+      const edf::native::GuestReader backing(base);
+      const edf::native::NativeSceneCpuWindow reader(backing);
+      if(edf::native::TreePublications().Publish(reader,owner)) {
+        native_step_trees.push_back(owner);
         static std::atomic<uint64_t> publications=0;
         const auto count=++publications;
         if(count<=4 || count%1000==0) REXLOG_INFO("Native tree producer publication: owner={:#x} completed={}",owner,count);
@@ -4423,6 +4506,7 @@ REX_HOOK_RAW(sub_820B5FA8) {
     state.scene_adapter.RetireWorldAnimation(ctx.r3.u32);
     state.scene_adapter.RetireGroupOrder(ctx.r3.u32);
     state.static_walk_plans.Retire(ctx.r3.u32);
+    edf::native::RetireFullFrameRoutesLocked(state,ctx.r3.u32);
   }
   __imp__sub_820B5FA8(ctx,base);
 }
@@ -5224,6 +5308,7 @@ REX_HOOK_RAW(sub_820B33B0) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
+    edf::native::SceneSourceOwners().Add(object);  // Before the owner exists: see NativeAddressFilter.
     state.scene_sources.Born(object);
     edf::native::PublishStaticScenePartsLocked(state,edf::native::GuestReader(base),object);
   }
@@ -5247,6 +5332,7 @@ REX_HOOK_RAW(sub_820B2AC0) {
     auto& state=edf::native::State();
     // Nested in construction the owner is not yet born and cannot become so
     // on another thread; skip the submission wait for a publication of nothing.
+    if(!edf::native::SceneSourceOwners().MayContain(owner)) return;
     { std::lock_guard lock(state.mutex); if(!state.scene_sources.HasOwner(owner)) return; }
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -5257,7 +5343,8 @@ REX_EXTERN(__imp__sub_820B2DF8);
 REX_HOOK_RAW(sub_820B2DF8) {
   const auto owner=ctx.r3.u32;
   __imp__sub_820B2DF8(ctx,base);
-  if(EDF_NATIVE_FLAG(scene_queued)) {
+  // Objects the scene sources never saw born have no generation: skip both locks.
+  if(EDF_NATIVE_FLAG(scene_queued) && edf::native::SceneSourceOwners().MayContain(owner)) {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -5339,7 +5426,7 @@ REX_EXTERN(__imp__sub_821C0B88);
 REX_HOOK_RAW(sub_821C0B88) {
   const auto owner=ctx.r3.u32;
   __imp__sub_821C0B88(ctx,base);
-  if(EDF_NATIVE_FLAG(scene_queued)) {
+  if(EDF_NATIVE_FLAG(scene_queued) && edf::native::SceneSourceOwners().MayContain(owner)) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     if(state.scene_sources.HasOwner(owner)) state.scene_sources.PublishVisibility(owner,
@@ -5350,7 +5437,7 @@ REX_EXTERN(__imp__sub_821BEF10);
 REX_HOOK_RAW(sub_821BEF10) {
   const auto destination=ctx.r4.u32;
   __imp__sub_821BEF10(ctx,base);
-  if(EDF_NATIVE_FLAG(scene_queued) && destination>=288) {
+  if(EDF_NATIVE_FLAG(scene_queued) && destination>=288 && edf::native::SceneSourceOwners().MayContain(destination-288)) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     const auto owner=destination-288;
@@ -5367,6 +5454,7 @@ REX_HOOK_RAW(sub_821C4EB8) {
   edf::native::TouchStaticWalkPlans({node+120});
   if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
+    edf::native::SceneAnchors().Add(node+120);
     state.scene_membership.Born(node+120); ++state.scene_membership_events;
   }
 }
@@ -5378,24 +5466,34 @@ REX_HOOK_RAW(sub_821C5D28) {
   edf::native::TouchStaticWalkPlans({node+120});
   if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
+    edf::native::SceneAnchors().Add(node+120);
     state.scene_membership.Born(node+120,edf::native::GuestReader(base).Word(node+132));
     ++state.scene_membership_events;
   }
 }
+// 821A1628 / 821A1678 link and unlink every guest list node (object lists,
+// update subscriptions, leaf lists). Only anchors the static walk plans or
+// the scene membership track matter here; SceneAnchors() holds every one of
+// them (added before tracking starts), so any other list's link skips the
+// bridge lock. Tracked links take it once, not once per consumer.
 REX_EXTERN(__imp__sub_821A1628);
 REX_HOOK_RAW(sub_821A1628) {
-  if(EDF_NATIVE_FLAG(scene_tree_published)) {
+  const auto anchor=ctx.r3.u32,node=ctx.r4.u32;
+  const auto& anchors=edf::native::SceneAnchors();
+  const bool tracked=anchors.MayContain(anchor) || anchors.MayContain(node);
+  if(tracked && EDF_NATIVE_FLAG(scene_tree_published)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
-    if(state.scene_membership.HasAnchor(ctx.r3.u32) || state.scene_membership.HasAnchor(ctx.r4.u32))
+    if(state.scene_membership.HasAnchor(anchor) || state.scene_membership.HasAnchor(node))
       edf::native::TreePublications().Invalidate();
   }
-  const auto anchor=ctx.r3.u32,node=ctx.r4.u32;
   __imp__sub_821A1628(ctx,base);
+  if(!tracked) return;
+  auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
   // After the link: the destination by its anchor, the source list by the node.
-  edf::native::TouchStaticWalkPlans({anchor,node});
+  edf::native::TouchStaticWalkPlansLocked(state,{anchor,node});
   if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility)) {
-    auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
     if(state.scene_membership.HasAnchor(anchor)) {
+      edf::native::SceneAnchors().Add(node);
       state.scene_membership.InsertAfter(anchor,node,edf::native::GuestReader(base).Word(node+8));
       ++state.scene_membership_events;
     } else if(state.scene_membership.Remove(node)) ++state.scene_membership_events;
@@ -5403,17 +5501,18 @@ REX_HOOK_RAW(sub_821A1628) {
 }
 REX_EXTERN(__imp__sub_821A1678);
 REX_HOOK_RAW(sub_821A1678) {
-  if(EDF_NATIVE_FLAG(scene_tree_published)) {
-    auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
-    if(state.scene_membership.HasAnchor(ctx.r3.u32)) edf::native::TreePublications().Invalidate();
-  }
   const auto node=ctx.r3.u32;
-  __imp__sub_821A1678(ctx,base);
-  edf::native::TouchStaticWalkPlans({node});
-  if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility)) {
+  const bool tracked=edf::native::SceneAnchors().MayContain(node);
+  if(tracked && EDF_NATIVE_FLAG(scene_tree_published)) {
     auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
-    if(state.scene_membership.Remove(node)) ++state.scene_membership_events;
+    if(state.scene_membership.HasAnchor(node)) edf::native::TreePublications().Invalidate();
   }
+  __imp__sub_821A1678(ctx,base);
+  if(!tracked) return;
+  auto& state=edf::native::State(); std::lock_guard lock(state.mutex);
+  edf::native::TouchStaticWalkPlansLocked(state,{node});
+  if(EDF_NATIVE_FLAG(scene_queued) && EDF_NATIVE_FLAG(scene_visibility))
+    if(state.scene_membership.Remove(node)) ++state.scene_membership_events;
 }
 REX_EXTERN(__imp__sub_821B0198);
 REX_EXTERN(__imp__sub_821C3070);
@@ -5473,8 +5572,7 @@ REX_HOOK_RAW(sub_820B4038) {
     if(EDF_NATIVE_FLAG(scene_membership_owned) && native_scene_publication && native_scene_publication->membership) {
       const auto& lists=*native_scene_publication->membership;
       if(state.scene_membership.Current(lists)) {
-        const auto found=lists.lists.find(ctx.r4.u32);
-        if(found!=lists.lists.end()) { membership=found->second; published=true; }
+        if(const auto* found=lists.lists.Find(ctx.r4.u32)) { membership=*found; published=true; }
       }
       if(!published) {
         static uint64_t fallbacks=0;
@@ -7040,8 +7138,11 @@ namespace {
 void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
   auto& registry=edf::native::RenderRegistry();
   if(!REXCVAR_GET(edf_native_render_registry) && !EDF_NATIVE_FLAG(full_frame)) { if(registry.active()) registry.Clear(); return; }
+  edf::native::HookTiming timing(edf::native::HookPhase::SimRegistry);
   try {
     const edf::native::GuestReader reader(base);
+    // Object headers, LOD tables and poses of the re-read objects share pages.
+    const edf::native::NativeSceneCpuWindow window(reader);
     // Buffer identities are read under the bridge lock, first sight only.
     const auto decode=[&](uint32_t instance,uint32_t vector) {
       auto& state=edf::native::State();
@@ -7052,17 +7153,17 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
           return found?found->generation:0;
         });
     };
-    const auto snapshot=registry.Tick(reader,scene,native_loop_budget.tick,decode);
+    const auto snapshot=registry.Tick(window,scene,native_loop_budget.tick,decode);
     static uint64_t ticks=0;
     const bool report=++ticks<=4 || ticks%1000==0;
     if(report) {
       const auto stats=registry.stats();
       REXLOG_INFO("Native render registry: generation={} tick={} entries={} records={} subscribed={} births={} seeded={} deaths={} "
-        "rebirths={} unknown_deaths={} unknown_classes={} deferred={} foreign={} builds={} changed={} read_failures={} "
-        "layouts={} layout_failures={} retrying={}",snapshot->generation,snapshot->tick,snapshot->entries.size(),stats.records,
+        "rebirths={} unknown_deaths={} unknown_classes={} deferred={} foreign={} builds={} changed={} unchanged={} pose_reuses={} "
+        "read_failures={} layouts={} layout_failures={} retrying={}",snapshot->generation,snapshot->tick,snapshot->entries.size(),stats.records,
         stats.subscribed,stats.births,stats.seeded,stats.deaths,stats.rebirths,stats.unknown_deaths,stats.unknown_classes,
-        stats.deferred,stats.foreign,stats.builds,stats.changed,stats.read_failures,stats.layout_captures,
-        stats.layout_failures,stats.retrying);
+        stats.deferred,stats.foreign,stats.builds,stats.changed,stats.unchanged,stats.pose_reuses,stats.read_failures,
+        stats.layout_captures,stats.layout_failures,stats.retrying);
     }
     if(REXCVAR_GET(edf_native_render_registry_audit)) {
       const auto audit=registry.AuditScene(reader,scene);
@@ -7101,7 +7202,14 @@ REX_HOOK_RAW(sub_821A4DE8) {
                       manager,actual,desired);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceTransition,edge);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::FrameTransition);
-  const bool model_publication=EDF_NATIVE_FLAG(model_publication);
+  // Model poses (ModelPublications) feed only the hybrid model pass and its
+  // audit: layouts are registered by 821C9C20 draws, which a full frame
+  // without A/B guest frames makes only if a guest phase still draws a model.
+  // With nothing registered there, neither the dirty-pose capture nor the pose
+  // publication runs; a later registration is seeded at the next publication.
+  const bool full_frame_only=EDF_NATIVE_FLAG(full_frame) && REXCVAR_GET(edf_native_ab_alternate)<=0;
+  const bool model_flag=EDF_NATIVE_FLAG(model_publication);
+  const bool model_publication=model_flag && (!full_frame_only || ModelPublications().size());
   std::vector<uint32_t> dirty_poses;
   {
     struct Scope {
@@ -7111,6 +7219,8 @@ REX_HOOK_RAW(sub_821A4DE8) {
     native_model_dirty_poses=model_publication?&dirty_poses:nullptr;
     __imp__sub_821A4DE8(ctx,base);
   }
+  // This step's 820B4250 tree publications; cleared on every exit below.
+  struct StepTrees { ~StepTrees() { native_step_trees.clear(); } } step_trees;
   if(EDF_NATIVE_FLAG(scene_camera_owned)) {
     auto cameras=edf::native::ReadNativeScenePassCameras(edf::native::GuestReader(base),manager);
     auto& state=edf::native::State();
@@ -7126,23 +7236,41 @@ REX_HOOK_RAW(sub_821A4DE8) {
   }
   if(EDF_NATIVE_FLAG(scene_queued) && (!native_loop_budget.unlocked || native_loop_budget.steps)) {
     auto& state=edf::native::State();
-    std::lock_guard submission(state.submissions);
-    std::lock_guard lock(state.mutex);
-    state.scene_publication_tick+=std::max(1u,native_loop_budget.steps);
-    if(EDF_NATIVE_FLAG(scene_visibility)) state.scene_membership.Publish();
+    const edf::native::GuestReader backing(base);
+    // Trees have their own lock: compared (and recaptured when they differ)
+    // before the bridge locks, through a page window. A tree 820B4250
+    // published during this step is skipped while its image is current (no
+    // hooked mutation since); an unhooked writer after it is caught at the
+    // next step's 820B4250 comparison.
     if(EDF_NATIVE_FLAG(scene_tree_published)) {
+      edf::native::HookTiming trees_timing(edf::native::HookPhase::SimTrees);
       auto& trees=edf::native::TreePublications();
-      const edf::native::GuestReader reader(base);
+      const edf::native::NativeSceneCpuWindow reader(backing);
       for(const auto owner:trees.Owners()) {
+        if(std::ranges::find(native_step_trees,owner)!=native_step_trees.end() && trees.Acquire(owner)) continue;
         try { trees.Publish(reader,owner); }
         catch(const std::exception&) { trees.Retire(owner); }
       }
     }
-    if(EDF_NATIVE_FLAG(scene_preload)) {
-      const edf::native::GuestReader reader(base);
-      edf::native::PreloadStaticSceneGeometryLocked(state,reader);
-      edf::native::PreloadStaticSceneMaterialsLocked(state,reader);
+    // The rest mutates bridge state: the geometry and material preloads keep
+    // the published group assets (which the full frame's static world draws)
+    // current, and the adapter publication is what every frame acquires.
+    edf::native::HookTiming wait(edf::native::HookPhase::SimLockWait);
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    wait.Finish();
+    state.scene_publication_tick+=std::max(1u,native_loop_budget.steps);
+    if(EDF_NATIVE_FLAG(scene_visibility)) {
+      edf::native::HookTiming membership_timing(edf::native::HookPhase::SimMembership);
+      state.scene_membership.Publish();
     }
+    if(EDF_NATIVE_FLAG(scene_preload)) {
+      { edf::native::HookTiming preload(edf::native::HookPhase::SimPreloadGeometry);
+        edf::native::PreloadStaticSceneGeometryLocked(state,backing); }
+      { edf::native::HookTiming preload(edf::native::HookPhase::SimPreloadMaterial);
+        edf::native::PreloadStaticSceneMaterialsLocked(state,backing); }
+    }
+    edf::native::HookTiming publish_timing(edf::native::HookPhase::SimPublish);
     if(state.scene_adapter.objects() || state.scene_adapter.geometry_groups() || state.scene_adapter.AcquirePublication())
       state.scene_adapter.Publish(state.scene_publication_tick,
         EDF_NATIVE_FLAG(scene_sources_owned)?state.scene_sources.AcquireSnapshot():nullptr,
@@ -7152,6 +7280,7 @@ REX_HOOK_RAW(sub_821A4DE8) {
   // Pose generation for this tick, beside the scene publication: only vectors
   // the dirty walk rebuilt (and first-sight seeds) are read from guest memory.
   if(model_publication) {
+    edf::native::HookTiming poses_timing(edf::native::HookPhase::SimPoses);
     try {
       const auto published=ModelPublications().PublishPoses(edf::native::GuestReader(base),native_loop_budget.tick,dirty_poses);
       static uint64_t publications=0;
@@ -7162,7 +7291,7 @@ REX_HOOK_RAW(sub_821A4DE8) {
     } catch(const std::exception& error) {
       REXLOG_WARN("Native model pose publication failed: {}",error.what());
     }
-  } else if(ModelPublications().size()) ModelPublications().Clear();
+  } else if(!model_flag && ModelPublications().size()) ModelPublications().Clear();
   TickNativeRenderRegistry(base,manager);
   timing.Finish();
   if(edge) REXLOG_INFO("Native resource transition: end manager={:#x}",manager);

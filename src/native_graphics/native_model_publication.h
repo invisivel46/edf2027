@@ -92,6 +92,15 @@ inline bool SameNativeModelPose(std::span<const NativePoseMatrix> a,std::span<co
     return std::bit_cast<std::array<uint32_t,16>>(x)==std::bit_cast<std::array<uint32_t,16>>(y);
   });
 }
+// The guest's pose bytes (64 big-endian bytes per matrix) against a decoded
+// pose, bitwise as SameNativeModelPose, without decoding or allocating: an
+// unchanged pose costs one pass over its bytes and keeps its shared copy.
+inline bool SameNativeModelPoseBytes(const uint8_t* bytes,size_t count,std::span<const NativePoseMatrix> pose) {
+  if(pose.size()!=count) return false;
+  for(size_t bone=0;bone<count;++bone) for(size_t i=0;i<16;++i)
+    if(GuestBlockWord(bytes+bone*64+i*4)!=std::bit_cast<uint32_t>(pose[bone][i])) return false;
+  return true;
+}
 template<class Reader,class Lookup>
 NativeModelBatchLayout DecodeNativeModelBatch(const Reader& reader,uint32_t address,const Lookup& lookup) {
   NativeModelBatchLayout batch; batch.address=address;

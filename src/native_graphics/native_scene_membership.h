@@ -1,4 +1,5 @@
 #pragma once
+#include "native_shared_vector.h"
 #include <cstdint>
 #include <list>
 #include <map>
@@ -23,15 +24,25 @@ class NativeSceneMembership {
     uint32_t end=0;
     std::vector<Member> members;
   };
+  // lists shares every chunk with the previous publication whose lists did
+  // not change: a new publication costs O(changed lists), not O(lists).
   struct Publication {
     uint64_t revision=0;
-    std::map<uint32_t,std::shared_ptr<const Snapshot>> lists;
+    NativeSharedMap<uint32_t,std::shared_ptr<const Snapshot>> lists;
   };
   bool Current(const Publication& publication) const { return publication.revision==revision_; }
   std::shared_ptr<const Publication> AcquirePublication() {
     if(!publication_ || !Current(*publication_)) {
-      auto next=std::make_shared<Publication>(); next->revision=revision_;
-      for(const auto& [address,list]:lists_) next->lists.emplace(address,Acquire(address));
+      if(republish_) {
+        published_={};
+        for(const auto& [address,list]:lists_) published_.Set(address,Acquire(address));
+        republish_=false;
+      } else for(const auto address:unpublished_) {
+        if(lists_.contains(address)) published_.Set(address,Acquire(address));
+        else published_.Erase(address);
+      }
+      unpublished_.clear();
+      auto next=std::make_shared<Publication>(); next->revision=revision_; next->lists=published_;
       publication_=std::move(next);
     }
     return publication_;
@@ -47,7 +58,7 @@ class NativeSceneMembership {
     const auto found=lists_.find(list);
     if(found==lists_.end()) return false;
     for(const auto& member:found->second.members) nodes_.erase(member.node);
-    lists_.erase(found); ++revision_; return true;
+    lists_.erase(found); ++revision_; Unpublished(list); return true;
   }
   bool Remove(uint32_t node) {
     if(Retire(node)) return true; // Destruction of the intrusive list header.
@@ -110,13 +121,25 @@ class NativeSceneMembership {
   };
   void Changed(uint32_t address,List& entry) {
     ++revision_;
-    entry.snapshot.reset();
+    entry.snapshot.reset(); Unpublished(address);
     if(!entry.pending) { changed_.push_back(address); entry.pending=true; }
+  }
+  // Bounded when nothing acquires publications: past the bound, the next
+  // acquisition republishes every list instead.
+  void Unpublished(uint32_t address) {
+    if(republish_) return;
+    unpublished_.push_back(address);
+    if(unpublished_.size()>2*lists_.size()+1024) { unpublished_.clear(); republish_=true; }
   }
   struct Location { uint32_t list; std::list<Member>::iterator at; };
   std::map<uint32_t,List> lists_;
   std::map<uint32_t,Location> nodes_;
   std::vector<uint32_t> changed_;
+  // Lists created, changed or retired since the last AcquirePublication, and
+  // what it last published (duplicates in unpublished_ are harmless).
+  std::vector<uint32_t> unpublished_;
+  NativeSharedMap<uint32_t,std::shared_ptr<const Snapshot>> published_;
+  bool republish_=false;
   uint64_t next_generation_=1;
   uint64_t revision_=0;
   std::shared_ptr<const Publication> publication_;

@@ -1,5 +1,6 @@
 #pragma once
 #include "guest_block.h"
+#include "native_address_filter.h"
 #include "native_scene_sources.h"
 #include <atomic>
 #include <map>
@@ -126,6 +127,10 @@ class NativeStaticWalkPlans {
   }
   // Moves on every Touch that dirtied a plan and every rebuilt membership.
   uint64_t Touches() const { return touches_.load(std::memory_order_acquire); }
+  // Every list header and member node a plan is built with is added here
+  // before the plan is published, so a hook whose anchors the filter does
+  // not hold can skip Touch (and its lock) altogether.
+  void SetAnchorFilter(NativeAddressFilter* anchors) { anchors_=anchors; }
   // Membership hooks: anchor is a list header or a planned member node.
   bool Touch(uint32_t anchor) {
     auto found=lists_.find(anchor);
@@ -149,7 +154,9 @@ class NativeStaticWalkPlans {
   }
   // Incremental: the leaf set is recollected only when the tree epoch moved; a
   // list is re-read only when a Touch dropped its plan or its header differs;
-  // a clean list whose sources moved only has its candidates refreshed.
+  // a clean list whose sources moved only has its candidates refreshed. A
+  // caller that needs no candidates (the full frame reads only membership)
+  // passes a constant revision and an empty find: no list is ever refreshed.
   template<class Reader,class Find>
   void Publish(const Reader& r,uint32_t world,uint64_t tree_epoch,uint64_t sources_revision,Find&& find) {
     auto& entry=worlds_[world];
@@ -172,6 +179,7 @@ class NativeStaticWalkPlans {
         slot.plan=std::move(next); ++stats_.refreshes; continue;
       }
       auto plan=ReadNativeStaticWalkList(r,world,list,++next_membership_,sources_revision,find);
+      if(anchors_) { anchors_->Add(list); for(const auto& member:plan->members) anchors_->Add(member.node); }
       for(const auto node:slot.indexed) { const auto at=nodes_.find(node); if(at!=nodes_.end() && at->second==list) nodes_.erase(at); }
       slot.indexed.clear(); slot.indexed.reserve(plan->members.size());
       for(const auto& member:plan->members) { nodes_[member.node]=list; slot.indexed.push_back(member.node); }
@@ -188,6 +196,17 @@ class NativeStaticWalkPlans {
       const auto slot=lists_.find(list);
       if(slot!=lists_.end() && slot->second.plan && slot->second.plan->world==world) visit(*slot->second.plan);
     }
+  }
+  // The same plans, retained (immutable; readable without the owner's lock).
+  std::vector<std::shared_ptr<const NativeStaticWalkList>> AcquirePlans(uint32_t world) const {
+    std::vector<std::shared_ptr<const NativeStaticWalkList>> plans;
+    const auto found=worlds_.find(world);
+    if(found==worlds_.end()) return plans;
+    for(const auto list:found->second.lists) {
+      const auto slot=lists_.find(list);
+      if(slot!=lists_.end() && slot->second.plan && slot->second.plan->world==world) plans.push_back(slot->second.plan);
+    }
+    return plans;
   }
   const Stats& stats() const { return stats_; }
   size_t lists() const { return lists_.size(); }
@@ -209,6 +228,7 @@ class NativeStaticWalkPlans {
   std::map<uint32_t,World> worlds_;
   std::atomic<uint64_t> touches_{0};
   uint64_t next_membership_=0;
+  NativeAddressFilter* anchors_=nullptr;
   Stats stats_;
 };
 // edf_native_scene_static_walk_audit: plan-driven classification next to the

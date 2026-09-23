@@ -75,7 +75,12 @@ PHASES = ('engine.render_helper', 'render.queued', 'render.material_group', 'ren
           # frame, its per-view scene begin, each pass in order, and its end.
           'frame.native', 'frame.native.begin', 'frame.native.static_world', 'frame.native.models',
           'frame.native.sky', 'frame.native.effects', 'frame.native.transparent', 'frame.native.post',
-          'frame.native.end', 'frame.native.view_overlays', 'frame.native.phases')
+          'frame.native.end', 'frame.native.view_overlays', 'frame.native.phases',
+          # The simulation-step publication (821A4DE8 exit, 820B4250 post-hook)
+          # inside engine.simulation_dispatch. Inclusive of each step's own
+          # lock waits; sim.lock_wait isolates the bridge-lock acquisitions.
+          'engine.simulation_dispatch', 'sim.registry', 'sim.static_walk', 'sim.preload_geometry', 'sim.preload_material',
+          'sim.trees', 'sim.membership', 'sim.publish', 'sim.poses', 'sim.lock_wait')
 # The first scene draw after the loading screen. Loading takes anywhere from
 # seconds to minutes, so windows are measured from here, not from launch.
 ENTRY = 'Native indexed input: draw=1,'
