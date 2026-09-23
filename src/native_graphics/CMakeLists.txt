@@ -18,6 +18,10 @@ if(WIN32)
     target_sources(edf_native_d3d11 PRIVATE d3d11_shared_surface.cpp)
     add_library(edf_native_d3d12 STATIC d3d12_device.cpp d3d12_descriptors.cpp d3d12_pipeline.cpp d3d12_buffer_pool.cpp native_disk_cache.cpp d3d12_backend.cpp native_parallel_recorder.cpp native_backend_present.cpp native_backend_compositor.cpp native_backend_ui.cpp)
     target_link_libraries(edf_native_d3d12 PUBLIC edf_native_effects d3d12 dxgi d3dcompiler OneCore bcrypt)
+    # FidelityFX API: vendored headers only, the DLL is loaded at run time
+    # (native_ffx.h). No import library, so a missing DLL cannot stop startup.
+    target_sources(edf_native_d3d12 PRIVATE native_ffx.cpp)
+    target_include_directories(edf_native_d3d12 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party)
 
     add_executable(edf_native_backend_bench ../../tools/native_backend_bench.cpp)
     target_link_libraries(edf_native_backend_bench PRIVATE edf_native_d3d12 d3d11 d3dcompiler)
@@ -77,6 +81,11 @@ if(WIN32)
         add_executable(edf_native_d3d12_backend_tests ../../tests/native_d3d12_backend_tests.cpp)
         target_link_libraries(edf_native_d3d12_backend_tests PRIVATE edf_native_d3d12)
         add_test(NAME edf_native_d3d12_backend_tests COMMAND edf_native_d3d12_backend_tests)
+        # FSR foundations on WARP: depth SRV, compute-writable textures, raw
+        # D3D12 passes and their ordering, scissor rounding, the FFX loader.
+        add_executable(edf_native_fsr_foundation_tests ../../tests/native_fsr_foundation_tests.cpp)
+        target_link_libraries(edf_native_fsr_foundation_tests PRIVATE edf_native_d3d12)
+        add_test(NAME edf_native_fsr_foundation_tests COMMAND edf_native_fsr_foundation_tests)
         add_executable(edf_native_gpu_timing_tests ../../tests/native_gpu_timing_tests.cpp)
         target_link_libraries(edf_native_gpu_timing_tests PRIVATE edf_native_d3d12)
         add_test(NAME edf_native_gpu_timing_tests COMMAND edf_native_gpu_timing_tests)

@@ -2,6 +2,7 @@
 #include "native_render_state_decode.h"
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -211,6 +212,17 @@ struct NativeBackendViewport {
 struct NativeBackendScissor {
   int32_t left=0,top=0,right=0,bottom=0;
 };
+// The scissor a viewport implies when none is set: rounded outward (floor the
+// origin, ceil the far edge), so a fractional viewport - a sub-pixel jitter
+// offset - never loses a column or row it partly covers to the scissor. The
+// viewport's own implicit clip still bounds what is drawn (WARP measured: no
+// pixel at or right of trunc(x+width), even with a wider scissor), so this
+// only ever removes a clip and never adds coverage. Whole-pixel viewports give
+// exactly what truncation gave.
+inline NativeBackendScissor NativeViewportScissor(const NativeBackendViewport& viewport) {
+  return {int32_t(std::floor(viewport.x)),int32_t(std::floor(viewport.y)),
+          int32_t(std::ceil(viewport.x+viewport.width)),int32_t(std::ceil(viewport.y+viewport.height))};
+}
 
 // Constant bytes a packet recorder owns for a whole frame and may bind many
 // times, from several recording threads. A backend that stages constants in
@@ -336,6 +348,21 @@ class NativeBackendRecorder {
   // backend there is nothing to ask the device.
   virtual void PushState()=0;
   virtual void PopState()=0;
+
+  // External work recorded straight into a backend command list (FFX, see
+  // NativeD3D12RawAccess). BeginExternal returns the recorder whose list is
+  // the tail of this recorder's stream: everything recorded here before the
+  // call executes before whatever is written into that list next, and
+  // everything recorded here after EndExternal executes after it. A packet
+  // recorder flushes to get there (its pending draws are replayed on recorder
+  // 0, or recorded by its workers and submitted); a direct recorder returns
+  // itself. Nothing may be recorded through this recorder between the two.
+  // EndExternal forgets every binding, as at the start of a frame: pipeline,
+  // targets, viewport, scissor, constants, streams, textures, samplers and
+  // blend factor must all be set again before the next draw. A packet
+  // recorder re-sends its own captured state by itself.
+  virtual NativeBackendRecorder& BeginExternal() { return *this; }
+  virtual void EndExternal() {}
 };
 // Diagnostics only (edf_native_shadow_render's draw lists): a recorder that
 // forwards every call to the one it wraps, observing what passes. While a
@@ -441,8 +468,40 @@ struct NativeBackendTextureDesc {
   // conversion passes need exactly this: read the surface, write the
   // converted result. Refused together with multisampling, which would need a
   // resolve and so a second resource - say what you mean instead.
+  //
+  // On a depth target this is the depth plane as an SRV: the resource is
+  // created typeless (D32_FLOAT_S8X24_UINT as R32G8X24_TYPELESS, D32_FLOAT as
+  // R32_TYPELESS, D24_UNORM_S8_UINT as R24G8_TYPELESS; see
+  // NativeDepthViewFormats), the DSV keeps `format`, and texture() samples
+  // depth as its .r. Single-sampled only, like colour.
   bool sampled=false;
+  // Writable by compute (D3D12 ALLOW_UNORDERED_ACCESS): CreateTexture, and
+  // CreateRenderTarget for a single-sampled colour target. RGBA16F, R8_UNORM,
+  // R16G16_FLOAT and the other typed-UAV formats; the backend refuses the
+  // combination where the API does. No UAV descriptor is made - the only
+  // writers are raw passes (NativeD3D12RawAccess), which build their own.
+  // Refused by a backend with no compute path (D3D11).
+  bool unordered_access=false;
+  // The depth value a depth target declares as its optimized clear. It must
+  // be what the target is actually cleared to or every clear is a slow one.
+  // 1 is forward Z; the full-frame scene is reversed-Z and clears to 0.
+  float clear_depth=1.0f;
 };
+
+// A depth format's typeless resource format and its depth-plane SRV format,
+// for a depth target declared `sampled`. Zeroes for a format that is not a
+// depth format the renderer creates. DXGI codes, so no API header is needed.
+struct NativeDepthViewFormats { uint32_t resource=0,shader=0; };
+inline NativeDepthViewFormats DescribeNativeDepthViewFormats(uint32_t depth_format) {
+  switch(depth_format) {
+    case 20: return {19,21};  // D32_FLOAT_S8X24_UINT: R32G8X24_TYPELESS, R32_FLOAT_X8X24_TYPELESS
+    case 40: return {39,41};  // D32_FLOAT: R32_TYPELESS, R32_FLOAT
+    case 45: return {44,46};  // D24_UNORM_S8_UINT: R24G8_TYPELESS, R24_UNORM_X8_TYPELESS
+    default: return {};
+  }
+}
+
+class NativeD3D12RawAccess;
 
 class NativeRenderBackend {
  public:
@@ -583,6 +642,11 @@ class NativeRenderBackend {
   // queue this is a queue signal, so it must follow Submit; on one without, the
   // context's own ordering already places it after the copy.
   virtual uint64_t SignalShared(NativeBackendSharedSurface& surface)=0;
+
+  // The D3D12 objects behind this backend (native_d3d12_raw.h), for work the
+  // seam does not express - FidelityFX. Null on every other backend, which a
+  // caller must treat as "not available here" rather than as an error.
+  virtual NativeD3D12RawAccess* D3D12Raw() { return nullptr; }
 };
 
 // Backends register here; selection is by name so a run can A/B them without a

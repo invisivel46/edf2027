@@ -613,7 +613,7 @@ float4 PS(V v) : SV_TARGET { return v.color; }
 // serial. The recorder may share, intern and upload those images however it
 // likes and hand the draws to its workers whenever it likes; what the lists
 // draw must be exactly what was asked for, in the order it was asked.
-struct FakeTimestamps final : NativeBackendTimestamps {
+struct SceneTimestamps final : NativeBackendTimestamps {
   uint32_t capacity() const override { return 64; }
 };
 struct RecorderSceneObjects {
@@ -621,7 +621,7 @@ struct RecorderSceneObjects {
   FakeTexture textures[5];
   FakeTarget target;
   FakeBuffer vertices, indices, update_target;
-  FakeTimestamps timestamps;
+  SceneTimestamps timestamps;
   RecorderSceneObjects() {
     vertices.data = TaggedVertices(3, 96, 8);
     for (uint16_t index = 0; index < 96; ++index) {

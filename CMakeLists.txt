@@ -402,9 +402,35 @@ message(STATUS "EDF2027 renderer: native D3D12 scene/composition/presentation/co
 # Some SDK builds directly import FidelityFX from rexruntime.dll, even when no
 # GPU plugin/upscaler is active. Satisfy that loader dependency without exposing
 # unsupported native upscaling controls. This is not the Xenos plugin.
+#
+# Which amd_fidelityfx_dx12.dll: the native FSR path (native_ffx.h) loads it at
+# run time, and wants AMD's signed prebuilt, which carries the frame-generation
+# provider the SDK's own build (FFX_API_ENABLE_FRAMEGEN_PROVIDER OFF) leaves
+# out. It exports the same five entry points (ffxCreateContext, ffxDestroyContext,
+# ffxConfigure, ffxQuery, ffxDispatch), so rexruntime.dll's direct import of
+# four of them is satisfied either way; the SDK presenter that would call them
+# is never created in native mode. Its providers (ffxQuery GET_VERSIONS, run by
+# edf_native_fsr_foundation_tests): upscale 3.1.4 and 2.3.3, the same as the
+# SDK build's, plus frame generation 1.1.3. It also imports VCRUNTIME140_1.dll,
+# USER32 and WINMM, which the SDK build does not. An option because it swaps a
+# binary the SDK itself loads: OFF, or a signed DLL that is not on disk, stages
+# the SDK's DLL exactly as before.
+option(EDF2027_FFX_SIGNED_DLL "Stage AMD's signed amd_fidelityfx_dx12.dll (with frame generation) instead of the SDK build's" ON)
+set(EDF2027_FFX_SIGNED_DLL_PATH
+    ${EDF2027_SDK_ROOT}/../../rexglue-sdk/out/build/win-amd64/_deps/fidelityfx-src/PrebuiltSignedDLL/amd_fidelityfx_dx12.dll
+    CACHE FILEPATH "AMD's signed amd_fidelityfx_dx12.dll (FidelityFX-SDK PrebuiltSignedDLL)")
 set(EDF2027_SDK_AUX_DLLS)
-if(TARGET rex::amd_fidelityfx_dx12)
+if(EDF2027_FFX_SIGNED_DLL AND EXISTS ${EDF2027_FFX_SIGNED_DLL_PATH})
+    get_filename_component(_ffx_signed ${EDF2027_FFX_SIGNED_DLL_PATH} ABSOLUTE)
+    message(STATUS "EDF2027 FidelityFX: staging signed ${_ffx_signed}")
+    list(APPEND EDF2027_SDK_AUX_DLLS ${_ffx_signed})
+elseif(TARGET rex::amd_fidelityfx_dx12)
+    if(EDF2027_FFX_SIGNED_DLL)
+        message(STATUS "EDF2027 FidelityFX: signed DLL not found at ${EDF2027_FFX_SIGNED_DLL_PATH}; staging the SDK's (no frame generation)")
+    endif()
     list(APPEND EDF2027_SDK_AUX_DLLS $<TARGET_FILE:rex::amd_fidelityfx_dx12>)
+endif()
+if(EDF2027_SDK_AUX_DLLS)
     add_custom_command(TARGET edf2027 POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${EDF2027_SDK_AUX_DLLS} $<TARGET_FILE_DIR:edf2027>/
         VERBATIM)
@@ -415,6 +441,15 @@ if(TARGET rex::amd_fidelityfx_dx12)
                 VERBATIM)
         endif()
     endforeach()
+    # The FFX loader test is defined in src/native_graphics, where a POST_BUILD
+    # from here cannot attach, so the same DLL is staged by a dependency.
+    if(TARGET edf_native_fsr_foundation_tests)
+        add_custom_target(edf_native_fsr_foundation_ffx_dll
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${EDF2027_SDK_AUX_DLLS}
+                    $<TARGET_FILE_DIR:edf_native_fsr_foundation_tests>/
+            VERBATIM)
+        add_dependencies(edf_native_fsr_foundation_tests edf_native_fsr_foundation_ffx_dll)
+    endif()
 endif()
 
 # Which runtime DLLs an SDK install ships depends on how it was configured (Tracy is

@@ -57,7 +57,8 @@ uint8_t Channel(uint32_t pixel, uint32_t mask, uint8_t absent) {
 }
 }
 NativeDepthTarget CreateNativeDepthTarget(NativeRenderBackend& backend,uint32_t width,
-                                          uint32_t height,DXGI_FORMAT format,uint32_t samples) {
+                                          uint32_t height,DXGI_FORMAT format,uint32_t samples,
+                                          float clear_depth,bool sampled) {
   if (!width || !height || width>16384 || height>16384 ||
       (format!=DXGI_FORMAT_D24_UNORM_S8_UINT && format!=DXGI_FORMAT_D32_FLOAT &&
        format!=DXGI_FORMAT_D32_FLOAT_S8X24_UINT))
@@ -67,6 +68,10 @@ NativeDepthTarget CreateNativeDepthTarget(NativeRenderBackend& backend,uint32_t 
   NativeBackendTextureDesc desc{};
   desc.width=width; desc.height=height; desc.levels=1;
   desc.format=format; desc.samples=samples; desc.depth=true;
+  if (!std::isfinite(clear_depth) || clear_depth<0 || clear_depth>1)
+    throw std::runtime_error("native depth target clear value outside [0,1]");
+  desc.clear_depth=clear_depth;
+  desc.sampled=sampled && samples<=1;
   result.backend_target=backend.CreateRenderTarget(desc);
   if(!result.backend_target) throw std::runtime_error("native depth target creation failed");
   result.surface=NativeD3D11RenderTargetResource(*result.backend_target);

@@ -343,6 +343,9 @@ class NativeDrawListRecorder final : public NativeBackendRecorderTap {
     if(!stack_.empty()) { state_=std::move(stack_.back()); stack_.pop_back(); }
     Inner().PopState();
   }
+  // Raw passes are not draws: nothing to list, only the ordering to keep.
+  NativeBackendRecorder& BeginExternal() override { return Inner().BeginExternal(); }
+  void EndExternal() override { Inner().EndExternal(); }
 
  private:
   static constexpr uint32_t kStages=3,kSlots=16;

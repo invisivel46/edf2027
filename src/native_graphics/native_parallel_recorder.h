@@ -73,6 +73,11 @@ class NativeParallelRecorder final : public NativeBackendRecorder {
   void ResolveTimestamps(NativeBackendTimestamps&,uint32_t,uint32_t) override;
   void PushState() override;
   void PopState() override;
+  // Flushes (so recorder 0 is the tail of the stream) and hands out recorder
+  // 0; EndExternal forwards to it and makes the next serial draw re-send its
+  // whole state. Producer state and saved states survive, like a clear.
+  NativeBackendRecorder& BeginExternal() override;
+  void EndExternal() override;
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

@@ -68,8 +68,13 @@ struct NativeDepthTarget {
 };
 // Native host depth storage. Guest depth format mapping and explicit
 // depth resolves are separate contracts; no implicit conversion is performed.
+// `clear_depth` is the optimized clear the target declares (0 for the
+// reversed-Z scene); `sampled` gives a single-sampled target a depth-plane
+// SRV as backend_target->texture() (NativeBackendTextureDesc::sampled) and is
+// ignored when multisampled, so a caller may ask for it unconditionally.
 NativeDepthTarget CreateNativeDepthTarget(NativeRenderBackend& backend,uint32_t width,
-                                          uint32_t height,DXGI_FORMAT format,uint32_t samples=1);
+                                          uint32_t height,DXGI_FORMAT format,uint32_t samples=1,
+                                          float clear_depth=1.0f,bool sampled=false);
 void ClearNativeDepthTarget(ID3D11DeviceContext& context,NativeDepthTarget& target,
                             bool depth,bool stencil,float depth_value,uint8_t stencil_value);
 void ClearNativeDepthTarget(NativeBackendRecorder& recorder,NativeDepthTarget& target,

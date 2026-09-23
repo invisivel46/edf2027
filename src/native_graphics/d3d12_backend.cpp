@@ -1,6 +1,7 @@
 #include "d3d12_backend.h"
 #include "d3d12_buffer_pool.h"
 #include "d3d12_pipeline.h"
+#include "native_d3d12_raw.h"
 #include "native_parallel_recorder.h"
 #include <algorithm>
 #include <atomic>
@@ -505,10 +506,10 @@ class D3D12Recorder final : public NativeBackendRecorder {
     Commands().RSSetViewports(1,&native);
     // D3D12 clips nothing without a scissor rectangle, so a viewport with no
     // scissor set would draw outside itself. Default it to the viewport; an
-    // explicit SetScissor overrides this.
-    const D3D12_RECT rect{static_cast<LONG>(viewport.x),static_cast<LONG>(viewport.y),
-                          static_cast<LONG>(viewport.x+viewport.width),
-                          static_cast<LONG>(viewport.y+viewport.height)};
+    // explicit SetScissor overrides this. Rounded outward, see
+    // NativeViewportScissor: identical to truncation for whole pixels.
+    const auto scissor=NativeViewportScissor(viewport);
+    const D3D12_RECT rect{scissor.left,scissor.top,scissor.right,scissor.bottom};
     bound_.viewport_scissor=rect;
     Commands().RSSetScissorRects(1,bound_.scissor_enabled?&bound_.scissor:&bound_.viewport_scissor);
   }
@@ -686,6 +687,20 @@ class D3D12Recorder final : public NativeBackendRecorder {
     bound_.textures_dirty=true;
     bound_.samplers_dirty=true;
   }
+  // After raw work (NativeD3D12RawAccess::RecordRaw), which may have set its
+  // own heaps, root signatures, pipeline and targets: put back what Begin set
+  // and forget the rest. The one-frame table memos stay - the tables they
+  // name are untouched ring slots of this frame and are re-bound, not reused
+  // blindly, on the next flush. The state stack is kept for a caller that
+  // pops across the pass; PopState marks textures and samplers dirty.
+  void EndExternal() override {
+    ID3D12DescriptorHeap* heaps[]={gpu_->view_heap(),gpu_->samplers().heap()};
+    Commands().SetDescriptorHeaps(2,heaps);
+    Commands().SetGraphicsRootSignature(signature_);
+    bound_={};
+  }
+  // The list raw work records into; valid between Begin and End.
+  ID3D12GraphicsCommandList& RawCommands() { return Commands(); }
 
  private:
   ID3D12GraphicsCommandList& Commands() {
@@ -866,7 +881,7 @@ class D3D12Completion final : public NativeBackendCompletion {
   uint64_t value_;
 };
 
-class D3D12Backend final : public NativeRenderBackend {
+class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAccess {
  public:
   explicit D3D12Backend(const NativeD3D12Options& options)
       : gpu_(options),
@@ -989,6 +1004,10 @@ class D3D12Backend final : public NativeRenderBackend {
     description.MipLevels=static_cast<UINT16>(desc.levels?desc.levels:1);
     description.Format=static_cast<DXGI_FORMAT>(desc.format);
     description.SampleDesc={1,0};
+    if(desc.unordered_access) {
+      if(desc.samples>1) throw std::runtime_error("a multisampled texture cannot be written by compute");
+      description.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    }
     RequireDevice(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
                                                         *tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
                   "texture creation");
@@ -1038,22 +1057,34 @@ class D3D12Backend final : public NativeRenderBackend {
                                      D3D12_MEMORY_POOL_UNKNOWN,0,0};
     if(desc.sampled && desc.samples>1)
       throw std::runtime_error("a multisampled target cannot be sampled directly; resolve it into a texture");
+    if(desc.unordered_access && (desc.depth || desc.samples>1))
+      throw std::runtime_error("only a single-sampled colour target can be written by compute");
+    // A sampled depth target is typeless underneath: the DSV names the depth
+    // format and the SRV the depth plane. A typed depth resource cannot have
+    // an SRV at all. Everything else keeps its typed format, so a target that
+    // is not sampled is created exactly as it always was.
+    const auto view_formats=DescribeNativeDepthViewFormats(desc.format);
+    if(desc.depth && desc.sampled && !view_formats.resource)
+      throw std::runtime_error("depth format "+std::to_string(desc.format)+" has no sampled form");
+    const bool sampled_depth=desc.depth && desc.sampled;
     D3D12_RESOURCE_DESC description{};
     description.Dimension=D3D12_RESOURCE_DIMENSION_TEXTURE2D;
     description.Width=desc.width;
     description.Height=desc.height;
     description.DepthOrArraySize=1;
     description.MipLevels=1;
-    description.Format=static_cast<DXGI_FORMAT>(desc.format);
+    description.Format=static_cast<DXGI_FORMAT>(sampled_depth?view_formats.resource:desc.format);
     description.SampleDesc={desc.samples?desc.samples:1,0};
     description.Flags=desc.depth?D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
                                 :D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    if(desc.unordered_access) description.Flags|=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     *tracked.state=desc.depth?D3D12_RESOURCE_STATE_DEPTH_WRITE:D3D12_RESOURCE_STATE_RENDER_TARGET;
     // A clear value must be declared up front or every clear is a slow path,
-    // and it must match what is actually cleared or validation complains.
+    // and it must match what is actually cleared or validation complains. In
+    // the view format, which for a typeless depth resource is the DSV's.
     D3D12_CLEAR_VALUE clear{};
-    clear.Format=description.Format;
-    if(desc.depth) clear.DepthStencil={1.0f,0};
+    clear.Format=static_cast<DXGI_FORMAT>(desc.format);
+    if(desc.depth) clear.DepthStencil={desc.clear_depth,0};
     Require(gpu_.device()->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&description,
                                                    *tracked.state,&clear,IID_PPV_ARGS(&tracked.resource)),
             "render target creation");
@@ -1063,7 +1094,7 @@ class D3D12Backend final : public NativeRenderBackend {
     const bool multisampled=description.SampleDesc.Count>1;
     if(desc.depth) {
       D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
-      dsv.Format=description.Format;
+      dsv.Format=static_cast<DXGI_FORMAT>(desc.format);
       dsv.ViewDimension=multisampled?D3D12_DSV_DIMENSION_TEXTURE2DMS:D3D12_DSV_DIMENSION_TEXTURE2D;
       gpu_.device()->CreateDepthStencilView(shared->resource.Get(),&dsv,view);
     } else {
@@ -1076,7 +1107,7 @@ class D3D12Backend final : public NativeRenderBackend {
     if(desc.sampled) {
       const auto srv_handle=texture_views_.Allocate();
       D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-      srv.Format=description.Format;
+      srv.Format=sampled_depth?static_cast<DXGI_FORMAT>(view_formats.shader):description.Format;
       srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
       srv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;
       srv.Texture2D.MipLevels=1;
@@ -1648,6 +1679,63 @@ class D3D12Backend final : public NativeRenderBackend {
       throw std::runtime_error(std::string("D3D12 present failed: the device was removed - ")+
                                RemovedReason()+SharedWaitState());
     Require(result,"present");
+  }
+
+  // Raw access (native_d3d12_raw.h).
+  NativeD3D12RawAccess* D3D12Raw() override { return this; }
+  ID3D12Device* Device() const override { return gpu_.device(); }
+  ID3D12CommandQueue* Queue() const override { return gpu_.queue(); }
+  static TrackedResource& Tracked(NativeBackendTexture& texture) {
+    auto* concrete=dynamic_cast<D3D12Texture*>(&texture);
+    if(!concrete) throw std::runtime_error("raw access was given a texture from another backend");
+    return concrete->tracked();
+  }
+  static TrackedResource& Tracked(NativeBackendRenderTarget& target) {
+    auto* concrete=dynamic_cast<D3D12RenderTarget*>(&target);
+    if(!concrete) throw std::runtime_error("raw access was given a render target from another backend");
+    return concrete->tracked();
+  }
+  ID3D12Resource* Resource(NativeBackendTexture& texture) const override { return Tracked(texture).resource.Get(); }
+  ID3D12Resource* Resource(NativeBackendRenderTarget& target) const override { return Tracked(target).resource.Get(); }
+  void RecordRaw(NativeBackendRecorder& recorder,std::span<const NativeD3D12RawUse> uses,
+                 const std::function<void(NativeD3D12RawPass&)>& body) override {
+    if(parallel_failure_) std::rethrow_exception(parallel_failure_);
+    if(!open_) throw std::runtime_error("a raw pass needs an open frame; call BeginFrame first");
+    // Resolved before anything is flushed, so a bad argument changes nothing.
+    std::vector<std::pair<TrackedResource*,D3D12_RESOURCE_STATES>> wanted;
+    wanted.reserve(uses.size());
+    for(const auto& use:uses) {
+      if(!use.texture==!use.target) throw std::runtime_error("a raw pass use names exactly one of texture or target");
+      wanted.emplace_back(use.texture?&Tracked(*use.texture):&Tracked(*use.target),use.state);
+    }
+    auto& tail=recorder.BeginExternal();
+    D3D12Recorder* direct=nullptr;
+    for(auto& owned:recorders_) if(owned.get()==&tail) direct=owned.get();
+    if(!direct) {
+      recorder.EndExternal();
+      throw std::runtime_error("a raw pass was given a recorder this D3D12 backend does not own");
+    }
+    struct Pass final : NativeD3D12RawPass {
+      D3D12Backend* backend; D3D12Recorder* recorder;
+      ID3D12Device* device() const override { return backend->gpu_.device(); }
+      ID3D12GraphicsCommandList* commands() const override { return &recorder->RawCommands(); }
+      ID3D12CommandQueue* queue() const override { return backend->gpu_.queue(); }
+      void Transition(NativeBackendTexture& texture,D3D12_RESOURCE_STATES state) override {
+        recorder->Transition(Tracked(texture),state);
+      }
+      void Transition(NativeBackendRenderTarget& target,D3D12_RESOURCE_STATES state) override {
+        recorder->Transition(Tracked(target),state);
+      }
+    } pass;
+    pass.backend=this; pass.recorder=direct;
+    try {
+      for(auto& [tracked,state]:wanted) direct->Transition(*tracked,state);
+      body(pass);
+    } catch(...) {
+      recorder.EndExternal();
+      throw;
+    }
+    recorder.EndExternal();
   }
 
   NativeD3D12Device& gpu() { return gpu_; }

@@ -196,6 +196,8 @@ REXCVAR_DEFINE_INT32(edf_native_render_width, 0, "EDF2027",
                     "Native render width at startup; 0 preserves the original scene size (restart required)");
 REXCVAR_DEFINE_INT32(edf_native_msaa, 0, "EDF2027",
                     "Native scene samples: 0 game default, 1 off, 2 or 4 MSAA (restart required)");
+REXCVAR_DEFINE_BOOL(edf_native_scene_depth_srv, false, "EDF2027",
+                   "Create a single-sampled native scene depth shader-readable (typeless, with a depth SRV) for FSR; ignored with MSAA (restart required)");
 REXCVAR_DEFINE_INT32(edf_native_render_height, 0, "EDF2027",
                     "Native render height at startup; paired with render width (restart required)");
 REXCVAR_DEFINE_STRING(edf_native_scene_capture, "", "EDF2027",
@@ -7896,7 +7898,7 @@ void NativeShadowFrame::Run(const NativeFrameContext& frame,uint32_t context,uin
     if(targets.backend!=backend_ || targets.width!=width || targets.height!=height || targets.samples!=scene.samples ||
        targets.output_format!=scene.output.format) {
       targets.color=CreateNativeRenderTarget(*backend_,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,scene.samples);
-      targets.depth=CreateNativeDepthTarget(*backend_,width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,scene.samples);
+      targets.depth=CreateNativeDepthTarget(*backend_,width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,scene.samples,0.0f);
       targets.output=CreateNativeRenderTarget(*backend_,scene.output.sampled.width,scene.output.sampled.height,DXGI_FORMAT(scene.output.format));
       targets.backend=backend_; targets.width=width; targets.height=height; targets.samples=scene.samples;
       targets.output_format=scene.output.format;
@@ -12395,9 +12397,13 @@ REX_HOOK_RAW(sub_8219C7A8) {
       const uint32_t samples=edf::native::NativeSceneSamples(creation.msaa,sample_override);
       auto found=state.scenes.find(owner);
       if (found==state.scenes.end() || found->second.color.sampled.width!=width || found->second.color.sampled.height!=height || found->second.samples!=samples) {
+        // Reversed-Z: the scene clears depth to 0, so that is its declared
+        // optimized clear. The SRV is opt-in and single-sampled only.
+        static const bool depth_srv=REXCVAR_GET(edf_native_scene_depth_srv);
         edf::native::NativeScene scene{
           edf::native::CreateNativeRenderTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,samples),
-          edf::native::CreateNativeDepthTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples)};
+          edf::native::CreateNativeDepthTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples,
+            0.0f,depth_srv)};
         scene.samples=samples;
         found=state.scenes.insert_or_assign(owner,std::move(scene)).first;
         REXLOG_INFO("Native full scene allocated: owner={:#x}, {}x{}, samples={}, guest_surface={:#x}",owner,width,height,samples,color_surface);

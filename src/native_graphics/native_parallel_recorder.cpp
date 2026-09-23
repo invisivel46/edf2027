@@ -786,6 +786,11 @@ void NativeParallelRecorder::WriteTimestamp(NativeBackendTimestamps& set,uint32_
 void NativeParallelRecorder::ResolveTimestamps(NativeBackendTimestamps& set,uint32_t first,uint32_t count) {
   impl_->Mark({0,&set,first,count,true});
 }
+NativeBackendRecorder& NativeParallelRecorder::BeginExternal() {
+  Flush(); impl_->serial_previous.reset();
+  return impl_->recorders[0]->BeginExternal();
+}
+void NativeParallelRecorder::EndExternal() { impl_->recorders[0]->EndExternal(); impl_->serial_previous.reset(); }
 void NativeParallelRecorder::PushState() { impl_->stack.push_back(impl_->state); }
 void NativeParallelRecorder::PopState() {
   if(impl_->stack.empty()) throw std::runtime_error("parallel recorder state stack underflow");

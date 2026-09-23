@@ -541,6 +541,9 @@ class D3D11Backend final : public NativeRenderBackend {
 
   std::unique_ptr<NativeBackendTexture> CreateTexture(const NativeBackendTextureDesc& desc,
                                                       std::span<const uint8_t> initial) override {
+    // No compute path on this backend (no raw access), so nothing could ever
+    // write one: refused rather than created and silently never written.
+    if(desc.unordered_access) throw std::runtime_error("the D3D11 backend has no compute-writable textures");
     D3D11_TEXTURE2D_DESC description{};
     description.Width=desc.width;
     description.Height=desc.height;
@@ -592,12 +595,19 @@ class D3D11Backend final : public NativeRenderBackend {
   std::unique_ptr<NativeBackendRenderTarget> CreateRenderTarget(const NativeBackendTextureDesc& desc) override {
     if(desc.sampled && desc.samples>1)
       throw std::runtime_error("a multisampled target cannot be sampled directly; resolve it into a texture");
+    if(desc.unordered_access) throw std::runtime_error("the D3D11 backend has no compute-writable targets");
+    // A sampled depth target is typeless underneath, as on D3D12; see
+    // NativeBackendTextureDesc::sampled. Unsampled targets are unchanged.
+    const auto view_formats=DescribeNativeDepthViewFormats(desc.format);
+    const bool sampled_depth=desc.depth && desc.sampled;
+    if(sampled_depth && !view_formats.resource)
+      throw std::runtime_error("depth format "+std::to_string(desc.format)+" has no sampled form");
     D3D11_TEXTURE2D_DESC description{};
     description.Width=desc.width;
     description.Height=desc.height;
     description.MipLevels=1;
     description.ArraySize=1;
-    description.Format=static_cast<DXGI_FORMAT>(desc.format);
+    description.Format=static_cast<DXGI_FORMAT>(sampled_depth?view_formats.resource:desc.format);
     description.SampleDesc={desc.samples?desc.samples:1,0};
     description.Usage=D3D11_USAGE_DEFAULT;
     description.BindFlags=desc.depth?D3D11_BIND_DEPTH_STENCIL:D3D11_BIND_RENDER_TARGET;
@@ -606,12 +616,22 @@ class D3D11Backend final : public NativeRenderBackend {
     Require(device_->CreateTexture2D(&description,nullptr,&texture),"render target creation");
     ComPtr<ID3D11RenderTargetView> colour;
     ComPtr<ID3D11DepthStencilView> depth;
-    if(desc.depth) Require(device_->CreateDepthStencilView(texture.Get(),nullptr,&depth),"depth view creation");
+    if(sampled_depth) {
+      D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};
+      dsv.Format=static_cast<DXGI_FORMAT>(desc.format);
+      dsv.ViewDimension=D3D11_DSV_DIMENSION_TEXTURE2D;
+      Require(device_->CreateDepthStencilView(texture.Get(),&dsv,&depth),"depth view creation");
+    } else if(desc.depth) Require(device_->CreateDepthStencilView(texture.Get(),nullptr,&depth),"depth view creation");
     else Require(device_->CreateRenderTargetView(texture.Get(),nullptr,&colour),"render target view creation");
     std::unique_ptr<D3D11Texture> sampled;
     if(desc.sampled) {
       ComPtr<ID3D11ShaderResourceView> view;
-      Require(device_->CreateShaderResourceView(texture.Get(),nullptr,&view),"sampled target view creation");
+      D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
+      srv.Format=static_cast<DXGI_FORMAT>(view_formats.shader);
+      srv.ViewDimension=D3D11_SRV_DIMENSION_TEXTURE2D;
+      srv.Texture2D.MipLevels=1;
+      Require(device_->CreateShaderResourceView(texture.Get(),sampled_depth?&srv:nullptr,&view),
+              "sampled target view creation");
       sampled=std::make_unique<D3D11Texture>(texture,std::move(view),desc.width,desc.height);
     }
     return std::make_unique<D3D11RenderTarget>(std::move(texture),std::move(colour),std::move(depth),
