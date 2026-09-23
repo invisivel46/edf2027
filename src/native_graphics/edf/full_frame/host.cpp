@@ -566,7 +566,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // 820D3FD0) draw with them. The native effect and wire builders derive the
   // same eye from the pass camera themselves (NativeEffectEyeFromView), so
   // their stale_guest_eye diagnostic now counts only a failed write. Not
-  // replicated: 82135530(device,1); native passes take context.viewport.
+  // replicated here: native passes take context.viewport and their own depth
+  // state; 82135530(device,1), the depth test the guest listeners draw with,
+  // is replayed by ViewOverlays.
   bool BeginView(edf::native::NativeFrameContext& context) override {
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeBegin);
     const auto scene=context.view.scene;
@@ -704,8 +706,12 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // with the frame context, then the view's +16 (clPlayerCamera 820D3FD0:
   // follow/talk icons and the trajectory ribbon). Their draws reach the native
   // scene through the per-draw hooks, with the view globals BeginView wrote.
-  // Not called: clSgsCoreRender +8 (821BE9D8, 82135530(device,0)), the
-  // counterpart of the +4 setter the frame does not call either.
+  // Those hooks take the depth test from the device mirrors, so the guest
+  // view's depth bracket is replayed around them: clSgsCoreRender +4 ends
+  // with 82135530(device,1) (depth test on, 821BE9CC) and +8 (821BE9D8) is
+  // 82135530(device,0), after the view's +16. Without the first, the
+  // listeners inherited the previous frame's 82135530(device,0) (BindOutput,
+  // for the HUD) and the pickups drew over every model and wall in front.
   void ViewOverlays(edf::native::NativeFrameContext& context) override {
     // The guest listeners' per-render state follows this frame's tick gate
     // (native_render_tick_frame; the 821A5080 hook restores it on exit).
@@ -723,6 +729,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     } fsr_view_globals{*this};
     if(const auto& draw=edf::native::native_scene_draw_camera)
       edf::native::WriteNativeViewGlobals(reader_,draw->projection,draw->view);
+    const auto renderer=reader_.Word(kRenderer);
+    const auto device=renderer?reader_.Word(reader_.Add(renderer,8)):0u;
+    if(device) guest_(0x82135530,device,1,0,0x821BE9CC);
     RemainingGuestCall(0);
     const auto sentinel=[&] { return Word(2232); };
     for(auto node=reader_.Word(sentinel());node!=sentinel();) {
@@ -732,6 +741,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     }
     RemainingGuestCall(1);
     Virtual(context.view.scene,16,0,0,0x821A5294);
+    if(device) guest_(0x82135530,device,0,0,0x821A52AC);
   }
   // The view globals back to the unjittered pass camera after the jittered
   // ViewOverlays call. Nothing when the view is not jittered. Never throws.
