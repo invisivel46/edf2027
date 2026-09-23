@@ -3345,6 +3345,9 @@ void SubmitSceneFrameLocked(Bridge& state) {
       counts.geometry_transient_appends);
     REXLOG_INFO("Native world constants: reused={}, snapshot_bytes={} (full immutable constant images copied by the producer)",
       counts.geometry_world_constant_reuses,counts.geometry_constant_snapshot_bytes);
+    REXLOG_INFO("Native constant images: interned={}, interned_bytes={}, uploads={}, upload_reuses={}, streamed_jobs={} (binds of an image the frame already held and the bytes not copied; images staged once per submission and binds of a staged image; worker ranges handed over before their flush)",
+      counts.geometry_constant_interned,counts.geometry_constant_interned_bytes,
+      counts.geometry_constant_uploads,counts.geometry_constant_upload_reuses,counts.geometry_streamed_jobs);
     REXLOG_INFO("Native scene backend spend: frames={}, splits={}, operations_last_frame={}, "
       "upload_stalls={}, descriptor_stalls={}, pipelines={} (hits={}, misses={}), "
       "sampler_tables={} (hits={}, misses={}, evictions={}), retiring={}, "

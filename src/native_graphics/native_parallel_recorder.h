@@ -5,9 +5,14 @@
 namespace edf::native {
 // The producer captures resolved draw state; persistent workers record contiguous
 // ranges into independent command lists. Resource mutation is a flush boundary.
+// A batch's leading ranges are handed to workers while the producer is still
+// capturing it (sized from the same batch in the previous frame), so a flush
+// joins only the tail; lists are still submitted in draw order.
 // Immutable constant images and shared binding snapshots belong to the frame
 // and survive intermediate flushes and saved states; Reset retires them after
-// all recording has finished. Geometry and constant references stay per draw.
+// all recording has finished. Constant images are interned by content for the
+// frame and bound through SetConstantImage, so a backend can stage each one
+// once per submission. Geometry and constant references stay per draw.
 // The owner must call Forget before destroying any resource referenced here.
 class NativeParallelRecorder final : public NativeBackendRecorder {
  public:
@@ -16,6 +21,13 @@ class NativeParallelRecorder final : public NativeBackendRecorder {
     uint64_t serial_draws=0,serial_flushes=0;
     uint64_t instanced_draws=0,folded_draws=0;
     uint64_t world_constant_reuses=0,constant_snapshot_bytes=0;
+    // SetConstants calls bound to an image the frame already held (the
+    // slot's own binding or an interned equal image), and the bytes they did
+    // not copy. constant_snapshot_bytes counts only the copies still made.
+    uint64_t constant_interned=0,constant_interned_bytes=0;
+    // Worker ranges handed over while the producer was still capturing the
+    // batch, rather than at the flush that joins them.
+    uint64_t streamed_jobs=0;
     // Transient list draws appended to the draw before them (TryAppendTransient).
     uint64_t transient_appends=0;
     uint32_t max_concurrent=0;

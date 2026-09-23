@@ -436,6 +436,32 @@ class D3D12Recorder final : public NativeBackendRecorder {
     std::memcpy(upload.cpu,bytes.data(),bytes.size());
     Commands().SetGraphicsRootConstantBufferView(RootConstantSlot(stage,slot),upload.gpu);
   }
+  // A packet recorder's frame-owned image: staged once per submission, by
+  // whichever list binds it first, and bound by address from every list after
+  // that. All lists of a submission retire together with its fence, so a
+  // slice in another list's ring lives as long as this list does. Two lists
+  // racing to stage it each copy the same bytes; either address is right.
+  void SetConstantImage(NativeBackendStage stage, uint32_t slot,
+                        const NativeBackendConstantImage& image) override {
+    const auto root=RootConstantSlot(stage,slot);
+    const auto frame=gpu_->pending_fence();
+    D3D12_GPU_VIRTUAL_ADDRESS address=0;
+    if(image.staged_frame.load(std::memory_order_acquire)==frame) {
+      address=image.staged_address.load(std::memory_order_relaxed);
+      constant_upload_reuses_.fetch_add(1,std::memory_order_relaxed);
+    } else {
+      const auto upload=gpu_->Allocate(image.bytes.size(),
+                                       D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,index_);
+      std::memcpy(upload.cpu,image.bytes.data(),image.bytes.size());
+      address=upload.gpu;
+      image.staged_address.store(address,std::memory_order_relaxed);
+      image.staged_frame.store(frame,std::memory_order_release);
+      constant_uploads_.fetch_add(1,std::memory_order_relaxed);
+    }
+    Commands().SetGraphicsRootConstantBufferView(root,address);
+  }
+  uint64_t constant_uploads() const { return constant_uploads_.load(std::memory_order_relaxed); }
+  uint64_t constant_upload_reuses() const { return constant_upload_reuses_.load(std::memory_order_relaxed); }
   void SetTexture(NativeBackendStage stage, uint32_t slot, NativeBackendTexture* texture) override {
     if(stage!=NativeBackendStage::Pixel)
       throw std::runtime_error("this root signature declares no vertex-stage textures");
@@ -811,6 +837,8 @@ class D3D12Recorder final : public NativeBackendRecorder {
   NativeD3D12Device* gpu_;
   ID3D12RootSignature* signature_;
   uint32_t index_=0;
+  // Constant images staged and re-bound from a staged slice (SetConstantImage).
+  std::atomic<uint64_t> constant_uploads_{0},constant_upload_reuses_{0};
   ID3D12GraphicsCommandList* commands_=nullptr;
   struct TransitionState {
     ComPtr<ID3D12Resource> resource;
@@ -1447,6 +1475,13 @@ class D3D12Backend final : public NativeRenderBackend {
       out.geometry_transient_appends=geometry.transient_appends;
       out.geometry_world_constant_reuses=geometry.world_constant_reuses;
       out.geometry_constant_snapshot_bytes=geometry.constant_snapshot_bytes;
+      out.geometry_constant_interned=geometry.constant_interned;
+      out.geometry_constant_interned_bytes=geometry.constant_interned_bytes;
+      out.geometry_streamed_jobs=geometry.streamed_jobs;
+      for(const auto& recorder:recorders_) {
+        out.geometry_constant_uploads+=recorder->constant_uploads();
+        out.geometry_constant_upload_reuses+=recorder->constant_upload_reuses();
+      }
     }
     out.upload_stalls=gpu_.upload_stalls();
     out.descriptor_stalls=gpu_.descriptor_stalls();

@@ -22,6 +22,14 @@
 using Microsoft::WRL::ComPtr;
 using namespace edf::native;
 
+// A recorder counter, or 0 on a build whose statistics predate it, so the
+// recorder bench compiles against the baseline recorder it is compared with.
+#define RECORDER_STAT(stats, field)                                        \
+  ([](const auto& s) -> uint64_t {                                         \
+    if constexpr (requires { s.field; }) return uint64_t(s.field);         \
+    else return 0;                                                         \
+  }(stats))
+
 namespace {
 int failures = 0;
 void Check(bool ok, const std::string& message) {
@@ -143,10 +151,33 @@ class FrontEndRecorder final : public NativeBackendRecorder {
   void UpdateTexture(NativeBackendTexture&, std::span<const uint8_t>) override {}
   void BeginQuery(NativeBackendQuery&) override {}
   void EndQuery(NativeBackendQuery&) override {}
-  void PushState() override {}
-  void PopState() override {}
+  // Timestamps keep their place among the primitives: an entry with no
+  // vertices whose state names the set, the slots and whether it resolves.
+  void WriteTimestamp(NativeBackendTimestamps& set, uint32_t slot) override { Mark(set, slot, 1, false); }
+  void ResolveTimestamps(NativeBackendTimestamps& set, uint32_t first, uint32_t count) override {
+    Mark(set, first, count, true);
+  }
+  // Everything bound, saved and restored whole, as the interface promises.
+  void PushState() override {
+    saved_.push_back({pipeline_, topology_, blend_, streams_, indices_, index_offset_, constants_, textures_,
+                      samplers_, colors_, depth_, viewport_, scissor_, scissor_enabled_});
+  }
+  void PopState() override {
+    if (saved_.empty()) throw std::runtime_error("front end: PopState with nothing pushed");
+    auto& s = saved_.back();
+    pipeline_ = s.pipeline; topology_ = s.topology; blend_ = s.blend; streams_ = s.streams;
+    indices_ = s.indices; index_offset_ = s.index_offset; constants_ = s.constants; textures_ = s.textures;
+    samplers_ = s.samplers; colors_ = s.colors; depth_ = s.depth; viewport_ = s.viewport;
+    scissor_ = s.scissor; scissor_enabled_ = s.scissor_enabled;
+    saved_.pop_back();
+  }
 
  private:
+  void Mark(NativeBackendTimestamps& set, uint32_t first, uint32_t count, bool resolve) {
+    Primitive marker;
+    Put(marker.state, &set); Put(marker.state, first); Put(marker.state, count); Put(marker.state, resolve);
+    primitives.push_back(std::move(marker));
+  }
   struct Stream { std::vector<uint8_t> bytes; uint32_t stride = 0; };
   template <class T> static void Put(std::vector<uint8_t>& out, const T& value) {
     const auto* bytes = reinterpret_cast<const uint8_t*>(&value);
@@ -214,6 +245,23 @@ class FrontEndRecorder final : public NativeBackendRecorder {
   NativeBackendViewport viewport_{};
   NativeBackendScissor scissor_{};
   bool scissor_enabled_ = false;
+  struct Saved {
+    NativeBackendPipeline* pipeline;
+    NativeBackendTopology topology;
+    std::optional<std::array<float, 4>> blend;
+    std::array<Stream, 16> streams;
+    FakeBuffer* indices;
+    uint32_t index_offset;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint8_t>> constants;
+    std::map<std::pair<uint32_t, uint32_t>, NativeBackendTexture*> textures;
+    std::map<std::pair<uint32_t, uint32_t>, NativeBackendSampler*> samplers;
+    std::vector<NativeBackendRenderTarget*> colors;
+    NativeBackendRenderTarget* depth;
+    NativeBackendViewport viewport;
+    NativeBackendScissor scissor;
+    bool scissor_enabled;
+  };
+  std::vector<Saved> saved_;
 };
 struct FrontEndRun {
   std::vector<Primitive> primitives;
@@ -491,17 +539,419 @@ float4 PS(V v) : SV_TARGET { return v.color; }
   Check(lit > kSize * kSize / 4, "the transient batching scene drew almost nothing: " + std::to_string(lit));
   std::cout << "transient batching: WARP pixels equal, " << batched_appends << " appends, " << lit << " lit\n";
 }
+
+// ---------------------------------------------------------------------------
+// Packet recorder equivalence and cost.
+//
+// A frame shaped like the game's: runs of draws whose materials interleave, a
+// per-draw vertex image that differs only in its matrix, material constants
+// re-sent unchanged, textures, saved states, timestamps between draws, buffer
+// updates that split the frame into batches and a short run that stays
+// serial. The recorder may share, intern and upload those images however it
+// likes and hand the draws to its workers whenever it likes; what the lists
+// draw must be exactly what was asked for, in the order it was asked.
+struct FakeTimestamps final : NativeBackendTimestamps {
+  uint32_t capacity() const override { return 64; }
+};
+struct RecorderSceneObjects {
+  NativeBackendPipeline pipelines[3];
+  FakeTexture textures[5];
+  FakeTarget target;
+  FakeBuffer vertices, indices, update_target;
+  FakeTimestamps timestamps;
+  RecorderSceneObjects() {
+    vertices.data = TaggedVertices(3, 96, 8);
+    for (uint16_t index = 0; index < 96; ++index) {
+      indices.data.push_back(uint8_t(index)); indices.data.push_back(uint8_t(index >> 8));
+    }
+    update_target.data.resize(16);
+  }
+};
+// The producer side of one frame, `draws` per batch. The bytes of every
+// constant image depend only on (frame, draw, material), never on how the
+// recorder stores them.
+void RecordSceneFrame(NativeBackendRecorder& r, RecorderSceneObjects& o, uint32_t frame, uint32_t draws) {
+  NativeBackendRenderTarget* colors[] = {&o.target};
+  r.SetRenderTargets(colors, nullptr);
+  r.SetViewport({0, 0, 64, 64, 0, 1});
+  r.SetScissor({0, 0, 64, 64}, false);
+  r.SetTopology(NativeBackendTopology::TriangleList);
+  r.SetVertexBuffer(0, o.vertices, 8, 0);
+  r.SetIndexBuffer(o.indices, NativeBackendIndexFormat::Uint16, 0);
+  std::vector<uint8_t> world(4096), material(1024), pixel(256);
+  uint32_t last_material = ~0u;
+  auto run = [&](uint32_t first, uint32_t count) {
+    for (uint32_t draw = first; draw < first + count; ++draw) {
+      const uint32_t m = (draw * 7 + frame) % 12;
+      for (size_t i = 0; i < world.size(); ++i) world[i] = uint8_t(m * 13 + i * 3);
+      for (size_t i = 0; i < 64; ++i) world[i] = uint8_t(draw * 5 + frame + i);
+      for (size_t i = 0; i < material.size(); ++i) material[i] = uint8_t(m * 29 + i);
+      for (size_t i = 0; i < pixel.size(); ++i) pixel[i] = uint8_t(m * 17 + i * 5);
+      r.SetPipeline(o.pipelines[m % 3]);
+      r.SetConstants(NativeBackendStage::Vertex, 0, world);
+      // Material constants re-sent with every draw, as the scene path does.
+      r.SetConstants(NativeBackendStage::Vertex, 1, material);
+      if (m != last_material) {
+        r.SetConstants(NativeBackendStage::Pixel, 0, pixel);
+        r.SetTexture(NativeBackendStage::Pixel, 0, &o.textures[m % 5]);
+        last_material = m;
+      }
+      if (draw % 97 == 13) {
+        // A saved state around a replacement: the restored image draws next.
+        r.PushState();
+        std::vector<uint8_t> other(pixel.size(), uint8_t(draw));
+        r.SetConstants(NativeBackendStage::Pixel, 0, other);
+        r.DrawIndexed(3, (draw % 32) * 3, 0);
+        r.PopState();
+      }
+      // Every third frame marks every draw, so whichever packet a range is
+      // handed over at has markers on both sides of it.
+      if (draw % 13 == 5 || frame % 3 == 2) r.WriteTimestamp(o.timestamps, draw % 64);
+      if (draw % 29 == 3) { r.WriteTimestamp(o.timestamps, (draw + 1) % 64); r.ResolveTimestamps(o.timestamps, 0, 4); }
+      r.DrawIndexed(3, (draw % 32) * 3, 0);
+    }
+  };
+  r.WriteTimestamp(o.timestamps, 0);
+  run(0, draws);
+  const std::array<uint8_t, 4> update{uint8_t(frame), 1, 2, 3};
+  r.UpdateBuffer(o.update_target, 0, update);  // A flush boundary: a second batch.
+  last_material = ~0u;
+  run(draws, draws);
+  r.UpdateBuffer(o.update_target, 0, update);
+  run(2 * draws, 5);  // Short: serial on the ordered list with the default minimum.
+  r.UpdateBuffer(o.update_target, 0, update);
+  r.WriteTimestamp(o.timestamps, 1);
+  r.ResolveTimestamps(o.timestamps, 0, 2);
+}
+void TestRecorderEquivalence() {
+  RecorderSceneObjects objects;
+  constexpr uint32_t kFrames = 6;
+  // Batch sizes vary from frame to frame, so a recorder that predicts them
+  // from an earlier frame is sometimes early and sometimes late.
+  auto draws_in = [](uint32_t frame) { return 150 + frame * 37 % 90 - (frame == 4 ? 120 : 0); };
+  // What was asked for, drawn by the front end directly.
+  std::vector<std::vector<Primitive>> reference;
+  {
+    FrontEndRecorder direct;
+    for (uint32_t frame = 0; frame < kFrames; ++frame) {
+      direct.Reset();
+      RecordSceneFrame(direct, objects, frame, draws_in(frame));
+      reference.push_back(std::move(direct.primitives));
+      direct.primitives.clear();
+    }
+  }
+  for (const uint32_t workers : {1u, 2u, 4u}) for (const uint32_t minimum : {1u, 32u}) {
+    const auto label = " (" + std::to_string(workers) + " workers, minimum " + std::to_string(minimum) + ")";
+    try {
+      FrontEndRecorder serial;
+      std::vector<std::unique_ptr<FrontEndRecorder>> lists;
+      std::vector<NativeBackendRecorder*> all{&serial};
+      for (uint32_t i = 0; i < workers; ++i) {
+        lists.push_back(std::make_unique<FrontEndRecorder>());
+        all.push_back(lists.back().get());
+      }
+      std::vector<Primitive> frame_primitives;
+      NativeParallelRecorder recorder(all, [&](bool) {
+        // Submission order: the ordered list, then each worker's.
+        for (auto* list : all) {
+          auto& fake = *static_cast<FrontEndRecorder*>(list);
+          frame_primitives.insert(frame_primitives.end(), fake.primitives.begin(), fake.primitives.end());
+          fake.primitives.clear(); fake.draws = 0; fake.Reset();
+        }
+      }, minimum);
+      for (uint32_t frame = 0; frame < kFrames; ++frame) {
+        recorder.Reset();
+        RecordSceneFrame(recorder, objects, frame, draws_in(frame));
+        recorder.Flush(false);
+        Check(frame_primitives == reference[frame],
+              "frame " + std::to_string(frame) + " recorded different primitives than asked for" + label + ": " +
+              std::to_string(frame_primitives.size()) + " vs " + std::to_string(reference[frame].size()));
+        frame_primitives.clear();
+      }
+      const auto statistics = recorder.statistics();
+      Check(statistics.batches >= kFrames * 2, "the scene did not reach the workers" + label);
+      // Material constants are re-sent with every draw and recur across the
+      // frame: interned, not copied again.
+      Check(RECORDER_STAT(statistics, constant_interned) > statistics.draws / 2,
+            "re-sent constants were copied instead of interned" + label + ": " +
+            std::to_string(RECORDER_STAT(statistics, constant_interned)) + " of " + std::to_string(statistics.draws) + " draws");
+      // Every frame after the first knows its batch sizes from the frame
+      // before. One worker never streams (its list takes the tail); two
+      // stream only when a batch reaches 7/8 of its prediction; with four,
+      // every batch after the first frame here streams at least one range.
+      const auto streamed = RECORDER_STAT(statistics, streamed_jobs);
+      Check(workers == 1 ? streamed == 0 : workers == 2 ? streamed > 0 : streamed >= (kFrames - 1) * 2,
+            "worker ranges were not streamed" + label + ": " + std::to_string(streamed));
+    } catch (const std::exception& error) {
+      Check(false, "recorder equivalence failed" + label + ": " + error.what());
+    }
+  }
+  std::cout << "packet recorder: primitives equal to the direct recording\n";
+}
+
+// The same frame on WARP through real command lists: direct recording against
+// packets on one, two and four workers. The vertex images carry the draw's
+// position and colour, the material images tint it, and draws overlap, so a
+// wrong image, a stale upload or a reordered draw changes pixels.
+struct WarpRecorderScene {
+  std::unique_ptr<NativeRenderBackend> backend;
+  std::unique_ptr<NativeBackendRenderTarget> target;
+  std::unique_ptr<NativeBackendBuffer> update_target;
+  std::unique_ptr<NativeBackendTexture> textures[5];
+  NativeBackendPipeline* pipelines[3]{};
+  NativeBackendSampler* sampler = nullptr;
+  static constexpr uint32_t kSize = 64;
+  explicit WarpRecorderScene(uint32_t workers, uint32_t minimum = 32, bool debug = true) {
+    NativeD3D12Options options; options.prefer_warp = true; options.debug_layer = debug;
+    options.geometry_workers = workers; options.geometry_minimum_draws = minimum;
+    backend = CreateNativeD3D12Backend(options);
+    const char* source = R"(
+cbuffer World : register(b0) { float4 world[256]; };
+cbuffer Material : register(b1) { float4 material[64]; };
+cbuffer Tint : register(b0) { float4 tint[16]; };
+Texture2D image : register(t0); SamplerState sample_image : register(s0);
+struct V { float4 position : SV_POSITION; float4 color : COLOR0; };
+V VS(uint id : SV_VertexID) {
+  float2 corner = float2(id == 1, id == 2) * 0.25;
+  V v; v.position = float4(world[0].xy + corner, 0, 1);
+  v.color = world[1] * material[1] + world[255] * 0.25 + material[63] * 0.125;
+  return v;
+}
+float4 PS(V v) : SV_TARGET {
+  return saturate(v.color * tint[0] + tint[15] * 0.25) * image.SampleLevel(sample_image, float2(.5, .5), 0);
+}
+)";
+    const auto vs = Compile(source, "VS", "vs_5_0"), ps = Compile(source, "PS", "ps_5_0");
+    for (uint32_t i = 0; i < 3; ++i) {
+      NativeBackendPipelineDesc desc{};
+      desc.vertex = Bytes(*vs.Get()); desc.pixel = Bytes(*ps.Get());
+      desc.vertex_id = 0x500; desc.pixel_id = 0x501;
+      desc.state = {0x10001, 0, 0, 0, i == 0 ? 15u : i == 1 ? 7u : 11u, 0};
+      desc.topology = NativeBackendTopology::TriangleList;
+      desc.render_targets = 1; desc.rtv_format[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+      pipelines[i] = &backend->CreatePipeline(desc);
+    }
+    NativeBackendTextureDesc target_desc{};
+    target_desc.width = target_desc.height = kSize; target_desc.levels = 1;
+    target_desc.format = DXGI_FORMAT_R8G8B8A8_UNORM; target_desc.render_target = true;
+    target = backend->CreateRenderTarget(target_desc);
+    NativeBackendBufferDesc update_desc{}; update_desc.bytes = 16; update_desc.vertex = true;
+    const std::array<uint8_t, 16> zeros{};
+    update_target = backend->CreateBuffer(update_desc, zeros);
+    for (uint32_t i = 0; i < 5; ++i) {
+      NativeBackendTextureDesc desc{}; desc.width = desc.height = 1; desc.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      const std::array<uint8_t, 4> texel{uint8_t(255 - i * 30), uint8_t(128 + i * 20), uint8_t(200 - i * 10), 255};
+      textures[i] = backend->CreateTexture(desc, texel);
+    }
+    sampler = &backend->CreateSampler({});
+  }
+  using World = std::array<float, 1024>;
+  using Material = std::array<float, 256>;
+  using Tint = std::array<float, 64>;
+  static void Fill(uint32_t frame, uint32_t draw, uint32_t m, World& world, Material& material, Tint& tint) {
+    for (size_t i = 0; i < world.size(); ++i) world[i] = float((m * 13 + i) % 17) / 64.0f;
+    world[0] = -1.0f + float((draw * 7 + frame * 3) % 60) / 32.0f;
+    world[1] = -1.0f + float((draw * 13 + frame) % 60) / 32.0f;
+    world[4] = float(draw % 5) / 4.0f; world[5] = float(draw % 7) / 6.0f;
+    world[6] = float((draw + frame) % 3) / 2.0f; world[7] = 1;
+    for (size_t i = 0; i < material.size(); ++i) material[i] = float((m * 29 + i) % 11) / 10.0f;
+    for (size_t i = 0; i < tint.size(); ++i) tint[i] = float((m * 17 + i * 5) % 9) / 8.0f;
+  }
+  // Bench frames alternate between two prepared sets of images.
+  bool precomputed = false;
+  struct Cache {
+    std::vector<std::pair<bool, World>> worlds;
+    Material materials[12]{};
+    Tint tints[12]{};
+  } cache[2];
+  // `producer_ns` busy-waits per draw: the translation work the game's
+  // producer does between draws, which worker recording can overlap.
+  void Frame(uint32_t frame, uint32_t draws, uint64_t producer_ns = 0) {
+    backend->BeginFrame();
+    auto& r = backend->Recorder();
+    r.ClearColor(*target, {0, 0, 0, 1});
+    NativeBackendRenderTarget* colors[] = {target.get()};
+    r.SetRenderTargets(colors, nullptr);
+    r.SetViewport({0, 0, float(kSize), float(kSize), 0, 1});
+    r.SetScissor({0, 0, int(kSize), int(kSize)}, false);
+    r.SetSampler(NativeBackendStage::Pixel, 0, sampler);
+    std::array<float, 1024> world{};
+    std::array<float, 256> material{};
+    std::array<float, 64> tint{};
+    uint32_t last_material = ~0u;
+    auto bytes = [](const auto& array) {
+      return std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(array.data()), sizeof(array));
+    };
+    auto run = [&](uint32_t first, uint32_t count) {
+      for (uint32_t draw = first; draw < first + count; ++draw) {
+        if (producer_ns) {
+          const auto until = std::chrono::steady_clock::now() + std::chrono::nanoseconds(producer_ns);
+          while (std::chrono::steady_clock::now() < until) {}
+        }
+        const uint32_t m = (draw * 7 + frame) % 12;
+        if (precomputed) {
+          // The bench measures the recorder, not this generator: the same
+          // bytes, prepared once.
+          auto& cached = cache[frame % 2];
+          if (cached.worlds.size() <= draw) cached.worlds.resize(draw + 1);
+          auto& entry = cached.worlds[draw];
+          if (!entry.first) {
+            entry.first = true;
+            Fill(frame, draw, m, entry.second, cached.materials[m], cached.tints[m]);
+          }
+          world = entry.second;
+          material = cached.materials[m];
+          tint = cached.tints[m];
+        } else {
+          Fill(frame, draw, m, world, material, tint);
+        }
+        const auto captured = std::chrono::steady_clock::now();
+        r.SetPipeline(*pipelines[m % 3]);
+        r.SetConstants(NativeBackendStage::Vertex, 0, bytes(world));
+        r.SetConstants(NativeBackendStage::Vertex, 1, bytes(material));
+        if (m != last_material) {
+          r.SetConstants(NativeBackendStage::Pixel, 0, bytes(tint));
+          r.SetTexture(NativeBackendStage::Pixel, 0, textures[m % 5].get());
+          last_material = m;
+        }
+        if (draw % 97 == 13) {
+          r.PushState();
+          std::array<float, 64> other{}; other.fill(0.5f);
+          r.SetConstants(NativeBackendStage::Pixel, 0, bytes(other));
+          r.Draw(3, 0);
+          r.PopState();
+          // A direct D3D12 list does not restore root constants on PopState;
+          // both recordings re-send them, the packets with the same bytes.
+          world[0] += 0.125f;
+          r.SetConstants(NativeBackendStage::Vertex, 0, bytes(world));
+          r.SetConstants(NativeBackendStage::Pixel, 0, bytes(tint));
+        }
+        r.Draw(3, 0);
+        capture_ns += Since(captured);
+      }
+    };
+    auto flush = [&](auto&& call) {
+      const auto start = std::chrono::steady_clock::now();
+      call();
+      flush_ns += Since(start);
+    };
+    const std::array<uint8_t, 16> update{uint8_t(frame)};
+    run(0, draws);
+    flush([&] { r.UpdateBuffer(*update_target, 0, update); });
+    last_material = ~0u;
+    run(draws, draws);
+    flush([&] { r.UpdateBuffer(*update_target, 0, update); });
+    run(2 * draws, 8);
+    flush([&] { backend->Submit(); });
+  }
+  // Producer time inside the recorder's draw-state calls, and inside the
+  // calls that flush (buffer updates, Submit): the joins and submissions.
+  uint64_t capture_ns = 0, flush_ns = 0;
+  static uint64_t Since(std::chrono::steady_clock::time_point start) {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+  }
+};
+void TestRecorderPixels() {
+  constexpr uint32_t kFrames = 5;
+  auto draws_in = [](uint32_t frame) { return 120 + frame * 29 % 70 - (frame == 3 ? 90 : 0); };
+  std::vector<std::vector<uint8_t>> reference;
+  {
+    WarpRecorderScene direct(0);
+    for (uint32_t frame = 0; frame < kFrames; ++frame) {
+      direct.Frame(frame, draws_in(frame));
+      reference.push_back(direct.backend->ReadRenderTarget(*direct.target));
+    }
+    for (const auto& message : direct.backend->DrainValidationMessages())
+      Check(false, "D3D12 validation error in the direct recorder scene: " + message);
+  }
+  size_t lit = 0;
+  for (size_t i = 0; i + 3 < reference.back().size(); i += 4)
+    lit += reference.back()[i] || reference.back()[i + 1] || reference.back()[i + 2];
+  Check(lit > 64 * 64 / 4, "the recorder scene drew almost nothing: " + std::to_string(lit));
+  for (const uint32_t workers : {1u, 2u, 4u}) for (const uint32_t minimum : {1u, 32u}) {
+    const auto label = " (" + std::to_string(workers) + " workers, minimum " + std::to_string(minimum) + ")";
+    WarpRecorderScene packets(workers, minimum);
+    for (uint32_t frame = 0; frame < kFrames; ++frame) {
+      packets.Frame(frame, draws_in(frame));
+      Check(packets.backend->ReadRenderTarget(*packets.target) == reference[frame],
+            "frame " + std::to_string(frame) + " pixels differ from the direct recorder" + label);
+    }
+    const auto statistics = packets.backend->Statistics();
+    Check(statistics.geometry_batches >= kFrames * 2, "the scene did not reach the workers" + label);
+    Check(RECORDER_STAT(statistics, geometry_constant_upload_reuses) > 0 && RECORDER_STAT(statistics, geometry_constant_interned) > 0,
+          "no constant image was interned or bound from a staged slice" + label);
+    Check(workers == 1 || RECORDER_STAT(statistics, geometry_streamed_jobs) > 0, "no worker range was streamed" + label);
+    for (const auto& message : packets.backend->DrainValidationMessages())
+      Check(false, "D3D12 validation error in the packet recorder scene" + label + ": " + message);
+  }
+  std::cout << "packet recorder: WARP pixels equal to the direct recorder, " << lit << " lit\n";
+}
+
+// --recorder-bench [frames] [draws] [producer_ns]: the game's shape on WARP
+// with four workers and no debug layer. Per frame: the producer's time from
+// BeginFrame to Submit returning; the part of it inside the draw-state calls
+// (capture: constant copies and hand-overs) and inside the calls that flush
+// (buffer updates and Submit: worker joins and submission); how long the
+// joins waited for workers; the workers' recording CPU; and the constant
+// bytes the producer copied. WARP rasterizes on the same CPU, so frame_ms is
+// noisy on a busy machine; capture and wait are the recorder's own costs.
+int RecorderBench(int argc, char** argv) {
+  const uint32_t frames = argc > 2 ? uint32_t(std::stoul(argv[2])) : 400;
+  const uint32_t draws = argc > 3 ? uint32_t(std::stoul(argv[3])) : 350;
+  const uint64_t producer_ns = argc > 4 ? std::stoull(argv[4]) : 0;
+  WarpRecorderScene scene(4, 32, false);
+  scene.precomputed = true;
+  for (uint32_t frame = 0; frame < 30; ++frame) scene.Frame(frame, draws, producer_ns);
+  const auto before = scene.backend->Statistics();
+  scene.capture_ns = scene.flush_ns = 0;
+  std::vector<double> times;
+  for (uint32_t frame = 0; frame < frames; ++frame) {
+    const auto start = std::chrono::steady_clock::now();
+    scene.Frame(frame, draws, producer_ns);
+    times.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+  }
+  const auto after = scene.backend->Statistics();
+  std::sort(times.begin(), times.end());
+  double sum = 0;
+  for (const double t : times) sum += t;
+  const double n = frames;
+  std::cout << "recorder bench: frames=" << frames << " draws_per_frame=" << (2 * draws + 8)
+            << " producer_ns_per_draw=" << producer_ns
+            << "\n  frame_ms mean=" << sum / n << " p50=" << times[times.size() / 2]
+            << " p90=" << times[times.size() * 9 / 10]
+            << "\n  capture_ms_per_frame=" << double(scene.capture_ns) / 1e6 / n
+            << " flush_ms_per_frame=" << double(scene.flush_ns) / 1e6 / n
+            << "\n  wait_ms_per_frame=" << double(after.geometry_wait_ns - before.geometry_wait_ns) / 1e6 / n
+            << " record_cpu_ms_per_frame=" << double(after.geometry_record_ns - before.geometry_record_ns) / 1e6 / n
+            << " batches_per_frame=" << double(after.geometry_batches - before.geometry_batches) / n
+            << "\n  constant_snapshot_bytes_per_frame="
+            << double(after.geometry_constant_snapshot_bytes - before.geometry_constant_snapshot_bytes) / n
+            << " frame_waits=" << (after.frame_waits - before.frame_waits)
+            << "\n  interned_per_frame=" << double(RECORDER_STAT(after, geometry_constant_interned) - RECORDER_STAT(before, geometry_constant_interned)) / n
+            << " uploads_per_frame=" << double(RECORDER_STAT(after, geometry_constant_uploads) - RECORDER_STAT(before, geometry_constant_uploads)) / n
+            << " upload_reuses_per_frame="
+            << double(RECORDER_STAT(after, geometry_constant_upload_reuses) - RECORDER_STAT(before, geometry_constant_upload_reuses)) / n
+            << " streamed_jobs_per_frame=" << double(RECORDER_STAT(after, geometry_streamed_jobs) - RECORDER_STAT(before, geometry_streamed_jobs)) / n
+            << '\n';
+  return 0;
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   // Unbuffered: if a later stage kills the process, the output that says how
   // far it got must not die in the buffer with it.
   std::cout << std::unitbuf;
+  if (argc > 1 && std::string(argv[1]) == "--recorder-bench") {
+    try { return RecorderBench(argc, argv); }
+    catch (const std::exception& error) { std::cerr << "recorder bench: " << error.what() << '\n'; return 1; }
+  }
   HWND present_window = nullptr;
   WNDCLASSEXW present_class{};
   try {
     TestTransientBatching();
     TestTransientBatchingPixels();
+    TestRecorderEquivalence();
+    TestRecorderPixels();
     RegisterNativeD3D12Backend();
     const auto& names = NativeRenderBackendNames();
     Check(std::find(names.begin(), names.end(), "d3d12") != names.end(),
