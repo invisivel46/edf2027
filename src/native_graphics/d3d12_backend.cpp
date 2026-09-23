@@ -2,6 +2,7 @@
 #include "d3d12_pipeline.h"
 #include "native_parallel_recorder.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -232,6 +233,46 @@ class D3D12Query final : public NativeBackendQuery {
   ComPtr<ID3D12Resource> readback_;
   NativeBackendQueryKind kind_;
   uint64_t fence_=0;  // 0 = never resolved.
+};
+
+// Profiling timestamps (edf_native_gpu_timings): one heap and one readback
+// buffer for the whole set. Each slot remembers the fence of the frame that
+// last resolved it, so a range is readable exactly when the GPU has passed
+// every resolve that covered it. A resolve may be recorded by a packet worker,
+// hence atomics; the producer only reads them after joining the workers.
+class D3D12Timestamps final : public NativeBackendTimestamps {
+ public:
+  D3D12Timestamps(NativeD3D12Device& gpu,ComPtr<ID3D12QueryHeap> heap,ComPtr<ID3D12Resource> readback,uint32_t capacity)
+      : gpu_(&gpu),heap_(std::move(heap)),readback_(std::move(readback)),capacity_(capacity),
+        fences_(std::make_unique<std::atomic<uint64_t>[]>(capacity)) {}
+  ~D3D12Timestamps() override { gpu_->Retire(std::move(heap_)); gpu_->Retire(std::move(readback_)); }
+  uint32_t capacity() const override { return capacity_; }
+  ID3D12QueryHeap* heap() const { return heap_.Get(); }
+  ID3D12Resource* readback() const { return readback_.Get(); }
+  void Check(uint32_t first,uint32_t count) const {
+    if(!count || first>=capacity_ || count>capacity_-first)
+      throw std::runtime_error("timestamp range "+std::to_string(first)+"+"+std::to_string(count)+
+                               " is outside a set of "+std::to_string(capacity_));
+  }
+  void Resolved(uint32_t first,uint32_t count,uint64_t fence) {
+    for(uint32_t slot=first;slot<first+count;++slot) fences_[slot].store(fence,std::memory_order_release);
+  }
+  // The fence the whole range waits for; 0 when any slot was never resolved.
+  uint64_t fence(uint32_t first,uint32_t count) const {
+    uint64_t latest=0;
+    for(uint32_t slot=first;slot<first+count;++slot) {
+      const auto value=fences_[slot].load(std::memory_order_acquire);
+      if(!value) return 0;
+      latest=(std::max)(latest,value);
+    }
+    return latest;
+  }
+ private:
+  NativeD3D12Device* gpu_;
+  ComPtr<ID3D12QueryHeap> heap_;
+  ComPtr<ID3D12Resource> readback_;
+  uint32_t capacity_;
+  std::unique_ptr<std::atomic<uint64_t>[]> fences_;
 };
 
 D3D12_FILTER_TYPE FilterType(NativeBackendFilter filter) {
@@ -596,6 +637,18 @@ class D3D12Recorder final : public NativeBackendRecorder {
                                 concrete.readback(),0);
     concrete.Resolved(gpu_->pending_fence());
   }
+  void WriteTimestamp(NativeBackendTimestamps& set,uint32_t slot) override {
+    auto& concrete=static_cast<D3D12Timestamps&>(set);
+    concrete.Check(slot,1);
+    Commands().EndQuery(concrete.heap(),D3D12_QUERY_TYPE_TIMESTAMP,slot);
+  }
+  void ResolveTimestamps(NativeBackendTimestamps& set,uint32_t first,uint32_t count) override {
+    auto& concrete=static_cast<D3D12Timestamps&>(set);
+    concrete.Check(first,count);
+    Commands().ResolveQueryData(concrete.heap(),D3D12_QUERY_TYPE_TIMESTAMP,first,count,
+                                concrete.readback(),uint64_t(first)*sizeof(uint64_t));
+    concrete.Resolved(first,count,gpu_->pending_fence());
+  }
   void PushState() override { stack_.push_back(bound_); }
   void PopState() override {
     if(stack_.empty()) throw std::runtime_error("PopState with nothing pushed");
@@ -851,6 +904,8 @@ class D3D12Backend final : public NativeRenderBackend {
                                                    *tracked.state,nullptr,IID_PPV_ARGS(&tracked.resource)),
             "buffer creation");
     auto buffer=std::make_unique<D3D12Buffer>(std::move(tracked),desc.bytes,desc.dynamic);
+    buffers_created_.fetch_add(1,std::memory_order_relaxed);
+    buffer_bytes_created_.fetch_add(desc.bytes,std::memory_order_relaxed);
     if(!initial.empty()) {
       if(initial.size()>desc.bytes)
         throw std::runtime_error("initial buffer contents are larger than the buffer");
@@ -907,6 +962,8 @@ class D3D12Backend final : public NativeRenderBackend {
     gpu_.device()->CreateShaderResourceView(tracked.resource.Get(),&srv,view);
     auto texture=std::make_unique<D3D12Texture>(std::move(tracked),desc.width,desc.height,view,
                                                 texture_views_);
+    textures_created_.fetch_add(1,std::memory_order_relaxed);
+    texture_bytes_created_.fetch_add(initial.size(),std::memory_order_relaxed);
     // Staged on the next frame that opens, like buffer contents: there is no
     // command list to copy with until then.
     if(!initial.empty()) {
@@ -1009,6 +1066,36 @@ class D3D12Backend final : public NativeRenderBackend {
     UINT64 frequency=0;
     Require(gpu_.queue()->GetTimestampFrequency(&frequency),"timestamp frequency query");
     return frequency;
+  }
+  std::unique_ptr<NativeBackendTimestamps> CreateTimestamps(uint32_t capacity) override {
+    if(!capacity) throw std::runtime_error("an empty timestamp set cannot be created");
+    const D3D12_QUERY_HEAP_DESC desc{D3D12_QUERY_HEAP_TYPE_TIMESTAMP,capacity,0};
+    ComPtr<ID3D12QueryHeap> heap;
+    Require(gpu_.device()->CreateQueryHeap(&desc,IID_PPV_ARGS(&heap)),"timestamp heap creation");
+    const D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK,D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
+                                              D3D12_MEMORY_POOL_UNKNOWN,0,0};
+    const D3D12_RESOURCE_DESC readback_desc{D3D12_RESOURCE_DIMENSION_BUFFER,0,uint64_t(capacity)*sizeof(uint64_t),
+                                            1,1,1,DXGI_FORMAT_UNKNOWN,{1,0},D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                                            D3D12_RESOURCE_FLAG_NONE};
+    ComPtr<ID3D12Resource> readback;
+    Require(gpu_.device()->CreateCommittedResource(&readback_heap,D3D12_HEAP_FLAG_NONE,&readback_desc,
+                                                   D3D12_RESOURCE_STATE_COPY_DEST,nullptr,
+                                                   IID_PPV_ARGS(&readback)),"timestamp readback creation");
+    return std::make_unique<D3D12Timestamps>(gpu_,std::move(heap),std::move(readback),capacity);
+  }
+  bool ReadTimestamps(NativeBackendTimestamps& set,uint32_t first,std::span<uint64_t> out) override {
+    auto& concrete=static_cast<D3D12Timestamps&>(set);
+    const auto count=static_cast<uint32_t>(out.size());
+    concrete.Check(first,count);
+    const auto fence=concrete.fence(first,count);
+    if(!fence || gpu_.completed_fence()<fence) return false;
+    void* mapped=nullptr;
+    const D3D12_RANGE range{size_t(first)*sizeof(uint64_t),size_t(first+count)*sizeof(uint64_t)};
+    if(FAILED(concrete.readback()->Map(0,&range,&mapped))) return false;
+    std::memcpy(out.data(),static_cast<const uint8_t*>(mapped)+range.Begin,size_t(count)*sizeof(uint64_t));
+    const D3D12_RANGE none{0,0};
+    concrete.readback()->Unmap(0,&none);
+    return true;
   }
   bool ReadQuery(NativeBackendQuery& query, std::span<uint8_t> result) override {
     auto& concrete=static_cast<D3D12Query&>(query);
@@ -1338,6 +1425,10 @@ class D3D12Backend final : public NativeRenderBackend {
     out.sampler_misses=gpu_.samplers().misses();
     out.sampler_evictions=gpu_.samplers().evictions();
     out.retiring=gpu_.retiring();
+    out.buffers_created=buffers_created_.load(std::memory_order_relaxed);
+    out.buffer_bytes_created=buffer_bytes_created_.load(std::memory_order_relaxed);
+    out.textures_created=textures_created_.load(std::memory_order_relaxed);
+    out.texture_bytes_created=texture_bytes_created_.load(std::memory_order_relaxed);
     out.frame_waits=gpu_.frame_waits();
     out.frame_wait_ns=gpu_.frame_wait_ns();
     return out;
@@ -1541,6 +1632,8 @@ class D3D12Backend final : public NativeRenderBackend {
   ComPtr<ID3D12RootSignature> signature_;
   NativeD3D12PipelineCache pipelines_;
   uint64_t wrapper_hits_=0;
+  // Resource creations, for attributing a slow frame (edf_native_frame_times).
+  std::atomic<uint64_t> buffers_created_{0},buffer_bytes_created_{0},textures_created_{0},texture_bytes_created_{0};
   NativeD3D12CpuDescriptorHeap texture_views_,render_target_views_,depth_views_;
   std::vector<std::unique_ptr<D3D12Recorder>> recorders_;
   std::map<std::string,std::unique_ptr<D3D12Pipeline>,std::less<>> wrappers_;

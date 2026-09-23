@@ -100,6 +100,31 @@ struct NativeParallelRecorder::Impl {
   size_t outstanding=0;
   bool stopping=false;
   std::vector<NativeBackendQuery*> queries;
+  // Profiling timestamps between packets: `before` is the packet they precede
+  // (packets.size() for after the last). Replayed by whichever list records
+  // that packet, so they keep their place among the draws without a flush.
+  struct Marker {
+    size_t before=0;
+    NativeBackendTimestamps* set=nullptr;
+    uint32_t first=0,count=0;
+    bool resolve=false;
+  };
+  std::vector<Marker> markers;
+  static void ReplayMarker(NativeBackendRecorder& r,const Marker& m) {
+    if(m.resolve) r.ResolveTimestamps(*m.set,m.first,m.count); else r.WriteTimestamp(*m.set,m.first);
+  }
+  // With nothing pending, recorder 0 is already the tail of the stream: any
+  // earlier worker lists were submitted by the flush that emptied `packets`.
+  void Mark(Marker m) {
+    if(failure) std::rethrow_exception(failure);
+    // Checked here, on the producer: a bad slot found by a worker would poison
+    // the whole recorder instead of failing the one call.
+    if(!m.count || m.first>=m.set->capacity() || m.count>m.set->capacity()-m.first)
+      throw std::runtime_error("timestamp range outside its set");
+    if(packets.empty()) { ReplayMarker(*recorders[0],m); return; }
+    m.before=packets.size();
+    markers.push_back(m);
+  }
   std::atomic<uint32_t> active_workers{0},max_concurrent{0};
   Statistics stats;
   std::exception_ptr failure;
@@ -128,10 +153,16 @@ struct NativeParallelRecorder::Impl {
           }
           try {
             const PacketState* previous=nullptr;
+            auto marker=std::lower_bound(markers.begin(),markers.end(),job.begin,
+              [](const Marker& m,size_t draw) { return m.before<draw; });
             for(size_t draw=job.begin;draw<job.end;++draw) {
+              for(;marker!=markers.end() && marker->before==draw;++marker) ReplayMarker(*recorders[index+1],*marker);
               Replay(*recorders[index+1],packets[draw],previous);
               previous=packets[draw].worlds?nullptr:&packets[draw].state;
             }
+            // Markers after the last packet: the last list executes last.
+            if(index+1==jobs.size())
+              for(;marker!=markers.end();++marker) ReplayMarker(*recorders[index+1],*marker);
           } catch(...) { job.error=std::current_exception(); }
           if(job.begin!=job.end) active_workers.fetch_sub(1);
           job.elapsed=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -220,7 +251,8 @@ struct NativeParallelRecorder::Impl {
       throw std::runtime_error("draw packet requires a blend factor");
     const auto* bindings=SnapshotBindings();
     if(queries.empty() && indexed && instances==1 && !first_instance &&
-       bindings->world_instancing && bindings->pipeline->world_instanced && !packets.empty()) {
+       bindings->world_instancing && bindings->pipeline->world_instanced && !packets.empty() &&
+       (markers.empty() || markers.back().before!=packets.size())) {
       auto& previous=packets.back();
       const auto slot=bindings->pipeline->instance_world_slot;
       const auto offset=bindings->pipeline->instance_world_offset;
@@ -286,10 +318,14 @@ struct NativeParallelRecorder::Impl {
     if(packets.size()<minimum_draws) {
       ++stats.serial_flushes; stats.serial_draws+=packets.size();
       const PacketState* previous=serial_previous?&*serial_previous:nullptr;
-      for(const auto& packet:packets) {
-        Replay(*recorders[0],packet,previous);
-        previous=packet.worlds?nullptr:&packet.state;
+      size_t marker=0;
+      for(size_t draw=0;draw<packets.size();++draw) {
+        for(;marker<markers.size() && markers[marker].before==draw;++marker) ReplayMarker(*recorders[0],markers[marker]);
+        Replay(*recorders[0],packets[draw],previous);
+        previous=packets[draw].worlds?nullptr:&packets[draw].state;
       }
+      for(;marker<markers.size();++marker) ReplayMarker(*recorders[0],markers[marker]);
+      markers.clear();
       if(packets.back().worlds) serial_previous.reset();
       else serial_previous=std::move(packets.back().state);
       packets.clear();
@@ -310,7 +346,7 @@ struct NativeParallelRecorder::Impl {
       std::chrono::steady_clock::now()-begin).count());
     std::exception_ptr error;
     for(const auto& job:jobs) { stats.record_ns+=job.elapsed; if(job.error) error=job.error; }
-    packets.clear();
+    packets.clear(); markers.clear();
     if(error) std::rethrow_exception(error);
     ++stats.batches;
     finish(reopen); serial_previous.reset();
@@ -321,7 +357,7 @@ NativeParallelRecorder::NativeParallelRecorder(std::vector<NativeBackendRecorder
 NativeParallelRecorder::~NativeParallelRecorder()=default;
 void NativeParallelRecorder::Reset() {
   if(!impl_->packets.empty()) throw std::runtime_error("reset would discard unsubmitted geometry");
-  impl_->state={}; impl_->stack.clear(); impl_->serial_previous.reset(); impl_->queries.clear();
+  impl_->state={}; impl_->stack.clear(); impl_->serial_previous.reset(); impl_->queries.clear(); impl_->markers.clear();
   // Flush joins the recording workers. Their SetConstants calls have copied
   // the data into backend-owned upload storage before these images retire.
   // Reuse the high-water storage next frame rather than allocating a vector
@@ -478,6 +514,12 @@ void NativeParallelRecorder::UpdateBuffer(NativeBackendBuffer& b,uint32_t offset
 void NativeParallelRecorder::UpdateTexture(NativeBackendTexture& t,std::span<const uint8_t> bytes) { Flush(); impl_->recorders[0]->UpdateTexture(t,bytes); impl_->serial_previous.reset(); }
 void NativeParallelRecorder::BeginQuery(NativeBackendQuery& q) { Flush(); impl_->queries.push_back(&q); impl_->recorders[0]->BeginQuery(q); }
 void NativeParallelRecorder::EndQuery(NativeBackendQuery& q) { Flush(); impl_->recorders[0]->EndQuery(q); std::erase(impl_->queries,&q); }
+void NativeParallelRecorder::WriteTimestamp(NativeBackendTimestamps& set,uint32_t slot) {
+  impl_->Mark({0,&set,slot,1,false});
+}
+void NativeParallelRecorder::ResolveTimestamps(NativeBackendTimestamps& set,uint32_t first,uint32_t count) {
+  impl_->Mark({0,&set,first,count,true});
+}
 void NativeParallelRecorder::PushState() { impl_->stack.push_back(impl_->state); }
 void NativeParallelRecorder::PopState() {
   if(impl_->stack.empty()) throw std::runtime_error("parallel recorder state stack underflow");

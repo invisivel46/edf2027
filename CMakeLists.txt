@@ -225,6 +225,11 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
     add_test(NAME edf_renderer_runtime_gate_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_renderer_runtime_gate)
     set_tests_properties(edf_renderer_runtime_gate_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_custom_target(edf_frame_time_report_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_frame_time_report
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_frame_time_report_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_frame_time_report)
+    set_tests_properties(edf_frame_time_report_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_custom_target(edf_renderer_image_compare_tests
         COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_compare_renderer_images
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)

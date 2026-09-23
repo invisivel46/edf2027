@@ -51,6 +51,8 @@
 #include "native_shader_binding.h"
 #include "native_frame_dispatch.h"
 #include "native_full_frame.h"
+#include "native_frame_times.h"
+#include "native_gpu_pass_timings.h"
 #include "native_full_frame_static_world.h"
 #include "native_full_frame_models.h"
 #include "native_full_frame_sky.h"
@@ -308,6 +310,10 @@ REXCVAR_DEFINE_INT32(edf_native_hook_sample_period,0,"EDF2027",
   "Sample one in N bridge timing scopes (0 disables); independent of full hook/load instrumentation").range(0,4096);
 REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
                    "Log inclusive CPU wall times for native/original graphics hook phases (development)");
+REXCVAR_DEFINE_BOOL(edf_native_gpu_timings, false, "EDF2027",
+                   "Log GPU time per full-frame pass (sky, static_world, models, effects, transparent, post, view overlays, HUD phases) and per frame from scene-backend timestamps, read back frames later without stalling (development)");
+REXCVAR_DEFINE_BOOL(edf_native_frame_times, false, "EDF2027",
+                   "Log present-to-present frame-time percentiles and one line per spike frame (over 25 ms or twice the rolling median) with its pipeline, shader, geometry and texture creations, declined passes and largest hook phases (development)");
 REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
                    "Sample end-frame publication eligibility and cumulative UI draws; does not capture pixels (development)");
 REXCVAR_DEFINE_BOOL(edf_native_load_timings, false, "EDF2027",
@@ -395,6 +401,18 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
                        ResourceOneShot, ResourceCoordinator, ResourceHelper, ResourceTransition, Count };
 thread_local uint32_t texture_loader_depth=0;
+// This frame's inclusive totals per phase, for the edf_native_frame_times
+// spike lines: every thread adds, the swap takes and clears them. Only full
+// (not sampled) timings add, so they exist only with the hook or load timings
+// on. Names are published by the first Finish of each phase.
+struct FrameHookPhases {
+  std::array<std::atomic<uint64_t>,static_cast<size_t>(HookPhase::Count)> nanos{};
+  std::array<std::atomic<const char*>,static_cast<size_t>(HookPhase::Count)> names{};
+};
+FrameHookPhases& FrameHookPhaseTotals() {
+  static FrameHookPhases totals;
+  return totals;
+}
 class HookTiming {
  public:
   explicit HookTiming(HookPhase phase,bool active=true) : phase_(phase), enabled_(active && (phase>=HookPhase::TextureSnapshot ?
@@ -459,6 +477,11 @@ class HookTiming {
       "load.resource.oneshot","load.resource.coordinator","load.resource.helper","load.resource.transition"};
     static_assert(std::size(names)==static_cast<size_t>(HookPhase::Count));
     const auto index=static_cast<size_t>(phase_);
+    if(!sample_period_ && REXCVAR_GET(edf_native_frame_times)) {
+      auto& totals=FrameHookPhaseTotals();
+      totals.names[index].store(names[index],std::memory_order_relaxed);
+      totals.nanos[index].fetch_add(uint64_t(ms*1e6),std::memory_order_relaxed);
+    }
     auto& bucket=buckets[index];
     ++bucket.count; bucket.total+=ms; bucket.maximum=(std::max)(bucket.maximum,ms);
     if(phase_>=HookPhase::TextureSnapshot ||
@@ -6089,6 +6112,7 @@ uint32_t NativeFullFramePaletteLimit(const Reader& reader) {
   return descriptor?reader.Word(reader.Add(descriptor,16)):edf::native::kNativeBonePaletteShaderBones;
 }
 void NativeFullFrameDeclined(const char* pass,const std::string& reason) {
+  edf::native::FrameEventCounters().pass_declines.fetch_add(1,std::memory_order_relaxed);
   static std::mutex mutex;
   static std::set<std::string> reported;
   std::lock_guard lock(mutex);
@@ -6631,6 +6655,70 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
 // through guest_, with the frame context at context_ as DispatchNativeFrame
 // passes it. See native_full_frame.h for where the frame sits between
 // 8219C7A8 and 8219C840.
+// edf_native_gpu_timings: timestamps at the full frame's pass boundaries on the
+// scene recorder (native_gpu_pass_timings.h), so each span brackets exactly
+// the GPU work its pass recorded. Each call takes the bridge locks, as every
+// recorder use does, and only when the cvar is on; off, it is one cvar read.
+// The frame's markers are resolved at its end and read by a later frame's
+// begin, which also logs the window every 600 frames read.
+edf::native::NativeGpuPassTimings& GpuPassTimings() {
+  static edf::native::NativeGpuPassTimings timings;
+  return timings;
+}
+template<class Body> void WithGpuPassTimings(Body&& body) {
+  if(!REXCVAR_GET(edf_native_gpu_timings)) return;
+  auto& state=edf::native::State();
+  std::lock_guard submission(state.submissions);
+  std::lock_guard lock(state.mutex);
+  auto& timings=GpuPassTimings();
+  if(!timings.supported() || !state.scene_backend) return;
+  try { body(timings,*state.scene_backend,state); }
+  catch(const std::exception& error) {
+    static std::atomic<bool> reported=false;
+    if(!reported.exchange(true)) REXLOG_WARN("Native GPU timing marker failed: {} (logged once)",error.what());
+  }
+}
+void GpuPassFrameBegin() {
+  WithGpuPassTimings([](auto& timings,auto& backend,auto& state) {
+    timings.BeginFrame(backend,edf::native::SceneRecorderLocked(state));
+    if(!timings.supported()) {
+      REXLOG_WARN("Native GPU timing unavailable: scene backend {} has no timestamps",std::string(backend.name()));
+      return;
+    }
+    edf::native::NativeGpuPassTimingWindow window;
+    if(!timings.TakeReport(window)) return;
+    REXLOG_INFO("Native GPU timing window: frames={} skipped={} dropped_spans={} invalid_spans={} ticks_per_s={} (GPU timestamps; frame is the helper's first to last marker, interval one frame's begin to the next)",
+      window.frames,window.skipped,window.dropped_spans,window.invalid_spans,timings.frequency());
+    for(const auto& pass:window.passes)
+      REXLOG_INFO("Native GPU timing: pass={} frames={} total_ms={:.3f} avg_ms={:.3f} max_ms={:.3f}",
+        pass.name,pass.frames,pass.total_ms,pass.average_ms(),pass.max_ms);
+  });
+}
+int GpuPassSpanBegin(std::string_view name) {
+  int span=-1;
+  WithGpuPassTimings([&](auto& timings,auto&,auto& state) {
+    if(timings.frame_open()) span=timings.BeginSpan(name,edf::native::SceneRecorderLocked(state));
+  });
+  return span;
+}
+void GpuPassSpanEnd(int span) {
+  if(span<0) return;
+  WithGpuPassTimings([&](auto& timings,auto&,auto& state) {
+    if(timings.frame_open()) timings.EndSpan(span,edf::native::SceneRecorderLocked(state));
+  });
+}
+void GpuPassFrameEnd() {
+  WithGpuPassTimings([](auto& timings,auto&,auto& state) {
+    if(timings.frame_open()) timings.EndFrame(edf::native::SceneRecorderLocked(state));
+  });
+}
+struct GpuPassSpan {
+  explicit GpuPassSpan(std::string_view name):span(GpuPassSpanBegin(name)) {}
+  ~GpuPassSpan() { GpuPassSpanEnd(span); }
+  GpuPassSpan(const GpuPassSpan&)=delete;
+  GpuPassSpan& operator=(const GpuPassSpan&)=delete;
+  int span;
+};
 class NativeFullFrameHost final : public edf::native::NativeFrameHost {
  public:
   using GuestCall=std::function<void(uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr)>;
@@ -6767,6 +6855,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     constexpr auto count=size_t(edf::native::HookPhase::FrameNativeEnd)-first;
     static_assert(count==std::size(edf::native::kNativeFramePassOrder));
     edf::native::HookTiming timing(index<count?edf::native::HookPhase(first+index):edf::native::HookPhase::FrameNative,index<count);
+    const GpuPassSpan gpu(pass.name());
     pass.Record(context);
   }
   // REMAINING GUEST CALLS, per view, in the helper's order: the overlay
@@ -6777,6 +6866,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // counterpart of the +4 setter the frame does not call either.
   void ViewOverlays(edf::native::NativeFrameContext& context) override {
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeOverlays);
+    const GpuPassSpan gpu("view_overlays");
     RemainingGuestCall(0);
     const auto sentinel=[&] { return Word(2232); };
     for(auto node=reader_.Word(sentinel());node!=sentinel();) {
@@ -6808,6 +6898,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     std::string error;
     if(edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error)) BindOutput(renderer,resolve_scene);
     else {
+      edf::native::FrameEventCounters().post_fallbacks.fetch_add(1,std::memory_order_relaxed);
       static std::atomic<bool> reported=false;
       if(!reported.exchange(true))
         REXLOG_WARN("Native full frame post failed, guest finish stage 820B0B80 used: {} (logged once)",error);
@@ -6879,13 +6970,19 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
       edf::native::BindActiveTarget(state);
     }
     RemainingGuestCall(3);
+    const GpuPassSpan gpu("hud");
+    const bool gpu_phases=REXCVAR_GET(edf_native_gpu_timings);
     const auto sentinel=[&] { return Word(2232); };
-    for(auto phase=Word(140);phase!=Word(144);++phase)
+    for(auto phase=Word(140);phase!=Word(144);++phase) {
+      // One span per HUD phase, by phase number (the first eight only).
+      const auto gpu_phase=gpu_phases && phase-Word(140)<8 ? GpuPassSpanBegin("hud.phase"+std::to_string(phase)) : -1;
       for(auto node=reader_.Word(sentinel());node!=sentinel();) {
         Virtual(reader_.Word(reader_.Add(node,12)),16,phase,0,0x821A536C);
         if(node==sentinel()) throw std::runtime_error("native full frame phase iterator invalidated");
         node=reader_.Word(node);
       }
+      GpuPassSpanEnd(gpu_phase);
+    }
   }
   // (d) After this helper returns, 821A6508 calls clSgsCoreRender +20
   // (821BE9F0 -> 8219C840). With post output (output_ready) its hook publishes
@@ -7041,7 +7138,9 @@ REX_HOOK_RAW(sub_821A5080) {
       });
     {
       edf::native::HookTiming frame_timing(edf::native::HookPhase::FrameNative);
+      GpuPassFrameBegin();
       full_frame.Run(host);
+      GpuPassFrameEnd();
     }
     const auto frames=full_frame.frames();
     if(frames<=4 || frames%1000==0)
@@ -8652,8 +8751,81 @@ class NativeSwapFrameTrace {
   std::array<Clock::time_point,5> marks_{};
 };
 }
+namespace {
+// edf_native_frame_times: one sample per guest swap, entry to entry (the
+// present-to-present time the player sees), with counter deltas over the same
+// interval. Called with the bridge locks held, after the scene frame's submit,
+// so the frame's own creations and splits are counted in it.
+void RecordNativeFrameTimeLocked(std::chrono::steady_clock::time_point entry) {
+  static std::optional<std::chrono::steady_clock::time_point> previous;
+  static edf::native::NativeFrameTimeRecorder recorder;
+  static edf::native::NativeFrameCounterDeltas deltas;
+  static uint64_t window_spikes=0,suppressed=0;
+  auto& state=edf::native::State();
+  const auto stats=state.scene_backend?state.scene_backend->Statistics():edf::native::NativeBackendStatistics{};
+  auto& events=edf::native::FrameEventCounters();
+  const edf::native::NativeFrameCounter counters[]{
+    {"pipelines",stats.pipeline_misses},
+    {"shader_compiles",events.shader_compiles.load(std::memory_order_relaxed)},
+    {"mesh_builds",state.meshes.builds()},
+    {"buffers",stats.buffers_created},
+    {"buffer_kb",stats.buffer_bytes_created/1024},
+    {"textures",stats.textures_created},
+    {"texture_kb",stats.texture_bytes_created/1024},
+    {"declines",events.pass_declines.load(std::memory_order_relaxed)},
+    {"post_fallbacks",events.post_fallbacks.load(std::memory_order_relaxed)},
+    {"upload_stalls",stats.upload_stalls},
+    {"descriptor_stalls",stats.descriptor_stalls},
+    {"sampler_misses",stats.sampler_misses},
+    {"backend_frame_waits",stats.frame_waits},
+    {"frame_splits",state.scene_frame_splits}};
+  deltas.Update(counters);
+  // The frame's three largest hook phases, taken whether or not it spikes so
+  // each frame starts from zero. Umbrella phases that contain the others are
+  // left out: they would always win.
+  std::array<std::pair<uint64_t,const char*>,3> top{};
+  auto& phases=edf::native::FrameHookPhaseTotals();
+  for(size_t index=0;index<phases.nanos.size();++index) {
+    const auto nanos=phases.nanos[index].exchange(0,std::memory_order_relaxed);
+    const auto phase=edf::native::HookPhase(index);
+    if(!nanos || phase==edf::native::HookPhase::FrameNative || phase==edf::native::HookPhase::RenderHelper ||
+       phase==edf::native::HookPhase::ResourceHelper) continue;
+    if(nanos<=top.back().first) continue;
+    top.back()={nanos,phases.names[index].load(std::memory_order_relaxed)};
+    std::sort(top.begin(),top.end(),[](const auto& a,const auto& b) { return a.first>b.first; });
+  }
+  if(!previous) { previous=entry; return; }
+  const double ms=std::chrono::duration<double,std::milli>(entry-*previous).count();
+  previous=entry;
+  const auto sample=recorder.Record(ms);
+  if(sample.spike()) {
+    // A loading screen can spike every frame; the window line still counts them.
+    if(++window_spikes>64) ++suppressed;
+    else {
+      std::string largest;
+      const bool timed=REXCVAR_GET(edf_native_hook_timings) || REXCVAR_GET(edf_native_load_timings);
+      for(const auto& [nanos,name]:top) {
+        if(!nanos || !name) continue;
+        largest+=std::format("{}{}:{:.3f}",largest.empty()?"":",",name,double(nanos)/1e6);
+      }
+      if(largest.empty()) largest=timed?"none":"off";
+      REXLOG_INFO("Native frame spike: frame={} ms={:.3f} median_ms={:.3f} reason={} {} top_phases={}",
+        sample.frame,sample.ms,sample.median_ms,sample.reason(),deltas.Describe(),largest);
+    }
+  }
+  edf::native::NativeFrameTimeWindow window;
+  if(recorder.TakeReport(window)) {
+    REXLOG_INFO("Native frame times: frames={} span_ms={:.1f} p50_ms={:.3f} p90_ms={:.3f} p99_ms={:.3f} p99_9_ms={:.3f} max_ms={:.3f} mean_ms={:.3f} spikes={} suppressed_spikes={} hist={}",
+      window.frames,window.span_ms,window.p50_ms,window.p90_ms,window.p99_ms,window.p999_ms,window.max_ms,
+      window.mean_ms,window.spikes,suppressed,edf::native::FormatNativeFrameTimeHistogram(window.histogram));
+    window_spikes=0; suppressed=0;
+  }
+}
+}
 REX_EXTERN(edf_native_swap_wait) {
   using namespace edf::native;
+  const bool frame_times=REXCVAR_GET(edf_native_frame_times);
+  const auto swap_entry=frame_times?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
   NativeSwapFrameTrace frame_trace(ctx.r3.u32);
   const GuestReader reader(base);
   const auto device=ctx.r3.u32;
@@ -8675,6 +8847,7 @@ REX_EXTERN(edf_native_swap_wait) {
   // resource fences separately retain their actual GPU completion semantics.
   SubmitSceneFrameLocked(state);
   frame_trace.Mark(1);
+  if(frame_times) RecordNativeFrameTimeLocked(swap_entry);
   auto [it,inserted]=state.swap_clocks.try_emplace(device);
   auto& timing=it->second;
   if(inserted) timing.clock.Reset(NativePacingClock::Clock::now(),0);

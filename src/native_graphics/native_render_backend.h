@@ -140,12 +140,28 @@ struct NativeBackendStatistics {
   // This is the number that separates "the CPU cannot keep up" from "the CPU is
   // waiting for the GPU", which no amount of CPU profiling can tell apart.
   uint64_t frame_waits=0,frame_wait_ns=0;
+  // Resources created since the backend was: a mesh or texture first seen in
+  // gameplay shows up here in the frame that paid for it. Texture bytes are
+  // the initial contents handed over, not the allocation.
+  uint64_t buffers_created=0,buffer_bytes_created=0,textures_created=0,texture_bytes_created=0;
 };
 
 enum class NativeBackendQueryKind : uint32_t { Occlusion, Timestamp, TimestampDisjoint };
 class NativeBackendQuery {
  public:
   virtual ~NativeBackendQuery()=default;
+};
+
+// A block of GPU timestamp slots for profiling (edf_native_gpu_timings).
+// Recorders write slots in recorded order and resolve ranges of them; the
+// backend reads a resolved range back once the GPU has passed it, never
+// blocking. One heap and one readback buffer for the whole block rather than a
+// query object per marker: a frame's dozen pass boundaries resolve with one
+// copy, and polling a frame is one map of one buffer.
+class NativeBackendTimestamps {
+ public:
+  virtual ~NativeBackendTimestamps()=default;
+  virtual uint32_t capacity() const=0;
 };
 
 enum class NativeBackendStage : uint32_t { Vertex, Pixel, Compute, Count };
@@ -246,6 +262,15 @@ class NativeBackendRecorder {
 
   virtual void BeginQuery(NativeBackendQuery& query)=0;
   virtual void EndQuery(NativeBackendQuery& query)=0;
+  // The GPU time at this point of the recorded stream, into `slot` of a set
+  // from CreateTimestamps. Ordered like a draw, not like a resource update: a
+  // packet recorder keeps it between the draws around it without flushing, so
+  // measuring a pass does not change how that pass is submitted. ResolveTimestamps
+  // makes [first, first+count) readable through ReadTimestamps once the GPU
+  // reaches it. No-ops where the backend has no timestamps; such a backend
+  // never hands out a set, so a caller never gets this far.
+  virtual void WriteTimestamp(NativeBackendTimestamps&,uint32_t) {}
+  virtual void ResolveTimestamps(NativeBackendTimestamps&,uint32_t,uint32_t) {}
 
   // State ownership, replacing the D3D11 getters. A caller that needs to run
   // foreign work and restore afterwards asks the recorder, because on a second
@@ -356,6 +381,13 @@ class NativeRenderBackend {
   // to ask.
   virtual bool ReadQuery(NativeBackendQuery& query, std::span<uint8_t> result)=0;
   virtual uint64_t TimestampFrequency() const { return 0; }
+  // A set of `capacity` timestamp slots, or null when this backend cannot
+  // time GPU work (the caller then reports that and measures nothing).
+  virtual std::unique_ptr<NativeBackendTimestamps> CreateTimestamps(uint32_t) { return nullptr; }
+  // Ticks of [first, first+out.size()) as last resolved, in TimestampFrequency
+  // units. False, without blocking, until the GPU has finished every resolve
+  // that covered the range, or when a slot was never resolved.
+  virtual bool ReadTimestamps(NativeBackendTimestamps&,uint32_t,std::span<uint64_t>) { return false; }
   // Expensive on both target APIs, and cached by the backend on the whole
   // description - so calling this every frame with the same description is
   // cheap, while a combination first seen mid-gameplay is a visible hitch.

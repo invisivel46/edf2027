@@ -1,4 +1,5 @@
 #include "d3d11_effect.h"
+#include "native_frame_times.h"
 #include <d3dcompiler.h>
 #include <cstring>
 #include <map>
@@ -93,6 +94,8 @@ NativeShader CompileNativeShader(ID3D11Device& device,const Effect& effect,const
 NativeShader CompileNativeShader(ID3D11Device* device, const Effect& effect,
                                  const ShaderEntry& entry,
                                  const std::filesystem::path& source_path,bool reverse_depth) {
+  // Attribution for edf_native_frame_times: a compile mid-gameplay is a hitch.
+  FrameEventCounters().shader_compiles.fetch_add(1,std::memory_order_relaxed);
   NativeShader result;
   result.entry = entry;
   result.source_fingerprint=EffectSourceFingerprint(effect.source);
