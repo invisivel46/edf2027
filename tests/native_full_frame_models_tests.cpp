@@ -250,7 +250,7 @@ void InstancedWorlds() {
   const auto draws=OrderNativeFullFrameModelDraws(plan.opaque,true);
   Require(draws.size()==5,"one draw per world and one per model");
   size_t first=draws.size();
-  for(size_t i=0;i<draws.size();++i) if(draws[i].draw.pass==0x9300) { first=std::min(first,i); Require(i-first<3,"sphere draws are adjacent"); }
+  for(size_t i=0;i<draws.size();++i) if(draws[i].draw.pass==0x9300) { first=(std::min)(first,i); Require(i-first<3,"sphere draws are adjacent"); }
   Require(first<draws.size(),"the sphere draws");
   // Without a pose the model is dropped, not its instances; an undecoded set draws nothing.
   mother->pose=Pose(4);
