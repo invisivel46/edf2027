@@ -346,13 +346,30 @@ struct NativeFullFrameModelDrawRef {
   NativeModelDraw draw;
 };
 // Draw order of a list. Transparent: items in list order, each item's draws in
-// guest order (record, batch, pass). Opaque: stably ordered by (pass index,
-// batch, pass record), so draws of the same model resource and material are
-// adjacent across entries and the renderer instances them, while every entry
-// still draws its pass n before its pass n+1. Opaque records of one entry are
-// thus not drawn in record order; depth testing makes that unobservable
-// except for blended passes of mode-0 objects.
-std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::span<const NativeFullFrameModelItem> items,bool opaque);
+// guest order (record, batch, pass). Opaque: NativeFullFrameModelOpaqueOrder
+// over the draws in guest order, `blends` saying which draws' resolved state
+// enables blending (none when not given).
+std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::span<const NativeFullFrameModelItem> items,bool opaque,
+  const std::function<bool(const NativeFullFrameModelDrawRef&)>& blends={});
+// The opaque list's order, as a permutation of its draws in guest order (items
+// in gather order, each item's draws in NativeModelDrawPlan order: what 821C9C20
+// draws as each mode-0 slot 4 is called). Each run of draws that do not blend
+// is stably ordered by (pass index, batch, pass record), so draws of the same
+// model resource and material are adjacent across entries and the renderer
+// instances them, while every entry still draws its pass n before its pass
+// n+1; within such a run the order is unobservable but at exact depth ties.
+// A draw whose state blends keeps its place: every draw before it in guest
+// order is drawn before it and every draw after it after, since what it blends
+// over, and what its depth write then rejects behind it, depend on that order
+// (mode-0 objects with alpha-blended, depth-writing passes: the trees' and
+// hedges' leaves, the soldiers' fade; shadow render frames 4000-4900 showed
+// their batch-grouped order as up to 59-level differences at leaf and helmet
+// edges).
+struct NativeFullFrameModelOrderKey {
+  uint32_t pass_index=0,batch=0,pass=0;
+  bool blends=false;
+};
+std::vector<uint32_t> NativeFullFrameModelOpaqueOrder(std::span<const NativeFullFrameModelOrderKey> keys);
 
 // Target formats and depth direction of the pass: the definition every
 // full-frame scene pass shares (native_full_frame_base_state.h).
@@ -463,12 +480,13 @@ enum class NativeFullFrameModelPhase : uint8_t { Visibility, Programs, Resolve, 
 // the sampler objects in program texture order, the blend factor and whether
 // the resolved state enables scissor. capture is the rigid draw's interned
 // capture; palette is a skinned row's capture of its pass constants, from
-// which each draw derives its own with its palette bound (With).
+// which each draw derives its own with its palette bound (With). blends:
+// whether the resolved state enables blending (NativeFullFrameModelOpaqueOrder).
 struct NativeFullFrameModelResolve {
   NativeBackendPipeline* pipeline=nullptr;
   std::vector<NativeBackendSampler*> samplers;
   std::optional<std::array<float,4>> blend_factor;
-  bool scissor=false;
+  bool scissor=false,blends=false;
   NativeSceneMaterialCapture capture;
   std::shared_ptr<NativeScenePaletteCapture> palette;
 };
@@ -609,7 +627,7 @@ struct NativeFullFrameModelRowState {
   std::vector<NativeBackendSampler*> samplers;
   std::optional<std::array<float,4>> blend_factor;
   NativeSceneView view;
-  bool scissor=false;
+  bool scissor=false,blends=false;  // blends: this frame's result's NativeFullFrameModelResolve::blends.
   // Indexes into constants of the globals whose names the pool carry knows
   // (at names version object_names), which a draw's pool constants bind.
   // object_patchable: no other constant of the row binds a variable of one

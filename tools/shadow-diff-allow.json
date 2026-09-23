@@ -1,5 +1,5 @@
 {
-  "about": "Allow list for tools/shadow-diff.py on edf_native_shadow_render captures. Every rule is an expected exclusion (the shadow render's own design) or a capture limitation of lists recorded before the tap kept only the slots a pipeline's shaders read (reflected=false). Real renderer discrepancies are deliberately NOT here: model vertex constants, the pre-sampler-restore post difference and the image pixels stay reported. Rules marked reflected=false stop matching once captures are reflected, so a stale-slot excuse cannot hide a real missing input there.",
+  "about": "Allow list for tools/shadow-diff.py on edf_native_shadow_render captures. Every rule is an expected exclusion (the shadow render's own design), a register or slot the shaders do not read, or a capture limitation: lists recorded before the tap kept only the slots a pipeline's shaders read (reflected=false), or without constant bytes (constant_bytes=false). Real renderer discrepancies are deliberately NOT here: a blended reorder, a blended pass order, a live register (constants.vs0.<variable> other than the unread ones below), an instance stream that is not the paired worlds (world.instances) and the image pixels stay reported. Rules marked reflected=false or constant_bytes=false stop matching on captures that have what they lack, so an excuse for a capture limitation cannot hide a real difference there. Model vertex constants are verified register by register only on captures with edf_native_shadow_render_constants=1.",
   "draws": [
     {
       "class": "expected exclusion",
@@ -49,12 +49,32 @@
       "evidence": "515 of 2312 static world instances, 5 materials; everything else on them matches. Open: whether these pixel shaders read slot 4 (a reflected capture reports texture.1.4.missing if they do)"
     },
     {
+      "class": "unread registers",
+      "kind": "differing",
+      "pass": "native.models",
+      "field": [
+        "constants.vs0.g_mWorldArray.tail",
+        "constants.vs0.g_mWorld.instanced"
+      ],
+      "reason": "model vertex registers the shaders do not read. g_mWorldArray.tail: palette registers past the native palette, which BindNativeFullFrameModelPalette writes over zeroed registers; both paths write the same bone count (821A1738: min(pose bones, descriptor+16)) and past it the guest's scratch keeps its (0,0,0,1) fill or an earlier object's bones (the guest would draw garbage if a vertex indexed them). A rigid Common.fx shader (VS_Main) reads no palette at all, so all of c4-c207 is tail for it. g_mWorld.instanced: the constant image of a world-instanced alternate, which reads its world from the EDFINSTANCE stream (AddNativeWorldInstancing rewrites every g_mWorld use; the declaration stays for the layout); the stream itself is checked against the paired worlds (instance_streams, world.instances)",
+      "evidence": "shadow2c (50c1d8f, edf_native_shadow_render_constants=1), 16 frames: all 3936 differing model pairs (246 per frame, 12 materials) classify as these two alone once paired by register content; every live palette bone and every rigid g_mWorld is bit-exact, c208-c237 (g_mView, g_mViewTranspose, g_mViewProjection, g_mProjection, lights, fog, material, g_Time/g_Highlight/g_Scroll) never differ; all 73 expanded instances per frame verify their instance stream bit for bit in guest order; $Globals layout from fxc vs_5_0 over the disc's Shader/*.dxsl (g_mWorld c0, g_mWorldArray[68] float4x3 c4-c207, g_mView c208) in all 59 vertex entries of that size"
+    },
+    {
+      "class": "capture limitation (no constant bytes)",
+      "kind": "differing",
+      "pass": "native.models",
+      "constant_bytes": false,
+      "field": "constants.vs0",
+      "reason": "a model draw's vertex constant image as a hash only: the palette tail and the instanced alternates' g_mWorld (the unread-registers rule) always differ, and without the bytes the tool cannot tell those from a live register. Verified register by register on constants captures, where this rule does not apply",
+      "evidence": "shadow2 (no bytes) and shadow2c (bytes) of the same build and scene have the same 246 differing model pairs per frame on constants.vs0 only; on shadow2c every one is unread registers"
+    },
+    {
       "class": "expected exclusion",
       "kind": "reordered",
       "pass": "native.models",
       "field": "opaque",
-      "reason": "the native models pass draws its opaque items in its own order; the guest draws them in callback order. An opaque depth-tested draw's order matters only at exact depth ties. A blending draw has the field 'blended' and is not excused",
-      "evidence": "log 'Native full frame models: opaque=180 transparent=0 blended=0'; 187-191 reorders per frame, all within native.models"
+      "reason": "the native models pass groups the opaque (non-blending) draws between two blending draws on (pass index, batch, pass record) so identical draws instance; the guest draws them in callback order. An opaque depth-tested draw's order matters only at exact depth ties. A blending draw keeps its guest place (NativeFullFrameModelOpaqueOrder); a reordered blending draw has the field 'blended' and is not excused",
+      "evidence": "shadow2/shadow2c: 53-57 opaque reorders per frame, all within native.models (the instanced 88390141/8839c861/87b19f81/88398a01/88390ce1 groups)"
     }
   ]
 }

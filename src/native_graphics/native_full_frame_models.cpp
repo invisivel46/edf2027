@@ -261,7 +261,23 @@ bool BindNativeFullFrameModelPalette(std::vector<NativeSceneMaterialInputs::Cons
     if(constant.name=="g_mWorldArray" && !BindNativeFullFrameModelPalette(constant,palette)) return false;
   return true;
 }
-std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::span<const NativeFullFrameModelItem> items,bool opaque) {
+std::vector<uint32_t> NativeFullFrameModelOpaqueOrder(std::span<const NativeFullFrameModelOrderKey> keys) {
+  std::vector<uint32_t> order(keys.size());
+  for(uint32_t i=0;i<order.size();++i) order[i]=i;
+  const auto less=[&](uint32_t a,uint32_t b) {
+    return std::tie(keys[a].pass_index,keys[a].batch,keys[a].pass)<std::tie(keys[b].pass_index,keys[b].batch,keys[b].pass);
+  };
+  for(size_t begin=0;begin<order.size();) {
+    if(keys[begin].blends) { ++begin; continue; }
+    size_t end=begin;
+    while(end<order.size() && !keys[end].blends) ++end;
+    std::stable_sort(order.begin()+ptrdiff_t(begin),order.begin()+ptrdiff_t(end),less);
+    begin=end;
+  }
+  return order;
+}
+std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::span<const NativeFullFrameModelItem> items,bool opaque,
+    const std::function<bool(const NativeFullFrameModelDrawRef&)>& blends) {
   std::vector<NativeFullFrameModelDrawRef> result;
   for(uint32_t item=0;item<items.size();++item) {
     const auto& layout=NativeFullFrameModelItemLayout(items[item]);
@@ -274,13 +290,15 @@ std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::spa
     }
   }
   if(opaque) {
-    const auto batch=[&](const NativeFullFrameModelDrawRef& ref) {
-      const auto& item=items[ref.item];
-      return NativeFullFrameModelItemLayout(item).meshes[ref.draw.mesh].batches[ref.draw.batch].address;
-    };
-    std::stable_sort(result.begin(),result.end(),[&](const auto& a,const auto& b) {
-      return std::tuple(a.pass_index,batch(a),a.draw.pass)<std::tuple(b.pass_index,batch(b),b.draw.pass);
-    });
+    std::vector<NativeFullFrameModelOrderKey> keys;
+    keys.reserve(result.size());
+    for(const auto& ref:result)
+      keys.push_back({ref.pass_index,NativeFullFrameModelItemLayout(items[ref.item]).meshes[ref.draw.mesh].batches[ref.draw.batch].address,
+                      ref.draw.pass,blends && blends(ref)});
+    std::vector<NativeFullFrameModelDrawRef> ordered;
+    ordered.reserve(result.size());
+    for(const auto i:NativeFullFrameModelOpaqueOrder(keys)) ordered.push_back(result[i]);
+    result=std::move(ordered);
   }
   return result;
 }
@@ -632,7 +650,7 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         const auto* cached=entry && entry->material.palette?entry->material.palette.get():nullptr;
         if(cached) derived=cached->capture().camera;
         if(cached && Cache::Current(*entry,row.constants,cached->capture().material.get(),derived)) {
-          row.palette=entry->material.palette; row.scissor=entry->material.scissor;
+          row.palette=entry->material.palette; row.scissor=entry->material.scissor; row.blends=entry->material.blends;
           row.pipeline=entry->material.pipeline; row.samplers=entry->material.samplers;
           row.blend_factor=entry->material.blend_factor;
           ++materials_.hits; ++stats.cache_hits;
@@ -644,13 +662,14 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
               const auto result=ResolveMaterial(program,*source.second,pass,base,row.constants,true);
               half.pipeline=result.capture.material->pipeline(); half.blend_factor=result.capture.material->blend_factor();
               half.samplers=ResolvedSamplers(program,result.samplers,pass.filtering); half.scissor=result.render.words[5]!=0;
+              half.blends=DecodeNativeRenderState(result.render.words).blend_enable;
             }
             half.palette=std::make_shared<NativeScenePaletteCapture>(program,*half.pipeline,pass.targets.reverse_depth,
               row.constants,half.samplers,half.blend_factor);
           });
           ++(entry?stats.captures:stats.resolves);
           ++materials_.misses;
-          row.palette=half.palette; row.scissor=half.scissor; derived=half.palette->capture().camera;
+          row.palette=half.palette; row.scissor=half.scissor; row.blends=half.blends; derived=half.palette->capture().camera;
           row.pipeline=half.pipeline; row.samplers=half.samplers; row.blend_factor=half.blend_factor;
           materials_.Store(std::move(cache_key),row.constants,std::move(half),row.palette->capture().material.get(),derived);
         }
@@ -659,7 +678,7 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
       } else {
         if(entry) derived=entry->material.capture.camera;
         if(entry && Cache::Current(*entry,row.constants,entry->material.capture.material.get(),derived)) {
-          row.capture=entry->material.capture; row.scissor=entry->material.scissor;
+          row.capture=entry->material.capture; row.scissor=entry->material.scissor; row.blends=entry->material.blends;
           row.pipeline=entry->material.pipeline; row.samplers=entry->material.samplers;
           row.blend_factor=entry->material.blend_factor;
           ++materials_.hits; ++stats.cache_hits;
@@ -675,13 +694,14 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
               half.pipeline=result.capture.material->pipeline();
               half.samplers=ResolvedSamplers(program,result.samplers,pass.filtering);
               half.blend_factor=result.capture.material->blend_factor(); half.scissor=result.render.words[5]!=0;
+              half.blends=DecodeNativeRenderState(result.render.words).blend_enable;
               half.capture=std::move(result.capture);
             }
             if(sources.intern) half.capture.material=sources.intern(std::move(half.capture.material));
           });
           ++(entry?stats.captures:stats.resolves);
           ++materials_.misses;
-          row.capture=half.capture; row.scissor=half.scissor; derived=half.capture.camera;
+          row.capture=half.capture; row.scissor=half.scissor; row.blends=half.blends; derived=half.capture.camera;
           row.pipeline=half.pipeline; row.samplers=half.samplers; row.blend_factor=half.blend_factor;
           const auto* captured=half.capture.material.get();
           materials_.Store(std::move(cache_key),row.constants,std::move(half),captured,derived);
@@ -730,6 +750,8 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     // views[item][draw]: the row view the draw records with; empty when the
     // item is not drawn.
     std::vector<std::vector<const NativeSceneView*>> views(items.size());
+    // blending[item][draw]: whether the draw's row state blends (the opaque order).
+    std::vector<std::vector<uint8_t>> blending(items.size());
     for(size_t index=0;index<items.size();++index) {
       auto* state=item_states[index];
       if(!state) continue;
@@ -785,10 +807,12 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         };
         auto& drawn=views[index];
         drawn.assign(state->draws.size(),nullptr);
+        blending[index].assign(state->draws.size(),0);
         bool complete=true;
         for(size_t d=0;d<state->draws.size() && complete;++d) {
           auto& draw=state->draws[d];
           auto& row=row_of(layout.skinned,draw.draw,draw.source);
+          blending[index][d]=row.blends;
           if(!row.deferrable) { ++stats.scissor; complete=false; mark(item,NativeCoverageStatus::Uncovered,"models_scissor"); break; }
           if(!row.same_backend) {
             ++stats.missing_geometry; complete=false; mark(item,NativeCoverageStatus::Uncovered,"models_missing_geometry"); break;
@@ -927,20 +951,27 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
       }
       pending.clear();
     }
-    // OrderNativeFullFrameModelDraws over the drawn items (a stable order of a
-    // subsequence is the subsequence of the stable order), from the states.
-    struct Ref { uint32_t item,index,pass_index,batch,pass; };
+    // OrderNativeFullFrameModelDraws over the drawn items, from the states:
+    // NativeFullFrameModelOpaqueOrder of the drawn draws in guest order (the
+    // items not drawn draw nothing either side of any blending draw, so their
+    // absence moves no draw across one).
+    struct Ref { uint32_t item,index; };
     std::vector<Ref> refs;
+    std::vector<NativeFullFrameModelOrderKey> keys;
     for(uint32_t item=0;item<items.size();++item) {
       if(views[item].empty()) continue;
       const auto& draws=item_states[item]->draws;
-      for(uint32_t index=0;index<draws.size();++index)
-        refs.push_back({item,index,draws[index].pass_index,draws[index].batch,draws[index].draw.pass});
+      for(uint32_t index=0;index<draws.size();++index) {
+        refs.push_back({item,index});
+        keys.push_back({draws[index].pass_index,draws[index].batch,draws[index].draw.pass,blending[item][index]!=0});
+      }
     }
-    if(!transparent)
-      std::stable_sort(refs.begin(),refs.end(),[](const Ref& a,const Ref& b) {
-        return std::tie(a.pass_index,a.batch,a.pass)<std::tie(b.pass_index,b.batch,b.pass);
-      });
+    if(!transparent) {
+      std::vector<Ref> ordered;
+      ordered.reserve(refs.size());
+      for(const auto i:NativeFullFrameModelOpaqueOrder(keys)) ordered.push_back(refs[i]);
+      refs=std::move(ordered);
+    }
     std::vector<std::shared_ptr<const NativeSceneInstance>> objects;
     const NativeSceneView* view=nullptr;
     uint32_t current=0;

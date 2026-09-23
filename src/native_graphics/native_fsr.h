@@ -11,10 +11,11 @@
 //                 effects eye, the guest view globals and (workstream B) the
 //                 motion vectors. The jitter goes only where camera constants
 //                 are written into draws: NativeSceneRenderer::SetClipJitter
-//                 (sky, static world, models, transparent model batches) and
+//                 (sky, models, static world, transparent model batches) and
 //                 a jittered copy of the camera for the effect activations.
-//   RunPass     - after "models": the scene colour copied as the opaque-only
-//                 colour, the reactive mask's reference.
+//   RunPass     - after "static_world" (the last opaque pass): the scene
+//                 colour copied as the opaque-only colour, the reactive
+//                 mask's reference.
 //   ViewOverlays- the guest listeners draw with the view globals, so these
 //                 are rewritten jittered around the call and put back after.
 //   MotionVectors (workstream B, native_motion_vectors.h) - recorded for an

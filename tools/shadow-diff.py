@@ -31,15 +31,20 @@ This tool compares them:
     * texture sizes: a slot the shader does not read keeps whatever the
       previous pass bound (native: the shadow cascades; guest: its own);
     * first index and base vertex: native passes keep their own buffers.
-  Draws are paired first on the key plus texture sizes and world matrix (so
-  equal meshes pair with their own instance), then on the key alone; each
-  stage aligns in order (difflib) and then pairs what is left by key in list
-  order. A pair is "reordered" when it is out of order WITHIN its native pass
-  (a longest-increasing-subsequence over the pass's guest indices): the
-  native passes group draws by kind where the guest callbacks interleave them,
-  which is reported once as the pass order, not per draw (--strict-order
-  checks the whole list instead). What stays unpaired is "missing" (guest
-  only) or "extra" (native only).
+  Draws are paired first, where the capture kept constant bytes, on the key
+  plus the first palette bone (c4-c6: a skinned draw of one mesh on another
+  object) and then plus g_mWorld (c0-c3: a rigid one), then on the key plus
+  texture sizes and world matrix (so equal meshes pair with their own
+  instance), then on the key alone; each stage aligns in order (difflib) and
+  then pairs what is left by key in list order. A pair is "reordered" when it
+  is out of order WITHIN its native pass (a longest-increasing-subsequence
+  over the pass's guest indices). The native passes group draws by kind where
+  the guest callbacks interleave them; which pass each list reaches first is
+  compared once per frame: a pass the native frame starts in another order is
+  one "pass_order" difference (label: the guest's order, pass: the native's;
+  "blended" when a draw of a moved pass blends), not one per draw
+  (--strict-order checks the whole list instead). What stays unpaired is
+  "missing" (guest only) or "extra" (native only).
 - Paired draws are compared field by field: constants (per stage/slot hash),
   world matrix (--float-tolerance), viewport, blend factor, scissor, texture
   sizes, texture and target identities (which must correspond one-to-one: the
@@ -53,10 +58,21 @@ This tool compares them:
   Captures without the stamped state (before the sampler/state recording)
   cannot say which part of a pipeline differs: their pipeline identity is
   compared with --strict-pipeline only, and counted in the summary. The input
-  layout is compared between draws of the same instancing variant. Geometry
-  (buffer identities, transient vertex hashes, first index, base vertex) is
-  compared with --strict-geometry only. An expanded instanced draw has no world
-  to compare (its worlds are in the instance stream). A "reflected" draw (the
+  layout is compared between draws of the same instancing variant. A
+  transient vertex upload (immediate geometry: the wires' strips, a post
+  quad) is the draw's content and its hash is compared
+  ("geometry.transient.N"; with the capture's vertex bytes, which words
+  differ). Other geometry (buffer identities, the whole geometry text, first
+  index, base vertex) is compared with --strict-geometry only. An expanded instanced draw has no world
+  of its own: its worlds are in the instance stream, which the tap records as
+  the FNV-1a hash of its transient bytes; the worlds of the draws paired with
+  its instances, concatenated in instance order, must hash to it (reported per
+  frame as instance_streams; "world.instances" on each pair where they do
+  not). Where the capture kept constant bytes, a vertex slot-0 image in the
+  Common.fx layout (COMMON_FX_REGISTERS) is compared per variable:
+  "constants.vs0.<variable>", with "g_mWorld.instanced" (a world-instanced
+  alternate, which does not read them) and "g_mWorldArray.tail" (past the
+  native palette) named apart. A "reflected" draw (the
   D3D12 backend reflected its pipeline's shaders) lists only the texture,
   sampler and constant slots those shaders read; an unreflected one lists
   every bound slot, including ones an earlier draw left bound.
@@ -72,12 +88,14 @@ An allow list (--allow FILE, JSON) excuses known differences:
               "pass": "*", "field": "*", "max": 10, "reason": "..."}]}
 
 A draw difference is allowed when a rule matches its kind ("missing", "extra",
-"differing", "reordered" or "*"), material, label and pass (fnmatch globs,
-default "*"; label is the guest callback where there is a guest draw, pass the
-native pass where there is a native one), "reflected" (true/false: whether
-the draws list only the slots their shaders read; omitted: either), and for
-"differing" and "reordered" the fields: "field" is a glob or a list of globs,
-and every field must match one of them (a reordered draw has the field
+"differing", "reordered", "pass_order" or "*"), material, label and pass
+(fnmatch globs, default "*"; label is the guest callback where there is a
+guest draw, pass the native pass where there is a native one), "reflected"
+(true/false: whether the draws list only the slots their shaders read;
+omitted: either), "constant_bytes" (true/false: whether both draws carry their
+constants' bytes; omitted: either), and for "differing", "reordered" and
+"pass_order" the fields: "field" is a glob or a list of globs, and every
+field must match one of them (a reordered draw or pass order has the field
 "blended" when it blends, none when it is opaque). "max" caps how many a rule
 excuses per run; "reason", "class" and "evidence" are for the reader. Exit 0
 when nothing is left beyond the allow list, 1 when something is, 2 on
@@ -217,12 +235,134 @@ def instanced_variant(draw: dict) -> bool:
     return bool(_hex(draw.get('vs', '0')) & INSTANCED_VERTEX_BIT)
 
 
+INSTANCE_STREAM_SLOT, INSTANCE_WORLD_BYTES = 15, 64  # The world-instanced alternates' EDFINSTANCE0-3 stream.
+
+
+def instance_stream(draw: dict) -> tuple[str, int] | None:
+    """(hash, bytes) of an instanced draw's transient instance stream (the
+    tap's "15=t:<FNV-1a 64 of the bytes>:<bytes>/<stride>"), when it holds
+    exactly one 64-byte world per instance from the first."""
+    for part in (draw.get('geometry') or '').split():
+        slot, _, value = part.partition('=')
+        if slot != str(INSTANCE_STREAM_SLOT) or not value.startswith('t:'):
+            continue
+        try:
+            digest, extent = value[2:].split(':')
+            size, stride = (int(v) for v in extent.split('/'))
+        except ValueError:
+            return None
+        if stride == INSTANCE_WORLD_BYTES and not draw.get('first_instance') and \
+                size == int(draw.get('instances', 1)) * INSTANCE_WORLD_BYTES:
+            return digest, size
+    return None
+
+
+def transient_streams(draw: dict) -> dict[int, tuple[str, int, int]]:
+    """The draw's transient vertex uploads but the instance stream: slot ->
+    (hash, bytes, stride), from the tap's "N=t:<hash>:<bytes>/<stride>"."""
+    out = {}
+    for part in (draw.get('geometry') or '').split():
+        slot, _, value = part.partition('=')
+        if not slot.isdigit() or int(slot) == INSTANCE_STREAM_SLOT or not value.startswith('t:'):
+            continue
+        try:
+            digest, extent = value[2:].split(':')
+            size, stride = (int(v) for v in extent.split('/'))
+        except ValueError:
+            continue
+        out[int(slot)] = (digest, size, stride)
+    return out
+
+
+def transient_bytes(draw: dict, slot: int) -> bytes | None:
+    """A transient upload's bytes, where the capture kept them (the tap's
+    "vertices", edf_native_shadow_render_constants)."""
+    for entry in draw.get('vertices') or []:
+        if entry.get('slot') == slot and entry.get('data') is not None:
+            return bytes.fromhex(entry['data'])
+    return None
+
+
+def _ordered(bits: int) -> int:
+    return bits if bits < 0x80000000 else -(bits & 0x7fffffff)
+
+
+def vertex_differences(guest: bytes, native: bytes, stride: int) -> dict:
+    """Which 32-bit words of two vertex uploads differ, read as host floats:
+    how many, in how many vertices, the largest absolute and ulp difference,
+    and the first (vertex, byte offset in the vertex)."""
+    if len(guest) != len(native):
+        return {'registers': f'sizes {len(guest)}/{len(native)}', 'max_abs': math.inf}
+    words = vertices = 0
+    largest, ulps, first = 0.0, 0, None
+    seen_vertex = -1
+    for at in range(0, len(guest) - len(guest) % 4, 4):
+        if guest[at:at + 4] == native[at:at + 4]:
+            continue
+        words += 1
+        vertex = at // stride if stride else 0
+        if vertex != seen_vertex:
+            vertices += 1
+            seen_vertex = vertex
+        if first is None:
+            first = (vertex, at - vertex * stride if stride else at)
+        a, b = struct.unpack_from('<f', guest, at)[0], struct.unpack_from('<f', native, at)[0]
+        if math.isfinite(a) and math.isfinite(b):
+            largest = max(largest, abs(a - b))
+        ua, ub = struct.unpack_from('<I', guest, at)[0], struct.unpack_from('<I', native, at)[0]
+        ulps = max(ulps, abs(_ordered(ua) - _ordered(ub)))
+    return {'registers': f'{words} words in {vertices} vertices, first vertex {first[0]} +{first[1]}, max {ulps} ulp'
+            if first else 'none', 'max_abs': largest}
+
+
+def fnv1a64(data: bytes) -> int:
+    """NativeShadowHash."""
+    value = 14695981039346656037
+    for byte in data:
+        value = ((value ^ byte) * 1099511628211) & 0xffffffffffffffff
+    return value
+
+
+def world_bytes(world) -> bytes | None:
+    """A recorded world as the 64 host bytes an instance stream holds; None
+    when it is not 16 finite numbers."""
+    if not world or len(world) != 16 or any(isinstance(v, str) for v in world):
+        return None
+    return struct.pack('<16f', *world)
+
+
+def verify_instance_streams(pairs: list[tuple[int, int]], guest: list[dict], native: list[dict]) -> dict:
+    """The instance streams of each side's expanded instanced draws against the
+    worlds of the draws the other side paired with its instances: the worlds
+    concatenated in instance order must hash to the recorded stream. Returns
+    {(side, list index): True (verified) / False (differs)} for every expanded
+    draw of a stream whose instances are all paired with draws of known world;
+    streams that cannot be checked are left out (their worlds stay unknown)."""
+    streams: dict[tuple, dict[int, tuple[int, dict]]] = defaultdict(dict)
+    for g, n in pairs:
+        for side, mine, index, other in (('native', native[n], n, guest[g]), ('guest', guest[g], g, native[n])):
+            if mine.get('_stream'):
+                streams[(side,) + mine['_stream']][mine['_instance']] = (index, other)
+    verdict = {}
+    for (side, _, count, digest, size), members in streams.items():
+        if len(members) != count:
+            continue
+        data = [world_bytes(members[k][1].get('world')) for k in range(count)]
+        if any(d is None for d in data):
+            continue
+        ok = f'{fnv1a64(b"".join(data)):016x}' == digest
+        for index, _ in members.values():
+            verdict[(side, index)] = ok
+    return verdict
+
+
 def expand(draws: list[dict], expand_instances: bool) -> list[dict]:
     """Instanced draws as one draw per instance (a native pass may instance
     what the guest draws one by one); indexed kinds become one kind."""
     out = []
     for draw in draws:
         count = int(draw.get('instances', 1)) if expand_instances else 1
+        stream = instance_stream(draw) if count > 1 else None
         for instance in range(max(count, 1)):
             copy = dict(draw)
             if expand_instances:
@@ -235,6 +375,8 @@ def expand(draws: list[dict], expand_instances: bool) -> list[dict]:
                         # the list does not record: not compared for these.
                         copy['world'] = None
                         copy['_world_unknown'] = True
+                        if stream:
+                            copy['_stream'] = (draw.get('i'), count) + stream
                 copy['_instance'] = instance
             out.append(copy)
     return out
@@ -262,6 +404,49 @@ def fine_key(draw: dict, shared: set[str] = frozenset()) -> tuple:
     texture and the world matrix."""
     textures = tuple(sorted((t['stage'], t['slot'], _texture_name(t, shared)) for t in draw.get('textures', [])))
     return structural_key(draw) + (textures, _rounded(draw.get('world')))
+
+
+def vertex_image(draw: dict) -> bytes | None:
+    """The vertex stage's slot-0 constant bytes, where the capture kept them
+    (edf_native_shadow_render_constants)."""
+    for constant in draw.get('constants', []):
+        if constant['stage'] == 0 and constant['slot'] == 0 and constant.get('data'):
+            return bytes.fromhex(constant['data'])
+    return None
+
+
+# What tells two draws of one mesh on two objects apart where no world is
+# recorded, in the Common.fx layout (COMMON_FX_REGISTERS): a skinned draw's
+# first palette bone (c4-c6), a rigid draw's g_mWorld (c0-c3). Each is live and
+# bit-exact on both paths for the draws that read it; the other holds whatever
+# the path left there (a skinned shader does not read g_mWorld, a rigid one
+# not the palette), so each is a pairing stage of its own.
+BONE_REGISTERS, WORLD_REGISTERS = (4, 7), (0, 4)
+_PALETTE_FILL = (bytes(16), struct.pack('<4f', 0.0, 0.0, 0.0, 1.0))
+
+
+def _registers_key(draw: dict, registers: tuple[int, int], live_palette: bool) -> tuple:
+    """The structural key plus a register window of the vertex image. A draw
+    without recorded constant bytes gets a key nothing else has, and so does an
+    instanced draw (its image is shared by its instances, and a world-instanced
+    alternate does not read its g_mWorld) and, for the palette window, a draw
+    whose first bone is only fill (zero or 0,0,0,1: no palette uploaded)."""
+    image = vertex_image(draw)
+    first, end = registers
+    if image is None or len(image) < COMMON_FX_MINIMUM_BYTES or draw.get('_world_unknown') or instanced_variant(draw):
+        return ('unkeyed', id(draw))
+    window = image[first * 16:end * 16]
+    if live_palette and all(window[r * 16:r * 16 + 16] in _PALETTE_FILL for r in range(end - first)):
+        return ('unkeyed', id(draw))
+    return structural_key(draw) + (window,)
+
+
+def bone_key(draw: dict) -> tuple:
+    return _registers_key(draw, BONE_REGISTERS, True)
+
+
+def world_register_key(draw: dict) -> tuple:
+    return _registers_key(draw, WORLD_REGISTERS, False)
 
 
 def medium_key(draw: dict, shared: set[str] = frozenset()) -> tuple:
@@ -354,6 +539,69 @@ def constant_registers(guest: str, native: str) -> dict:
     return {'registers': ','.join(f'c{s}' if s == e else f'c{s}-c{e}' for s, e in runs), 'max_abs': largest}
 
 
+# The vertex $Globals prefix every model and world shader shares: each .dxsl
+# includes Common.fx, whose globals come first, and D3DCompile (vs_5_0, as
+# CompileNativeShader) lays them out identically in all 59 vertex entries with
+# a constant image of 3744 bytes or more (fxc /T vs_5_0 over the disc's Shader/
+# sources: g_mWorld at offset 0, g_mWorldArray (float4x3[68]) at 64, g_mView at
+# 3328 ...). Smaller images (Utility's older [32]-bone layouts, the post's
+# quad shaders) have other layouts and are not classified.
+COMMON_FX_REGISTERS = ((0, 4, 'g_mWorld'), (4, 208, 'g_mWorldArray'), (208, 212, 'g_mView'),
+                       (212, 216, 'g_mViewTranspose'), (216, 220, 'g_mViewProjection'), (220, 224, 'g_mProjection'))
+COMMON_FX_MINIMUM_BYTES = 224 * 16  # c224 on: lights, fog, shadow, material and per-object globals (g_Time, g_Highlight).
+_ZERO_REGISTER = bytes(16)
+
+
+def classify_vertex_registers(guest: bytes, native: bytes, instanced: bool) -> dict[str, list[int]]:
+    """The differing registers of a Common.fx vertex image by variable, as
+    field suffixes:
+      g_mWorld.instanced   g_mWorld where a draw is a world-instanced alternate:
+                           that shader reads its world from the instance stream
+                           (AddNativeWorldInstancing rewrites every g_mWorld use
+                           to edf_instance_world and keeps the declaration only
+                           for the layout), so the registers are unread;
+      g_mWorldArray.tail   palette registers past the native palette: zero on
+                           the native side (BindNativeFullFrameModelPalette
+                           writes the bones over zeroed registers) and after
+                           its last nonzero register. The guest writes the same
+                           count (821A1738: min(pose bones, descriptor+16)), so
+                           past it its scratch holds the (0,0,0,1) fill or an
+                           earlier object's bones; a vertex indexes only its
+                           mesh's bones;
+      <name>               any other difference in a named variable;
+      material             c224 on (lights, fog, material, per-object globals)."""
+    count = max(len(guest), len(native)) // 16
+    last_live = 3
+    for r in range(4, min(208, len(native) // 16)):
+        if native[r * 16:r * 16 + 16] != _ZERO_REGISTER:
+            last_live = r
+    out: dict[str, list[int]] = {}
+    for r in range(count):
+        if guest[r * 16:r * 16 + 16] == native[r * 16:r * 16 + 16]:
+            continue
+        name = 'material'
+        for first, end, variable in COMMON_FX_REGISTERS:
+            if first <= r < end:
+                name = variable
+                break
+        if name == 'g_mWorld' and instanced:
+            name = 'g_mWorld.instanced'
+        elif name == 'g_mWorldArray' and r > last_live and native[r * 16:r * 16 + 16] == _ZERO_REGISTER:
+            name = 'g_mWorldArray.tail'
+        out.setdefault(name, []).append(r)
+    return out
+
+
+def _register_runs(registers: list[int]) -> str:
+    runs: list[list[int]] = []
+    for r in registers:
+        if runs and runs[-1][1] == r - 1:
+            runs[-1][1] = r
+        else:
+            runs.append([r, r])
+    return ','.join(f'c{s}' if s == e else f'c{s}-c{e}' for s, e in runs)
+
+
 def compare_fields(guest: dict, native: dict, settings: 'Settings', textures: Correspondence,
                    targets: Correspondence, details: dict | None = None) -> list[str]:
     fields = []
@@ -363,9 +611,24 @@ def compare_fields(guest: dict, native: dict, settings: 'Settings', textures: Co
         g, n = g_constants.get(slot), n_constants.get(slot)
         if g is None or n is None or g['hash'] != n['hash'] or g['bytes'] != n['bytes']:
             name = f'constants.{"vs" if slot[0] == 0 else "ps" if slot[0] == 1 else "cs"}{slot[1]}'
+            if g is not None and n is not None and g.get('data') and n.get('data'):
+                a, b = bytes.fromhex(g['data']), bytes.fromhex(n['data'])
+                if slot == (0, 0) and len(a) == len(b) >= COMMON_FX_MINIMUM_BYTES:
+                    # Name the variables that differ (the capture kept the bytes).
+                    groups = classify_vertex_registers(a, b, instanced_variant(guest) or instanced_variant(native))
+                    for variable, registers in groups.items():
+                        fields.append(f'{name}.{variable}')
+                        if details is not None:
+                            details[f'{name}.{variable}'] = {'registers': _register_runs(registers),
+                                                             'max_abs': constant_registers(
+                                                                 b''.join(a[r * 16:r * 16 + 16] for r in registers).hex(),
+                                                                 b''.join(b[r * 16:r * 16 + 16] for r in registers).hex())['max_abs']}
+                    if not groups:  # Same bytes, different hash: cannot happen for one hash function.
+                        fields.append(name)
+                    continue
+                if details is not None:
+                    details[name] = constant_registers(g['data'], n['data'])
             fields.append(name)
-            if details is not None and g is not None and n is not None and g.get('data') and n.get('data'):
-                details[name] = constant_registers(g['data'], n['data'])
     if not (guest.get('_world_unknown') or native.get('_world_unknown')) and \
             not _floats_equal(guest.get('world'), native.get('world'), settings.float_tolerance):
         fields.append('world')
@@ -411,6 +674,18 @@ def compare_fields(guest: dict, native: dict, settings: 'Settings', textures: Co
         fields.append('pipeline')
     if instanced_variant(guest) == instanced_variant(native) and guest.get('layout') != native.get('layout'):
         fields.append('layout')
+    # Immediate geometry: a transient vertex upload is the draw's content (both
+    # paths convert the guest's vertices the same way), so its hash is
+    # compared; slot 15, the instance stream, only through the instance check
+    # (a draw that does not instance leaves an earlier stream bound there).
+    g_transient, n_transient = transient_streams(guest), transient_streams(native)
+    for slot in sorted(set(g_transient) & set(n_transient)):
+        if g_transient[slot] != n_transient[slot]:
+            name = f'geometry.transient.{slot}'
+            fields.append(name)
+            a, b = transient_bytes(guest, slot), transient_bytes(native, slot)
+            if details is not None and a is not None and b is not None:
+                details[name] = vertex_differences(a, b, g_transient[slot][2])
     if settings.strict_geometry:
         if guest.get('geometry') != native.get('geometry'):
             fields.append('geometry')
@@ -431,11 +706,12 @@ class Difference:
     native_label: str = ''  # the native pass where there is a native draw, else the guest callback
     details: dict = field(default_factory=dict)  # per field, where the capture says more (constant registers)
     reflected: bool = False  # both draws list only the slots their shaders read
+    constant_bytes: bool = False  # both draws carry their constants' bytes (edf_native_shadow_render_constants)
 
     def to_json(self) -> dict:
         out = {'kind': self.kind, 'material': self.material, 'label': self.label, 'pass': self.native_label,
                'fields': self.fields, 'guest': self.guest_index, 'native': self.native_index,
-               'allowed_by': self.allowed_by, 'reflected': self.reflected}
+               'allowed_by': self.allowed_by, 'reflected': self.reflected, 'constant_bytes': self.constant_bytes}
         if self.details:
             out['details'] = self.details
         return out
@@ -462,6 +738,8 @@ class DrawDiff:
     classes: dict = field(default_factory=dict)      # guest label -> {native label: pairs}
     pass_order: dict = field(default_factory=dict)   # the pass sequences in each list's order
     pipeline_identity_differs: int = 0               # pairs whose raw pipeline identity differs
+    instance_streams: dict = field(default_factory=dict)  # expanded instances whose stream was checked: verified/differs
+    pairs: list = field(default_factory=list)        # (guest draw, native draw) as paired, expanded; not reported
 
     def groups(self) -> dict:
         by_material: dict[str, Counter] = defaultdict(Counter)
@@ -529,6 +807,14 @@ def _increasing(values: list[int]) -> set[int]:
     return keep
 
 
+def _first_order(runs: list[list]) -> list[str]:
+    seen: list[str] = []
+    for label, _ in runs:
+        if label not in seen:
+            seen.append(label)
+    return seen
+
+
 def _runs(labels: list[str]) -> list[list]:
     runs: list[list] = []
     for label in labels:
@@ -551,7 +837,8 @@ def diff_draws(guest_draws: list[dict], native_draws: list[dict], settings: Sett
     # what the one before left.
     pairs: list[tuple[int, int]] = []
     still_guest, still_native = list(range(len(guest))), list(range(len(native)))
-    for key in (lambda d: fine_key(d, shared_textures), lambda d: medium_key(d, shared_textures), structural_key):
+    for key in (bone_key, world_register_key, lambda d: fine_key(d, shared_textures),
+                lambda d: medium_key(d, shared_textures), structural_key):
         more, still_guest, still_native = _pair([key(d) for d in guest], [key(d) for d in native], still_guest, still_native)
         pairs.extend(more)
     pairs.sort()
@@ -566,6 +853,7 @@ def diff_draws(guest_draws: list[dict], native_draws: list[dict], settings: Sett
         in_order.update(members[k] for k in keep)
     textures = Correspondence(shared_textures)
     targets = Correspondence(ids(guest, 'targets') & ids(native, 'targets') - {'0000000000000000', 'None'})
+    streams = verify_instance_streams(pairs, guest, native)
     differences: list[Difference] = []
     matched = identity_differs = 0
     classes: dict[str, Counter] = defaultdict(Counter)
@@ -575,13 +863,17 @@ def diff_draws(guest_draws: list[dict], native_draws: list[dict], settings: Sett
             identity_differs += 1
         details: dict = {}
         fields = compare_fields(guest[g], native[n], settings, textures, targets, details)
+        if False in (streams.get(('native', n)), streams.get(('guest', g))):
+            # The instance stream is not the paired draws' worlds in instance order.
+            fields.append('world.instances')
         label, native_label = guest[g].get('label', ''), native[n].get('label', '')
         ordered = (g, n) in in_order
         reflected = bool(guest[g].get('reflected') and native[n].get('reflected'))
         if fields:
+            with_bytes = all(c.get('data') for d in (guest[g], native[n]) for c in d.get('constants', []))
             differences.append(Difference('differing', material(guest[g]), label, fields, guest[g].get('i'),
                                           native[n].get('i'), native_label=native_label, details=details,
-                                          reflected=reflected))
+                                          reflected=reflected, constant_bytes=with_bytes))
         if not ordered and settings.check_order:
             # Order matters for a blending draw; for an opaque depth-tested one
             # only at exact depth ties. "blended" says which, where the capture
@@ -605,8 +897,26 @@ def diff_draws(guest_draws: list[dict], native_draws: list[dict], settings: Sett
     native_of_guest = {g: native[n].get('label', '') for g, n in pairs}
     order = {'guest': _runs([native_of_guest.get(g, guest[g].get('label', '')) for g in range(len(guest))]),
              'native': _runs([d.get('label', '') for d in native])}
-    return DrawDiff(len(guest), len(native), matched, differences,
-                    {k: dict(v) for k, v in sorted(classes.items())}, order, identity_differs)
+    # The passes in the order each list first reaches them (an interleaving of
+    # the guest's is not a difference, only which pass starts first): a pass
+    # the native frame draws before one the guest draws it after is a
+    # "pass_order" difference, "blended" when a draw of a pass whose place
+    # differs blends (it then blends over, and hides behind it, other content).
+    if settings.check_order and not settings.strict_order:
+        g_first, n_first = _first_order(order['guest']), _first_order(order['native'])
+        both = set(g_first) & set(n_first)
+        g_first, n_first = [p for p in g_first if p in both], [p for p in n_first if p in both]
+        if g_first != n_first:
+            moved = {p for p in both if g_first.index(p) != n_first.index(p)}
+            blended = any(canonical_state(d['decoded']).get('blend', 'off') != 'off'
+                          for d in native if d.get('label', '') in moved and 'decoded' in d)
+            differences.append(Difference('pass_order', '*', ' > '.join(g_first), ['blended'] if blended else [],
+                                          native_label=' > '.join(n_first)))
+    result = DrawDiff(len(guest), len(native), matched, differences,
+                      {k: dict(v) for k, v in sorted(classes.items())}, order, identity_differs)
+    result.instance_streams = dict(Counter('verified' if ok else 'differs' for ok in streams.values()))
+    result.pairs = [(guest[g], native[n]) for g, n in pairs]
+    return result
 
 
 # ------------------------------------------------------------- allow list ---
@@ -621,6 +931,7 @@ class Rule:
     used: int = 0
     pass_: str = '*'
     reflected: bool | None = None  # None: any; False: only differences between unreflected draws
+    constant_bytes: bool | None = None  # None: any; False: only differences between draws without constant bytes
 
     def name(self) -> str:
         return self.reason or f'{self.kind} {self.material} {self.label} {self.pass_} {self.field}'
@@ -636,7 +947,9 @@ class Rule:
             return False
         if self.reflected is not None and difference.reflected != self.reflected:
             return False
-        if difference.kind in ('differing', 'reordered'):
+        if self.constant_bytes is not None and difference.constant_bytes != self.constant_bytes:
+            return False
+        if difference.kind in ('differing', 'reordered', 'pass_order'):
             globs = [self.field] if isinstance(self.field, str) else list(self.field)
             return all(any(fnmatch.fnmatchcase(f, glob) for glob in globs) for f in difference.fields)
         return True
@@ -652,7 +965,7 @@ def load_allow(path: Path | None) -> tuple[dict, list[Rule]]:
     rules = []
     for entry in data.get('draws', []):
         unknown = set(entry) - {'kind', 'material', 'label', 'pass', 'field', 'max', 'reason', 'evidence', 'reflected',
-                                'class'}
+                                'class', 'constant_bytes'}
         if unknown:
             raise InputError(f'{path}: unknown rule keys {sorted(unknown)}')
         entry = {k: v for k, v in entry.items() if k not in ('evidence', 'class')}
@@ -761,6 +1074,7 @@ def compare_frame(files: FrameFiles, settings: Settings, rules: list[Rule], imag
                        'counts': dict(Counter(d.kind for d in draws.differences)),
                        'unallowed': dict(Counter(d.kind for d in remaining)),
                        'pipeline_identity_differs': draws.pipeline_identity_differs,
+                       'instance_streams': draws.instance_streams,
                        'state_recorded': stamped,
                        'classes': draws.classes, 'pass_order': draws.pass_order,
                        'groups': draws.groups(),
@@ -800,6 +1114,8 @@ def print_report(report: dict, limit: int) -> None:
     if not draws['state_recorded']:
         print(f'   pipeline state not recorded in this capture: {draws["pipeline_identity_differs"]} paired draws have '
               f'different raw pipeline identities (not compared; --strict-pipeline compares them)')
+    if draws.get('instance_streams'):
+        print(f'   instance streams (expanded instances checked against the paired worlds): {draws["instance_streams"]}')
     print(f'   classes (guest callback -> native pass): {draws["classes"]}')
     order = draws['pass_order']
     print(f'   pass order: guest {[f"{k}x{n}" for k, n in order["guest"]]}')

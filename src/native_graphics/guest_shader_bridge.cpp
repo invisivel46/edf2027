@@ -245,7 +245,7 @@ REXCVAR_DEFINE_INT32(edf_native_shadow_render_limit,16,"EDF2027",
 REXCVAR_DEFINE_STRING(edf_native_shadow_render_prefix,"native-shadow/shadow","EDF2027",
                      "Path prefix of shadow render output: <prefix>.<frame>.native.bmp/.guest.bmp, .native.draws.jsonl/.guest.draws.jsonl and .shadow.json; its directory is created (development)");
 REXCVAR_DEFINE_BOOL(edf_native_shadow_render_constants,false,"EDF2027",
-                   "Shadow render: also write every draw's constant bytes into the draw lists, so tools/shadow-diff.py can say which registers differ (large; development)");
+                   "Shadow render: also write every draw's constant bytes and its transient vertex uploads of up to 4 KB into the draw lists, so tools/shadow-diff.py can say which registers and vertices differ (large; development)");
 REXCVAR_DEFINE_BOOL(edf_native_pixel_centers,true,"EDF2027",
                    "Apply the guest PA_SU_VTX_CNTL half-pixel offset to the audited retail post passes; false restores the unshifted viewport for regression diagnosis");
 REXCVAR_DEFINE_INT32(edf_native_loop_trace,0,"EDF2027",
@@ -375,7 +375,7 @@ REXCVAR_DEFINE_INT32(edf_native_hook_sample_period,0,"EDF2027",
 REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
                    "Log inclusive CPU wall times for native/original graphics hook phases (development)");
 REXCVAR_DEFINE_BOOL(edf_native_gpu_timings, false, "EDF2027",
-                   "Log GPU time per full-frame pass (sky, static_world, models, effects, transparent, post, view overlays, HUD phases) and per frame from scene-backend timestamps, read back frames later without stalling (development)");
+                   "Log GPU time per full-frame pass (sky, models, static_world, effects, transparent, post, view overlays, HUD phases) and per frame from scene-backend timestamps, read back frames later without stalling (development)");
 REXCVAR_DEFINE_BOOL(edf_native_coverage_census, false, "EDF2027",
                    "Full-frame coverage census: count, per class and reason, what the native passes draw and every object, pass or view they skip that the guest render helper would have drawn; logs 'Native coverage' summaries every edf_native_coverage_census_interval seconds and at exit (tools/coverage-report.py; development)");
 REXCVAR_DEFINE_INT32(edf_native_coverage_census_interval,30,"EDF2027",
@@ -650,8 +650,8 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        RenderGatherClassify, RenderGatherVisibility, RenderGatherLod, RenderGatherPush, RenderGatherGuest,
                        QueuedEligibility, QueuedResolve, QueuedInstances, QueuedRecord,
                        QueuedHandoff, QueuedHandoffBinds, QueuedHandoffReplays,
-                       FrameNative, FrameNativeBegin, FrameNativeSky, FrameNativeStaticWorld,
-                       FrameNativeModels, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
+                       FrameNative, FrameNativeBegin, FrameNativeSky, FrameNativeModels,
+                       FrameNativeStaticWorld, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
                        FrameNativeEnd, FrameNativeOverlays, FrameNativePhases,
                        FrameNativeModelsVisibility, FrameNativeModelsPrograms, FrameNativeModelsResolve, FrameNativeModelsRecord,
                        FrameNativeStaticWorldSelect, FrameNativeStaticWorldBuild, FrameNativeStaticWorldRecord,
@@ -688,8 +688,8 @@ constexpr const char* kHookPhaseNames[]{"activation.original","activation.native
   "render.gather.classify","render.gather.visibility","render.gather.lod","render.gather.push","render.gather.guest_dispatch",
   "render.queued.eligibility","render.queued.resolve","render.queued.instances","render.queued.record",
   "render.queued.handoff","render.queued.handoff_binds","render.queued.handoff_replays",
-  "frame.native","frame.native.begin","frame.native.sky","frame.native.static_world",
-  "frame.native.models","frame.native.effects","frame.native.transparent","frame.native.post",
+  "frame.native","frame.native.begin","frame.native.sky","frame.native.models",
+  "frame.native.static_world","frame.native.effects","frame.native.transparent","frame.native.post",
   "frame.native.end","frame.native.view_overlays","frame.native.phases",
   "frame.native.models.visibility","frame.native.models.programs","frame.native.models.resolve","frame.native.models.record",
   "frame.native.static_world.select","frame.native.static_world.build","frame.native.static_world.record",
@@ -8832,9 +8832,10 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     const GpuPassSpan gpu(pass.name());
     if(shadow_) shadow_->Label(std::string("native.")+pass.name());
     pass.Record(context);
-    // FSR: the opaque-only colour (sky, static world, opaque models), before
-    // the effects and transparent passes, for the reactive mask.
-    if(edf::native::native_scene_draw_camera && std::string_view(pass.name())=="models") CopyFsrOpaque(context);
+    // FSR: the opaque-only colour (sky, opaque models, static world), after
+    // the last of them and before the effects and transparent passes, for the
+    // reactive mask.
+    if(edf::native::native_scene_draw_camera && std::string_view(pass.name())=="static_world") CopyFsrOpaque(context);
   }
   void CopyFsrOpaque(const edf::native::NativeFrameContext& context) {
     auto& state=edf::native::State();

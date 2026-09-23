@@ -264,6 +264,7 @@ void Tap() {
     const auto& second=draws[1];
     Check(second.label=="native.models" && second.kind==NativeDrawKind::Instanced && second.instances==4,"instanced draw");
     Check(second.geometry.find(std::format("3=t:{:016x}:64/16",NativeShadowHash(quad.data(),quad.size())))!=std::string::npos,"transient geometry hash");
+    Check(second.vertices.empty(),"no vertex bytes unless asked");
     Check(second.blend && (*second.blend)[0]==0.5f,"blend factor");
     Check(!second.scissor,"disabled scissor");
     Check(second.constant_hash==first.constant_hash,"same constants, same combined hash");
@@ -299,8 +300,16 @@ void Tap() {
   tap.SetSampler(NativeBackendStage::Pixel,3,&sampler);
   tap.SetConstants(NativeBackendStage::Vertex,1,constants);
   tap.SetConstants(NativeBackendStage::Pixel,0,std::vector<uint8_t>(16,7));
+  // Small transient uploads keep their bytes; a large one and a buffer do not.
+  const std::vector<uint8_t> strip(560,3),large(kNativeShadowTransientBytes+16,4);
+  tap.SetTransientVertices(0,strip,28);
+  tap.SetTransientVertices(1,large,16);
+  tap.SetTransientVertices(2,strip,28);
+  tap.SetVertexBuffer(2,vertices,32,0);
   tap.Draw(3,0);
   const auto filtered=tap.Take();
+  Check(filtered.size()==1 && filtered[0].vertices.size()==1 && filtered[0].vertices[0].first==0 &&
+        filtered[0].vertices[0].second==strip,"small transient vertex bytes when asked, per slot");
   Check(filtered.size()==1 && filtered[0].reflected && filtered[0].textures.size()==1 && filtered[0].textures[0].slot==2 &&
         filtered[0].samplers.empty() && filtered[0].constants.size()==1 && filtered[0].constants[0].stage==0 &&
         filtered[0].constants[0].data==constants,"a reflected pipeline lists only the slots it reads, with the bytes");
@@ -393,6 +402,14 @@ void Serialization() {
     "\"decoded\":\"blend=0:2/1/1:2/1/1 mask=15 depth=0/0/1 raster=3/1/1/1\",\"format\":[1,10,0,1,0],\"reflected\":true,\"scissor\":[0,0,640,360]}";
   Check(stamped_line==stamped_expected,"stamped draw line");
   if(stamped_line!=stamped_expected) std::cerr<<stamped_line<<"\n"<<stamped_expected<<"\n";
+  auto with_vertices=stamped;
+  with_vertices.vertices={{0,{0x00,0x3f}},{3,{0xff}}};
+  const auto vertices_line=SerializeNativeDrawRecord(with_vertices);
+  const std::string scissor=",\"scissor\":[0,0,640,360]}";
+  const auto vertices_expected=stamped_expected.substr(0,stamped_expected.size()-scissor.size())+
+    ",\"vertices\":[{\"slot\":0,\"data\":\"003f\"},{\"slot\":3,\"data\":\"ff\"}]"+scissor;
+  Check(vertices_line==vertices_expected,"vertex bytes after the reflected flag");
+  if(vertices_line!=vertices_expected) std::cerr<<vertices_line<<"\n"<<vertices_expected<<"\n";
   Check(NativeShadowJsonString("a\nb\\\x01")=="\"a\\nb\\\\\\u0001\"","escapes");
 }
 }
