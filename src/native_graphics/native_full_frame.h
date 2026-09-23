@@ -1,5 +1,6 @@
 #pragma once
 #include "native_frame_motion.h"
+#include "native_motion_vectors.h"
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -34,7 +35,7 @@ struct NativeRenderRegistrySnapshot;
 //   and phase loop still run, as in the guest.
 // - Per view: AdvanceSerial(view); BeginView, and when it accepts, every view
 //   pass in order through RunPass; ViewOverlays (always, as the guest runs its
-//   per-view listeners); EndView.
+//   per-view listeners); MotionVectors when BeginView accepted; EndView.
 // - SideEffects, then every frame pass (Post) through RunPass with a frame
 //   context (view.scene 0); output_ready is what they report.
 // - Phases (the HUD on the output target), then EndScene(output_ready).
@@ -60,6 +61,10 @@ struct NativeFrameInputs {
   // the host's guest HUD phases step the radar shake and cursor fade only
   // then (the bridge's 82176708/8218ED68 hooks).
   bool tick_frame=true;
+  // This render's index: NativeFullFrame::Run's count of frames, set once per
+  // frame before any view (the motion vectors' history key: consecutive
+  // renders have consecutive indexes).
+  uint64_t frame=0;
 };
 struct NativeFrameView {
   uint32_t scene=0,index=0;
@@ -80,6 +85,13 @@ struct NativeFrameContext {
   uint32_t owner=0;          // The helper's owner (r3 of 821A5080), set by BeginView.
   uint32_t guest_context=0;  // The guest frame context (helper stack+80) as the view's walks read it, set by BeginView.
   bool output_ready=false;   // Set by the post pass: the ordinary output is active for 8219C840.
+  // Motion vectors (edf_native_motion_vectors, native_motion_vectors.h): in a
+  // view's context, what NativeFrameHost::MotionVectors recorded for it (after
+  // its passes and ViewOverlays); in the frame context the frame passes
+  // (Post) and Phases get, the last accepted view's whose motion texture is
+  // set, else the default (motion null, reset). For FSR (workstream C): the
+  // texture, whether history reset, and the unjittered camera parameters.
+  NativeMotionVectorOutput motion;
 };
 struct NativeFramePass {
   virtual ~NativeFramePass()=default;
@@ -98,6 +110,10 @@ class NativeFrameHost {
   virtual void RunPass(size_t index,NativeFramePass& pass,NativeFrameContext& context) { (void)index; pass.Record(context); }
   // The view's guest listeners (remaining guest calls).
   virtual void ViewOverlays(NativeFrameContext&) {}
+  // Motion vectors for an accepted view, after ViewOverlays and before
+  // EndView: RecordNativeMotionVectors into context.motion. Records nothing
+  // (and leaves the default) while edf_native_motion_vectors is off.
+  virtual void MotionVectors(NativeFrameContext&) {}
   virtual void EndView(NativeFrameContext&) {}
   // HOOK POINT: the helper's guest side effects other code relies on, from
   // the ongoing side-effect research. Called once per frame before the post.

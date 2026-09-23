@@ -333,6 +333,48 @@ bool SameConstants(const NativeFullFrameModelConstants& a,const NativeFullFrameM
   return a.skinned==b.skinned && a.bones==b.bones && a.worlds==b.worlds && a.palette.size()==b.palette.size() &&
     (a.palette.empty() || !std::memcmp(a.palette.data(),b.palette.data(),a.palette.size()*sizeof(float)));
 }
+// The velocity draws of one moved item (NativeFullFrameModelFrame::velocity):
+// each draw's geometry with its record's world now and last frame, or for a
+// draw whose game vertex shader skins, both palettes. A draw of a skinned
+// layout whose shader does not read BLENDINDICES draws with its record's
+// world (as the model draw binds it). Nothing when the two constant sets do
+// not have the same shape (a relayout keeps no history).
+void AppendVelocity(const NativeFullFrameModelItem& item,const NativeFullFrameModelItemState& state,
+    std::vector<NativeMotionVelocityDraw>& out) {
+  const auto& now=state.values;
+  const auto& before=state.last_values;
+  if(now.worlds.size()!=before.worlds.size() || now.skinned!=before.skinned || now.palette.size()!=before.palette.size()) return;
+  std::shared_ptr<const std::vector<float>> palette,previous;
+  const bool palette_moved=now.palette!=before.palette;
+  for(const auto& draw:state.draws) {
+    if(!draw.source.second || draw.draw.mesh>=now.worlds.size()) continue;
+    NativeMotionVelocityDraw velocity;
+    velocity.geometry=draw.source.second;
+    bool skinned=false;
+    if(now.skinned && !now.palette.empty() && draw.source.first && draw.source.first->program) {
+      const auto& program=*draw.source.first->program;
+      const auto skinning=NativeMotionSkinningOf(program.vertex.reflection?program.vertex:program.reversed_vertex);
+      if(skinning.indices) {
+        if(!palette_moved) continue;  // The palette did not move.
+        skinned=true;
+        velocity.kind=NativeMotionVelocityKind::Skinned;
+        velocity.weighted=skinning.weights;
+        if(!palette) {
+          palette=std::make_shared<const std::vector<float>>(now.palette);
+          previous=std::make_shared<const std::vector<float>>(before.palette);
+        }
+        velocity.palette=palette; velocity.previous_palette=previous;
+      }
+    }
+    if(!skinned) {
+      velocity.kind=item.instanced>=0?NativeMotionVelocityKind::Instanced:NativeMotionVelocityKind::Rigid;
+      velocity.world=NativeMotionWorldOf(now.worlds[draw.draw.mesh]);
+      velocity.previous_world=NativeMotionWorldOf(before.worlds[draw.draw.mesh]);
+      if(velocity.world==velocity.previous_world) continue;  // This record did not move.
+    }
+    out.push_back(std::move(velocity));
+  }
+}
 }
 NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistrySnapshot& snapshot,
     const NativeFullFrameModelCamera& camera,const NativeFullFrameModelPass& pass,const NativeFullFrameModelSources& sources,
@@ -660,15 +702,25 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         const uint32_t world=item.instanced<0?0:item.world;
         const auto blend=NativeRenderBlendOf(pose,*motion_of,pass.motion);
         if(blend.previous) ++stats.blended;
+        // The first Build of this frame to reach the item (the motion
+        // vectors' previous constants swap once per frame).
+        const bool first_this_frame=state->values_frame!=frames_;
         if(!state->valued || state->pose!=pose || state->blend!=blend || state->world!=world || state->palette_limit!=pass.palette_limit) {
           // Pose source: the published pose, or blended from the previous tick's.
           auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,poses_.Pose(pose,*motion_of,pass.motion),pass.palette_limit):
             NativeFullFrameModelInstancedConstants(layout,poses_.Matrix(pose,*motion_of,world,pass.motion));
-          if(!state->valued || !SameConstants(values,state->values))
+          if(!state->valued || !SameConstants(values,state->values)) {
             for(auto& draw:state->draws) { draw.object.reset(); draw.made_from.reset(); }
+            if(!state->valued) { state->last_frame=0; state->moved_frame=0; }
+            else {
+              if(first_this_frame) { state->last_values=std::move(state->values); state->last_frame=state->values_frame; }
+              state->moved_frame=frames_;
+            }
+          }
           state->values=std::move(values); state->pose=pose; state->blend=blend; state->world=world; state->palette_limit=pass.palette_limit;
           state->valued=true;
         }
+        state->values_frame=frames_;
         const auto& values=state->values;
         // The pool constants in effect at the item's draw: its entry's slot 4
         // found the carried pool, its own stores (the entry's, a part's) over
@@ -771,6 +823,9 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         }
         if(complete) { ++stats.drawn; mark(item,NativeCoverageStatus::Covered,"models"); }
         else drawn.clear();
+        // Motion vectors: this item's draws again, with last frame's constants.
+        if(complete && pass.velocity && !transparent && state->moved_frame==frames_ && state->last_frame+1==frames_)
+          AppendVelocity(item,*state,frame.velocity);
       } catch(const std::exception&) { ++stats.failed; views[index].clear(); mark(item,NativeCoverageStatus::Uncovered,"models_failed"); }
     }
     // OrderNativeFullFrameModelDraws over the drawn items (a stable order of a

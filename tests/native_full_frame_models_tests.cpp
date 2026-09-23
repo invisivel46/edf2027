@@ -2087,6 +2087,128 @@ void OtherPassClasses() {
   Require(plan.stats.entries==3 && plan.stats.other_pass==2 && plan.opaque.size()==1 && plan.opaque[0].entry->object==3 &&
     plan.transparent.empty(),"a class drawn by another pass was planned by the models pass");
 }
+// Motion vectors (NativeFullFrameModelPass::velocity): the previous constants
+// swap once per frame, not per Build. A first frame and an unmoved frame list
+// nothing; a moved pose lists each moved record's draw with its world now and
+// last frame (a record whose world did not move, none); a second Build of
+// the same frame (another view) keeps last frame's as previous; an item not
+// drawn in the frame before lists nothing; velocity off lists nothing. A draw
+// whose vertex shader reads BLENDINDICES is Skinned, with both palettes and
+// its weights.
+void VelocityBuild(std::shared_ptr<NativeRenderBackend> backend) {
+  SkinnedFixture fixture(backend);
+  // A second program whose vertex shader skins from BLENDINDICES/BLENDWEIGHT,
+  // over geometry that carries them.
+  auto skinning=std::make_shared<NativeSceneMaterialProgram>(*fixture.program);
+  {
+    Effect effect;
+    effect.source=R"(
+      float4x3 g_mWorldArray[8];
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float3 g_vLights[4];
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0,int4 indices:BLENDINDICES0,float4 weights:BLENDWEIGHT0) {
+        V o; float3 skinned=mul(float4(position,1),g_mWorldArray[indices.x])*weights.x;
+        o.position=mul(mul(float4(skinned,1),g_mWorld),g_mViewProjection);
+        o.color=float4(g_vLights[0],1); return o;
+      }
+    )";
+    skinning->vertex=skinning->reversed_vertex=CompileNativeShader(nullptr,effect,{false,"VS","vs_3_0"},"velocity-skinning.fx");
+  }
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw> skinned_geometry;
+  {
+    std::vector<uint8_t> declaration(36),vertices(128),indices{0,0,0,1,0,2,0,0,0,2,0,3};
+    SkinnedFixture::Word(declaration,4,0x2a23b9);
+    SkinnedFixture::Word(declaration,12,12); SkinnedFixture::Word(declaration,16,0x1a2286); declaration[21]=2;
+    SkinnedFixture::Word(declaration,24,16); SkinnedFixture::Word(declaration,28,0x1a23a6); declaration[33]=1;
+    const float points[]{-.125f,-.25f,.5f, -.125f,.25f,.5f, .125f,.25f,.5f, .125f,-.25f,.5f};
+    for(size_t v=0;v<4;++v) {
+      for(size_t i=0;i<3;++i) SkinnedFixture::Word(vertices,v*32+i*4,std::bit_cast<uint32_t>(points[v*3+i]));
+      SkinnedFixture::Word(vertices,v*32+12,0);
+      SkinnedFixture::Word(vertices,v*32+16,std::bit_cast<uint32_t>(1.f));
+    }
+    NativeIndexedMesh mesh(*backend,skinning->vertex,declaration,32,vertices,indices,2);
+    skinned_geometry=std::make_shared<const NativeIndexedMesh::RetainedDraw>(mesh.RetainDraw(backend,0,6));
+  }
+  // Record 0 palette-skinned under pass 0x3000 (the fixture's shader: no
+  // BLENDINDICES, so drawn rigid with its record's world), record 1 uploads
+  // bone 1; the second entry's record draws under pass 0x3100 (skinning).
+  const auto layout=Layout(0x1000,true,3,{Mesh(0,true,false,{Batch(0x2000,{0x3000})}),Mesh(1,false,true,{Batch(0x2100,{0x3000})})});
+  const auto skinned_layout=Layout(0x5000,true,3,{Mesh(0,true,false,{Batch(0x6000,{0x3100})})});
+  auto entry=Entry(1,{0,0,100},1,layout),other=Entry(2,{1,0,100},1,skinned_layout);
+  bool present=true;
+  const auto snapshot=[&] {
+    NativeRenderRegistrySnapshot result;
+    if(present) result.entries.push_back(entry);
+    result.entries.push_back(other);
+    return result;
+  };
+  auto camera=MakeCamera();
+  for(size_t i=0;i<16;++i) camera.pass.view_projection[i]=std::bit_cast<uint32_t>(i%5?0.f:1.5f);
+  auto pass=fixture.Pass();
+  pass.velocity=true;
+  auto published=std::make_shared<NativeSceneGroupMaterial>();
+  published->program=fixture.program; published->constants=fixture.constants;
+  auto skinning_published=std::make_shared<NativeSceneGroupMaterial>();
+  skinning_published->program=skinning; skinning_published->constants=fixture.constants;
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t record) {
+    return std::shared_ptr<const NativeSceneGroupMaterial>(record==0x3100?skinning_published:published);
+  };
+  sources.geometry=[&](const NativeModelBatchLayout& batch,uint32_t) { return batch.address==0x6000?skinned_geometry:fixture.geometry; };
+  sources.generation=[] { return uint64_t(1); };
+  NativeFullFrameModels models;
+  const auto build=[&](uint32_t view) { pass.view=view; return models.Build(snapshot(),camera,pass,sources); };
+  const auto move=[](std::shared_ptr<NativeRenderEntry>& moved,size_t bone,float by) {
+    auto pose=std::make_shared<std::vector<NativePoseMatrix>>(*moved->pose);
+    (*pose)[bone][12]+=by; moved->pose=pose;
+  };
+  auto frame=build(0);
+  Require(frame.stats.drawn==2 && frame.velocity.empty(),"a first frame lists no velocity");
+  frame=build(0);
+  Require(frame.velocity.empty(),"an unmoved frame lists no velocity");
+  const auto before=(*entry->pose)[1];
+  move(entry,1,1);
+  frame=build(0);
+  Require(frame.velocity.size()==1,"one moved record, one velocity draw");
+  const auto& rigid=frame.velocity[0];
+  Require(rigid.kind==NativeMotionVelocityKind::Rigid && rigid.geometry==fixture.geometry &&
+    rigid.world==(*entry->pose)[1] && rigid.previous_world==before,"the moved record's world now and last frame");
+  // Another view of the same frame, moved again: the previous stays last frame's.
+  move(entry,1,1);
+  frame=build(1);
+  Require(frame.velocity.size()==1 && frame.velocity[0].previous_world==before && frame.velocity[0].world==(*entry->pose)[1],
+    "a second Build of a frame keeps last frame's constants as previous");
+  frame=build(0);
+  Require(frame.velocity.empty(),"a still frame after a move lists nothing");
+  // Not drawn for a frame, then moved: no history.
+  present=false;
+  build(0);
+  present=true;
+  move(entry,1,1);
+  frame=build(0);
+  Require(frame.stats.drawn==2 && frame.velocity.empty(),"an item not drawn in the frame before has no velocity");
+  // Off: nothing listed.
+  pass.velocity=false;
+  move(entry,1,1);
+  frame=build(0);
+  Require(frame.velocity.empty(),"velocity off lists nothing");
+  pass.velocity=true;
+  // The skinning shader: both palettes.
+  const auto pack=[](const std::vector<NativePoseMatrix>& pose) {
+    std::vector<float> palette(pose.size()*kNativeBonePaletteFloats);
+    PackNativeBonePalette(pose,palette);
+    return palette;
+  };
+  const auto palette_before=pack(*other->pose);
+  move(other,0,2);
+  frame=build(0);
+  Require(frame.velocity.size()==1 && frame.velocity[0].kind==NativeMotionVelocityKind::Skinned &&
+    frame.velocity[0].geometry==skinned_geometry && frame.velocity[0].weighted,"a BLENDINDICES shader's draw is skinned, weighted");
+  Require(*frame.velocity[0].palette==pack(*other->pose) && *frame.velocity[0].previous_palette==palette_before,
+    "the skinned draw carries both palettes");
+}
 int main(int argc,char** argv) {
   // --models-bench: ModelFrames runs 600 frames on D3D11 and prints its per-frame timings.
   models_bench=argc>1 && std::string_view(argv[1])=="--models-bench";
@@ -2103,7 +2225,7 @@ int main(int argc,char** argv) {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ObjectConstantBuild(device); PoolCarryFrames(device); ModelFrames(device);
+      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ObjectConstantBuild(device); PoolCarryFrames(device); ModelFrames(device); VelocityBuild(device);
       ReuseOffFrames(device);
     }
   } catch(const std::exception& error) {

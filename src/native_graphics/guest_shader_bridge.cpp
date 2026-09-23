@@ -59,6 +59,7 @@
 #include "native_gpu_pass_timings.h"
 #include "native_full_frame_static_world.h"
 #include "native_full_frame_models.h"
+#include "native_motion_vector_pass.h"
 #include "native_full_frame_sky.h"
 #include "native_full_frame_effects.h"
 #include "native_view_globals.h"
@@ -200,6 +201,10 @@ REXCVAR_DEFINE_INT32(edf_native_msaa, 0, "EDF2027",
                     "Native scene samples: 0 game default, 1 off, 2 or 4 MSAA (restart required)");
 REXCVAR_DEFINE_BOOL(edf_native_scene_depth_srv, false, "EDF2027",
                    "Create a single-sampled native scene depth shader-readable (typeless, with a depth SRV) for FSR; ignored with MSAA (restart required)");
+REXCVAR_DEFINE_BOOL(edf_native_motion_vectors, false, "EDF2027",
+                   "FSR motion vectors: camera reprojection from the scene depth plus a velocity re-render of moving models, per view before post; forces a single-sampled, shader-readable scene depth (restart required)");
+REXCVAR_DEFINE_INT32(edf_native_motion_vectors_debug, 0, "EDF2027",
+                    "Motion vector debug view over the output before the HUD: 0 off, 1 motion as colour, 2 history-valid mask").range(0,2);
 REXCVAR_DEFINE_INT32(edf_native_render_height, 0, "EDF2027",
                     "Native render height at startup; paired with render width (restart required)");
 REXCVAR_DEFINE_STRING(edf_native_scene_capture, "", "EDF2027",
@@ -6785,6 +6790,9 @@ struct NativeFullFrameModelsShared {
   std::vector<edf::native::NativeEffectItem> map_effects;  // orders from 0 within the map-effect walk
   uint32_t model_order=0;
   uint32_t map_effect_filings=0,effect_filings=0;
+  // The models pass's velocity draws this view (NativeFullFrameModelFrame::
+  // velocity; edf_native_motion_vectors), for the host's MotionVectors.
+  std::shared_ptr<const std::vector<edf::native::NativeMotionVelocityDraw>> velocity;
   bool map_effects_first=true;  // clMapEffectManager precedes clEffectObjectManager on the world list
 };
 // The full frame's Models pass: NativeFullFrameModels::Build over the
@@ -6812,6 +6820,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     shared_->transparent.reset();
+    shared_->velocity.reset();
     shared_->model_order=0;
     const auto registry=context.inputs.registry;
     if(!registry || registry->entries.empty() || !context.view.scene) { ++empty_; return; }
@@ -6861,6 +6870,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       } catch(const std::exception&) { return std::nullopt; }
     };
     pass.census=NativeCoverageCensusOn();
+    pass.velocity=REXCVAR_GET(edf_native_motion_vectors);
     auto& state=State();
     // The bridge locks in short holds (NativeLockSlices): the targets, each use
     // of the model pass caches (program, geometry) and each resolve with its
@@ -6991,6 +7001,8 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       if(pass.census) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:models","stale");
     }
     else if(!transparent->batches.empty()) shared_->transparent=std::move(transparent);
+    if(current && !frame->velocity.empty())
+      shared_->velocity=std::make_shared<const std::vector<NativeMotionVelocityDraw>>(std::move(frame->velocity));
     shared_->model_order=uint32_t(frame->plan.transparent.size());
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
@@ -8036,6 +8048,8 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     :base_(base),reader_(base),owner_(owner),context_(context),guest_(std::move(guest)) {}
   // edf_native_shadow_render: this frame's shadow (null on every other frame).
   void SetShadow(edf::native::NativeShadowFrame* shadow) { shadow_=shadow; }
+  // The models pass's per-view handoff, for the velocity draws.
+  void SetModels(std::shared_ptr<NativeFullFrameModelsShared> models) { models_=std::move(models); }
   // (a) One generation of publication, published cameras and world animations
   // under the producer lock, as the hook acquires them; the motion budget and
   // its publication were already acquired by the hook, which restores all of
@@ -8231,6 +8245,62 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     RemainingGuestCall(1);
     Virtual(context.view.scene,16,0,0,0x821A5294);
   }
+  // edf_native_motion_vectors: the view's motion vectors, after its passes
+  // and guest overlays, before post (RecordNativeMotionVectors), into
+  // context.motion. Camera reprojection from the scene depth (the scene is
+  // made 1x with a sampled depth while the cvar is on, restart required) and
+  // the models pass's velocity draws. The pass camera is the one every pass
+  // of the view drew with; jitter (workstream C) must stay out of it or be
+  // taken off here. Everything the record bound is forgotten afterwards and
+  // the scene's targets are bound again.
+  void MotionVectors(edf::native::NativeFrameContext& context) override {
+    if(!REXCVAR_GET(edf_native_motion_vectors) || !context.renderer || !edf::native::native_scene_pass_camera) return;
+    const GpuPassSpan gpu("motion_vectors");
+    const auto velocity=models_?models_->velocity:nullptr;
+    auto& state=edf::native::State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto scene=state.scenes.find(context.renderer);
+    if(state.active_scene!=context.renderer || scene==state.scenes.end() || !state.scene_backend) return;
+    auto& motion=MotionVectorState();
+    edf::native::NativeMotionVectorContext record;
+    record.backend=state.scene_backend.get();
+    record.recorder=&edf::native::SceneRecorderLocked(state);
+    record.depth=scene->second.depth.backend_target.get();
+    record.depth_format=scene->second.depth.format;
+    record.width=scene->second.color.sampled.width; record.height=scene->second.color.sampled.height;
+    const auto& v=context.viewport;
+    record.viewport={float(v.x),float(v.y),float(v.width),float(v.height),0,1};
+    record.scene=context.view.scene;
+    record.frame=context.inputs.frame;
+    record.camera=&*edf::native::native_scene_pass_camera;
+    record.velocity=velocity.get();
+    try {
+      context.motion=edf::native::RecordNativeMotionVectors(motion,record);
+    } catch(...) {
+      ++state.bind_generation; state.recorded={};
+      edf::native::BindActiveTarget(state);
+      throw;
+    }
+    // The velocity draws' geometry stays until the recording is submitted.
+    if(velocity) state.scene_recorded_frames.push_back(velocity);
+    ++state.bind_generation; state.recorded={};
+    edf::native::BindActiveTarget(state);
+    if(!context.motion.motion) {
+      static std::atomic<bool> reported=false;
+      if(!reported.exchange(true))
+        REXLOG_WARN("Native motion vectors declined: the scene depth has no SRV (samples={}); they need a 1x scene depth made sampled (logged once)",
+          scene->second.samples);
+      return;
+    }
+    const auto& stats=motion.statistics();
+    if(stats.records<=4 || stats.records%1000==0)
+      REXLOG_INFO("Native motion vectors: records={} resets={} last_reset={} declined={} velocity_draws={} instances={} skipped={} "
+        "this_view_velocity={} scenes={} reasons first/gap/viewport/size/cut/invalid={}/{}/{}/{}/{}/{}",
+        stats.records,stats.resets,edf::native::NativeMotionResetName(motion.last_reset()),stats.declined,stats.velocity_draws,
+        stats.velocity_instances,stats.velocity_skipped,velocity?velocity->size():size_t(0),motion.history().size(),
+        stats.reasons[1],stats.reasons[2],stats.reasons[3],stats.reasons[4],stats.reasons[5],stats.reasons[6]);
+  }
   // HOOK POINT: helper side effects other code relies on, to be filled from
   // the ongoing side-effect research. Known and not replicated: the world
   // callbacks (owner+44 list, vtable +8) and the bucket drain 821A3BA0, which
@@ -8253,8 +8323,10 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     // An unlocked render-only frame holds the tone history (NativePostHistory):
     // its 0.025-per-draw blend stays once per simulation tick.
     const auto history=context.inputs.tick_frame?edf::native::NativePostHistory::Advance:edf::native::NativePostHistory::Hold;
-    if(edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error,history)) BindOutput(renderer,resolve_scene);
-    else {
+    if(edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error,history)) {
+      BindOutput(renderer,resolve_scene);
+      MotionVectorDebug(renderer,context.motion);
+    } else {
       edf::native::FrameEventCounters().post_fallbacks.fetch_add(1,std::memory_order_relaxed);
       static std::atomic<bool> reported=false;
       if(!reported.exchange(true))
@@ -8280,6 +8352,28 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
           binding.output_surface,binding.device_surface,binding.active_target,binding.active_scene,count);
     }
     return bound;
+  }
+  // edf_native_motion_vectors_debug: the frame's motion vectors (1: as colour,
+  // 2: the history-valid mask) over the native post's output, before the HUD.
+  void MotionVectorDebug(uint32_t renderer,const edf::native::NativeMotionVectorOutput& motion) {
+    const auto mode=REXCVAR_GET(edf_native_motion_vectors_debug);
+    if(!mode || !motion.motion || !renderer) return;
+    auto& state=edf::native::State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto scene=state.scenes.find(renderer);
+    if(scene==state.scenes.end() || state.active_output!=renderer || !scene->second.output.backend_surface || !state.scene_backend) return;
+    auto& output=scene->second.output;
+    MotionVectorState().RecordDebug(*state.scene_backend,edf::native::SceneRecorderLocked(state),*output.backend_surface,
+      output.format,mode,motion);
+    ++state.bind_generation; state.recorded={};
+    edf::native::BindActiveTarget(state);
+  }
+  // The motion vectors' state (texture, per-scene camera history, pipelines),
+  // for the scene backend. Leaked, as the other backend-lifetime caches here.
+  static edf::native::NativeMotionVectors& MotionVectorState() {
+    static auto* state=new edf::native::NativeMotionVectors;
+    return *state;
   }
   // What 820B0B80 does around its post chain that the native post does not,
   // and what the HUD phase loop inherits from it in the guest. 8219C930's tail
@@ -8393,6 +8487,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   uint32_t owner_,context_;
   GuestCall guest_;
   edf::native::NativeShadowFrame* shadow_=nullptr;
+  std::shared_ptr<NativeFullFrameModelsShared> models_;
   uint32_t views_begun_=0;
 };
 }
@@ -8528,8 +8623,8 @@ REX_HOOK_RAW(sub_821A5080) {
     // left are listed in kNativeFrameRemainingGuestCalls. 821A6508 joins each helper call (821A53A8) before the next, so the
     // single instance is never run concurrently.
     static edf::native::NativeFullFrame full_frame;
+    static const auto models=std::make_shared<NativeFullFrameModelsShared>();
     static const bool wired=[&] {
-      const auto models=std::make_shared<NativeFullFrameModelsShared>();
       return full_frame.Replace(std::make_unique<NativeFullFrameStaticWorldPass>(base)) &&
         full_frame.Replace(std::make_unique<NativeFullFrameModelsPass>(base,models)) &&
         full_frame.Replace(std::make_unique<NativeFullFrameSkyPass>(base,models)) &&
@@ -8551,6 +8646,7 @@ REX_HOOK_RAW(sub_821A5080) {
         work.ctr.u64=function; work.lr=lr;
         rex::runtime::ResolveIndirectFunction(function)(work,base);
       });
+    host.SetModels(models);
     // edf_native_shadow_render (native_shadow_render.h): null unless this
     // frame takes a shadow render; the tap it arms is removed on every exit.
     std::unique_ptr<edf::native::NativeShadowFrame> shadow;
@@ -12443,13 +12539,16 @@ REX_HOOK_RAW(sub_8219C7A8) {
       const auto color_surface=reader.Word(reader.Add(reader.Word(reader.Add(owner,8)),12168));
       const auto& creation=state.surface_creations.at(color_surface);
       // Pin the choice for this renderer lifetime, including later scene recreation.
-      static const int32_t sample_override=REXCVAR_GET(edf_native_msaa);
+      static const int32_t sample_override=REXCVAR_GET(edf_native_motion_vectors)?1:REXCVAR_GET(edf_native_msaa);
       const uint32_t samples=edf::native::NativeSceneSamples(creation.msaa,sample_override);
       auto found=state.scenes.find(owner);
       if (found==state.scenes.end() || found->second.color.sampled.width!=width || found->second.color.sampled.height!=height || found->second.samples!=samples) {
         // Reversed-Z: the scene clears depth to 0, so that is its declared
         // optimized clear. The SRV is opt-in and single-sampled only.
-        static const bool depth_srv=REXCVAR_GET(edf_native_scene_depth_srv);
+        // Motion vectors read the depth through its SRV, which is single-sampled
+        // only: with them on, the scene is 1x and its depth sampled.
+        static const bool motion_vectors=REXCVAR_GET(edf_native_motion_vectors);
+        static const bool depth_srv=REXCVAR_GET(edf_native_scene_depth_srv) || motion_vectors;
         edf::native::NativeScene scene{
           edf::native::CreateNativeRenderTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,samples),
           edf::native::CreateNativeDepthTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples,

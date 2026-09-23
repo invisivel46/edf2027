@@ -4,6 +4,7 @@
 #include "native_full_frame_base_state.h"
 #include "native_full_frame_model_cache.h"
 #include "native_model_pass.h"
+#include "native_motion_vector_pass.h"
 #include "native_render_entry.h"
 #include "native_render_motion.h"
 #include "native_reuse.h"
@@ -390,6 +391,11 @@ struct NativeFullFrameModelPass {
   // Coverage census marks (NativeFullFrameModelPlan::census,
   // NativeFullFrameModelFrame::census); off, none are made.
   bool census=false;
+  // Motion vectors (edf_native_motion_vectors): list the velocity draws of
+  // the opaque items that moved since the previous frame
+  // (NativeFullFrameModelFrame::velocity). Off, the list stays empty; nothing
+  // drawn depends on it either way.
+  bool velocity=false;
 };
 // The explicit base state every model draw starts from, opaque and transparent
 // alike: the shared full-frame base state (NativeFullFrameBaseState, the same
@@ -499,6 +505,12 @@ struct NativeFullFrameModelFrame {
   // when drawn, else uncovered with the reason it was not (missing program or
   // geometry, failed, scissor, palette). The plan's marks are plan.census.
   std::vector<NativeCoverageMark> census;
+  // With NativeFullFrameModelPass::velocity: every draw of every drawn opaque
+  // item whose constants moved by value this frame and whose previous
+  // constants were drawn in the frame before (NativeFullFrameModelItemState::
+  // last_values, last_frame), with its geometry and both transforms, in
+  // opaque item order (native_motion_vector_pass.h).
+  std::vector<NativeMotionVelocityDraw> velocity;
 };
 // Persistent per-object draw state of NativeFullFrameModels. One item state
 // per (object, registry generation, LOD model or instanced set and world):
@@ -534,6 +546,16 @@ struct NativeFullFrameModelItemState {
   std::vector<NativeFullFrameModelDrawState> draws;
   NativeFullFrameModelConstants values;
   uint64_t used=0,seen=0;  // The Build (duplicates) and the frame (aging) it was last drawn in.
+  // The motion vectors' previous transforms, swapped once per frame (not per
+  // Build): when an item's constants move by value in its first Build of a
+  // frame, the constants it was drawn with before go to last_values (moved,
+  // not copied) and last_frame is the frame (NativeFullFrameModels' frame
+  // count) they were last drawn in; a second Build of the same frame keeps
+  // them. values_frame: the frame `values` were last drawn in; moved_frame:
+  // the frame they last moved by value. An item moved this frame with history
+  // is moved_frame == frame && last_frame + 1 == frame.
+  NativeFullFrameModelConstants last_values;
+  uint64_t last_frame=0,values_frame=0,moved_frame=0;
 };
 // One material row's per-frame work, kept across frames: its pass constants
 // (the published constants with the pass camera and animation applied), the

@@ -112,6 +112,42 @@ int main() {
     check(host.trace[6]=="1:static_world" && host.trace[7]=="stub:replaced","replaced view pass keeps its position");
     check(host.trace[host.trace.size()-3]=="stub:replaced" && !host.output_ready,"replaced post runs in the frame");
   }
+  // Motion vectors: MotionVectors runs for accepted views only, after their
+  // overlays and before EndView, with the frame's index; the frame context
+  // (post, phases) gets the last accepted view's motion that has a texture.
+  {
+    class MotionVectorHost final : public NativeFrameHost {
+     public:
+      std::vector<std::string> trace;
+      std::vector<uint64_t> frames;
+      NativeBackendTexture* texture=reinterpret_cast<NativeBackendTexture*>(uintptr_t(0x1000));
+      bool finish_saw=false,phases_saw=false;
+      NativeFrameInputs AcquireInputs() override { return {}; }
+      std::vector<uint32_t> Views() override { return {1,2,3}; }
+      uint32_t AdvanceSerial(uint32_t) override { return 0; }
+      bool BeginView(NativeFrameContext& context) override { return context.view.scene!=2; }
+      void ViewOverlays(NativeFrameContext& context) override { trace.push_back("overlays:"+std::to_string(context.view.scene)); }
+      void MotionVectors(NativeFrameContext& context) override {
+        trace.push_back("motion:"+std::to_string(context.view.scene));
+        frames.push_back(context.inputs.frame);
+        if(context.view.scene==1) { context.motion.motion=texture; context.motion.reset=false; context.motion.fov_y=1; }
+      }
+      void EndView(NativeFrameContext& context) override { trace.push_back("end_view:"+std::to_string(context.view.scene)); }
+      bool Finish(NativeFrameContext& context) override {
+        finish_saw=context.motion.motion==texture && !context.motion.reset && context.motion.fov_y==1; return true;
+      }
+      void Phases(NativeFrameContext& context) override { phases_saw=context.motion.motion==texture; }
+      void EndScene(const NativeFrameInputs&,bool) override {}
+    } host;
+    NativeFullFrame frame;
+    frame.Run(host);
+    frame.Run(host);
+    const std::vector<std::string> one{"overlays:1","motion:1","end_view:1","overlays:2","end_view:2","overlays:3","motion:3","end_view:3"};
+    std::vector<std::string> expected=one; expected.insert(expected.end(),one.begin(),one.end());
+    check(host.trace==expected,"motion vectors run after the overlays of accepted views only");
+    check(host.frames==std::vector<uint64_t>({1,1,2,2}),"the frame index counts frames");
+    check(host.finish_saw && host.phases_saw,"post and phases get the view's motion vectors");
+  }
   // The motion budget: AcquireInputs' budget reaches every pass and the frame
   // context unchanged; poses interpolate only unlocked, at divisor 1, with the
   // model interpolation setting (the guest 821C9C20 hook's condition).

@@ -43,20 +43,28 @@ bool NativeFullFrame::Replace(std::unique_ptr<NativeFramePass> pass) {
 void NativeFullFrame::Run(NativeFrameHost& host) {
   ++frames_;
   auto acquired=host.AcquireInputs();
+  acquired.frame=frames_;
   acquired.tick_frame=tick_gate_.Advance(acquired.motion);
   if(!acquired.tick_frame) ++held_frames_;
   const auto& inputs=acquired;
   const auto views=host.Views();
+  NativeMotionVectorOutput motion;
   for(uint32_t index=0;index<views.size();++index) {
     NativeFrameContext context{host,inputs,{views[index],index,0}};
     context.view.serial=host.AdvanceSerial(views[index]);
-    if(host.BeginView(context))
+    const bool begun=host.BeginView(context);
+    if(begun)
       for(size_t pass=0;pass<view_passes_.size();++pass) host.RunPass(pass,*view_passes_[pass],context);
     host.ViewOverlays(context);
+    if(begun) {
+      host.MotionVectors(context);
+      if(context.motion.motion) motion=context.motion;
+    }
     host.EndView(context);
   }
   host.SideEffects(inputs);
   NativeFrameContext frame{host,inputs,{}};
+  frame.motion=motion;
   for(size_t pass=0;pass<frame_passes_.size();++pass) host.RunPass(view_passes_.size()+pass,*frame_passes_[pass],frame);
   host.Phases(frame);
   host.EndScene(inputs,frame.output_ready);
