@@ -352,7 +352,7 @@ REXCVAR_DEFINE_INT32(edf_native_coverage_census_interval,30,"EDF2027",
   "Seconds between edf_native_coverage_census summaries").range(1,3600);
 REXCVAR_DEFINE_BOOL(edf_native_frame_times, false, "EDF2027",
                    "Log present-to-present frame-time percentiles and one line per spike frame (over 25 ms or twice the rolling median) with its pipeline, shader, geometry and texture creations, declined passes and largest hook phases (development)");
-REXCVAR_DEFINE_INT32(edf_native_thread_qos,1,"EDF2027",
+REXCVAR_DEFINE_INT32(edf_native_thread_qos,2,"EDF2027",
   "Engine and render helper thread QoS: 0 OS default (a hidden or occluded window gets low QoS, which on hybrid CPUs "
   "prefers efficiency cores), 1 opt out of execution-speed throttling (HighQoS), 2 also prefer performance-core CPU sets").range(0,2);
 REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
