@@ -1,3 +1,4 @@
+#include "native_graphics/native_load_trace.h"
 #include "native_graphics/native_model_header.h"
 #include "native_graphics/native_model_cleanup.h"
 #include "native_graphics/native_index_binding.h"
@@ -169,6 +170,8 @@ static void __imp__sub_821D3748(PPCContext& ctx,uint8_t* base) {
   edf::native::GuestReader(base).StoreWord(0x510,0); // Simulate first free-state store.
   pool_original_called=true; Clobber(ctx);
 }
+// The extracted hooks time themselves under edf_native_load_trace; off here.
+static bool LoadTraceOn() { return false; }
 #define REXCVAR_GET(name) pool_bridge_enabled
 #define REX_KERNEL_MEMORY() (&pool_memory)
 #define REX_HOOK_RAW(name) static void name(PPCContext& ctx,uint8_t* base)
