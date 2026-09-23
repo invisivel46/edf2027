@@ -2,6 +2,7 @@
 #include "native_graphics/native_scene_bindings.h"
 #include "native_graphics/native_scene_sources.h"
 #include "native_graphics/native_scene_adapter.h"
+#include "native_graphics/native_world_publication_mirror.h"
 #include "native_graphics/native_scene_tree.h"
 #include "native_graphics/native_scene_walk_lock.h"
 #include "native_graphics/native_scene_static_walk.h"
@@ -28,6 +29,8 @@
 #include <bit>
 #include <chrono>
 #include <cstring>
+#include <mutex>
+#include <span>
 #include <iostream>
 
 using namespace edf::native;
@@ -1772,6 +1775,74 @@ void FullFrameFixedRecord() {
   const auto mismatched=SelectNativeFullFrameStaticWorld(publication,camera,routes);
   Require(mismatched.objects.empty() && mismatched.stats.route_mismatch==2 && !mismatched.stats.fixed,"route kind mismatch was drawn");
 }
+// NativeWorldPublicationMirror: the 820B4250 post-hook takes the bridge lock
+// only for a value the adapter does not already hold. Driven exactly as the
+// hook and the two retire sites drive it, against a real adapter; the model
+// is the old path, which always locked and published.
+void WorldPublicationMirror() {
+  using Order=std::vector<uint32_t>;
+  NativeSceneAdapter adapter,always;
+  NativeWorldPublicationMirror mirror;
+  struct BridgeLock {
+    std::mutex mutex; bool held=false;
+    void lock() { mutex.lock(); held=true; }
+    void unlock() { held=false; mutex.unlock(); }
+  } bridge;
+  size_t locks=0,publishes=0;
+  const auto lock=[&] { ++locks; return std::unique_lock(bridge); };
+  const auto order=[&](uint32_t owner,const Order& value) {
+    always.PublishGroupOrder(owner,value);
+    return mirror.PublishOrder(owner,value,lock,[&](std::span<const uint32_t> published) {
+      Require(bridge.held,"group order published without the bridge lock");
+      ++publishes; adapter.PublishGroupOrder(owner,published);
+    });
+  };
+  const auto animation=[&](uint32_t owner,NativeScenePassAnimation value) {
+    always.PublishWorldAnimation(owner,value);
+    return mirror.PublishAnimation(owner,value,lock,[&](const NativeScenePassAnimation& published) {
+      Require(bridge.held,"world animation published without the bridge lock");
+      ++publishes; adapter.PublishWorldAnimation(owner,published);
+    });
+  };
+  uint64_t tick=0;
+  const auto same=[&] {
+    ++tick;
+    const auto a=adapter.Publish(tick),b=always.Publish(tick);
+    if(a->world_animations!=b->world_animations || a->group_order.size()!=b->group_order.size()) return false;
+    for(const auto& [owner,value]:b->group_order) {
+      const auto* found=a->group_order.Find(owner);
+      if(!found || !*found || !value || **found!=*value) return false;
+    }
+    return true;
+  };
+  // Retire sites: 820B5FA8 (both) and RetireGroupOrder (orders), under the lock.
+  const auto retire=[&](uint32_t owner,bool animations) {
+    std::lock_guard guard(bridge);
+    adapter.RetireGroupOrder(owner); mirror.RetiredOrder(owner); always.RetireGroupOrder(owner);
+    if(animations) { adapter.RetireWorldAnimation(owner); mirror.RetiredAnimation(owner); always.RetireWorldAnimation(owner); }
+  };
+  Require(order(0x100,{1,2,3}) && locks==1 && same(),"first group order skipped the adapter");
+  Require(!order(0x100,{1,2,3}) && locks==1 && same(),"unchanged group order took the bridge lock");
+  const auto retained=adapter.GroupOrder(0x100);
+  Require(order(0x100,{1,3}) && locks==2 && *adapter.GroupOrder(0x100)==Order{1,3} && *retained==Order{1,2,3} && same(),
+    "changed group order was skipped or mutated the retained order");
+  Require(order(0x200,{1,3}) && locks==3 && same(),"an equal order of another owner was taken as current");
+  Require(order(0x100,{}) && !order(0x100,{}) && locks==4 && same(),"an emptied group order was not published once");
+  retire(0x100,false);
+  Require(!adapter.GroupOrder(0x100) && order(0x100,{}) && locks==5 && same(),
+    "a retired owner's order was proven current without the adapter");
+  Require(animation(0x100,{5,1}) && !animation(0x100,{5,1}) && same(),"unchanged world animation took the bridge lock");
+  const auto before=adapter.AcquireWorldAnimations();
+  Require(animation(0x100,{6,1}) && adapter.AcquireWorldAnimations()!=before && same(),"advanced water time was skipped");
+  retire(0x100,true);
+  Require(animation(0x100,{6,1}) && same() && adapter.AcquireWorldAnimations()->at(0x100)==NativeScenePassAnimation{6,1},
+    "a retired owner's animation was proven current without the adapter");
+  // A throwing adapter call leaves the mirror unproven: the next call locks again.
+  const auto locked=locks;
+  Reject([&] { mirror.PublishOrder(0x300,Order{7},lock,[](std::span<const uint32_t>) { throw std::runtime_error("publish"); }); });
+  Require(!mirror.OrderCurrent(0x300,Order{7}) && locks==locked+1 && !bridge.held,"a failed publication was mirrored or kept the lock");
+  Require(publishes==locks-1,"a lock was taken without a publication");
+}
 void GroupOrder() {
   std::vector<uint8_t> memory(0x1000);
   const GeometryRetryReader reader{memory};
@@ -2631,6 +2702,29 @@ void PreloadChangeSignals() {
   reader.StoreWord(31800,0x3f800000);
   Require(program.Unchanged(reader) && !RefreshNativeSceneMaterialConstants(reader,schema,layout,*refreshed),
     "pass-owned camera constant republished the group");
+  {
+    // The preload's parallel precheck (ProbeNativeSceneMaterialGuestInputs)
+    // decides what the serial path would: program bytes, then, only when they
+    // hold, the constant refresh; a refresh that throws is reported, not thrown.
+    const auto probed=ProbeNativeSceneMaterialGuestInputs(reader,program,schema,layout,*refreshed);
+    Require(probed.program_unchanged && probed.constants_read && !probed.constants,"current material probed as changed");
+    reader.StoreWord(31300,0x40800000);
+    const auto moved=ProbeNativeSceneMaterialGuestInputs(reader,program,schema,layout,*refreshed);
+    const auto serial=RefreshNativeSceneMaterialConstants(reader,schema,layout,*refreshed);
+    Require(moved.program_unchanged && moved.constants_read && moved.constants && serial && *moved.constants==*serial,
+      "probed constant refresh differs from the serial refresh");
+    reader.StoreWord(31300,0x40400000);
+    reader.StoreWord(30604,8);
+    CountingReader skipped{reader};
+    const auto changed=ProbeNativeSceneMaterialGuestInputs(skipped,program,schema,layout,*refreshed);
+    Require(!changed.program_unchanged && !changed.constants && skipped.reads<=program.ranges(),
+      "changed material program was refreshed or probed as current");
+    reader.StoreWord(30604,7);
+    reader.StoreWord(31408,0);
+    const auto failed=ProbeNativeSceneMaterialGuestInputs(reader,program,schema,layout,*refreshed);
+    Require(failed.program_unchanged && !failed.constants_read && !failed.constants,"a throwing refresh was probed as read");
+    reader.StoreWord(31408,1);
+  }
   reader.StoreWord(31408,0);
   Reject([&] { RefreshNativeSceneMaterialConstants(reader,schema,layout,*refreshed); });
   reader.StoreWord(31408,1);
@@ -3361,7 +3455,7 @@ int main(int argc,char** argv) {
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
     AddressFilter(); FullFrameLiveRoutes(); FullFrameFixedRecord();
-    GroupOrder(); FullFrameStaticWorld(); FullFrameStaticWorldFrames(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
+    WorldPublicationMirror(); GroupOrder(); FullFrameStaticWorld(); FullFrameStaticWorldFrames(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

@@ -7,7 +7,9 @@
 #include <atomic>
 #include <chrono>
 #include <iostream>
+#include <mutex>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -99,6 +101,52 @@ int main() {
       for (int index = 0; index < 200; ++index) workers.Submit([] {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
       });
+    }
+    {
+      // RunNativeSlices (the static preloads' prechecks): every index exactly
+      // once, in contiguous slices, the caller's own slice first, all done on
+      // return; no more slices than workers+1 and none under min_slice.
+      const auto caller = std::this_thread::get_id();
+      for (const uint32_t count : {0u, 1u, 3u, 16u}) {
+        NativeDecodeWorkers workers(count);
+        for (const size_t items : {size_t(0), size_t(1), size_t(31), size_t(32), size_t(64), size_t(412), size_t(1000)}) {
+          std::vector<std::atomic<int>> visits(items);
+          std::mutex mutex;
+          std::vector<std::pair<size_t, size_t>> slices;
+          bool caller_first = false;
+          edf::native::RunNativeSlices(workers, items, 32, [&](size_t begin, size_t end) {
+            for (size_t i = begin; i < end; ++i) visits[i].fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard lock(mutex);
+            slices.emplace_back(begin, end);
+            if (begin == 0 && std::this_thread::get_id() == caller) caller_first = true;
+          });
+          size_t wrong = 0;
+          for (const auto& visit : visits) wrong += visit.load() != 1;
+          Check(!wrong, "a slice index was skipped or repeated: workers=" + std::to_string(count) +
+                " items=" + std::to_string(items));
+          Check(caller_first, "the caller did not run the first slice: items=" + std::to_string(items));
+          const size_t lanes = std::min<size_t>(count + 1, std::max<size_t>(1, items / 32));
+          Check(slices.size() <= lanes, "more slices than lanes: items=" + std::to_string(items));
+          for (const auto& [begin, end] : slices)
+            Check(slices.size() == 1 || end - begin >= 32 || end == items,
+                  "a slice below the minimum was handed off: items=" + std::to_string(items));
+        }
+      }
+      // A throwing caller slice still joins the handed-off slices before the
+      // exception leaves: they borrow the caller's body and stack.
+      NativeDecodeWorkers workers(3);
+      std::atomic<int> finished{0};
+      bool thrown = false;
+      try {
+        edf::native::RunNativeSlices(workers, 400, 32, [&](size_t begin, size_t) {
+          if (begin == 0) throw std::runtime_error("caller slice");
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          finished.fetch_add(1, std::memory_order_relaxed);
+        });
+      } catch (const std::runtime_error&) {
+        thrown = true;
+      }
+      Check(thrown && finished.load() == 3, "a throwing caller slice left handed-off slices running");
     }
   } catch (const std::exception& error) {
     std::cerr << "unexpected: " << error.what() << '\n';

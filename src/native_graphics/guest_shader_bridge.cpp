@@ -15,6 +15,7 @@
 #include "native_scene_sources.h"
 #include "native_scene_adapter.h"
 #include "native_scene_pass_inputs.h"
+#include "native_world_publication_mirror.h"
 #include "native_scene_cpu_window.h"
 #include "native_scene_membership.h"
 #include "native_scene_geometry.h"
@@ -275,6 +276,10 @@ REXCVAR_DEFINE_BOOL(edf_native_reuse_material, true, "EDF2027",
                    "Skip re-binding the shader pair, textures and samplers when the previous indexed draw already bound the same ones and nothing has bound since. Set false if repeated objects ever show another material's textures; that is what a wrong guard here looks like");
 REXCVAR_DEFINE_INT32(edf_native_shader_workers, -1, "EDF2027",
                     "Threads used to compile a shader registration's entries: -1 picks one per core up to eight, 0 compiles inline on the calling thread. Compilation is the load cost worth threading - the entries are a real batch and each takes milliseconds, unlike the per-draw work, which has neither property");
+REXCVAR_DEFINE_INT32(edf_native_preload_workers, -1, "EDF2027",
+                    "Threads that help the engine thread check the static preloads' groups each step (821A4DE8, between frames): -1 picks 3 on 8+ cores, 1 on 4+, else 0; 0 checks every group on the engine thread. Read once, at the first preload").range(-1,16);
+REXCVAR_DEFINE_BOOL(edf_native_registry_overlap, true, "EDF2027",
+                   "Run the render registry's per-step tick on its own thread beside the step's scene publication and preloads (joined before 821A4DE8 returns); false runs it after them on the engine thread");
 REXCVAR_DEFINE_BOOL(edf_native_backend_preview, false, "EDF2027",
                    "Open a second window drawn and presented entirely by the selected backend. Needs --edf_native_backend and --edf_native_publish_frames. The renderer's own window is untouched");
 REXCVAR_DEFINE_BOOL(edf_native_batch_audit, false, "EDF2027",
@@ -336,6 +341,10 @@ NativeSceneTreePublications& TreePublications() {
 // milliseconds on the render thread. Leaked: hooks may run during shutdown.
 NativeAddressFilter& SceneAnchors() { static auto* value=new NativeAddressFilter; return *value; }
 NativeAddressFilter& SceneSourceOwners() { static auto* value=new NativeAddressFilter; return *value; }
+// The adapter's per-world group orders and pass animations as last written
+// (native_world_publication_mirror.h): the 820B4250 post-hook's lock-free
+// proof that its publication is a no-op. Leaked like the filters above.
+NativeWorldPublicationMirror& WorldPublications() { static auto* value=new NativeWorldPublicationMirror; return *value; }
 // Capture at renderer initialization. Saving a new F1 choice must not change
 // live UI scaling while the current render targets still have the old size.
 const std::array<int32_t,2>& NativeRenderDimensions() {
@@ -380,7 +389,7 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        FrameNativeModelsVisibility, FrameNativeModelsPrograms, FrameNativeModelsResolve, FrameNativeModelsRecord,
                        FrameNativeStaticWorldSelect, FrameNativeStaticWorldBuild, FrameNativeStaticWorldRecord,
                        SimRegistry, SimStaticWalk, SimPreloadGeometry, SimPreloadMaterial,
-                       SimTrees, SimMembership, SimPublish, SimPoses, SimLockWait,
+                       SimTrees, SimMembership, SimPublish, SimPoses, SimLockWait, SimPreloadPrecheck, SimWorldUpdate,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
@@ -443,7 +452,7 @@ class HookTiming {
       "frame.native.models.visibility","frame.native.models.programs","frame.native.models.resolve","frame.native.models.record",
       "frame.native.static_world.select","frame.native.static_world.build","frame.native.static_world.record",
       "sim.registry","sim.static_walk","sim.preload_geometry","sim.preload_material",
-      "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait",
+      "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait","sim.preload_precheck","sim.world_update",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
       "load.shader.registration","load.shader.lock","load.shader.entry",
       "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
@@ -4159,6 +4168,7 @@ void RetireGroupOrder(uint32_t owner) {
   auto& state=State();
   std::lock_guard lock(state.mutex);
   state.scene_adapter.RetireGroupOrder(owner);
+  WorldPublications().RetiredOrder(owner);
 }
 // Only the 820B4038 static walk and its audit consume plans. The full frame
 // reads its route words live at selection (NativeFullFrameLiveRoutes), for the
@@ -4353,18 +4363,24 @@ REX_HOOK_RAW(sub_820B4250) {
     }
   }
   edf::native::PublishStaticWalkPlans(base,owner);
+  // Both publications below are no-ops for an unchanged value, which is the
+  // common case at every step. WorldPublications mirrors what the adapter
+  // holds, so an unchanged value is proven without the bridge mutex, which the
+  // full frame's passes hold in long slices on the render thread (a locked
+  // no-op here cost 0.26 ms a call in the intro, 0.02 ms on the guest path).
   if(EDF_NATIVE_FLAG(scene_group_order) || REXCVAR_GET(edf_native_scene_group_order_audit)) {
     static thread_local std::vector<uint32_t> order;
     try {
       const edf::native::GuestReader reader(base);
       edf::native::CaptureNativeSceneGroupOrder(reader,reader.Add(owner,240),order);
       auto& state=edf::native::State();
-      std::lock_guard lock(state.mutex);
-      if(state.scene_adapter.PublishGroupOrder(owner,order)) {
-        static std::atomic<uint64_t> changes=0;
-        const auto count=++changes;
-        if(count<=4 || count%1000==0) REXLOG_INFO("Native group order publication: owner={:#x} groups={} changes={}",owner,order.size(),count);
-      }
+      edf::native::WorldPublications().PublishOrder(owner,order,[&] { return std::unique_lock(state.mutex); },
+        [&](std::span<const uint32_t> value) {
+          if(!state.scene_adapter.PublishGroupOrder(owner,value)) return;
+          static std::atomic<uint64_t> changes=0;
+          const auto count=++changes;
+          if(count<=4 || count%1000==0) REXLOG_INFO("Native group order publication: owner={:#x} groups={} changes={}",owner,value.size(),count);
+        });
     } catch(const std::exception& error) {
       edf::native::RetireGroupOrder(owner);
       static std::set<std::string> reported;
@@ -4375,8 +4391,8 @@ REX_HOOK_RAW(sub_820B4250) {
   }
   if(published) {
     auto& state=edf::native::State();
-    std::lock_guard lock(state.mutex);
-    state.scene_adapter.PublishWorldAnimation(owner,*published);
+    edf::native::WorldPublications().PublishAnimation(owner,*published,[&] { return std::unique_lock(state.mutex); },
+      [&](const edf::native::NativeScenePassAnimation& value) { state.scene_adapter.PublishWorldAnimation(owner,value); });
   }
 }
 REX_EXTERN(__imp__sub_820B4310);
@@ -4460,6 +4476,8 @@ REX_HOOK_RAW(sub_820B5FA8) {
     std::lock_guard lock(state.mutex);
     state.scene_adapter.RetireWorldAnimation(ctx.r3.u32);
     state.scene_adapter.RetireGroupOrder(ctx.r3.u32);
+    edf::native::WorldPublications().RetiredAnimation(ctx.r3.u32);
+    edf::native::WorldPublications().RetiredOrder(ctx.r3.u32);
     state.static_walk_plans.Retire(ctx.r3.u32);
   }
   __imp__sub_820B5FA8(ctx,base);
@@ -4941,6 +4959,41 @@ std::shared_ptr<const NativeIndexedMesh::RetainedDraw> RetainNativeSceneGeometry
     throw std::runtime_error("native scene geometry changed before publication");
   return geometry;
 }
+// Workers for the static preloads' per-group checks (edf_native_preload_workers).
+// Created on first use, so a run without a static world starts no thread.
+NativeDecodeWorkers& PreloadWorkers() {
+  static NativeDecodeWorkers workers([] {
+    const auto requested=REXCVAR_GET(edf_native_preload_workers);
+    if(requested>=0) return uint32_t((std::min)(requested,16));
+    // The engine thread takes a slice itself. 821A4DE8 runs between the helper
+    // join and the next frame, while the render thread is idle, so a few cores
+    // are free; the checks are pointer chases through cold host maps and guest
+    // pages, which stop scaling well before the core count.
+    const auto cores=std::thread::hardware_concurrency();
+    return uint32_t(cores>=8?3u:cores>=4?1u:0u);
+  }());
+  return workers;
+}
+// The preloads' prechecks over the preload workers (RunNativeSlices); slices
+// under 32 groups are not worth a hand-off. body must not throw.
+template<class Body> void RunPreloadSlices(size_t count,const Body& body) {
+  // Inside sim.preload_geometry/sim.preload_material: the prechecks' share.
+  HookTiming timing(HookPhase::SimPreloadPrecheck);
+  RunNativeSlices(PreloadWorkers(),count,32,body);
+}
+// Parallel prechecks of the preloads (below). 821A4DE8 runs serially between
+// the helper join and the next frame, so the ~2.1 ms the two preloads spent
+// proving 412 unchanged groups one by one (~2-3 us each: cold host maps, the
+// buffer writer lock, guest pages) was frame time. The "current" predicates
+// are pure: they read bridge state, guest memory through a per-slice window
+// and BufferWrites under its own lock (Unchanged observes and counts nothing).
+// While this thread holds the bridge mutex no bridge writer can run (every
+// writer takes it), and the workers' reads are ordered after this thread's
+// acquisition and before its release by the pool's own lock, so a slice reads
+// exactly the state the serial loop would. What they decide is then applied
+// serially, in group order, by the loop as before; an exception in a slice
+// leaves that group to the serial check, which throws or not as it did.
+enum class NativeStaticPrecheck : uint8_t { Unknown,Current,Changed };
 void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) {
   if(!state.initialized) return;
   // Only a membership change can leave an adapter entry or load record stale.
@@ -4961,8 +5014,8 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
   // write revisions, declaration/shader identity. Buffer comparisons that are
   // due (the sampled writer-coverage oracle) and every audit policy fall
   // through to the guarded path, so the live comparison keeps its cadence.
-  const auto current=[&](uint32_t address,const auto& group,const auto& load) {
-    if(load.revision!=group.revision || !load.reads.Unchanged(reader)) return false;
+  const auto current=[&](const auto& window,uint32_t address,const auto& group,const auto& load) {
+    if(load.revision!=group.revision || !load.reads.Unchanged(window)) return false;
     const auto* vb=state.model_buffers.Find(load.source.vertex,NativeModelBuffers::Kind::Vertex);
     const auto* ib=state.model_buffers.Find(load.source.index,NativeModelBuffers::Kind::Index);
     if(!vb || !ib || !vb->physical || !ib->physical ||
@@ -4980,13 +5033,36 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
       {load.source.vertex,*vb->physical,vb->bytes,&vb->vertex_contents},
       {load.source.index,*ib->physical,ib->bytes,&index_contents}}},load.versions,policy);
   };
+  std::vector<std::pair<uint32_t,const NativeSceneSources::Group*>> groups;
+  groups.reserve(state.scene_sources.Groups().size());
+  for(const auto& [address,group]:state.scene_sources.Groups()) groups.emplace_back(address,&group);
+  std::vector<NativeStaticPrecheck> precheck(groups.size(),NativeStaticPrecheck::Unknown);
+  RunPreloadSlices(groups.size(),[&](size_t begin,size_t end) {
+    const NativeSceneCpuWindow window(backing);
+    for(size_t i=begin;i<end;++i) {
+      try {
+        const auto cached=state.scene_geometry_loads.find(groups[i].first);
+        precheck[i]=cached!=state.scene_geometry_loads.end() && current(window,groups[i].first,*groups[i].second,cached->second)?
+          NativeStaticPrecheck::Current:NativeStaticPrecheck::Changed;
+      } catch(...) { precheck[i]=NativeStaticPrecheck::Unknown; }
+    }
+  });
+  // Groups can share buffers, and a load, reuse or scheduled verification
+  // below commits buffer state and consumes BufferWrites observations that a
+  // later group's check reads. So a precheck stands only while no group has
+  // left the unchanged path this tick; after the first that does, each group
+  // is checked here, serially, exactly as before.
+  bool mutated=false;
   const auto loaded_before=state.scene_geometry_loaded;
-  for(const auto& entry:state.scene_sources.Groups()) {
-    const auto address=entry.first; const auto& group=entry.second; // Captured below.
+  for(size_t index=0;index<groups.size();++index) {
+    const auto address=groups[index].first; const auto& group=*groups[index].second; // Captured below.
     const auto cached=state.scene_geometry_loads.find(address);
-    if(cached!=state.scene_geometry_loads.end() && current(address,group,cached->second)) {
+    const bool unchanged=!mutated && precheck[index]!=NativeStaticPrecheck::Unknown?precheck[index]==NativeStaticPrecheck::Current:
+      cached!=state.scene_geometry_loads.end() && current(reader,address,group,cached->second);
+    if(unchanged) {
       ++state.scene_geometry_unchanged; continue;
     }
+    mutated=true;
     try {
       NativeRecordedReads reads;
       const auto input=ReadNativeSceneGeometrySource(NativeRecordingReader(reader,reads),address);
@@ -5145,23 +5221,60 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
   // published program, schema/shader/texture identities and every recorded
   // program byte. Constant values are not program inputs: they change per
   // frame (untracked stores) and are refreshed on their own below.
-  const auto current=[&](uint32_t address,const auto& group,const auto& load) {
+  const auto host_current=[&](uint32_t address,const auto& group,const auto& load) {
     const auto geometry=state.scene_geometry_loads.find(address);
     if(load.revision!=group.revision || !load.published || geometry==state.scene_geometry_loads.end() ||
        geometry->second.source.material!=load.material ||
        state.scene_adapter.GroupMaterial(address,group.revision)!=load.published) return false;
-    if(!NativeSceneMaterialHostCurrent(state,*load.published->program,load.material,load.schema)) return false;
-    return load.reads.Unchanged(reader);
+    return NativeSceneMaterialHostCurrent(state,*load.published->program,load.material,load.schema);
   };
-  for(const auto& [address,group]:state.scene_sources.Groups()) {
+  const auto current=[&](uint32_t address,const auto& group,const auto& load) {
+    return host_current(address,group,load) && load.reads.Unchanged(reader);
+  };
+  // Prechecked in parallel, as the geometry (RunPreloadSlices): the host
+  // checks, the program bytes and, when both hold, the constant refresh
+  // (ProbeNativeSceneMaterialGuestInputs), all pure. Unlike geometry, groups do
+  // not depend on each other here: a group's check reads its own load, its own
+  // adapter entry and host state this pass never writes, and what the loop
+  // writes (the adapter's entry, the load) is that group's alone. So every
+  // precheck stands; one that threw is redone here.
+  struct Precheck { bool known=false,current=false; NativeSceneMaterialGuestProbe guest; };
+  std::vector<std::pair<uint32_t,const NativeSceneSources::Group*>> groups;
+  groups.reserve(state.scene_sources.Groups().size());
+  for(const auto& [address,group]:state.scene_sources.Groups()) groups.emplace_back(address,&group);
+  std::vector<Precheck> precheck(groups.size());
+  RunPreloadSlices(groups.size(),[&](size_t begin,size_t end) {
+    const NativeSceneCpuWindow window(backing);
+    for(size_t i=begin;i<end;++i) {
+      auto& result=precheck[i];
+      try {
+        const auto cached=state.scene_material_loads.find(groups[i].first);
+        if(cached!=state.scene_material_loads.end() && host_current(groups[i].first,*groups[i].second,cached->second)) {
+          const auto& load=cached->second;
+          if(!load.schema) continue;  // Unknown: the serial check decides.
+          result.guest=ProbeNativeSceneMaterialGuestInputs(window,load.reads,*load.schema,load.constants,load.published->constants);
+          result.current=result.guest.program_unchanged;
+        }
+        result.known=true;
+      } catch(...) { result=Precheck{}; }
+    }
+  });
+  for(size_t index=0;index<groups.size();++index) {
+    const auto address=groups[index].first; const auto& group=*groups[index].second;
     const auto cached=state.scene_material_loads.find(address);
-    if(cached!=state.scene_material_loads.end() && current(address,group,cached->second)) {
+    auto* guest=precheck[index].known && precheck[index].current?&precheck[index].guest:nullptr;
+    const bool unchanged=precheck[index].known?precheck[index].current:
+      cached!=state.scene_material_loads.end() && current(address,group,cached->second);
+    if(cached!=state.scene_material_loads.end() && unchanged) {
       // The program is unchanged; only constant values are re-read, and the
       // program object is kept when one of them moved.
       auto& load=cached->second;
       bool refreshed=false;
       try {
-        auto constants=RefreshNativeSceneMaterialConstants(reader,*load.schema,load.constants,load.published->constants);
+        // A prechecked refresh that threw is the same failure as one thrown here.
+        if(guest && !guest->constants_read) throw std::runtime_error("prechecked material constant refresh failed");
+        auto constants=guest?std::move(guest->constants):
+          RefreshNativeSceneMaterialConstants(reader,*load.schema,load.constants,load.published->constants);
         if(constants) {
           static std::set<std::string> reported;
           for(size_t i=0;i<constants->size() && reported.size()<32;++i)
@@ -5350,6 +5463,9 @@ REX_HOOK_RAW(sub_820B2DF8) {
   __imp__sub_820B2DF8(ctx,base);
   // Objects the scene sources never saw born have no generation: skip both locks.
   if(EDF_NATIVE_FLAG(scene_queued) && edf::native::SceneSourceOwners().MayContain(owner)) {
+    // Timed with its lock wait: the other per-step bridge-mutex user inside the
+    // simulation dispatch, next to the 820B4250 post-hook.
+    edf::native::HookTiming timing(edf::native::HookPhase::SimWorldUpdate);
     auto& state=edf::native::State();
     // The bridge mutex alone, as the step's publication: a world update submits
     // nothing, and the submission gate would make it wait out the swap's pacing.
@@ -7323,7 +7439,9 @@ REX_HOOK_RAW(sub_821C0D70) {
 namespace {
 // End of 821A4DE8 (r3 is the scene): after the scene+100 slot-2 walk, so this
 // tick's pose builds are in memory. Failures stay native and are counted.
-void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
+// tick: the engine thread's native_loop_budget.tick (thread-local), passed in
+// because the tick may run on RegistryWorker.
+void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick) {
   auto& registry=edf::native::RenderRegistry();
   if(!REXCVAR_GET(edf_native_render_registry) && !EDF_NATIVE_FLAG(full_frame)) { if(registry.active()) registry.Clear(); return; }
   edf::native::HookTiming timing(edf::native::HookPhase::SimRegistry);
@@ -7341,7 +7459,7 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
           return found?found->generation:0;
         },bones);
     };
-    const auto snapshot=registry.Tick(window,scene,native_loop_budget.tick,decode);
+    const auto snapshot=registry.Tick(window,scene,tick,decode);
     static uint64_t ticks=0;
     const bool report=++ticks<=4 || ticks%1000==0;
     if(report) {
@@ -7367,6 +7485,20 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
     if(++failures<=8 || (failures&(failures-1))==0)
       REXLOG_WARN("Native render registry tick failed ({}): {}",failures,error.what());
   }
+}
+// The registry tick (0.5-0.9 ms a frame in play) beside the step publication
+// (edf_native_registry_overlap). 821A4DE8's tail runs serially between the
+// helper join and the next frame, so its phases add up to frame time; the
+// tick depends on none of them. It reads guest memory the guest call just
+// left (no guest code runs until the hook returns, which joins it first) and
+// its own state, which only the tick touches (its hooks append to a locked
+// event list); its first-sight layout decodes take the bridge mutex, so while
+// the preloads hold it they wait, and nothing here waits on the tick with the
+// mutex held. One worker, so ticks never overlap each other; the pool's lock
+// orders each tick after the previous one and before the hook returns.
+edf::native::NativeDecodeWorkers& RegistryWorker() {
+  static edf::native::NativeDecodeWorkers worker(1);
+  return worker;
 }
 }
 REX_EXTERN(__imp__sub_821A4DE8);
@@ -7407,6 +7539,18 @@ REX_HOOK_RAW(sub_821A4DE8) {
     native_model_dirty_poses=model_publication?&dirty_poses:nullptr;
     __imp__sub_821A4DE8(ctx,base);
   }
+  // The registry tick starts now on RegistryWorker and is joined below, or on
+  // any exit (the guard), before this hook returns to guest code.
+  struct RegistryJoin {
+    uint64_t ticket=0;
+    void Wait() { if(ticket) RegistryWorker().Wait(std::exchange(ticket,0)); }
+    ~RegistryJoin() { Wait(); }
+  } registry_join;
+  const bool registry_overlap=REXCVAR_GET(edf_native_registry_overlap);
+  if(registry_overlap)
+    registry_join.ticket=RegistryWorker().Submit([base,manager,tick=native_loop_budget.tick] {
+      try { TickNativeRenderRegistry(base,manager,tick); } catch(...) {}  // A worker cannot carry it; the tick logs its own.
+    });
   // This step's 820B4250 tree publications; cleared on every exit below.
   struct StepTrees { ~StepTrees() { native_step_trees.clear(); } } step_trees;
   if(EDF_NATIVE_FLAG(scene_camera_owned)) {
@@ -7488,7 +7632,8 @@ REX_HOOK_RAW(sub_821A4DE8) {
       REXLOG_WARN("Native model pose publication failed: {}",error.what());
     }
   } else if(!model_flag && ModelPublications().size()) ModelPublications().Clear();
-  TickNativeRenderRegistry(base,manager);
+  if(registry_overlap) registry_join.Wait();
+  else TickNativeRenderRegistry(base,manager,native_loop_budget.tick);
   timing.Finish();
   if(edge) REXLOG_INFO("Native resource transition: end manager={:#x}",manager);
 }

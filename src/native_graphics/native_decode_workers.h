@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -66,4 +67,30 @@ class NativeDecodeWorkers {
   std::atomic<uint64_t> submitted_{0},waits_{0},inline_jobs_{0};
   bool stop_=false;
 };
+// The fan-out the header comment says draws do not have, for a caller that
+// does have a batch: body(begin,end) over [0,count) in contiguous slices of
+// at least min_slice, the calling thread taking the first and one worker each
+// of the others (at most workers()+1 slices, at most 17), returning when every
+// slice has finished. Every index is visited exactly once. body must not
+// throw on a worker (a worker cannot carry an exception back); if the caller's
+// own slice throws, the submitted slices, which borrow body, are still joined
+// before the exception leaves.
+template<class Body>
+void RunNativeSlices(NativeDecodeWorkers& workers,size_t count,size_t min_slice,const Body& body) {
+  static constexpr size_t kMaxLanes=17;
+  const size_t lanes=(std::min)({size_t(workers.workers())+1,kMaxLanes,
+    (std::max)(size_t(1),count/(std::max)(size_t(1),min_slice))});
+  if(lanes<=1) { body(size_t(0),count); return; }
+  const size_t step=(count+lanes-1)/lanes;
+  struct Join {
+    NativeDecodeWorkers& workers;
+    uint64_t tickets[kMaxLanes]{};
+    ~Join() { for(const auto ticket:tickets) workers.Wait(ticket); }
+  } join{workers};
+  for(size_t lane=1;lane<lanes;++lane) {
+    const size_t begin=(std::min)(count,lane*step),end=(std::min)(count,begin+step);
+    if(begin<end) join.tickets[lane]=workers.Submit([&body,begin,end] { body(begin,end); });
+  }
+  body(size_t(0),(std::min)(count,step));
+}
 }  // namespace edf::native
