@@ -241,11 +241,38 @@ No cvar was added for the finish/post pass on this branch.
   image (BMP/PNG): share of pixels over `--threshold`, max difference, PSNR,
   optional `--mask`; exits nonzero above `--limit`.
   `python tools/compare-renderer-images.py guest.bmp native.bmp --mask diff.png`
-- `tools/compare-renderer-ab-captures.py` pairs captures from an
-  `edf_native_ab_alternate` run by the `ab_alternate frame=F native=0|1` log
-  lines and judges each guest/native pair against a guest-vs-guest baseline
-  plus `--margin`. Exits 0 on pass, 1 on a failing pair, 2 on unusable input.
-  `python tools/compare-renderer-ab-captures.py out/captures game.log --prefix ab`
+- `tools/compare-renderer-ab-captures.py` is the image-correctness gate next
+  to the FPS gate. It reads the captures of an `edf_native_ab_alternate` run
+  and takes each frame's side from the `ab_alternate frame=F native=0|1` log
+  lines, or from `--period N [--start S]` when there is no log. Each native
+  frame is compared with its nearest guest frames P and Q on 8x8 block means,
+  in 40x40 px tiles. A tile is bad when its native error (the smaller of the
+  errors against P and Q) is more than `--noise-ratio` 2 times the P-vs-Q
+  error, plus `--floor` 6. The P-vs-Q error is the motion noise, and each tile
+  takes the largest value among itself and its neighbours. A native frame fails
+  when more than 8% of its tiles are bad (`--max-bad-tiles`), when its largest
+  connected bad region is more than 5% of the frame (`--max-region`), or when
+  it is blank while its guest frames are not. The gate fails on any failing
+  native frame (`--max-failing-frames` 0). It also fails on any tile that is bad
+  in at least half of the native frames. That check catches small losses that
+  last, such as one missing HUD element. A control judges every guest frame
+  against its own guest neighbours. It never fails the gate but warns when the
+  capture moves too much for the thresholds. The tool prints JSON like the
+  runtime gate: `passed`, `failures`, `warnings`, `summary`, `control`,
+  per-frame `frames`. `--diff-image` writes the worst native frame: guest,
+  native, bad tiles in red, and each block's error over its limit (red above
+  it). Exits 0 on pass, 1 on fail, 2 on unusable input. `--self-test` runs
+  `tools/test_compare_renderer_ab_captures.py`.
+  `python tools/compare-renderer-ab-captures.py out/renderer-ab/ab-skyfix game.log --prefix cap --diff-image worst.png`
+  `python tools/compare-renderer-ab-captures.py out/renderer-ab/ab-5c7d6e9 --period 1 --prefix cap`
+  Calibration: `ab-5c7d6e9` is the known-bad set, in which native frames lose
+  static geometry beyond about 100-150 m. It fails in 31 of 31 native frames,
+  with 41-43% of tiles bad and 244 persistent tiles. Its guest-as-native
+  control passes: 30 frames, the worst at 3.7% bad tiles and a 3.5% region
+  (a civilian crossing close to the camera). Guest-as-native frames with
+  synthetic damage fail in 30 of 30 frames each for a black frame, a missing
+  radar, a far region cut to sky and a 160x120 px cut. A missing ammo-text box
+  fails through the persistent-tile check.
 
 ## 7. Known gaps
 

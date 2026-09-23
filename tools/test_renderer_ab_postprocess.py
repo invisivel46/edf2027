@@ -184,9 +184,9 @@ class PairTests(unittest.TestCase):
                                    candidate_log=log, ab_alternate=True)
         ab = report["ab_alternate"]
         self.assertTrue(ab["passed"], ab)
-        self.assertEqual(ab["summary"], {"pairs": 3, "failed": 0, "passed": True})
-        self.assertEqual(ab["baseline"]["step"], 2)
-        self.assertEqual([p["guest"] for p in ab["pairs"]], [600, 602, 604])
+        self.assertEqual((ab["summary"]["native_frames"], ab["summary"]["failing_frames"]), (2, []))
+        self.assertEqual([(f["prev"], f["frame"], f["next"]) for f in ab["frames"]],
+                         [(600, 601, 602), (602, 603, 604)])
         sides = {f["frame"]: f.get("candidate_side") for f in report["frames"]}
         self.assertEqual((sides[600], sides[601]), ("guest", "native"))
 
@@ -197,13 +197,10 @@ class PairTests(unittest.TestCase):
         self.assertFalse(report["ab_alternate"]["passed"])
 
     def test_parse_ab_output(self):
-        text = ("baseline guest/guest step=1 pairs=2 median=0.1000% max=0.2000% min_psnr_db=40.00\n"
-                "guest=601 native=602 differing=3.5000% max_diff=90 psnr_db=31.20 limit=0.7000% result=FAIL\n"
-                "summary pairs=1 failed=1 baseline_max=0.2000% margin=0.5 result=FAIL\n")
-        parsed = post.parse_ab_output(text)
-        self.assertEqual(parsed["pairs"][0]["differing_percent"], 3.5)
-        self.assertFalse(parsed["pairs"][0]["passed"])
-        self.assertEqual(parsed["summary"]["failed"], 1)
+        parsed = post.parse_ab_output('{"passed": false, "summary": {"native_frames": 1, "failing_frames": [602]}}')
+        self.assertEqual(parsed["summary"]["failing_frames"], [602])
+        self.assertFalse(parsed["passed"])
+        self.assertEqual(post.parse_ab_output("error: not json"), {})
 
     def test_sheet_and_cli(self):
         self.write(self.base, 600, gameplay)

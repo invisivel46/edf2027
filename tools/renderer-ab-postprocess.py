@@ -63,10 +63,6 @@ except ImportError:  # pragma: no cover - depends on the machine
     _PilImage = None
 
 CAPTURE_NAME = re.compile(r"\.output\.(\d+)\.(?:bmp|png)$", re.IGNORECASE)
-AB_PAIR = re.compile(r"guest=(\d+) native=(\d+) differing=([\d.]+)% max_diff=(\d+) psnr_db=(\S+) "
-                     r"limit=([\d.]+)% result=(PASS|FAIL)")
-AB_BASELINE = re.compile(r"baseline guest/guest step=(\d+) pairs=(\d+) median=([\d.]+)% max=([\d.]+)%")
-AB_SUMMARY = re.compile(r"summary pairs=(\d+) failed=(\d+) .*result=(PASS|FAIL)")
 
 DEFAULTS = {"dark_luma": 24, "dark_fraction": 0.85, "flat_stddev": 6.0, "sample_step": 4}
 
@@ -179,16 +175,12 @@ def write_mask_thumbnail(comparison, path: Path, max_width: int) -> None:
 # ------------------------------------------------------------ A/B alternate
 
 def parse_ab_output(stdout: str) -> dict:
-    pairs = [{"guest": int(m[1]), "native": int(m[2]), "differing_percent": float(m[3]), "max_diff": int(m[4]),
-              "psnr_db": m[5], "limit_percent": float(m[6]), "passed": m[7] == "PASS"}
-             for m in AB_PAIR.finditer(stdout)]
-    result: dict = {"pairs": pairs}
-    if (m := AB_BASELINE.search(stdout)):
-        result["baseline"] = {"step": int(m[1]), "pairs": int(m[2]), "median_percent": float(m[3]),
-                              "max_percent": float(m[4])}
-    if (m := AB_SUMMARY.search(stdout)):
-        result["summary"] = {"pairs": int(m[1]), "failed": int(m[2]), "passed": m[3] == "PASS"}
-    return result
+    """The JSON report of compare-renderer-ab-captures.py ({} when stdout is not JSON)."""
+    try:
+        report = json.loads(stdout)
+    except ValueError:
+        return {}
+    return report if isinstance(report, dict) else {}
 
 
 def run_ab_alternate(captures_dir: Path, log: Path, prefix: str, extra: list[str]) -> dict:
@@ -197,7 +189,7 @@ def run_ab_alternate(captures_dir: Path, log: Path, prefix: str, extra: list[str
     proc = subprocess.run(argv, capture_output=True, text=True)
     report = parse_ab_output(proc.stdout)
     report.update({"exit_code": proc.returncode, "passed": proc.returncode == 0,
-                   "stdout": proc.stdout, "stderr": proc.stderr.strip() or None})
+                   "stderr": proc.stderr.strip() or None})
     return report
 
 
@@ -360,9 +352,10 @@ def render_sheet(directory: Path) -> Path:
         if (ab := report.get("ab_alternate")) is not None:
             summary = ab.get("summary") or {}
             verdict = "PASS" if ab.get("passed") else "FAIL"
+            notes = "; ".join(ab.get("failures") or []) or ab.get("error") or ab.get("stderr") or ""
             parts.append(f"<p>A/B alternate (candidate): <span class={'ok' if ab.get('passed') else 'bad'}>"
-                         f"{verdict}</span> pairs {summary.get('pairs', 'n/a')}, failed "
-                         f"{summary.get('failed', 'n/a')}{' - ' + html.escape(ab['stderr']) if ab.get('stderr') else ''}</p>")
+                         f"{verdict}</span> native frames {summary.get('native_frames', 'n/a')}, failing "
+                         f"{len(summary.get('failing_frames') or [])}{' - ' + html.escape(notes) if notes else ''}</p>")
         for frame in report["frames"]:
             base, cand, comp = frame.get("baseline"), frame.get("candidate"), frame.get("compare")
             meta = [f"<b>frame {frame['frame']}</b>"]
