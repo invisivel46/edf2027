@@ -10,6 +10,21 @@ include(CTest)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# A cached, empty CMAKE_CXX_FLAGS_RELEASE once built this whole game at -O0:
+# CMake seeds the per-config flags only when the cache entry is missing, and
+# an explicitly empty entry survives every reconfigure. Refuse to configure an
+# optimized config whose flags carry no optimization level.
+option(EDF2027_ALLOW_UNOPTIMIZED_RELEASE "Allow Release/RelWithDebInfo flags without -O" OFF)
+if(CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$" AND NOT EDF2027_ALLOW_UNOPTIMIZED_RELEASE)
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" _edf_config)
+    if(NOT " ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_edf_config}} " MATCHES " [-/]O[1-3sxz2]? ")
+        message(FATAL_ERROR "CMAKE_CXX_FLAGS_${_edf_config} ('${CMAKE_CXX_FLAGS_${_edf_config}}') "
+            "has no optimization level, so this ${CMAKE_BUILD_TYPE} build would compile at -O0. "
+            "Reconfigure with -DCMAKE_CXX_FLAGS_${_edf_config}=\"-O2 -DNDEBUG\" (the preset does this), "
+            "or pass -DEDF2027_ALLOW_UNOPTIMIZED_RELEASE=ON on purpose.")
+    endif()
+endif()
+
 option(EDF2027_NATIVE_GRAPHICS_ONLY "Build native graphics tools without ReXGlue or Xenos" OFF)
 add_subdirectory(src/native_graphics)
 if(EDF2027_NATIVE_GRAPHICS_ONLY)
@@ -62,6 +77,9 @@ if(NOT EDF2027_EXECUTABLE_NAME MATCHES "^[A-Za-z0-9][A-Za-z0-9_.-]*$")
     message(FATAL_ERROR "EDF2027_EXECUTABLE_NAME must be a simple executable basename")
 endif()
 set_target_properties(edf2027 PROPERTIES OUTPUT_NAME "${EDF2027_EXECUTABLE_NAME}")
+
+# Opt-in -O3 / x86-64-v3 / ThinLTO / PGO experiments; all off by default.
+include(cmake/edf_optimization.cmake)
 
 # Read-only import/staging check, including transitive non-system dependencies.
 # Run from the VS developer environment so CMake can use dumpbin.
