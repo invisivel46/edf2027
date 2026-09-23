@@ -97,6 +97,7 @@
 #include "native_profile_result.h"
 #include "native_capture_policy.h"
 #include "native_ab_alternate.h"
+#include "native_shadow_render.h"
 #include "native_post_finish_plan.h"
 #include "native_full_frame_post.h"
 #include "native_constant_ownership.h"
@@ -204,6 +205,14 @@ REXCVAR_DEFINE_INT32(edf_native_output_capture_start_frame,0,"EDF2027",
                     "Positive indexed frame starts interval captures and disables startup milestones; 0 preserves defaults (development)");
 REXCVAR_DEFINE_BOOL(edf_native_output_capture_scene_color,false,"EDF2027",
                    "Also capture scene color at each selected output frame to diagnose post-processing differences (development)");
+REXCVAR_DEFINE_INT32(edf_native_shadow_render,0,"EDF2027",
+                    "Shadow render: every Nth indexed output frame, after the native full frame, also render the guest helper path for the same state into offscreen targets and write both pre-HUD images and draw lists (tools/shadow-diff.py); 0 off (development)").range(0,100000);
+REXCVAR_DEFINE_INT32(edf_native_shadow_render_start_frame,0,"EDF2027",
+                    "First indexed output frame a shadow render may take; shadow frames are start, start+N, ... (development)").range(0,100000000);
+REXCVAR_DEFINE_INT32(edf_native_shadow_render_limit,16,"EDF2027",
+                    "Maximum shadow frames written per run (development)").range(0,4096);
+REXCVAR_DEFINE_STRING(edf_native_shadow_render_prefix,"native-shadow/shadow","EDF2027",
+                     "Path prefix of shadow render output: <prefix>.<frame>.native.bmp/.guest.bmp, .native.draws.jsonl/.guest.draws.jsonl and .shadow.json; its directory is created (development)");
 REXCVAR_DEFINE_BOOL(edf_native_pixel_centers,true,"EDF2027",
                    "Apply the guest PA_SU_VTX_CNTL half-pixel offset to the audited retail post passes; false restores the unshifted viewport for regression diagnosis");
 REXCVAR_DEFINE_INT32(edf_native_loop_trace,0,"EDF2027",
@@ -3182,7 +3191,7 @@ edf::native::NativeBackendRecorder& SceneRecorderLocked(Bridge& state) {
   ++state.scene_frame_operations;
   // One producer captures immutable draw packets. The D3D12 scene backend
   // distributes contiguous packet ranges to its recording workers.
-  return backend.Recorder(0);
+  return backend.Recorder();  // Recorder(0), or the shadow render's draw-list tap wrapping it.
 }
 void PublishSceneSharedLocked(Bridge& state,const NativeRenderTarget& output,NativeFrameKind kind) {
   if(state.scene_shared_refused || !state.scene_backend || !output.backend_surface) return;
@@ -3766,6 +3775,14 @@ thread_local uint64_t native_render_publication=0;
 // clEffectEtc02 slot 4 hook (8217C4A0) keeps +612 on such a render. The full
 // frame reads NativeFrameInputs::tick_frame instead.
 thread_local bool native_render_tick_frame=true;
+// The shadow render's guest side (edf_native_shadow_render,
+// native_shadow_render.h) on this thread; null outside it, always null with
+// the cvar off. Counts what its guest route held back.
+struct NativeShadowGuest {
+  uint64_t tone_holds=0;      // PS_Downsample_Tone draws skipped (the immediate draw hook)
+  uint64_t lifetime_holds=0;  // clEffectEtc02 +612 put back (the 8217C4A0 hook)
+};
+thread_local NativeShadowGuest* native_shadow_guest=nullptr;
 struct NativeModelRenderContext {
   uint32_t source=0;
   const std::vector<edf::native::NativePoseMatrix>* poses=nullptr;
@@ -7349,11 +7366,317 @@ struct GpuPassSpan {
   GpuPassSpan& operator=(const GpuPassSpan&)=delete;
   int span;
 };
+// edf_native_shadow_render: one shadow frame (native_shadow_render.h has the
+// design and the side-effect handling). Begin (the 821A5080 hook, before the
+// native frame) arms the draw-list tap on the scene backend; the host's
+// Label names the native pass recording; Run (NativeFullFrameHost::Phases,
+// after the native post, before the HUD) captures the native image, renders
+// the guest route into the shadow's own targets, captures that, puts every
+// guest word and bridge field back and writes the files. The destructor
+// removes the tap on every exit.
+}
+namespace edf::native {
+namespace {
+class NativeShadowFrame {
+ public:
+  using GuestCall=std::function<void(uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr)>;
+  static std::unique_ptr<NativeShadowFrame> Begin(uint8_t* base,uint32_t owner) {
+    const NativeShadowSchedule schedule{REXCVAR_GET(edf_native_shadow_render),REXCVAR_GET(edf_native_shadow_render_start_frame),
+      uint64_t((std::max)(0,REXCVAR_GET(edf_native_shadow_render_limit)))};
+    static uint64_t taken=0,last_frame=0;  // 821A6508 joins each helper call before the next.
+    auto& state=State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    const auto frame=state.indexed_output_frames+1;
+    if(frame==last_frame || !NativeShadowRenderDue(frame,schedule,taken)) return nullptr;
+    last_frame=frame; ++taken;
+    std::unique_ptr<NativeShadowFrame> shadow(new NativeShadowFrame(base,owner,frame));
+    try {
+      auto& backend=EnsureSceneBackendLocked(state);
+      if(backend.recorder_tap) throw std::runtime_error("the scene backend already has a recorder tap");
+      shadow->tap_.Arm("native.begin");
+      backend.recorder_tap=&shadow->tap_;
+      shadow->backend_=&backend;
+    } catch(const std::exception& error) {
+      REXLOG_ERROR("Native shadow render frame={}: not armed: {}",frame,error.what());
+      return nullptr;
+    }
+    REXLOG_INFO("Native shadow render: frame={} armed (every {} from {}, {} of {})",frame,schedule.period,schedule.start,taken,schedule.limit);
+    return shadow;
+  }
+  ~NativeShadowFrame() { Disarm(); }
+  NativeShadowFrame(const NativeShadowFrame&)=delete;
+  NativeShadowFrame& operator=(const NativeShadowFrame&)=delete;
+  void Label(std::string label) { tap_.SetLabel(std::move(label)); }
+  // After the native finish stage, before the HUD: `context` is the helper's
+  // guest frame context (the host's), `views` the views BeginView accepted.
+  void Run(const NativeFrameContext& frame,uint32_t context,uint32_t views,const GuestCall& guest);
+
+ private:
+  NativeShadowFrame(uint8_t* base,uint32_t owner,uint64_t frame)
+    :base_(base),reader_(base),owner_(owner),frame_(frame),serial_before_(reader_.Word(reader_.Add(owner,136))) {}
+  // The shadow's own scene color, depth and ordinary output, matching the
+  // native scene's so the guest scene begin and 8219C930 reuse them. Leaked,
+  // as other backend-lifetime caches here, so no exit order can free them late.
+  struct Targets {
+    NativeRenderBackend* backend=nullptr;
+    uint32_t width=0,height=0,samples=0,output_format=0;
+    NativeRenderTarget color,output;
+    NativeDepthTarget depth;
+  };
+  static Targets& ShadowTargets() { static auto* targets=new Targets; return *targets; }
+  void Disarm() {
+    if(!backend_) return;
+    auto& state=State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    if(state.scene_backend.get()==backend_ && backend_->recorder_tap==&tap_) backend_->recorder_tap=nullptr;
+    backend_=nullptr;
+  }
+  std::string GuestLabel(uint32_t lr,uint32_t object) const {
+    switch(lr) {
+      case 0x821A515C: return "guest.view_begin";
+      case 0x821A51DC: {
+        uint32_t vtable=0;
+        try { vtable=reader_.Word(object); } catch(const std::exception&) {}
+        return std::format("guest.world:{:08x}",vtable);
+      }
+      case 0x821A520C: return "guest.buckets";
+      case 0x821A5268: return "guest.overlays";
+      case 0x821A5294: return "guest.view16";
+      case 0x821A52AC: return "guest.view_end";
+      case 0x821A52E8: return "guest.finish";
+      case 0x821A52FC: return "guest.finish16";
+      default: return std::format("guest.{:08x}",lr);
+    }
+  }
+  void CaptureGuestWords(NativeGuestSnapshot& snapshot,const NativeFrameInputs& inputs) const {
+    const auto capture=[&](std::string name,uint32_t address,uint32_t words) {
+      try { snapshot.Capture(reader_,std::move(name),address,words); }
+      catch(const std::exception& error) { REXLOG_WARN("Native shadow render: {} at {:#x} not snapshot: {}",name,address,error.what()); }
+    };
+    capture("serial",reader_.Add(owner_,136),1);
+    capture("buckets",reader_.Add(owner_,168),512);  // owner+168..+2215: heads and the drain's buckets
+    if(const auto pool=reader_.Word(NativeViewGlobalsLayout::kPoolGlobal)) {
+      capture("pool.copies",reader_.Add(pool,NativeViewGlobalsLayout::kProjectionCopy),36);  // +64..+207
+      for(uint32_t offset=32;offset<=56;offset+=4) {
+        const auto record=reader_.Word(reader_.Add(pool,offset));
+        if(!record) continue;
+        const auto data=reader_.Word(reader_.Add(record,NativeViewGlobalsLayout::kValueData));
+        const auto count=reader_.Word(reader_.Add(record,NativeViewGlobalsLayout::kValueCount));
+        if(data && count && count<=1024) capture(std::format("pool.record+{}",offset),data,count*4);
+      }
+    }
+    if(inputs.registry) for(const auto& entry:inputs.registry->entries) {
+      try {
+        if(!entry || reader_.Word(entry->object)!=NativeBrokenObject::vtable) continue;
+      } catch(const std::exception&) { continue; }
+      capture(std::format("broken+712:{:08x}",entry->object),reader_.Add(entry->object,NativeBrokenObject::drawn),1);
+    }
+  }
+  void Write(const std::string& suffix,std::string_view bytes) const {
+    const auto path=std::filesystem::path(prefix_+"."+std::to_string(frame_)+suffix);
+    std::ofstream file(path,std::ios::binary|std::ios::trunc);
+    file.write(bytes.data(),std::streamsize(bytes.size()));
+    file.close();
+    if(!file) throw std::runtime_error("shadow render write failed: "+path.string());
+  }
+
+  uint8_t* base_;
+  const GuestReader reader_;
+  uint32_t owner_;
+  uint64_t frame_;
+  uint32_t serial_before_;
+  std::string prefix_;
+  NativeRenderBackend* backend_=nullptr;
+  NativeDrawListRecorder tap_;
+};
+void NativeShadowFrame::Run(const NativeFrameContext& frame,uint32_t context,uint32_t views,const GuestCall& guest) {
+  auto& state=State();
+  prefix_=REXCVAR_GET(edf_native_shadow_render_prefix);
+  if(prefix_.empty()) prefix_="native-shadow/shadow";
+  const auto renderer=reader_.Word(0x8257bfb4);
+  std::vector<NativeDrawRecord> native_draws,guest_draws;
+  std::vector<uint8_t> native_bmp,guest_bmp;
+  std::string skipped;
+  // 1. The native frame as the post left it (pre-HUD), and its draw list.
+  {
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    native_draws=tap_.Take();
+    const auto scene=renderer?state.scenes.find(renderer):state.scenes.end();
+    if(!frame.output_ready) skipped="the native post left no output";
+    else if(!views) skipped="no view was rendered";
+    else if(scene==state.scenes.end() || state.active_output!=renderer || !scene->second.output.content_valid)
+      skipped="the native output is not active and valid";
+    else if(state.scene_backend.get()!=backend_) skipped="the scene backend changed";
+    else {
+      try { native_bmp=CaptureOutputBmp(state,scene->second); }
+      catch(const std::exception& error) { skipped=std::string("native capture: ")+error.what(); }
+      tap_.ResetState();
+    }
+  }
+  if(!skipped.empty()) {
+    REXLOG_WARN("Native shadow render frame={}: skipped: {}",frame_,skipped);
+    Disarm();
+    return;
+  }
+  // 2. Guest words the guest route writes and game state keeps.
+  NativeGuestSnapshot snapshot;
+  CaptureGuestWords(snapshot,frame.inputs);
+  // 3. The shadow's targets in place of the native scene's, and the bridge
+  // fields the guest scene begin and finish rewrite.
+  struct Saved {
+    uint32_t active_scene=0,active_output=0,active_target=0,timer_owner=0,color_surface=0;
+    bool full_frame=false,timer_resolved=false,frame_complete=false;
+    uint64_t indexed_start=0;
+    std::vector<std::pair<uint32_t,uint32_t>> target_stack;
+    std::vector<DrawVisibility> visibility;
+    uint32_t resolved_handle=0;
+    std::optional<NativeTexture> resolved;
+  } saved;
+  auto& targets=ShadowTargets();
+  const auto swap_targets=[&](NativeScene& scene) {
+    std::swap(scene.color,targets.color); std::swap(scene.depth,targets.depth); std::swap(scene.output,targets.output);
+  };
+  {
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    auto& scene=state.scenes.at(renderer);
+    const auto width=scene.color.sampled.width,height=scene.color.sampled.height;
+    if(targets.backend!=backend_ || targets.width!=width || targets.height!=height || targets.samples!=scene.samples ||
+       targets.output_format!=scene.output.format) {
+      targets.color=CreateNativeRenderTarget(*backend_,width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,scene.samples);
+      targets.depth=CreateNativeDepthTarget(*backend_,width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,scene.samples);
+      targets.output=CreateNativeRenderTarget(*backend_,scene.output.sampled.width,scene.output.sampled.height,DXGI_FORMAT(scene.output.format));
+      targets.backend=backend_; targets.width=width; targets.height=height; targets.samples=scene.samples;
+      targets.output_format=scene.output.format;
+      REXLOG_INFO("Native shadow render targets: {}x{} samples={} output_format={}",width,height,scene.samples,scene.output.format);
+    }
+    saved.active_scene=state.active_scene; saved.active_output=state.active_output; saved.active_target=state.active_target;
+    saved.timer_owner=state.scene_gpu_timer_owner; saved.timer_resolved=state.scene_gpu_timer_resolved;
+    saved.full_frame=state.scene_full_frame; saved.indexed_start=state.scene_indexed_start;
+    saved.target_stack=state.target_stack; saved.visibility=std::move(state.visibility); state.visibility.clear();
+    saved.color_surface=scene.color_surface; saved.frame_complete=scene.frame_complete;
+    saved.resolved_handle=reader_.Word(reader_.Add(renderer,104));
+    if(const auto found=state.textures.find(saved.resolved_handle);found!=state.textures.end()) saved.resolved=found->second;
+    swap_targets(scene);
+    targets.output.content_valid=false;  // The shadow output starts undefined, as a new frame's does.
+    ++state.bind_generation; state.recorded={};
+  }
+  // 4. The guest route for the same state: scene begin (clSgsCoreRender +0),
+  // the view loop and the finish stage, no phase loop.
+  NativeShadowGuest held;
+  std::exception_ptr failure;
+  {
+    const NativeAbSideLatch guest_side(false);
+    struct Scope {
+      bool tick_frame=native_render_tick_frame;
+      NativeShadowGuest* shadow=native_shadow_guest;
+      uint32_t animation_owner=native_scene_animation_owner;
+      std::optional<NativeScenePassCamera> camera=native_scene_pass_camera;
+      std::optional<NativeScenePassAnimation> animation=native_scene_pass_animation;
+      ~Scope() {
+        native_render_tick_frame=tick_frame; native_shadow_guest=shadow; native_scene_animation_owner=animation_owner;
+        native_scene_pass_camera=std::move(camera); native_scene_pass_animation=std::move(animation);
+      }
+    } scope;
+    native_render_tick_frame=false;  // The 8217C4A0 hook puts clEffectEtc02 +612 back.
+    native_shadow_guest=&held;       // The immediate draw hook holds PS_Downsample_Tone.
+    native_scene_animation_owner=0; native_scene_pass_camera.reset(); native_scene_pass_animation.reset();
+    {
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      tap_.Arm("guest.scene_begin");
+    }
+    try {
+      reader_.StoreWord(reader_.Add(owner_,136),serial_before_);  // The native views' serials.
+      const auto core=reader_.Word(reader_.Add(owner_,132));
+      guest(reader_.Word(reader_.Word(core)),core,0,0,0x821A6508);
+      {
+        std::lock_guard submission(state.submissions);
+        std::lock_guard lock(state.mutex);
+        if(state.active_scene!=renderer) throw std::runtime_error("the guest scene begin did not open the scene");
+      }
+      DispatchNativeFrame(reader_,owner_,context,[&](uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr) {
+        tap_.SetLabel(GuestLabel(lr,object));
+        guest(function,object,argument,index,lr);
+      },false);
+    } catch(...) { failure=std::current_exception(); }
+  }
+  // 5. The guest image, then the native scene back and every bridge field.
+  std::string guest_error;
+  {
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    guest_draws=tap_.Take();
+    auto& scene=state.scenes.at(renderer);
+    if(failure) guest_error="the guest route threw";
+    else if(state.active_output!=renderer || !scene.output.content_valid) guest_error="the guest post left no valid output";
+    else {
+      try { guest_bmp=CaptureOutputBmp(state,scene); }
+      catch(const std::exception& error) { guest_error=std::string("guest capture: ")+error.what(); }
+    }
+    swap_targets(scene);
+    scene.color_surface=saved.color_surface; scene.frame_complete=saved.frame_complete;
+    state.active_scene=saved.active_scene; state.active_output=saved.active_output; state.active_target=saved.active_target;
+    state.scene_gpu_timer_owner=saved.timer_owner; state.scene_gpu_timer_resolved=saved.timer_resolved;
+    state.scene_full_frame=saved.full_frame; state.scene_indexed_start=saved.indexed_start;
+    state.target_stack=std::move(saved.target_stack); state.visibility=std::move(saved.visibility);
+    if(saved.resolved) state.textures.insert_or_assign(saved.resolved_handle,*saved.resolved);
+    ++state.bind_generation; state.recorded={};
+    tap_.ResetState();
+    BindActiveTarget(state);
+  }
+  Disarm();
+  // 6. Every guest word back as the native frame left it.
+  const auto restored=snapshot.Restore(reader_);
+  // 7. The files.
+  uint32_t restored_words=0;
+  std::string ranges;
+  for(const auto& range:restored) {
+    restored_words+=range.changed;
+    ranges+=std::format("{}{{\"name\":{},\"address\":\"{:08x}\",\"words\":{},\"changed\":{}}}",ranges.empty()?"":",",
+      NativeShadowJsonString(range.name),range.address,range.words,range.changed);
+  }
+  std::string excluded;
+  for(const auto& item:kNativeShadowExclusions) excluded+=(excluded.empty()?"":",")+NativeShadowJsonString(item);
+  const auto& motion=frame.inputs.motion;
+  const auto stem=std::filesystem::path(prefix_+"."+std::to_string(frame_)).filename().string();
+  const auto meta=std::format("{{\"format\":\"edf-shadow-frame\",\"version\":1,\"frame\":{},\"owner\":\"{:08x}\",\"renderer\":\"{:08x}\","
+    "\"views\":{},\"serial\":{},\"motion\":{{\"tick\":{},\"fraction\":{},\"steps\":{},\"unlocked\":{},\"interpolate\":{}}},\"tick_frame\":{},"
+    "\"native\":{{\"image\":{},\"draws\":{},\"count\":{}}},\"guest\":{{\"image\":{},\"draws\":{},\"count\":{},\"error\":{}}},"
+    "\"held\":{{\"tone\":{},\"lifetime\":{}}},\"restored_words\":{},\"restored\":[{}],\"excluded\":[{}]}}\n",
+    frame_,owner_,renderer,views,serial_before_,motion.tick,NativeShadowJsonFloat(motion.fraction),motion.steps,motion.unlocked,
+    motion.interpolate,frame.inputs.tick_frame,
+    NativeShadowJsonString(stem+".native.bmp"),NativeShadowJsonString(stem+".native.draws.jsonl"),native_draws.size(),
+    guest_bmp.empty()?std::string("null"):NativeShadowJsonString(stem+".guest.bmp"),NativeShadowJsonString(stem+".guest.draws.jsonl"),
+    guest_draws.size(),guest_error.empty()?std::string("null"):NativeShadowJsonString(guest_error),
+    held.tone_holds,held.lifetime_holds,restored_words,ranges,excluded);
+  try {
+    if(const auto directory=std::filesystem::path(prefix_).parent_path();!directory.empty())
+      std::filesystem::create_directories(directory);
+    Write(".native.bmp",{reinterpret_cast<const char*>(native_bmp.data()),native_bmp.size()});
+    if(!guest_bmp.empty()) Write(".guest.bmp",{reinterpret_cast<const char*>(guest_bmp.data()),guest_bmp.size()});
+    Write(".native.draws.jsonl",SerializeNativeDrawList("native",frame_,native_draws));
+    Write(".guest.draws.jsonl",SerializeNativeDrawList("guest",frame_,guest_draws));
+    Write(".shadow.json",meta);
+  } catch(const std::exception& error) { REXLOG_ERROR("Native shadow render frame={}: {}",frame_,error.what()); }
+  REXLOG_INFO("Native shadow render: frame={} prefix={} native_draws={} guest_draws={} tone_holds={} lifetime_holds={} restored_words={} guest_error={}",
+    frame_,prefix_,native_draws.size(),guest_draws.size(),held.tone_holds,held.lifetime_holds,restored_words,
+    guest_error.empty()?"none":guest_error);
+  if(failure) std::rethrow_exception(failure);
+}
+}
+}
+namespace {
 class NativeFullFrameHost final : public edf::native::NativeFrameHost {
  public:
   using GuestCall=std::function<void(uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr)>;
   NativeFullFrameHost(uint8_t* base,uint32_t owner,uint32_t context,GuestCall guest)
     :base_(base),reader_(base),owner_(owner),context_(context),guest_(std::move(guest)) {}
+  // edf_native_shadow_render: this frame's shadow (null on every other frame).
+  void SetShadow(edf::native::NativeShadowFrame* shadow) { shadow_=shadow; }
   // (a) One generation of publication, published cameras and world animations
   // under the producer lock, as the hook acquires them; the motion budget and
   // its publication were already acquired by the hook, which restores all of
@@ -7462,6 +7785,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     context.renderer=renderer;
     state.scene_full_frame=true;  // Counts as the scene's indexed draws for output frames and captures.
     context.owner=owner_; context.guest_context=context_;
+    ++views_begun_;
     const auto width=reader_.Word(reader_.Add(renderer,84)),height=reader_.Word(reader_.Add(renderer,88));
     const auto rect=edf::native::ReadGuestWords<4>(reader_,reader_.Add(scene,480));
     const auto extent=[](uint32_t word,uint32_t limit) {
@@ -7505,6 +7829,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     static_assert(count==std::size(edf::native::kNativeFramePassOrder));
     edf::native::HookTiming timing(index<count?edf::native::HookPhase(first+index):edf::native::HookPhase::FrameNative,index<count);
     const GpuPassSpan gpu(pass.name());
+    if(shadow_) shadow_->Label(std::string("native.")+pass.name());
     pass.Record(context);
   }
   // REMAINING GUEST CALLS, per view, in the helper's order: the overlay
@@ -7521,6 +7846,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     native_render_tick_frame=context.inputs.tick_frame;
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeOverlays);
     const GpuPassSpan gpu("view_overlays");
+    if(shadow_) shadow_->Label("native.overlays");
     RemainingGuestCall(0);
     const auto sentinel=[&] { return Word(2232); };
     for(auto node=reader_.Word(sentinel());node!=sentinel();) {
@@ -7619,6 +7945,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // output (clNoguchiCallback 820A4DD0, clSatoCallback 8216E630); each draw
   // is translated by the per-draw hooks (821FD8F8). The output is bound first.
   void Phases(edf::native::NativeFrameContext& context) override {
+    // edf_native_shadow_render: the guest route for this frame's state, after
+    // the native post and before the HUD, into the shadow's own targets.
+    if(shadow_) shadow_->Run(context,context_,views_begun_,guest_);
     // The HUD's two draw-counted advances (clGaugeRader 82176708, the window
     // cursor fade 8218ED68) follow this frame's tick gate; see their hooks.
     native_render_tick_frame=context.inputs.tick_frame;
@@ -7686,6 +8015,8 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   const edf::native::GuestReader reader_;
   uint32_t owner_,context_;
   GuestCall guest_;
+  edf::native::NativeShadowFrame* shadow_=nullptr;
+  uint32_t views_begun_=0;
 };
 }
 namespace {
@@ -7817,6 +8148,13 @@ REX_HOOK_RAW(sub_821A5080) {
         work.ctr.u64=function; work.lr=lr;
         rex::runtime::ResolveIndirectFunction(function)(work,base);
       });
+    // edf_native_shadow_render (native_shadow_render.h): null unless this
+    // frame takes a shadow render; the tap it arms is removed on every exit.
+    std::unique_ptr<edf::native::NativeShadowFrame> shadow;
+    if(REXCVAR_GET(edf_native_shadow_render)>0) {
+      shadow=edf::native::NativeShadowFrame::Begin(base,ctx.r3.u32);
+      host.SetShadow(shadow.get());
+    }
     {
       edf::native::HookTiming frame_timing(edf::native::HookPhase::FrameNative);
       GpuPassFrameBegin();
@@ -7908,8 +8246,9 @@ REX_EXTERN(__imp__sub_8217C4A0);
 REX_HOOK_RAW(sub_8217C4A0) {
   if(native_render_tick_frame) { __imp__sub_8217C4A0(ctx,base); return; }
   const edf::native::GuestReader reader(base);
-  edf::native::NativeRenderStepOncePerTick(reader,false,reader.Add(ctx.r3.u32,edf::native::kNativeEffectEtc02Lifetime),0xFFFFFFFFu,
+  const bool held=edf::native::NativeRenderStepOncePerTick(reader,false,reader.Add(ctx.r3.u32,edf::native::kNativeEffectEtc02Lifetime),0xFFFFFFFFu,
     std::array<uint32_t,0>{},[&] { __imp__sub_8217C4A0(ctx,base); });
+  if(held && native_shadow_guest) ++native_shadow_guest->lifetime_holds;
 }
 REX_EXTERN(__imp__sub_820B2510);
 REX_HOOK_RAW(sub_820B2510) {
@@ -8400,7 +8739,8 @@ REX_HOOK_RAW(sub_821A4DE8) {
   // without A/B guest frames makes only if a guest phase still draws a model.
   // With nothing registered there, neither the dirty-pose capture nor the pose
   // publication runs; a later registration is seeded at the next publication.
-  const bool full_frame_only=EDF_NATIVE_FLAG(full_frame) && REXCVAR_GET(edf_native_ab_alternate)<=0;
+  const bool full_frame_only=EDF_NATIVE_FLAG(full_frame) && REXCVAR_GET(edf_native_ab_alternate)<=0 &&
+    REXCVAR_GET(edf_native_shadow_render)<=0;
   const bool model_flag=EDF_NATIVE_FLAG(model_publication);
   const bool model_publication=model_flag && (!full_frame_only || ModelPublications().size());
   std::vector<uint32_t> dirty_poses;
@@ -14408,7 +14748,13 @@ REX_HOOK_RAW(sub_821FD8F8) {
         const float center_offset=REXCVAR_GET(edf_native_pixel_centers)
           ? edf::native::GuestPixelCenterOffset(centers_word) : 0.f;
         const bool shift_centers=initialized && center_offset!=0.f;
-        if(post_seam) {
+        // The shadow render's guest post (edf_native_shadow_render) holds the
+        // tone history: the target already holds this frame's value from the
+        // native post, so the 0.025-per-draw blend is not applied twice.
+        const bool shadow_tone_hold=native_shadow_guest && !output_draw && target.content_valid &&
+          pixel.shader().entry.name=="PS_Downsample_Tone";
+        if(shadow_tone_hold) ++native_shadow_guest->tone_holds;
+        else if(post_seam) {
           auto shifted=viewport;
           if(shift_centers) {
             shifted.viewport.TopLeftX+=center_offset;
@@ -14449,7 +14795,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
         }
         native_submitted=true;
         ++state.native_quad_draws;
-        target.content_valid=initialized;
+        if(!shadow_tone_hold) target.content_valid=initialized;
         if (output_draw && ++state.output_draws<=5)
           REXLOG_INFO("Native final bloom: draws={}, initialized={}, frame_complete=false",state.output_draws,initialized);
         const auto bloom_now=std::chrono::steady_clock::now();

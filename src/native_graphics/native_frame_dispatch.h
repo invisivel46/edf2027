@@ -32,8 +32,10 @@ void DispatchNativeFrameBuckets(const Reader& reader,uint32_t owner,uint32_t con
 // Native ownership of the outer frame phase order. The callback boundary is
 // explicit so remaining world, overlay and presentation phases can migrate
 // independently. Lists are reacquired after callbacks that may mutate them.
+// `phases` false stops after the finish stage (+12, +16), before the HUD
+// phase loop: the shadow render's guest side (native_shadow_render.h).
 template<class Reader,class Call>
-void DispatchNativeFrame(const Reader& reader,uint32_t owner,uint32_t context,Call call) {
+void DispatchNativeFrame(const Reader& reader,uint32_t owner,uint32_t context,Call call,bool phases=true) {
   const auto word=[&](uint32_t offset) { return reader.Word(reader.Add(owner,offset)); };
   const auto flag=[&](uint32_t offset) { return *reader.Bytes(reader.Add(owner,offset),1)!=0; };
   const auto virtual_call=[&](uint32_t object,uint32_t method,uint32_t arg,uint32_t index,uint32_t lr) {
@@ -81,6 +83,7 @@ void DispatchNativeFrame(const Reader& reader,uint32_t owner,uint32_t context,Ca
   }
   virtual_call(word(132),12,0,0,0x821A52E8);
   virtual_call(word(132),16,0,0,0x821A52FC);
+  if(!phases) return;
   for(auto phase=word(140);phase!=word(144);++phase) {
     auto node=reader.Word(word(2232));
     while(node!=word(2232)) {
