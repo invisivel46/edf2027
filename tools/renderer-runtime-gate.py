@@ -97,6 +97,22 @@ ENTRY = 'Native indexed input: draw=1,'
 FULL_FRAME_ENTRY = 'Native full frame static world: frames=1 '
 
 
+
+def read_log_lines(path):
+    """The log's lines, oldest first: the logger rotates game.log into
+    game.1.log (newest) .. game.N.log (oldest), so read those first."""
+    path = Path(path)
+    parts = []
+    stem, suffix = path.stem, path.suffix
+    index = 1
+    while (path.with_name(f'{stem}.{index}{suffix}')).exists():
+        parts.append(path.with_name(f'{stem}.{index}{suffix}'))
+        index += 1
+    lines = []
+    for part in reversed(parts):
+        lines += part.read_text(encoding='utf-8', errors='replace').splitlines()
+    return lines + path.read_text(encoding='utf-8', errors='replace').splitlines()
+
 def is_entry(line):
     return ENTRY in line or FULL_FRAME_ENTRY in line
 # Loading starts: the mission camera file lookup (M202 for mission 1) or the
@@ -206,7 +222,7 @@ def summarize(path, start, end, anchor='entry'):
     gameplay segment, so loading screens inside the window are excluded."""
     fps, samples, repeats, groups, errors, hooks = [], 0, 0, {}, 0, {}
     in_window = False
-    lines = Path(path).read_text(encoding='utf-8', errors='replace').splitlines()
+    lines = read_log_lines(path)
     entry = mission_entry(lines)
     marks = markers(lines)
     marks_s = {k: v if v is None or k == 'loading_screens' else round(v, 1) for k, v in marks.items()}
@@ -374,8 +390,8 @@ def main():
                     help='fail unless the candidate phase costs less than the baseline (repeatable)')
     args = ap.parse_args()
 
-    base_lines = Path(args.baseline).read_text(encoding='utf-8', errors='replace').splitlines()
-    cand_lines = Path(args.candidate).read_text(encoding='utf-8', errors='replace').splitlines()
+    base_lines = read_log_lines(args.baseline)
+    cand_lines = read_log_lines(args.candidate)
     mode, reason = choose_mode(args.phase, markers(base_lines), markers(cand_lines))
     print(f'renderer-runtime-gate: phase mode {mode} ({reason})', file=sys.stderr)
 
