@@ -29,6 +29,10 @@ One switch, `--edf_native_renderer=off|world|full|native`, replaces setting
 the individual cvars in section 6. Since `361f80b` the default is `native`:
 the full-frame renderer runs unless `--edf_native_renderer=off` restores the
 guest renderer. Before `361f80b` the default was `off`.
+The full frame has only run on the D3D12 scene backend: with
+`--edf_native_scene_backend` other than `d3d12`/`d3d12-warp` (the settings
+dialog offers `d3d11`), the `native` preset resolves to `off` and logs a
+warning once at startup; `world` and `full` are left as asked.
 
 - `world`: `edf_native_host`, `shader_bridge`, `seam_draws`,
   `material_activation`, `scene_queued`, `scene_preload`, the six
@@ -381,7 +385,13 @@ change-driven behaviour (`665e3e1`) has no cvar.
 - `tools/run-renderer-ab.ps1` runs baseline and candidate exes interleaved on
   the same script, gates each pair and writes
   `out/renderer-ab/<timestamp>-<Name>/summary.json`. Only one game may run at
-  a time; `-Seconds` (default 360) must cover loading plus 150 s.
+  a time; `-Seconds` (default 360) must cover loading plus 150 s. It passes
+  `--edf_native_renderer` explicitly: `-BaselineRenderer` defaults to `off`
+  (the guest renderer) and `-CandidateRenderer` to `native`, because since
+  `361f80b` an executable given no preset runs `native`. The launcher
+  `start-native-binding-validation.ps1` does the same with `-Renderer`
+  (default `off`); an `--edf_native_renderer=...` in `-ExtraArgs` replaces it,
+  and an executable older than the preset (`42823d7`) gets no option.
   `powershell -File tools/run-renderer-ab.ps1 -Baseline <o2-baseline> -Candidate win-amd64-release -Script tools/native-benchmark-input.txt -Repeat 2`
 - `tools/compare-renderer-images.py` compares one guest image with one native
   image (BMP/PNG): share of pixels over `--threshold`, max difference, PSNR,

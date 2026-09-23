@@ -169,10 +169,14 @@ class NativeIndexedMesh {
   // list (ExpandIndexedVertices), the same primitives from the same vertex
   // values in the same order. Being non-indexed from vertex 0 is what lets a
   // packet recorder append the next identical-state draw to this one; a
-  // generated index buffer only covers its own draw's vertices. For a vertex
-  // shader that does not read SV_VertexID (the pipeline's transient_batchable
-  // says so), and list topologies only.
-  void DrawTransientExpanded(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+  // generated index buffer only covers its own draw's vertices. List
+  // topologies only. `pipeline` is the one bound for this draw: the expansion
+  // is only equal for a pipeline whose transient_batchable is set (slot-0
+  // per-vertex layout, no SV_VertexID/SV_InstanceID/SV_PrimitiveID); any other,
+  // including one not yet decided, takes DrawTransient / DrawLinesTransient,
+  // the indexed draw. Returns whether it expanded.
+  bool DrawTransientExpanded(NativeBackendRecorder& recorder,const NativeBackendPipeline& pipeline,
+                             std::span<const uint8_t> guest_vertices,
                              uint32_t first_index,uint32_t index_count,NativeBackendTopology topology,
                              int32_t base_vertex=0) const;
   // Vertex stride and index width, for a caller building the draw itself.

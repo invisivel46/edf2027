@@ -153,7 +153,14 @@ class FrontEndRecorder final : public NativeBackendRecorder {
   void EndQuery(NativeBackendQuery&) override {}
   // Timestamps keep their place among the primitives: an entry with no
   // vertices whose state names the set, the slots and whether it resolves.
-  void WriteTimestamp(NativeBackendTimestamps& set, uint32_t slot) override { Mark(set, slot, 1, false); }
+  // Where each timestamp lands (this list's primitive count when written);
+  // with timestamp_entries off, no entry is added for it.
+  bool timestamp_entries = true;
+  std::vector<size_t> timestamps;
+  void WriteTimestamp(NativeBackendTimestamps& set, uint32_t slot) override {
+    timestamps.push_back(primitives.size());
+    if (timestamp_entries) Mark(set, slot, 1, false);
+  }
   void ResolveTimestamps(NativeBackendTimestamps& set, uint32_t first, uint32_t count) override {
     Mark(set, first, count, true);
   }
@@ -388,7 +395,63 @@ FrontEndRun RecordUiPhase(UiObjects& objects, bool batching, uint32_t minimum_dr
   run.statistics = recorder.statistics();
   return run;
 }
+struct FakeTimestamps final : NativeBackendTimestamps {
+  uint32_t capacity() const override { return 8; }
+};
+// A timestamp between two appendable draws: the second must not append to the
+// first, or its vertices are drawn before the timestamp, in the span before it.
+// The world-instancing fold already refuses to fold across one.
+void TestTransientBatchingMarkers() {
+  UiObjects objects;
+  FakeTimestamps set;
+  for (const uint32_t minimum : {1u, 1000u}) {
+    const auto label = " (worker minimum " + std::to_string(minimum) + ")";
+    FrontEndRecorder serial, first, second;
+    for (auto* list : {&serial, &first, &second}) list->timestamp_entries = false;
+    std::vector<Primitive> primitives;
+    std::vector<size_t> timestamps;
+    NativeParallelRecorder recorder({&serial, &first, &second}, [&](bool) {
+      for (auto* list : {&serial, &first, &second}) {
+        for (const auto at : list->timestamps) timestamps.push_back(primitives.size() + at);
+        primitives.insert(primitives.end(), list->primitives.begin(), list->primitives.end());
+        list->primitives.clear(); list->timestamps.clear(); list->draws = 0; list->Reset();
+      }
+    }, minimum);
+    NativeBackendRenderTarget* colors[] = {&objects.target};
+    const std::array<uint8_t, 16> projection{1, 2, 3, 4};
+    std::vector<uint8_t> scratch;
+    uint32_t tag = 0;
+    auto draw = [&] {
+      scratch = TaggedVertices(++tag, 6, 8);
+      recorder.SetTransientVerticesOwned(0, scratch, 8);
+      recorder.SetTopology(NativeBackendTopology::TriangleList);
+      recorder.Draw(6, 0);
+    };
+    recorder.Reset();
+    recorder.SetTransientBatching(true);
+    recorder.SetRenderTargets(colors, nullptr);
+    recorder.SetViewport({0, 0, 1280, 720, 0, 1});
+    recorder.SetPipeline(objects.brush);
+    recorder.SetConstants(NativeBackendStage::Vertex, 0, projection);
+    // A run of two, a timestamp, a run of three, a timestamp, one more: 2 + 1
+    // appends, and each timestamp after exactly the primitives drawn before it.
+    draw(); draw();
+    recorder.WriteTimestamp(set, 0);
+    draw(); draw(); draw();
+    recorder.WriteTimestamp(set, 1);
+    draw();
+    recorder.Flush(false);
+    const auto appends = recorder.statistics().transient_appends;
+    Check(appends == 3, "appends across timestamps: " + std::to_string(appends) + " (want 3)" + label);
+    Check(primitives.size() == 12, "timestamp run drew " + std::to_string(primitives.size()) + " primitives (want 12)" + label);
+    Check((timestamps == std::vector<size_t>{4, 10}),
+          "timestamps landed after " + (timestamps.size() == 2 ? std::to_string(timestamps[0]) + " and " +
+          std::to_string(timestamps[1]) : std::to_string(timestamps.size()) + " markers") +
+          " primitives (want 4 and 10)" + label);
+  }
+}
 void TestTransientBatching() {
+  TestTransientBatchingMarkers();
   UiObjects objects;
   // Every draw on the serial list, every flush on the workers, and a mix.
   for (const uint32_t minimum : {1u, 4u, 1000u}) {

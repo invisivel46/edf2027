@@ -1,7 +1,10 @@
 #include "native_graphics/native_full_frame.h"
 #include "native_graphics/native_ab_alternate.h"
 #include <array>
+#include <atomic>
 #include <bit>
+#include <functional>
+#include <thread>
 #include <map>
 #include <iostream>
 #include <string>
@@ -191,8 +194,16 @@ int main() {
   {
     struct Memory {
       mutable std::map<uint32_t,uint32_t> words;
+      // Runs before each compare-exchange: a simulation write landing between
+      // the draw and the put-back.
+      mutable std::function<void()> before_exchange;
       uint32_t Word(uint32_t at) const { return words[at]; }
       void StoreWord(uint32_t at,uint32_t value) const { words[at]=value; }
+      bool CompareExchangeWord(uint32_t at,uint32_t expected,uint32_t desired) const {
+        if(before_exchange) std::exchange(before_exchange,nullptr)();
+        if(words[at]!=expected) return false;
+        words[at]=desired; return true;
+      }
     };
     constexpr uint32_t gauge=0x40001000,cursor=0x40002000;
     constexpr float decay=-0.99f;
@@ -237,6 +248,78 @@ int main() {
     Memory idle; idle.StoreWord(gauge+kNativeRadarShakeOffset,123);
     check(!NativeRenderStepOncePerTick(idle,false,gauge+kNativeRadarShakeFrames,0xFFFFFFFFu,
       std::array{uint32_t(gauge+kNativeRadarShakeOffset)},[&] { radar(idle); }) && idle.Word(gauge+kNativeRadarShakeOffset)==123,"idle shake");
+    // A simulation write after the draw returned and before the put-back (the
+    // arming 82175FFC on the tick thread): the counter's compare-exchange
+    // sees it and leaves both fields as the writer stored them.
+    Memory armed; armed.StoreWord(gauge+kNativeRadarShakeFrames,5);
+    armed.StoreWord(gauge+kNativeRadarShakeOffset,std::bit_cast<uint32_t>(4.f));
+    armed.before_exchange=[&] { arm(armed); };
+    check(!NativeRenderStepOncePerTick(armed,false,gauge+kNativeRadarShakeFrames,0xFFFFFFFFu,
+      std::array{uint32_t(gauge+kNativeRadarShakeOffset)},[&] { radar(armed); }) &&
+      armed.Word(gauge+kNativeRadarShakeFrames)==30 &&
+      armed.Word(gauge+kNativeRadarShakeOffset)==std::bit_cast<uint32_t>(20.f),"a write before the put-back is kept");
+    // The same for the cursor fade reset (8218F138) after the draw's step.
+    Memory reset; reset.StoreWord(cursor+kNativeCursorFade,7);
+    reset.before_exchange=[&] { reset.StoreWord(cursor+kNativeCursorFade,0); };
+    check(!NativeRenderStepOncePerTick(reset,false,cursor+kNativeCursorFade,1u,std::array<uint32_t,0>{},
+      [&] { cursor_fade(reset); }) && reset.Word(cursor+kNativeCursorFade)==0,"a reset before the put-back is kept");
+    // A write to an `also` word after the counter was put back: the counter
+    // is restored, the other word keeps the writer's value.
+    Memory offset; offset.StoreWord(gauge+kNativeRadarShakeFrames,5);
+    offset.StoreWord(gauge+kNativeRadarShakeOffset,std::bit_cast<uint32_t>(4.f));
+    bool first_exchange=true;
+    std::function<void()> second=[&] { offset.StoreWord(gauge+kNativeRadarShakeOffset,std::bit_cast<uint32_t>(9.f)); };
+    offset.before_exchange=[&] { first_exchange=false; offset.before_exchange=second; };
+    check(NativeRenderStepOncePerTick(offset,false,gauge+kNativeRadarShakeFrames,0xFFFFFFFFu,
+      std::array{uint32_t(gauge+kNativeRadarShakeOffset)},[&] { radar(offset); }) && !first_exchange &&
+      offset.Word(gauge+kNativeRadarShakeFrames)==5 &&
+      offset.Word(gauge+kNativeRadarShakeOffset)==std::bit_cast<uint32_t>(9.f),"a write between the put-backs is kept");
+    // Without a writer the put-back is exact.
+    Memory quiet; quiet.StoreWord(gauge+kNativeRadarShakeFrames,5);
+    quiet.StoreWord(gauge+kNativeRadarShakeOffset,std::bit_cast<uint32_t>(4.f));
+    check(NativeRenderStepOncePerTick(quiet,false,gauge+kNativeRadarShakeFrames,0xFFFFFFFFu,
+      std::array{uint32_t(gauge+kNativeRadarShakeOffset)},[&] { radar(quiet); }) &&
+      quiet.Word(gauge+kNativeRadarShakeFrames)==5 &&
+      quiet.Word(gauge+kNativeRadarShakeOffset)==std::bit_cast<uint32_t>(4.f),"a held render puts both back");
+    // Real threads: held renders (each an atomic step and its put-back) race a
+    // simulation thread that stores fresh values. Held renders are net zero,
+    // so the counter must end at the simulation's last write; a plain-store
+    // put-back loses it whenever the write falls between its check and store.
+    {
+      struct Atomic {
+        mutable std::array<std::atomic<uint32_t>,2> words{};
+        uint32_t Word(uint32_t at) const { return words[at].load(); }
+        bool CompareExchangeWord(uint32_t at,uint32_t expected,uint32_t desired) const {
+          return words[at].compare_exchange_strong(expected,desired);
+        }
+      } shared;
+      std::atomic<bool> stop=false,pause=false,paused=false;
+      std::thread renders([&] {
+        while(!stop.load()) {
+          if(pause.load()) { paused.store(true); while(pause.load() && !stop.load()) std::this_thread::yield(); paused.store(false); continue; }
+          NativeRenderStepOncePerTick(shared,false,0,1u,std::array{uint32_t(1)},[&] {
+            shared.words[0].fetch_add(1); shared.words[1].fetch_add(3);
+          });
+        }
+      });
+      uint32_t lost=0;
+      for(uint32_t write=1;write<=5000;++write) {
+        const uint32_t value=0x10000000u+write*16;
+        shared.words[1].store(value); shared.words[0].store(value);
+        for(int spin=0;spin<(write&15);++spin) std::this_thread::yield();
+        // Quiesce the renders, then read: net zero since the write, but for a
+        // draw that stepped the new value itself before its put-back failed.
+        pause.store(true);
+        while(!paused.load()) std::this_thread::yield();
+        const auto counter=shared.words[0].load();
+        lost+=counter!=value && counter!=value+1;
+        pause.store(false);
+        while(paused.load()) std::this_thread::yield();
+      }
+      stop=true; renders.join();
+      if(lost) std::cerr<<"concurrent simulation writes undone: "<<lost<<"\n";
+      check(lost==0,"a concurrent simulation write was undone");
+    }
     // Locked (tick frame): the call alone, nothing put back.
     Memory plain; plain.StoreWord(cursor+kNativeCursorFade,3);
     check(!NativeRenderStepOncePerTick(plain,true,cursor+kNativeCursorFade,1u,std::array<uint32_t,0>{},[&] { cursor_fade(plain); }) &&
