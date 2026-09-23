@@ -4,7 +4,7 @@
 
 namespace edf::native {
 NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScenePublication& publication,
-    const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRoutes& routes) {
+    const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRouteRead& route) {
   NativeFullFrameStaticSelection result;
   auto& stats=result.stats;
   const auto* sources=publication.sources.get();
@@ -39,17 +39,20 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
       for(const auto& member:members->members) {
         ++stats.members;
         if(!seen.insert(member.owner).second) { ++stats.duplicates; continue; }
-        const auto* route=routes.Find(member.owner);
-        if(!route) { ++stats.unrouted; continue; }
-        if(ClassifyNativeStaticWalk(route->hidden,route->mode,route->direct)!=NativeStaticWalkRoute::Direct) {
-          ++stats.not_direct; continue;
-        }
         const auto candidate=sources?sources->FindCandidateView(member.owner):NativeSceneSources::CandidateView{};
         if(!candidate.visibility || !candidate.visibility->lod_count) { ++stats.unpublished; continue; }
         const auto& object=*candidate.visibility;
         const auto selection=SelectNativeVisibility(view,object,NativeVisibilityCenter(view,object));
         if(!selection.in_range) { ++stats.culled_distance; continue; }
         if(!selection.visible()) { ++stats.culled_frustum; continue; }
+        // The route words, live, for culling's survivors only (every filter
+        // here only drops objects, so the order changes no selection).
+        ++stats.route_reads;
+        const auto words=route(member.owner);
+        if(!words) { ++stats.unrouted; continue; }
+        if(ClassifyNativeStaticWalk(words->hidden,words->mode,words->direct)!=NativeStaticWalkRoute::Direct) {
+          ++stats.not_direct; continue;
+        }
         ++stats.visible;
         const auto parts=candidate.Lod(selection.lod);
         if(!parts) { ++stats.missing_lod; continue; }

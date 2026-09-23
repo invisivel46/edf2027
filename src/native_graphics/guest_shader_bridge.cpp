@@ -935,14 +935,6 @@ struct Bridge {
   NativeSceneSources scene_sources;
   NativeSceneMembership scene_membership;
   NativeStaticWalkPlans static_walk_plans;
-  // edf_native_full_frame: sub_821C0C00's route words per world as of its last
-  // step (PublishStaticWalkPlans), and the published union the frame acquires.
-  // The table has its own lock (full_frame_route_mutex, taken alone or inside
-  // this mutex, never around it), so the step refreshes it off the bridge lock.
-  std::mutex full_frame_route_mutex;
-  NativeFullFrameRouteTable full_frame_route_table;
-  std::shared_ptr<const NativeFullFrameStaticRoutes> full_frame_routes_published;  // Under full_frame_route_mutex.
-  std::shared_ptr<const NativeFullFrameStaticRoutes> full_frame_routes=std::make_shared<const NativeFullFrameStaticRoutes>();
   NativeStaticWalkAudit static_walk_audit;
   uint64_t static_walk_lists=0,static_walk_misses=0,static_walk_stale=0,static_walk_members=0;
   uint64_t static_walk_direct_reuses=0,static_walk_source_reuses=0,static_walk_abandoned=0,static_walk_bucket_native=0;
@@ -4138,25 +4130,17 @@ void RetireGroupOrder(uint32_t owner) {
   std::lock_guard lock(state.mutex);
   state.scene_adapter.RetireGroupOrder(owner);
 }
-// The full frame needs the plans for its route words even without the walk.
+// Only the 820B4038 static walk and its audit consume plans. The full frame
+// reads its route words live at selection (NativeFullFrameLiveRoutes), for the
+// objects culling keeps, so it publishes nothing per step for them.
 bool NativeStaticWalkPlansEnabled() {
-  return REXCVAR_GET(edf_native_scene_static_walk) || REXCVAR_GET(edf_native_scene_static_walk_audit) ||
-    EDF_NATIVE_FLAG(full_frame);
-}
-// Drops one world's route words and republishes the union; the caller holds
-// the bridge lock (the route lock is taken inside it, never around it).
-void RetireFullFrameRoutesLocked(Bridge& state,uint32_t owner) {
-  std::lock_guard routes(state.full_frame_route_mutex);
-  if(!state.full_frame_route_table.Retire(owner)) return;
-  state.full_frame_routes_published=std::make_shared<const NativeFullFrameStaticRoutes>(state.full_frame_route_table.routes());
-  state.full_frame_routes=state.full_frame_routes_published;
+  return REXCVAR_GET(edf_native_scene_static_walk) || REXCVAR_GET(edf_native_scene_static_walk_audit);
 }
 void RetireStaticWalkPlans(uint32_t owner) {
   if(!NativeStaticWalkPlansEnabled()) return;
   auto& state=State();
   std::lock_guard lock(state.mutex);
   state.static_walk_plans.Retire(owner);
-  RetireFullFrameRoutesLocked(state,owner);
 }
 // After a guest link/unlink: each anchor is a list header or a member node,
 // so the list it belongs to (by the plan's node index) loses its plan. The
@@ -4171,95 +4155,36 @@ void TouchStaticWalkPlans(std::initializer_list<uint32_t> anchors) {
   std::lock_guard lock(state.mutex);
   TouchStaticWalkPlansLocked(state,anchors);
 }
-// 820B4250 post-hook: the world's plan, published after its tree.
-//
-// Plans are published under the bridge lock (they read the scene sources);
-// with plans reused that is two header words per list through a page window.
-// The full frame's route words are then refreshed off the bridge lock, under
-// the route table's own lock: one header read per member compared with its
-// slot (the words have unhooked writers, so each step re-reads them), and the
-// bridge lock is taken again only to swap in a changed union, which shares
-// every unchanged chunk.
-//
-// Full frame without the static walk (and without its audit): the plans'
-// source candidates are consumed only by the 820B4038 walk, which the full
-// frame replaces, so plans are built without them (constant revision, empty
-// find): no FindCandidate per member and no refresh of every member when the
-// candidate revision moves.
+// 820B4250 post-hook: the world's plan, published after its tree, under the
+// bridge lock (plans read the scene sources); with plans reused that is two
+// header words per list through a page window.
 void PublishStaticWalkPlans(uint8_t* base,uint32_t owner) {
   if(!NativeStaticWalkPlansEnabled()) return;
   HookTiming timing(HookPhase::SimStaticWalk);
   auto& state=State();
   const auto epoch=TreePublications().Epoch();
-  const bool candidates=REXCVAR_GET(edf_native_scene_static_walk) || REXCVAR_GET(edf_native_scene_static_walk_audit);
-  const bool full_frame=EDF_NATIVE_FLAG(full_frame);
   const GuestReader backing(base);
   const NativeSceneCpuWindow reader(backing);
-  const auto deferred=[](const std::exception& error) {
-    static std::set<std::string> reported;
-    static std::mutex reported_mutex;
-    std::lock_guard lock(reported_mutex);
-    if(reported.insert(error.what()).second) REXLOG_INFO("Native static walk plan deferred: {}",error.what());
-  };
-  NativeFullFrameRouteTable::Plans plans;
-  {
-    HookTiming wait(HookPhase::SimLockWait);
-    std::lock_guard lock(state.mutex);
-    wait.Finish();
-    try {
-      state.static_walk_plans.SetAnchorFilter(&SceneAnchors());
-      const auto& sources=state.scene_sources;
-      if(candidates) state.static_walk_plans.Publish(reader,owner,epoch,sources.CandidateRevision(),
-        [&](uint32_t object) { return sources.FindCandidate(object); });
-      else state.static_walk_plans.Publish(reader,owner,epoch,0,[](uint32_t) { return NativeSceneSources::Candidate{}; });
-      const auto& stats=state.static_walk_plans.stats();
-      if(stats.publications<=4 || stats.publications%1000==0)
-        REXLOG_INFO("Native static walk plan: owner={:#x} publications={} collections={} builds={} reuses={} refreshes={} touches={} lists={} nodes={} candidates={}",
-          owner,stats.publications,stats.collections,stats.builds,stats.reuses,stats.refreshes,stats.touches,
-          state.static_walk_plans.lists(),state.static_walk_plans.nodes(),candidates);
-      if(full_frame) plans=state.static_walk_plans.AcquirePlans(owner);
-    } catch(const std::exception& error) {
-      state.static_walk_plans.Retire(owner);
-      RetireFullFrameRoutesLocked(state,owner);
-      deferred(error);
-      return;
-    }
-  }
-  if(!full_frame) return;
-  // sub_821C0C00's route words as of this step, for the full frame's static
-  // world: membership from the plans, the header words read live because a
-  // reused plan's copies are advisory.
-  std::shared_ptr<const NativeFullFrameStaticRoutes> published;
-  bool failed=false;
-  {
-    std::lock_guard routes(state.full_frame_route_mutex);
-    auto& table=state.full_frame_route_table;
-    try {
-      if(!table.Current(owner,plans)) table.Rebuild(owner,std::move(plans));
-      table.Refresh(owner,[&](const NativeStaticWalkMember& member) {
-        const auto* header=reader.Bytes(member.owner,68);  // +0 vtable, +52 mode, +64 hidden.
-        const auto vtable=GuestBlockWord(header);
-        return NativeFullFrameStaticRoute{PlannedNativeStaticDirect(member,vtable,
-            [&](uint32_t table_address) { return reader.Word(reader.Add(table_address,16)); }),
-          GuestBlockWord(header+52),uint16_t(GuestBlockWord(header+64)>>16)};
-      });
-    } catch(const std::exception& error) { table.Retire(owner); failed=true; deferred(error); }
-    // The table's map shares its spine with the last publication unless a route changed.
-    if(!state.full_frame_routes_published || !table.routes().Shares(*state.full_frame_routes_published))
-      state.full_frame_routes_published=published=std::make_shared<const NativeFullFrameStaticRoutes>(table.routes());
-    const auto& stats=table.stats();
-    if(stats.refreshes<=4 || stats.refreshes%1000==0)
-      REXLOG_INFO("Native full frame routes: owner={:#x} refreshes={} rebuilds={} reads={} changes={} retired={} routes={}",
-        owner,stats.refreshes,stats.rebuilds,stats.reads,stats.changes,stats.retired,table.routes().size());
-  }
-  if(!failed && !published) return;
   HookTiming wait(HookPhase::SimLockWait);
   std::lock_guard lock(state.mutex);
   wait.Finish();
-  if(failed) state.static_walk_plans.Retire(owner);
-  // Newest first: a retire under the bridge lock may have published since.
-  std::lock_guard routes(state.full_frame_route_mutex);
-  state.full_frame_routes=state.full_frame_routes_published;
+  try {
+    state.static_walk_plans.SetAnchorFilter(&SceneAnchors());
+    const auto& sources=state.scene_sources;
+    state.static_walk_plans.Publish(reader,owner,epoch,sources.CandidateRevision(),
+      [&](uint32_t object) { return sources.FindCandidate(object); });
+    const auto& stats=state.static_walk_plans.stats();
+    if(stats.publications<=4 || stats.publications%1000==0)
+      REXLOG_INFO("Native static walk plan: owner={:#x} publications={} collections={} builds={} reuses={} refreshes={} touches={} lists={} nodes={}",
+        owner,stats.publications,stats.collections,stats.builds,stats.reuses,stats.refreshes,stats.touches,
+        state.static_walk_plans.lists(),state.static_walk_plans.nodes());
+  } catch(const std::exception& error) {
+    state.static_walk_plans.Retire(owner);
+    static std::set<std::string> reported;
+    static std::mutex reported_mutex;
+    std::lock_guard reported_lock(reported_mutex);
+    if(reported.insert(error.what()).second) REXLOG_INFO("Native static walk plan deferred: {}",error.what());
+  }
 }
 }
 #define EDF_TREE_MUTATION(address) \
@@ -4506,7 +4431,6 @@ REX_HOOK_RAW(sub_820B5FA8) {
     state.scene_adapter.RetireWorldAnimation(ctx.r3.u32);
     state.scene_adapter.RetireGroupOrder(ctx.r3.u32);
     state.static_walk_plans.Retire(ctx.r3.u32);
-    edf::native::RetireFullFrameRoutesLocked(state,ctx.r3.u32);
   }
   __imp__sub_820B5FA8(ctx,base);
 }
@@ -6253,11 +6177,14 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
   uint64_t frames_=0,declined_=0,ids_=0;
 };
 // The full frame's StaticWorld pass: SelectNativeFullFrameStaticWorld +
-// NativeFullFrameStaticWorld::Build over the frame's publication, the step's
-// route words and the view's camera, recorded through the scene renderer on
-// the open scene target. No guest calls; the only guest reads are the view's
-// visibility camera (scene+96 matrix, +288 frustum, +400 depth scale), which
-// the publication does not carry yet.
+// NativeFullFrameStaticWorld::Build over the frame's publication and the view's
+// camera, recorded through the scene renderer on the open scene target. No
+// guest calls; the only guest reads are the view's visibility camera (scene+96
+// matrix, +288 frustum, +400 depth scale), which the publication does not
+// carry yet, and the route words (+0 vtable and its +16 slot, +52 mode, +64
+// hidden) of the objects culling keeps, read live through one page window as
+// 820B4038 reads them at render time (the same race with the simulation's
+// unhooked writers the guest walk has).
 class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass {
  public:
   explicit NativeFullFrameStaticWorldPass(uint8_t* base):reader_(base) {}
@@ -6279,7 +6206,8 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     auto& state=State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
-    const auto routes=state.full_frame_routes;
+    const NativeSceneCpuWindow window(reader_);
+    const NativeFullFrameLiveRoutes routes(window);
     const auto targets=ActiveTargetsLocked(state);
     if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) { ++skipped_; return; }
     const auto& v=context.viewport;
@@ -6292,7 +6220,7 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     pass.viewport={d.TopLeftX,d.TopLeftY,d.Width,d.Height,d.MinDepth,d.MaxDepth};
     pass.scissor={s.left,s.top,s.right,s.bottom};
     pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
-    const auto frame=world_.Build(*publication,camera,*routes,pass,NativeFullFrameStaticResolver(pass,
+    const auto frame=world_.Build(*publication,camera,std::cref(routes),pass,NativeFullFrameStaticResolver(pass,
       [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); }));
     uint64_t drawn=0;
     if(!frame.draws.empty()) {
@@ -6310,8 +6238,8 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     const auto& selected=frame.selection.stats;
     const auto& built=frame.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame static world: frames={} skipped={} routes={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={}",
-        frames_,skipped_,routes->size(),selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,
+      REXLOG_INFO("Native full frame static world: frames={} skipped={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={}",
+        frames_,skipped_,routes.reads,routes.slot_reads,routes.failures,selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,
         selected.unrouted,selected.not_direct,selected.unpublished,selected.undrawable,built.groups,built.draws,built.instances,drawn,
         built.resolves,built.cache_hits,built.declined,built.missing_group,built.missing_material,built.missing_geometry,built.world_declines);
   }

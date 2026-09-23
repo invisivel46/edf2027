@@ -1131,7 +1131,15 @@ void FullFrameStaticWorld() {
   constexpr uint32_t A=0x6000,B=0x6100,C=0x6200,D=0x6300,E=0x6400,F=0x6500,G=0x6600,H=0x6700,I=0x6800,J=0x6900;
   constexpr uint32_t G1=0x8100,G2=0x8200,G3=0x8300;
   NativeSceneSources sources;
-  NativeFullFrameStaticRoutes routes;
+  // The live route words the frame reads, per owner (J has none: unreadable).
+  std::map<uint32_t,NativeFullFrameStaticRoute> live;
+  std::vector<uint32_t> route_reads;
+  const NativeFullFrameStaticRouteRead routes=[&](uint32_t owner)->std::optional<NativeFullFrameStaticRoute> {
+    route_reads.push_back(owner);
+    const auto found=live.find(owner);
+    if(found==live.end()) return std::nullopt;
+    return found->second;
+  };
   std::map<uint32_t,NativeSceneVisibility> records;
   // Each owner's world: identity with its own x translation (row-major registers).
   const auto translation=[](uint32_t owner) { return float(owner>>8); };
@@ -1149,7 +1157,7 @@ void FullFrameStaticWorld() {
     for(size_t i=0;i<16;++i) for(size_t byte=0;byte<4;++byte)
       registers[i*4+byte]=uint8_t(std::bit_cast<uint32_t>(matrix[i])>>(24-byte*8));
     sources.PublishWorld(owner,registers);
-    if(route) routes.Set(owner,*route);
+    if(route) live[owner]=*route;
   };
   using P=NativeSceneSources::Part;
   object(A,{0,0,50},1000,2,{P{0x7000,0,0,0,G1},P{0x7100,1,0,0,G1}});
@@ -1177,18 +1185,29 @@ void FullFrameStaticWorld() {
   camera.visibility.matrix=kNativeSceneIdentity; camera.visibility.depth_scale=-1;
   auto& f=camera.visibility.frustum;
   f[8]=1; f[10]=-1; f[12]=-1; f[14]=-1; f[17]=1; f[18]=-1; f[21]=-1; f[22]=-1; f[24]=1; f[25]=1000;
-  // No guest reads: the arena is gone before the frame is selected, and a
-  // read outside the published image throws instead of reaching memory.
+  // No guest reads but the route words: the arena is gone before the frame is
+  // selected, and a read outside the published image throws instead of
+  // reaching memory.
   std::fill(memory.begin(),memory.end(),uint8_t(0xcd));
   const NativeSceneTreeImageReader image_reader(*image);
   Reject([&] { image_reader.Word(root1+120); });
   Reject([&] { image_reader.Word(world+100); });
+  using Object=NativeFullFrameStaticSelection::Object;
   const auto selection=SelectNativeFullFrameStaticWorld(publication,camera,routes);
   const auto& s=selection.stats;
   Require(s.worlds==1 && s.nodes_classified==5 && s.lists==3 && !s.missing_lists && s.members==10 && s.duplicates==1 &&
     s.unrouted==1 && s.not_direct==2 && s.culled_distance==1 && s.culled_frustum==1 && s.visible==4 && s.selected==4 &&
-    s.parts==5 && s.unordered_groups==1 && s.unordered_parts==1 && s.tree_reads>0,"full-frame traversal or culling statistics");
-  using Object=NativeFullFrameStaticSelection::Object;
+    s.parts==5 && s.unordered_groups==1 && s.unordered_parts==1 && s.tree_reads>0 && s.route_reads==7,
+    "full-frame traversal or culling statistics");
+  // Route words are read once per object culling keeps, in walk order: never
+  // for C (distance), D (frustum), H (culled leaf) or the duplicate A.
+  Require(route_reads==std::vector<uint32_t>{A,B,E,F,G,I,J},"full-frame route words read for culled or duplicate objects");
+  // Live semantics: a mode written after the step (no publication) routes E
+  // natively on the next frame, and a hidden write drops A.
+  live[E].mode=0; live[A].hidden=1;
+  const auto rerouted=SelectNativeFullFrameStaticWorld(publication,camera,routes);
+  Require(rerouted.objects==std::vector<Object>{{B,1},{E,0},{G,0},{I,0}},"full-frame selection used stale route words");
+  live[E].mode=1; live[A].hidden=0;
   Require(selection.objects==std::vector<Object>{{A,0},{B,1},{G,0},{I,0}},"full-frame traversal selected other objects");
   Require(selection.owners.size()==1 && selection.owners[0].owner==world && selection.owners[0].groups.size()==2 &&
     selection.owners[0].groups[0].group==G2 && selection.owners[0].groups[0].instances==std::vector<uint32_t>{0x7400} &&
@@ -1272,48 +1291,32 @@ void AddressFilter() {
   for(const auto address:{0u,1u,0x82000000u,0xFFFFFFFFu})
     for(const auto bit:NativeAddressFilter::Bits(address)) Require(bit<NativeAddressFilter::kBits,"address filter bit out of range");
 }
-// NativeFullFrameRouteTable: slots follow the plans' membership, a refresh
-// touches the published map only for changed routes, unchanged steps share
-// the published spine, and retirement drops the world's owners.
-void FullFrameRouteTable() {
-  const auto plan=[](uint32_t list,uint64_t membership,std::vector<uint32_t> owners) {
-    auto result=std::make_shared<NativeStaticWalkList>();
-    result->list=list; result->world=0x1000; result->membership=membership;
-    for(const auto owner:owners) {
-      NativeStaticWalkMember member; member.node=owner+0x10; member.owner=owner; member.vtable=0x7000; member.direct=true;
-      result->members.push_back(member);
-    }
-    return std::shared_ptr<const NativeStaticWalkList>(std::move(result));
+// NativeFullFrameLiveRoutes: sub_821C0C00's words straight from the header
+// (+0 vtable, +52 mode, +64 hidden halfword), the vtable+16 slot read only
+// for a render-slot object and once per vtable, and an unreadable header
+// unrouted rather than thrown.
+void FullFrameLiveRoutes() {
+  std::vector<uint8_t> memory(0x2000);
+  const GeometryRetryReader r{memory};
+  constexpr uint32_t direct_table=0x100,virtual_table=0x200,A=0x1000,B=0x1100,C=0x1200,D=0x1300;
+  r.StoreWord(direct_table+16,kNativeStaticDirectRender); r.StoreWord(virtual_table+16,0x82001234);
+  const auto header=[&](uint32_t owner,uint32_t vtable,uint32_t mode,uint16_t hidden) {
+    r.StoreWord(owner,vtable); r.StoreWord(owner+52,mode); r.StoreWord(owner+64,uint32_t(hidden)<<16|0xBEEF);
   };
-  std::map<uint32_t,NativeFullFrameStaticRoute> live{{0xA000,{true,0,0}},{0xB000,{true,1,0}},{0xC000,{false,0,0}}};
-  size_t reads=0;
-  const auto read=[&](const NativeStaticWalkMember& member) { ++reads; return live.at(member.owner); };
-  NativeFullFrameRouteTable table;
-  NativeFullFrameRouteTable::Plans plans{plan(0x100,1,{0xA000,0xB000}),plan(0x200,2,{0xA000,0xC000})};
-  Require(!table.Current(0x1000,plans),"an unseen world is current");
-  table.Rebuild(0x1000,plans);
-  Require(table.Current(0x1000,plans) && table.Refresh(0x1000,read)==3 && reads==4 && table.routes().size()==3 &&
-    table.routes().Find(0xB000)->mode==1 && !table.routes().Find(0xC000)->direct,"first refresh did not publish every owner once");
-  const auto published=std::make_shared<const NativeFullFrameStaticRoutes>(table.routes());
-  Require(!table.Refresh(0x1000,read) && table.routes().Shares(*published),"an unchanged step changed the published routes");
-  // Unhooked writers: mode and hidden change without a membership event.
-  live[0xB000].mode=0; live[0xC000].hidden=1;
-  Require(table.Refresh(0x1000,read)==2 && !table.routes().Shares(*published) && table.routes().Find(0xB000)->mode==0 &&
-    table.routes().Find(0xC000)->hidden==1 && published->Find(0xB000)->mode==1,"a route change was missed or mutated a publication");
-  // A source refresh (new plan objects, same membership) keeps the layout.
-  NativeFullFrameRouteTable::Plans refreshed{plan(0x100,1,{0xA000,0xB000}),plan(0x200,2,{0xA000,0xC000})};
-  Require(table.Current(0x1000,refreshed),"a source refresh relaid the route slots");
-  // A Touch-rebuilt list: C leaves, D joins; known routes are kept.
-  live[0xD000]={true,0,0};
-  NativeFullFrameRouteTable::Plans moved{plan(0x100,1,{0xA000,0xB000}),plan(0x200,3,{0xA000,0xD000})};
-  Require(!table.Current(0x1000,moved),"a membership stamp move kept the old slots");
-  table.Rebuild(0x1000,moved);
-  Require(!table.routes().Find(0xC000) && table.Refresh(0x1000,read)==1 && table.routes().Find(0xD000) &&
-    table.routes().size()==3,"rebuild kept an unlisted owner or refreshed known routes");
-  Require(table.Retire(0x1000) && table.routes().empty() && !table.Retire(0x1000) && table.stats().retired==1,
-    "retirement kept the world's routes");
-  Reject([&] { table.Rebuild(0x1000,plans); table.Refresh(0x1000,[](const NativeStaticWalkMember&)->NativeFullFrameStaticRoute {
-    throw std::runtime_error("unreadable header"); }); });
+  header(A,direct_table,0,0); header(B,virtual_table,0,0); header(C,direct_table,2,0); header(D,direct_table,0,3);
+  const NativeFullFrameLiveRoutes routes(r);
+  Require(routes(A)==NativeFullFrameStaticRoute{true,0,0} && routes(B)==NativeFullFrameStaticRoute{false,0,0} &&
+    routes(C)==NativeFullFrameStaticRoute{false,2,0} && routes(D)==NativeFullFrameStaticRoute{false,0,3},
+    "live route words misread");
+  Require(routes.reads==4 && routes.slot_reads==2,"vtable slot read for a bucket or hidden object");
+  // Live: a changed word is seen on the next read; the vtable slot is cached.
+  r.StoreWord(C+52,0); r.StoreWord(direct_table+16,0);
+  Require(routes(C)==NativeFullFrameStaticRoute{true,0,0} && routes.slot_reads==2,"live mode change missed or vtable slot re-read");
+  // Past the arena (the header straddles its end): unrouted, counted.
+  Require(!routes(0x2000-40) && !routes(0x3000) && routes.failures==2 && routes.reads==5,"unreadable header was not unrouted");
+  // Through the type-erased reader SelectNativeFullFrameStaticWorld takes.
+  const NativeFullFrameStaticRouteRead erased=std::cref(routes);
+  Require(erased(B)==NativeFullFrameStaticRoute{false,0,0} && routes.reads==6,"erased route reader");
 }
 void GroupOrder() {
   std::vector<uint8_t> memory(0x1000);
@@ -2901,7 +2904,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
-    AddressFilter(); FullFrameRouteTable();
+    AddressFilter(); FullFrameLiveRoutes();
     GroupOrder(); FullFrameStaticWorld(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };

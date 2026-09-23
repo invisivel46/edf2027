@@ -6,6 +6,7 @@
 #include "native_static_world_cache.h"
 #include "native_queued_scene.h"
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -24,10 +25,10 @@ namespace edf::native {
 //   native_scene_queues       -> a frame-local selection (group -> instances)
 //   821C3BB8 group walk       -> the published group_order
 //   821D96D8 group draw       -> one resolved material per group, instanced draws
-// There are no guest reads, guest queues, device mirrors, eligibility against
-// the device or handoffs. Every input is a published immutable generation:
-// NativeScenePublication (sources, membership, trees, group order, geometry,
-// material programs) plus the route words the step publishes per owner.
+// There are no guest queues, device mirrors, eligibility against the device or
+// handoffs. Every input is a published immutable generation - NativeScenePublication
+// (sources, membership, trees, group order, geometry, material programs) - but
+// the route words, read live for the objects culling keeps (NativeFullFrameLiveRoutes).
 
 // The camera one full frame renders the static world with.
 //  visibility: camera+96 view matrix, camera+288 frustum and context+8 depth
@@ -40,97 +41,45 @@ struct NativeFullFrameStaticCamera {
   NativeScenePassCamera pass;
   std::optional<NativeScenePassAnimation> animation;
 };
-// sub_821C0C00's route words for one owner, as of the simulation step:
-// vtable+16==820B2670 (direct), +52 mode and +64 hidden. These are not in the
-// scene publication yet; the step's static walk plans hold them (the full
-// frame must publish them with the step: CollectNativeFullFrameStaticRoutes).
+// sub_821C0C00's route words for one owner: vtable+16==820B2670 (direct), +52
+// mode and +64 hidden. They have unhooked writers (inline stw/sth), so they
+// are not published: the selection reads them live at render time, for the
+// objects that survive tree and frustum culling only, as 820B4038 reads them
+// in the guest's own render walk (the same race with the simulation).
 struct NativeFullFrameStaticRoute {
   bool direct=false;
   uint32_t mode=0;
   uint16_t hidden=0;
   bool operator==(const NativeFullFrameStaticRoute&) const=default;
 };
-// Shared chunks: a publication copies it in O(1) and a changed route clones one chunk.
-using NativeFullFrameStaticRoutes=NativeSharedMap<uint32_t,NativeFullFrameStaticRoute>;
-inline void CollectNativeFullFrameStaticRoutes(const NativeStaticWalkList& plan,NativeFullFrameStaticRoutes& routes) {
-  for(const auto& member:plan.members) routes.Set(member.owner,{member.direct,member.mode,member.hidden});
-}
-// The step's route words, kept per world in the order of its static walk plans
-// (820B4250 post-hook, sim thread). +52 and +64 have unhooked writers (inline
-// stw/sth), so every member's header is re-read each step, but that is one
-// 68-byte read per member compared against its slot: nothing is allocated or
-// rehashed, and only a changed route touches the published map. The slot
-// layout is rebuilt only when a plan's membership stamp moves (a Touch or a
-// header change), never for a source refresh. Not synchronized.
-class NativeFullFrameRouteTable {
+// Reads one owner's route words; nullopt when its header cannot be read.
+using NativeFullFrameStaticRouteRead=std::function<std::optional<NativeFullFrameStaticRoute>(uint32_t owner)>;
+// The production route reader over a reader (typically a page window): one
+// 68-byte header read per object (+0 vtable, +52 mode, +64 hidden), and the
+// vtable+16 slot only when the object would take the render slot (hidden 0,
+// mode 0), in sub_821C0C00's order. Vtables are image data, never stored to,
+// so each vtable's slot answer is kept for the reader's lifetime. The reader
+// must outlive this. Not synchronized.
+template<class Reader>
+class NativeFullFrameLiveRoutes {
  public:
-  using Plans=std::vector<std::shared_ptr<const NativeStaticWalkList>>;
-  struct Stats { uint64_t refreshes=0,rebuilds=0,reads=0,changes=0,retired=0; };
-  // The world's slots were laid out from these plans (same lists, same membership).
-  bool Current(uint32_t world,const Plans& plans) const {
-    const auto found=worlds_.find(world);
-    if(found==worlds_.end() || found->second.plans.size()!=plans.size()) return false;
-    for(size_t i=0;i<plans.size();++i) {
-      const auto& a=*found->second.plans[i];const auto& b=*plans[i];
-      if(a.list!=b.list || a.membership!=b.membership) return false;
-    }
-    return true;
+  explicit NativeFullFrameLiveRoutes(const Reader& reader):reader_(reader) {}
+  std::optional<NativeFullFrameStaticRoute> operator()(uint32_t owner) const {
+    try {
+      const auto* header=reader_.Bytes(owner,68);
+      const auto vtable=GuestBlockWord(header);
+      NativeFullFrameStaticRoute route{false,GuestBlockWord(header+52),uint16_t(GuestBlockWord(header+64)>>16)};
+      ++reads;
+      if(route.hidden || route.mode) return route;
+      if(const auto found=direct_.find(vtable);found!=direct_.end()) route.direct=found->second;
+      else { route.direct=reader_.Word(reader_.Add(vtable,16))==kNativeStaticDirectRender; direct_.emplace(vtable,route.direct); ++slot_reads; }
+      return route;
+    } catch(const std::exception&) { ++failures; return std::nullopt; }
   }
-  // Lays the world's slots out from its plans, keeping the known routes of
-  // owners it still lists; owners it no longer lists leave the routes.
-  void Rebuild(uint32_t world,Plans plans) {
-    auto& entry=worlds_[world];
-    std::unordered_map<uint32_t,NativeFullFrameStaticRoute> known;
-    for(const auto& slot:entry.slots) if(slot.valid) known.emplace(slot.member->owner,slot.route);
-    std::vector<Slot> slots;
-    for(const auto& plan:plans) for(const auto& member:plan->members) {
-      Slot slot{&member};
-      if(const auto found=known.find(member.owner);found!=known.end()) { slot.route=found->second; slot.valid=true; }
-      slots.push_back(slot);
-    }
-    std::unordered_set<uint32_t> listed;
-    for(const auto& slot:slots) listed.insert(slot.member->owner);
-    for(const auto& [object,route]:known) if(!listed.contains(object)) routes_.Erase(object);
-    entry.plans=std::move(plans); entry.slots=std::move(slots);
-    ++stats_.rebuilds;
-  }
-  // read(member) returns the live route of member.owner. Returns how many
-  // published routes changed.
-  template<class Read>
-  size_t Refresh(uint32_t world,Read&& read) {
-    const auto found=worlds_.find(world);
-    if(found==worlds_.end()) return 0;
-    size_t changed=0;
-    for(auto& slot:found->second.slots) {
-      const NativeFullFrameStaticRoute route=read(*slot.member);
-      ++stats_.reads;
-      if(slot.valid && slot.route==route) continue;
-      slot.route=route; slot.valid=true;
-      const auto* published=routes_.Find(slot.member->owner);
-      if(!published || !(*published==route)) { routes_.Set(slot.member->owner,route); ++changed; }
-    }
-    ++stats_.refreshes; stats_.changes+=changed;
-    return changed;
-  }
-  bool Retire(uint32_t world) {
-    const auto found=worlds_.find(world);
-    if(found==worlds_.end()) return false;
-    for(const auto& slot:found->second.slots) routes_.Erase(slot.member->owner);
-    worlds_.erase(found); ++stats_.retired;
-    return true;
-  }
-  const NativeFullFrameStaticRoutes& routes() const { return routes_; }
-  const Stats& stats() const { return stats_; }
+  mutable uint64_t reads=0,slot_reads=0,failures=0;
  private:
-  struct Slot {
-    const NativeStaticWalkMember* member=nullptr;  // In World::plans, which keep it alive.
-    NativeFullFrameStaticRoute route;
-    bool valid=false;
-  };
-  struct World { Plans plans; std::vector<Slot> slots; };
-  std::map<uint32_t,World> worlds_;
-  NativeFullFrameStaticRoutes routes_;
-  Stats stats_;
+  const Reader& reader_;
+  mutable std::unordered_map<uint32_t,bool> direct_;
 };
 // Addresses of the published tree image only: every read is a captured byte,
 // and anything else throws rather than reaching guest memory.
@@ -164,7 +113,7 @@ struct NativeFullFrameStaticSelection {
   struct Object { uint32_t owner=0,lod=0; bool operator==(const Object&) const=default; };
   struct Stats {
     uint64_t worlds=0,missing_orders=0,nodes_classified=0,tree_reads=0,lists=0,missing_lists=0,members=0,duplicates=0;
-    uint64_t unrouted=0,not_direct=0,unpublished=0,culled_distance=0,culled_frustum=0,visible=0,missing_lod=0,undrawable=0;
+    uint64_t route_reads=0,unrouted=0,not_direct=0,unpublished=0,culled_distance=0,culled_frustum=0,visible=0,missing_lod=0,undrawable=0;
     uint64_t selected=0,parts=0,unordered_groups=0,unordered_parts=0;
   };
   std::vector<NativeFullFrameStaticOwner> owners;
@@ -176,16 +125,17 @@ struct NativeFullFrameStaticSelection {
 // owner with a tree image: walk the tree with frustum classification from the
 // camera; gather each accepted leaf list (node+120), then world+372, from the
 // published membership; visit each owner once (the guest's +48 frame marker);
-// route by the published words (hidden, then mode 0 with direct 820B2670
-// dispatch; buckets, virtual and unknown routes are other passes' objects);
 // cull by the published visibility record and pick the LOD
-// (SelectNativeVisibility, shared with the 820B4038 hook); push each part of
+// (SelectNativeVisibility, shared with the 820B4038 hook); route by the words
+// route() reads for the survivors only (hidden, then mode 0 with direct
+// 820B2670 dispatch; buckets, virtual and unknown routes are other passes'
+// objects; an unreadable header is unrouted); push each part of
 // that LOD into its group. A part without a group makes the whole object
 // undrawable here, as it sends the object back to the guest in the hook.
 // Selections of a group outside the owner's published order are counted and
 // dropped: 821C3BB8 never reaches them.
 NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScenePublication& publication,
-  const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRoutes& routes);
+  const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRouteRead& route);
 
 // Target formats and depth direction of the pass, and its base state: the one
 // definition every full-frame scene pass shares (native_full_frame_base_state.h).
@@ -269,7 +219,7 @@ class NativeFullFrameStaticWorld {
   // production resolver. Runs once per group per cache miss.
   template<class Resolve>
   NativeFullFrameStaticFrame Build(const NativeScenePublication& publication,const NativeFullFrameStaticCamera& camera,
-      const NativeFullFrameStaticRoutes& routes,const NativeFullFrameStaticPass& pass,Resolve&& resolve);
+      const NativeFullFrameStaticRouteRead& route,const NativeFullFrameStaticPass& pass,Resolve&& resolve);
   Cache cache;
   NativeSceneInstanceReuse reuse;
  private:
@@ -278,10 +228,10 @@ class NativeFullFrameStaticWorld {
 
 template<class Resolve>
 NativeFullFrameStaticFrame NativeFullFrameStaticWorld::Build(const NativeScenePublication& publication,
-    const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRoutes& routes,
+    const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRouteRead& route,
     const NativeFullFrameStaticPass& pass,Resolve&& resolve) {
   NativeFullFrameStaticFrame frame;
-  frame.selection=SelectNativeFullFrameStaticWorld(publication,camera,routes);
+  frame.selection=SelectNativeFullFrameStaticWorld(publication,camera,route);
   auto& stats=frame.stats;
   const auto base=NativeFullFrameStaticBaseState(pass.targets);
   const auto* sources=publication.sources.get();
