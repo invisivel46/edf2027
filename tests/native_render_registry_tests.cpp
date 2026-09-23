@@ -730,6 +730,64 @@ void MotherSpheresArePublishedEveryTick() {
 }
 }
 
+// A render-only iteration (refresh false): the published snapshot is returned
+// as is while no event arrived and nothing is pending, whatever a subscribed
+// object's memory holds; events (a birth, a death, a subscription) are still
+// applied and published at the same tick; the next full tick re-reads the
+// subscribers. CountNativeRenderSnapshotChanges is what the idle audit logs.
+void RenderOnlyTicks() {
+  std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(8);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kMoving=0x2000,kStill=0x3000,kLate=0x4000;
+  BuildTree(memory,kMoving,true); BuildTree(memory,kStill);
+  registry.Born(kMoving); registry.Born(kStill);
+  const auto stepped=registry.Tick(memory,kScene,1,decode);
+  Require(stepped->entries.size()==2 && registry.stats().subscribed==1,"the step publishes both entries");
+  // Nothing happened: the same snapshot, no new generation, nothing read.
+  const auto builds=registry.stats().builds;
+  const auto idle=registry.Tick(memory,kScene,1,decode,false);
+  Require(idle==stepped && registry.stats().builds==builds && registry.stats().idle_ticks==1 && registry.stats().light_ticks==0,
+    "an idle render-only tick read or published something");
+  // A subscriber's pose moved without a step (what the idle audit looks for):
+  // the light tick leaves it; a full tick at the same tick catches it, and the
+  // count names the one entry.
+  BuildPose(memory,kMoving+400,kMoving+0x600,2,40.0f);
+  Require(registry.Tick(memory,kScene,1,decode,false)==stepped,"a light tick re-read a subscriber");
+  const auto full=registry.Tick(memory,kScene,1,decode,true);
+  Require(full!=stepped && (*EntryOf(*full,kMoving)->pose)[0][0]==40.0f && CountNativeRenderSnapshotChanges(*stepped,*full)==1 &&
+    CountNativeRenderSnapshotChanges(*full,*full)==0,"the full tick catches the moved subscriber, and only it");
+  // A birth and a subscription on a render-only iteration: applied, read and
+  // published at the same tick, without re-reading the other subscribers.
+  BuildPose(memory,kMoving+400,kMoving+0x600,2,80.0f);
+  BuildTree(memory,kLate);
+  registry.Born(kLate);
+  const auto born=registry.Tick(memory,kScene,1,decode,false);
+  Require(born!=full && born->generation==full->generation+1 && born->tick==1 && EntryOf(*born,kLate) &&
+    EntryOf(*born,kMoving)==EntryOf(*full,kMoving) && registry.stats().light_ticks==1,"a render-only birth");
+  Require(CountNativeRenderSnapshotChanges(*full,*born)==1 && CountNativeRenderSnapshotChanges(*born,*full)==1,
+    "an added entry counts once either way");
+  registry.Subscribed(kStill,true); Link(memory,kUpdatesList,kStill+120,kStill);
+  memory.StoreWord(kStill+kNativeRenderObjectSubscribed,1);
+  memory.StoreByte(kStill+kNativeRenderObjectHidden,1);
+  const auto subscribed=registry.Tick(memory,kScene,1,decode,false);
+  Require(EntryOf(*subscribed,kStill)->hidden && EntryOf(*subscribed,kMoving)==EntryOf(*full,kMoving) &&
+    registry.stats().subscribed==2,"a render-only subscription reads its object");
+  // A death on a render-only iteration is unpublished at once.
+  registry.Died(kLate); Unlink(memory,kLate+108);
+  const auto dead=registry.Tick(memory,kScene,1,decode,false);
+  Require(!EntryOf(*dead,kLate) && dead->entries.size()==2 && CountNativeRenderSnapshotChanges(*subscribed,*dead)==1,
+    "a render-only death");
+  // The next step re-reads every subscriber.
+  const auto next=registry.Tick(memory,kScene,2,decode);
+  Require((*EntryOf(*next,kMoving)->pose)[0][0]==80.0f && next->tick==2,"the next step reads what the light ticks left");
+  Require(!registry.AuditScene(memory,kScene).mismatches(),"light ticks keep the registry matching the scene");
+  // Before any publication a render-only tick publishes (seeds) anyway.
+  NativeRenderRegistry fresh(0);
+  const auto first=fresh.Tick(memory,kScene,5,decode,false);
+  Require(first && first->entries.size()==2 && fresh.stats().seeded==2,"a first render-only tick seeds and publishes");
+}
+
 int main() {
   try {
     ClassTableLookup();
@@ -737,6 +795,7 @@ int main() {
     SkyIsNotPublished();
     ResolvesClassAfterDerivedConstructor();
     SubscriptionDrivesRereads();
+    RenderOnlyTicks();
     LayoutCaptureWaitsForSizedPose();
     CharacterLodAndAttachments();
     AuditCountsMismatches();

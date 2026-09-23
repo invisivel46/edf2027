@@ -304,6 +304,9 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
             if(source!=draw.source) { draw.object.reset(); draw.made_from.reset(); draw.source=std::move(source); }
           }
           state->sourced=complete; state->generation=generation;
+        } else if(sources.audit) {
+          for(const auto& draw:state->draws)
+            sources.audit(layout.meshes[draw.draw.mesh].batches[draw.draw.batch],draw.draw.pass,draw.source);
         }
       } catch(const std::exception&) { ++stats.failed; state->sourced=false; }
       if(state->sourced) states[list][index]=state;

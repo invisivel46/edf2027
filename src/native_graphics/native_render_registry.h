@@ -114,7 +114,9 @@ inline bool SameNativeRenderEntry(const NativeRenderEntry& a,const NativeRenderE
 class NativeRenderRegistry {
  public:
   struct Stats {
-    uint64_t ticks=0,births=0,seeded=0,rebirths=0,deaths=0,unknown_deaths=0,subscriptions=0,unknown_subscriptions=0,
+    // ticks: publications; light_ticks: those made with refresh false;
+    // idle_ticks: refresh-false ticks that read and published nothing.
+    uint64_t ticks=0,light_ticks=0,idle_ticks=0,births=0,seeded=0,rebirths=0,deaths=0,unknown_deaths=0,subscriptions=0,unknown_subscriptions=0,
       unknown_classes=0,reclassified=0,deferred=0,foreign=0,builds=0,changed=0,unchanged=0,pose_reuses=0,read_failures=0,
       layout_captures=0,layout_failures=0,instanced_worlds=0,frame_poses=0,frame_pose_reuses=0,frame_pose_failures=0;
     size_t records=0,subscribed=0,published=0,retrying=0;
@@ -139,11 +141,25 @@ class NativeRenderRegistry {
   // Engine thread, at the end of 821A4DE8 (after its scene+100 slot-2 walk).
   // decode(instance,pose_vector,bones) returns a NativeModelLayout sized for
   // `bones` pose entries (DecodeNativeModelLayoutWith's override) or throws.
+  //
+  // refresh false: a render-only iteration (unlocked, no simulation step, so
+  // the tick has not advanced). Only what an event or a first sight asks for
+  // is read: the hooks' events are applied, and pending (new, resubscribed,
+  // deferred) objects and due retries are re-read, but not the scene+100
+  // members, the animated set or the round-robin refresh, whose inputs a
+  // simulation step writes. When that leaves nothing to read and no event
+  // arrived, the published snapshot is returned as is: no new generation.
   template<class Reader,class Decode>
-  std::shared_ptr<const NativeRenderRegistrySnapshot> Tick(const Reader& reader,uint32_t scene,uint64_t tick,const Decode& decode) {
+  std::shared_ptr<const NativeRenderRegistrySnapshot> Tick(const Reader& reader,uint32_t scene,uint64_t tick,const Decode& decode,
+      bool refresh=true) {
     active_.store(true,std::memory_order_relaxed);
+    const bool events=Drain();
+    if(!refresh && seeded_ && !events && pending_.empty() && !RetryDue(tick)) {
+      std::lock_guard lock(publish_mutex_);
+      if(published_) { ++stats_.idle_ticks; return published_; }
+    }
     ++stats_.ticks;
-    Drain();
+    if(!refresh) ++stats_.light_ticks;
     // Enabled mid-game (or first tick): adopt what the scene already holds.
     if(!seeded_) {
       WalkNativeRenderList(reader,scene+kNativeRenderSceneObjects,[&](uint32_t object) {
@@ -153,12 +169,14 @@ class NativeRenderRegistry {
     }
     std::vector<uint32_t> work(pending_.begin(),pending_.end());
     pending_.clear();
-    work.insert(work.end(),subscribed_.begin(),subscribed_.end());
-    work.insert(work.end(),animated_.begin(),animated_.end());
+    if(refresh) {
+      work.insert(work.end(),subscribed_.begin(),subscribed_.end());
+      work.insert(work.end(),animated_.begin(),animated_.end());
+    }
     for(auto at=retry_.begin();at!=retry_.end();) {
       if(at->second<=tick) { work.push_back(at->first); at=retry_.erase(at); } else ++at;
     }
-    for(size_t visited=0;visited<refresh_ && !ring_.empty();++visited) {
+    for(size_t visited=0;refresh && visited<refresh_ && !ring_.empty();++visited) {
       if(cursor_>=ring_.size()) cursor_=0;
       const auto [object,generation]=ring_[cursor_];
       const auto found=records_.find(object);
@@ -238,9 +256,14 @@ class NativeRenderRegistry {
     { std::lock_guard lock(events_mutex_); events_.push_back({object,event}); }
     active_.store(true,std::memory_order_relaxed);
   }
-  void Drain() {
+  bool RetryDue(uint64_t tick) const {
+    return std::any_of(retry_.begin(),retry_.end(),[&](const auto& item) { return item.second<=tick; });
+  }
+  // Whether any event was applied.
+  bool Drain() {
     std::vector<Pending> events;
     { std::lock_guard lock(events_mutex_); events.swap(events_); }
+    if(events.empty()) return false;
     for(const auto& [object,event]:events) {
       if(event==Event::Birth) { if(records_.contains(object)) { ++stats_.rebirths; Forget(object); } Birth(object); continue; }
       const auto found=records_.find(object);
@@ -252,6 +275,7 @@ class NativeRenderRegistry {
       ++stats_.subscriptions;
       Subscribe(object,found->second,event==Event::Subscribe);
     }
+    return true;
   }
   void Birth(uint32_t object) {
     auto& record=records_[object];
@@ -475,6 +499,18 @@ class NativeRenderRegistry {
   mutable std::mutex publish_mutex_;
   std::shared_ptr<const NativeRenderRegistrySnapshot> published_;
 };
+// Entries that differ between two snapshots: an object in only one of them,
+// or whose entry is another object (the registry carries an unchanged entry's
+// pointer over). Both lists are ordered by object.
+inline size_t CountNativeRenderSnapshotChanges(const NativeRenderRegistrySnapshot& a,const NativeRenderRegistrySnapshot& b) {
+  size_t i=0,j=0,changes=0;
+  while(i<a.entries.size() || j<b.entries.size()) {
+    if(j==b.entries.size() || (i<a.entries.size() && a.entries[i]->object<b.entries[j]->object)) { ++changes; ++i; }
+    else if(i==a.entries.size() || b.entries[j]->object<a.entries[i]->object) { ++changes; ++j; }
+    else { changes+=a.entries[i]!=b.entries[j]; ++i; ++j; }
+  }
+  return changes;
+}
 // Process-wide registry fed by the guest hooks; leaked like ModelPublications.
 NativeRenderRegistry& RenderRegistry();
 }

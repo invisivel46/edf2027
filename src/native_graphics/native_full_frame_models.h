@@ -234,6 +234,12 @@ struct NativeFullFrameModelSources {
   std::function<std::shared_ptr<const NativeSceneMaterial>(std::shared_ptr<const NativeSceneMaterial>)> intern;
   std::function<void(const std::function<void()>&)> exclusive;
   std::function<uint64_t()> generation;
+  // Diagnostic, empty by default: every draw of an item state kept at the
+  // current generation (not re-sourced this Build) is handed here with its
+  // batch, pass record and the sources it holds, for the host to compare with
+  // a fresh fetch (edf_native_model_source_audit).
+  std::function<void(const NativeModelBatchLayout&,uint32_t pass,const std::pair<std::shared_ptr<const NativeSceneGroupMaterial>,
+    std::shared_ptr<const NativeIndexedMesh::RetainedDraw>>& sources)> audit;
 };
 // Build's stages, reported as each begins (the host's sub-phase timings):
 // visibility (plan), programs (program and geometry sources of every drawn

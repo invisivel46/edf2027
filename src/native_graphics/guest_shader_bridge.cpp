@@ -243,6 +243,12 @@ REXCVAR_DEFINE_BOOL(edf_native_render_registry,false,"EDF2027",
                    "Track render objects from the base constructor/destructor and update subscription, and publish a per-tick renderable snapshot at the end of 821A4DE8 for the full-frame renderer; draws are unchanged (development)");
 REXCVAR_DEFINE_BOOL(edf_native_render_registry_audit,false,"EDF2027",
                    "Walk scene+84 and scene+100 each tick and count mismatches against the render registry's records and subscriptions; requires edf_native_render_registry (development)");
+REXCVAR_DEFINE_BOOL(edf_native_model_source_audit,false,"EDF2027",
+                   "Full-frame Models pass: fetch the program and geometry of every draw kept at the current source generation afresh from the providers and log each one that differs (a provider input the source generation missed) (development)");
+REXCVAR_DEFINE_BOOL(edf_native_render_registry_idle_skip,true,"EDF2027",
+                   "On an unlocked render-only iteration (no simulation step) the render registry applies its events and reads only new, resubscribed and retrying objects, not every scene+100 member, animated object and round-robin refresh; false re-reads them every iteration");
+REXCVAR_DEFINE_BOOL(edf_native_render_registry_idle_audit,false,"EDF2027",
+                   "Follow each render-only light registry tick with a full one and log every entry the full tick changed (what the light tick missed until the next step) (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_pass,false,"EDF2027",
                    "Draw rigid published models natively at 821C9C20; any unsupported object runs the original draw. Requires edf_native_model_publication and the static world pass scene flags (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_pass_skinned,false,"EDF2027",
@@ -6141,11 +6147,16 @@ struct NativeFullFrameModelsShared {
 // pass. Program and geometry come from the model pass caches
 // (NativeModelPassProgramLocked / NativeModelGeometryLocked) through the
 // models' draw states and side table: gathered only for items new to the
-// persistent draw states or at a new source generation (a registry
-// publication, shader or backend change), and then asked once per pass record
-// and per pass record and batch value, so frames between publications read no
-// guest memory for them; guest memory is read, never called. Between
-// publications each draw carries its scene object and only the camera moves. The snapshot is the render registry's (fed on with the full
+// persistent draw states or at a new source generation, and then asked once
+// per pass record and per pass record and batch value. The generation
+// (NativeFullFrameModelSourceMemo) advances only when a provider would now
+// return something else: each Build asks the providers again, in a few lock
+// slices, for every program and geometry a current draw state holds, so a
+// constant value moved by a step, by a 821A4DE8 listener on a render-only
+// iteration or by anything else is seen at the next frame, and frames where
+// nothing moved re-source nothing. Guest memory is read, never called.
+// Between changes each draw carries its scene object and only the camera
+// moves. The snapshot is the render registry's (fed on with the full
 // frame); before its first tick there is none and this records nothing.
 class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
  public:
@@ -6195,26 +6206,65 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     })) { ++empty_; return; }
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("models",reason); };
-    const NativeFullFrameModelSources sources{
-      [&](uint32_t record) { return slices([&] { return NativeModelPassProgramLocked(state,window,record,true,report); }); },
+    // The providers, each inside its own slice: the model pass program of a
+    // pass record and the retained geometry of a batch under it.
+    const auto fetch_program=[&](uint32_t record) {
+      return slices([&] { return NativeModelPassProgramLocked(state,window,record,true,report); });
+    };
+    const auto fetch_geometry=[&](const NativeModelBatchLayout& batch,uint32_t record) {
+      return slices([&] { return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,batch,record),batch); });
+    };
+    NativeFullFrameModelSources sources{
+      [&](uint32_t record) { return source_memo_.ProgramFor(record,[&] { return fetch_program(record); }); },
       [&](const NativeModelBatchLayout& batch,uint32_t record) {
-        return slices([&] { return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,batch,record),batch); });
+        const GeometryInput input{batch,record};
+        return source_memo_.GeometryFor(SourceGeometryKey(input),input,[&] { return fetch_geometry(batch,record); });
       },
       // Called only inside exclusive, which holds the locks.
       [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); },
       [&](const std::function<void()>& work) { slices(work); },
-      // The providers' change signal: a registry publication (a simulation
-      // step, after which guest program bytes and constant values may have
-      // moved), a shader registration or release, or a backend replacement.
-      // Frames between publications read no guest memory for programs or
-      // geometry; each (pass record, batch, layout) is fetched once after one.
+      // The providers' change signal (NativeFullFrameModelSourceMemo): it
+      // advances when a host identity moved (a shader registration or
+      // release, a backend replacement) or when a provider, asked again for
+      // every program and geometry a current row holds, returns another
+      // object (a rebuilt program, refreshed constant values, reloaded
+      // geometry), whatever wrote the inputs and whether or not a simulation
+      // step ran. Rows are fetched only then, and served from the results
+      // just asked for. The providers are called directly here, the locks
+      // held once per chunk.
       [&] {
-        const auto inputs=slices([&] {
-          return std::tuple<uint64_t,uint64_t,const void*>{registry->generation,state.shader_registry_generation,state.scene_backend.get()};
-        });
-        if(inputs!=source_inputs_) { source_inputs_=inputs; ++source_generation_; }
-        return source_generation_;
+        return source_memo_.Validate(
+          [&] { return SourceHost{state.shader_registry_generation,state.scene_backend.get()}; },
+          [&](uint32_t record) { return NativeModelPassProgramLocked(state,window,record,true,report); },
+          [&](const GeometryInput& input) {
+            return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,input.first,input.second),input.first);
+          },
+          [&](const auto& work) { slices(work); });
       }};
+    // edf_native_model_source_audit: every draw state Build keeps at the
+    // current generation (not re-sourced this frame) is fetched afresh from
+    // the providers and compared with what it holds. A mismatch is a provider
+    // input the change signal missed (or a guest write racing this frame);
+    // it is logged, and the frame still draws the kept sources.
+    if(REXCVAR_GET(edf_native_model_source_audit))
+      sources.audit=[&](const NativeModelBatchLayout& batch,uint32_t record,const NativeFullFrameModelSourcePair& kept) {
+        const char* mismatch=nullptr;
+        try {
+          const auto program=fetch_program(record);
+          const auto geometry=program && program->program?fetch_geometry(batch,record):nullptr;
+          if(!program || !program->program) mismatch="program now missing";
+          else if(!kept.first || (program!=kept.first &&
+                  (program->program!=kept.first->program || !(program->constants==kept.first->constants))))
+            mismatch=kept.first && program->program==kept.first->program?"constant values moved":"program rebuilt";
+          else if(geometry!=kept.second) mismatch=geometry?"geometry reloaded":"geometry now missing";
+        } catch(const std::exception&) { mismatch="refetch threw"; }
+        ++source_audits_;
+        if(!mismatch) return;
+        ++source_mismatches_;
+        if(source_mismatches_<=32 || !(source_mismatches_&(source_mismatches_-1)))
+          REXLOG_WARN("Native full frame models source audit mismatch: pass={:#x} batch={:#x} reason={} generation={} "
+            "audits={} mismatches={}",record,batch.address,mismatch,source_memo_.generation(),source_audits_,source_mismatches_);
+      };
     // frame.native.models.{visibility,programs,resolve}: Build's stages, each
     // timed from its start to the next's.
     std::optional<HookTiming> stage;
@@ -6255,20 +6305,38 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
+      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
+        "source_generation={} source_memo={} source_validated={} source_advances={}/{}/{}/{} source_reuses={} source_audits={}/{}",
         frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
         built.items,built.drawn,built.draws,statistics.draws,built.resolves,built.captures,built.palettes,built.cache_hits,built.memo_hits,
         built.reused,built.derived,built.sourced,built.programs,built.geometries,built.camera_rows,built.rows,
         built.source_hits,built.source_fetches,models_.material_cache().size(),models_.source_table().size(),
         models_.item_states(),models_.row_states(),built.missing_program,built.missing_geometry,built.failed,broken_,
-        slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
+        slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()),
+        source_memo_.generation(),source_memo_.size(),source_memo_.stats().validated,source_memo_.stats().advances,
+        source_memo_.stats().host_changes,source_memo_.stats().changes,source_memo_.stats().prunes,source_memo_.stats().reuses,
+        source_audits_,source_mismatches_);
   }
  private:
   const edf::native::GuestReader reader_;
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   edf::native::NativeFullFrameModels models_;
-  std::tuple<uint64_t,uint64_t,const void*> source_inputs_{UINT64_MAX,UINT64_MAX,nullptr};
-  uint64_t source_generation_=0;
+  // The source memo's host identities (shader registrations, backend) and
+  // geometry key: the pass record and the whole batch value, every field of
+  // it (a superset of what NativeModelGeometryLocked reads), as Build keys
+  // its own per-generation answers.
+  using SourceHost=std::tuple<uint64_t,const void*>;
+  using GeometryInput=std::pair<edf::native::NativeModelBatchLayout,uint32_t>;
+  using GeometryKey=std::tuple<uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t,uint32_t,uint64_t,
+    std::vector<uint32_t>>;
+  static GeometryKey SourceGeometryKey(const GeometryInput& input) {
+    const auto& [batch,record]=input;
+    return {record,batch.address,batch.material,batch.declaration,batch.stride,batch.index_count,batch.draw_count,
+      batch.vertex.owner,batch.vertex.generation,batch.index.owner,batch.index.generation,batch.passes};
+  }
+  edf::native::NativeFullFrameModelSourceMemo<SourceHost,std::shared_ptr<const edf::native::NativeSceneGroupMaterial>,
+    GeometryKey,GeometryInput,std::shared_ptr<const edf::native::NativeIndexedMesh::RetainedDraw>> source_memo_;
+  uint64_t source_audits_=0,source_mismatches_=0;
   uint64_t frames_=0,empty_=0,stale_=0,broken_=0;
 };
 // The full frame's Effects pass: CollectNativeEffectManager over the
@@ -7601,8 +7669,11 @@ namespace {
 // End of 821A4DE8 (r3 is the scene): after the scene+100 slot-2 walk, so this
 // tick's pose builds are in memory. Failures stay native and are counted.
 // tick: the engine thread's native_loop_budget.tick (thread-local), passed in
-// because the tick may run on RegistryWorker.
-void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick) {
+// because the tick may run on RegistryWorker. render_only: an unlocked
+// iteration without a simulation step (the tick has not advanced), for which
+// the registry reads only what its events ask for (NativeRenderRegistry::Tick
+// with refresh false) unless edf_native_render_registry_idle_skip is off.
+void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool render_only) {
   auto& registry=edf::native::RenderRegistry();
   if(!REXCVAR_GET(edf_native_render_registry) && !EDF_NATIVE_FLAG(full_frame)) { if(registry.active()) registry.Clear(); return; }
   edf::native::HookTiming timing(edf::native::HookPhase::SimRegistry);
@@ -7620,14 +7691,37 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick) {
           return found?found->generation:0;
         },bones);
     };
-    const auto snapshot=registry.Tick(window,scene,tick,decode);
+    // What a render-only iteration's refresh would re-read (scene+100
+    // members, instanced worlds, frame-posed roots, the round robin) is
+    // written by simulation steps: 821A4DE8 still runs the scene+100 slot-2
+    // updates on such an iteration, over state no step has moved, and the
+    // unlock notes measured source poses changing only at the 60 Hz step
+    // cadence. edf_native_render_registry_idle_audit checks that claim: it
+    // follows each such light tick with a full one and logs every entry the
+    // full tick changed, which the light tick would have left until the next
+    // step.
+    const bool light=render_only && REXCVAR_GET(edf_native_render_registry_idle_skip);
+    auto snapshot=registry.Tick(window,scene,tick,decode,!light);
+    if(light && REXCVAR_GET(edf_native_render_registry_idle_audit)) {
+      const auto full=registry.Tick(window,scene,tick,decode,true);
+      const auto changes=snapshot && full?edf::native::CountNativeRenderSnapshotChanges(*snapshot,*full):size_t(0);
+      static uint64_t audited=0,mismatched=0,changed=0;
+      ++audited; mismatched+=changes!=0; changed+=changes;
+      if(changes && (mismatched<=16 || !(mismatched&(mismatched-1))))
+        REXLOG_WARN("Native render registry idle audit mismatch: tick={} changed_entries={} audited={} mismatched={} total_changed={}",
+          tick,changes,audited,mismatched,changed);
+      else if(!changes && (audited<=4 || audited%1000==0))
+        REXLOG_INFO("Native render registry idle audit: audited={} mismatched={} total_changed={}",audited,mismatched,changed);
+      snapshot=full;
+    }
     static uint64_t ticks=0;
     const bool report=++ticks<=4 || ticks%1000==0;
     if(report) {
       const auto stats=registry.stats();
-      REXLOG_INFO("Native render registry: generation={} tick={} entries={} records={} subscribed={} births={} seeded={} deaths={} "
+      REXLOG_INFO("Native render registry: generation={} tick={} entries={} light_ticks={} idle_ticks={} records={} subscribed={} births={} seeded={} deaths={} "
         "rebirths={} unknown_deaths={} unknown_classes={} deferred={} foreign={} builds={} changed={} unchanged={} pose_reuses={} "
-        "read_failures={} layouts={} layout_failures={} retrying={} frame_poses={}/{}/{}",snapshot->generation,snapshot->tick,snapshot->entries.size(),stats.records,
+        "read_failures={} layouts={} layout_failures={} retrying={} frame_poses={}/{}/{}",snapshot->generation,snapshot->tick,snapshot->entries.size(),
+        stats.light_ticks,stats.idle_ticks,stats.records,
         stats.subscribed,stats.births,stats.seeded,stats.deaths,stats.rebirths,stats.unknown_deaths,stats.unknown_classes,
         stats.deferred,stats.foreign,stats.builds,stats.changed,stats.unchanged,stats.pose_reuses,stats.read_failures,
         stats.layout_captures,stats.layout_failures,stats.retrying,stats.frame_poses,stats.frame_pose_reuses,stats.frame_pose_failures);
@@ -7707,18 +7801,32 @@ REX_HOOK_RAW(sub_821A4DE8) {
     void Wait() { if(ticket) RegistryWorker().Wait(std::exchange(ticket,0)); }
     ~RegistryJoin() { Wait(); }
   } registry_join;
+  // A render-only iteration (unlocked, no simulation step): the tick has not
+  // advanced and no step wrote simulation state. 821A4DE8 itself still ran
+  // (camera interpolation, the scene+100 and +2228 listeners), so what it
+  // publishes from the scene cameras is still read; the registry reads only
+  // what its events ask for (TickNativeRenderRegistry).
+  const bool render_only=native_loop_budget.unlocked && !native_loop_budget.steps;
   const bool registry_overlap=REXCVAR_GET(edf_native_registry_overlap);
   if(registry_overlap)
-    registry_join.ticket=RegistryWorker().Submit([base,manager,tick=native_loop_budget.tick] {
-      try { TickNativeRenderRegistry(base,manager,tick); } catch(...) {}  // A worker cannot carry it; the tick logs its own.
+    registry_join.ticket=RegistryWorker().Submit([base,manager,tick=native_loop_budget.tick,render_only] {
+      try { TickNativeRenderRegistry(base,manager,tick,render_only); } catch(...) {}  // A worker cannot carry it; the tick logs its own.
     });
   // This step's 820B4250 tree publications; cleared on every exit below.
   struct StepTrees { ~StepTrees() { native_step_trees.clear(); } } step_trees;
   if(EDF_NATIVE_FLAG(scene_camera_owned)) {
+    // Every iteration: an unlocked render-only one interpolates the cameras
+    // (821CDDF8 at 821A4EB0). The engine thread is PublishCameras' only
+    // caller, so a set equal to the one it last published (a still camera)
+    // skips the bridge mutex, which the render thread holds in slices.
+    static std::shared_ptr<const edf::native::NativeScenePassCameras> published;
     auto cameras=edf::native::ReadNativeScenePassCameras(edf::native::GuestReader(base),manager);
-    auto& state=edf::native::State();
-    std::lock_guard lock(state.mutex);
-    state.scene_adapter.PublishCameras(std::move(cameras));
+    if(!published || *published!=cameras) {
+      auto& state=edf::native::State();
+      std::lock_guard lock(state.mutex);
+      state.scene_adapter.PublishCameras(std::move(cameras));
+      published=state.scene_adapter.AcquireCameras();
+    }
   }
   {
     auto& motion=ModelMotionState();
@@ -7794,7 +7902,7 @@ REX_HOOK_RAW(sub_821A4DE8) {
     }
   } else if(!model_flag && ModelPublications().size()) ModelPublications().Clear();
   if(registry_overlap) registry_join.Wait();
-  else TickNativeRenderRegistry(base,manager,native_loop_budget.tick);
+  else TickNativeRenderRegistry(base,manager,native_loop_budget.tick,render_only);
   timing.Finish();
   if(edge) REXLOG_INFO("Native resource transition: end manager={:#x}",manager);
 }
