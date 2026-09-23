@@ -46,11 +46,11 @@ NativeEffectConstants ReadNativeEffectConstants(const Reader& r) {
 // The eye's one writer is sub_821A19F0(pool [8257C02C], view), whose one
 // caller is the scene begin 821BE8D0 (r4 = scene+96: the view the pass camera
 // holds). The full-frame renderer never runs 821BE8D0 (the render helper
-// 821A5080 is skipped and BeginView does not replicate the pool writes), so in
-// that mode [8257C02C]+192 is whatever the last guest-rendered view left: a
-// previous frame, a menu, or nothing. The native builders therefore derive the
-// eye from the pass camera's view (NativeEffectEyeFromView) and read +192 only
-// for diagnostics (ReadNativeEffectGuestEye). The guest readers of +192 are
+// 821A5080 is skipped); its BeginView writes the pool natively instead
+// (WriteNativeViewGlobals, native_view_globals.h, whose eye is this function).
+// The native builders derive the eye from the pass camera's view
+// (NativeEffectEyeFromView) and read +192 only for diagnostics
+// (ReadNativeEffectGuestEye). The guest readers of +192 are
 // 821A7E08 (the electric wire strip), 821A8090, 821A8360, 821A8628 and
 // 821A88E8; 821A8360 is also called by the guest view listener 820D3FD0.
 inline constexpr uint32_t kNativeEffectShaderGlobal=0x8257C034;

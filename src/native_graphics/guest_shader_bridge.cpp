@@ -57,6 +57,7 @@
 #include "native_full_frame_models.h"
 #include "native_full_frame_sky.h"
 #include "native_full_frame_effects.h"
+#include "native_view_globals.h"
 #include "native_bucket_dispatch.h"
 #include "native_map_effects.h"
 #include "native_scene_tree.h"
@@ -7367,13 +7368,17 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // opened: pass camera (published, else read as the 821BE8D0 hook does),
   // viewport from scene+480 with the retail depth range words 820008CC and
   // 820009A4 (reversed), and the depth/stencil clear it issues for every view
-  // but the first (8219C7A8 already cleared color and depth). Not replicated:
-  // the guest view/projection globals (821A17F8/821A19F0 on 8257C02C) and
-  // 82135530(device,1); native passes take the pass camera and
-  // context.viewport. The view's guest listeners (ViewOverlays) therefore see
-  // those two as the previous guest writer left them. The same holds for the
-  // eye 821A19F0 stores at [8257C02C]+192: the native effect and wire builders
-  // derive it from the pass camera's view (NativeEffectEyeFromView).
+  // but the first (8219C7A8 already cleared color and depth). The guest
+  // view/projection globals 821BE8D0 ends with (821A17F8/821A19F0 on the effect
+  // pool [8257C02C]: g_mProjection, g_mViewTranspose, g_mViewInverseTranspose,
+  // g_mView, g_mViewProjection and the pool's +64/+128/+192 copies) are written
+  // natively from the pass camera (native_view_globals.h), for every view as
+  // the helper calls +4 for every view, before any pass: the view's guest
+  // listeners (ViewOverlays: clItem01 through 8216DA80, clPlayerCamera
+  // 820D3FD0) draw with them. The native effect and wire builders derive the
+  // same eye from the pass camera themselves (NativeEffectEyeFromView), so
+  // their stale_guest_eye diagnostic now counts only a failed write. Not
+  // replicated: 82135530(device,1); native passes take context.viewport.
   bool BeginView(edf::native::NativeFrameContext& context) override {
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeBegin);
     const auto scene=context.view.scene;
@@ -7381,6 +7386,14 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     const auto found=cameras?cameras->find(scene):edf::native::NativeScenePassCameras::const_iterator{};
     if(cameras && found!=cameras->end()) edf::native::native_scene_pass_camera=found->second;
     else edf::native::native_scene_pass_camera=edf::native::ReadNativeScenePassCamera(reader_,scene);
+    // 821BE8D0's 821A17F8(pool, scene+32) and 821A19F0(pool, scene+96), from
+    // the same camera the native passes draw with.
+    if(!edf::native::WriteNativeViewGlobals(reader_,edf::native::native_scene_pass_camera->projection,
+         edf::native::native_scene_pass_camera->view)) {
+      static std::atomic<uint64_t> missing=0;
+      if(const auto count=++missing;count<=4 || !(count&(count-1)))
+        REXLOG_WARN("Native full frame view: no effect pool at 8257C02C; view globals not written (count={})",count);
+    }
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -7442,9 +7455,11 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     pass.Record(context);
   }
   // REMAINING GUEST CALLS, per view, in the helper's order: the overlay
-  // listeners' +12 (clSatoCallback 8216DA80) with the frame context, then the
-  // view's +16 (clPlayerCamera 820D3FD0: follow/talk icons and the trajectory
-  // ribbon). Their draws reach the native scene through the per-draw hooks.
+  // listeners' +12 (clSatoCallback 8216DA80 -> 8217A728 -> 82122640: the
+  // [8257BF88] instance list's slot 3s, i.e. clItem01 8218F3D8, the pickups)
+  // with the frame context, then the view's +16 (clPlayerCamera 820D3FD0:
+  // follow/talk icons and the trajectory ribbon). Their draws reach the native
+  // scene through the per-draw hooks, with the view globals BeginView wrote.
   // Not called: clSgsCoreRender +8 (821BE9D8, 82135530(device,0)), the
   // counterpart of the +4 setter the frame does not call either.
   void ViewOverlays(edf::native::NativeFrameContext& context) override {
