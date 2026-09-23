@@ -324,6 +324,9 @@ REXCVAR_DEFINE_BOOL(edf_native_gpu_timings, false, "EDF2027",
                    "Log GPU time per full-frame pass (sky, static_world, models, effects, transparent, post, view overlays, HUD phases) and per frame from scene-backend timestamps, read back frames later without stalling (development)");
 REXCVAR_DEFINE_BOOL(edf_native_frame_times, false, "EDF2027",
                    "Log present-to-present frame-time percentiles and one line per spike frame (over 25 ms or twice the rolling median) with its pipeline, shader, geometry and texture creations, declined passes and largest hook phases (development)");
+REXCVAR_DEFINE_INT32(edf_native_thread_qos,1,"EDF2027",
+  "Engine and render helper thread QoS: 0 OS default (a hidden or occluded window gets low QoS, which on hybrid CPUs "
+  "prefers efficiency cores), 1 opt out of execution-speed throttling (HighQoS), 2 also prefer performance-core CPU sets").range(0,2);
 REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
                    "Sample end-frame publication eligibility and cumulative UI draws; does not capture pixels (development)");
 REXCVAR_DEFINE_BOOL(edf_native_load_timings, false, "EDF2027",
@@ -406,10 +409,50 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        FrameNativeStaticWorldSelect, FrameNativeStaticWorldBuild, FrameNativeStaticWorldRecord,
                        SimRegistry, SimStaticWalk, SimPreloadGeometry, SimPreloadMaterial,
                        SimTrees, SimMembership, SimPublish, SimPoses, SimLockWait, SimPreloadPrecheck, SimWorldUpdate,
+                       BridgeMutexWait, BridgeGateWait, GuestWait,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
                        ShaderRegistration, ShaderLock, ShaderEntry,
                        TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
                        ResourceOneShot, ResourceCoordinator, ResourceHelper, ResourceTransition, Count };
+constexpr const char* kHookPhaseNames[]{"activation.original","activation.native",
+  "instance.original","instance.native","indexed.native","indexed.original",
+  "immediate.native","immediate.original","swap.gpu_wait","swap.refresh_wait",
+  "engine.wait","completion.poll","scene.setup","worker.service","tiling.begin","tiling.end",
+  "fence.wait","submission.flush","descriptor.submit","scene.setup.original","scene.setup.native",
+  "scene.setup.lock","scene.clear","target.color","target.depth","viewport.hook",
+  "viewport.lock","viewport.read","viewport.write","viewport.original",
+  "indexed.mesh","indexed.bindings","mesh.ranges","mesh.acquire","mesh.draw_range",
+  "mesh.observe","mesh.lookup","mesh.commit",
+  "indexed.submission_wait","indexed.context_wait","immediate.submission_wait",
+  "immediate.context_wait","presentation.context_wait",
+  "activation.lock","activation.resolve","activation.params_vs","activation.params_ps",
+  "activation.textures","activation.bind",
+  "xui.native","xui.decode","xui.bind","xui.draw",
+  "indexed.setup","indexed.record","indexed.draw","indexed.tail","indexed.coverage",
+  "immediate.classify","immediate.utility3d","immediate.acquire","immediate.record","immediate.tail",
+  "activation.sampler_words","instance.read","instance.patch",
+  "engine.simulation_dispatch","engine.render_helper","engine.frame_transition",
+  "render.gather","render.buckets","render.model","render.mesh","render.overlay",
+  "render.scene_end","render.finish","render.pose",
+  "render.list","render.scene_begin","render.children","render.world",
+  "render.listener","render.ui_listener",
+  "render.queued","render.material_group",
+  "render.gather.classify","render.gather.visibility","render.gather.lod","render.gather.push","render.gather.guest_dispatch",
+  "render.queued.eligibility","render.queued.resolve","render.queued.instances","render.queued.record",
+  "render.queued.handoff","render.queued.handoff_binds","render.queued.handoff_replays",
+  "frame.native","frame.native.begin","frame.native.sky","frame.native.static_world",
+  "frame.native.models","frame.native.effects","frame.native.transparent","frame.native.post",
+  "frame.native.end","frame.native.view_overlays","frame.native.phases",
+  "frame.native.models.visibility","frame.native.models.programs","frame.native.models.resolve","frame.native.models.record",
+  "frame.native.static_world.select","frame.native.static_world.build","frame.native.static_world.record",
+  "sim.registry","sim.static_walk","sim.preload_geometry","sim.preload_material",
+  "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait","sim.preload_precheck","sim.world_update",
+  "bridge.mutex_wait","bridge.gate_wait","guest.wait",
+  "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
+  "load.shader.registration","load.shader.lock","load.shader.entry",
+  "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
+  "load.resource.oneshot","load.resource.coordinator","load.resource.helper","load.resource.transition"};
+static_assert(std::size(kHookPhaseNames)==static_cast<size_t>(HookPhase::Count));
 thread_local uint32_t texture_loader_depth=0;
 // This frame's inclusive totals per phase, for the edf_native_frame_times
 // spike lines: every thread adds, the swap takes and clears them. Only full
@@ -422,6 +465,271 @@ struct FrameHookPhases {
 FrameHookPhases& FrameHookPhaseTotals() {
   static FrameHookPhases totals;
   return totals;
+}
+// Engine-thread region probe (edf_native_hook_timings only; nothing runs when
+// off). The step dispatch 821A4BA0 and the frame transition 821A4DE8 run guest
+// code on the engine thread, and their inclusive timings say how long they
+// take, not why. This splits a region's wall time into: time off the CPU
+// (thread cycle time against the TSC: blocked in a wait, or preempted), the
+// processor class it ran on (efficiency-class samples at entry, exit and at
+// every timed hook inside it), whether the render helper ran beside it, the
+// bridge-lock and guest waits inside it (bridge.*_wait, guest.wait), and every
+// timed hook phase nested in it. A fixed calibration kernel run beside the
+// region measures how fast the engine thread itself executes there,
+// independent of guest content: a slower region with an unchanged kernel is
+// more guest work; a slower kernel is a slower thread (core class, clock, SMT
+// sibling, cache). Scheduling, locks and guest state are unchanged.
+enum class EngineRegion : uint8_t { Dispatch, Transition, Count };
+struct EngineRegionTotals {
+  uint64_t calls=0,steps=0;
+  double wall_ms=0,oncpu_ms=0;
+  // Processor samples: [0] the highest efficiency class (performance cores;
+  // every core on a non-hybrid part), [1] a lower class, [2] unknown.
+  std::array<uint64_t,3> cores{};
+  uint64_t migrations=0,helper_entry=0,helper_exit=0,mxcsr_stale=0;
+  std::array<double,size_t(HookPhase::Count)> phase_ms{};
+  std::array<uint64_t,size_t(HookPhase::Count)> phase_calls{};
+  // Guest wait wrappers timed inside the region, by function.
+  struct Wait { uint32_t function=0; uint64_t calls=0; double ms=0; };
+  std::array<Wait,6> waits{};
+  uint64_t other_waits=0; double other_wait_ms=0;
+  // Calibration kernels (microseconds) and the class they ran on.
+  uint64_t calibrations=0; double alu_us=0,memory_us=0;
+  std::array<uint64_t,3> calibration_cores{};
+  std::chrono::steady_clock::time_point reported{};
+};
+// The region this thread is in; null outside one (and always when timings are off).
+thread_local EngineRegionTotals* native_engine_region=nullptr;
+// The guest wait wrapper being timed on this thread, for the per-function split.
+thread_local uint32_t native_guest_wait_function=0;
+// Render helper calls (821A5080) in flight, sampled at region entry and exit.
+std::atomic<int> native_render_helper_active{0};
+// Logical processor -> efficiency class (GetSystemCpuSetInformation), and the
+// CPU set IDs of the highest class. Read once; the topology does not change.
+struct NativeCpuTopology {
+  struct Processor { BYTE efficiency=0; bool known=false; };
+  std::vector<Processor> processors;  // index: group*64+number
+  std::vector<ULONG> performance_sets;
+  BYTE highest=0,lowest=0;
+  size_t performance_logical=0,other_logical=0;
+  static const NativeCpuTopology& Get() { static const NativeCpuTopology value=Build(); return value; }
+  bool hybrid() const { return highest!=lowest; }
+  // 0: highest class, 1: lower class, 2: unknown.
+  size_t Classify(const PROCESSOR_NUMBER& number) const {
+    const size_t index=size_t(number.Group)*64+number.Number;
+    if(index>=processors.size() || !processors[index].known) return 2;
+    return processors[index].efficiency==highest?0:1;
+  }
+  size_t Current() const { PROCESSOR_NUMBER number{}; GetCurrentProcessorNumberEx(&number); return Classify(number); }
+ private:
+  static NativeCpuTopology Build() {
+    NativeCpuTopology result;
+    ULONG length=0;
+    GetSystemCpuSetInformation(nullptr,0,&length,GetCurrentProcess(),0);
+    if(!length) return result;
+    std::vector<uint8_t> buffer(length);
+    if(!GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()),length,&length,
+         GetCurrentProcess(),0)) return result;
+    struct Entry { size_t index; BYTE efficiency; ULONG id; };
+    std::vector<Entry> entries;
+    for(size_t offset=0;offset+offsetof(SYSTEM_CPU_SET_INFORMATION,CpuSet)<=length;) {
+      const auto* entry=reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data()+offset);
+      if(!entry->Size || offset+entry->Size>length) break;
+      if(entry->Type==CpuSetInformation)
+        entries.push_back({size_t(entry->CpuSet.Group)*64+entry->CpuSet.LogicalProcessorIndex,
+          entry->CpuSet.EfficiencyClass,entry->CpuSet.Id});
+      offset+=entry->Size;
+    }
+    if(entries.empty()) return result;
+    result.highest=result.lowest=entries.front().efficiency;
+    for(const auto& entry:entries) {
+      result.highest=(std::max)(result.highest,entry.efficiency);
+      result.lowest=(std::min)(result.lowest,entry.efficiency);
+      if(entry.index>=result.processors.size()) result.processors.resize(entry.index+1);
+      result.processors[entry.index]={entry.efficiency,true};
+    }
+    for(const auto& entry:entries) {
+      if(entry.efficiency==result.highest) { result.performance_sets.push_back(entry.id); ++result.performance_logical; }
+      else ++result.other_logical;
+    }
+    return result;
+  }
+};
+thread_local std::array<EngineRegionTotals,size_t(EngineRegion::Count)> native_engine_regions;
+void ReportEngineRegion(EngineRegion region,EngineRegionTotals& totals) {
+  static constexpr const char* kRegionNames[]{"dispatch","transition"};
+  const double calls=double(totals.calls);
+  // The eight costliest phases nested in the region, per region call.
+  std::array<size_t,8> top{};
+  size_t count=0;
+  for(size_t index=0;index<totals.phase_ms.size();++index) {
+    if(!totals.phase_calls[index]) continue;
+    size_t at=count;
+    while(at>0 && totals.phase_ms[top[at-1]]<totals.phase_ms[index]) {
+      if(at<top.size()) top[at]=top[at-1];
+      --at;
+    }
+    if(at<top.size()) { top[at]=index; count=(std::min)(count+1,top.size()); }
+  }
+  std::string phases,waits;
+  char text[192];
+  for(size_t rank=0;rank<count;++rank) {
+    const auto index=top[rank];
+    std::snprintf(text,sizeof(text),"%s=%.3fms(%.1fx%.2fus) ",kHookPhaseNames[index],totals.phase_ms[index]/calls,
+      double(totals.phase_calls[index])/calls,1000.0*totals.phase_ms[index]/double(totals.phase_calls[index]));
+    phases+=text;
+  }
+  for(const auto& wait:totals.waits) {
+    if(!wait.calls) continue;
+    std::snprintf(text,sizeof(text),"%08X=%.3fms(%.2fx) ",wait.function,wait.ms/calls,double(wait.calls)/calls);
+    waits+=text;
+  }
+  if(totals.other_waits) {
+    std::snprintf(text,sizeof(text),"other=%.3fms(%.2fx) ",totals.other_wait_ms/calls,double(totals.other_waits)/calls);
+    waits+=text;
+  }
+  const double calibrations=double((std::max)(totals.calibrations,uint64_t(1)));
+  REXLOG_INFO("Native engine region probe: region={} calls={} steps={} wall_ms/call={:.3f} wall_ms/step={:.3f} "
+    "oncpu={:.1f}% offcpu_ms/call={:.3f} cores[performance/lower/unknown]={}/{}/{} migrations={} "
+    "helper_running[entry/exit]={}/{} mxcsr_stale={} calibration[n={} alu_us={:.1f} memory_us={:.1f} "
+    "cores={}/{}/{}] phases/call: {}waits/call: {}",
+    kRegionNames[size_t(region)],totals.calls,totals.steps,totals.wall_ms/calls,
+    totals.steps?totals.wall_ms/double(totals.steps):0.0,
+    totals.wall_ms>0?100.0*totals.oncpu_ms/totals.wall_ms:0.0,(totals.wall_ms-totals.oncpu_ms)/calls,
+    totals.cores[0],totals.cores[1],totals.cores[2],totals.migrations,totals.helper_entry,totals.helper_exit,
+    totals.mxcsr_stale,totals.calibrations,totals.alu_us/calibrations,totals.memory_us/calibrations,
+    totals.calibration_cores[0],totals.calibration_cores[1],totals.calibration_cores[2],phases,waits);
+}
+// One engine-thread region (see EngineRegionTotals). Construct it inside the
+// region's own inclusive HookTimings so they are not attributed to it.
+class EngineRegionScope {
+ public:
+  using Clock=std::chrono::steady_clock;
+  EngineRegionScope(EngineRegion region,uint32_t steps,uint32_t guest_csr)
+      :region_(region),steps_(steps) {
+    if(!REXCVAR_GET(edf_native_hook_timings)) return;
+    auto& totals=native_engine_regions[size_t(region)];
+    previous_=std::exchange(native_engine_region,&totals);
+    totals_=&totals;
+    // The guest's cached flush mode against the live MXCSR: a stale cache
+    // runs VMX code without flush-to-zero (slow denormals) until the next
+    // FPU instruction rewrites it.
+    if(((_mm_getcsr()^guest_csr)&0x8040u)!=0) ++totals.mxcsr_stale;
+    if(native_render_helper_active.load(std::memory_order_relaxed)>0) ++totals.helper_entry;
+    GetCurrentProcessorNumberEx(&processor_);
+    ++totals.cores[NativeCpuTopology::Get().Classify(processor_)];
+    QueryThreadCycleTime(GetCurrentThread(),&cycles_);
+    tsc_=__rdtsc();
+    start_=Clock::now();
+  }
+  ~EngineRegionScope() { Finish(); }
+  EngineRegionScope(const EngineRegionScope&)=delete;
+  EngineRegionScope& operator=(const EngineRegionScope&)=delete;
+  void Finish() {
+    if(!totals_) return;
+    auto& totals=*std::exchange(totals_,nullptr);
+    const auto now=Clock::now();
+    const auto tsc=__rdtsc();
+    ULONG64 cycles=0;
+    QueryThreadCycleTime(GetCurrentThread(),&cycles);
+    native_engine_region=previous_;
+    const double wall=std::chrono::duration<double,std::milli>(now-start_).count();
+    const double share=tsc>tsc_?(std::min)(1.0,double(cycles-cycles_)/double(tsc-tsc_)):1.0;
+    PROCESSOR_NUMBER processor{};
+    GetCurrentProcessorNumberEx(&processor);
+    ++totals.cores[NativeCpuTopology::Get().Classify(processor)];
+    if(processor.Group!=processor_.Group || processor.Number!=processor_.Number) ++totals.migrations;
+    if(native_render_helper_active.load(std::memory_order_relaxed)>0) ++totals.helper_exit;
+    ++totals.calls; totals.steps+=steps_;
+    totals.wall_ms+=wall; totals.oncpu_ms+=wall*share;
+    if(totals.calls>=256 && (totals.reported==Clock::time_point{} || now-totals.reported>=std::chrono::seconds(5))) {
+      ReportEngineRegion(region_,totals);
+      totals={};
+      totals.reported=now;
+    }
+  }
+ private:
+  EngineRegion region_;
+  uint32_t steps_;
+  EngineRegionTotals* totals_=nullptr;
+  EngineRegionTotals* previous_=nullptr;
+  PROCESSOR_NUMBER processor_{};
+  ULONG64 cycles_=0;
+  uint64_t tsc_=0;
+  Clock::time_point start_{};
+};
+// Fixed work on the engine thread, every 32nd region call with hook timings
+// on, outside every region timing: a dependent multiply-add chain (latency
+// bound: the core's class and clock) and a pointer chase through 16 MiB
+// (last-level cache and memory contention). About 25 us and 50-200 us.
+void RunEngineCalibration(EngineRegion region) {
+  if(!REXCVAR_GET(edf_native_hook_timings)) return;
+  static thread_local std::array<uint64_t,size_t(EngineRegion::Count)> calls{};
+  if(calls[size_t(region)]++%32) return;
+  static thread_local std::vector<uint32_t> chase;
+  static constexpr size_t kLines=(16u<<20)/64,kStride=16;
+  if(chase.empty()) {
+    // One random cycle through every line: no stride a prefetcher can follow.
+    std::vector<uint32_t> order(kLines);
+    for(size_t index=0;index<kLines;++index) order[index]=uint32_t(index);
+    uint64_t state=0x9E3779B97F4A7C15ull;
+    for(size_t index=kLines-1;index>0;--index) {
+      state=state*6364136223846793005ull+1442695040888963407ull;
+      std::swap(order[index],order[size_t(state>>33)%(index+1)]);
+    }
+    chase.assign(kLines*kStride,0);
+    for(size_t index=0;index<kLines;++index)
+      chase[size_t(order[index])*kStride]=uint32_t(order[(index+1)%kLines]*kStride);
+  }
+  using Clock=std::chrono::steady_clock;
+  const auto core=NativeCpuTopology::Get().Current();
+  const auto start=Clock::now();
+  uint64_t value=calls[size_t(region)];
+  for(uint32_t index=0;index<(1u<<15);++index) value=value*0x5851F42D4C957F2Dull+0x14057B7EF767814Full;
+  const auto alu=Clock::now();
+  uint32_t cursor=uint32_t((value>>40)%kLines)*kStride;
+  for(uint32_t hop=0;hop<2048;++hop) cursor=chase[cursor];
+  const auto end=Clock::now();
+  static volatile uint64_t sink=0;
+  sink=value+cursor;
+  auto& totals=native_engine_regions[size_t(region)];
+  ++totals.calibrations; ++totals.calibration_cores[core];
+  totals.alu_us+=std::chrono::duration<double,std::micro>(alu-start).count();
+  totals.memory_us+=std::chrono::duration<double,std::micro>(end-alu).count();
+}
+// Quality of service for the two threads that bound a frame: the engine thread
+// (step dispatch and transition) and the render helper (edf_native_thread_qos).
+// Windows derives a thread's QoS from its window: a hidden or occluded one
+// (automated runs launch hidden) gets low QoS, which on a hybrid CPU steers it
+// towards efficiency cores and lower clocks. 1 opts these two threads (only;
+// workers keep the OS default) out of execution-speed throttling (HighQoS);
+// 2 also restricts them to the highest efficiency class's CPU sets
+// (performance cores; a no-op on a non-hybrid part). Applied once per thread, at its first hook
+// call; guest state, locks and ordering are untouched.
+enum class NativeThreadRole : uint8_t { Engine, RenderHelper };
+void ApplyNativeThreadQos(NativeThreadRole role) {
+  static thread_local bool applied=false;
+  if(applied) return;
+  applied=true;
+  const auto mode=REXCVAR_GET(edf_native_thread_qos);
+  const auto& topology=NativeCpuTopology::Get();
+  static std::once_flag topology_once;
+  std::call_once(topology_once,[&] {
+    REXLOG_INFO("Native thread QoS: mode={} hybrid={} performance_logical={} other_logical={}",
+      mode,topology.hybrid(),topology.performance_logical,topology.other_logical);
+  });
+  if(mode<=0) return;
+  THREAD_POWER_THROTTLING_STATE state{};
+  state.Version=THREAD_POWER_THROTTLING_CURRENT_VERSION;
+  state.ControlMask=THREAD_POWER_THROTTLING_EXECUTION_SPEED;
+  state.StateMask=0;
+  const bool high=SetThreadInformation(GetCurrentThread(),ThreadPowerThrottling,&state,sizeof(state))!=0;
+  bool performance=false;
+  if(mode>=2 && topology.hybrid() && !topology.performance_sets.empty())
+    performance=SetThreadSelectedCpuSets(GetCurrentThread(),topology.performance_sets.data(),
+      ULONG(topology.performance_sets.size()))!=0;
+  REXLOG_INFO("Native thread QoS: role={} thread={} high_qos={} performance_cpu_sets={}",
+    role==NativeThreadRole::Engine?"engine":"render_helper",GetCurrentThreadId(),high,performance);
 }
 class HookTiming {
  public:
@@ -448,44 +756,7 @@ class HookTiming {
     const double ms=std::chrono::duration<double,std::milli>(now-start_).count();
     struct Bucket { uint64_t count=0; double total=0,maximum=0; Clock::time_point reported{}; };
     static thread_local std::array<Bucket,static_cast<size_t>(HookPhase::Count)> buckets{};
-    static constexpr const char* names[]{"activation.original","activation.native",
-      "instance.original","instance.native","indexed.native","indexed.original",
-      "immediate.native","immediate.original","swap.gpu_wait","swap.refresh_wait",
-      "engine.wait","completion.poll","scene.setup","worker.service","tiling.begin","tiling.end",
-      "fence.wait","submission.flush","descriptor.submit","scene.setup.original","scene.setup.native",
-      "scene.setup.lock","scene.clear","target.color","target.depth","viewport.hook",
-      "viewport.lock","viewport.read","viewport.write","viewport.original",
-      "indexed.mesh","indexed.bindings","mesh.ranges","mesh.acquire","mesh.draw_range",
-      "mesh.observe","mesh.lookup","mesh.commit",
-      "indexed.submission_wait","indexed.context_wait","immediate.submission_wait",
-      "immediate.context_wait","presentation.context_wait",
-      "activation.lock","activation.resolve","activation.params_vs","activation.params_ps",
-      "activation.textures","activation.bind",
-      "xui.native","xui.decode","xui.bind","xui.draw",
-      "indexed.setup","indexed.record","indexed.draw","indexed.tail","indexed.coverage",
-      "immediate.classify","immediate.utility3d","immediate.acquire","immediate.record","immediate.tail",
-      "activation.sampler_words","instance.read","instance.patch",
-      "engine.simulation_dispatch","engine.render_helper","engine.frame_transition",
-      "render.gather","render.buckets","render.model","render.mesh","render.overlay",
-      "render.scene_end","render.finish","render.pose",
-      "render.list","render.scene_begin","render.children","render.world",
-      "render.listener","render.ui_listener",
-      "render.queued","render.material_group",
-      "render.gather.classify","render.gather.visibility","render.gather.lod","render.gather.push","render.gather.guest_dispatch",
-      "render.queued.eligibility","render.queued.resolve","render.queued.instances","render.queued.record",
-      "render.queued.handoff","render.queued.handoff_binds","render.queued.handoff_replays",
-      "frame.native","frame.native.begin","frame.native.sky","frame.native.static_world",
-      "frame.native.models","frame.native.effects","frame.native.transparent","frame.native.post",
-      "frame.native.end","frame.native.view_overlays","frame.native.phases",
-      "frame.native.models.visibility","frame.native.models.programs","frame.native.models.resolve","frame.native.models.record",
-      "frame.native.static_world.select","frame.native.static_world.build","frame.native.static_world.record",
-      "sim.registry","sim.static_walk","sim.preload_geometry","sim.preload_material",
-      "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait","sim.preload_precheck","sim.world_update",
-      "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
-      "load.shader.registration","load.shader.lock","load.shader.entry",
-      "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
-      "load.resource.oneshot","load.resource.coordinator","load.resource.helper","load.resource.transition"};
-    static_assert(std::size(names)==static_cast<size_t>(HookPhase::Count));
+    const auto& names=kHookPhaseNames;
     const auto index=static_cast<size_t>(phase_);
     if(!sample_period_ && REXCVAR_GET(edf_native_frame_times)) {
       auto& totals=FrameHookPhaseTotals();
@@ -494,6 +765,16 @@ class HookTiming {
     }
     auto& bucket=buckets[index];
     ++bucket.count; bucket.total+=ms; bucket.maximum=(std::max)(bucket.maximum,ms);
+    if(auto* region=native_engine_region) {
+      region->phase_ms[index]+=ms; ++region->phase_calls[index];
+      ++region->cores[NativeCpuTopology::Get().Current()];
+      if(phase_==HookPhase::GuestWait) {
+        auto slot=std::find_if(region->waits.begin(),region->waits.end(),[](const EngineRegionTotals::Wait& wait) {
+          return wait.function==native_guest_wait_function || !wait.function; });
+        if(slot==region->waits.end()) { ++region->other_waits; region->other_wait_ms+=ms; }
+        else { slot->function=native_guest_wait_function; ++slot->calls; slot->ms+=ms; }
+      }
+    }
     if(phase_>=HookPhase::TextureSnapshot ||
        ((sample_period_ || bucket.count>=256) && (bucket.reported==Clock::time_point{} || now-bucket.reported>=std::chrono::seconds(5)))) {
       if(sample_period_) {
@@ -514,6 +795,27 @@ class HookTiming {
   bool enabled_;
   Clock::time_point start_{};
 };
+// A bridge lock whose contended acquisitions are timed (bridge.mutex_wait,
+// bridge.gate_wait; inside an engine region they are also attributed to it).
+// try_lock first, so an uncontended acquisition is one atomic operation as
+// before, and nothing is timed unless hook timings are on and the lock was
+// actually held by another thread. Lockable, so lock_guard, unique_lock,
+// scoped_lock and NativeLockSlices take it unchanged.
+template<class Mutex,HookPhase Phase>
+class NativeTimedMutex {
+ public:
+  void lock() {
+    if(mutex_.try_lock()) return;
+    HookTiming timing(Phase);
+    mutex_.lock();
+  }
+  bool try_lock() { return mutex_.try_lock(); }
+  void unlock() { mutex_.unlock(); }
+ private:
+  Mutex mutex_;
+};
+using BridgeMutex=NativeTimedMutex<std::mutex,HookPhase::BridgeMutexWait>;
+using BridgeGate=NativeTimedMutex<std::recursive_mutex,HookPhase::BridgeGateWait>;
 // Coarse wait totals are sampled once per swap. They include all participating
 // threads, so they locate waits but must not be summed as a CPU-time partition.
 enum class FrameWaitKind { Engine,GuestFence,SharedSlot };
@@ -961,8 +1263,8 @@ struct Bridge {
   // - Recorder state (scene recorder, active targets, bind_generation,
   //   recorded, scene_recorded_*) is written only by the render thread, under
   //   both locks; the simulation never records.
-  std::recursive_mutex submissions;
-  std::mutex mutex;
+  BridgeGate submissions;
+  BridgeMutex mutex;
   std::filesystem::path root;
   bool initialized=false;
   std::string scene_backend_name;
@@ -1323,8 +1625,8 @@ struct Bridge {
 };
 Bridge& State() { static Bridge state; return state; }
 // State().mutex for one visibility walk; see native_scene_walk_lock.h.
-using BridgeWalkLock=NativeWalkLockScope<std::mutex>;
-using BridgeGuestCall=NativeWalkGuestCall<std::mutex>;
+using BridgeWalkLock=NativeWalkLockScope<BridgeMutex>;
+using BridgeGuestCall=NativeWalkGuestCall<BridgeMutex>;
 // The current tree walk's camera view, shared with the list gathers it runs
 // under its own scope: one read per walk, again only after a guest call.
 struct BridgeWalkView {
@@ -3491,10 +3793,15 @@ struct NativeLoopTrace {
 REX_HOOK_RAW(sub_821A4BA0) {
   if(native_loop_budget.unlocked && ctx.lr==0x821A65D8)
     ctx.r4.u64=native_loop_budget.steps;
+  edf::native::ApplyNativeThreadQos(edf::native::NativeThreadRole::Engine);
   NativeLoopTrace trace("step_dispatch",ctx.r3.u32,ctx.lr,ctx.r4.u32);
-  edf::native::HookTiming timing(edf::native::HookPhase::ResourceCoordinator);
-  edf::native::HookTiming engine_timing(edf::native::HookPhase::SimulationDispatch);
-  __imp__sub_821A4BA0(ctx,base);
+  {
+    edf::native::HookTiming timing(edf::native::HookPhase::ResourceCoordinator);
+    edf::native::HookTiming engine_timing(edf::native::HookPhase::SimulationDispatch);
+    const edf::native::EngineRegionScope region(edf::native::EngineRegion::Dispatch,ctx.r4.u32,ctx.fpscr.csr);
+    __imp__sub_821A4BA0(ctx,base);
+  }
+  edf::native::RunEngineCalibration(edf::native::EngineRegion::Dispatch);
 }
 REX_EXTERN(__imp__sub_821A5080);
 // Inclusive engine phases below the helper. These keep the original guest
@@ -3509,6 +3816,44 @@ EDF_RENDER_PHASE(821A3BA0, RenderBuckets)
 EDF_RENDER_PHASE(821B2C28, RenderMesh)
 EDF_RENDER_PHASE(820D3FD0, RenderOverlay)
 EDF_RENDER_PHASE(821BE9D8, RenderSceneEnd)
+// Every guest function that calls a kernel wait import (KeWaitForSingleObject,
+// KeWaitForMultipleObjects, NtWaitForSingleObjectEx, KeDelayExecutionThread),
+// found by scanning the generated code: guest.wait, and inside an engine
+// region its split by function. Timing only; the original always runs.
+// 8214E328/8214E400/8214EAD0: graphics events; 823C08C0/823C0988/823C0A38:
+// semaphore and multi-object waits; 82132ED0: the worker event wait;
+// 821FCA78: sleep; 8243B230-8243B2D8: single-event wrappers; 821FA450,
+// 821FAC48, 821FBA30: file and title-notification waits.
+#define EDF_GUEST_WAIT(address) \
+  REX_EXTERN(__imp__sub_##address); \
+  REX_HOOK_RAW(sub_##address) { \
+    struct Function { \
+      uint32_t previous=std::exchange(edf::native::native_guest_wait_function,0x##address##u); \
+      ~Function() { edf::native::native_guest_wait_function=previous; } \
+    } function; \
+    edf::native::HookTiming timing(edf::native::HookPhase::GuestWait); \
+    __imp__sub_##address(ctx,base); \
+  }
+EDF_GUEST_WAIT(8214E328)
+EDF_GUEST_WAIT(8214E400)
+EDF_GUEST_WAIT(8214EAD0)
+EDF_GUEST_WAIT(823C08C0)
+EDF_GUEST_WAIT(823C0988)
+EDF_GUEST_WAIT(823C0A38)
+EDF_GUEST_WAIT(82132ED0)
+EDF_GUEST_WAIT(821FCA78)
+EDF_GUEST_WAIT(8243B230)
+EDF_GUEST_WAIT(8243B248)
+EDF_GUEST_WAIT(8243B260)
+EDF_GUEST_WAIT(8243B278)
+EDF_GUEST_WAIT(8243B290)
+EDF_GUEST_WAIT(8243B2A8)
+EDF_GUEST_WAIT(8243B2C0)
+EDF_GUEST_WAIT(8243B2D8)
+EDF_GUEST_WAIT(821FA450)
+EDF_GUEST_WAIT(821FAC48)
+EDF_GUEST_WAIT(821FBA30)
+#undef EDF_GUEST_WAIT
 REX_EXTERN(__imp__sub_821C9478);
 REX_HOOK_RAW(sub_821C9478) {
   edf::native::HookTiming timing(edf::native::HookPhase::RenderPose);
@@ -6061,7 +6406,7 @@ REX_HOOK_RAW(sub_820B4038) {
         // stay valid. Only a route into the original routine is a guest call.
         const bool try_native=hidden==0 && (int32_t(mode)==1 || int32_t(mode)==2);
         work.r3.u64=owner; work.r4.u64=context; work.lr=0x820B410C;
-        callback=NativeWalkBucketDispatch<std::mutex>(try_native,[&] { return TryNativeBucketInsert(work,base); },[&] {
+        callback=NativeWalkBucketDispatch<BridgeMutex>(try_native,[&] { return TryNativeBucketInsert(work,base); },[&] {
           // Unported callbacks may change membership or node values. Continue
           // from the original post-callback link rather than an older snapshot.
           membership.reset();
@@ -7247,6 +7592,12 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
 REXCVAR_DEFINE_INT32(edf_native_ab_alternate,0,"EDF2027",
   "A/B diagnostics: alternate guest and native passes in runs of N indexed output frames from the capture start frame; odd runs are native, 0 off (development)").range(0,1000);
 REX_HOOK_RAW(sub_821A5080) {
+  edf::native::ApplyNativeThreadQos(edf::native::NativeThreadRole::RenderHelper);
+  // Sampled by the engine region probe: is the helper running beside the step?
+  struct HelperActive {
+    HelperActive() { edf::native::native_render_helper_active.fetch_add(1,std::memory_order_relaxed); }
+    ~HelperActive() { edf::native::native_render_helper_active.fetch_sub(1,std::memory_order_relaxed); }
+  } helper_active;
   bool ab_native=true;
   if(const auto ab_period=REXCVAR_GET(edf_native_ab_alternate); ab_period>0) {
     uint64_t frame=0;
@@ -7871,8 +8222,12 @@ REX_HOOK_RAW(sub_821A4DE8) {
   const bool edge=trace && actual!=desired;
   if(edge) REXLOG_INFO("Native resource transition: begin manager={:#x} actual={} desired={}",
                       manager,actual,desired);
+  // Before the transition's timings: the render helper has been joined here,
+  // so this is the engine thread's speed with the helper idle.
+  edf::native::RunEngineCalibration(edf::native::EngineRegion::Transition);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceTransition,edge);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::FrameTransition);
+  edf::native::EngineRegionScope region(edf::native::EngineRegion::Transition,native_loop_budget.steps,ctx.fpscr.csr);
   // Model poses (ModelPublications) feed only the hybrid model pass and its
   // audit: layouts are registered by 821C9C20 draws, which a full frame
   // without A/B guest frames makes only if a guest phase still draws a model.
