@@ -42,7 +42,10 @@ bool NativeFullFrame::Replace(std::unique_ptr<NativeFramePass> pass) {
 }
 void NativeFullFrame::Run(NativeFrameHost& host) {
   ++frames_;
-  const auto inputs=host.AcquireInputs();
+  auto acquired=host.AcquireInputs();
+  acquired.tick_frame=tick_gate_.Advance(acquired.motion);
+  if(!acquired.tick_frame) ++held_frames_;
+  const auto& inputs=acquired;
   const auto views=host.Views();
   for(uint32_t index=0;index<views.size();++index) {
     NativeFrameContext context{host,inputs,{views[index],index,0}};

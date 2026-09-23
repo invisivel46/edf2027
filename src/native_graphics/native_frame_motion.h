@@ -1,4 +1,6 @@
 #pragma once
+#include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace edf::native {
@@ -7,18 +9,69 @@ namespace edf::native {
 // 821A4DE8 hook published it for this render: the same budget the camera's
 // 821CDDF8 interpolation used), the steps that tick dispatched, and whether
 // model poses interpolate. The registry's poses for `tick` blend from their
-// previous tick's at `fraction` (native_render_motion.h).
+// previous tick's at `fraction` (native_render_motion.h). `unlocked`: the
+// heartbeat ran the unlocked loop, where a render may dispatch no step.
 struct NativeFrameMotion {
   uint64_t tick=0;
   float fraction=1;
   uint32_t steps=0;
   bool interpolate=false;
+  bool unlocked=false;
   bool operator==(const NativeFrameMotion&) const=default;
 };
 // interpolate: the unlocked loop at divisor 1 with edf_native_model_interpolation,
 // the condition the guest-path 821C9C20 hook blends under.
 constexpr NativeFrameMotion MakeNativeFrameMotion(bool unlocked,uint32_t divisor,uint64_t tick,float fraction,uint32_t steps,
     bool model_interpolation) {
-  return {tick,fraction,steps,unlocked && divisor==1 && model_interpolation};
+  return {tick,fraction,steps,unlocked && divisor==1 && model_interpolation,unlocked};
 }
+// Whether a render is the one its simulation tick's per-render state advances
+// on. The guest advances some state once per RENDERED frame (clEffectEtc02's
+// +612 lifetime in its draw, the PS_Downsample_Tone history blend); at the
+// retail 60 Hz a render and a tick are 1:1, so that is once per tick. In the
+// unlocked loop a render that dispatched no step (steps 0: the 821A4DE8
+// transition's render_only) repeats its tick; only the first render after a
+// step advances, and once however many steps it dispatched, as a locked
+// render after a multi-step catch-up does. Locked renders always advance, so
+// locked mode is unchanged. Call once per frame; every view and pass of that
+// frame reads the one answer (NativeFrameInputs::tick_frame).
+class NativeTickGate {
+ public:
+  bool Advance(const NativeFrameMotion& motion) {
+    if(motion.unlocked && (!motion.steps || (committed_ && motion.tick==tick_))) return false;
+    committed_=true; tick_=motion.tick;
+    return true;
+  }
+  bool committed() const { return committed_; }
+  uint64_t tick() const { return tick_; }
+ private:
+  bool committed_=false;
+  uint64_t tick_=0;
+};
+// One guest draw that steps a counter word by a fixed `step` per call (and may
+// store other words with it, `also`), made to step once per tick: `call` runs
+// the original; on a held render (tick_frame false) the counter and `also` are
+// put back afterwards, but only when the call made exactly its own step, so a
+// different writer is never undone. Returns whether it put them back. On a
+// tick frame it is the call alone (locked mode unchanged). Memory: Word and
+// StoreWord on guest addresses (GuestReader).
+template<class Memory,class Call,size_t N>
+bool NativeRenderStepOncePerTick(const Memory& memory,bool tick_frame,uint32_t counter,uint32_t step,
+                                 const std::array<uint32_t,N>& also,Call&& call) {
+  if(tick_frame) { call(); return false; }
+  const auto before=memory.Word(counter);
+  std::array<uint32_t,N> saved{};
+  for(size_t i=0;i<N;++i) saved[i]=memory.Word(also[i]);
+  call();
+  if(memory.Word(counter)!=uint32_t(before+step)) return false;
+  memory.StoreWord(counter,before);
+  for(size_t i=0;i<N;++i) memory.StoreWord(also[i],saved[i]);
+  return true;
+}
+// The HUD's two draw-counted advances (the HUD phase loop runs every render;
+// its XUI clock and timers advance by elapsed time and are left alone):
+// clGaugeRader::slot3 82176708 (+296 frames left of the damage shake, -1 per
+// draw at 821768B0, with +300 the shake offset decayed at 821768AC) and the
+// window cursor highlight 8218ED68 (+68 fade-in count, +1 per draw at 8218EDA8).
+inline constexpr uint32_t kNativeRadarShakeFrames=296,kNativeRadarShakeOffset=300,kNativeCursorFade=68;
 }

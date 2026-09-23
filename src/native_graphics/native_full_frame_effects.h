@@ -647,6 +647,7 @@ struct NativeEffectCollection {
   std::vector<NativeEffectItem> immediate;  // mode 0: slot 4 runs inside the walk, before the drain
   std::vector<uint32_t> unsupported_slots;  // slot 4 of objects no builder covers
   uint32_t visited=0,duplicates=0,culled=0,hidden=0,undrawn_keys=0,unknown_modes=0,unsupported=0;
+  uint32_t held=0;  // clEffectEtc02 lifetimes a render-only frame did not commit (commit false)
 };
 // clEffectObjectManager (vtable 0x820072D4) keeps its objects on the intrusive
 // list at +48; its slot 2 (sub_820D4850, shared with clGameBossObject_Manager)
@@ -669,9 +670,14 @@ struct NativeEffectList {
 // No byte +36 test exists on this path: clGameObject_Manager::slot1 reads +36,
 // but that is the update walk, not the render walk.
 // `order` is the pass-wide filing counter (see NativeTransparentItem).
+// `commit` false withholds every CommitNativeEffectDraw (counted in `held`):
+// the caller passes NativeFrameInputs::tick_frame, so in the unlocked loop the
+// +612 lifetime, which the guest counts in draws, still counts once per
+// simulation tick (NativeTickGate) instead of once per render. The draws are
+// built from the same state either way; locked frames always commit.
 template<class Reader>
 NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32_t context,uint32_t& order,
-                                            std::unordered_set<uint32_t>* visited=nullptr) {
+                                            std::unordered_set<uint32_t>* visited=nullptr,bool commit=true) {
   NativeEffectCollection out;
   const auto view=ReadNativeSceneVisibilityView(r,context);
   const auto in=ReadNativeEffectInputs(r);
@@ -708,7 +714,8 @@ NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32
     }
     if(mode && !NativeTransparentKeyDrawn(item.key)) { ++out.undrawn_keys; continue; }
     item.draws=BuildNativeEffectDraws(r,object,item.type,in);
-    CommitNativeEffectDraw(r,item);
+    if(commit) CommitNativeEffectDraw(r,item);
+    else if(item.type==NativeEffectClass::EffectEtc02) ++out.held;
     (mode?out.items:out.immediate).push_back(std::move(item));
   }
   std::stable_sort(out.items.begin(),out.items.end(),[](const NativeEffectItem& a,const NativeEffectItem& b) {
@@ -731,8 +738,8 @@ std::vector<NativeTransparentItem> NativeEffectTransparentItems(std::vector<Nati
 }
 template<class Reader>
 NativeEffectCollection CollectNativeEffectManager(const Reader& r,uint32_t manager,uint32_t context,uint32_t& order,
-                                                  std::unordered_set<uint32_t>* visited=nullptr) {
+                                                  std::unordered_set<uint32_t>* visited=nullptr,bool commit=true) {
   if(r.Word(manager)!=NativeEffectList::manager_vtable) throw std::runtime_error("not a clEffectObjectManager");
-  return CollectNativeEffects(r,r.Add(manager,NativeEffectList::manager_offset),context,order,visited);
+  return CollectNativeEffects(r,r.Add(manager,NativeEffectList::manager_offset),context,order,visited,commit);
 }
 }

@@ -190,14 +190,21 @@ bool NativePostOwnResolveAllowed(const NativePostDraw& draw) {
     draw.kind==PostPassKind::DownsampleTone || draw.kind==PostPassKind::BlurHorizontal;
 }
 
-NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& input,const NativePostTone& tone) {
+NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& input,const NativePostTone& tone,
+                                 NativePostHistory history) {
   auto in=input; in.tone=tone.Scalars(); in.tone_source=PostToneSource::SharedPool;
   auto frame=BuildNativePostFrame(BuildPostFinishPlan(in),tone);
-  for(const auto& draw:frame.draws) sink.Draw(draw);
+  for(const auto& draw:frame.draws) {
+    if(history==NativePostHistory::Hold && draw.kind==PostPassKind::DownsampleTone && sink.HasToneHistory(draw)) {
+      frame.history_held=true;
+      continue;
+    }
+    sink.Draw(draw);
+  }
   return frame;
 }
-NativePostFrame RecordNativePost(NativePostSink& sink,const PostGuestMemory& memory,uint32_t self) {
+NativePostFrame RecordNativePost(NativePostSink& sink,const PostGuestMemory& memory,uint32_t self,NativePostHistory history) {
   const auto tone=ReadNativePostTone(memory);
-  return RecordNativePost(sink,ReadNativePostInput(memory,self,tone),tone);
+  return RecordNativePost(sink,ReadNativePostInput(memory,self,tone),tone,history);
 }
 }

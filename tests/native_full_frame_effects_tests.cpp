@@ -1,4 +1,5 @@
 #include "native_graphics/native_full_frame_effects.h"
+#include "native_graphics/native_frame_motion.h"
 #include "native_graphics/native_transparent_items.h"
 #include <algorithm>
 #include <array>
@@ -837,6 +838,50 @@ void TestCollection() {
             "merged sequence "+std::to_string(i));
   // A, C, B, E (filed, never drawn), I and J (filed; no builder): six.
   Require(order==40+6,"one filing number per keyed object that reached sub_821C0C00");
+  // Per-tick commits: the pass passes NativeFrameInputs::tick_frame (NativeTickGate)
+  // as `commit`. Locked, every render decrements +612 (unchanged); unlocked at
+  // two renders per tick, once per tick; the draws are built the same either way.
+  {
+    const auto collect=[&](bool commit) {
+      uint32_t filing=0;
+      std::unordered_set<uint32_t> seen;
+      return CollectNativeEffectManager(m,manager,context,filing,&seen,commit);
+    };
+    const auto signature=[](const NativeEffectCollection& c) {
+      std::vector<std::pair<uint32_t,size_t>> out;
+      for(const auto* list:{&c.items,&c.immediate})
+        for(const auto& item:*list) for(const auto& draw:item.draws) out.emplace_back(item.object,draw.vertex_count());
+      return out;
+    };
+    const auto defaulted=[&] { uint32_t filing=0; std::unordered_set<uint32_t> seen; return CollectNativeEffectManager(m,manager,context,filing,&seen); };
+    m.StoreWord(objects[7]+612,20);
+    const auto reference=defaulted();
+    Require(m.Word(objects[7]+612)==19 && reference.held==0,"the default commits, as before");
+    m.StoreWord(objects[7]+612,20);
+    NativeTickGate locked;
+    for(uint64_t tick=1;tick<=4;++tick) {
+      const auto c=collect(locked.Advance(MakeNativeFrameMotion(false,1,tick,1,1,true)));
+      Require(c.held==0 && signature(c)==signature(reference),"locked frames commit and draw as before");
+    }
+    Require(m.Word(objects[7]+612)==16,"locked: one +612 decrement per render");
+    m.StoreWord(objects[7]+612,20);
+    NativeTickGate unlocked;
+    struct Frame { uint64_t tick; uint32_t steps; bool advances; };
+    const Frame frames[]={{1,1,true},{1,0,false},{2,1,true},{2,0,false},{4,2,true},{4,0,false},{4,0,false},{5,1,true},{5,1,false}};
+    uint32_t held=0;
+    for(const auto& f:frames) {
+      const bool tick_frame=unlocked.Advance(MakeNativeFrameMotion(true,1,f.tick,f.steps?0.f:.5f,f.steps,true));
+      Require(tick_frame==f.advances,"unlocked gate at tick "+std::to_string(f.tick));
+      const auto c=collect(tick_frame);
+      Require(signature(c)==signature(reference),"a held frame draws what a committing one does");
+      held+=c.held;
+    }
+    // Four tick frames (a two-step catch-up counts once, as a locked render
+    // after one does; a repeated budget does not count again).
+    Require(m.Word(objects[7]+612)==16,"unlocked: one +612 decrement per tick");
+    Require(held==5,"the five render-only frames each withheld the one drawn clEffectEtc02");
+    Require(m.Word(objects[10]+612)==5,"a culled clEffectEtc02 never decrements");
+  }
 }
 }
 // The recording activates a run of adjacent draws once when this holds: it
