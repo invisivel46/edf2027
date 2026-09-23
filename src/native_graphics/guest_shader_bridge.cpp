@@ -14041,14 +14041,18 @@ REX_HOOK_RAW(sub_821FD8F8) {
         // device+(112+register)*16 / device+(368+register)*16 respectively.
         auto registers=[&](uint32_t offset,size_t bytes) {return std::span<const uint8_t>{reader.Bytes(reader.Add(ctx.r3.u32,offset),bytes),bytes};};
         const auto& movie_plan=*state.movie_bindings[movie_sd?1:0];
-        // On an output that is not 16:9 a full-screen (or canvas-placed) movie
-        // is fitted into the centred 16:9 rectangle (native_canvas_constants.h).
+        // At any size but 1280x720 a full-screen (or canvas-placed) movie is
+        // fitted into the centred 16:9 rectangle, the whole target on 16:9
+        // (native_canvas_constants.h), moved onto host pixel edges by the
+        // guest's half-pixel convention.
+        const float movie_center=REXCVAR_GET(edf_native_pixel_centers)?
+          edf::native::GuestPixelCenterOffset(edf::native::ReadVertexCenterWord(reader,ctx.r3.u32)):0.0f;
         const auto movie_layout=edf::native::MapNativeMovieRegisters(registers(1792,160),
-          {reader.Bytes(ctx.r6.u32,64),64},scene.output.sampled.width,scene.output.sampled.height);
+          {reader.Bytes(ctx.r6.u32,64),64},scene.output.sampled.width,scene.output.sampled.height,movie_center);
         if(movie_layout.framing!=edf::native::NativeMovieFraming::Unchanged && state.movie_draws<3)
-          REXLOG_INFO("Native movie framing: {} into the 16:9 area of {}x{}",
+          REXLOG_INFO("Native movie framing: {} into the 16:9 area of {}x{} (pixel centre {})",
             movie_layout.framing==edf::native::NativeMovieFraming::FullTarget?"full-target quad":"canvas quad",
-            scene.output.sampled.width,scene.output.sampled.height);
+            scene.output.sampled.width,scene.output.sampled.height,movie_center);
         movie_plan.SetConstants(*state.movie_vertex,movie_pixel,movie_layout.registers,registers(5888,16));
         movie_pixel.ClearTextures(); movie_pixel.ClearSamplers();
         for(uint32_t i=0;i<3;++i) {

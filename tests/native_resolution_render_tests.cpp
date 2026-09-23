@@ -1,7 +1,8 @@
 // WARP render tests at sizes other than 1280x720 (native_display_layout.h):
 // the 2D canvas layout and its scissor rasterized through the Utility and XUI
 // constant forms, and the presenter's fit and filters, at 1366x768, 2560x1080,
-// 1024x768 and 1920x1080 on the D3D12 backend.
+// 1024x768 and 1920x1080 on the D3D12 backend, and the movie quad
+// (MapNativeMovieRegisters) at 16:9 sizes above and below 720p and odd sizes.
 #include "native_graphics/native_backend_compositor.h"
 #include "native_graphics/native_canvas_constants.h"
 #include "native_graphics/native_display_layout.h"
@@ -29,7 +30,10 @@ cbuffer Canvas : register(b0) {
   float2 _g_DX2DScale; float2 _g_DX2DOffset;
   float4 ProjectionRows[4];
   float4 color;
-  uint4 mode;            // x: 0 Utility, 1 XUI
+  uint4 mode;            // x: 0 Utility, 1 XUI, 2 VS_Movie
+  float4 TransformRows[4];
+  float4 MovieProjection[4];
+  float4 Params;
 };
 struct V { float4 position:SV_POSITION; };
 V VS(uint id:SV_VertexID) {
@@ -38,7 +42,14 @@ V VS(uint id:SV_VertexID) {
   float2 p=float2((c&1)?corners.z:corners.x,(c&2)?corners.w:corners.y);
   V v;
   if(mode.x==0) v.position=float4(p*_g_DX2DScale+_g_DX2DOffset,0,1);
-  else {
+  else if(mode.x==2) {
+    // movie_effect.cpp's VS_Movie.
+    float3 q=float3(p,1);
+    float3 t=float3(dot(TransformRows[0].xyw,q),dot(TransformRows[1].xyw,q),dot(TransformRows[3].xyw,q));
+    v.position=float4(dot(t,MovieProjection[0].xyw),dot(t,MovieProjection[1].xyw),
+                      dot(t,MovieProjection[2].xyw),dot(t,MovieProjection[3].xyw));
+    v.position+=Params.x*float4(MovieProjection[0].z,MovieProjection[1].z,MovieProjection[2].z,MovieProjection[3].z);
+  } else {
     float3 t=float3(p,1);
     v.position=float4(dot(t,ProjectionRows[0].xyw),dot(t,ProjectionRows[1].xyw),
                       dot(t,ProjectionRows[2].xyw),dot(t,ProjectionRows[3].xyw));
@@ -59,6 +70,7 @@ struct Constants {
   float projection[16];
   float color[4];
   uint32_t mode[4];
+  float movie[36];  // TransformRows, ProjectionRows, Params
 };
 struct Canvas {
   NativeRenderBackend& backend;
@@ -146,6 +158,69 @@ Constants Xui(uint32_t width,uint32_t height,const NativeClipAffine& affine,std:
   c.color[0]=c.color[1]=c.color[2]=c.color[3]=1;
   c.mode[0]=1;
   return c;
+}
+// The movie: VS_Movie's register block as the logo draws it (identity
+// TransformRows, the target's viewport ortho in ProjectionRows) and a quad in
+// canvas pixels on the guest's pixel edges, through MapNativeMovieRegisters as
+// the movie hook does.
+std::vector<uint8_t> GuestMovieRegisters(uint32_t width,uint32_t height) {
+  const float values[40]{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1,
+                         2.0f/float(width),0,0,-1, 0,-2.0f/float(height),0,1, 0,0,1,0, 0,0,0,1,
+                         0,0,0,0, 0,0,0,0};
+  std::vector<uint8_t> out(160);
+  for(size_t i=0;i<40;++i) StoreNativeGuestFloat(out,i*4,values[i]);
+  return out;
+}
+std::vector<uint8_t> GuestMovieQuad(float x0,float y0,float x1,float y1) {
+  const float values[16]{x0,y0,0,0, x1,y0,1,0, x0,y1,0,1, x1,y1,1,1};
+  std::vector<uint8_t> out(64);
+  for(size_t i=0;i<16;++i) StoreNativeGuestFloat(out,i*4,values[i]);
+  return out;
+}
+Constants Movie(const std::array<uint8_t,160>& registers,std::array<float,4> corners) {
+  Constants c{};
+  std::memcpy(c.corners,corners.data(),16);
+  for(size_t i=0;i<36;++i) c.movie[i]=NativeGuestFloatAt(registers,i*4);
+  c.color[0]=c.color[1]=c.color[2]=c.color[3]=1;
+  c.mode[0]=2;
+  return c;
+}
+void MovieTests(NativeRenderBackend& backend) {
+  Canvas canvas(backend);
+  const float center=0.5f;  // pix_center kD3DZero, the device default
+  const std::array<float,4> corners{-center,-center,1280-center,720-center};
+  const auto quad=GuestMovieQuad(corners[0],corners[1],corners[2],corners[3]);
+  const std::pair<uint32_t,uint32_t> sizes[]{{2560,1440},{3840,2160},{1920,1080},{2560,1080},{1366,768},
+                                             {1024,576},{1024,768},{1706,720}};
+  for(const auto [width,height]:sizes) {
+    const std::string at=std::to_string(width)+"x"+std::to_string(height);
+    const auto layout=MapNativeMovieRegisters(GuestMovieRegisters(width,height),quad,width,height,center);
+    Require(layout.framing==NativeMovieFraming::Canvas,"movie "+at+" not framed as a canvas quad");
+    // Exactly the centred 16:9 rectangle (the whole target on 16:9); the
+    // rest of the target keeps its black clear.
+    const auto rect=PixelRect(NativeHudCanvasRect(width,height,NativeHudSafeArea::Console));
+    const auto image=Render(canvas,width,height,{{Movie(layout.registers,corners),{}}});
+    RequireRect(image,rect,"movie "+at);
+    size_t bars=0;
+    for(uint32_t y=0;y<height;++y) for(uint32_t x=0;x<width;++x) {
+      const bool inside=int32_t(x)>=rect[0] && int32_t(x)<rect[2] && int32_t(y)>=rect[1] && int32_t(y)<rect[3];
+      const auto* p=&image.rgba[(size_t(y)*width+x)*4];
+      if(!inside && (p[0]|p[1]|p[2])) ++bars;
+    }
+    Require(bars==0,"movie "+at+": "+std::to_string(bars)+" bar pixels not black");
+  }
+  // 1280x720: the registers are the game's, byte for byte, and so is the image.
+  {
+    const auto registers=GuestMovieRegisters(1280,720);
+    const auto layout=MapNativeMovieRegisters(registers,quad,1280,720,center);
+    Require(layout.framing==NativeMovieFraming::Unchanged &&
+            std::memcmp(layout.registers.data(),registers.data(),160)==0,"movie 1280x720 registers changed");
+    std::array<uint8_t,160> raw{};
+    std::memcpy(raw.data(),registers.data(),160);
+    Require(Render(canvas,1280,720,{{Movie(layout.registers,corners),{}}}).rgba==
+            Render(canvas,1280,720,{{Movie(raw,corners),{}}}).rgba,"movie 1280x720 image changed");
+  }
+  std::cout<<"Movie fit WARP tests passed\n";
 }
 
 void CanvasTests(NativeRenderBackend& backend) {
@@ -266,6 +341,7 @@ int main() {
     NativeD3D12Options options{}; options.prefer_warp=true; options.debug_layer=true;
     auto backend=CreateNativeD3D12Backend(options);
     CanvasTests(*backend);
+    MovieTests(*backend);
     PresenterTests(*backend);
   } catch(const std::exception& error) { std::cerr<<error.what()<<'\n'; return 1; }
   return 0;

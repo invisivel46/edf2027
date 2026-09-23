@@ -119,12 +119,23 @@ inline NativeClipBounds NativeXuiClipBounds(std::span<const uint8_t> registers,s
   }
   return bounds;
 }
-// Movie framing on a target that is not 16:9. The movie quad (four float2
-// position + float2 UV vertices, VS_Movie: TransformRows then ProjectionRows,
-// plus Params.x times the projection's z column) is placed by the game either
-// over the whole target or, like XUI, in 1280x720 canvas pixels at the top
-// left. Either way it is fitted into the centred 16:9 rectangle: a movie is
-// pillarboxed or letterboxed, never stretched. Anything else is left alone.
+// Movie framing at any render size other than the engine's 1280x720. The movie
+// quad (four float2 position + float2 UV vertices, VS_Movie: TransformRows then
+// ProjectionRows, plus Params.x times the projection's z column) is placed by
+// the game either over the whole target or, like XUI, in 1280x720 canvas pixels
+// at the top left (the startup logo does this: at 2560x1440 it filled only the
+// top-left 1280x720). Either way it is fitted into the centred 16:9 rectangle,
+// the same one edf_hud_safe_area=16:9 gives the canvas: uniformly scaled,
+// pillarboxed or letterboxed, never stretched or cropped. On a 16:9 target the
+// rectangle is the whole target, so a canvas quad is scaled to fill it. A quad
+// that already fills the target as drawn (1280x720, or a full-target quad on
+// 16:9) and anything that is neither kind is left alone, byte for byte.
+//
+// pixel_center: the guest's PA_SU_VTX_CNTL half-pixel offset (0.5 under
+// pix_center kD3DZero, GuestPixelCenterOffset). The game's quad sits on its
+// target's pixel edges in that convention (-0.5 .. 1279.5); a remapped quad is
+// moved onto the host's edges first, so the scaled picture covers the whole
+// rectangle and does not bleed a column into the bars.
 enum class NativeMovieFraming:uint8_t { Unchanged,FullTarget,Canvas };
 struct NativeMovieLayout {
   std::array<uint8_t,160> registers{};
@@ -154,11 +165,12 @@ inline NativeClipBounds NativeMovieClipBounds(std::span<const uint8_t> registers
   return bounds;
 }
 inline NativeMovieLayout MapNativeMovieRegisters(std::span<const uint8_t> registers,std::span<const uint8_t> vertices,
-                                                 uint32_t width,uint32_t height) {
+                                                 uint32_t width,uint32_t height,float pixel_center=0.0f) {
   NativeMovieLayout layout;
   if(registers.size()!=160) throw std::runtime_error("invalid native movie register block");
   for(size_t i=0;i<160;++i) layout.registers[i]=registers[i];
-  if(!width || !height || IsConsoleAspect(width,height)) return layout;
+  if(!width || !height || (width==uint32_t(kNativeCanvasWidth) && height==uint32_t(kNativeCanvasHeight))) return layout;
+  if(!std::isfinite(pixel_center)) pixel_center=0.0f;
   const auto bounds=NativeMovieClipBounds(registers,vertices);
   if(!bounds.valid) return layout;
   // Tolerance: two target pixels.
@@ -175,11 +187,17 @@ inline NativeMovieLayout MapNativeMovieRegisters(std::span<const uint8_t> regist
     sx=float(width)/kNativeCanvasWidth; sy=float(height)/kNativeCanvasHeight;
   } else return layout;
   const auto affine=NativeHudClipAffine(width,height,NativeHudSafeArea::Console);
+  // Already where the fitted picture goes (a full-target quad on 16:9).
+  if(sx==1 && sy==1 && affine.identity()) { layout.framing=NativeMovieFraming::Unchanged; return layout; }
+  // Half a guest target pixel in clip space (x right, y up), added per
+  // homogeneous w.
+  const float cx=2.0f*pixel_center/float(width),cy=-2.0f*pixel_center/float(height);
   std::array<float,16> p{};
   for(size_t i=0;i<16;++i) p[i]=NativeGuestFloatAt(registers,64+i*4);
   for(size_t i=0;i<4;++i) {
+    const float px=p[i]+cx*p[12+i],py=p[4+i]+cy*p[12+i];
     // The canvas case first takes XUI's top-left canvas mapping to the whole target.
-    const float x=sx*p[i]+(sx-1)*p[12+i],y=sy*p[4+i]+(1-sy)*p[12+i];
+    const float x=sx*px+(sx-1)*p[12+i],y=sy*py+(1-sy)*p[12+i];
     p[i]=affine.ax*x+affine.bx*p[12+i];
     p[4+i]=affine.ay*y+affine.by*p[12+i];
   }

@@ -294,6 +294,81 @@ void TestMovieFraming() {
     CHECK(layout.framing==NativeMovieFraming::Unchanged);
   }
 }
+// The startup logo as the game draws it: a canvas-pixel quad on the guest's
+// pixel edges (-0.5 .. 1279.5 under pix_center kD3DZero), projected with the
+// target's own viewport ortho. At 2560x1440 it used to stay 1280x720 in the
+// top-left quarter (16:9 targets were skipped). Every size now places it on
+// the centred 16:9 rectangle: centred, uniformly scaled, and on 16:9 covering
+// the whole target; 1280x720 is untouched.
+void TestMovieFit() {
+  // Target pixels of a clip-space rectangle.
+  const auto pixels=[](const NativeClipBounds& b,uint32_t width,uint32_t height) {
+    return std::array<double,4>{(b.min_x+1)*0.5*width,(1-b.max_y)*0.5*height,(b.max_x+1)*0.5*width,(1-b.min_y)*0.5*height};
+  };
+  struct Case { uint32_t width,height; };
+  for(const auto [width,height]:{Case{2560,1440},{3840,2160},{1920,1080},{2560,1080},{1366,768},
+                                   {1024,576},{1706,720},{1024,768},{5120,1440},{641,481}}) {
+    const auto rect=NativeHudCanvasRect(width,height,NativeHudSafeArea::Console);
+    const auto registers=MovieRegisters(width,height,true);
+    for(const float center:{0.5f,0.0f}) {
+      const auto quad=MovieQuad(-center,-center,1280-center,720-center);
+      const auto layout=MapNativeMovieRegisters(registers,quad,width,height,center);
+      CHECK(layout.framing==NativeMovieFraming::Canvas);
+      // Back on the host's pixel edges: the vertices shifted by the half pixel
+      // in canvas units land exactly on the rectangle.
+      const auto bounds=NativeMovieClipBounds(layout.registers,quad);
+      CHECK(bounds.valid);
+      const auto p=pixels(bounds,width,height);
+      const double tolerance=0.01;
+      const bool placed=Near(p[0],rect.x,tolerance) && Near(p[1],rect.y,tolerance) &&
+                        Near(p[2],rect.x+rect.width,tolerance) && Near(p[3],rect.y+rect.height,tolerance);
+      CHECK(placed);
+      if(!placed) std::cerr<<"  movie "<<width<<"x"<<height<<" centre "<<center<<": "<<p[0]<<","<<p[1]<<" - "
+                           <<p[2]<<","<<p[3]<<"\n";
+      // Centred (the bars differ by at most one pixel) and uniformly scaled
+      // (the two axes' scales agree to within the one-pixel rounding).
+      CHECK(std::abs((p[0])-(double(width)-p[2]))<=1.0+tolerance);
+      CHECK(std::abs((p[1])-(double(height)-p[3]))<=1.0+tolerance);
+      CHECK(Near((p[2]-p[0])/1280.0,(p[3]-p[1])/720.0,1.0/720.0));
+      // 16:9: the whole target is covered, no bars.
+      if(IsConsoleAspect(width,height))
+        CHECK(Near(p[0],0,tolerance) && Near(p[1],0,tolerance) && Near(p[2],width,tolerance) && Near(p[3],height,tolerance));
+      // The half pixel is canvas-space: with the shift the picture's centre
+      // is the rectangle's centre exactly.
+      CHECK(Near((p[0]+p[2])*0.5,rect.x+rect.width*0.5,tolerance));
+      // Only the projection rows change.
+      CHECK(std::memcmp(layout.registers.data(),registers.data(),64)==0);
+      CHECK(std::memcmp(layout.registers.data()+128,registers.data()+128,32)==0);
+    }
+  }
+  // Explicit sizes from the logo capture: 2560x1440 fills 0..2560 (it filled
+  // 0..1280 before), 2560x1080 pillarboxes at 320..2240 with no column
+  // across the bar edge.
+  {
+    const auto quad=MovieQuad(-0.5f,-0.5f,1279.5f,719.5f);
+    const auto wide=NativeMovieClipBounds(MapNativeMovieRegisters(MovieRegisters(2560,1440,true),quad,2560,1440,0.5f).registers,quad);
+    CHECK(Near(wide.min_x,-1) && Near(wide.max_x,1) && Near(wide.min_y,-1) && Near(wide.max_y,1));
+    const auto ultra=NativeMovieClipBounds(MapNativeMovieRegisters(MovieRegisters(2560,1080,true),quad,2560,1080,0.5f).registers,quad);
+    CHECK(Near((ultra.min_x+1)*1280,320,1e-2) && Near((ultra.max_x+1)*1280,2240,1e-2));
+  }
+  // 1280x720 is the identity, byte for byte, for either quad and any pixel
+  // centre; a full-target quad on a 16:9 target is already fitted.
+  for(const bool canvas:{true,false}) {
+    const auto registers=MovieRegisters(1280,720,canvas);
+    const auto quad=canvas?MovieQuad(-0.5f,-0.5f,1279.5f,719.5f):MovieQuad(-1,1,1,-1);
+    for(const float center:{0.5f,0.0f}) {
+      const auto layout=MapNativeMovieRegisters(registers,quad,1280,720,center);
+      CHECK(layout.framing==NativeMovieFraming::Unchanged);
+      CHECK(std::memcmp(layout.registers.data(),registers.data(),160)==0);
+    }
+  }
+  for(const auto [width,height]:{std::pair{1920u,1080u},{2560u,1440u},{3840u,2160u}}) {
+    const auto registers=MovieRegisters(width,height,false);
+    const auto layout=MapNativeMovieRegisters(registers,MovieQuad(-1,1,1,-1),width,height,0.5f);
+    CHECK(layout.framing==NativeMovieFraming::Unchanged);
+    CHECK(std::memcmp(layout.registers.data(),registers.data(),160)==0);
+  }
+}
 
 // ---- Presentation ----------------------------------------------------------------------
 void TestPresentFit() {
@@ -445,6 +520,7 @@ int main() {
   TestCanvasLayout();
   TestCanvasDrawAndScissor();
   TestMovieFraming();
+  TestMovieFit();
   TestPresentFit();
   TestPostPyramid();
   if(failures) { std::cerr<<failures<<" display layout check(s) failed\n"; return 1; }
