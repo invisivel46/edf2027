@@ -1,13 +1,153 @@
 #include "d3d11_effect.h"
+#include "native_disk_cache.h"
 #include "native_frame_times.h"
 #include <d3dcompiler.h>
+#include <atomic>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <regex>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace edf::native {
 namespace {
+// The bytecode cache behind CompileNativeShader (see d3d11_effect.h).
+struct ShaderCache {
+  std::mutex mutex;
+  std::unordered_map<std::string,std::shared_ptr<const std::vector<uint8_t>>> memory;
+  std::optional<std::string> compiler_override;
+  std::atomic<uint64_t> compiles{0},memory_hits{0},disk_hits{0},disk_stores{0},disk_rejects{0},unkeyed{0};
+};
+ShaderCache& Shaders() { static ShaderCache cache; return cache; }
+constexpr char kShaderFileMagic[8]={'E','D','F','D','X','B','C','1'};
+constexpr size_t kShaderFileLimit=16u<<20;
+
+std::string CompilerIdentity() {
+  auto& cache=Shaders();
+  {
+    std::lock_guard lock(cache.mutex);
+    if(cache.compiler_override) return *cache.compiler_override;
+  }
+  static const std::string identity=NativeModuleIdentity(L"d3dcompiler_47.dll");
+  return identity;
+}
+// The key is taken over the preprocessed text rather than the source plus a
+// list of includes: preprocessing is what the compiler itself consumes, so a
+// changed include, a changed define or the Common.fx adaptation all reach it
+// without this code having to know which files were opened.
+std::optional<NativeContentHash> ShaderKey(const std::string& source,const std::string& source_name,
+    const D3D_SHADER_MACRO* defines,ID3DInclude* includes,const char* entry,const char* target,UINT flags) {
+  Microsoft::WRL::ComPtr<ID3DBlob> preprocessed,errors;
+  if(FAILED(D3DPreprocess(source.data(),source.size(),source_name.c_str(),defines,includes,&preprocessed,&errors)) ||
+     !preprocessed)
+    return std::nullopt;
+  NativeSha256 hash;
+  hash.AddField(std::string_view("edf-native-shader-v1"));
+  hash.AddField(std::string_view(CompilerIdentity()));
+  hash.AddField(std::string_view(target));
+  hash.AddField(std::string_view(entry));
+  hash.AddU32(flags);
+  for(const auto* define=defines;define && define->Name;++define) {
+    hash.AddField(std::string_view(define->Name));
+    hash.AddField(std::string_view(define->Definition?define->Definition:""));
+  }
+  hash.AddField(std::span<const uint8_t>(static_cast<const uint8_t*>(preprocessed->GetBufferPointer()),
+                                         preprocessed->GetBufferSize()));
+  return hash.Finish();
+}
+std::filesystem::path ShaderFile(const NativeContentHash& key) {
+  const auto directory=NativeCacheDirectory();
+  if(directory.empty()) return {};
+  return directory/"shaders"/(NativeHashHex(key)+".dxbc");
+}
+std::shared_ptr<const std::vector<uint8_t>> LoadShaderFile(const NativeContentHash& key) {
+  const auto path=ShaderFile(key);
+  if(path.empty()) return nullptr;
+  const auto file=NativeReadCacheFile(path,kShaderFileLimit);
+  if(!file) return nullptr;
+  try {
+    NativeCacheReader reader(*file);
+    char magic[sizeof(kShaderFileMagic)];
+    reader.Bytes(magic,sizeof(magic));
+    if(std::memcmp(magic,kShaderFileMagic,sizeof(magic)) || reader.Hash()!=key)
+      throw NativeCacheFormatError("foreign shader cache file");
+    const auto digest=reader.Hash();
+    auto payload=reader.Blob(kShaderFileLimit);
+    if(reader.remaining() || payload.empty() || NativeSha256Of(payload)!=digest)
+      throw NativeCacheFormatError("shader cache payload does not match its digest");
+    return std::make_shared<const std::vector<uint8_t>>(std::move(payload));
+  } catch(const NativeCacheFormatError&) {
+    ++Shaders().disk_rejects;
+    return nullptr;
+  }
+}
+void StoreShaderFile(const NativeContentHash& key,std::span<const uint8_t> bytecode) {
+  const auto path=ShaderFile(key);
+  if(path.empty()) return;
+  NativeCacheWriter writer;
+  writer.Bytes(kShaderFileMagic,sizeof(kShaderFileMagic));
+  writer.Hash(key);
+  writer.Hash(NativeSha256Of(bytecode));
+  writer.Blob(bytecode);
+  if(NativeWriteCacheFile(path,writer.bytes())) ++Shaders().disk_stores;
+}
+Microsoft::WRL::ComPtr<ID3DBlob> BlobOf(std::span<const uint8_t> bytes) {
+  Microsoft::WRL::ComPtr<ID3DBlob> blob;
+  if(FAILED(D3DCreateBlob(bytes.size(),&blob))) throw std::runtime_error("shader blob allocation failed");
+  std::memcpy(blob->GetBufferPointer(),bytes.data(),bytes.size());
+  return blob;
+}
+// D3DCompile with the cache in front. The compile itself is called exactly as
+// it was before the cache existed, so a miss produces the bytes it always did.
+HRESULT CompileCached(const std::string& source,const std::string& source_name,const D3D_SHADER_MACRO* defines,
+    ID3DInclude* includes,const char* entry,const char* target,UINT flags,
+    Microsoft::WRL::ComPtr<ID3DBlob>& bytecode,Microsoft::WRL::ComPtr<ID3DBlob>& errors) {
+  auto& cache=Shaders();
+  const auto key=ShaderKey(source,source_name,defines,includes,entry,target,flags);
+  if(key) {
+    const auto hex=NativeHashHex(*key);
+    std::shared_ptr<const std::vector<uint8_t>> found;
+    {
+      std::lock_guard lock(cache.mutex);
+      if(const auto entry_found=cache.memory.find(hex);entry_found!=cache.memory.end()) found=entry_found->second;
+    }
+    if(found) {
+      ++cache.memory_hits;
+      FrameEventCounters().shader_cache_hits.fetch_add(1,std::memory_order_relaxed);
+      bytecode=BlobOf(*found);
+      return S_OK;
+    }
+    if((found=LoadShaderFile(*key))) {
+      ++cache.disk_hits;
+      FrameEventCounters().shader_cache_hits.fetch_add(1,std::memory_order_relaxed);
+      {
+        std::lock_guard lock(cache.mutex);
+        cache.memory.emplace(hex,found);
+      }
+      bytecode=BlobOf(*found);
+      return S_OK;
+    }
+  } else {
+    ++cache.unkeyed;
+  }
+  // Attribution for edf_native_frame_times: a compile mid-gameplay is a hitch.
+  FrameEventCounters().shader_compiles.fetch_add(1,std::memory_order_relaxed);
+  ++cache.compiles;
+  const HRESULT result=D3DCompile(source.data(),source.size(),source_name.c_str(),defines,includes,entry,target,
+                                  flags,0,&bytecode,&errors);
+  if(FAILED(result) || !bytecode || !key) return result;
+  const std::span<const uint8_t> bytes(static_cast<const uint8_t*>(bytecode->GetBufferPointer()),
+                                       bytecode->GetBufferSize());
+  {
+    std::lock_guard lock(cache.mutex);
+    cache.memory.emplace(NativeHashHex(*key),std::make_shared<const std::vector<uint8_t>>(bytes.begin(),bytes.end()));
+  }
+  StoreShaderFile(*key,bytes);
+  return result;
+}
 std::string AdaptNormalReconstruction(std::string source) {
   // BC3/DXT5 normal XY is quantized independently, so its squared length can
   // exceed one. Reconstruct the positive hemisphere at its boundary instead
@@ -94,8 +234,6 @@ NativeShader CompileNativeShader(ID3D11Device& device,const Effect& effect,const
 NativeShader CompileNativeShader(ID3D11Device* device, const Effect& effect,
                                  const ShaderEntry& entry,
                                  const std::filesystem::path& source_path,bool reverse_depth) {
-  // Attribution for edf_native_frame_times: a compile mid-gameplay is a hitch.
-  FrameEventCounters().shader_compiles.fetch_add(1,std::memory_order_relaxed);
   NativeShader result;
   result.entry = entry;
   result.source_fingerprint=EffectSourceFingerprint(effect.source);
@@ -157,10 +295,11 @@ float4 EdfNativeNormalize(float4 v) { if(dot(v,v)==0) return 0; return normalize
       ".z; return edf_native_result; }\n";
   }
   const char* target = entry.pixel ? "ps_5_0" : "vs_5_0";
-  HRESULT hr = D3DCompile(source.data(), source.size(), source_path.string().c_str(),
-                          defines, &includes, compile_entry.c_str(), target,
-                          D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_OPTIMIZATION_LEVEL3,
-                          0, &result.bytecode, &errors);
+  // Counted in shader_compiles only when the compiler really runs; a cache
+  // hit is counted in shader_cache_hits instead.
+  HRESULT hr = CompileCached(source, source_path.string(), defines, &includes, compile_entry.c_str(), target,
+                             D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                             result.bytecode, errors);
   if (FAILED(hr)) {
     std::string message = "native compilation failed: " + source_path.filename().string() + ':' + entry.name;
     if (errors && errors->GetBufferSize()) {
@@ -179,6 +318,23 @@ float4 EdfNativeNormalize(float4 v) { if(dot(v,v)==0) return 0; return normalize
     hr = device->CreateVertexShader(result.bytecode->GetBufferPointer(), result.bytecode->GetBufferSize(), nullptr, &result.vertex);
   if (FAILED(hr)) throw std::runtime_error("native shader creation failed: " + entry.name);
   return result;
+}
+NativeShaderCacheStatistics GetNativeShaderCacheStatistics() {
+  auto& cache=Shaders();
+  NativeShaderCacheStatistics out;
+  out.compiles=cache.compiles; out.memory_hits=cache.memory_hits; out.disk_hits=cache.disk_hits;
+  out.disk_stores=cache.disk_stores; out.disk_rejects=cache.disk_rejects; out.unkeyed=cache.unkeyed;
+  return out;
+}
+void ClearNativeShaderMemoryCache() {
+  auto& cache=Shaders();
+  std::lock_guard lock(cache.mutex);
+  cache.memory.clear();
+}
+void SetNativeShaderCompilerIdentityForTesting(std::string identity) {
+  auto& cache=Shaders();
+  std::lock_guard lock(cache.mutex);
+  cache.compiler_override=std::move(identity);
 }
 bool AddNativeWorldInstancing(NativeShader& shader,const Effect& effect,
     const std::filesystem::path& source_path,bool reverse_depth,std::string* reason) {

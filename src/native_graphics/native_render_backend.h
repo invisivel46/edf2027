@@ -155,6 +155,19 @@ struct NativeBackendStatistics {
   // gameplay shows up here in the frame that paid for it. Texture bytes are
   // the initial contents handed over, not the allocation.
   uint64_t buffers_created=0,buffer_bytes_created=0,textures_created=0,texture_bytes_created=0;
+  // Of buffers_created, the ones that needed their own committed allocation
+  // (~170 us each on the measured GPU) and the ones placed in a pooled heap
+  // (~5 us each), and the pool's heaps.
+  uint64_t buffers_committed=0,buffers_placed=0,buffer_heaps=0,buffer_heap_bytes=0;
+  // The persistent pipeline manifest: pipelines built ahead on background
+  // threads; content hits, new draw states whose pipeline was already built
+  // (by a warmer, or earlier in the run under other shader ids) and so cost no
+  // build; and lookups that had to wait for a warmer's build in progress.
+  // pipeline_misses counts only builds made on the drawing thread.
+  uint64_t pipeline_prebuilt=0,pipeline_content_hits=0,pipeline_waits=0,pipeline_wait_ns=0;
+  uint64_t pipeline_manifest_entries=0;
+  // Sampler tables written ahead from the manifest.
+  uint64_t sampler_prewarmed=0;
 };
 
 enum class NativeBackendQueryKind : uint32_t { Occlusion, Timestamp, TimestampDisjoint };
@@ -450,6 +463,10 @@ class NativeRenderBackend {
   // Not pure: a backend with none of these concepts answers zeroes rather than
   // being forced to invent them.
   virtual NativeBackendStatistics Statistics() const { return {}; }
+  // One line on the persistent caches' state (manifest loaded or why not,
+  // prebuilt pipelines, pooled buffers), for the log. Empty when the backend
+  // has none.
+  virtual std::string DescribeCaches() const { return {}; }
   // The same for a sampled texture, on the same blocking terms. Separate
   // because a resolved scene is a texture and not a target, and a backend that
   // can only be read where it draws can only be checked where it draws.

@@ -1,4 +1,5 @@
 #include "d3d12_descriptors.h"
+#include <cstring>
 #include <cstdio>
 #include <stdexcept>
 
@@ -124,6 +125,14 @@ D3D12_GPU_DESCRIPTOR_HANDLE NativeD3D12SamplerCache::Table(std::span<const D3D12
     tables_.erase(oldest);
     ++evictions_;
   }
+  Write(samplers,index);
+  const D3D12_GPU_DESCRIPTOR_HANDLE table{gpu_start_.ptr+index*increment_};
+  tables_.emplace(std::move(key),Entry{table,index,used});
+  ++misses_;
+  return table;
+}
+
+void NativeD3D12SamplerCache::Write(std::span<const D3D12_SAMPLER_DESC> samplers,uint32_t index) {
   for(size_t slot=0;slot<samplers.size();++slot) {
     const D3D12_CPU_DESCRIPTOR_HANDLE at{cpu_start_.ptr+(index+slot)*increment_};
     device_->CreateSampler(&samplers[slot],at);
@@ -140,9 +149,31 @@ D3D12_GPU_DESCRIPTOR_HANDLE NativeD3D12SamplerCache::Table(std::span<const D3D12
                                       0.0f,1,D3D12_COMPARISON_FUNC_ALWAYS,{0,0,0,0},0.0f,0.0f};
     device_->CreateSampler(&fallback,at);
   }
-  const D3D12_GPU_DESCRIPTOR_HANDLE table{gpu_start_.ptr+index*increment_};
-  tables_.emplace(std::move(key),Entry{table,index,used});
-  ++misses_;
-  return table;
+}
+
+bool NativeD3D12SamplerCache::Prewarm(std::span<const D3D12_SAMPLER_DESC> samplers) {
+  std::lock_guard lock(mutex_);
+  if(samplers.size()>slots_per_table_ || tables_.size()>=max_tables_) return false;
+  std::string key(reinterpret_cast<const char*>(samplers.data()),samplers.size()*sizeof(D3D12_SAMPLER_DESC));
+  if(tables_.contains(key)) return false;
+  // Never-evicted tables occupy slots [0, size*width) contiguously; a heap
+  // that has evicted is full, which the size check above already refused.
+  const uint32_t index=static_cast<uint32_t>(tables_.size())*slots_per_table_;
+  Write(samplers,index);
+  tables_.emplace(std::move(key),Entry{{gpu_start_.ptr+index*increment_},index,0});
+  ++prewarmed_;
+  return true;
+}
+
+std::vector<std::vector<D3D12_SAMPLER_DESC>> NativeD3D12SamplerCache::Combinations() {
+  std::lock_guard lock(mutex_);
+  std::vector<std::vector<D3D12_SAMPLER_DESC>> out;
+  out.reserve(tables_.size());
+  for(const auto& [key,entry]:tables_) {
+    std::vector<D3D12_SAMPLER_DESC> combination(key.size()/sizeof(D3D12_SAMPLER_DESC));
+    std::memcpy(combination.data(),key.data(),key.size());
+    out.push_back(std::move(combination));
+  }
+  return out;
 }
 }  // namespace edf::native

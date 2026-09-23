@@ -1,6 +1,7 @@
 #pragma once
 #include "d3d12_device.h"
 #include "native_render_backend.h"
+#include <filesystem>
 #include <memory>
 
 namespace edf::native {
@@ -22,6 +23,12 @@ void SetNativeD3D12UploadMegabytes(uint32_t megabytes);
 // for finding a hang: the hang happens on hardware, and WARP is far too slow to
 // reach the part of the game where it happens.
 void SetNativeD3D12DebugLayer(bool enabled);
+// Where the scene backend keeps its persistent pipeline manifest
+// (d3d12_pipelines.bin, or d3d12_pipelines_warp.bin for WARP). Empty (the
+// default) keeps no manifest. Only the scene backend uses it: it is the one
+// that builds the game's pipelines, and one writer per file keeps two backends
+// from overwriting each other's.
+void SetNativeD3D12SceneCacheDirectory(std::filesystem::path directory);
 
 std::unique_ptr<NativeRenderBackend> CreateNativeD3D12Backend(const NativeD3D12Options& options={});
 }  // namespace edf::native

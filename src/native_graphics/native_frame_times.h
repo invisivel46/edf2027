@@ -96,7 +96,8 @@ class NativeFrameCounterDeltas {
 // they happen and read by the frame-time recorder. Relaxed: they are
 // attribution, not synchronization.
 struct NativeFrameEventCounters {
-  std::atomic<uint64_t> shader_compiles{0};  // CompileNativeShader calls.
+  std::atomic<uint64_t> shader_compiles{0};    // D3DCompile calls CompileNativeShader made.
+  std::atomic<uint64_t> shader_cache_hits{0};  // CompileNativeShader answered from its bytecode cache.
   std::atomic<uint64_t> pass_declines{0};    // Full-frame passes or items declined.
   std::atomic<uint64_t> post_fallbacks{0};   // Native post failed; guest finish stage ran.
 };

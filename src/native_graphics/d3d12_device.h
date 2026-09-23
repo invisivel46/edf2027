@@ -7,6 +7,7 @@
 #include <wrl/client.h>
 #include <cstdint>
 #include <memory>
+#include <filesystem>
 #include <functional>
 #include <string>
 #include <vector>
@@ -50,6 +51,18 @@ struct NativeD3D12Options {
   // Zero preserves direct recording. Positive values enable draw packets.
   uint32_t geometry_workers=0;
   uint32_t geometry_minimum_draws=32;
+  // Placed-buffer pool for fully initialised, non-dynamic buffers
+  // (NativeD3D12BufferPool). Zero heap bytes keeps every buffer committed.
+  // Reserved heaps are created with the backend, so a first burst of buffers
+  // does not pay for a heap either.
+  uint64_t buffer_pool_heap_bytes=16u<<20;
+  uint64_t buffer_pool_max_buffer_bytes=8u<<20;
+  uint32_t buffer_pool_reserve_heaps=0;
+  // Persistent pipeline manifest (NativeD3D12PipelineCache): read at
+  // construction, its pipelines prebuilt on this many background threads, and
+  // written back as the run adds to it. Empty: no manifest.
+  std::filesystem::path pipeline_manifest;
+  uint32_t pipeline_prewarm_threads=2;
 };
 
 class NativeD3D12Device {
@@ -68,6 +81,13 @@ class NativeD3D12Device {
   ID3D12GraphicsCommandList* preamble(uint32_t recorder) const { return preambles_.at(recorder).Get(); }
   uint32_t recorders() const { return static_cast<uint32_t>(lists_.size()); }
   const std::string& adapter_name() const { return adapter_name_; }
+  // PCI identity and user-mode driver version of the adapter, zero where the
+  // adapter would not say. Recorded in the pipeline manifest.
+  uint32_t adapter_vendor() const { return adapter_vendor_; }
+  uint32_t adapter_device() const { return adapter_device_; }
+  uint32_t adapter_subsystem() const { return adapter_subsystem_; }
+  uint32_t adapter_revision() const { return adapter_revision_; }
+  uint64_t adapter_driver() const { return adapter_driver_; }
   bool is_warp() const { return is_warp_; }
   // Whether the debug layer is actually validating. Asking for it and not
   // getting it (the Graphics Tools feature is not installed) must not read as
@@ -185,6 +205,8 @@ class NativeD3D12Device {
   std::vector<std::unique_ptr<NativeD3D12DescriptorRing>> views_;
   std::unique_ptr<NativeD3D12SamplerCache> samplers_;
   std::string adapter_name_;
+  uint32_t adapter_vendor_=0,adapter_device_=0,adapter_subsystem_=0,adapter_revision_=0;
+  uint64_t adapter_driver_=0;
   uint64_t next_fence_=0,frame_counter_=0,upload_stalls_=0,descriptor_stalls_=0;
   uint64_t frame_waits_=0,frame_wait_ns_=0;
   uint32_t open_frame_=0;
