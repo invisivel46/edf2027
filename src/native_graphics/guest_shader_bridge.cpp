@@ -7320,7 +7320,12 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       } catch(const std::exception&) { return std::nullopt; }
     };
     pass.census=NativeCoverageCensusOn();
-    pass.velocity=REXCVAR_GET(edf_native_motion_vectors);
+    // FSR implies motion vectors (MotionVectors records them for a jittered
+    // view), so its views list the moved models' velocity draws too: without
+    // them a moving soldier carries only the camera's motion and FSR's
+    // history trails behind it (ghosting on the first hardware run, where
+    // velocity_draws stayed 0 with edf_native_fsr=native_aa).
+    pass.velocity=REXCVAR_GET(edf_native_motion_vectors) || native_scene_draw_camera.has_value();
     auto& state=State();
     // The bridge locks in short holds (NativeLockSlices): the targets, each use
     // of the model pass caches (program, geometry) and each resolve with its

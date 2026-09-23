@@ -253,6 +253,11 @@ void TestHistoryRules() {
   const auto camera=MakeCamera({0,0,0},0,kPi/3,0.5,2000);
   Check(std::abs(camera.Near()-0.5f)<1e-4f && std::abs(camera.Far()-2000.f)<1.f && std::abs(camera.FovY()-float(kPi/3))<1e-5f,
         "near, far and fov from the projection");
+  // The game's right-handed form (821C82C0: P[2][2] = -f/(f-n), P[2][3] = -1).
+  auto right_handed=camera;
+  right_handed.projection[10]=-right_handed.projection[10]; right_handed.projection[11]=-1;
+  Check(std::abs(right_handed.Near()-0.5f)<1e-4f && std::abs(right_handed.Far()-2000.f)<1.f,
+        "near and far from a right-handed projection");
 }
 // The CPU reprojection against independent references: a world point
 // projected by both cameras, and a direction by both rotations.

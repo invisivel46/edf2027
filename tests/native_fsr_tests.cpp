@@ -163,6 +163,19 @@ void TestCameraParams() {
   const auto jittered=NativeFsrCameraFromProjectionWords(NativeFsrJitterGuestMatrix(words,0.001f,-0.002f));
   Check(jittered.derived && Near(jittered.near_plane,params.near_plane,1e-6f) && Near(jittered.fov_y,params.fov_y,1e-6f),
         "the jitter moved the camera parameters");
+  // The game's own shape, as 821C82C0 builds it: right-handed, P[2][2] =
+  // -f/(f-n), P[3][2] = -n f/(f-n), P[2][3] = -1 (the first hardware run
+  // logged the defaults for every dispatch because only P[2][3] = 1 derived).
+  std::array<float,16> rh{y*9/16,0,0,0, 0,y,0,0, 0,0,-(f/(f-n)),-1, 0,0,-(n*f/(f-n)),0};
+  const auto game=NativeFsrCameraFromProjection(rh);
+  Check(game.derived && Near(game.near_plane,n,1e-3f) && Near(game.far_plane,f,f*1e-3f) && Near(game.fov_y,fov,1e-5f),
+        "camera parameters from the game's right-handed projection: near="+std::to_string(game.near_plane)+" far="+
+        std::to_string(game.far_plane)+" fov="+std::to_string(game.fov_y));
+  // A reversed-Z matrix (P[2][2] = -n/(f-n), P[3][2] = n f/(f-n)): the same
+  // planes, in order.
+  std::array<float,16> reversed{y*9/16,0,0,0, 0,y,0,0, 0,0,-n/(f-n),1, 0,0,n*f/(f-n),0};
+  const auto flipped=NativeFsrCameraFromProjection(reversed);
+  Check(flipped.derived && Near(flipped.near_plane,n,1e-3f) && Near(flipped.far_plane,f,f*1e-3f),"reversed-Z projection");
   // Infinite far (P[2][2] = 1): a huge far.
   auto infinite=p; infinite[10]=1; infinite[14]=-n;
   const auto open=NativeFsrCameraFromProjection(infinite);
@@ -213,9 +226,14 @@ void TestResetRules() {
   Check(step(none)==0,"accumulation after a route gap");
   Check(step([](auto& f) { f.ab_native=false; })==kNativeFsrResetAbSide,"A/B side change");
   Check(step([](auto& f) { f.mode=NativeFsrMode::Quality; })==kNativeFsrResetMode,"mode change");
-  Check(step([](auto& f) { f.camera.fov_y=1.2f; })==kNativeFsrResetCut,"fov change (cut)");
-  Check(step([](auto& f) { f.camera.fov_y=1.2f+1e-5f; })==0,"a fov within tolerance reset");
-  Check(step([](auto& f) { f.camera.near_plane=0.25f; })==kNativeFsrResetCut,"near change (cut)");
+  Check(step([](auto& f) { f.camera.fov_y=1.3f; })==kNativeFsrResetCut,"fov jump (cut)");
+  Check(step([](auto& f) { f.camera.fov_y=1.2f; })==0 && step([](auto& f) { f.camera.fov_y=1.0f; })==0,
+        "a zoom (0.1 and 0.2 rad per frame) reset");
+  Check(step([](auto& f) { f.camera.near_plane=0.2f; })==kNativeFsrResetCut,"near jump (cut)");
+  Check(step([](auto& f) { f.camera.near_plane=0.3f; f.camera.far_plane=6000; })==0,"a small near/far change reset");
+  Check(step([](auto& f) { f.camera.far_plane=20000; })==kNativeFsrResetCut,"far jump (cut)");
+  Check(step([](auto& f) { f.camera.derived=false; })==kNativeFsrResetCut,"losing the derived camera");
+  facts.camera.derived=true; ++facts.helper_frame; tracker.Next(facts);
   Check(step([](auto& f) { f.motion_reset=true; })==kNativeFsrResetMotion,"B's reset");
   Check(step([](auto& f) { f.motion_reset=false; f.width=640; })==kNativeFsrResetResize,"several frames then one reason");
   tracker.Forget();

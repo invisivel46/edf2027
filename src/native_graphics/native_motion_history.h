@@ -80,13 +80,17 @@ struct NativeMotionCamera {
     rotation[12]=rotation[13]=rotation[14]=0; rotation[15]=1;
     return NativeMotionMultiply(rotation,NativeMotionMatrixOf(projection));
   }
-  // A D3D perspective projection (row vectors): p22 = f/(f-n), p32 = -n f/(f-n).
+  // A D3D perspective projection (row vectors): p22 = f/(f-n), p32 = -n f/(f-n)
+  // with p23 = 1 (left-handed), or p22 = -f/(f-n), p32 = -n f/(f-n) with
+  // p23 = -1 (right-handed, the game's 821C82C0). p22 is taken times the sign
+  // of p23, which turns the second into the first.
+  double DepthScale() const { return projection[11]<0?-double(projection[10]):double(projection[10]); }
   float Near() const {
-    const double p22=projection[10],p32=projection[14];
+    const double p22=DepthScale(),p32=projection[14];
     return p22!=0?float(-p32/p22):0.f;
   }
   float Far() const {
-    const double p22=projection[10],p32=projection[14];
+    const double p22=DepthScale(),p32=projection[14];
     return p22!=1?float(p32/(1-p22)):INFINITY;
   }
   float FovY() const { return projection[5]!=0?float(2*std::atan(1.0/double(projection[5]))):0.f; }
