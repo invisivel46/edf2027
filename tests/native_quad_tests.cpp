@@ -1381,6 +1381,27 @@ float4 PS():SV_TARGET {return float4(tex2D_DXT5N_xGxR(NormalSampler,float2(.5,.5
       normal_desc.min=normal_desc.mag=normal_desc.mip=NativeBackendFilter::Point;
       normal_desc.u=normal_desc.v=normal_desc.w=NativeBackendAddress::Clamp;
       normal_ps.SetSampler("NormalSampler",&backend->CreateSampler(normal_desc));
+      {
+        // The shadow render saves every sampler slot before its guest route
+        // and puts them back after it (native_shadow_render.h), so the
+        // full-frame post, which reads its samplers back from the bindings,
+        // posts after a shadow frame exactly as before it.
+        NativeBackendSamplerDesc other_desc=normal_desc;
+        other_desc.min=other_desc.mag=NativeBackendFilter::Linear;
+        auto* original=normal_ps.ReadSampler("NormalSampler");
+        const auto saved=normal_ps.SamplerValues();
+        const auto generation=normal_ps.resource_generation();
+        Require(saved.size()==1 && normal_ps.RestoreSamplerValues(saved)==0 && normal_ps.resource_generation()==generation,
+                "restoring unchanged samplers changed the bindings");
+        normal_ps.SetSampler("NormalSampler",&backend->CreateSampler(other_desc));
+        Require(normal_ps.ReadSampler("NormalSampler")!=original,"the test sampler was not replaced");
+        Require(normal_ps.RestoreSamplerValues(saved)==1 && normal_ps.ReadSampler("NormalSampler")==original &&
+                normal_ps.resource_generation()!=generation,"sampler restore did not put the saved sampler back");
+        Require(normal_ps.SamplerImages().size()==1 && normal_ps.SamplerImages()[0].sampler==original,
+                "the restored sampler is not what a recorder is told to bind");
+        const std::map<UINT,NativeBackendSampler*> foreign{{15,nullptr}};
+        Require(normal_ps.RestoreSamplerValues(foreign)==0,"a slot the bindings do not reflect was restored");
+      }
       for(const auto xy:std::array<std::array<float,2>,6>{{{.5f,.5f},{.75f,.5f},{1,1},{0,0},{1,128.f/255},{.5f,nan}}}) {
         const float encoded[]{0,xy[1],0,xy[0]};
         context->ClearRenderTargetView(normal_texture.target.Get(),encoded);

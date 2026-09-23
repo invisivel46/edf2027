@@ -37,6 +37,7 @@ struct FakeTexture final : NativeBackendTexture {
 };
 struct FakeBuffer final : NativeBackendBuffer { size_t bytes() const override { return 64; } };
 struct FakePipeline final : NativeBackendPipeline {};
+struct FakeSampler final : NativeBackendSampler {};
 // Records every call it receives, so forwarding can be checked call by call.
 struct FakeRecorder final : NativeBackendRecorder {
   std::vector<std::string> calls;
@@ -196,6 +197,8 @@ void Tap() {
   FakeBuffer vertices,indices;
   FakePipeline pipeline,instanced;
   pipeline.identity=0x1111; pipeline.identity_vertex=0xaa; pipeline.identity_pixel=0xbb; pipeline.identity_layout=0xcc;
+  pipeline.identity_state=kNativeOpaqueCopyState; pipeline.identity_format={1,10,20,2,0};
+  FakeSampler sampler;
   pipeline.world_instanced=&instanced; pipeline.instance_world_slot=1; pipeline.instance_world_offset=16;
   // Unarmed: forwarded, not recorded.
   tap.SetPipeline(pipeline);
@@ -205,6 +208,8 @@ void Tap() {
   tap.SetPipeline(pipeline);
   tap.SetTopology(NativeBackendTopology::TriangleStrip);
   tap.SetTexture(NativeBackendStage::Pixel,2,&texture);
+  tap.SetSampler(NativeBackendStage::Pixel,2,&sampler);
+  tap.SetScissor({1,2,3,4},true);
   std::vector<uint8_t> constants(96,0);
   for(uint32_t i=0;i<16;++i) {  // g_mWorld at offset 16: 1..16
     const float value=float(i+1);
@@ -220,6 +225,7 @@ void Tap() {
   const std::vector<uint8_t> quad(64,9);
   tap.SetTransientVertices(3,quad,16);
   tap.SetBlendFactor({0.5f,0.25f,0,1});
+  tap.SetScissor({1,2,3,4},false);
   tap.DrawIndexedInstanced(6,4,0,0,0);
   // PushState/PopState put the tracked bindings back.
   tap.PushState();
@@ -250,10 +256,16 @@ void Tap() {
     Check(first.world.has_value() && (*first.world)[0]==1.f && (*first.world)[15]==16.f,"world matrix from the pipeline's g_mWorld registers");
     Check(first.geometry.find("0=b:")==0 && first.geometry.find(" i:")!=std::string::npos,"buffer geometry");
     Check(first.viewport[2]==1280.f && !first.blend,"viewport, no blend factor");
+    Check(first.samplers.size()==1 && first.samplers[0].stage==1 && first.samplers[0].slot==2 &&
+          first.samplers[0].id==uint64_t(reinterpret_cast<uintptr_t>(&sampler)),"sampler identity");
+    Check(first.state && *first.state==kNativeOpaqueCopyState && first.format==std::array<uint32_t,5>{1,10,20,2,0},
+          "the pipeline's stamped state and formats");
+    Check(first.scissor && first.scissor->left==1 && first.scissor->bottom==4,"enabled scissor");
     const auto& second=draws[1];
     Check(second.label=="native.models" && second.kind==NativeDrawKind::Instanced && second.instances==4,"instanced draw");
     Check(second.geometry.find(std::format("3=t:{:016x}:64/16",NativeShadowHash(quad.data(),quad.size())))!=std::string::npos,"transient geometry hash");
     Check(second.blend && (*second.blend)[0]==0.5f,"blend factor");
+    Check(!second.scissor,"disabled scissor");
     Check(second.constant_hash==first.constant_hash,"same constants, same combined hash");
     const auto& third=draws[2];
     Check(third.kind==NativeDrawKind::Draw && third.count==4 && third.textures.size()==1,"state after PopState");
@@ -271,6 +283,27 @@ void Tap() {
   const auto again=tap.Take();
   Check(again.size()==2 && again[0].constant_hash!=again[1].constant_hash,"constant change changes the hash");
   Check(again.size()==2 && !again[0].world && again[0].pipeline==uint64_t(reinterpret_cast<uintptr_t>(&plain)),"unstamped pipeline: address, no world");
+  Check(again.size()==2 && !again[0].state && again[0].samplers.empty(),"unstamped pipeline: no state; Arm forgets the samplers");
+  Check(again.size()==2 && !again[0].reflected && again[0].constants.size()==1 && again[0].constants[0].data.empty(),
+        "unreflected pipeline: every bound slot; no constant bytes unless asked");
+  // A reflected pipeline lists only the slots its shaders read, and the
+  // constant bytes when asked for.
+  FakePipeline reflected; reflected.identity=0x2222; reflected.used_slots_known=true;
+  reflected.used_pixel_textures=1u<<2; reflected.used_vertex_constants=1u<<1;
+  FakeTexture stale(8,8);
+  tap.Arm("native.post");
+  tap.RecordConstantBytes(true);
+  tap.SetPipeline(reflected);
+  tap.SetTexture(NativeBackendStage::Pixel,2,&texture);
+  tap.SetTexture(NativeBackendStage::Pixel,3,&stale);
+  tap.SetSampler(NativeBackendStage::Pixel,3,&sampler);
+  tap.SetConstants(NativeBackendStage::Vertex,1,constants);
+  tap.SetConstants(NativeBackendStage::Pixel,0,std::vector<uint8_t>(16,7));
+  tap.Draw(3,0);
+  const auto filtered=tap.Take();
+  Check(filtered.size()==1 && filtered[0].reflected && filtered[0].textures.size()==1 && filtered[0].textures[0].slot==2 &&
+        filtered[0].samplers.empty() && filtered[0].constants.size()==1 && filtered[0].constants[0].stage==0 &&
+        filtered[0].constants[0].data==constants,"a reflected pipeline lists only the slots it reads, with the bytes");
 }
 
 void BackendRouting() {
@@ -300,6 +333,17 @@ void Identity() {
   StampNativeBackendPipelineIdentity(c,desc);
   Check(a.identity && a.identity==b.identity && a.identity!=c.identity,"identity follows the description");
   Check(a.identity_vertex==1 && a.identity_pixel==2 && a.identity_layout==3,"shader and layout ids");
+  Check(a.identity_state==RenderStateWords{1,2,3,4,5,6} && c.identity_state[4]==0,"stamped state words");
+  desc.render_targets=1; desc.rtv_format[0]=10; desc.dsv_format=20; desc.sample_count=2;
+  desc.topology=NativeBackendTopology::TriangleStrip;
+  StampNativeBackendPipelineIdentity(c,desc);
+  Check(c.identity_format==std::array<uint32_t,5>{1,10,20,2,uint32_t(NativeBackendTopology::TriangleStrip)},"stamped formats");
+  // The decoded text is equal for the guest's and the native post's words,
+  // except for the depth function the disabled depth test ignores.
+  Check(NativeShadowStateText(kNativeOpaqueCopyState)=="blend=0:2/1/1:2/1/1 mask=15 depth=0/0/1 raster=3/1/1/1","decoded copy state");
+  Check(NativeShadowStateText({0x10001,0x700760,0x18000,0x87000006,15,0})=="blend=0:2/1/1:2/1/1 mask=15 depth=0/0/7 raster=3/1/1/1",
+        "decoded guest post state");
+  Check(NativeShadowStateText({0x10001,1,0,0,15,0})=="undecodable","stencil is not decoded");
 }
 
 void Serialization() {
@@ -316,19 +360,39 @@ void Serialization() {
   draw.targets={0x10}; draw.depth=0x20;
   draw.viewport={0,0,1280,720,0,1};
   draw.geometry="0=b:1+0/32";
+  auto stamped=draw;
   const auto line=SerializeNativeDrawRecord(draw);
   const std::string expected=
     "{\"i\":4,\"label\":\"guest.world:820077d8 \\\"q\\\"\",\"pipeline\":\"0000000000001234\",\"vs\":\"000000000000000a\","
     "\"ps\":\"000000000000000b\",\"layout\":\"000000000000000c\",\"topology\":1,\"kind\":\"indexed\",\"count\":36,\"first\":6,"
     "\"base\":-2,\"instances\":1,\"first_instance\":0,\"textures\":[{\"stage\":1,\"slot\":2,\"id\":\"0000000000000abc\",\"w\":64,\"h\":32}],"
+    "\"samplers\":[],"
     "\"constants\":[{\"stage\":0,\"slot\":1,\"bytes\":96,\"hash\":\"000000000000feed\"}],\"constant_hash\":\"0000000000000099\","
     "\"world\":[1.5,0,0,0,0,\"nan\",0,0,0,0,\"inf\",0,0,0,0,0],\"targets\":[\"0000000000000010\"],\"depth\":\"0000000000000020\","
-    "\"viewport\":[0,0,1280,720,0,1],\"blend\":null,\"geometry\":\"0=b:1+0/32\"}";
+    "\"viewport\":[0,0,1280,720,0,1],\"blend\":null,\"geometry\":\"0=b:1+0/32\",\"scissor\":null}";
   Check(line==expected,"draw line");
   if(line!=expected) std::cerr<<line<<"\n"<<expected<<"\n";
   const auto list=SerializeNativeDrawList("native",12,{draw,draw});
   const auto header=std::string("{\"format\":\"edf-shadow-draws\",\"version\":1,\"side\":\"native\",\"frame\":12,\"draws\":2}\n");
   Check(list.starts_with(header) && list==header+expected+"\n"+expected+"\n","list: header then one line per draw");
+  stamped.samplers.push_back({1,2,0xdef});
+  stamped.state=kNativeOpaqueCopyState; stamped.format={1,10,0,1,0};
+  stamped.scissor=NativeBackendScissor{0,0,640,360};
+  stamped.reflected=true;
+  stamped.constants[0].data={0x01,0xab};
+  const auto stamped_line=SerializeNativeDrawRecord(stamped);
+  const std::string stamped_expected=
+    "{\"i\":4,\"label\":\"guest.world:820077d8 \\\"q\\\"\",\"pipeline\":\"0000000000001234\",\"vs\":\"000000000000000a\","
+    "\"ps\":\"000000000000000b\",\"layout\":\"000000000000000c\",\"topology\":1,\"kind\":\"indexed\",\"count\":36,\"first\":6,"
+    "\"base\":-2,\"instances\":1,\"first_instance\":0,\"textures\":[{\"stage\":1,\"slot\":2,\"id\":\"0000000000000abc\",\"w\":64,\"h\":32}],"
+    "\"samplers\":[{\"stage\":1,\"slot\":2,\"id\":\"0000000000000def\"}],"
+    "\"constants\":[{\"stage\":0,\"slot\":1,\"bytes\":96,\"hash\":\"000000000000feed\",\"data\":\"01ab\"}],\"constant_hash\":\"0000000000000099\","
+    "\"world\":[1.5,0,0,0,0,\"nan\",0,0,0,0,\"inf\",0,0,0,0,0],\"targets\":[\"0000000000000010\"],\"depth\":\"0000000000000020\","
+    "\"viewport\":[0,0,1280,720,0,1],\"blend\":null,\"geometry\":\"0=b:1+0/32\","
+    "\"state\":[\"00010001\",\"00000000\",\"00000000\",\"00000000\",\"0000000f\",\"00000000\"],"
+    "\"decoded\":\"blend=0:2/1/1:2/1/1 mask=15 depth=0/0/1 raster=3/1/1/1\",\"format\":[1,10,0,1,0],\"reflected\":true,\"scissor\":[0,0,640,360]}";
+  Check(stamped_line==stamped_expected,"stamped draw line");
+  if(stamped_line!=stamped_expected) std::cerr<<stamped_line<<"\n"<<stamped_expected<<"\n";
   Check(NativeShadowJsonString("a\nb\\\x01")=="\"a\\nb\\\\\\u0001\"","escapes");
 }
 }

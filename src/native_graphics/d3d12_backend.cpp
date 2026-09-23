@@ -1226,8 +1226,8 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
     // state from these words, and the wrapper below needs the two blend-factor
     // answers out of the same decode.
     const auto decoded=DecodeNativeRenderState(desc.state);
-    ValidateAgainstRootLayout(desc.vertex,false,"vertex shader "+std::to_string(desc.vertex_id));
-    ValidateAgainstRootLayout(desc.pixel,true,"pixel shader "+std::to_string(desc.pixel_id));
+    const auto vertex_slots=ValidateAgainstRootLayout(desc.vertex,false,"vertex shader "+std::to_string(desc.vertex_id));
+    const auto pixel_slots=ValidateAgainstRootLayout(desc.pixel,true,"pixel shader "+std::to_string(desc.pixel_id));
 
     std::vector<D3D12_INPUT_ELEMENT_DESC> elements;
     elements.reserve(desc.input_layout.size());
@@ -1254,6 +1254,11 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
                                                               decoded.requires_blend_factor,
                                                               decoded.replicate_blend_alpha)).first;
     if(!found->second->identity) StampNativeBackendPipelineIdentity(*found->second,desc);
+    if(auto& pipeline=*found->second; !pipeline.used_slots_known) {
+      pipeline.used_vertex_constants=vertex_slots.constant_buffers; pipeline.used_pixel_constants=pixel_slots.constant_buffers;
+      pipeline.used_pixel_textures=pixel_slots.textures; pipeline.used_pixel_samplers=pixel_slots.samplers;
+      pipeline.used_slots_known=true;
+    }
     return *found->second;
   }
 

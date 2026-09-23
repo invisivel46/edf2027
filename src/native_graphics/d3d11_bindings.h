@@ -79,6 +79,13 @@ class ShaderBindings {
   NativeBackendTexture* ReadTexture(const std::string& name) const;
   NativeBackendSampler* ReadSampler(const std::string& name) const;
   void ClearSamplers();
+  // Every reflected sampler slot's current value, and putting such a set back,
+  // for a caller that runs another route's activations on these bindings and
+  // must leave them as it found them (the shadow render's guest route: the
+  // full-frame post reads its samplers back from here). Restore returns how
+  // many slots it changed; slots the bindings do not reflect are ignored.
+  std::map<UINT,NativeBackendSampler*> SamplerValues() const { return sampler_values_; }
+  size_t RestoreSamplerValues(const std::map<UINT,NativeBackendSampler*>& values);
   void SetSampler(const std::string& name, NativeBackendSampler* sampler);
   bool TrySetSampler(const std::string& name, NativeBackendSampler* sampler);
   void Bind(ID3D11DeviceContext& context);

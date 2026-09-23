@@ -300,6 +300,18 @@ void ShaderBindings::ClearSamplers() {
   for (auto& [slot, sampler] : sampler_values_) { sampler=nullptr; sampler_slots_[slot]=nullptr; }
   ++resource_generation_;
 }
+size_t ShaderBindings::RestoreSamplerValues(const std::map<UINT,NativeBackendSampler*>& values) {
+  size_t changed=0;
+  for(const auto& [slot,sampler]:values) {
+    const auto found=sampler_values_.find(slot);
+    if(found==sampler_values_.end() || found->second==sampler) continue;
+    found->second=sampler;
+    sampler_slots_.at(slot)=sampler?NativeD3D11SamplerState(*sampler):nullptr;
+    ++changed;
+  }
+  if(changed) ++resource_generation_;
+  return changed;
+}
 void ShaderBindings::SetSampler(const std::string& name, NativeBackendSampler* sampler) {
   if (!TrySetSampler(name,sampler)) throw std::runtime_error("unknown sampler: " + name);
 }

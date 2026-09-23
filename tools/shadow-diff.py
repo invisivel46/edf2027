@@ -13,45 +13,89 @@ This tool compares them:
 
 - Images, per pixel: exact (any channel differs) and with --pixel-tolerance
   (largest channel difference above it), for known float-order differences.
-  --max-pixels is how many pixels may exceed the tolerance.
-- Draw lists: each draw's structural key (pipeline identity, shaders, topology, counts,
-  texture slots and sizes; instanced draws expanded to one per instance) aligns
-  the guest list against the native one in order (difflib); unaligned draws
-  with the same key are paired as "reordered"; the rest are "missing" (guest
-  only) or "extra" (native only). Paired draws are compared field by field:
-  constants (per stage/slot hash), world matrix (--float-tolerance), viewport,
-  blend factor, and texture and target identities, which must correspond
-  one-to-one between the sides (the shadow's guest side draws into its own
-  targets and samples its own scene resolve, so raw identities differ).
-  Geometry (buffer identities, transient vertex hashes) is compared with
-  --strict-geometry only: native passes keep their own vertex buffers. An
-  expanded instanced draw has no world to compare (its worlds are in the
-  instance stream); its constants are still compared as recorded.
-- Differences are grouped by material (vertex:pixel shader ids) and by class
-  (the recording label: native pass or guest callback).
+  --max-pixels is how many pixels may exceed the tolerance. The report also
+  has the signed mean difference per channel (native - guest): a global tone
+  or exposure difference shows as a nonzero mean over most of the frame, a
+  geometry difference as a few pixels far over the tolerance.
+- Draw lists: each draw's structural key (vertex:pixel material, topology, kind
+  and counts; instanced draws expanded to one per instance) aligns the guest
+  list against the native one. The key deliberately leaves out everything the
+  two paths always have differently for the same draw:
+    * the pipeline identity: it hashes the raw render state words, and the
+      guest path builds its pipelines from the live guest registers (with don't
+      care bits, e.g. a depth function under a disabled depth test) where the
+      native passes build them from owned state (kNativeOpaqueCopyState for
+      the post), so every pipeline differs even where the GPU state is equal;
+    * the input layout of a world-instanced alternate (it adds the instance
+      stream);
+    * texture sizes: a slot the shader does not read keeps whatever the
+      previous pass bound (native: the shadow cascades; guest: its own);
+    * first index and base vertex: native passes keep their own buffers.
+  Draws are paired first on the key plus texture sizes and world matrix (so
+  equal meshes pair with their own instance), then on the key alone; each
+  stage aligns in order (difflib) and then pairs what is left by key in list
+  order. A pair is "reordered" when it is out of order WITHIN its native pass
+  (a longest-increasing-subsequence over the pass's guest indices): the
+  native passes group draws by kind where the guest callbacks interleave them,
+  which is reported once as the pass order, not per draw (--strict-order
+  checks the whole list instead). What stays unpaired is "missing" (guest
+  only) or "extra" (native only).
+- Paired draws are compared field by field: constants (per stage/slot hash),
+  world matrix (--float-tolerance), viewport, blend factor, scissor, texture
+  sizes, texture and target identities (which must correspond one-to-one: the
+  guest side draws into its own targets and samples its own scene resolve;
+  "texture.S.N.unbound" is a slot bound on one side only),
+  sampler identities (the backend deduplicates samplers on their description,
+  so equal ids are equal states; compared directly), and the decoded render
+  state ("state.blend", "state.mask", "state.depth", "state.raster",
+  canonicalised: blend factors are ignored with blending off, the depth
+  function and write with the depth test off) and target formats ("format").
+  Captures without the stamped state (before the sampler/state recording)
+  cannot say which part of a pipeline differs: their pipeline identity is
+  compared with --strict-pipeline only, and counted in the summary. The input
+  layout is compared between draws of the same instancing variant. Geometry
+  (buffer identities, transient vertex hashes, first index, base vertex) is
+  compared with --strict-geometry only. An expanded instanced draw has no world
+  to compare (its worlds are in the instance stream). A "reflected" draw (the
+  D3D12 backend reflected its pipeline's shaders) lists only the texture,
+  sampler and constant slots those shaders read; an unreflected one lists
+  every bound slot, including ones an earlier draw left bound.
+- Differences are grouped by material (vertex:pixel shader ids), by class (the
+  recording label: guest callback for guest draws, native pass for native
+  ones), by native pass, and by differing field; the class map says which
+  native pass each guest callback's draws went to.
 
 An allow list (--allow FILE, JSON) excuses known differences:
 
   {"pixels": {"tolerance": 2, "max_pixels": 64},
    "draws": [{"kind": "missing", "material": "*:00000000000000ab", "label": "guest.overlays",
-              "field": "*", "max": 10, "reason": "..."}]}
+              "pass": "*", "field": "*", "max": 10, "reason": "..."}]}
 
 A draw difference is allowed when a rule matches its kind ("missing", "extra",
-"differing", "reordered" or "*"), material and label (fnmatch globs, default
-"*"), and for "differing" the field; "max" caps how many a rule excuses.
-Exit 0 when nothing is left beyond the allow list, 1 when something is, 2 on
-unreadable input. Standard library only.
+"differing", "reordered" or "*"), material, label and pass (fnmatch globs,
+default "*"; label is the guest callback where there is a guest draw, pass the
+native pass where there is a native one), "reflected" (true/false: whether
+the draws list only the slots their shaders read; omitted: either), and for
+"differing" and "reordered" the fields: "field" is a glob or a list of globs,
+and every field must match one of them (a reordered draw has the field
+"blended" when it blends, none when it is opaque). "max" caps how many a rule
+excuses per run; "reason", "class" and "evidence" are for the reader. Exit 0
+when nothing is left beyond the allow list, 1 when something is, 2 on
+unreadable input.
+Standard library only.
 """
 from __future__ import annotations
 
 import argparse
+import bisect
 import difflib
 import fnmatch
 import importlib.util
 import json
 import math
+import struct
 import sys
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -82,11 +126,17 @@ class ImageDiff:
     tolerance: int
     bbox: tuple[int, int, int, int] | None  # x0, y0, x1, y1 of pixels over the tolerance
     mask: bytes = b''
+    signed_mean: tuple[float, float, float] = (0.0, 0.0, 0.0)  # native - guest, per channel, over the frame
+    histogram: dict = field(default_factory=dict)  # largest channel difference -> pixels (1, 2, 3, 4-8, 9-16, 17+)
 
     def to_json(self) -> dict:
         return {'width': self.width, 'height': self.height, 'exact_differing': self.exact,
                 'over_tolerance': self.over, 'max_channel_diff': self.max_diff, 'tolerance': self.tolerance,
-                'bbox': list(self.bbox) if self.bbox else None}
+                'bbox': list(self.bbox) if self.bbox else None,
+                'signed_mean': [round(v, 4) for v in self.signed_mean], 'histogram': self.histogram}
+
+
+_BUCKETS = ((1, '1'), (2, '2'), (3, '3'), (8, '4-8'), (16, '9-16'), (255, '17+'))
 
 
 def diff_images(native, guest, tolerance: int) -> ImageDiff:
@@ -96,6 +146,8 @@ def diff_images(native, guest, tolerance: int) -> ImageDiff:
     a, b = native.rgb, guest.rgb
     mask = bytearray(w * h)
     exact = over = max_diff = 0
+    sums = [0, 0, 0]
+    histogram = Counter()
     x0 = y0 = None
     x1 = y1 = -1
     if a == b:
@@ -106,11 +158,19 @@ def diff_images(native, guest, tolerance: int) -> ImageDiff:
             continue
         for x in range(w):
             i = row + x * 3
-            m = max(abs(a[i] - b[i]), abs(a[i + 1] - b[i + 1]), abs(a[i + 2] - b[i + 2]))
+            dr, dg, db = a[i] - b[i], a[i + 1] - b[i + 1], a[i + 2] - b[i + 2]
+            m = max(abs(dr), abs(dg), abs(db))
             if not m:
                 continue
+            sums[0] += dr
+            sums[1] += dg
+            sums[2] += db
             exact += 1
             max_diff = max(max_diff, m)
+            for limit, name in _BUCKETS:
+                if m <= limit:
+                    histogram[name] += 1
+                    break
             if m > tolerance:
                 over += 1
                 mask[y * w + x] = 255
@@ -119,7 +179,9 @@ def diff_images(native, guest, tolerance: int) -> ImageDiff:
                 x1 = max(x1, x)
                 y1 = max(y1, y)
     bbox = (x0, y0, x1, y1) if x0 is not None else None
-    return ImageDiff(w, h, exact, over, max_diff, tolerance, bbox, bytes(mask))
+    total = w * h
+    return ImageDiff(w, h, exact, over, max_diff, tolerance, bbox, bytes(mask),
+                     tuple(s / total for s in sums), {name: histogram[name] for _, name in _BUCKETS if histogram[name]})
 
 
 # ----------------------------------------------------------------- draws ----
@@ -151,6 +213,10 @@ def material(draw: dict) -> str:
     return f'{vs:016x}:{_hex(draw.get("ps", "0")):016x}'
 
 
+def instanced_variant(draw: dict) -> bool:
+    return bool(_hex(draw.get('vs', '0')) & INSTANCED_VERTEX_BIT)
+
+
 def expand(draws: list[dict], expand_instances: bool) -> list[dict]:
     """Instanced draws as one draw per instance (a native pass may instance
     what the guest draws one by one); indexed kinds become one kind."""
@@ -175,19 +241,69 @@ def expand(draws: list[dict], expand_instances: bool) -> list[dict]:
 
 
 def structural_key(draw: dict) -> tuple:
-    textures = tuple(sorted((t['stage'], t['slot'], t['w'], t['h']) for t in draw.get('textures', [])))
-    return (draw.get('pipeline'), material(draw), draw.get('topology'), draw.get('kind'), draw.get('count'), draw.get('first'),
-            draw.get('base'), draw.get('instances', 1), textures)
+    """What a draw IS on both paths: material, topology, kind and counts."""
+    return (material(draw), draw.get('topology'), draw.get('kind'), draw.get('count'), draw.get('instances', 1))
+
+
+def _rounded(values):
+    if not values:
+        return None
+    return tuple(round(v, 3) if isinstance(v, (int, float)) else v for v in values)
+
+
+def _texture_name(texture: dict, shared: set[str]) -> str:
+    # A texture both lists use is one object: its id. A side's own (the
+    # shadow's scene resolve) can only be named by its size.
+    return texture['id'] if texture['id'] in shared else f'{texture["w"]}x{texture["h"]}'
+
+
+def fine_key(draw: dict, shared: set[str] = frozenset()) -> tuple:
+    """The structural key plus what tells two draws of one mesh apart: every
+    texture and the world matrix."""
+    textures = tuple(sorted((t['stage'], t['slot'], _texture_name(t, shared)) for t in draw.get('textures', [])))
+    return structural_key(draw) + (textures, _rounded(draw.get('world')))
+
+
+def medium_key(draw: dict, shared: set[str] = frozenset()) -> tuple:
+    """The structural key plus the first texture and the world matrix: what
+    still tells meshes apart where a later slot holds a stale binding."""
+    first = min(((t['stage'], t['slot'], _texture_name(t, shared)) for t in draw.get('textures', [])), default=None)
+    return structural_key(draw) + (first, _rounded(draw.get('world')))
+
+
+def canonical_state(decoded: str) -> dict[str, str]:
+    """The decoded state text (NativeShadowStateText) as parts, with what the
+    GPU ignores dropped: blend factors with blending off, the depth function
+    and write with the depth test off."""
+    if not decoded or decoded == 'undecodable':
+        return {'state': decoded or 'none'}
+    parts = dict(item.split('=', 1) for item in decoded.split() if '=' in item)
+    blend = parts.get('blend', '')
+    if blend.startswith('0:'):
+        parts['blend'] = 'off'
+    depth = parts.get('depth', '')
+    if depth.startswith('0/'):
+        parts['depth'] = 'off'
+    return parts
 
 
 class Correspondence:
-    """Identities that must map one-to-one between the sides (targets, textures)."""
+    """Identities that must map one-to-one between the sides (targets, textures).
 
-    def __init__(self):
+    An identity that appears in both lists (`shared`: a game texture, a post
+    target both routes draw into) is one object both sides use, so it must be
+    the same on both; only a side's own objects (the shadow's scene color and
+    its resolve against the native ones) map through the correspondence. That
+    keeps one stale binding from poisoning the map for the real ones."""
+
+    def __init__(self, shared: set[str] | None = None):
         self.forward: dict[str, str] = {}
         self.backward: dict[str, str] = {}
+        self.shared = shared or set()
 
     def check(self, guest: str, native: str) -> bool:
+        if guest in self.shared or native in self.shared:
+            return guest == native
         if guest in self.forward or native in self.backward:
             return self.forward.get(guest) == native and self.backward.get(native) == guest
         self.forward[guest] = native
@@ -213,32 +329,93 @@ def _floats_equal(a, b, tolerance: float) -> bool:
     return True
 
 
+def constant_registers(guest: str, native: str) -> dict:
+    """Which float4 registers of two constant images (hex, as the tap writes
+    them with edf_native_shadow_render_constants) differ, and by how much."""
+    a, b = bytes.fromhex(guest), bytes.fromhex(native)
+    registers = []
+    largest = 0.0
+    for r in range(max(len(a), len(b)) // 16 + (1 if max(len(a), len(b)) % 16 else 0)):
+        x, y = a[r * 16:r * 16 + 16], b[r * 16:r * 16 + 16]
+        if x == y:
+            continue
+        registers.append(r)
+        if len(x) == len(y) == 16:
+            for i in range(0, 16, 4):
+                u, v = struct.unpack_from('<f', x, i)[0], struct.unpack_from('<f', y, i)[0]
+                if math.isfinite(u) and math.isfinite(v):
+                    largest = max(largest, abs(u - v))
+    runs = []
+    for r in registers:
+        if runs and runs[-1][1] == r - 1:
+            runs[-1][1] = r
+        else:
+            runs.append([r, r])
+    return {'registers': ','.join(f'c{s}' if s == e else f'c{s}-c{e}' for s, e in runs), 'max_abs': largest}
+
+
 def compare_fields(guest: dict, native: dict, settings: 'Settings', textures: Correspondence,
-                   targets: Correspondence) -> list[str]:
+                   targets: Correspondence, details: dict | None = None) -> list[str]:
     fields = []
     g_constants = {(c['stage'], c['slot']): c for c in guest.get('constants', [])}
     n_constants = {(c['stage'], c['slot']): c for c in native.get('constants', [])}
     for slot in sorted(set(g_constants) | set(n_constants)):
         g, n = g_constants.get(slot), n_constants.get(slot)
         if g is None or n is None or g['hash'] != n['hash'] or g['bytes'] != n['bytes']:
-            fields.append(f'constants.{"vs" if slot[0] == 0 else "ps" if slot[0] == 1 else "cs"}{slot[1]}')
-    if not (guest.get('_world_unknown') or native.get('_world_unknown')) and             not _floats_equal(guest.get('world'), native.get('world'), settings.float_tolerance):
+            name = f'constants.{"vs" if slot[0] == 0 else "ps" if slot[0] == 1 else "cs"}{slot[1]}'
+            fields.append(name)
+            if details is not None and g is not None and n is not None and g.get('data') and n.get('data'):
+                details[name] = constant_registers(g['data'], n['data'])
+    if not (guest.get('_world_unknown') or native.get('_world_unknown')) and \
+            not _floats_equal(guest.get('world'), native.get('world'), settings.float_tolerance):
         fields.append('world')
     if not _floats_equal(guest.get('viewport'), native.get('viewport'), settings.float_tolerance):
         fields.append('viewport')
     if not _floats_equal(guest.get('blend'), native.get('blend'), settings.float_tolerance):
         fields.append('blend')
-    g_textures = {(t['stage'], t['slot']): t['id'] for t in guest.get('textures', [])}
-    n_textures = {(t['stage'], t['slot']): t['id'] for t in native.get('textures', [])}
+    if 'scissor' in guest and 'scissor' in native and guest['scissor'] != native['scissor']:
+        fields.append('scissor')
+    g_textures = {(t['stage'], t['slot']): t for t in guest.get('textures', [])}
+    n_textures = {(t['stage'], t['slot']): t for t in native.get('textures', [])}
     for slot in sorted(set(g_textures) | set(n_textures)):
-        if slot not in g_textures or slot not in n_textures or not textures.check(g_textures[slot], n_textures[slot]):
+        g, n = g_textures.get(slot), n_textures.get(slot)
+        if g is None or n is None:
+            # Bound on one side only. Where both lists are reflected (only the
+            # slots the shaders read) that is a missing input; otherwise it
+            # can be a slot an earlier draw left bound on one path.
+            reflected = guest.get('reflected') and native.get('reflected')
+            fields.append(f'texture.{slot[0]}.{slot[1]}.{"missing" if reflected else "unbound"}')
+            continue
+        if (g['w'], g['h']) != (n['w'], n['h']):
+            fields.append(f'texture.{slot[0]}.{slot[1]}.size')
+        elif not textures.check(g['id'], n['id']):
             fields.append(f'texture.{slot[0]}.{slot[1]}')
+    if 'samplers' in guest and 'samplers' in native:
+        g_samplers = {(s['stage'], s['slot']): s['id'] for s in guest['samplers']}
+        n_samplers = {(s['stage'], s['slot']): s['id'] for s in native['samplers']}
+        for slot in sorted(set(g_samplers) | set(n_samplers)):
+            if g_samplers.get(slot) != n_samplers.get(slot):
+                fields.append(f'sampler.{slot[0]}.{slot[1]}')
     g_targets = list(guest.get('targets', [])) + [guest.get('depth')]
     n_targets = list(native.get('targets', [])) + [native.get('depth')]
     if len(g_targets) != len(n_targets) or not all(targets.check(str(g), str(n)) for g, n in zip(g_targets, n_targets)):
         fields.append('targets')
-    if settings.strict_geometry and guest.get('geometry') != native.get('geometry'):
-        fields.append('geometry')
+    if 'decoded' in guest and 'decoded' in native:
+        g_state, n_state = canonical_state(guest['decoded']), canonical_state(native['decoded'])
+        for part in sorted(set(g_state) | set(n_state)):
+            if g_state.get(part) != n_state.get(part):
+                fields.append(f'state.{part}')
+        if guest.get('format') != native.get('format'):
+            fields.append('format')
+    elif settings.strict_pipeline and guest.get('pipeline') != native.get('pipeline'):
+        fields.append('pipeline')
+    if instanced_variant(guest) == instanced_variant(native) and guest.get('layout') != native.get('layout'):
+        fields.append('layout')
+    if settings.strict_geometry:
+        if guest.get('geometry') != native.get('geometry'):
+            fields.append('geometry')
+        if (guest.get('first'), guest.get('base')) != (native.get('first'), native.get('base')):
+            fields.append('range')
     return fields
 
 
@@ -246,15 +423,22 @@ def compare_fields(guest: dict, native: dict, settings: 'Settings', textures: Co
 class Difference:
     kind: str       # missing | extra | differing | reordered
     material: str
-    label: str
+    label: str      # the guest callback where there is a guest draw, else the native pass
     fields: list[str] = field(default_factory=list)
     guest_index: int | None = None
     native_index: int | None = None
     allowed_by: str | None = None
+    native_label: str = ''  # the native pass where there is a native draw, else the guest callback
+    details: dict = field(default_factory=dict)  # per field, where the capture says more (constant registers)
+    reflected: bool = False  # both draws list only the slots their shaders read
 
     def to_json(self) -> dict:
-        return {'kind': self.kind, 'material': self.material, 'label': self.label, 'fields': self.fields,
-                'guest': self.guest_index, 'native': self.native_index, 'allowed_by': self.allowed_by}
+        out = {'kind': self.kind, 'material': self.material, 'label': self.label, 'pass': self.native_label,
+               'fields': self.fields, 'guest': self.guest_index, 'native': self.native_index,
+               'allowed_by': self.allowed_by, 'reflected': self.reflected}
+        if self.details:
+            out['details'] = self.details
+        return out
 
 
 @dataclass
@@ -265,6 +449,8 @@ class Settings:
     expand_instances: bool = True
     strict_geometry: bool = False
     check_order: bool = True
+    strict_order: bool = False
+    strict_pipeline: bool = False
 
 
 @dataclass
@@ -273,61 +459,154 @@ class DrawDiff:
     native_draws: int
     matched: int
     differences: list[Difference]
+    classes: dict = field(default_factory=dict)      # guest label -> {native label: pairs}
+    pass_order: dict = field(default_factory=dict)   # the pass sequences in each list's order
+    pipeline_identity_differs: int = 0               # pairs whose raw pipeline identity differs
 
     def groups(self) -> dict:
         by_material: dict[str, Counter] = defaultdict(Counter)
         by_label: dict[str, Counter] = defaultdict(Counter)
+        by_pass: dict[str, Counter] = defaultdict(Counter)
+        by_field: Counter = Counter()
         for difference in self.differences:
             by_material[difference.material][difference.kind] += 1
             by_label[difference.label][difference.kind] += 1
+            by_pass[difference.native_label][difference.kind] += 1
+            by_field.update(difference.fields)
         return {'material': {k: dict(v) for k, v in sorted(by_material.items())},
-                'label': {k: dict(v) for k, v in sorted(by_label.items())}}
+                'label': {k: dict(v) for k, v in sorted(by_label.items())},
+                'pass': {k: dict(v) for k, v in sorted(by_pass.items())},
+                'field': dict(by_field.most_common())}
+
+
+def _pair(g_keys: list, n_keys: list, guest: list[int], native: list[int]):
+    """Pairs guest and native indices with equal keys: in order where the
+    sequences align, then by key in list order. Returns (pairs, guest left,
+    native left)."""
+    matcher = difflib.SequenceMatcher(None, [g_keys[i] for i in guest], [n_keys[i] for i in native], autojunk=False)
+    pairs: list[tuple[int, int]] = []
+    left_guest: list[int] = []
+    left_native: list[int] = []
+    for tag, g0, g1, n0, n1 in matcher.get_opcodes():
+        if tag == 'equal':
+            pairs.extend((guest[g0 + k], native[n0 + k]) for k in range(g1 - g0))
+        else:
+            left_guest.extend(guest[g0:g1])
+            left_native.extend(native[n0:n1])
+    waiting: dict[tuple, deque] = defaultdict(deque)
+    for n in left_native:
+        waiting[n_keys[n]].append(n)
+    still_guest = []
+    for g in left_guest:
+        queue = waiting.get(g_keys[g])
+        if queue:
+            pairs.append((g, queue.popleft()))
+        else:
+            still_guest.append(g)
+    still_native = sorted(n for queue in waiting.values() for n in queue)
+    return pairs, still_guest, still_native
+
+
+def _increasing(values: list[int]) -> set[int]:
+    """Positions of one longest strictly increasing subsequence of values."""
+    tails: list[int] = []       # smallest tail value of an increasing run of each length
+    tail_at: list[int] = []     # its position
+    previous = [-1] * len(values)
+    for position, value in enumerate(values):
+        k = bisect.bisect_left(tails, value)
+        if k == len(tails):
+            tails.append(value)
+            tail_at.append(position)
+        else:
+            tails[k] = value
+            tail_at[k] = position
+        previous[position] = tail_at[k - 1] if k else -1
+    keep = set()
+    position = tail_at[-1] if tail_at else -1
+    while position >= 0:
+        keep.add(position)
+        position = previous[position]
+    return keep
+
+
+def _runs(labels: list[str]) -> list[list]:
+    runs: list[list] = []
+    for label in labels:
+        if runs and runs[-1][0] == label:
+            runs[-1][1] += 1
+        else:
+            runs.append([label, 1])
+    return runs
 
 
 def diff_draws(guest_draws: list[dict], native_draws: list[dict], settings: Settings) -> DrawDiff:
     guest = expand(guest_draws, settings.expand_instances)
     native = expand(native_draws, settings.expand_instances)
-    g_keys = [structural_key(d) for d in guest]
-    n_keys = [structural_key(d) for d in native]
-    textures, targets = Correspondence(), Correspondence()
+    def ids(draws: list[dict], name: str) -> set[str]:
+        if name == 'textures':
+            return {t['id'] for d in draws for t in d.get('textures', [])}
+        return {str(t) for d in draws for t in list(d.get('targets', [])) + [d.get('depth')]}
+    shared_textures = ids(guest, 'textures') & ids(native, 'textures')
+    # Pair on the most specific key first, then on less, each stage taking
+    # what the one before left.
+    pairs: list[tuple[int, int]] = []
+    still_guest, still_native = list(range(len(guest))), list(range(len(native)))
+    for key in (lambda d: fine_key(d, shared_textures), lambda d: medium_key(d, shared_textures), structural_key):
+        more, still_guest, still_native = _pair([key(d) for d in guest], [key(d) for d in native], still_guest, still_native)
+        pairs.extend(more)
+    pairs.sort()
+    # Order: within each native pass (or across the list with --strict-order).
+    in_order: set[tuple[int, int]] = set()
+    groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
+    for g, n in pairs:
+        groups['' if settings.strict_order else native[n].get('label', '')].append((g, n))
+    for members in groups.values():
+        members.sort(key=lambda pair: pair[1])
+        keep = _increasing([g for g, _ in members])
+        in_order.update(members[k] for k in keep)
+    textures = Correspondence(shared_textures)
+    targets = Correspondence(ids(guest, 'targets') & ids(native, 'targets') - {'0000000000000000', 'None'})
     differences: list[Difference] = []
-    matched = 0
-    pairs: list[tuple[int, int, bool]] = []  # guest index, native index, in order
-    unmatched_guest: list[int] = []
-    unmatched_native: list[int] = []
-    matcher = difflib.SequenceMatcher(None, g_keys, n_keys, autojunk=False)
-    for tag, g0, g1, n0, n1 in matcher.get_opcodes():
-        if tag == 'equal':
-            pairs.extend((g0 + k, n0 + k, True) for k in range(g1 - g0))
-        else:
-            unmatched_guest.extend(range(g0, g1))
-            unmatched_native.extend(range(n0, n1))
-    # Same structure, different position: paired in list order.
-    waiting: dict[tuple, list[int]] = defaultdict(list)
-    for n in unmatched_native:
-        waiting[n_keys[n]].append(n)
-    still_guest = []
-    for g in unmatched_guest:
-        queue = waiting.get(g_keys[g])
-        if queue:
-            pairs.append((g, queue.pop(0), False))
-        else:
-            still_guest.append(g)
-    still_native = sorted(n for queue in waiting.values() for n in queue)
-    for g, n, in_order in sorted(pairs):
-        fields = compare_fields(guest[g], native[n], settings, textures, targets)
-        label = guest[g].get('label', '')
+    matched = identity_differs = 0
+    classes: dict[str, Counter] = defaultdict(Counter)
+    for g, n in pairs:
+        classes[guest[g].get('label', '')][native[n].get('label', '')] += 1
+        if guest[g].get('pipeline') != native[n].get('pipeline'):
+            identity_differs += 1
+        details: dict = {}
+        fields = compare_fields(guest[g], native[n], settings, textures, targets, details)
+        label, native_label = guest[g].get('label', ''), native[n].get('label', '')
+        ordered = (g, n) in in_order
+        reflected = bool(guest[g].get('reflected') and native[n].get('reflected'))
         if fields:
-            differences.append(Difference('differing', material(guest[g]), label, fields, guest[g].get('i'), native[n].get('i')))
-        if not in_order and settings.check_order:
-            differences.append(Difference('reordered', material(guest[g]), label, [], guest[g].get('i'), native[n].get('i')))
-        if not fields and (in_order or not settings.check_order):
+            differences.append(Difference('differing', material(guest[g]), label, fields, guest[g].get('i'),
+                                          native[n].get('i'), native_label=native_label, details=details,
+                                          reflected=reflected))
+        if not ordered and settings.check_order:
+            # Order matters for a blending draw; for an opaque depth-tested one
+            # only at exact depth ties. "blended" says which, where the capture
+            # has the decoded state.
+            blended = any(canonical_state(d['decoded']).get('blend', 'off') != 'off'
+                          for d in (guest[g], native[n]) if 'decoded' in d)
+            differences.append(Difference('reordered', material(guest[g]), label, ['blended'] if blended else [],
+                                          guest[g].get('i'), native[n].get('i'), native_label=native_label,
+                                          reflected=reflected))
+        if not fields and (ordered or not settings.check_order):
             matched += 1
     for g in still_guest:
-        differences.append(Difference('missing', material(guest[g]), guest[g].get('label', ''), [], guest[g].get('i'), None))
+        label = guest[g].get('label', '')
+        differences.append(Difference('missing', material(guest[g]), label, [], guest[g].get('i'), None, native_label=label,
+                                      reflected=bool(guest[g].get('reflected'))))
     for n in still_native:
-        differences.append(Difference('extra', material(native[n]), native[n].get('label', ''), [], None, native[n].get('i')))
-    return DrawDiff(len(guest), len(native), matched, differences)
+        label = native[n].get('label', '')
+        differences.append(Difference('extra', material(native[n]), label, [], None, native[n].get('i'), native_label=label,
+                                      reflected=bool(native[n].get('reflected'))))
+    # The pass sequence in each list's order, by the native pass each draw went to.
+    native_of_guest = {g: native[n].get('label', '') for g, n in pairs}
+    order = {'guest': _runs([native_of_guest.get(g, guest[g].get('label', '')) for g in range(len(guest))]),
+             'native': _runs([d.get('label', '') for d in native])}
+    return DrawDiff(len(guest), len(native), matched, differences,
+                    {k: dict(v) for k, v in sorted(classes.items())}, order, identity_differs)
 
 
 # ------------------------------------------------------------- allow list ---
@@ -336,13 +615,15 @@ class Rule:
     kind: str = '*'
     material: str = '*'
     label: str = '*'
-    field: str = '*'
+    field: str | list[str] = '*'
     max: int | None = None
     reason: str = ''
     used: int = 0
+    pass_: str = '*'
+    reflected: bool | None = None  # None: any; False: only differences between unreflected draws
 
     def name(self) -> str:
-        return self.reason or f'{self.kind} {self.material} {self.label} {self.field}'
+        return self.reason or f'{self.kind} {self.material} {self.label} {self.pass_} {self.field}'
 
     def matches(self, difference: Difference) -> bool:
         if self.max is not None and self.used >= self.max:
@@ -351,8 +632,13 @@ class Rule:
             return False
         if not fnmatch.fnmatchcase(difference.material, self.material) or not fnmatch.fnmatchcase(difference.label, self.label):
             return False
-        if difference.kind == 'differing' and self.field != '*':
-            return all(fnmatch.fnmatchcase(f, self.field) for f in difference.fields)
+        if not fnmatch.fnmatchcase(difference.native_label, self.pass_):
+            return False
+        if self.reflected is not None and difference.reflected != self.reflected:
+            return False
+        if difference.kind in ('differing', 'reordered'):
+            globs = [self.field] if isinstance(self.field, str) else list(self.field)
+            return all(any(fnmatch.fnmatchcase(f, glob) for glob in globs) for f in difference.fields)
         return True
 
 
@@ -365,9 +651,13 @@ def load_allow(path: Path | None) -> tuple[dict, list[Rule]]:
         raise InputError(f'{path}: {error}') from error
     rules = []
     for entry in data.get('draws', []):
-        unknown = set(entry) - {'kind', 'material', 'label', 'field', 'max', 'reason'}
+        unknown = set(entry) - {'kind', 'material', 'label', 'pass', 'field', 'max', 'reason', 'evidence', 'reflected',
+                                'class'}
         if unknown:
             raise InputError(f'{path}: unknown rule keys {sorted(unknown)}')
+        entry = {k: v for k, v in entry.items() if k not in ('evidence', 'class')}
+        if 'pass' in entry:
+            entry['pass_'] = entry.pop('pass')
         rules.append(Rule(**entry))
     return data.get('pixels', {}), rules
 
@@ -422,7 +712,8 @@ def compare_frame(files: FrameFiles, settings: Settings, rules: list[Rule], imag
     unallowed = 0
     if files.meta:
         meta = json.loads(files.meta.read_text(encoding='utf-8'))
-        report['meta'] = {k: meta.get(k) for k in ('frame', 'views', 'motion', 'tick_frame', 'held', 'restored_words')}
+        report['meta'] = {k: meta.get(k) for k in ('frame', 'views', 'motion', 'tick_frame', 'held', 'restored_words',
+                                                   'samplers_restored')}
         if meta.get('guest', {}).get('error'):
             report['guest_error'] = meta['guest']['error']
             unallowed += 1
@@ -446,15 +737,32 @@ def compare_frame(files: FrameFiles, settings: Settings, rules: list[Rule], imag
         if diff_mask is not None and image.over:
             images_module.write_grey_png(diff_mask, image.width, image.height, image.mask)
             report['image']['mask'] = str(diff_mask)
+    # The pre-post scene images, when the capture has them: diagnostic only
+    # (HDR clamped to 0..1), never counted against the frame.
+    scene = (meta.get('scene') or {}) if files.meta else {}
+    if scene.get('native') and scene.get('guest'):
+        root = Path(files.stem).parent
+        try:
+            s_native = images_module.read_image(root / scene['native'])
+            s_guest = images_module.read_image(root / scene['guest'])
+            report['scene_image'] = diff_images(s_native, s_guest, settings.pixel_tolerance).to_json()
+        except (images_module.ImageError, OSError, InputError) as error:
+            report['scene_image'] = {'error': str(error)}
+    elif scene.get('error'):
+        report['scene_image'] = {'error': scene['error']}
     # Draw lists.
     _, guest_draws = load_draws(files.guest_draws)
     _, native_draws = load_draws(files.native_draws)
     draws = diff_draws(guest_draws, native_draws, settings)
     remaining = apply_allow(draws.differences, rules)
     unallowed += len(remaining)
+    stamped = all('decoded' in d for d in guest_draws + native_draws if d.get('pipeline'))
     report['draws'] = {'guest': draws.guest_draws, 'native': draws.native_draws, 'matched': draws.matched,
                        'counts': dict(Counter(d.kind for d in draws.differences)),
                        'unallowed': dict(Counter(d.kind for d in remaining)),
+                       'pipeline_identity_differs': draws.pipeline_identity_differs,
+                       'state_recorded': stamped,
+                       'classes': draws.classes, 'pass_order': draws.pass_order,
                        'groups': draws.groups(),
                        'differences': [d.to_json() for d in draws.differences]}
     report['unallowed'] = unallowed
@@ -466,7 +774,8 @@ def print_report(report: dict, limit: int) -> None:
     meta = report.get('meta')
     if meta:
         print(f'   frame={meta.get("frame")} views={meta.get("views")} tick_frame={meta.get("tick_frame")} '
-              f'motion={meta.get("motion")} held={meta.get("held")} restored_words={meta.get("restored_words")}')
+              f'motion={meta.get("motion")} held={meta.get("held")} restored_words={meta.get("restored_words")}'
+              f' samplers_restored={meta.get("samplers_restored")}')
     if report.get('guest_error'):
         print(f'   guest side failed: {report["guest_error"]}')
     image = report['image']
@@ -476,27 +785,41 @@ def print_report(report: dict, limit: int) -> None:
         verdict = 'ok' if image['pass'] else 'DIFFERENT'
         print(f'   image {image["width"]}x{image["height"]}: exact_differing={image["exact_differing"]} '
               f'over_tolerance({image["tolerance"]})={image["over_tolerance"]} max_channel_diff={image["max_channel_diff"]} '
-              f'bbox={image["bbox"]} -> {verdict}')
+              f'bbox={image["bbox"]} signed_mean={image.get("signed_mean")} histogram={image.get("histogram")} -> {verdict}')
+    scene = report.get('scene_image')
+    if scene:
+        if 'error' in scene:
+            print(f'   pre-post scene: {scene["error"]}')
+        else:
+            print(f'   pre-post scene (HDR clamped): exact_differing={scene["exact_differing"]} '
+                  f'max_channel_diff={scene["max_channel_diff"]} bbox={scene["bbox"]} signed_mean={scene["signed_mean"]} '
+                  f'histogram={scene["histogram"]}')
     draws = report['draws']
     print(f'   draws guest={draws["guest"]} native={draws["native"]} matched={draws["matched"]} '
           f'differences={draws["counts"] or "{}"} unallowed={draws["unallowed"] or "{}"}')
-    groups = draws['groups']['material']
-    if groups:
-        print('   by material (vs:ps):')
-        for name, counts in list(groups.items())[:limit]:
-            print(f'     {name} {counts}')
-    labels = draws['groups']['label']
-    if labels:
-        print('   by class (label):')
-        for name, counts in list(labels.items())[:limit]:
-            print(f'     {name} {counts}')
+    if not draws['state_recorded']:
+        print(f'   pipeline state not recorded in this capture: {draws["pipeline_identity_differs"]} paired draws have '
+              f'different raw pipeline identities (not compared; --strict-pipeline compares them)')
+    print(f'   classes (guest callback -> native pass): {draws["classes"]}')
+    order = draws['pass_order']
+    print(f'   pass order: guest {[f"{k}x{n}" for k, n in order["guest"]]}')
+    print(f'               native {[f"{k}x{n}" for k, n in order["native"]]}')
+    groups = draws['groups']
+    for title, key in (('by material (vs:ps)', 'material'), ('by class (label)', 'label'), ('by native pass', 'pass')):
+        if groups[key]:
+            print(f'   {title}:')
+            for name, counts in list(groups[key].items())[:limit]:
+                print(f'     {name} {counts}')
+    if groups['field']:
+        print(f'   differing fields: {groups["field"]}')
     shown = 0
     for difference in draws['differences']:
         if difference['allowed_by'] or shown >= limit:
             continue
         shown += 1
+        detail = ''.join(f' [{k}: {v["registers"]} max_abs={v["max_abs"]:.3g}]' for k, v in difference.get('details', {}).items())
         print(f'     {difference["kind"]:9} guest#{difference["guest"]} native#{difference["native"]} '
-              f'{difference["material"]} {difference["label"]} {",".join(difference["fields"])}')
+              f'{difference["material"]} {difference["label"]} -> {difference["pass"]} {",".join(difference["fields"])}{detail}')
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -508,8 +831,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('--float-tolerance', type=float, default=0.0,
                         help='relative/absolute tolerance for world matrices, viewports and blend factors (default 0: exact)')
     parser.add_argument('--no-expand-instances', action='store_true', help='compare instanced draws as recorded')
-    parser.add_argument('--strict-geometry', action='store_true', help='also compare vertex/index buffer identities and transient vertex hashes')
+    parser.add_argument('--strict-geometry', action='store_true',
+                        help='also compare vertex/index buffer identities, transient vertex hashes, first index and base vertex')
+    parser.add_argument('--strict-pipeline', action='store_true',
+                        help='compare raw pipeline identities where the capture has no decoded state')
     parser.add_argument('--ignore-order', action='store_true', help='do not report draws that match only out of order')
+    parser.add_argument('--strict-order', action='store_true',
+                        help='check the order across the whole list, not within each native pass')
     parser.add_argument('--allow', type=Path, help='allow list (JSON; see the module docstring)')
     parser.add_argument('--json', type=Path, help='write the full report here')
     parser.add_argument('--diff-mask', action='store_true', help='write <stem>.diff.png (white = over tolerance)')
@@ -521,7 +849,8 @@ def main(argv: list[str] | None = None) -> int:
             pixel_tolerance=args.pixel_tolerance if args.pixel_tolerance is not None else int(pixels.get('tolerance', 0)),
             max_pixels=args.max_pixels if args.max_pixels is not None else int(pixels.get('max_pixels', 0)),
             float_tolerance=args.float_tolerance, expand_instances=not args.no_expand_instances,
-            strict_geometry=args.strict_geometry, check_order=not args.ignore_order)
+            strict_geometry=args.strict_geometry, check_order=not args.ignore_order, strict_order=args.strict_order,
+            strict_pipeline=args.strict_pipeline)
         images_module = _load_images()
         reports = []
         for path in args.frames:
@@ -537,10 +866,13 @@ def main(argv: list[str] | None = None) -> int:
     unused = [rule.name() for rule in rules if not rule.used]
     if unused:
         print(f'allow list rules that matched nothing: {unused}')
+    if rules:
+        print('allow list use: ' + ', '.join(f'{rule.name()!r}={rule.used}' for rule in rules))
     print(f'{len(reports)} frame(s), {unallowed} difference(s) beyond the allow list')
     if args.json:
         args.json.write_text(json.dumps({'settings': settings.__dict__, 'frames': reports, 'unallowed': unallowed,
-                                         'unused_rules': unused}, indent=2), encoding='utf-8')
+                                         'unused_rules': unused,
+                                         'rule_use': {rule.name(): rule.used for rule in rules}}, indent=2), encoding='utf-8')
     return 1 if unallowed else 0
 
 

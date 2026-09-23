@@ -38,7 +38,7 @@ static_assert(kNativeCullNone==D3D12_CULL_MODE_NONE && kNativeCullFront==D3D12_C
               kNativeCullBack==D3D12_CULL_MODE_BACK);
 static_assert(kNativeDepthWriteZero==D3D12_DEPTH_WRITE_MASK_ZERO && kNativeDepthWriteAll==D3D12_DEPTH_WRITE_MASK_ALL);
 
-void ValidateAgainstRootLayout(std::span<const uint8_t> bytecode, bool pixel, const std::string& name) {
+NativeShaderSlots ValidateAgainstRootLayout(std::span<const uint8_t> bytecode, bool pixel, const std::string& name) {
   ComPtr<ID3D12ShaderReflection> reflection;
   Require(D3DReflect(bytecode.data(),bytecode.size(),IID_PPV_ARGS(&reflection)),"shader reflection");
   D3D12_SHADER_DESC description{};
@@ -52,18 +52,22 @@ void ValidateAgainstRootLayout(std::span<const uint8_t> bytecode, bool pixel, co
                              " but the root signature declares "+std::to_string(allowed)+
                              ((pixel?" pixel ":" vertex ")+std::string(kind)+" slots"));
   };
+  NativeShaderSlots used;
   for(UINT index=0;index<description.BoundResources;++index) {
     D3D12_SHADER_INPUT_BIND_DESC binding{};
     Require(reflection->GetResourceBindingDesc(index,&binding),"resource binding");
     switch(binding.Type) {
       case D3D_SIT_CBUFFER:
         if(binding.BindPoint>=constant_buffers) refuse("constant buffer",binding.BindPoint,constant_buffers);
+        used.constant_buffers|=1u<<binding.BindPoint;
         break;
       case D3D_SIT_TEXTURE:
         if(binding.BindPoint>=textures) refuse("texture",binding.BindPoint,textures);
+        used.textures|=1u<<binding.BindPoint;
         break;
       case D3D_SIT_SAMPLER:
         if(binding.BindPoint>=samplers) refuse("sampler",binding.BindPoint,samplers);
+        used.samplers|=1u<<binding.BindPoint;
         break;
       default:
         // Anything else needs a root parameter that does not exist. Better to
@@ -73,6 +77,7 @@ void ValidateAgainstRootLayout(std::span<const uint8_t> bytecode, bool pixel, co
                                  ", which this root signature does not declare");
     }
   }
+  return used;
 }
 
 
