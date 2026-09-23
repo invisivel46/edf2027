@@ -18,6 +18,20 @@ inline NativeSceneMatrix NativeSceneTranspose(const NativeSceneMatrix& matrix) {
   for(size_t row=0;row<4;++row) for(size_t col=0;col<4;++col) result[row*4+col]=matrix[col*4+row];
   return result;
 }
+// A sub-pixel clip-space offset (FSR jitter) folded into a row-vector matrix
+// that ends in clip space (a projection, view*projection or
+// world*view*projection): clip.xy += (x, y) * clip.w, i.e. column 0 gains x
+// times column 3 and column 1 gains y times column 3. NDC moves by exactly
+// (x, y) for every vertex, so the rasterized image shifts by (x, y) * size / 2
+// pixels (y up in NDC). Zero leaves the matrix bit for bit.
+inline NativeSceneMatrix NativeSceneClipJitter(const NativeSceneMatrix& matrix,float x,float y) {
+  NativeSceneMatrix result=matrix;
+  for(size_t row=0;row<4;++row) {
+    result[row*4+0]+=x*matrix[row*4+3];
+    result[row*4+1]+=y*matrix[row*4+3];
+  }
+  return result;
+}
 struct NativeSceneMatrixBinding {
   NativeSceneMatrixSource source;
   uint32_t offset;
@@ -175,6 +189,14 @@ class NativeSceneRenderer {
   NativeSceneRenderStatistics RenderUniform(NativeRenderBackend& backend,
     const NativeIndexedMesh::RetainedDraw& geometry,const NativeSceneMaterial& material,
     std::span<const NativeSceneMatrix> worlds,const NativeSceneView& view);
+  // FSR camera jitter (native_fsr.h), in NDC units: while non-zero, every
+  // matrix recorded that ends in clip space (Projection, ViewProjection,
+  // WorldViewProjection) carries NativeSceneClipJitter; View and the culling
+  // matrix do not. The views handed in stay what the caches keyed them on, so
+  // jitter reaches the draws without reaching any cache key. (0, 0), the
+  // default, records exactly what it did before the jitter existed.
+  void SetClipJitter(float x,float y) { clip_jitter_={x,y}; }
+  std::array<float,2> clip_jitter() const { return clip_jitter_; }
  private:
   struct Visible {
     const NativeSceneInstance* instance;
@@ -188,5 +210,6 @@ class NativeSceneRenderer {
     const World& world,const NativeSceneView& view,const NativeSceneMatrix& vp,NativeSceneRenderStatistics& statistics);
   std::vector<Visible> visible_;
   std::vector<uint8_t> constants_scratch_,instances_scratch_;
+  std::array<float,2> clip_jitter_{};
 };
 }

@@ -104,6 +104,9 @@
 #include "native_ab_alternate.h"
 #include "native_shadow_render.h"
 #include "native_post_finish_plan.h"
+#include "native_fsr.h"
+#include "native_ffx.h"
+#include "native_d3d12_raw.h"
 #include "native_full_frame_post.h"
 #include "native_constant_ownership.h"
 #include "immediate_mesh_key.h"
@@ -201,6 +204,14 @@ REXCVAR_DEFINE_INT32(edf_native_msaa, 0, "EDF2027",
                     "Native scene samples: 0 game default, 1 off, 2 or 4 MSAA (restart required)");
 REXCVAR_DEFINE_BOOL(edf_native_scene_depth_srv, false, "EDF2027",
                    "Create a single-sampled native scene depth shader-readable (typeless, with a depth SRV) for FSR; ignored with MSAA (restart required)");
+REXCVAR_DEFINE_STRING(edf_native_fsr, "off", "EDF2027",
+                     "FSR 3.1 on the native full-frame scene (native_fsr.h): off, or native_aa (1.0x temporal anti-aliasing); quality, balanced, performance and ultra_performance are accepted and run as native_aa until render scaling exists. On at startup it forces 1x scene MSAA and the sampled scene depth (edf_native_msaa, edf_native_scene_depth_srv; restart-time), so turning it on later needs a restart unless those already hold. Off while edf_native_ab_alternate, edf_native_reuse_off_alternate or edf_native_shadow_render is set");
+REXCVAR_DEFINE_DOUBLE(edf_native_fsr_sharpness, 0.2, "EDF2027",
+                     "FSR sharpening (RCAS) strength, 0 (off) to 1").range(0.0,1.0);
+// Defined further down; FSR reads them to stand aside for the validation runs.
+REXCVAR_DECLARE(int32_t, edf_native_ab_alternate);
+REXCVAR_DECLARE(int32_t, edf_native_reuse_off_alternate);
+REXCVAR_DECLARE(int32_t, edf_native_shadow_render);
 REXCVAR_DEFINE_BOOL(edf_native_motion_vectors, false, "EDF2027",
                    "FSR motion vectors: camera reprojection from the scene depth plus a velocity re-render of moving models, per view before post; forces a single-sampled, shader-readable scene depth (restart required)");
 REXCVAR_DEFINE_INT32(edf_native_motion_vectors_debug, 0, "EDF2027",
@@ -1281,6 +1292,28 @@ NativePacingState& PacingState() {
   static NativePacingState state;
   return state;
 }
+// FSR native AA (native_fsr.h, edf_native_fsr), under the bridge locks.
+// `frame` arms one helper call: its scene passes draw jittered and the
+// scene's resolve to owner+104 (ResolveScene: the native post's, or the
+// 8219C930 hook's mode 1) dispatches FSR and maps owner+104 to the output.
+// Armed by the first accepted view's BeginView (ArmNativeFsrFrameLocked);
+// cleared by the dispatch, or unconsumed at EndScene / the next frame
+// (counted as dropped: a direct-frame publication, or a post that failed
+// before resolving).
+struct NativeFsrBridgeState {
+  NativeFsrUpscaler upscaler;
+  NativeFsrResetTracker resets;
+  bool frame=false,opaque=false;
+  uint32_t owner=0;
+  uint64_t helper_frame=0;
+  int32_t index=0;
+  NativeFsrMode mode=NativeFsrMode::Off;
+  NativeFsrJitter jitter;
+  NativeFsrCameraParams camera;       // from the unjittered pass camera
+  NativeMotionVectorOutput motion;    // workstream B's, for the last view
+  std::chrono::steady_clock::time_point last_dispatch{};
+  uint64_t armed=0,dispatched=0,dropped=0,failures=0,history_resets=0;
+};
 struct Bridge {
   // Game command ordering is separate from immediate-context access. A swap
   // may hold this gate while releasing mutex between polls so the host can paint.
@@ -1332,6 +1365,7 @@ struct Bridge {
   uint64_t shader_registry_generation=0;
   uint64_t scene_publication_tick=0,scene_published_selections=0,scene_current_selections=0;
   NativeSceneRenderer scene_renderer;
+  NativeFsrBridgeState fsr;
   std::vector<NativeSceneSnapshot> scene_recorded_snapshots;
   // Full-frame pass frames (models, sky) whose snapshots a recording uses;
   // released with scene_recorded_snapshots at submission.
@@ -1793,6 +1827,72 @@ void CaptureScene(Bridge& state,uint32_t owner) {
       state.visibility.size(),unavailable,state.indexed_draws,state.indexed_outside_scene);
   } catch (const std::exception& error) { REXLOG_ERROR("Native scene capture: {}",error.what()); }
 }
+// FSR's end of an armed frame (NativeFsrBridgeState): the scene colour just
+// resolved (render size, jittered), the sampled depth, motion vectors (B's,
+// or zero) and the opaque-only copy go through GENERATEREACTIVEMASK and the
+// upscaler, recorded here on the scene recorder, and the output texture is
+// what owner+104 samples from now on. Nullopt (owner+104 keeps the plain
+// resolve) when the frame is not armed for this scene or the dispatch fails.
+std::optional<NativeTexture> DispatchNativeFsrLocked(Bridge& state,uint32_t owner,NativeScene& scene) {
+  auto& fsr=state.fsr;
+  if(!fsr.frame || fsr.owner!=owner) return std::nullopt;
+  fsr.frame=false;
+  if(!scene.color.sampled.content_valid || !scene.color.sampled.backend || !state.scene_backend) return std::nullopt;
+  try {
+    const auto width=scene.color.sampled.width,height=scene.color.sampled.height;
+    const auto plan=PlanNativeFsrMotion(fsr.motion,fsr.camera);
+    const auto reasons=fsr.resets.Next({fsr.helper_frame,width,height,scene.color.format,fsr.mode,NativeAbNativeSide(),
+      plan.camera,plan.reset});
+    const auto now=std::chrono::steady_clock::now();
+    const float frame_ms=fsr.dispatched?std::chrono::duration<float,std::milli>(now-fsr.last_dispatch).count():16.6667f;
+    fsr.last_dispatch=now;
+    NativeFsrDispatchInputs inputs;
+    inputs.color=scene.color.sampled.backend.get();
+    inputs.depth=scene.depth.backend_target.get();
+    inputs.motion=plan.motion;
+    inputs.opaque=fsr.opaque;
+    inputs.jitter=fsr.jitter;
+    // Workstream B's vectors are UV offsets (current to previous position);
+    // this scales them to render pixels, as FSR takes them.
+    inputs.motion_scale={float(width),float(height)};
+    inputs.sharpness=float(REXCVAR_GET(edf_native_fsr_sharpness));
+    inputs.frame_ms=frame_ms;
+    inputs.reset=reasons!=0;
+    inputs.camera=plan.camera;
+    fsr.upscaler.Dispatch(*state.scene_backend,SceneRecorderLocked(state),inputs);
+    // The raw pass left the recorder with no bindings (EndExternal).
+    ++state.bind_generation;
+    state.recorded={};
+    ++fsr.dispatched;
+    if(inputs.reset) ++fsr.history_resets;
+    // Resets other than "no motion vectors" (which is every frame until
+    // workstream B lands) are worth a line each, sparsely.
+    static uint64_t logged_resets=0;
+    if((reasons&~kNativeFsrResetMotion) && (++logged_resets<=8 || !(logged_resets&(logged_resets-1))))
+      REXLOG_INFO("FSR history reset: {} (frame={} count={})",NativeFsrResetTracker::Describe(reasons),fsr.helper_frame,logged_resets);
+    if(fsr.dispatched<=4 || fsr.dispatched%1000==0)
+      REXLOG_INFO("FSR dispatch: count={} {}x{} jitter=({:.4f},{:.4f})px phase={}/{} reset={} reactive={} motion={} near={} far={} fov_y={:.4f}{} sharpness={:.2f} dropped={} failures={}",
+        fsr.dispatched,width,height,inputs.jitter.pixel_x,inputs.jitter.pixel_y,fsr.index,fsr.upscaler.JitterPhaseCount(),
+        NativeFsrResetTracker::Describe(reasons),inputs.opaque,plan.motion?"workstream_b":"zero",plan.camera.near_plane,
+        plan.camera.far_plane,plan.camera.fov_y,plan.camera.derived?"":" (defaults)",inputs.sharpness,fsr.dropped,fsr.failures);
+    for(const auto& message:DrainNativeFsrMessages()) {
+      static uint64_t messages=0;
+      if(++messages<=32) REXLOG_WARN("FidelityFX: {}",message);
+    }
+    NativeTexture output;
+    output.backend=fsr.upscaler.output();
+    output.width=width; output.height=height; output.mip_count=1;
+    output.format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+    output.content_valid=true;
+    return output;
+  } catch(const std::exception& error) {
+    fsr.resets.Forget();
+    if(++fsr.failures<=8 || !(fsr.failures&(fsr.failures-1)))
+      REXLOG_ERROR("FSR dispatch failed, the plain resolve is used: {} (failures={})",error.what(),fsr.failures);
+    for(const auto& message:DrainNativeFsrMessages()) REXLOG_WARN("FidelityFX: {}",message);
+    return std::nullopt;
+  }
+}
 void ResolveScene(const GuestReader& reader,Bridge& state,uint32_t owner) {
   try {
     auto& scene=state.scenes.at(owner);
@@ -1815,7 +1915,10 @@ void ResolveScene(const GuestReader& reader,Bridge& state,uint32_t owner) {
     // what is set.
     ++state.bind_generation;
     state.recorded={};
-    state.textures.insert_or_assign(handle,scene.color.sampled);
+    // An FSR frame's post samples the upscaled image instead (the same
+    // extent: native AA). Unarmed, this is the plain resolve as before.
+    if(auto upscaled=DispatchNativeFsrLocked(state,owner,scene)) state.textures.insert_or_assign(handle,std::move(*upscaled));
+    else state.textures.insert_or_assign(handle,scene.color.sampled);
     if (++state.scene_resolves<=5 || state.scene_resolves%1000==0)
       REXLOG_INFO("Native HDR scene resolve: count={}, texture={:#x}, initialized={}, frame_complete={}",
         state.scene_resolves,handle,scene.color.sampled.content_valid,scene.frame_complete);
@@ -2366,6 +2469,111 @@ thread_local std::shared_ptr<const NativeScenePassCameras> native_scene_pass_cam
 thread_local std::optional<NativeScenePassAnimation> native_scene_pass_animation;
 thread_local std::shared_ptr<const NativeSceneAdapter::WorldAnimations> native_scene_pass_animations;
 thread_local uint32_t native_scene_animation_owner=0;
+// FSR (native_fsr.h): while a full-frame view is jittered, the pass camera
+// with the jitter in its projection and view*projection, for the draws that
+// take their camera constants from a NativeScenePassCamera (the effect and
+// map-effect activations). native_scene_pass_camera itself stays unjittered:
+// the static world's reuse keys, per-group camera constants and camera plan,
+// the culls, the effects' eye and the guest view globals all read it. The
+// renderer-drawn passes get the same jitter through
+// NativeSceneRenderer::SetClipJitter. Null (no jitter) outside such a view.
+thread_local std::optional<NativeScenePassCamera> native_scene_draw_camera;
+thread_local NativeFsrJitter native_scene_view_jitter;
+const NativeScenePassCamera& NativeSceneDrawCamera() {
+  return native_scene_draw_camera?*native_scene_draw_camera:*native_scene_pass_camera;
+}
+NativeFsrMode NativeFsrRequestedMode() {
+  const std::string text=REXCVAR_GET(edf_native_fsr);
+  if(const auto mode=ParseNativeFsrMode(text)) return *mode;
+  static std::atomic<bool> reported=false;
+  if(!reported.exchange(true))
+    REXLOG_WARN("edf_native_fsr={} is not a mode (off, native_aa, quality, balanced, performance, ultra_performance); FSR stays off",text);
+  return NativeFsrMode::Off;
+}
+NativeFsrExclusions NativeFsrCurrentExclusions() {
+  return {REXCVAR_GET(edf_native_ab_alternate)>0,REXCVAR_GET(edf_native_reuse_off_alternate)>0,
+          REXCVAR_GET(edf_native_shadow_render)>0};
+}
+// Whether the scene targets are made for FSR (1x colour, sampled depth):
+// edf_native_fsr on at the first scene allocation and no validation run.
+// Restart-time, like the two settings it overrides.
+bool NativeFsrSceneAtStartup() {
+  static const bool on=[] {
+    const auto mode=NativeFsrRequestedMode();
+    if(mode==NativeFsrMode::Off) return false;
+    if(const auto* excluded=NativeFsrExcludedBy(NativeFsrCurrentExclusions())) {
+      REXLOG_WARN("FSR requested (edf_native_fsr={}) but {} is set: FSR stays off and the scene targets are not changed",
+        NativeFsrModeName(mode),excluded);
+      return false;
+    }
+    REXLOG_INFO("FSR requested at startup (edf_native_fsr={}): scene MSAA forced to 1x (edf_native_msaa={} not used) and the "
+      "scene depth made sampled (edf_native_scene_depth_srv); both hold until restart",NativeFsrModeName(mode),REXCVAR_GET(edf_native_msaa));
+    return true;
+  }();
+  return on;
+}
+// Arms this helper call's frame for FSR on `renderer`'s scene (its first
+// accepted view, locks held) and picks the frame's jitter: false, and no
+// jitter anywhere, when FSR is off, stood aside, or cannot run.
+bool ArmNativeFsrFrameLocked(Bridge& state,uint32_t renderer,NativeScene& scene,uint64_t helper_frame) {
+  auto& fsr=state.fsr;
+  if(fsr.frame) { ++fsr.dropped; fsr.frame=false; }
+  fsr.opaque=false; fsr.motion={};
+  const auto mode=NativeFsrRequestedMode();
+  if(mode==NativeFsrMode::Off) {
+    if(fsr.mode!=NativeFsrMode::Off) {
+      REXLOG_INFO("FSR off (dispatched={} dropped={} failures={})",fsr.dispatched,fsr.dropped,fsr.failures);
+      fsr.resets.Forget();
+    }
+    fsr.mode=NativeFsrMode::Off;
+    return false;
+  }
+  if(const auto* excluded=NativeFsrExcludedBy(NativeFsrCurrentExclusions())) {
+    static std::atomic<bool> reported=false;
+    if(!reported.exchange(true)) REXLOG_WARN("FSR disabled: {} is set (validation runs compare unjittered frames)",excluded);
+    return false;
+  }
+  if(scene.samples!=1 || !scene.depth.backend_target || !scene.depth.backend_target->texture()) {
+    static std::atomic<bool> reported=false;
+    if(!reported.exchange(true))
+      REXLOG_WARN("FSR needs a restart: the scene has {} sample(s) and {} depth; edf_native_fsr on at startup makes them 1x and sampled",
+        scene.samples,scene.depth.backend_target && scene.depth.backend_target->texture()?"sampled":"unsampled");
+    return false;
+  }
+  if(!state.scene_backend) return false;
+  if(NativeFsrEffectiveMode(mode)!=mode) {
+    static std::atomic<bool> reported=false;
+    if(!reported.exchange(true))
+      REXLOG_WARN("edf_native_fsr={} runs as native_aa: only native AA is implemented",NativeFsrModeName(mode));
+  }
+  const auto width=scene.color.sampled.width,height=scene.color.sampled.height;
+  std::string error;
+  if(!fsr.upscaler.Prepare(*state.scene_backend,width,height,scene.color.format,&error)) {
+    static uint64_t failures=0;
+    if(++failures<=4 || !(failures&(failures-1))) REXLOG_WARN("FSR unavailable: {} (count={})",error,failures);
+    for(const auto& message:DrainNativeFsrMessages()) REXLOG_WARN("FidelityFX: {}",message);
+    return false;
+  }
+  if(fsr.upscaler.recreated())
+    REXLOG_INFO("FSR context: {}x{} provider={} flags=HDR|DEPTH_INVERTED|AUTO_EXPOSURE jitter_phases={} ({}) gpu_memory={:.1f}MB contexts={} retired={}",
+      width,height,fsr.upscaler.provider().empty()?"?":fsr.upscaler.provider(),fsr.upscaler.JitterPhaseCount(),
+      fsr.upscaler.jitter_from_ffx()?"ffx":"local",double(fsr.upscaler.stats().context_bytes)/1048576.0,fsr.upscaler.stats().contexts,fsr.upscaler.stats().retired);
+  const auto phases=(std::max)(1,fsr.upscaler.JitterPhaseCount());
+  fsr.index%=phases;
+  fsr.jitter=MakeNativeFsrJitter(fsr.upscaler.JitterOffset(fsr.index),width,height);
+  fsr.index=(fsr.index+1)%phases;
+  fsr.mode=mode; fsr.frame=true; fsr.owner=renderer; fsr.helper_frame=helper_frame;
+  ++fsr.armed;
+  return true;
+}
+// An armed frame nothing resolved (a direct-frame publication, a failed post):
+// dropped, so no later resolve dispatches with its jitter.
+void DisarmNativeFsrLocked(Bridge& state) {
+  if(!state.fsr.frame) return;
+  state.fsr.frame=false;
+  if(const auto dropped=++state.fsr.dropped;dropped<=4 || !(dropped&(dropped-1)))
+    REXLOG_INFO("FSR frame not dispatched: nothing resolved the scene to owner+104 (direct frame or post failure; dropped={})",dropped);
+}
 const NativeSceneSources& NativeSceneSourcesForPass(const Bridge& state) {
   if(EDF_NATIVE_FLAG(scene_sources_owned) && native_scene_publication && native_scene_publication->sources) {
     static uint64_t reads=0;
@@ -7101,7 +7309,7 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
         const NativeSceneCpuWindow window(reader_);
         const auto report=[](const std::string& reason) { NativeFullFrameDeclined("effects",reason); };
         for(const auto& item:collection.immediate)
-          drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,*native_scene_pass_camera,viewport,formats,report,
+          drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,NativeSceneDrawCamera(),viewport,formats,report,
             [&](const std::exception& error) { report(error.what()); });
       } else if(NativeCoverageCensusOn())
         CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:effects","no_targets",collection.immediate.size());
@@ -7173,7 +7381,8 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     }
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("transparent",reason); };
-    const auto& camera=*native_scene_pass_camera;
+    // The effects' activations draw with the jittered camera under FSR.
+    const auto& camera=NativeSceneDrawCamera();
     std::vector<NativeTransparentItem> models;
     if(frame) for(size_t index=0;index<frame->batches.size();++index)
       models.push_back({frame->batches[index].key,frame->batches[index].order,[&state,&targets,frame,index](NativeBackendRecorder& recorder) {
@@ -7306,7 +7515,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("map effects",reason); };
     // A run of alike draws (the wires' strips) activates once.
-    map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,*native_scene_pass_camera,viewport,formats,report,
+    map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,NativeSceneDrawCamera(),viewport,formats,report,
       [&](const std::exception& error) { report(error.what()); });
   }
   // The coverage census of one map-effect walk, member by member as
@@ -8041,11 +8250,23 @@ void NativeShadowFrame::Run(const NativeFrameContext& frame,uint32_t context,uin
 }
 }
 namespace {
+// FSR's motion vectors: workstream B's (native_motion_vectors.h), which
+// NativeFullFrame::Run hands the frame context as the last accepted view's
+// (null texture and reset when edf_native_motion_vectors recorded none;
+// PlanNativeFsrMotion turns that into zero motion and a history reset). The
+// one place FSR takes them from.
+edf::native::NativeMotionVectorOutput NativeFsrMotionInput(const edf::native::NativeFrameContext& context) {
+  return context.motion;
+}
 class NativeFullFrameHost final : public edf::native::NativeFrameHost {
  public:
   using GuestCall=std::function<void(uint32_t function,uint32_t object,uint32_t argument,uint32_t index,uint32_t lr)>;
   NativeFullFrameHost(uint8_t* base,uint32_t owner,uint32_t context,GuestCall guest)
     :base_(base),reader_(base),owner_(owner),context_(context),guest_(std::move(guest)) {}
+  // A pass that threw leaves no jitter behind for the guest routes or the HUD.
+  ~NativeFullFrameHost() { EndFsrView(); }
+  NativeFullFrameHost(const NativeFullFrameHost&)=delete;
+  NativeFullFrameHost& operator=(const NativeFullFrameHost&)=delete;
   // edf_native_shadow_render: this frame's shadow (null on every other frame).
   void SetShadow(edf::native::NativeShadowFrame* shadow) { shadow_=shadow; }
   // The models pass's per-view handoff, for the velocity draws.
@@ -8064,6 +8285,8 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     std::shared_ptr<const edf::native::NativeRenderRegistrySnapshot> registry;
     {
       std::lock_guard lock(state.mutex);
+      // A frame armed for FSR and never resolved is not this one's.
+      edf::native::DisarmNativeFsrLocked(state);
       edf::native::native_scene_publication=state.scene_adapter.AcquirePublication();
       edf::native::native_scene_pass_cameras=EDF_NATIVE_FLAG(scene_camera_owned)?state.scene_adapter.AcquireCameras():nullptr;
       edf::native::native_scene_pass_animations=state.scene_adapter.AcquireWorldAnimations();
@@ -8205,6 +8428,22 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
       edf::native::ClearNativeDepthTarget(edf::native::SceneRecorderLocked(state),native_scene->second.depth,true,true,
         viewport.max_depth,0);
     }
+    // FSR (native_fsr.h): the frame's first accepted view arms it and picks
+    // the jitter; every view of an armed frame draws jittered. The pass camera
+    // and the view globals written above stay unjittered.
+    if(!fsr_arm_tried_) {
+      fsr_arm_tried_=true;
+      edf::native::ArmNativeFsrFrameLocked(state,renderer,native_scene->second,native_render_frames.load(std::memory_order_relaxed));
+    }
+    edf::native::native_scene_draw_camera.reset();
+    edf::native::native_scene_view_jitter={};
+    if(state.fsr.frame && state.fsr.owner==renderer) {
+      const auto& jitter=state.fsr.jitter;
+      edf::native::native_scene_view_jitter=jitter;
+      edf::native::native_scene_draw_camera=edf::native::NativeFsrJitterCamera(*edf::native::native_scene_pass_camera,jitter);
+      state.scene_renderer.SetClipJitter(jitter.clip_x,jitter.clip_y);
+      state.fsr.camera=edf::native::NativeFsrCameraFromProjectionWords(edf::native::native_scene_pass_camera->projection);
+    }
     edf::native::BindActiveTarget(state);
     if(state.context) edf::native::MakeNativeDrawViewport(viewport.x,viewport.y,viewport.width,viewport.height,
       viewport.min_depth,viewport.max_depth,false,{}).Bind(*state.context.Get());
@@ -8219,6 +8458,23 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     const GpuPassSpan gpu(pass.name());
     if(shadow_) shadow_->Label(std::string("native.")+pass.name());
     pass.Record(context);
+    // FSR: the opaque-only colour (sky, static world, opaque models), before
+    // the effects and transparent passes, for the reactive mask.
+    if(edf::native::native_scene_draw_camera && std::string_view(pass.name())=="models") CopyFsrOpaque(context);
+  }
+  void CopyFsrOpaque(const edf::native::NativeFrameContext& context) {
+    auto& state=edf::native::State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    auto& fsr=state.fsr;
+    const auto scene=state.scenes.find(context.renderer);
+    auto* opaque=fsr.upscaler.opaque_texture();
+    if(!fsr.frame || fsr.owner!=context.renderer || state.active_scene!=context.renderer || scene==state.scenes.end() ||
+       !opaque || !scene->second.color.backend_surface) return;
+    edf::native::SceneRecorderLocked(state).ResolveTarget(*opaque,*scene->second.color.backend_surface);
+    ++state.bind_generation;
+    state.recorded={};
+    fsr.opaque=true;
   }
   // REMAINING GUEST CALLS, per view, in the helper's order: the overlay
   // listeners' +12 (clSatoCallback 8216DA80 -> 8217A728 -> 82122640: the
@@ -8235,6 +8491,16 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeOverlays);
     const GpuPassSpan gpu("view_overlays");
     if(shadow_) shadow_->Label("native.overlays");
+    // FSR: the listeners' draws take their camera from the view globals, so
+    // for this call those carry the jitter too (the draw camera's projection;
+    // the view, hence the eye pool+192, is unchanged). Put back unjittered
+    // when the call returns or throws; the view's jitter ends at EndView.
+    struct FsrViewGlobals {
+      NativeFullFrameHost& host;
+      ~FsrViewGlobals() { host.RestoreFsrViewGlobals(); }
+    } fsr_view_globals{*this};
+    if(const auto& draw=edf::native::native_scene_draw_camera)
+      edf::native::WriteNativeViewGlobals(reader_,draw->projection,draw->view);
     RemainingGuestCall(0);
     const auto sentinel=[&] { return Word(2232); };
     for(auto node=reader_.Word(sentinel());node!=sentinel();) {
@@ -8245,6 +8511,30 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     RemainingGuestCall(1);
     Virtual(context.view.scene,16,0,0,0x821A5294);
   }
+  // The view globals back to the unjittered pass camera after the jittered
+  // ViewOverlays call. Nothing when the view is not jittered. Never throws.
+  void RestoreFsrViewGlobals() noexcept {
+    if(!edf::native::native_scene_draw_camera) return;
+    try {
+      if(const auto& camera=edf::native::native_scene_pass_camera)
+        edf::native::WriteNativeViewGlobals(reader_,camera->projection,camera->view);
+    } catch(...) {}
+  }
+  // The end of a view's jittered drawing (EndView, or the host's destruction
+  // when a pass threw): no renderer jitter, no draw camera. Never throws.
+  void EndFsrView() noexcept {
+    if(!edf::native::native_scene_draw_camera) return;
+    RestoreFsrViewGlobals();
+    edf::native::native_scene_draw_camera.reset();
+    edf::native::native_scene_view_jitter={};
+    try {
+      auto& state=edf::native::State();
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      state.scene_renderer.SetClipJitter(0,0);
+    } catch(...) {}
+  }
+  void EndView(edf::native::NativeFrameContext&) override { EndFsrView(); }
   // edf_native_motion_vectors: the view's motion vectors, after its passes
   // and guest overlays, before post (RecordNativeMotionVectors), into
   // context.motion. Camera reprojection from the scene depth (the scene is
@@ -8254,7 +8544,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // taken off here. Everything the record bound is forgotten afterwards and
   // the scene's targets are bound again.
   void MotionVectors(edf::native::NativeFrameContext& context) override {
-    if(!REXCVAR_GET(edf_native_motion_vectors) || !context.renderer || !edf::native::native_scene_pass_camera) return;
+    // FSR implies them: a jittered (FSR-armed) view records them too.
+    if((!REXCVAR_GET(edf_native_motion_vectors) && !edf::native::native_scene_draw_camera) ||
+       !context.renderer || !edf::native::native_scene_pass_camera) return;
     const GpuPassSpan gpu("motion_vectors");
     const auto velocity=models_?models_->velocity:nullptr;
     auto& state=edf::native::State();
@@ -8323,6 +8615,14 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     // An unlocked render-only frame holds the tone history (NativePostHistory):
     // its 0.025-per-draw blend stays once per simulation tick.
     const auto history=context.inputs.tick_frame?edf::native::NativePostHistory::Advance:edf::native::NativePostHistory::Hold;
+    // FSR dispatches inside the scene's resolve (either route below) with the
+    // frame's motion vectors (the last accepted view's).
+    {
+      auto& state=edf::native::State();
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      if(state.fsr.frame) state.fsr.motion=NativeFsrMotionInput(context);
+    }
     if(edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error,history)) {
       BindOutput(renderer,resolve_scene);
       MotionVectorDebug(renderer,context.motion);
@@ -8456,6 +8756,8 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
+    // An FSR frame the scene's resolve did not consume (a direct frame).
+    edf::native::DisarmNativeFsrLocked(state);
     const auto renderer=reader_.Word(kRenderer);
     const bool output=renderer && state.active_output==renderer;
     const bool open=renderer && state.active_scene==renderer;
@@ -8489,6 +8791,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   edf::native::NativeShadowFrame* shadow_=nullptr;
   std::shared_ptr<NativeFullFrameModelsShared> models_;
   uint32_t views_begun_=0;
+  bool fsr_arm_tried_=false;  // this frame's first accepted view has armed FSR (or declined to)
 };
 }
 namespace {
@@ -12539,16 +12842,28 @@ REX_HOOK_RAW(sub_8219C7A8) {
       const auto color_surface=reader.Word(reader.Add(reader.Word(reader.Add(owner,8)),12168));
       const auto& creation=state.surface_creations.at(color_surface);
       // Pin the choice for this renderer lifetime, including later scene recreation.
-      static const int32_t sample_override=REXCVAR_GET(edf_native_motion_vectors)?1:REXCVAR_GET(edf_native_msaa);
+      // FSR on at startup (NativeFsrSceneAtStartup) and the motion vectors
+      // both take the scene to 1x.
+      static const bool fsr_scene=edf::native::NativeFsrSceneAtStartup();
+      static const int32_t sample_override=fsr_scene || REXCVAR_GET(edf_native_motion_vectors)?1:REXCVAR_GET(edf_native_msaa);
       const uint32_t samples=edf::native::NativeSceneSamples(creation.msaa,sample_override);
       auto found=state.scenes.find(owner);
       if (found==state.scenes.end() || found->second.color.sampled.width!=width || found->second.color.sampled.height!=height || found->second.samples!=samples) {
         // Reversed-Z: the scene clears depth to 0, so that is its declared
         // optimized clear. The SRV is opt-in and single-sampled only.
-        // Motion vectors read the depth through its SRV, which is single-sampled
-        // only: with them on, the scene is 1x and its depth sampled.
+        // Motion vectors and FSR read the depth through its SRV, which is
+        // single-sampled only: with either on, the scene is 1x and its depth sampled.
         static const bool motion_vectors=REXCVAR_GET(edf_native_motion_vectors);
-        static const bool depth_srv=REXCVAR_GET(edf_native_scene_depth_srv) || motion_vectors;
+        static const bool depth_srv=REXCVAR_GET(edf_native_scene_depth_srv) || motion_vectors || fsr_scene;
+        // FidelityFX availability, once, on the scene device (FSR runs there).
+        static const bool ffx_logged=[&] {
+          auto* raw=EnsureSceneBackendLocked(state).D3D12Raw();
+          REXLOG_INFO("{} (scene backend {}{}; edf_native_fsr={})",edf::native::NativeFsrLibrary().Describe(raw?raw->Device():nullptr),
+            std::string(EnsureSceneBackendLocked(state).name()),raw?"":", no D3D12 raw access: FSR unavailable",
+            std::string(REXCVAR_GET(edf_native_fsr)));
+          return true;
+        }();
+        (void)ffx_logged;
         edf::native::NativeScene scene{
           edf::native::CreateNativeRenderTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,samples),
           edf::native::CreateNativeDepthTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples,

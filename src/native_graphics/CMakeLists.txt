@@ -22,6 +22,8 @@ if(WIN32)
     # FidelityFX API: vendored headers only, the DLL is loaded at run time
     # (native_ffx.h). No import library, so a missing DLL cannot stop startup.
     target_sources(edf_native_d3d12 PRIVATE native_ffx.cpp)
+    # FSR 3.1 native AA on the full-frame scene (native_fsr.h), over the loader.
+    target_sources(edf_native_d3d12 PRIVATE native_fsr.cpp)
     target_include_directories(edf_native_d3d12 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party)
 
     add_executable(edf_native_backend_bench ../../tools/native_backend_bench.cpp)
@@ -90,6 +92,12 @@ if(WIN32)
         add_executable(edf_native_fsr_foundation_tests ../../tests/native_fsr_foundation_tests.cpp)
         target_link_libraries(edf_native_fsr_foundation_tests PRIVATE edf_native_d3d12)
         add_test(NAME edf_native_fsr_foundation_tests COMMAND edf_native_fsr_foundation_tests)
+        # FSR integration (native_fsr.h): modes, jitter and projection math,
+        # camera and reset rules, the renderer's clip jitter, and an FSR
+        # dispatch on WARP with the real DLL when it is staged.
+        add_executable(edf_native_fsr_tests ../../tests/native_fsr_tests.cpp)
+        target_link_libraries(edf_native_fsr_tests PRIVATE edf_native_d3d11)
+        add_test(NAME edf_native_fsr_tests COMMAND edf_native_fsr_tests)
         add_executable(edf_native_gpu_timing_tests ../../tests/native_gpu_timing_tests.cpp)
         target_link_libraries(edf_native_gpu_timing_tests PRIVATE edf_native_d3d12)
         add_test(NAME edf_native_gpu_timing_tests COMMAND edf_native_gpu_timing_tests)

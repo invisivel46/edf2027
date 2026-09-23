@@ -22,6 +22,7 @@
 #include "native_graphics/native_static_world_pass.h"
 #include "native_graphics/native_static_world_cache.h"
 #include "native_graphics/native_full_frame_static_world.h"
+#include "native_graphics/native_fsr.h"
 #include "native_graphics/native_address_filter.h"
 #include "native_graphics/native_texture_binding.h"
 #include "native_graphics/d3d11_backend.h"
@@ -1431,6 +1432,145 @@ void FullFrameStaticWorld() {
     select_cache.stats.list_builds==builds && std::ranges::count(direct.objects,NativeFullFrameStaticSelection::Object{E,0})==1,
     "a cached selection used stale route words");
   live[E].mode=1;
+}
+// FSR jitter and the static world's reuse (native_fsr.h). The full frame keys
+// the static world on the UNJITTERED pass camera and puts the jitter only into
+// what the draws record (NativeSceneRenderer::SetClipJitter, and the jittered
+// draw camera for effect activations). Two groups: G1's material has no camera
+// constant (a moved camera reuses it camera-only), G2's has g_mProjection, not
+// derivable here, so a moved camera re-resolves it.
+//  - A still camera with FSR on: every frame after the first is the previous
+//    frame whole (reused_frame), no resolve, while the draw camera still moves
+//    by the jitter every frame (the view never does).
+//  - Control: had the jittered camera been the key, a still camera would lose
+//    whole-frame reuse every frame and re-resolve G2 every frame.
+//  - A moving camera: the statistics with FSR on equal those with it off,
+//    frame for frame (camera_only hits unchanged).
+void FullFrameStaticWorldJitter() {
+  std::vector<uint8_t> memory(0x10000);
+  const GeometryRetryReader r{memory};
+  const auto store=[&](uint32_t at,std::initializer_list<float> values) {
+    for(const auto value:values) { r.StoreWord(at,std::bit_cast<uint32_t>(value)); at+=4; }
+  };
+  constexpr uint32_t world=0x1000,levels=0x2000,root=0x3000;
+  r.StoreWord(world+52,levels); r.StoreWord(world+56,levels+32);
+  r.StoreWord(levels+20,root); r.StoreWord(levels+24,root+144);
+  r.StoreWord(root+116,1); store(root+32,{0,0,50,1,5,5,5,0,5});
+  const std::shared_ptr<const NativeSceneTreeImage> image=CaptureNativeSceneTree(r,world);
+  constexpr uint32_t A=0x6000,B=0x6100,G1=0x8100,G2=0x8200;
+  NativeSceneSources sources;
+  const auto object=[&](uint32_t owner,uint32_t instance,uint32_t group) {
+    sources.Born(owner);
+    NativeSceneSources::Part part{instance,0,0,0,group};
+    part.world_data=owner+0x80; part.world_first=0;
+    Require(sources.Observe(owner,std::vector<NativeSceneSources::Part>{part}),"jitter fixture parts");
+    NativeSceneVisibility visibility;
+    visibility.box={0,0,50,1, 1,0,0,0, 0,1,0,0, 0,0,1,0};
+    visibility.radius=1.7f; visibility.distance=1000; visibility.lod_count=1; visibility.lod_thresholds={100,0};
+    sources.PublishVisibility(owner,visibility);
+    sources.PublishWorld(owner,NativeSceneSources::World{});
+  };
+  object(A,0x7000,G1); object(B,0x7100,G2);
+  auto lists=std::make_shared<NativeSceneMembership::Publication>();
+  auto snapshot=std::make_shared<NativeSceneMembership::Snapshot>(); snapshot->end=root+120+8;
+  for(const auto owner:{A,B}) snapshot->members.push_back({owner+0x10,owner});
+  lists->lists.Set(root+120,std::move(snapshot));
+  NativeScenePublication publication;
+  publication.sources=sources.AcquireSnapshot(); publication.membership=lists;
+  publication.trees[world]=image;
+  publication.group_order.Set(world,std::make_shared<const NativeSceneGroupOrder>(NativeSceneGroupOrder{G1,G2}));
+  auto program=std::make_shared<NativeSceneMaterialProgram>();
+  program->inputs.vertex=0x9100; program->inputs.pixel=0x9200;
+  program->inputs.vertex_registers.push_back({"g_mWorld",0,4});
+  for(const auto group:{G1,G2}) {
+    auto material=std::make_shared<NativeSceneGroupMaterial>(); material->group=group;
+    material->revision=publication.sources->FindGroup(group)->revision; material->program=program;
+    material->constants.push_back({false,"c0",std::vector<uint8_t>(16,uint8_t(group>>8)),false});
+    material->constants.push_back({false,"g_mWorld",std::vector<uint8_t>(64,0),false});
+    if(group==G2) material->constants.push_back({false,"g_mProjection",std::vector<uint8_t>(64,0),true});
+    publication.group_materials.Assign(material,NativeSceneGroupKey{});
+    auto geometry=std::make_shared<NativeSceneGroupGeometry>(); geometry->group=group; geometry->revision=material->revision;
+    publication.group_geometry.Assign(geometry,NativeSceneGroupKey{});
+  }
+  NativeFullFrameStaticPass pass;
+  pass.targets.dsv_format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT; pass.targets.rtv_format[0]=DXGI_FORMAT_R16G16B16A16_FLOAT;
+  uint64_t resolves=0;
+  const auto resolve=[&](const NativeSceneGroupMaterial&,const auto&,const NativeSceneMaterialPassState& state,auto) {
+    ++resolves;
+    NativeFullFrameStaticMaterial result; result.render=state.render.words;
+    return result;
+  };
+  const NativeFullFrameStaticRouteRead routes=[](uint32_t)->std::optional<NativeFullFrameStaticRoute> {
+    return NativeFullFrameStaticRoute{true,0,0};
+  };
+  NativeFullFrameStaticCamera camera;
+  camera.visibility.matrix=kNativeSceneIdentity; camera.visibility.depth_scale=-1;
+  auto& f=camera.visibility.frustum;
+  f[8]=1; f[10]=-1; f[12]=-1; f[14]=-1; f[17]=1; f[18]=-1; f[21]=-1; f[22]=-1; f[24]=1; f[25]=1000;
+  // A perspective pass camera (row vectors, guest words), 1280x720.
+  const auto words=[](const NativeSceneMatrix& m) {
+    std::array<uint32_t,16> out{};
+    for(size_t i=0;i<16;++i) out[i]=std::bit_cast<uint32_t>(m[i]);
+    return out;
+  };
+  NativeSceneMatrix projection{1.3f,0,0,0, 0,2.3f,0,0, 0,0,1.0001f,1, 0,0,-0.10001f,0};
+  camera.pass.projection=words(projection); camera.pass.view=words(kNativeSceneIdentity);
+  camera.pass.view_projection=camera.pass.projection;
+  const auto jitter_of=[](uint32_t frame) {
+    return MakeNativeFsrJitter(NativeFsrJitterOffset(int32_t(frame),NativeFsrJitterPhaseCount(1280,1280)),1280,720);
+  };
+  const auto frame_stats=[](const NativeFullFrameStaticFrame& frame) {
+    const auto& s=frame.stats;
+    return std::array<uint64_t,7>{s.reused_frame,s.camera_only,s.cache_hits,s.resolves,s.draws,s.instances,s.reused_draws};
+  };
+  constexpr uint32_t kFrames=12;
+  // Still camera, FSR on: keyed on the pass camera, drawn with the jittered one.
+  {
+    NativeFullFrameStaticWorld keyed;
+    resolves=0;
+    std::optional<NativeScenePassCamera> previous_draw;
+    for(uint32_t frame=0;frame<kFrames;++frame) {
+      const auto jitter=jitter_of(frame);
+      const auto draw=NativeFsrJitterCamera(camera.pass,jitter);
+      Require(draw.view==camera.pass.view && draw.projection!=camera.pass.projection,"the draw camera's view moved or its projection did not");
+      Require(!previous_draw || !(*previous_draw==draw),"consecutive frames drew with one jitter");
+      previous_draw=draw;
+      const auto& built=keyed.Build(publication,camera,routes,pass,resolve);
+      Require(built.stats.draws==2,"jitter fixture draws");
+      if(frame) Require(built.stats.reused_frame==1 && resolves==2,"a still camera under FSR jitter lost whole-frame reuse");
+    }
+  }
+  // Control: the jittered camera as the key.
+  {
+    NativeFullFrameStaticWorld jittered;
+    resolves=0;
+    uint64_t reused=0,camera_only=0;
+    for(uint32_t frame=0;frame<kFrames;++frame) {
+      auto moved=camera; moved.pass=NativeFsrJitterCamera(camera.pass,jitter_of(frame));
+      const auto& built=jittered.Build(publication,moved,routes,pass,resolve);
+      reused+=built.stats.reused_frame; if(frame) camera_only+=built.stats.camera_only;
+    }
+    Require(reused==0 && resolves==kFrames+1 && camera_only>0,
+      "the control (jitter in the static world's key) did not show what the unjittered key keeps");
+  }
+  // Moving camera: FSR on and off draw the same static world, stat for stat.
+  {
+    NativeFullFrameStaticWorld off,on;
+    uint64_t camera_only=0;
+    for(uint32_t frame=0;frame<kFrames;++frame) {
+      auto moving=camera;
+      auto view=kNativeSceneIdentity; view[12]=float(frame)*0.25f;
+      moving.pass.view=words(view);
+      const auto a=frame_stats(off.Build(publication,moving,routes,pass,resolve));
+      // The integration's draw camera for this frame; the key is `moving` as is.
+      const auto draw=NativeFsrJitterCamera(moving.pass,jitter_of(frame));
+      Require(draw.view==moving.pass.view,"the jitter moved the view");
+      const auto& built=on.Build(publication,moving,routes,pass,resolve);
+      Require(frame_stats(built)==a,"FSR on changed the static world's reuse statistics");
+      if(frame) camera_only+=built.stats.camera_only;
+    }
+    Require(camera_only>=kFrames-2,"a moving camera stopped hitting G1's camera-only path");
+  }
 }
 // NativeFullFrameStaticWorld across a run of gameplay-like frames: the camera
 // moves every frame, some objects publish new worlds every frame (a new
@@ -3449,6 +3589,30 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
       direct.instanced_draws==reference.instanced_draws && pixels==reference_pixels && pixel(16,0)==255 && pixel(48,0)==255,
       "RenderUniform recorded differently from Render");
   }
+  {
+    // FSR's clip jitter (NativeSceneRenderer::SetClipJitter). (0, 0) records
+    // exactly the image no jitter records (edf_native_fsr=off is byte for
+    // byte what it was). A whole pixel of jitter moves the image by exactly
+    // one pixel: right for +x, down for -y (NDC y is up), through the
+    // ViewProjection matrix the shader reads. Cleared, the image is back.
+    render(*initial);
+    const auto base=pixels;
+    Require(renderer.clip_jitter()==std::array<float,2>{0,0},"the renderer starts jittered");
+    renderer.SetClipJitter(0,0); render(*initial);
+    Require(pixels==base,"a zero clip jitter changed the recorded image");
+    renderer.SetClipJitter(2.f/64,0); render(*initial);
+    const auto right=pixels;
+    renderer.SetClipJitter(0,-2.f/32); render(*initial);
+    const auto down=pixels;
+    renderer.SetClipJitter(0,0); render(*initial);
+    Require(pixels==base,"clearing the clip jitter did not restore the image");
+    Require(right!=base && down!=base,"a whole-pixel clip jitter moved nothing");
+    const auto at=[](const std::vector<uint8_t>& image,uint32_t x,uint32_t y,uint32_t channel) { return image[(size_t(y)*64+x)*4+channel]; };
+    for(uint32_t y=0;y<32;++y) for(uint32_t x=0;x<64;++x) for(uint32_t channel=0;channel<4;++channel) {
+      if(x) Require(at(right,x,y,channel)==at(base,x-1,y,channel),"a one-pixel x clip jitter did not move the image one pixel right");
+      if(y) Require(at(down,x,y,channel)==at(base,x,y-1,channel),"a one-pixel y clip jitter did not move the image one pixel down");
+    }
+  }
   NativeSceneAdapter adapter;
   Require(!adapter.PreviousGroupMaterial(500),"empty material history returned an asset");
   {
@@ -3791,7 +3955,7 @@ int main(int argc,char** argv) {
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
     AddressFilter(); FullFrameLiveRoutes(); FullFrameFixedRecord();
-    WorldPublicationMirror(); GroupOrder(); FullFrameStaticWorld(); FullFrameStaticCull(); FullFrameStaticWorldFrames(false); FullFrameStaticWorldFrames(true); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
+    WorldPublicationMirror(); GroupOrder(); FullFrameStaticWorld(); FullFrameStaticWorldJitter(); FullFrameStaticCull(); FullFrameStaticWorldFrames(false); FullFrameStaticWorldFrames(true); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

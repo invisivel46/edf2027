@@ -277,6 +277,11 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
     add_test(NAME edf_renderer_image_compare_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_compare_renderer_images)
     set_tests_properties(edf_renderer_image_compare_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+    add_custom_target(edf_fsr_quality_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_fsr_quality
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_fsr_quality_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_fsr_quality)
+    set_tests_properties(edf_fsr_quality_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_custom_target(edf_shadow_diff_tests
         COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_shadow_diff
         WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
@@ -458,6 +463,9 @@ if(EDF2027_SDK_AUX_DLLS)
                     $<TARGET_FILE_DIR:edf_native_fsr_foundation_tests>/
             VERBATIM)
         add_dependencies(edf_native_fsr_foundation_tests edf_native_fsr_foundation_ffx_dll)
+        if(TARGET edf_native_fsr_tests)
+            add_dependencies(edf_native_fsr_tests edf_native_fsr_foundation_ffx_dll)
+        endif()
     endif()
 endif()
 

@@ -237,6 +237,16 @@ void NativeSceneRenderer::Record(NativeRenderBackend& backend,size_t count,const
   auto& recorder=backend.Recorder();
   recorder.SetWorldInstancing(false);
   recorder.SetViewport(view.viewport); recorder.SetScissor(view.scissor,view.scissor_enabled);
+  // The clip-space matrices the draws record with: the view's, or with the
+  // FSR jitter folded in (SetClipJitter). Culling used the unjittered vp.
+  const NativeSceneMatrix* projection=&view.projection;
+  const NativeSceneMatrix* clip=&vp;
+  NativeSceneMatrix jittered_projection,jittered_clip;
+  if(clip_jitter_[0]!=0 || clip_jitter_[1]!=0) {
+    jittered_projection=NativeSceneClipJitter(view.projection,clip_jitter_[0],clip_jitter_[1]);
+    jittered_clip=NativeSceneClipJitter(vp,clip_jitter_[0],clip_jitter_[1]);
+    projection=&jittered_projection; clip=&jittered_clip;
+  }
   for(size_t first=0;first<count;) {
     const auto* geometry=geometry_of(first);
     const auto* material_pointer=material_of(first);
@@ -257,9 +267,9 @@ void NativeSceneRenderer::Record(NativeRenderBackend& backend,size_t count,const
         switch(matrix.source) {
           case NativeSceneMatrixSource::World: value=world_of(first); break;
           case NativeSceneMatrixSource::View: value=view.view; break;
-          case NativeSceneMatrixSource::Projection: value=view.projection; break;
-          case NativeSceneMatrixSource::ViewProjection: value=vp; break;
-          case NativeSceneMatrixSource::WorldViewProjection: value=Multiply(world_of(first),vp); break;
+          case NativeSceneMatrixSource::Projection: value=*projection; break;
+          case NativeSceneMatrixSource::ViewProjection: value=*clip; break;
+          case NativeSceneMatrixSource::WorldViewProjection: value=Multiply(world_of(first),*clip); break;
           case NativeSceneMatrixSource::ViewTranspose: value=NativeSceneTranspose(view.view); break;
         }
         Pack(constants_scratch_.data()+matrix.offset,value,matrix.column_major);
