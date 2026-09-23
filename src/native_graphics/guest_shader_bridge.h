@@ -7,6 +7,9 @@ namespace edf::native {
 class GuestMeshWatchAudit;
 // Weak registration: the application owns the audit within SDK Memory lifetime.
 void SetNativeMeshWatchAudit(std::weak_ptr<GuestMeshWatchAudit> audit);
+// The final edf_native_coverage_census summary (native_coverage_census.h),
+// once per run, when the census is on and counted any frame.
+void LogNativeCoverageCensusFinal();
 // Transitional reference-run bridge: constructs native resources from the
 // live guest shader loader while the existing renderer remains the oracle.
 void InitializeGuestShaderBridge(const std::filesystem::path& game_root);

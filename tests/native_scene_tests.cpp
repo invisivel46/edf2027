@@ -1267,6 +1267,21 @@ void FullFrameStaticWorld() {
   // Route words are read once per object culling keeps, in walk order: never
   // for C (distance), D (frustum), H (culled leaf) or the duplicate A.
   Require(route_reads==std::vector<uint32_t>{A,B,E,F,G,I,J},"full-frame route words read for culled or duplicate objects");
+  // Coverage census: the members dropped where the guest would go on to slot
+  // 4, in walk order - E (mode 1, filed for the drain) and J (unreadable) -
+  // but not the hidden F; nothing without the cache's census flag.
+  {
+    Require(selection.skipped.empty(),"full-frame selection lists skips without the census");
+    const auto reads=route_reads;
+    NativeFullFrameStaticSelectCache census_cache;
+    census_cache.census=true;
+    const auto counted=SelectNativeFullFrameStaticWorld(publication,camera,routes,&census_cache);
+    using Skip=NativeFullFrameStaticSelection::Skip;
+    Require(counted.skipped.size()==2 && counted.skipped[0].owner==E && counted.skipped[0].reason==Skip::Bucket &&
+      counted.skipped[1].owner==J && counted.skipped[1].reason==Skip::Unrouted,"full-frame census skips");
+    Require(counted.objects==selection.objects,"the census changes no selection");
+    route_reads=reads;
+  }
   // Live semantics: a mode written after the step (no publication) routes E
   // natively on the next frame, and a hidden write drops A.
   live[E].mode=0; live[A].hidden=1;

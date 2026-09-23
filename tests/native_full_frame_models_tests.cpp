@@ -204,6 +204,11 @@ void SortKeys() {
   const auto plan=PlanNativeFullFrameModels(snapshot,camera);
   Require(plan.opaque.size()==1 && plan.opaque[0].entry->object==7,"mode 0 is opaque");
   Require(plan.stats.bucket_zero==1 && plan.transparent.size()==5,"bucket 0 keys are dropped");
+  // Coverage census: the bucket-0 entry is parity (821A3BA0 skips it too); off, no marks.
+  Require(plan.census.empty(),"no census marks unless asked");
+  const auto counted=PlanNativeFullFrameModels(snapshot,camera,{},true);
+  Require(counted.census.size()==1 && counted.census[0].status==NativeCoverageStatus::Parity &&
+    std::string_view(counted.census[0].reason)=="bucket_zero","bucket 0 is a parity mark");
   const std::array<uint32_t,5> order{4,2,6,5,1};
   for(size_t i=0;i<order.size();++i) Require(plan.transparent[i].entry->object==order[i],"transparents draw key descending, ties in gather order");
   Require(plan.transparent[0].key==65535 && plan.transparent[3].key==655,"transparent keys are recorded");
@@ -296,6 +301,17 @@ void AttachmentsFollowTheModel() {
   for(const auto& entry:{opaque,filed,unposed,after}) snapshot.entries.push_back(entry);
   const auto plan=PlanNativeFullFrameModels(snapshot,MakeCamera());
   Require(plan.stats.attachments==6 && plan.stats.no_attachment==6 && plan.stats.no_pose==1,"attachments counted");
+  {
+    // Coverage census: one uncovered mark per attachment left undrawn and per unposed model.
+    const auto counted=PlanNativeFullFrameModels(snapshot,MakeCamera(),{},true);
+    size_t attachments=0,poses=0;
+    for(const auto& mark:counted.census) {
+      Require(mark.status==NativeCoverageStatus::Uncovered,"plan skips are uncovered");
+      attachments+=std::string_view(mark.reason)=="models_no_attachment";
+      poses+=std::string_view(mark.reason)=="models_no_pose";
+    }
+    Require(counted.census.size()==7 && attachments==6 && poses==1,"census marks for the plan's skips");
+  }
   Require(plan.opaque.size()==6,"model, face and weapon; face and weapon without the model; the next entry");
   Require(plan.opaque[0].entry==opaque.get() && plan.opaque[0].attachment==-1 &&
     plan.opaque[1].entry==opaque.get() && plan.opaque[1].attachment==0 &&
@@ -1137,6 +1153,25 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
   // and 1 now bind it as well; entry 2 sees only its own.
   check("the previous frame's stores reach the next frame's first draws",2,1,2,2);
   check("an unchanged frame carries them",0,3,0,0);
+  {
+    // Coverage census: every drawn item is a covered mark; a pass record
+    // without a program leaves each item uncovered (missing program).
+    auto counted=pass; counted.census=true;
+    NativeFullFrameModels counting;
+    const auto frame=counting.Build(snapshot,camera,counted,sources);
+    Require(frame.census.size()==3 && std::all_of(frame.census.begin(),frame.census.end(),[](const NativeCoverageMark& mark) {
+      return mark.status==NativeCoverageStatus::Covered && std::string_view(mark.reason)=="models";
+    }),"drawn items are covered marks");
+    Require(NativeFullFrameModels{}.Build(snapshot,camera,pass,sources).census.empty(),"no build marks unless asked");
+    NativeFullFrameModels missing;
+    auto without=sources;
+    without.program=[](uint32_t) { return std::shared_ptr<const NativeSceneGroupMaterial>(); };
+    const auto dropped=missing.Build(snapshot,camera,counted,without);
+    Require(dropped.stats.drawn==0 && dropped.census.size()==3 && std::all_of(dropped.census.begin(),dropped.census.end(),
+      [](const NativeCoverageMark& mark) {
+        return mark.status==NativeCoverageStatus::Uncovered && std::string_view(mark.reason)=="models_missing_program";
+      }),"items without a program are uncovered marks");
+  }
   entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{1,0,0,1})});
   check("a new set of equal values carries its object",0,3,0,0);
   entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{.5f,0,0,1})});

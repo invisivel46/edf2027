@@ -876,6 +876,9 @@ void TestCollection() {
   const auto out=CollectNativeEffectManager(m,manager,context,ViewWords(m),order,&visited);
   Require(out.visited==objects.size() && out.duplicates==1 && out.hidden==1 && out.culled==2 && out.undrawn_keys==1 &&
           out.unknown_modes==1 && out.unsupported==1 && out.unsupported_slots==std::vector<uint32_t>{0x82000000},"collection counters");
+  // The coverage census names the unsupported object by its class: (vtable, slot 4, objects).
+  Require(out.unsupported_classes.size()==1 && out.unsupported_classes[0]==std::array<uint32_t,3>{m.Word(objects[8]),0x82000000u,1u},
+          "unsupported class of J");
   Require(out.immediate.size()==1 && out.immediate[0].object==objects[6],"mode 0 runs at once");
   const uint32_t expect[]={objects[1],objects[7],objects[0],objects[2]};  // C 9000, I 7000, A 5000, B 5000
   Require(out.items.size()==4,"four filed effects");

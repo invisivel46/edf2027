@@ -1,5 +1,6 @@
 #pragma once
 #include "native_bucket_dispatch.h"
+#include "native_coverage_census.h"
 #include "native_full_frame_base_state.h"
 #include "native_full_frame_model_cache.h"
 #include "native_model_pass.h"
@@ -210,6 +211,11 @@ struct NativeFullFrameModelPlan {
   // bodies store into the effect pool follows this order.
   std::vector<const NativeRenderEntry*> calls;
   Stats stats;
+  // With census (edf_native_coverage_census): one mark per entry the guest
+  // would dispatch but the plan cannot draw whole (no model, pose, attachment
+  // or instanced model; an unknown sort mode), or leaves as the guest does
+  // (bucket 0). Empty otherwise.
+  std::vector<NativeCoverageMark> census;
 };
 // clBrokenObject (vtable 820077D8): slot 4 8211FAA8 copies obj+708 into
 // obj+712 before it poses and draws; its slot 3 8211FAF8 releases the object
@@ -241,7 +247,7 @@ std::vector<const NativeRenderEntry*> NativeFullFrameBrokenObjects(const NativeR
 // ordered by object; entries are taken in `gather` order (unlisted ones at
 // its `unlisted` position, among themselves in snapshot order).
 NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera,
-  const NativeFullFrameModelGather& gather={});
+  const NativeFullFrameModelGather& gather={},bool census=false);
 
 // The shared effect pool as the model slot 4s leave it (821A1730 ->
 // 821A16D8: one float4 over a named pool value, sticky until the next store).
@@ -364,6 +370,9 @@ struct NativeFullFrameModelPass {
   uint32_t view=0;
   uint64_t guest_frames=0;
   std::function<std::optional<std::array<uint8_t,16>>(const std::string&)> pool;
+  // Coverage census marks (NativeFullFrameModelPlan::census,
+  // NativeFullFrameModelFrame::census); off, none are made.
+  bool census=false;
 };
 // The explicit base state every model draw starts from, opaque and transparent
 // alike: the shared full-frame base state (NativeFullFrameBaseState, the same
@@ -469,6 +478,10 @@ struct NativeFullFrameModelFrame {
   NativeFullFrameModelPlan plan;
   std::vector<NativeFullFrameModelBatch> batches;  // Opaque, then transparent.
   Stats stats;
+  // With NativeFullFrameModelPass::census: one mark per planned item, covered
+  // when drawn, else uncovered with the reason it was not (missing program or
+  // geometry, failed, scissor, palette). The plan's marks are plan.census.
+  std::vector<NativeCoverageMark> census;
 };
 // Persistent per-object draw state of NativeFullFrameModels. One item state
 // per (object, registry generation, LOD model or instanced set and world):

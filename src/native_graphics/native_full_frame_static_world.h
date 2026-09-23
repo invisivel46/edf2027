@@ -188,6 +188,14 @@ struct NativeFullFrameStaticSelection {
   // Every object selected natively, in walk order, with the LOD it chose.
   std::vector<Object> objects;
   Stats stats;
+  // With NativeFullFrameStaticSelectCache::census (edf_native_coverage_census):
+  // each member dropped where the guest walk would have gone on to its slot 4
+  // (or, unpublished, might have), with why. Hidden members, culled ones and
+  // second visits are not listed (the guest drops them too). The pass names
+  // each owner's class and decides whether another pass draws it.
+  enum class Skip : uint8_t { Unpublished, Unrouted, Virtual, Bucket, UnknownMode, RouteMismatch, MissingLod, Undrawable };
+  struct Skipped { uint32_t owner=0; Skip reason=Skip::Unpublished; };
+  std::vector<Skipped> skipped;
 };
 // A conservative "every one of these objects is culled" test, exact against
 // SelectNativeVisibility's float arithmetic: Culled(bound) is true only when
@@ -441,6 +449,9 @@ struct NativeFullFrameStaticSelectCache {
   // stack and the moved owners.
   std::vector<uint32_t> gathered,pending,stack,moved;
   size_t objects=0;  // The last selection's object count, reserved up front.
+  // Fill NativeFullFrameStaticSelection::skipped (the coverage census); set
+  // by the caller before each selection. Changes no selection.
+  bool census=false;
 };
 // 821C61D8 + 820B4038 + 821C3BB8's group order over published data. Per world
 // owner with a tree image: walk the tree with frustum classification from the

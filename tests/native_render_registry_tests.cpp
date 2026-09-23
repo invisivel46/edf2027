@@ -197,6 +197,22 @@ void ResolvesClassAfterDerivedConstructor() {
   const auto after=registry.Tick(memory,kScene,3,decode);
   Require(after->entries.size()==1 && registry.stats().unknown_classes==1 && registry.stats().records==2 &&
     !registry.AuditScene(memory,kScene).mismatches(),"unknown class tracked, not published");
+  // The coverage census's per-vtable count of resolved records of no known class.
+  using Classes=std::vector<std::pair<uint32_t,uint32_t>>;
+  Require(registry.UnknownClasses()==Classes{{0x82999990u,1u}},"one unknown class record");
+  constexpr uint32_t kEffect2=0x4000;
+  BuildObject(memory,kEffect2,0x82999990u,false);
+  registry.Born(kEffect2);
+  registry.Tick(memory,kScene,4,decode);
+  Require(registry.UnknownClasses()==Classes{{0x82999990u,2u}},"two records of the unknown class");
+  registry.Died(kEffect);
+  registry.Tick(memory,kScene,5,decode);
+  Require(registry.UnknownClasses()==Classes{{0x82999990u,1u}},"a death uncounts its record");
+  registry.Born(kEffect2);  // Rebirth without a death: forgotten, then pending again.
+  registry.Tick(memory,kScene,6,decode);
+  Require(registry.UnknownClasses()==Classes{{0x82999990u,1u}},"a rebirth counts its record once");
+  registry.Clear();
+  Require(registry.UnknownClasses().empty(),"clear drops the counts");
 }
 
 void SubscriptionDrivesRereads() {

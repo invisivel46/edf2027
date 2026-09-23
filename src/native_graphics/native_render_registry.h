@@ -299,6 +299,16 @@ class NativeRenderRegistry {
     }
     return audit;
   }
+  // Resolved records whose vtable is not in the class table (nothing native
+  // draws them from the snapshot), per vtable: (vtable, records), ascending.
+  // Kept as records resolve and die, so this costs one pass over the few
+  // distinct vtables (the coverage census, edf_native_coverage_census). Same
+  // thread as Tick.
+  std::vector<std::pair<uint32_t,uint32_t>> UnknownClasses() const {
+    std::vector<std::pair<uint32_t,uint32_t>> classes(unknown_counts_.begin(),unknown_counts_.end());
+    std::sort(classes.begin(),classes.end());
+    return classes;
+  }
   std::shared_ptr<const NativeRenderRegistrySnapshot> AcquireSnapshot() const {
     std::lock_guard lock(publish_mutex_);
     return published_;
@@ -312,6 +322,7 @@ class NativeRenderRegistry {
   void Clear() {
     { std::lock_guard lock(events_mutex_); events_.clear(); }
     records_.clear(); pending_.clear(); subscribed_.clear(); animated_.clear(); retry_.clear(); ring_.clear();
+    unknown_counts_.clear();
     objects_=decltype(objects_){}; entries_.clear();
     cursor_=0; seeded_=false;
     { std::lock_guard lock(publish_mutex_); published_.reset(); }
@@ -377,8 +388,19 @@ class NativeRenderRegistry {
     ++stats_.births;
   }
   void Forget(uint32_t object) {
-    records_.erase(object); pending_.erase(object); subscribed_.erase(object); animated_.erase(object); retry_.erase(object);
+    if(const auto found=records_.find(object);found!=records_.end()) {
+      CountUnknown(found->second,false);
+      records_.erase(found);
+    }
+    pending_.erase(object); subscribed_.erase(object); animated_.erase(object); retry_.erase(object);
     Unpublish(object);
+  }
+  // unknown_counts_ for a resolved record of no known class.
+  void CountUnknown(const Record& record,bool add) {
+    if(!record.vtable || record.type) return;
+    if(add) { ++unknown_counts_[record.vtable]; return; }
+    const auto found=unknown_counts_.find(record.vtable);
+    if(found!=unknown_counts_.end() && !--found->second) unknown_counts_.erase(found);
   }
   struct EntryObject { uint32_t operator()(const std::shared_ptr<const NativeRenderEntry>& entry) const { return entry->object; } };
   void Publish(uint32_t object,std::shared_ptr<const NativeRenderEntry> entry) {
@@ -407,7 +429,9 @@ class NativeRenderRegistry {
           Subscribe(object,record,reader.Word(object+kNativeRenderObjectSubscribed)==1);
           pending_.erase(object);
         }
+        CountUnknown(record,false);
         record.vtable=vtable; record.type=FindNativeRenderClass(vtable); record.captures.clear();
+        CountUnknown(record,true);
         record.hierarchy.Reset(); record.frame_pose.reset();
         if(!record.type) ++stats_.unknown_classes;
         // Re-read every tick: inputs that advance outside scene+100 (instanced
@@ -637,6 +661,7 @@ class NativeRenderRegistry {
   std::unordered_map<uint32_t,Record> records_;
   std::unordered_set<uint32_t> pending_,subscribed_,animated_;  // animated_: re-read every tick (instanced worlds)
   std::unordered_map<uint32_t,uint64_t> retry_;              // object -> next tick to retry
+  std::unordered_map<uint32_t,uint32_t> unknown_counts_;     // vtable -> resolved records of no known class
   std::vector<std::pair<uint32_t,uint64_t>> ring_;           // (object, generation), lazily pruned
   size_t cursor_=0;
   bool seeded_=false;

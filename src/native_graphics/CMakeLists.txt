@@ -1,4 +1,4 @@
-add_library(edf_native_effects STATIC effect.cpp movie_effect.cpp xui_effect.cpp font_effect.cpp native_render_backend.cpp native_render_state_decode.cpp native_guest_vertex_stream.cpp native_dds_decode.cpp native_sampler_decode.cpp native_decode_workers.cpp native_full_frame.cpp native_full_frame_post.cpp native_render_registry.cpp native_full_frame_effects.cpp native_gpu_pass_timings.cpp native_frame_times.cpp)
+add_library(edf_native_effects STATIC effect.cpp movie_effect.cpp xui_effect.cpp font_effect.cpp native_render_backend.cpp native_render_state_decode.cpp native_guest_vertex_stream.cpp native_dds_decode.cpp native_sampler_decode.cpp native_decode_workers.cpp native_full_frame.cpp native_full_frame_post.cpp native_render_registry.cpp native_full_frame_effects.cpp native_gpu_pass_timings.cpp native_frame_times.cpp native_coverage_census.cpp)
 target_include_directories(edf_native_effects PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/..)
 target_compile_features(edf_native_effects PUBLIC cxx_std_20)
 
@@ -159,4 +159,7 @@ if(BUILD_TESTING)
     add_executable(edf_native_lock_slices_tests ../../tests/native_lock_slices_tests.cpp)
     target_link_libraries(edf_native_lock_slices_tests PRIVATE edf_native_effects)
     add_test(NAME edf_native_lock_slices_tests COMMAND edf_native_lock_slices_tests)
+    add_executable(edf_native_coverage_census_tests ../../tests/native_coverage_census_tests.cpp)
+    target_link_libraries(edf_native_coverage_census_tests PRIVATE edf_native_effects)
+    add_test(NAME edf_native_coverage_census_tests COMMAND edf_native_coverage_census_tests)
 endif()

@@ -709,6 +709,9 @@ struct NativeEffectCollection {
   std::vector<NativeEffectItem> items;      // key >= 256, descending, filing order on ties
   std::vector<NativeEffectItem> immediate;  // mode 0: slot 4 runs inside the walk, before the drain
   std::vector<uint32_t> unsupported_slots;  // slot 4 of objects no builder covers
+  // (vtable, slot 4, objects) of the objects no builder covers, first-seen order
+  // (the coverage census names them by class).
+  std::vector<std::array<uint32_t,3>> unsupported_classes;
   uint32_t visited=0,duplicates=0,culled=0,hidden=0,undrawn_keys=0,unknown_modes=0,unsupported=0;
   uint32_t held=0;  // clEffectEtc02 lifetimes a render-only frame did not commit (commit false)
 };
@@ -774,6 +777,11 @@ NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32
       ++out.unsupported;
       if(std::find(out.unsupported_slots.begin(),out.unsupported_slots.end(),item.slot4)==out.unsupported_slots.end())
         out.unsupported_slots.push_back(item.slot4);
+      const auto vtable=r.Word(object);
+      const auto known=std::find_if(out.unsupported_classes.begin(),out.unsupported_classes.end(),
+        [&](const auto& entry) { return entry[0]==vtable && entry[1]==item.slot4; });
+      if(known!=out.unsupported_classes.end()) ++(*known)[2];
+      else out.unsupported_classes.push_back({vtable,item.slot4,1u});
       continue;
     }
     if(mode && !NativeTransparentKeyDrawn(item.key)) { ++out.undrawn_keys; continue; }

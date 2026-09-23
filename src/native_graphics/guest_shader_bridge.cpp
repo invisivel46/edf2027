@@ -51,6 +51,7 @@
 #include "native_shader_binding.h"
 #include "native_frame_dispatch.h"
 #include "native_full_frame.h"
+#include "native_coverage_census.h"
 #include "native_frame_times.h"
 #include "native_disk_cache.h"
 #include "native_gpu_pass_timings.h"
@@ -336,6 +337,10 @@ REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
                    "Log inclusive CPU wall times for native/original graphics hook phases (development)");
 REXCVAR_DEFINE_BOOL(edf_native_gpu_timings, false, "EDF2027",
                    "Log GPU time per full-frame pass (sky, static_world, models, effects, transparent, post, view overlays, HUD phases) and per frame from scene-backend timestamps, read back frames later without stalling (development)");
+REXCVAR_DEFINE_BOOL(edf_native_coverage_census, false, "EDF2027",
+                   "Full-frame coverage census: count, per class and reason, what the native passes draw and every object, pass or view they skip that the guest render helper would have drawn; logs 'Native coverage' summaries every edf_native_coverage_census_interval seconds and at exit (tools/coverage-report.py; development)");
+REXCVAR_DEFINE_INT32(edf_native_coverage_census_interval,30,"EDF2027",
+  "Seconds between edf_native_coverage_census summaries").range(1,3600);
 REXCVAR_DEFINE_BOOL(edf_native_frame_times, false, "EDF2027",
                    "Log present-to-present frame-time percentiles and one line per spike frame (over 25 ms or twice the rolling median) with its pipeline, shader, geometry and texture creations, declined passes and largest hook phases (development)");
 REXCVAR_DEFINE_INT32(edf_native_thread_qos,1,"EDF2027",
@@ -2991,6 +2996,11 @@ void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t d
                 state.optimized_out, state.parameter_errors, state.texture_bindings,
                 state.texture_missing, state.texture_binding_errors,state.sampler_bindings,state.samplers.size());
 }
+}
+void LogNativeCoverageCensusFinal() {
+  static std::atomic<bool> logged=false;
+  if(!REXCVAR_GET(edf_native_coverage_census) || !CoverageCensus().Totals().frames || logged.exchange(true)) return;
+  for(const auto& line:CoverageCensus().Summary("final")) REXLOG_INFO("{}",line);
 }
 void SetNativeMeshWatchAudit(std::weak_ptr<GuestMeshWatchAudit> audit) {
   auto& state=State();
@@ -6635,8 +6645,48 @@ uint32_t NativeFullFramePaletteLimit(const Reader& reader) {
   const auto descriptor=reader.Word(reader.Add(reader.Word(0x8257c02c),36));
   return descriptor?reader.Word(reader.Add(descriptor,16)):edf::native::kNativeBonePaletteShaderBones;
 }
+// edf_native_coverage_census (native_coverage_census.h): the full frame's
+// counting sites. Off, each site costs this one cvar read.
+bool NativeCoverageCensusOn() { return REXCVAR_GET(edf_native_coverage_census); }
+double NativeCoverageNow() {
+  return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+// An object's vtable and slot 4 (vtable+16) as the census names its class;
+// zeros when the object cannot be read.
+template<class Reader>
+std::pair<uint32_t,uint32_t> NativeCoverageClassOf(const Reader& reader,uint32_t object) {
+  try {
+    const auto vtable=object?reader.Word(object):0u;
+    return {vtable,vtable?reader.Word(reader.Add(vtable,16)):0u};
+  } catch(const std::exception&) { return {0u,0u}; }
+}
+// The world list (owner+44) of one view: every manager whose slot 2 the guest
+// helper calls (821A51D8), covered when a native pass replaces that manager's
+// walk (NativeCoverageWorldListPass), else uncovered with its slot 2.
+template<class Reader>
+void CensusNativeWorldList(const Reader& reader,uint32_t owner) {
+  using namespace edf::native;
+  std::vector<NativeCoverageMark> marks;
+  try {
+    const auto end=reader.Word(reader.Add(owner,NativeWorldList::end));
+    uint32_t guard=0;
+    for(auto node=reader.Word(reader.Add(owner,NativeWorldList::head));node!=end;node=reader.Word(reader.Add(node,NativeWorldList::next))) {
+      if(++guard>NativeWorldList::limit) throw std::runtime_error("native world list does not terminate");
+      const auto object=reader.Word(reader.Add(node,NativeWorldList::object));
+      const auto vtable=object?reader.Word(object):0u;
+      if(NativeCoverageWorldListPass(vtable)) marks.push_back({NativeCoverageStatus::Covered,vtable,nullptr,"world_list"});
+      else marks.push_back({NativeCoverageStatus::Uncovered,vtable,nullptr,"world_list_unhandled",vtable?reader.Word(reader.Add(vtable,8)):0u});
+    }
+  } catch(const std::exception& error) {
+    CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"world_list","world_list_unreadable",1,error.what());
+  }
+  CoverageCensus().Add(marks);
+}
 void NativeFullFrameDeclined(const char* pass,const std::string& reason) {
   edf::native::FrameEventCounters().pass_declines.fetch_add(1,std::memory_order_relaxed);
+  // Every decline drops the draw (or the pass) it was for.
+  if(NativeCoverageCensusOn())
+    edf::native::CoverageCensus().Add(edf::native::NativeCoverageStatus::Uncovered,0,std::string("pass:")+pass,"declined",1,reason);
   static std::mutex mutex;
   static std::set<std::string> reported;
   std::lock_guard lock(mutex);
@@ -6728,6 +6778,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
         return registers;
       } catch(const std::exception&) { return std::nullopt; }
     };
+    pass.census=NativeCoverageCensusOn();
     auto& state=State();
     // The bridge locks in short holds (NativeLockSlices): the targets, each use
     // of the model pass caches (program, geometry) and each resolve with its
@@ -6741,7 +6792,11 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,pass.targets,pass.viewport,pass.scissor,viewport);
       backend=state.scene_backend;
       return state.active_scene==context.renderer && targets.count && targets.depth && backend;
-    })) { ++empty_; return; }
+    })) {
+      ++empty_;
+      if(pass.census) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:models","no_targets");
+      return;
+    }
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("models",reason); };
     // The providers, each inside its own slice: the model pass program of a
@@ -6827,6 +6882,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     };
     auto frame=std::make_shared<NativeFullFrameModelFrame>(models_.Build(*registry,camera,pass,sources,phase));
     stage.reset();
+    if(pass.census) { CoverageCensus().Add(frame->plan.census); CoverageCensus().Add(frame->census); }
     auto transparent=std::make_shared<NativeFullFrameModelFrame>();
     for(auto& batch:frame->batches) if(batch.transparent) transparent->batches.push_back(std::move(batch));
     std::erase_if(frame->batches,[](const NativeFullFrameModelBatch& batch) { return batch.transparent; });
@@ -6847,7 +6903,11 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       state.scene_recorded_frames.push_back(registry);
       return true;
     });
-    if(!current) ++stale_;
+    if(!current) {
+      ++stale_;
+      // Nothing of this view's models was recorded (the targets moved).
+      if(pass.census) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:models","stale");
+    }
     else if(!transparent->batches.empty()) shared_->transparent=std::move(transparent);
     shared_->model_order=uint32_t(frame->plan.transparent.size());
     const auto& built=frame->stats;
@@ -6929,6 +6989,7 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
       if(!same) ++stale_eyes_;
     }
     shared_->effect_filings=order-first;
+    if(NativeCoverageCensusOn()) CensusEffects(collection);
     for(const auto slot:collection.unsupported_slots)
       if(unsupported_.insert(slot).second) {
         const auto* name=NativeEffectSlotName(slot);
@@ -6947,7 +7008,8 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
         for(const auto& item:collection.immediate)
           drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,*native_scene_pass_camera,viewport,formats,report,
             [&](const std::exception& error) { report(error.what()); });
-      }
+      } else if(NativeCoverageCensusOn())
+        CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:effects","no_targets",collection.immediate.size());
     }
     if(++frames_<=4 || frames_%1000==0)
       REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} absent={} stale_guest_eye={} held_frames={}",
@@ -6957,6 +7019,26 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
   }
  private:
   const edf::native::GuestReader reader_;
+  // The coverage census of one collection: each drawn object's class
+  // (covered; an empty slot 4 is parity), each class no builder covers, and
+  // the objects left as the guest leaves them (a key below 256) or of an
+  // unknown sort mode.
+  void CensusEffects(const edf::native::NativeEffectCollection& collection) {
+    using namespace edf::native;
+    auto& census=CoverageCensus();
+    std::vector<NativeCoverageMark> marks;
+    for(const auto* list:{&collection.immediate,&collection.items})
+      for(const auto& item:*list) {
+        const auto vtable=NativeCoverageClassOf(reader_,item.object).first;
+        marks.push_back(item.type==NativeEffectClass::Empty?NativeCoverageMark{NativeCoverageStatus::Parity,vtable,nullptr,"empty_slot4",item.slot4}:
+          NativeCoverageMark{NativeCoverageStatus::Covered,vtable,nullptr,"effects"});
+      }
+    census.Add(marks);
+    for(const auto& [vtable,slot4,count]:collection.unsupported_classes)
+      census.Add(NativeCoverageStatus::Uncovered,vtable,{},"effect_no_builder",count,std::format("slot=0x{:08X}",slot4));
+    census.Add(NativeCoverageStatus::Uncovered,0,"effect_object","effect_unknown_mode",collection.unknown_modes);
+    census.Add(NativeCoverageStatus::Parity,0,"effect_object","undrawn_key",collection.undrawn_keys);
+  }
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   std::set<uint32_t> unsupported_;
   uint64_t frames_=0,absent_=0,stale_eyes_=0,held_frames_=0;
@@ -6987,7 +7069,13 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     std::lock_guard lock(state.mutex);
     NativeFullFramePassTargets formats; NativeBackendViewport backend_viewport; NativeBackendScissor scissor; NativeViewportState viewport;
     const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
-    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) return;
+    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) {
+      // Every filed item of the view is dropped.
+      if(NativeCoverageCensusOn())
+        CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:transparent","no_targets",
+          (frame?frame->batches.size():0)+effects.size()+map_effects.size());
+      return;
+    }
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("transparent",reason); };
     const auto& camera=*native_scene_pass_camera;
@@ -7059,6 +7147,10 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     // The walk's reads (world list, members, wire and grass records and
     // constants) go through one page window: no guest code runs during the pass.
     const NativeSceneCpuWindow walk(reader_);
+    const bool census=NativeCoverageCensusOn();
+    // The helper's world callbacks this view would run (the sky pass is the
+    // first pass of every accepted view).
+    if(census && context.owner) CensusNativeWorldList(walk,context.owner);
     std::vector<NativeMapEffectMember> members;
     uint32_t manager=0;
     try {
@@ -7068,7 +7160,11 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
         shared_->map_effects_first=NativeMapEffectsFiledBeforeEffects(walk,context.owner);
       }
     } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); manager=0; members.clear(); }
-    if(!manager) { if(sky) RecordSky(context,sky); return; }
+    if(!manager) {
+      if(census && sky) CoverageCensus().Add(NativeCoverageStatus::Covered,0x8200284Cu,{},"sky");
+      if(sky) RecordSky(context,sky);
+      return;
+    }
     // The walk's routes in list order: the sky, runs of immediate draws
     // around it (recorded here), and the filed grass maps (Transparent).
     // The wires' eye is the pass camera's, as for the effects pass.
@@ -7078,6 +7174,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
       if(segment.sky) RecordSky(context,sky);
       else RecordMapEffectDraws(context,segment.draws);
     }
+    if(census) CensusMapEffects(members,sky,plan);
     for(const auto& member:plan.unsupported)
       if(unsupported_.insert({member.vtable,member.mode}).second) {
         const auto* name=NativeMapEffectClassName(member.vtable);
@@ -7116,6 +7213,36 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     // A run of alike draws (the wires' strips) activates once.
     map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,*native_scene_pass_camera,viewport,formats,report,
       [&](const std::exception& error) { report(error.what()); });
+  }
+  // The coverage census of one map-effect walk, member by member as
+  // PlanNativeMapEffects routes it: the current sky, mode-0 wires and grass
+  // maps, and filed grass maps are covered; a hidden member does nothing in
+  // the guest either; a mode-2 grass map left unfiled has a key the drain
+  // never reaches or no draws (parity; a build failure is also a decline);
+  // anything else is unsupported, as is a sky that is not the current one.
+  void CensusMapEffects(const std::vector<edf::native::NativeMapEffectMember>& members,uint32_t sky,
+      const edf::native::NativeMapEffectPlan& plan) {
+    using namespace edf::native;
+    std::vector<NativeCoverageMark> marks;
+    for(const auto& member:members) {
+      NativeCoverageMark mark{NativeCoverageStatus::Covered,member.vtable,nullptr,"map_effects"};
+      if(member.kind==NativeMapEffectKind::Sky) {
+        if(member.object==sky) mark.reason="sky";
+        else { mark.status=NativeCoverageStatus::Uncovered; mark.reason="sky_not_current"; mark.slot=member.render; }
+      } else if(member.hidden) continue;
+      else if(member.kind==NativeMapEffectKind::ElectricWire && member.mode==0) {}
+      else if(member.kind==NativeMapEffectKind::GrassMap && member.mode==0) {}
+      else if(member.kind==NativeMapEffectKind::GrassMap && member.mode==2) {
+        const bool filed=std::any_of(plan.filed.begin(),plan.filed.end(),[&](const auto& item) { return item.object==member.object; });
+        if(!filed) { mark.status=NativeCoverageStatus::Parity; mark.reason="grass_not_filed"; }
+      } else {
+        mark.status=NativeCoverageStatus::Uncovered; mark.slot=member.render;
+        mark.reason=member.mode==0?"map_effect_unsupported_mode0":member.mode==1?"map_effect_unsupported_mode1":
+          member.mode==2?"map_effect_unsupported_mode2":"map_effect_unsupported_mode_other";
+      }
+      marks.push_back(mark);
+    }
+    CoverageCensus().Add(marks);
   }
   void RecordSky(edf::native::NativeFrameContext& context,uint32_t sky) {
     using namespace edf::native;
@@ -7275,7 +7402,12 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     const auto& publication=context.inputs.publication;
-    if(!publication || !native_scene_pass_camera || !context.renderer) { ++skipped_; return; }
+    if(!publication || !native_scene_pass_camera || !context.renderer) {
+      ++skipped_;
+      // No static world this view.
+      if(NativeCoverageCensusOn() && !publication) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:static_world","no_publication");
+      return;
+    }
     const auto scene=context.view.scene;
     NativeFullFrameStaticCamera camera;
     camera.visibility.matrix=ReadNativeVisibilityFloats<16>(reader_,reader_.Add(scene,96));
@@ -7299,9 +7431,15 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
       targets=ActiveTargetsLocked(state);
       backend=state.scene_backend;
       return state.active_scene==context.renderer && targets.count && targets.depth && backend;
-    })) { ++skipped_; return; }
+    })) {
+      ++skipped_;
+      if(NativeCoverageCensusOn()) CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:static_world","no_targets");
+      return;
+    }
     const NativeSceneCpuWindow window(reader_);
     const NativeFullFrameLiveRoutes routes(window);
+    const bool census=NativeCoverageCensusOn();
+    world_.selection_cache.census=census;
     const auto& v=context.viewport;
     const auto viewport=MakeNativeDrawViewport(v.x,v.y,v.width,v.height,v.min_depth,v.max_depth,false,{});
     NativeFullFrameStaticPass pass;
@@ -7354,6 +7492,7 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     });
     timing.reset();
     if(!current) ++stale_;
+    if(census) CensusStaticWorld(window,frame,current);
     const auto& selected=frame.selection.stats;
     const auto& built=frame.stats;
     const auto& cached=world_.selection_cache.stats;
@@ -7366,6 +7505,63 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
+  // The coverage census of one static world frame. Selected objects are
+  // covered by class. A skipped member (NativeFullFrameStaticSelection::
+  // skipped) whose class the registry's table holds is the models pass's to
+  // draw and count, one whose slot 4 is a bare blr draws nothing in the guest
+  // either (parity), and any other is uncovered, named by its class and slot
+  // 4. The build's group-level drops (no group, material or geometry; a
+  // scissor or declined material) and instance declines, lists without a
+  // published membership and worlds without a published group order are
+  // uncovered; groups outside a published order are parity (821C3BB8 never
+  // reaches them). A stale frame recorded nothing.
+  template<class Reader>
+  static void CensusStaticWorld(const Reader& reader,const edf::native::NativeFullFrameStaticFrame& frame,bool current) {
+    using namespace edf::native;
+    using Skip=NativeFullFrameStaticSelection::Skip;
+    auto& census=CoverageCensus();
+    std::unordered_map<uint32_t,std::pair<uint32_t,uint32_t>> classes;  // owner -> (vtable, slot 4), this frame
+    const auto class_of=[&](uint32_t owner) {
+      auto [found,inserted]=classes.try_emplace(owner);
+      if(inserted) found->second=NativeCoverageClassOf(reader,owner);
+      return found->second;
+    };
+    std::vector<NativeCoverageMark> marks;
+    marks.reserve(frame.selection.objects.size()+frame.selection.skipped.size());
+    for(const auto& object:frame.selection.objects)
+      marks.push_back({NativeCoverageStatus::Covered,class_of(object.owner).first,nullptr,"static_world"});
+    for(const auto& skipped:frame.selection.skipped) {
+      const auto [vtable,slot4]=class_of(skipped.owner);
+      const auto owner=NativeCoverageSlotOwner(vtable,slot4);
+      if(owner==NativeCoverageOwner::Models) continue;
+      if(owner==NativeCoverageOwner::Empty) { marks.push_back({NativeCoverageStatus::Parity,vtable,nullptr,"empty_slot4",slot4}); continue; }
+      const char* reason="static_unpublished";
+      switch(skipped.reason) {
+        case Skip::Unpublished: reason="static_unpublished"; break;
+        case Skip::Unrouted: reason="static_unrouted"; break;
+        case Skip::Virtual: reason="static_other_slot4"; break;
+        case Skip::Bucket: reason="static_bucket_route"; break;
+        case Skip::UnknownMode: reason="static_unknown_mode"; break;
+        case Skip::RouteMismatch: reason="static_route_mismatch"; break;
+        case Skip::MissingLod: reason="static_missing_lod"; break;
+        case Skip::Undrawable: reason="static_undrawable"; break;
+      }
+      marks.push_back({NativeCoverageStatus::Uncovered,vtable,nullptr,reason,slot4});
+    }
+    census.Add(marks);
+    const auto& selected=frame.selection.stats;
+    const auto& built=frame.stats;
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_list","static_missing_list",selected.missing_lists);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_world_owner","static_missing_order",selected.missing_orders);
+    census.Add(NativeCoverageStatus::Parity,0,"static_group","unordered_group",selected.unordered_parts);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_missing_group",built.missing_group);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_missing_material",built.missing_material);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_missing_geometry",built.missing_geometry);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_scissor",built.scissor);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_declined",built.declined);
+    census.Add(NativeCoverageStatus::Uncovered,0,"static_instance","static_world_declined",built.world_declines);
+    if(!current) census.Add(NativeCoverageStatus::Uncovered,0,"pass:static_world","stale");
+  }
   const edf::native::GuestReader reader_;
   edf::native::NativeFullFrameStaticWorld world_;  // Cross-frame material cache and instance reuse.
   uint64_t frames_=0,skipped_=0,stale_=0,uniform_=0;
@@ -7548,6 +7744,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
       if(++skipped<=4 || !(skipped&(skipped-1)))
         REXLOG_INFO("Native full frame view skipped: renderer={:#x} active_scene={:#x} skipped={} (no scene from 8219C7A8)",
           renderer,state.active_scene,skipped);
+      // No view pass runs: everything the guest would draw in the view is dropped.
+      if(NativeCoverageCensusOn())
+        edf::native::CoverageCensus().Add(edf::native::NativeCoverageStatus::Uncovered,0,"frame","view_skipped");
       return false;
     }
     context.renderer=renderer;
@@ -7939,6 +8138,12 @@ REX_HOOK_RAW(sub_821A5080) {
       GpuPassFrameBegin();
       full_frame.Run(host);
       GpuPassFrameEnd();
+    }
+    if(NativeCoverageCensusOn()) {
+      auto& census=edf::native::CoverageCensus();
+      const auto now=NativeCoverageNow();
+      census.EndFrame(now);
+      for(const auto& line:census.Poll(now,double(REXCVAR_GET(edf_native_coverage_census_interval)))) REXLOG_INFO("{}",line);
     }
     const auto frames=full_frame.frames();
     if(frames<=4 || frames%1000==0)
@@ -8449,6 +8654,28 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool re
       else if(!changes && (audited<=4 || audited%1000==0))
         REXLOG_INFO("Native render registry idle audit: audited={} mismatched={} total_changed={}",audited,mismatched,changed);
       snapshot=full;
+    }
+    // Coverage census: the resolved objects of classes the registry's table
+    // does not hold, which no native pass draws unless their slot 4 is one the
+    // static world or effect builders take (NativeCoverageSlotOwner). Present
+    // objects, not visibility-tested: counted into every full frame while they exist.
+    static bool census_population=false;
+    if(REXCVAR_GET(edf_native_coverage_census)) {
+      std::vector<edf::native::NativeCoverageCensus::Population> population;
+      for(const auto& [vtable,count]:registry.UnknownClasses()) {
+        uint32_t slot4=0;
+        try { slot4=window.Word(window.Add(vtable,16)); } catch(const std::exception&) {}
+        const auto owner=edf::native::NativeCoverageSlotOwner(vtable,slot4);
+        if(owner!=edf::native::NativeCoverageOwner::None && owner!=edf::native::NativeCoverageOwner::Empty) continue;
+        const bool empty=owner==edf::native::NativeCoverageOwner::Empty;
+        population.push_back({empty?edf::native::NativeCoverageStatus::Parity:edf::native::NativeCoverageStatus::Uncovered,vtable,{},
+          empty?"empty_slot4":"registry_unknown_class",std::format("slot=0x{:08X}",slot4),count});
+      }
+      edf::native::CoverageCensus().SetPopulation("registry",std::move(population));
+      census_population=true;
+    } else if(census_population) {
+      edf::native::CoverageCensus().SetPopulation("registry",{});
+      census_population=false;
     }
     static uint64_t ticks=0;
     const bool report=++ticks<=4 || ticks%1000==0;
