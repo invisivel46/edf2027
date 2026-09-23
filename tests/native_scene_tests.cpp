@@ -1281,6 +1281,21 @@ void FullFrameStaticWorld() {
     Require(counted.skipped.size()==2 && counted.skipped[0].owner==E && counted.skipped[0].reason==Skip::Bucket &&
       counted.skipped[1].owner==J && counted.skipped[1].reason==Skip::Unrouted,"full-frame census skips");
     Require(counted.objects==selection.objects,"the census changes no selection");
+    Require(counted.missing_lists.empty(),"full-frame census names a missing list with every list published");
+    // world+372 without a published membership (the scene membership never
+    // tracks it): counted, and named by world and list for the census only.
+    auto partial=std::make_shared<NativeSceneMembership::Publication>();
+    for(const auto address:{root0+120,root1+120,child_a+120}) partial->lists.Set(address,*lists->lists.Find(address));
+    auto unlisted=publication; unlisted.membership=partial;
+    NativeFullFrameStaticSelectCache missing_cache;
+    missing_cache.census=true;
+    const auto missing=SelectNativeFullFrameStaticWorld(unlisted,camera,routes,&missing_cache);
+    Require(missing.stats.missing_lists==1 && missing.stats.lists==3 &&
+      missing.missing_lists==std::vector<NativeFullFrameStaticSelection::MissingList>{{world,world+372}},
+      "full-frame census did not name the missing world+372 list");
+    Require(missing.objects==std::vector<Object>{{A,0},{B,1},{G,0}},"a missing world+372 changed the leaves' selection");
+    const auto uncounted=SelectNativeFullFrameStaticWorld(unlisted,camera,routes);
+    Require(uncounted.stats.missing_lists==1 && uncounted.missing_lists.empty(),"missing lists named without the census");
     route_reads=reads;
   }
   // Live semantics: a mode written after the step (no publication) routes E

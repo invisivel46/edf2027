@@ -196,6 +196,12 @@ struct NativeFullFrameStaticSelection {
   enum class Skip : uint8_t { Unpublished, Unrouted, Virtual, Bucket, UnknownMode, RouteMismatch, MissingLod, Undrawable };
   struct Skipped { uint32_t owner=0; Skip reason=Skip::Unpublished; };
   std::vector<Skipped> skipped;
+  // With the census too: each gathered list the published membership does not
+  // hold (stats.missing_lists), by world owner and list address, in walk
+  // order. The census tells world+372 (never tracked: see
+  // NativeCoverageMapListMarks) from a leaf list that should have been.
+  struct MissingList { uint32_t world=0,list=0; bool operator==(const MissingList&) const=default; };
+  std::vector<MissingList> missing_lists;
 };
 // A conservative "every one of these objects is culled" test, exact against
 // SelectNativeVisibility's float arithmetic: Culled(bound) is true only when

@@ -221,13 +221,22 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
       },[&](uint32_t list) { lists.push_back(list); });
       stats.tree_reads+=tree.reads;
     }
-    // 820B4310 gathers world+372 (non-octree map objects) after the octree.
+    // 820B4310 also gathers world+372: the objects 820B3DE0 (its slot 3) files
+    // there because they are not clOctTreeObject_Base, before the octree walk.
+    // No class this walk draws can be one (each derives from
+    // clOctTreeObject_Base and goes to the octree), so the list is not
+    // membership-tracked and its place in the order changes no selection; the
+    // census accounts for what it holds (NativeCoverageMapListMarks).
     lists.push_back(uint32_t(owner+372));
     for(const auto address:lists) {
       ++stats.lists;
       const std::shared_ptr<const NativeSceneMembership::Snapshot>* members=nullptr;
       if(membership) members=membership->lists.Find(address);
-      if(!members || !*members) { ++stats.missing_lists; continue; }
+      if(!members || !*members) {
+        ++stats.missing_lists;
+        if(c.census) result.missing_lists.push_back({owner,address});
+        continue;
+      }
       auto& entry=c.lists[address];
       entry.used=c.pass;
       if(entry.members!=*members) {

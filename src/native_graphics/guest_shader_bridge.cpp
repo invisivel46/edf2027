@@ -7815,10 +7815,12 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
   // draw and count, one whose slot 4 is a bare blr draws nothing in the guest
   // either (parity), and any other is uncovered, named by its class and slot
   // 4. The build's group-level drops (no group, material or geometry; a
-  // scissor or declined material) and instance declines, lists without a
-  // published membership and worlds without a published group order are
+  // scissor or declined material) and instance declines, leaf lists without
+  // a published membership and worlds without a published group order are
   // uncovered; groups outside a published order are parity (821C3BB8 never
-  // reaches them). A stale frame recorded nothing.
+  // reaches them). world+372, the one list the membership never tracks, is
+  // parity, its live members named by class (NativeCoverageMapListMarks). A
+  // stale frame recorded nothing.
   template<class Reader>
   static void CensusStaticWorld(const Reader& reader,const edf::native::NativeFullFrameStaticFrame& frame,bool current) {
     using namespace edf::native;
@@ -7852,10 +7854,26 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
       }
       marks.push_back({NativeCoverageStatus::Uncovered,vtable,nullptr,reason,slot4});
     }
+    // Lists without a published membership: world+372 is never tracked and
+    // holds no static world object (parity; NativeCoverageMapListMarks names
+    // its members from the live list), any other (a leaf list) is uncovered,
+    // named by world and list.
+    for(const auto& missing:frame.selection.missing_lists) {
+      char detail[64];
+      std::snprintf(detail,sizeof(detail),"world=0x%08X list=0x%08X",missing.world,missing.list);
+      if(missing.list!=missing.world+kNativeCoverageMapList) {
+        census.Add(NativeCoverageStatus::Uncovered,0,"static_list","static_missing_list",1,detail);
+        continue;
+      }
+      census.Add(NativeCoverageStatus::Parity,0,"static_map_list","untracked_non_octree_list",1,detail);
+      try { NativeCoverageMapListMarks(reader,missing.list,class_of,marks); }
+      catch(const std::exception& error) {
+        census.Add(NativeCoverageStatus::Uncovered,0,"static_map_list","static_map_list_unreadable",1,error.what());
+      }
+    }
     census.Add(marks);
     const auto& selected=frame.selection.stats;
     const auto& built=frame.stats;
-    census.Add(NativeCoverageStatus::Uncovered,0,"static_list","static_missing_list",selected.missing_lists);
     census.Add(NativeCoverageStatus::Uncovered,0,"static_world_owner","static_missing_order",selected.missing_orders);
     census.Add(NativeCoverageStatus::Parity,0,"static_group","unordered_group",selected.unordered_parts);
     census.Add(NativeCoverageStatus::Uncovered,0,"static_group","static_missing_group",built.missing_group);

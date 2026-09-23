@@ -34,6 +34,7 @@
 #include <map>
 #include <mutex>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -94,6 +95,41 @@ NativeCoverageOwner NativeCoverageSlotOwner(uint32_t vtable,uint32_t slot4);
 // (static world, models), clGameObject_Manager and clGameBossObject_Manager
 // (models), clMapEffectManager (sky). Null for any other vtable.
 const char* NativeCoverageWorldListPass(uint32_t vtable);
+// clMapObjectManager's world+372 list, which the static world gathers (as
+// 820B4310 does, before its octree walk) but the scene membership never
+// tracks. 820B3DE0 (the manager's slot 3, adding an object) files an object
+// into the octree when __RTDynamicCast (821E9348) makes it a
+// clOctTreeObject_Base, and links it here only when it is not one. Every
+// class the static world draws (slot 4 820B2670: clMapArtifact_Base and its
+// clBuilding, clFieldParts, clNameBoard*, clSmall*; slot 4 820BAF90: clRock)
+// derives from clOctTreeObject_Base, so none is ever here: the list's absence
+// from the membership is parity for the static world. Its members are other
+// passes' objects, named here by class from the live list (head at +0, end at
+// +12, nodes {+0 next, +8 object}) so a non-empty list still shows up:
+//  - Models (the registry's snapshot draws them wherever they are listed): no mark;
+//  - Empty slot 4: parity, empty_slot4;
+//  - anything else (StaticWorld, MapEffects, Effects, None): uncovered,
+//    static_map_list_member with its slot 4 (the static world never visits
+//    them and the sky and effect passes walk their own managers' lists).
+// class_of(object) -> {vtable, slot 4}. Throws on a list that does not reach
+// its end within `limit` nodes (or on an unreadable word, as the reader does).
+inline constexpr uint32_t kNativeCoverageMapList=372;
+template<class Reader,class ClassOf>
+void NativeCoverageMapListMarks(const Reader& reader,uint32_t list,ClassOf&& class_of,std::vector<NativeCoverageMark>& marks,
+    uint32_t limit=1u<<17) {
+  const auto end=reader.Word(reader.Add(list,12));
+  uint32_t count=0;
+  for(auto node=reader.Word(list);node!=end;node=reader.Word(node)) {
+    if(!node || ++count>limit) throw std::runtime_error("native map object list does not reach its end");
+    const auto object=reader.Word(reader.Add(node,8));
+    const auto [vtable,slot4]=class_of(object);
+    switch(NativeCoverageSlotOwner(vtable,slot4)) {
+      case NativeCoverageOwner::Models: break;
+      case NativeCoverageOwner::Empty: marks.push_back({NativeCoverageStatus::Parity,vtable,nullptr,"empty_slot4",slot4}); break;
+      default: marks.push_back({NativeCoverageStatus::Uncovered,vtable,nullptr,"static_map_list_member",slot4}); break;
+    }
+  }
+}
 
 class NativeCoverageCensus {
  public:

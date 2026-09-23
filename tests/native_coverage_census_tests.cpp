@@ -1,5 +1,7 @@
 #include "native_graphics/native_coverage_census.h"
 #include <iostream>
+#include <map>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -166,6 +168,61 @@ void TestNamesAndOwners() {
         std::string(NativeCoverageWorldListPass(0x82002214))=="sky" && !NativeCoverageWorldListPass(0x82001234),"world-list passes");
   Check(std::string(NativeCoverageStatusName(NativeCoverageStatus::Parity))=="parity","status names");
 }
+// world+372 (NativeCoverageMapListMarks): the members of the untracked map
+// list, read live, named by class. Models' classes are the models pass's to
+// count; a bare-blr slot 4 is parity; any other class is uncovered with its
+// slot 4. An empty list marks nothing; a list that never reaches its end throws.
+void TestMapList() {
+  using edf::native::NativeCoverageMapListMarks;
+  struct Reader {
+    std::map<uint32_t,uint32_t> words;
+    uint32_t Add(uint32_t address,uint32_t offset) const { return address+offset; }
+    uint32_t Word(uint32_t address) const {
+      const auto found=words.find(address);
+      if(found==words.end()) throw std::runtime_error("unmapped");
+      return found->second;
+    }
+  };
+  constexpr uint32_t world=0x40001000,list=world+edf::native::kNativeCoverageMapList,end=0x40002000;
+  const std::map<uint32_t,std::pair<uint32_t,uint32_t>> classes={
+    {0x5000,{0x82005198,0x8210E6C0}},  // clGiantAnt: models
+    {0x5100,{0x82004474,0x8252B718}},  // bare blr: parity
+    {0x5200,{0x8200284C,0x820BB270}},  // clSky: map effects, not walked from here
+    {0x5300,{0x82000000,0x82123456}}}; // no pass
+  const auto class_of=[&](uint32_t object) { return classes.at(object); };
+  Reader reader;
+  reader.words[list]=end; reader.words[list+12]=end;
+  std::vector<NativeCoverageMark> marks;
+  NativeCoverageMapListMarks(reader,list,class_of,marks);
+  Check(marks.empty(),"map list: an empty list marks nothing");
+  // Nodes {+0 next, +8 object}, in list order.
+  const uint32_t nodes[]={0x6000,0x6100,0x6200,0x6300};
+  reader.words[list]=nodes[0];
+  uint32_t object=0x5000;
+  for(size_t i=0;i<4;++i,object+=0x100) {
+    reader.words[nodes[i]]=i+1<4?nodes[i+1]:end;
+    reader.words[nodes[i]+8]=object;
+  }
+  NativeCoverageMapListMarks(reader,list,class_of,marks);
+  Check(marks.size()==3,"map list: one mark per member other passes do not count");
+  if(marks.size()==3) {
+    Check(marks[0].status==NativeCoverageStatus::Parity && marks[0].vtable==0x82004474 &&
+      std::string(marks[0].reason)=="empty_slot4" && marks[0].slot==0x8252B718,"map list: bare blr member is parity");
+    Check(marks[1].status==NativeCoverageStatus::Uncovered && marks[1].vtable==0x8200284C &&
+      std::string(marks[1].reason)=="static_map_list_member" && marks[1].slot==0x820BB270,"map list: clSky member is uncovered");
+    Check(marks[2].status==NativeCoverageStatus::Uncovered && marks[2].vtable==0x82000000 &&
+      std::string(marks[2].reason)=="static_map_list_member","map list: unowned member is uncovered");
+  }
+  // A cycle, and a null link, never reach the end.
+  reader.words[nodes[3]]=nodes[0];
+  bool threw=false;
+  try { marks.clear(); NativeCoverageMapListMarks(reader,list,class_of,marks,16); } catch(const std::exception&) { threw=true; }
+  Check(threw,"map list: a cycle throws");
+  reader.words[nodes[3]]=0;
+  threw=false;
+  try { marks.clear(); NativeCoverageMapListMarks(reader,list,class_of,marks); } catch(const std::exception&) { threw=true; }
+  Check(threw,"map list: a null link throws");
+}
 // Adds from several threads land in the frame whole.
 void TestThreads() {
   NativeCoverageCensus census;
@@ -188,6 +245,7 @@ int main() {
   TestOrderAndSummary();
   TestPoll();
   TestNamesAndOwners();
+  TestMapList();
   TestThreads();
   if(failures) { std::cerr<<failures<<" failure(s)\n"; return 1; }
   std::cout<<"native coverage census tests passed\n";
