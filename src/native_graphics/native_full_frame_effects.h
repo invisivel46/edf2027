@@ -141,8 +141,32 @@ inline constexpr uint32_t NativeEffectTechniqueOffset(NativeEffectTechnique t) {
 inline constexpr uint32_t NativeEffectSamplerListOffset(NativeEffectTechnique t) {
   return t==NativeEffectTechnique::Particle?272:t==NativeEffectTechnique::ZParticle?316:216;
 }
+// The technique object is not itself a material: 821A7640 activates
+// 821B94E8([technique+16]) (lwz r3,16(r30), r30 = +244/+288) and 821A7C70
+// 821B94E8([+204]) = [+188+16]. That word is the 112-byte material (pass
+// record: +96/+104 state operations, +108 the shader pair) 821B8E48 reads.
+inline constexpr uint32_t kNativeEffectTechniqueMaterial=16;
+template<class Reader>
+uint32_t NativeEffectTechniqueMaterial(const Reader& r,uint32_t effect,NativeEffectTechnique t) {
+  return r.Word(r.Add(r.Add(effect,NativeEffectTechniqueOffset(t)),kNativeEffectTechniqueMaterial));
+}
+// sub_821BC4C8(r3 technique, r4 sampler list, r5 texture), which both
+// producers call before the activation, unconditionally: the list's vector at
+// +4 (begin +4, count +12) holds the material's local texture records, and
+// each gets the texture at +4 (NativeMaterialTexture's handle word). It is
+// the guest's own write, so the program read after it samples the draw's
+// texture through the material's own sampler record.
+inline constexpr uint32_t kNativeEffectSamplerListLimit=64;
+template<class Reader>
+void BindNativeEffectTexture(const Reader& r,uint32_t effect,NativeEffectTechnique t,uint32_t texture) {
+  const auto list=r.Add(effect,NativeEffectSamplerListOffset(t));
+  const auto begin=r.Word(r.Add(list,4)),count=r.Word(r.Add(list,12));
+  if(count>kNativeEffectSamplerListLimit) throw std::runtime_error("native effect sampler list is too long");
+  for(uint32_t i=0;i<count;++i) r.StoreWord(r.Add(r.Word(r.Add(begin,i*4)),4),texture);
+}
 // Blend (r7 of 821A7640, r8 of 821A7C70): 0 = SRCALPHA/INVSRCALPHA (6/7),
-// 1 = ONE/ONE; any other value leaves the device's blend as it was.
+// 1 = ONE/ONE; any other value leaves the device's blend as it was. The
+// values are the li r4 to 82135078 (state 0x48) and 82135108 (0x4c).
 enum : int32_t { kNativeEffectBlendAlpha=0,kNativeEffectBlendAdditive=1 };
 struct NativeEffectDraw {
   enum class Kind : uint8_t { Particles,RibbonQuads,RibbonStrip };
@@ -157,6 +181,10 @@ struct NativeEffectDraw {
   std::vector<NativeParticleVertex> particle_vertices;
   std::vector<NativeRibbonVertex> ribbon_vertices;
   uint32_t primitive() const { return kind==Kind::RibbonStrip?6:13; }
+  // 821A7C70 sets blend and depth write (82135078/82135108/82135578) before
+  // its 821B94E8, so the technique's own state operations win over them;
+  // 821A7640 sets its blend after the activation, so the draw's blend wins.
+  bool state_before_activation() const { return technique==NativeEffectTechnique::Ribbon; }
   uint32_t stride() const { return kind==Kind::Particles?44:36; }
   uint32_t vertex_count() const {
     return uint32_t(kind==Kind::Particles?particle_vertices.size():ribbon_vertices.size());
@@ -206,8 +234,17 @@ std::vector<NativeParticleRecord> ReadNativeParticleArray(const Reader& r,uint32
 // The effect classes, keyed by their slot 4 (vtable+16).
 enum class NativeEffectClass : uint8_t {
   Unknown,Particle01Limit,Particle02,Glass,RocketAmmo01,AcidAmmo01,BeamAmmo01,RocketAmmo02,SolidAmmo01,LaserAmmo01,WebAmmo01,
-  EffectEtc02
+  EffectEtc02,Spark01,MuzzleFlash,Empty
 };
+// A slot 4 without a builder, named for the log (classnames.txt); null when
+// the slot is not a known effect class.
+inline const char* NativeEffectSlotName(uint32_t slot4) {
+  switch(slot4) {
+    case 0x8211F540: return "clSpark02";      // b 821A88E8
+    case 0x8217ECB8: return "clEffectEtc01";  // 8217EA40 per +612 entry, 224 bytes apart
+    default: return nullptr;
+  }
+}
 inline NativeEffectClass ClassifyNativeEffect(uint32_t slot4) {
   switch(slot4) {
     case 0x8211D250: return NativeEffectClass::Particle01Limit;  // clParticle01_Limit, vtable 0x82004F6C
@@ -221,9 +258,11 @@ inline NativeEffectClass ClassifyNativeEffect(uint32_t slot4) {
     case 0x82117CD0: return NativeEffectClass::LaserAmmo01;      // clLaserAmmo01, 0x82007438
     case 0x8211BB80: return NativeEffectClass::WebAmmo01;        // clWebAmmo01, 0x82007670
     case 0x8217C4A0: return NativeEffectClass::EffectEtc02;      // clEffectEtc02, 0x82012C78
-    // Not built: clSpark01 (0x8211E7A0, strip via 821A8090) and clMuzzleFlash
-    // (0x821897A8, segments via 821A8628) reach the same producers but were not
-    // in scope; they count as unsupported.
+    case 0x8211E7A0: return NativeEffectClass::Spark01;          // clSpark01, strip via 821A8090
+    case 0x821897A8: return NativeEffectClass::MuzzleFlash;      // clMuzzleFlash, segments via 821A8628
+    case 0x8252B718: return NativeEffectClass::Empty;            // a bare blr: nothing to draw
+    // Not built (NativeEffectSlotName): clSpark02 (0x8211F540, 821A88E8) and
+    // clEffectEtc01 (0x8217ECB8, 8217EA40); they count as unsupported.
     default: return NativeEffectClass::Unknown;
   }
 }
@@ -239,6 +278,28 @@ NativeEffectInputs ReadNativeEffectInputs(const Reader& r) {
   in.eye=ReadNativeFxVec3(r,r.Add(r.Word(kNativeEffectCameraGlobal),kNativeEffectEyeOffset));
   in.k=ReadNativeEffectConstants(r);
   return in;
+}
+
+// The points 821A8628 reads for `count` (r5): none below 2 (signed), else
+// srawi/addze count/2 pairs, capped at 100.
+template<class Reader>
+std::vector<NativeRibbonPoint> ReadNativeRibbonSegmentPoints(const Reader& r,uint32_t array,uint32_t count) {
+  std::vector<NativeRibbonPoint> points;
+  if(int32_t(count)<2) return points;
+  const auto used=std::min<uint32_t>(uint32_t(int32_t(count)/2),kNativeRibbonPointLimit)*2;
+  points.reserve(used);
+  for(uint32_t i=0;i<used;++i) points.push_back(ReadNativeRibbonPoint(r,r.Add(array,i*kNativeRibbonPointBytes)));
+  return points;
+}
+// The points 821A8090 reads for `count` (r5): none below 2 (signed), else up to 100.
+template<class Reader>
+std::vector<NativeRibbonPoint> ReadNativeRibbonStripPoints(const Reader& r,uint32_t array,uint32_t count) {
+  std::vector<NativeRibbonPoint> points;
+  if(int32_t(count)<2) return points;
+  const auto used=std::min<uint32_t>(count,kNativeRibbonPointLimit);
+  points.reserve(used);
+  for(uint32_t i=0;i<used;++i) points.push_back(ReadNativeRibbonPoint(r,r.Add(array,i*kNativeRibbonPointBytes)));
+  return points;
 }
 
 // Per-class builders. Each returns the draws its slot 4 issues, in order.
@@ -379,14 +440,10 @@ std::vector<NativeEffectDraw> BuildNativeEffectDraws(const Reader& r,uint32_t ob
       // - 32, read even when the count is below 2 (the strip is then skipped).
       const auto array=word(784),count=word(792);
       const NativeFxVec4 white{k.one,k.one,k.one,k.one};
-      if(int32_t(count)>=2) {
-        const auto used=std::min<uint32_t>(count,kNativeRibbonPointLimit);
-        std::vector<NativeRibbonPoint> points;
-        points.reserve(used);
-        for(uint32_t i=0;i<used;++i) points.push_back(ReadNativeRibbonPoint(r,r.Add(array,i*kNativeRibbonPointBytes)));
+      if(int32_t(count)>=2)
         draws.push_back(MakeNativeRibbonDraw(in.effect,NativeEffectDraw::Kind::RibbonStrip,
-          BuildNativeRibbonStrip(points,white,NativeFxMul(single(484),single(780)),in.eye,k),word(796),0,0));
-      }
+          BuildNativeRibbonStrip(ReadNativeRibbonStripPoints(r,array,count),white,NativeFxMul(single(484),single(780)),in.eye,k),
+          word(796),0,0));
       const uint32_t last=array+(count<<5)-32;                  // rlwinm r10,r10,5,0,26; add; addi -32
       NativeParticleRecord head{ReadNativeFxVec3(r,last),white,k.zero,k.zero};
       head.radius=NativeFxMul(NativeFxMul(single(484),single(780)),k.web_scale);
@@ -415,6 +472,30 @@ std::vector<NativeEffectDraw> BuildNativeEffectDraws(const Reader& r,uint32_t ob
       draws.push_back(MakeNativeRibbonDraw(in.effect,NativeEffectDraw::Kind::RibbonQuads,std::move(vertices),word(528),blend,0));
       break;
     }
+    case NativeEffectClass::Spark01:
+      // 8211E7A0: b 821A8090(r4 +544, r5 +556, r7 +528, r8 &+512, r9 1, r10 0, f1 +440).
+      draws.push_back(MakeNativeRibbonDraw(in.effect,NativeEffectDraw::Kind::RibbonStrip,
+        BuildNativeRibbonStrip(ReadNativeRibbonStripPoints(r,word(544),word(556)),ReadNativeFxVec4(r,r.Add(object,512)),
+          single(440),in.eye,k),word(528),kNativeEffectBlendAdditive,0));
+      break;
+    case NativeEffectClass::MuzzleFlash: {
+      // 821897A8: two 821A8628 calls, both r7 +396, r8 &+480, r9 1, r10 0. The
+      // first r4 +464, r5 = +424 << 1, f1 = [[+384]+20]; the second the two
+      // points after those, r4 = +464 + (+424 << 6), r5 2, f1 the same offset
+      // that far past [+384].
+      const auto points=word(464),widths=word(384),pairs=word(424),texture=word(396);
+      const auto colour=ReadNativeFxVec4(r,r.Add(object,480));
+      const uint32_t tail=pairs<<6;                                // rlwinm r11,r11,6,0,25
+      const auto segments=[&](uint32_t array,uint32_t count,float width) {
+        draws.push_back(MakeNativeRibbonDraw(in.effect,NativeEffectDraw::Kind::RibbonQuads,
+          BuildNativeRibbonSegments(ReadNativeRibbonSegmentPoints(r,array,count),colour,width,in.eye,k),
+          texture,kNativeEffectBlendAdditive,0));
+      };
+      segments(points,pairs<<1,ReadNativeFxFloat(r,r.Add(widths,20)));
+      segments(points+tail,2,ReadNativeFxFloat(r,widths+tail+20));   // add r4,r6,r11; add r31,r4,r11
+      break;
+    }
+    case NativeEffectClass::Empty: break;
     case NativeEffectClass::Unknown: throw std::runtime_error("unsupported native effect class");
   }
   std::erase_if(draws,[](const NativeEffectDraw& draw) { return draw.empty(); });

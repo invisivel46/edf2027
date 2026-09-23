@@ -6081,7 +6081,10 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
     try { collection=CollectNativeEffectManager(reader_,manager,context.guest_context,order); }
     catch(const std::exception& error) { NativeFullFrameDeclined("effects",error.what()); return; }
     for(const auto slot:collection.unsupported_slots)
-      if(unsupported_.insert(slot).second) REXLOG_INFO("Native full frame effects: unsupported slot 4 {:#x} (not drawn)",slot);
+      if(unsupported_.insert(slot).second) {
+        const auto* name=NativeEffectSlotName(slot);
+        REXLOG_INFO("Native full frame effects: unsupported class {} (slot 4 {:#x}, not drawn)",name?name:"unknown",slot);
+      }
     uint64_t drawn=0;
     if(!collection.immediate.empty()) {
       auto& state=State();
@@ -6144,10 +6147,12 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
         state.recorded={};
       }});
     const auto model_count=models.size(),effect_count=effects.size();
+    // Per effect draw: recorded, or declined (reported once per reason).
+    uint64_t effect_draws=0,effect_declined=0;
     auto effect_items=NativeEffectTransparentItems(std::move(effects),[&](NativeBackendRecorder&,const NativeEffectItem& item) {
       for(const auto& draw:item.draws) {
-        try { RecordNativeFullFrameEffectLocked(state,reader_,window,draw,camera,viewport,formats,report); }
-        catch(const std::exception& error) { report(error.what()); }
+        try { RecordNativeFullFrameEffectLocked(state,reader_,window,draw,camera,viewport,formats,report); ++effect_draws; }
+        catch(const std::exception& error) { report(error.what()); ++effect_declined; }
       }
     });
     std::vector<std::vector<NativeTransparentItem>> sources;
@@ -6156,8 +6161,8 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     RecordNativeTransparentItems(sequence,SceneRecorderLocked(state));
     if(frame) state.scene_recorded_frames.push_back(std::move(frame));
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame transparent: frames={} model_batches={} effect_items={} drawn_items={}",
-        frames_,model_count,effect_count,sequence.size());
+      REXLOG_INFO("Native full frame transparent: frames={} model_batches={} effect_items={} merged_items={} effect_draws={} effect_declined={}",
+        frames_,model_count,effect_count,sequence.size(),effect_draws,effect_declined);
   }
  private:
   const edf::native::GuestReader reader_;
@@ -12055,24 +12060,38 @@ std::array<uint8_t,N*4> NativeFullFrameDeclarationBytes(const std::array<uint32_
   return bytes;
 }
 // One effect draw of the full frame (native_full_frame_effects.h), recorded
-// without guest calls: the technique object in the effect-shader object
-// (+244/+288/+188) is the material 821B94E8 would activate, so its program
-// comes from the model pass cache and is applied to the shader bindings as a
-// published activation is (NativeSceneMaterialProgram::ApplyBindings), with
-// the pass camera over its camera globals and the draw's texture in the one
-// slot 821A7640/821A7C70 fill. Render state: the shared full-frame base
-// state, the technique's own operations, then the draw's blend (0x48/0x4c)
-// and, for the ribbons, depth write (0x30). The vertices are the host bytes
-// EncodeNativeEffectVertices builds, one RecordNativeSceneImmediate per guest
-// DrawPrimitiveUP, under the Vs_Particle (44-byte) or VS_3DTex (36-byte)
-// declaration the immediate path accepts. Throws when any of it is missing.
+// without guest calls. As the producers do: 821BC4C8 stores the draw's
+// texture into the technique's sampler list (BindNativeEffectTexture, the
+// guest's own write), then the material 821B94E8 activates, [technique+16]
+// (NativeEffectTechniqueMaterial; the technique object itself is not a pass
+// record), has its program from the model pass cache - rebuilt when the
+// stored texture changed it - applied to the shader bindings as a published
+// activation is (NativeSceneMaterialProgram::ApplyBindings), with the pass
+// camera over its camera globals. Render state: the shared full-frame base
+// state, then for the ribbons the draw's blend (0x48/0x4c) and depth write
+// (0x30) and the technique's own operations over them, for the particles the
+// technique's operations and the blend over them (state_before_activation).
+// The vertices are the host bytes EncodeNativeEffectVertices builds, one
+// RecordNativeSceneImmediate per guest DrawPrimitiveUP, under the Vs_Particle
+// (44-byte) or VS_3DTex (36-byte) declaration the immediate path accepts.
+// Throws when any of it is missing.
 void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
     const NativeEffectDraw& draw,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
     const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report) {
-  const auto technique=reader.Add(draw.effect,NativeEffectTechniqueOffset(draw.technique));
-  const auto material=NativeModelPassProgramLocked(state,window,technique,false,report);
+  if(draw.texture) {
+    const auto texture=state.textures.find(draw.texture);
+    if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
+      throw std::runtime_error("native effect texture is not decoded");
+  }
+  BindNativeEffectTexture(window,draw.effect,draw.technique,draw.texture);
+  const auto pass=NativeEffectTechniqueMaterial(window,draw.effect,draw.technique);
+  if(!pass) throw std::runtime_error("native effect technique has no material");
+  const auto material=NativeModelPassProgramLocked(state,window,pass,false,report);
   if(!material || !material->program) throw std::runtime_error("native effect technique has no program");
   const auto& program=*material->program;
+  if(draw.texture && std::none_of(program.inputs.textures.begin(),program.inputs.textures.end(),
+       [&](const auto& texture) { return texture.handle==draw.texture; }))
+    throw std::runtime_error("native effect texture is not sampled by its technique");
   const auto vertex=state.shaders.find(program.inputs.vertex),pixel=state.shaders.find(program.inputs.pixel);
   if(vertex==state.shaders.end() || pixel==state.shaders.end() || !vertex->second.bindings || !pixel->second.bindings)
     throw std::runtime_error("native effect shaders are not registered");
@@ -12099,21 +12118,15 @@ void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,c
   state.active_vertex=0;
   state.active_vertex_parameters.reset();
   program.ApplyBindings(vs,ps,constants,samplers);
-  if(draw.texture) {
-    const auto texture=state.textures.find(draw.texture);
-    if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
-      throw std::runtime_error("native effect texture is not decoded");
-    if(program.inputs.textures.size()!=1) throw std::runtime_error("native effect technique does not sample one texture");
-    ps.BeginResourceUpdate();
-    const bool bound=ps.TrySetTexture(program.inputs.textures[0].name,texture->second.backend);
-    ps.EndResourceUpdate();
-    if(!bound) throw std::runtime_error("native effect texture does not match its shader");
-  }
   state.linked_vertex=program.inputs.vertex; state.linked_pixel=program.inputs.pixel;
-  auto render=program.ResolveRenderState(base.render);
-  if(draw.blend==kNativeEffectBlendAlpha) { ApplyNativeMaterialState(render,0x48,6); ApplyNativeMaterialState(render,0x4c,7); }
-  else if(draw.blend==kNativeEffectBlendAdditive) { ApplyNativeMaterialState(render,0x48,1); ApplyNativeMaterialState(render,0x4c,1); }
-  if(draw.sets_depth_write) ApplyNativeMaterialState(render,0x30,draw.depth_write?1:0);
+  const auto draw_state=[&](NativeMaterialRenderPass pass) {
+    if(draw.blend==kNativeEffectBlendAlpha) { ApplyNativeMaterialState(pass,0x48,6); ApplyNativeMaterialState(pass,0x4c,7); }
+    else if(draw.blend==kNativeEffectBlendAdditive) { ApplyNativeMaterialState(pass,0x48,1); ApplyNativeMaterialState(pass,0x4c,1); }
+    if(draw.sets_depth_write) ApplyNativeMaterialState(pass,0x30,draw.depth_write?1:0);
+    return pass;
+  };
+  const auto render=draw.state_before_activation()?program.ResolveRenderState(draw_state(base.render)):
+                                                   draw_state(program.ResolveRenderState(base.render));
   DecodeNativeRenderState(render.words);
   // The immediate path's accepted layouts (see the 821FD8F8 hook's checks).
   const bool particle=draw.kind==NativeEffectDraw::Kind::Particles;

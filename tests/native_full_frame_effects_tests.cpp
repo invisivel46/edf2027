@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <map>
@@ -309,6 +310,26 @@ std::vector<Call> T_Etc02(const Reader& m,uint32_t r3,uint32_t r1=kStack) {
   if(r6>0) calls.push_back({true,13,m.Read(r1+80,uint32_t(r6)*144),m.Word(r3+528),m.Byte(0x82554BF0)?1:0,2,0});
   return calls;
 }
+// clSpark01 slot 4 (recomp.71.cpp:3697): b 821A8090.
+std::vector<Call> T_Spark01(const Reader& m,uint32_t r11) {
+  std::vector<Call> calls;
+  auto ribbon=T_Strip(m,m.Word(r11+544),m.Word(r11+556),r11+512,lfs(m,r11+440));
+  if(!ribbon.empty()) calls.push_back({true,6,std::move(ribbon),m.Word(r11+528),1,2,0});
+  return calls;
+}
+// clMuzzleFlash slot 4 (recomp.49.cpp:6665): two 821A8628 calls.
+std::vector<Call> T_Muzzle(const Reader& m,uint32_t r31) {
+  std::vector<Call> calls;
+  const uint32_t r30=r31+480;
+  uint32_t r11=m.Word(r31+384);
+  auto first=T_Segments(m,m.Word(r31+464),m.Word(r31+424)<<1,r30,lfs(m,r11+20));
+  if(!first.empty()) calls.push_back({true,13,std::move(first),m.Word(r31+396),1,2,0});
+  r11=m.Word(r31+424)<<6;
+  const uint32_t r4=m.Word(r31+384),r6=m.Word(r31+464);
+  auto second=T_Segments(m,r6+r11,2,r30,lfs(m,r4+r11+20));
+  if(!second.empty()) calls.push_back({true,13,std::move(second),m.Word(r31+396),1,2,0});
+  return calls;
+}
 std::vector<Call> Transcribe(const Reader& m,uint32_t object,NativeEffectClass type) {
   std::vector<Call> calls;
   const auto w=[&](uint32_t o) { return m.Word(object+o); };
@@ -324,6 +345,8 @@ std::vector<Call> Transcribe(const Reader& m,uint32_t object,NativeEffectClass t
     case NativeEffectClass::LaserAmmo01: return T_Laser(m,object);
     case NativeEffectClass::WebAmmo01: return T_Web(m,object);
     case NativeEffectClass::EffectEtc02: return T_Etc02(m,object);
+    case NativeEffectClass::Spark01: return T_Spark01(m,object);
+    case NativeEffectClass::MuzzleFlash: return T_Muzzle(m,object);
     default: break;
   }
   return calls;
@@ -428,7 +451,76 @@ void TestBuilders() {
     m.StoreWord(kObject+640,kArray); m.StoreWord(kObject+528,0x8000); m.StoreWord(kObject+612,5);
     m.StoreByte(0x82554BF0,uint8_t(round%2));
     CheckClass(m,0x8217C4A0,"clEffectEtc02"+tag);
+    FillObject(m,kObject,0x8211E7A0);
+    const uint32_t sparks=round==3?150:round==4?1:round==5?0xFFFFFFFEu:2+uint32_t(round)*3;  // cap, too few, negative
+    FillFloats(m,kArray,std::min<uint32_t>(sparks,150)*32,-200,200);
+    m.StoreWord(kObject+544,kArray); m.StoreWord(kObject+556,sparks); m.StoreWord(kObject+528,0x9000);
+    CheckClass(m,0x8211E7A0,"clSpark01"+tag);
+    FillObject(m,kObject,0x821897A8);
+    const uint32_t pairs=round==3?150:round==4?0:1+uint32_t(round%6);  // 150 pairs: the first call caps at 100
+    constexpr uint32_t kWidths=0x53000000;
+    FillFloats(m,kArray,(pairs+1)*64,-200,200); FillFloats(m,kWidths,(pairs+1)*64,0.5f,8.f);
+    m.StoreWord(kObject+464,kArray); m.StoreWord(kObject+384,kWidths); m.StoreWord(kObject+424,pairs);
+    m.StoreWord(kObject+396,0x9100);
+    if(round==2) for(uint32_t o:{32u,36u,40u}) m.StoreWord(kArray+o,m.Word(kArray+o-32));  // zero-length segment
+    CheckClass(m,0x821897A8,"clMuzzleFlash"+tag);
+    FillObject(m,kObject,0x8252B718);
+    CheckClass(m,0x8252B718,"blr slot 4"+tag);
   }
+  // No builder: still unsupported, named for the log.
+  Require(ClassifyNativeEffect(0x8211F540)==NativeEffectClass::Unknown && std::string(NativeEffectSlotName(0x8211F540))=="clSpark02","clSpark02 unsupported");
+  Require(ClassifyNativeEffect(0x8217ECB8)==NativeEffectClass::Unknown && std::string(NativeEffectSlotName(0x8217ECB8))=="clEffectEtc01","clEffectEtc01 unsupported");
+  Require(!NativeEffectSlotName(0x82000000),"an unknown slot has no name");
+}
+// --- Technique material and sampler list (821A7640/821A7C70) --------------------
+void TestTechniqueMaterial() {
+  auto m=MakeMemory();
+  const std::pair<NativeEffectTechnique,uint32_t> techniques[]={{NativeEffectTechnique::Particle,244},
+    {NativeEffectTechnique::ZParticle,288},{NativeEffectTechnique::Ribbon,188}};
+  for(const auto& [technique,offset]:techniques) {
+    const auto tag=" (technique +"+std::to_string(offset)+")";
+    const uint32_t list=kEffect+NativeEffectSamplerListOffset(technique),entries=0x45000000+offset*16,records=0x46000000+offset*64;
+    // lwz r3,16(r30) / lwz r3,204(r30): the material is the word at +16.
+    m.StoreWord(kEffect+offset,0xBAD0BAD0); m.StoreWord(kEffect+offset+16,0x47000000+offset);
+    Require(NativeEffectTechniqueMaterial(m,kEffect,technique)==0x47000000+offset,"material is [technique+16]"+tag);
+    // 821BC4C8: each listed record gets the texture at +4; nothing else moves.
+    m.StoreWord(list+4,entries); m.StoreWord(list+12,3);
+    for(uint32_t i=0;i<3;++i) {
+      m.StoreWord(entries+i*4,records+i*28);
+      m.StoreWord(records+i*28,0x11110000+i); m.StoreWord(records+i*28+4,0xDEAD); m.StoreWord(records+i*28+8,i);
+    }
+    m.StoreWord(records+3*28+4,0xBEEF);  // past the count
+    BindNativeEffectTexture(m,kEffect,technique,0x1234+offset);
+    for(uint32_t i=0;i<3;++i)
+      Require(m.Word(records+i*28+4)==0x1234+offset && m.Word(records+i*28)==0x11110000+i && m.Word(records+i*28+8)==i,
+              "texture stored in record "+std::to_string(i)+tag);
+    Require(m.Word(records+3*28+4)==0xBEEF,"only the listed records"+tag);
+    BindNativeEffectTexture(m,kEffect,technique,0);  // unconditional, as the guest's
+    Require(m.Word(records+4)==0,"a null texture is stored too"+tag);
+    m.StoreWord(list+12,0); BindNativeEffectTexture(m,kEffect,technique,0x55);
+    Require(m.Word(records+4)==0,"an empty list writes nothing"+tag);
+    m.StoreWord(list+12,kNativeEffectSamplerListLimit+1);
+    bool threw=false;
+    try { BindNativeEffectTexture(m,kEffect,technique,0x55); } catch(const std::exception&) { threw=true; }
+    Require(threw,"a corrupt list count is refused"+tag);
+  }
+  // Ribbons set blend/depth before the activation, particles the blend after.
+  const auto k=ReadNativeEffectConstants(m);
+  Require(!MakeNativeParticleDraw(kEffect,{},0,1,0,k).state_before_activation() &&
+          !MakeNativeParticleDraw(kEffect,{},0,1,1,k).state_before_activation(),"particle blend after activation");
+  Require(MakeNativeRibbonDraw(kEffect,NativeEffectDraw::Kind::RibbonQuads,{},0,1,1).state_before_activation(),"ribbon state before activation");
+}
+// --- Filed effect items reach their record callbacks in draw order -------------
+void TestTransparentRecording() {
+  std::vector<NativeEffectItem> items(4);
+  const uint16_t keys[]={300,100,5000,300};
+  for(uint32_t i=0;i<4;++i) { items[i].key=keys[i]; items[i].order=10+i; items[i].object=0x50000000+i; }
+  std::vector<uint32_t> ran;
+  const auto effects=NativeEffectTransparentItems(items,[&](NativeBackendRecorder&,const NativeEffectItem& item) { ran.push_back(item.object); });
+  const auto merged=MergeNativeTransparentItems({effects});
+  alignas(std::max_align_t) unsigned char storage[64]{};  // the callbacks never touch the recorder
+  RecordNativeTransparentItems(merged,*reinterpret_cast<NativeBackendRecorder*>(storage));
+  Require(ran==std::vector<uint32_t>{0x50000002,0x50000000,0x50000003},"filed effects record by key, then filing order; key 100 drops");
 }
 // --- The four-vertex expansion and the call split -----------------------------
 void TestExpansion() {
@@ -584,6 +676,8 @@ int main() {
   try {
     TestExpansion();
     TestBuilders();
+    TestTechniqueMaterial();
+    TestTransparentRecording();
     TestSortOrder();
     TestCollection();
   } catch(const std::exception& error) {
