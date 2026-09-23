@@ -134,6 +134,19 @@ NativeFullFrameModelConstants NativeFullFrameModelInstancedConstants(const Nativ
   result.worlds.assign(layout.meshes.size(),NativeModelWorldRegisters(world));
   return result;
 }
+std::vector<NativeSceneMaterialInputs::Constant> NativeFullFrameModelObjectConstants(
+    std::span<const NativeSceneMaterialInputs::Constant> pass,std::span<const NativeRenderObjectConstant> objects) {
+  std::vector<NativeSceneMaterialInputs::Constant> result;
+  if(objects.empty()) return result;
+  for(const auto& constant:pass) {
+    if(!constant.global || constant.registers.size()<16) continue;
+    const auto object=std::find_if(objects.begin(),objects.end(),[&](const auto& o) { return o.name==constant.name; });
+    if(object==objects.end()) continue;
+    auto& replaced=result.emplace_back(constant);
+    std::copy(object->registers.begin(),object->registers.end(),replaced.registers.begin());
+  }
+  return result;
+}
 bool BindNativeFullFrameModelPalette(NativeSceneMaterialInputs::Constant& constant,std::span<const float> palette) {
   if(!constant.global || constant.pixel || constant.registers.size()%16 || palette.size()*4>constant.registers.size()) return false;
   std::fill(constant.registers.begin(),constant.registers.end(),uint8_t(0));
@@ -214,7 +227,7 @@ std::vector<NativeBackendSampler*> ResolvedSamplers(const NativeSceneMaterialPro
 // Whether two sets of an item's constants are the same bytes (the palette
 // floats compared as bits: a NaN is itself, -0 is not 0).
 bool SameConstants(const NativeFullFrameModelConstants& a,const NativeFullFrameModelConstants& b) {
-  return a.skinned==b.skinned && a.bones==b.bones && a.worlds==b.worlds && a.palette.size()==b.palette.size() &&
+  return a.skinned==b.skinned && a.bones==b.bones && a.worlds==b.worlds && a.objects==b.objects && a.palette.size()==b.palette.size() &&
     (a.palette.empty() || !std::memcmp(a.palette.data(),b.palette.data(),a.palette.size()*sizeof(float)));
 }
 }
@@ -406,11 +419,13 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           row.palette=half.palette; row.scissor=half.scissor; derived=half.palette->capture().camera;
           materials_.Store(std::move(cache_key),row.constants,std::move(half),row.palette->capture().material.get(),derived);
         }
-        row.capture={};
+        row.capture={}; row.pipeline=nullptr; row.samplers.clear(); row.blend_factor.reset();
       } else {
         if(entry) derived=entry->material.capture.camera;
         if(entry && Cache::Current(*entry,row.constants,entry->material.capture.material.get(),derived)) {
           row.capture=entry->material.capture; row.scissor=entry->material.scissor;
+          row.pipeline=entry->material.pipeline; row.samplers=entry->material.samplers;
+          row.blend_factor=entry->material.blend_factor;
           ++materials_.hits; ++stats.cache_hits;
         } else {
           NativeFullFrameModelResolve half;
@@ -431,6 +446,7 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           ++(entry?stats.captures:stats.resolves);
           ++materials_.misses;
           row.capture=half.capture; row.scissor=half.scissor; derived=half.capture.camera;
+          row.pipeline=half.pipeline; row.samplers=half.samplers; row.blend_factor=half.blend_factor;
           const auto* captured=half.capture.material.get();
           materials_.Store(std::move(cache_key),row.constants,std::move(half),captured,derived);
         }
@@ -475,14 +491,17 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         const uint32_t world=item.instanced<0?0:item.world;
         const auto blend=NativeRenderBlendOf(pose,*motion_of,pass.motion);
         if(blend.previous) ++stats.blended;
-        if(!state->valued || state->pose!=pose || state->blend!=blend || state->world!=world || state->palette_limit!=pass.palette_limit) {
+        const auto& object_constants=NativeFullFrameModelItemConstants(item);
+        if(!state->valued || state->pose!=pose || state->blend!=blend || state->world!=world || state->palette_limit!=pass.palette_limit ||
+           state->constants!=object_constants) {
           // Pose source: the published pose, or blended from the previous tick's.
           auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,poses_.Pose(pose,*motion_of,pass.motion),pass.palette_limit):
             NativeFullFrameModelInstancedConstants(layout,poses_.Matrix(pose,*motion_of,world,pass.motion));
+          if(object_constants) values.objects=*object_constants;
           if(!state->valued || !SameConstants(values,state->values))
             for(auto& draw:state->draws) { draw.object.reset(); draw.made_from.reset(); }
           state->values=std::move(values); state->pose=pose; state->blend=blend; state->world=world; state->palette_limit=pass.palette_limit;
-          state->valued=true;
+          state->constants=object_constants; state->valued=true;
         }
         const auto& values=state->values;
         auto& drawn=views[index];
@@ -502,7 +521,15 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
               for(auto& constant:row.palette_constants)
                 if(!BindNativeFullFrameModelPalette(constant,values.palette)) { complete=false; break; }
               if(!complete) { ++stats.palette; break; }
-              auto capture=row.palette->With(row.palette_constants);
+              // Per-object constants rebind like the palette (after it: none
+              // is g_mWorldArray, and the last of a name wins in With).
+              auto objects=NativeFullFrameModelObjectConstants(row.constants,values.objects);
+              if(!objects.empty()) {
+                objects.insert(objects.begin(),row.palette_constants.begin(),row.palette_constants.end());
+                ++stats.object_constants;
+              }
+              auto capture=row.palette->With(objects.empty()?std::span<const NativeSceneMaterialInputs::Constant>(row.palette_constants):
+                std::span<const NativeSceneMaterialInputs::Constant>(objects));
               // g_mWorld as 821A17D8 stores it; a palette shader need not declare it.
               if(NativeSceneCaptureBindsWorld(capture)) ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
               draw.object=make(draw,capture); draw.made_from=row.palette;
@@ -513,6 +540,22 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
             if(draw.object && draw.made_from.get()==row.capture.material.get()) ++stats.reused;
             else {
               auto capture=row.capture;
+              // Per-object constants: the row's constants with theirs bound,
+              // captured against the row's pipeline half (the row's material
+              // is shared by every draw of it, so never patched).
+              const auto objects=NativeFullFrameModelObjectConstants(row.constants,values.objects);
+              if(!objects.empty()) {
+                if(!row.pipeline) throw std::runtime_error("native full-frame model row has no pipeline half");
+                auto bound=row.constants;
+                for(const auto& object:objects)
+                  for(auto& constant:bound)
+                    if(constant.global && constant.pixel==object.pixel && constant.name==object.name) constant=object;
+                exclusive([&] {
+                  capture=row.program->Capture(*row.pipeline,pass.targets.reverse_depth,bound,row.samplers,row.blend_factor,false);
+                  if(sources.intern) capture.material=sources.intern(std::move(capture.material));
+                });
+                ++stats.object_constants;
+              }
               ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
               draw.object=make(draw,capture); draw.made_from=row.capture.material;
             }

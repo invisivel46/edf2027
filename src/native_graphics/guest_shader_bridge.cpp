@@ -6763,12 +6763,12 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} attachments={} no_attachment={} items={} drawn={} blended={} interpolate={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
+      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} attachments={} no_attachment={} items={} drawn={} blended={} interpolate={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} object_constants={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
         "source_generation={} source_memo={} source_validated={} source_advances={}/{}/{}/{} source_reuses={} source_audits={}/{}",
         frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
         planned.attachments,planned.no_attachment,
         built.items,built.drawn,built.blended,pass.motion.interpolate,built.draws,statistics.draws,built.resolves,built.captures,built.palettes,built.cache_hits,built.memo_hits,
-        built.reused,built.derived,built.sourced,built.programs,built.geometries,built.camera_rows,built.rows,
+        built.reused,built.derived,built.object_constants,built.sourced,built.programs,built.geometries,built.camera_rows,built.rows,
         built.source_hits,built.source_fetches,models_.material_cache().size(),models_.source_table().size(),
         models_.item_states(),models_.row_states(),built.missing_program,built.missing_geometry,built.failed,broken_,
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()),
@@ -8305,11 +8305,12 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool re
       const auto stats=registry.stats();
       REXLOG_INFO("Native render registry: generation={} tick={} entries={} light_ticks={} idle_ticks={} records={} subscribed={} births={} seeded={} deaths={} "
         "rebirths={} unknown_deaths={} unknown_classes={} deferred={} foreign={} builds={} changed={} unchanged={} pose_reuses={} "
-        "read_failures={} layouts={} layout_failures={} retrying={} frame_poses={}/{}/{}",snapshot->generation,snapshot->tick,snapshot->entries.size(),
+        "read_failures={} layouts={} layout_failures={} retrying={} frame_poses={}/{}/{} constant_changes={}",snapshot->generation,snapshot->tick,snapshot->entries.size(),
         stats.light_ticks,stats.idle_ticks,stats.records,
         stats.subscribed,stats.births,stats.seeded,stats.deaths,stats.rebirths,stats.unknown_deaths,stats.unknown_classes,
         stats.deferred,stats.foreign,stats.builds,stats.changed,stats.unchanged,stats.pose_reuses,stats.read_failures,
-        stats.layout_captures,stats.layout_failures,stats.retrying,stats.frame_poses,stats.frame_pose_reuses,stats.frame_pose_failures);
+        stats.layout_captures,stats.layout_failures,stats.retrying,stats.frame_poses,stats.frame_pose_reuses,stats.frame_pose_failures,
+        stats.constant_changes);
     }
     if(REXCVAR_GET(edf_native_render_registry_audit)) {
       const auto audit=registry.AuditScene(reader,scene);

@@ -949,6 +949,188 @@ void AttachmentBuild(std::shared_ptr<NativeRenderBackend> backend) {
   entry->attachments[0].pose=moved;
   check("a moved face remakes only its own object",1,1);
 }
+NativeRenderObjectConstant ObjectConstant(const char* name,std::array<float,4> value) {
+  NativeRenderObjectConstant constant; constant.name=name;
+  for(size_t i=0;i<4;++i) {
+    const auto word=std::bit_cast<uint32_t>(value[i]);
+    for(size_t b=0;b<4;++b) constant.registers[i*4+b]=uint8_t(word>>(24-b*8));
+  }
+  return constant;
+}
+NativeRenderConstants ObjectConstants(std::vector<NativeRenderObjectConstant> constants) {
+  return std::make_shared<const std::vector<NativeRenderObjectConstant>>(std::move(constants));
+}
+// 821A16D8 stores one float4 over the pool value: every global of the name
+// (either stage) takes the object's 16 bytes over its first register and
+// keeps the rest; locals and other names are untouched.
+void ObjectConstantOverrides() {
+  using Constant=NativeSceneMaterialInputs::Constant;
+  const std::vector<Constant> pass{
+    {false,"g_Highlight",std::vector<uint8_t>(16,0x11),true},
+    {true,"g_Highlight",std::vector<uint8_t>(32,0x22),true},
+    {true,"g_Time",std::vector<uint8_t>(16,0x33),false},     // A local of the name: not the pool's.
+    {false,"g_Other",std::vector<uint8_t>(16,0x44),true},
+    {false,"g_Time",{},true}};                               // No register: nothing to bind.
+  const std::vector<NativeRenderObjectConstant> objects{ObjectConstant("g_Highlight",{1,2,3,4}),ObjectConstant("g_Time",{5,6,7,8})};
+  const auto replaced=NativeFullFrameModelObjectConstants(pass,objects);
+  Require(replaced.size()==2 && !replaced[0].pixel && replaced[1].pixel && replaced[0].name=="g_Highlight" &&
+    replaced[1].name=="g_Highlight" && replaced[1].global,"both stages' globals of the name, in pass order");
+  Require(std::equal(objects[0].registers.begin(),objects[0].registers.end(),replaced[0].registers.begin()) &&
+    replaced[1].registers.size()==32 && std::equal(objects[0].registers.begin(),objects[0].registers.end(),replaced[1].registers.begin()) &&
+    std::all_of(replaced[1].registers.begin()+16,replaced[1].registers.end(),[](uint8_t b) { return b==0x22; }),
+    "the first register is the object's, the rest the published bytes");
+  Require(NativeFullFrameModelObjectConstants(pass,{}).empty(),"no object constants replace nothing");
+  // An item's set: its attachment's, else the entry's (model and instanced).
+  auto entry=Entry(1,{0,0,100});
+  entry->constants=ObjectConstants({objects[0]});
+  const auto face=Layout(0x4000,false,1,{Mesh(0,false,true,{Batch(0x4100,{0x4200})})});
+  entry->attachments.push_back({{0x1588,face},0x1636,Pose(1)});
+  entry->attachments[0].constants=ObjectConstants(objects);
+  NativeRenderRegistrySnapshot snapshot; snapshot.entries.push_back(entry);
+  const auto plan=PlanNativeFullFrameModels(snapshot,MakeCamera());
+  Require(plan.opaque.size()==2 && NativeFullFrameModelItemConstants(plan.opaque[0])==entry->constants &&
+    NativeFullFrameModelItemConstants(plan.opaque[1])==entry->attachments[0].constants,"an item's constants");
+}
+// Build with per-object constants against full captures: a rigid draw
+// captures the row's constants with its object's bound against the row's
+// pipeline half (a draw without any shares the row's material); a skinned
+// draw rebinds them with its palette. Unchanged values carry the objects, a
+// new pointer to equal values too; a moved value remakes that item's only.
+void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
+  using Constant=NativeSceneMaterialInputs::Constant;
+  auto program=std::make_shared<NativeSceneMaterialProgram>();
+  {
+    Effect effect;
+    effect.source=R"(
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float4 g_Highlight;
+      float4 g_Time;
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0) {
+        V o; o.position=mul(mul(float4(position,1),g_mWorld),g_mViewProjection);
+        o.color=g_Highlight+g_Time; return o;
+      }
+      float4 tint;
+      Texture2D image; SamplerState imageSampler;
+      float4 PS(V v):SV_Target { return v.color*tint*image.Sample(imageSampler,float2(.5,.5)); }
+    )";
+    program->backend=backend;
+    program->vertex=program->reversed_vertex=CompileNativeShader(nullptr,effect,{false,"VS","vs_3_0"},"object-constants.fx");
+    program->pixel=CompileNativeShader(nullptr,effect,{true,"PS","ps_3_0"},"object-constants.fx");
+    NativeBackendTextureDesc texture; texture.width=texture.height=1; texture.format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    const uint8_t white[]{255,255,255,255};
+    program->inputs.textures.push_back({"image"}); program->inputs.textures.push_back({"imageSampler"});
+    program->textures={backend->CreateTexture(texture,white),{}};
+  }
+  std::vector<uint8_t> declaration(12),vertices(48),indices{0,0,0,1,0,2,0,0,0,2,0,3};
+  SkinnedFixture::Word(declaration,4,0x2a23b9);
+  const float points[]{-.125f,-.25f,.5f, -.125f,.25f,.5f, .125f,.25f,.5f, .125f,-.25f,.5f};
+  for(size_t i=0;i<12;++i) SkinnedFixture::Word(vertices,i*4,std::bit_cast<uint32_t>(points[i]));
+  NativeIndexedMesh mesh(*backend,program->vertex,declaration,12,vertices,indices,2);
+  const auto geometry=std::make_shared<const NativeIndexedMesh::RetainedDraw>(mesh.RetainDraw(backend,0,6));
+  auto published=std::make_shared<NativeSceneGroupMaterial>();
+  published->program=program;
+  published->constants={{false,"g_mWorld",SkinnedFixture::Floats({1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}),true},
+    {false,"g_mViewProjection",SkinnedFixture::Floats({1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}),true},
+    {false,"g_Highlight",SkinnedFixture::Floats({.1f,.1f,.1f,0}),true},{false,"g_Time",SkinnedFixture::Floats({9,0,0,1}),true},
+    {true,"tint",SkinnedFixture::Floats({1,1,1,1}),false}};
+  const auto layout=Layout(0x1000,false,1,{Mesh(0,false,true,{Batch(0x2000,{0x3000})})});
+  NativeRenderRegistrySnapshot snapshot;
+  std::vector<std::shared_ptr<NativeRenderEntry>> entries;
+  for(uint32_t i=0;i<3;++i) { entries.push_back(Entry(i+1,{float(i),0,100},1,layout)); snapshot.entries.push_back(entries.back()); }
+  entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{1,0,0,1})});
+  entries[2]->constants=ObjectConstants({ObjectConstant("g_Highlight",{0,1,0,1}),ObjectConstant("g_Time",{2,0,0,1}),
+    ObjectConstant("g_NotInTheShader",{3,3,3,3})});
+  const auto camera=MakeCamera();
+  SkinnedFixture skinned(backend);
+  const auto pass=skinned.Pass();
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t) { return std::shared_ptr<const NativeSceneGroupMaterial>(published); };
+  sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { return geometry; };
+  sources.generation=[] { return uint64_t(1); };
+  NativeFullFrameModels models;
+  const auto check=[&](const char* name,uint64_t derived,uint64_t reused,uint64_t object_constants) {
+    const auto frame=models.Build(snapshot,camera,pass,sources);
+    Require(frame.stats.drawn==3 && frame.stats.draws==3 && frame.stats.failed==0 && frame.stats.derived==derived &&
+      frame.stats.reused==reused && frame.stats.object_constants==object_constants,name);
+    auto constants=published->constants;
+    for(auto& constant:constants) camera.pass.Apply(constant);
+    std::vector<const NativeSceneInstance*> drawn;
+    for(const auto& batch:frame.batches) for(const auto& object:batch.snapshot.instances) drawn.push_back(object.get());
+    const auto refs=OrderNativeFullFrameModelDraws(frame.plan.opaque,true);
+    Require(drawn.size()==refs.size() && drawn.size()==3,name);
+    for(size_t d=0;d<refs.size();++d) {
+      const auto& item=frame.plan.opaque[refs[d].item];
+      auto bound=constants;
+      if(const auto& objects=item.entry->constants)
+        for(const auto& replaced:NativeFullFrameModelObjectConstants(constants,*objects))
+          for(auto& constant:bound) if(constant.name==replaced.name && constant.pixel==replaced.pixel) constant=replaced;
+      const auto& material=*drawn[d]->object.material;
+      NativeBackendSampler* sampler=material.samplers().at(0).second;
+      const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
+      auto full=program->Capture(*material.pipeline(),false,bound,samplers,material.blend_factor(),false);
+      const auto values=NativeFullFrameModelConstantsFor(*layout,*item.entry->pose,pass.palette_limit);
+      ApplyNativeScenePublishedWorld(full,values.worlds[refs[d].draw.mesh]);
+      Require(material.Equivalent(*full.material) && !std::memcmp(drawn[d]->object.world.data(),full.world.data(),sizeof(full.world)),
+        "a rigid draw's material is the full capture of its object's constants");
+    }
+    // Entry 1 never has constants: its material is the row's, which every
+    // draw without constants shares; a draw with them has its own image.
+    const auto* plain=drawn[1]->object.material.get();
+    for(size_t d=0;d<refs.size();++d) {
+      const auto* material=drawn[d]->object.material.get();
+      if(frame.plan.opaque[refs[d].item].entry->constants) Require(material!=plain && !material->Equivalent(*plain),
+        "per-object constants reach the image");
+      else Require(material==plain,"a draw without object constants shares the row's material");
+    }
+    if(entries[0]->constants && entries[2]->constants)
+      Require(!drawn[2]->object.material->Equivalent(*drawn[0]->object.material),"each object its own values");
+  };
+  check("rigid draws with and without object constants",3,0,2);
+  check("an unchanged frame carries them",0,3,0);
+  entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{1,0,0,1})});
+  check("a new set of equal values carries its object",0,3,0);
+  entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{.5f,0,0,1})});
+  check("a moved value remakes only its item's object",1,2,1);
+  entries[2]->constants.reset();
+  check("constants gone: the row's material",1,2,0);
+  // Skinned: the palette and the object constant rebind together.
+  const auto skinned_layout=Layout(0x5000,true,3,{Mesh(0,true,false,{Batch(0x6000,{0x7000})})});
+  auto character=Entry(9,{0,0,100},1,skinned_layout);
+  character->constants=ObjectConstants({ObjectConstant("g_vLights",{4,5,6,7})});
+  auto plain=Entry(10,{1,0,100},1,skinned_layout);
+  NativeRenderRegistrySnapshot characters;
+  characters.entries.push_back(character); characters.entries.push_back(plain);
+  auto skinned_published=std::make_shared<NativeSceneGroupMaterial>();
+  skinned_published->program=skinned.program; skinned_published->constants=skinned.constants;
+  NativeFullFrameModelSources skinned_sources;
+  skinned_sources.program=[&](uint32_t) { return std::shared_ptr<const NativeSceneGroupMaterial>(skinned_published); };
+  skinned_sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { return skinned.geometry; };
+  skinned_sources.generation=[] { return uint64_t(1); };
+  NativeFullFrameModels skinned_models;
+  const auto frame=skinned_models.Build(characters,camera,pass,skinned_sources);
+  Require(frame.stats.drawn==2 && frame.stats.palettes==2 && frame.stats.object_constants==1,"skinned draws with a constant");
+  auto constants=skinned.constants;
+  for(auto& constant:constants) camera.pass.Apply(constant);
+  std::vector<const NativeSceneInstance*> drawn;
+  for(const auto& batch:frame.batches) for(const auto& object:batch.snapshot.instances) drawn.push_back(object.get());
+  const auto refs=OrderNativeFullFrameModelDraws(frame.plan.opaque,true);
+  Require(drawn.size()==2 && refs.size()==2,"two skinned draws");
+  for(size_t d=0;d<2;++d) {
+    const auto& item=frame.plan.opaque[refs[d].item];
+    auto bound=constants;
+    if(item.entry->constants)
+      for(const auto& replaced:NativeFullFrameModelObjectConstants(constants,*item.entry->constants))
+        for(auto& constant:bound) if(constant.name==replaced.name && constant.pixel==replaced.pixel) constant=replaced;
+    const auto values=NativeFullFrameModelConstantsFor(*skinned_layout,*item.entry->pose,pass.palette_limit);
+    const auto& material=*drawn[d]->object.material;
+    NativeBackendSampler* sampler=material.samplers().at(0).second;
+    const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
+    const auto full=skinned.Full(*material.pipeline(),bound,values.palette,samplers,material.blend_factor());
+    Require(material.Equivalent(*full.material),"a skinned draw binds its palette and its object's constants");
+  }
+}
 std::string SameModelFrame(const NativeFullFrameModelFrame& a,const NativeFullFrameModelFrame& b);
 // The draw states' carry rules, draw by draw: an unchanged frame and a moved
 // camera carry every object (only the batch views move); a new pose pointer
@@ -1454,13 +1636,13 @@ int main(int argc,char** argv) {
     }
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
     SourceTable(); SourceMemo(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
-    AttachmentsFollowTheModel(); PoseSource();
+    AttachmentsFollowTheModel(); PoseSource(); ObjectConstantOverrides();
     // The skinned material path against full captures, on both backends (WARP).
     for(int backend=0;backend<2;++backend) {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ModelFrames(device);
+      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ObjectConstantBuild(device); ModelFrames(device);
     }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
