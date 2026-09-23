@@ -7,6 +7,7 @@
 #include <vector>
 #include <memory>
 #include "native_buffer_writes.h"
+#include "native_interval_index.h"
 
 namespace edf::native {
 class NativeIndexBuffer;
@@ -38,8 +39,11 @@ class NativeModelBuffers {
     if(physical && (*physical>=0x20000000u || bytes>0x20000000u-*physical))
       throw std::runtime_error("invalid native model physical extent");
     if(index_storage && kind!=Kind::Index) throw std::runtime_error("index storage on vertex owner");
-    buffers_.insert_or_assign(owner,Buffer{kind,address,static_cast<uint32_t>(bytes),stride,++generation_,0,physical,std::move(index_storage)});
-    index_dirty_=true;
+    const auto previous=buffers_.find(owner);
+    if(previous!=buffers_.end() && previous->second.physical && previous->second.bytes) index_.Remove();
+    const auto generation=++generation_;
+    buffers_.insert_or_assign(owner,Buffer{kind,address,static_cast<uint32_t>(bytes),stride,generation,0,physical,std::move(index_storage)});
+    if(physical && bytes) index_.Add(*physical,*physical+bytes,owner,generation);
     if(writes_) writes_->Subscribe(owner,physical,static_cast<uint32_t>(bytes));
   }
   const Buffer* Find(uint32_t owner,Kind kind) const {
@@ -82,14 +86,12 @@ class NativeModelBuffers {
   // Diagnostic query against currently published owners, without invalidation.
   template<class Visitor> void VisitPhysicalOverlaps(uint32_t address,uint32_t bytes,Visitor visitor) {
     if(!bytes || address>=0x20000000u || bytes>0x20000000u-address) return;
-    RebuildIndex();
-    auto at=std::lower_bound(intervals_.begin(),intervals_.end(),uint64_t(address)+bytes,
-      [](const Interval& interval,uint64_t end) { return interval.begin<end; });
-    while(at!=intervals_.begin()) {
-      --at;
-      if(at->prefix_end<=address) break;
-      if(at->end>address) visitor(at->owner,buffers_.at(at->owner));
-    }
+    if(RebuildIndex())
+      index_.Query(address,bytes,[&](uint32_t owner,uint64_t tag) { return Live(owner,tag); },
+        [&](uint32_t owner,uint64_t) { visitor(owner,buffers_.at(owner)); });
+    else for(const auto& [owner,buffer]:buffers_)
+      if(buffer.physical && buffer.bytes && uint64_t(address)+bytes>*buffer.physical &&
+         uint64_t(*buffer.physical)+buffer.bytes>address) visitor(owner,buffer);
   }
   // Called after live source validation, under the same registry lock as
   // invalidation. A lifetime generation is not a content-version certificate.
@@ -111,10 +113,11 @@ class NativeModelBuffers {
     return writes_->CommitObserved(owner,expected,[&] { found->second.vertex_storage=std::move(storage); });
   }
   void Retire(uint32_t owner) {
-    if(buffers_.erase(owner)) {
-      index_dirty_=true;
-      if(writes_) writes_->Unsubscribe(owner);
-    }
+    const auto found=buffers_.find(owner);
+    if(found==buffers_.end()) return;
+    if(found->second.physical && found->second.bytes) index_.Remove();
+    buffers_.erase(found);
+    if(writes_) writes_->Unsubscribe(owner);
   }
   struct GeometryOwner { uint32_t owner; uint64_t generation; NativeBufferWrites::ObservedVersion version; };
   // Registry lock held. Publish both GPU conversions and the canonical full VB
@@ -183,19 +186,18 @@ class NativeModelBuffers {
       return;
     }
     if(!batch.count) return;
-    RebuildIndex();
+    const bool indexed=RebuildIndex();
     std::vector<uint32_t> affected;
     for(size_t i=0;i<batch.count;++i) {
       const auto& range=batch.ranges[i];
       if(!range.bytes) continue;
-      auto at=std::lower_bound(intervals_.begin(),intervals_.end(),uint64_t(range.address)+range.bytes,
-        [](const Interval& interval,uint64_t end) { return interval.begin<end; });
-      while(at!=intervals_.begin()) {
-        --at;
-        // Prefix maximum makes this valid even with nested/aliased resources.
-        if(at->prefix_end<=range.address) break;
-        if(at->end>range.address) affected.push_back(at->owner);
-      }
+      // Prefix maximum makes this valid even with nested/aliased resources.
+      if(indexed)
+        index_.Query(range.address,range.bytes,[&](uint32_t owner,uint64_t tag) { return Live(owner,tag); },
+          [&](uint32_t owner,uint64_t) { affected.push_back(owner); });
+      else for(const auto& [owner,buffer]:buffers_)
+        if(buffer.physical && buffer.bytes && uint64_t(range.address)+range.bytes>*buffer.physical &&
+           uint64_t(*buffer.physical)+buffer.bytes>range.address) affected.push_back(owner);
     }
     std::sort(affected.begin(),affected.end());
     affected.erase(std::unique(affected.begin(),affected.end()),affected.end());
@@ -243,19 +245,21 @@ class NativeModelBuffers {
   }
  private:
   NativeBufferWrites* writes_;
-  struct Interval { uint64_t begin,end,prefix_end; uint32_t owner; };
-  void RebuildIndex() {
-    if(!index_dirty_) return;
-    intervals_.clear();
-    for(const auto& [owner,buffer]:buffers_) if(buffer.physical && buffer.bytes)
-      intervals_.push_back({*buffer.physical,uint64_t(*buffer.physical)+buffer.bytes,0,owner});
-    std::sort(intervals_.begin(),intervals_.end(),[](const Interval& a,const Interval& b) { return a.begin<b.begin; });
-    uint64_t end=0;
-    for(auto& interval:intervals_) { end=(std::max)(end,interval.end); interval.prefix_end=end; }
-    index_dirty_=false;
+  // Incremental overlap index (native_interval_index.h): publication and
+  // retirement no longer force a full sort before the next query. False only
+  // on allocation failure, where callers fall back to an exact linear scan.
+  bool RebuildIndex() {
+    return index_.Refresh([&](auto add) {
+      for(const auto& [owner,buffer]:buffers_) if(buffer.physical && buffer.bytes)
+        add(*buffer.physical,uint64_t(*buffer.physical)+buffer.bytes,owner,buffer.generation);
+    });
   }
-  std::vector<Interval> intervals_;
-  bool index_dirty_=true;
+  bool Live(uint32_t owner,uint64_t generation) const {
+    const auto found=buffers_.find(owner);
+    return found!=buffers_.end() && found->second.generation==generation &&
+      found->second.physical && found->second.bytes;
+  }
+  NativeIntervalIndex index_;
   std::map<uint32_t,Buffer> buffers_;
   uint64_t generation_=0;
 };

@@ -79,6 +79,7 @@
 #include "native_generated_indices.h"
 #include "native_physical_write_notify.h"
 #include "native_contract_ledger.h"
+#include "native_load_trace.h"
 #include "utility_layout.h"
 #include "triangle_strip.h"
 #include "guest_fence.h"
@@ -379,6 +380,12 @@ REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
                    "Sample end-frame publication eligibility and cumulative UI draws; does not capture pixels (development)");
 REXCVAR_DEFINE_BOOL(edf_native_load_timings, false, "EDF2027",
                    "Log each texture/shader load phase CPU duration, including nested work (development)");
+REXCVAR_DEFINE_BOOL(edf_native_load_trace, false, "EDF2027",
+                   "Loading-screen trace: log the load's phase transitions (mission begin, BeginLoading/EndLoading requests, "
+                   "the engine's resource transition, LoadMap, the loading presenter's start and exit) and, per phase and "
+                   "every 250 ms while loading, the time per category (file reads and bytes, texture snapshot/guest/create, "
+                   "shaders, model construction/publication/retirement, preloads, guest and bridge-mutex waits) split "
+                   "engine thread / other threads, plus the engine thread's CPU time; aggregated, no per-call lines (development)");
 REXCVAR_DEFINE_BOOL(edf_native_mesh_watch_audit,false,"EDF2027",
                    "Audit physical mesh write versions against exact bytes; never skips validation (development)");
 REXCVAR_DEFINE_BOOL(edf_native_untiled_scene, true, "EDF2027",
@@ -395,6 +402,149 @@ REXCVAR_DEFINE_BOOL(edf_native_preview_window, false, "EDF2027",
                    "Show native frames in a separate development window; requires frame publication");
 REXCVAR_DECLARE(bool, edf_native_host);
 REX_EXTERN(__imp__KeSetEvent);
+
+// edf_native_load_trace (native_load_trace.h): phase events and 250 ms ticks.
+// Everything here runs only with the cvar on; off, each hook pays one cvar read.
+namespace {
+bool LoadTraceOn() { return REXCVAR_GET(edf_native_load_trace); }
+struct NativeLoadTraceState {
+  using Clock=std::chrono::steady_clock;
+  std::mutex mutex;
+  std::atomic<bool> loading{false};   // BeginLoading request .. presenter exit
+  std::atomic<int64_t> next_tick{0};  // steady_clock ticks
+  std::atomic<HANDLE> engine{nullptr};
+  Clock::time_point origin{},last_event{},last_tick{},window_start{};
+  edf::native::LoadTraceSample at_event{},at_tick{},at_window{};
+  uint64_t engine_cpu_event=0,engine_cpu_tick=0,engine_cpu_window=0;
+  std::atomic<uint64_t> presenter_frames{0};
+  uint64_t presenter_frames_event=0,presenter_frames_tick=0,presenter_frames_window=0;
+  bool started=false;
+  // Mission script natives (dispatcher 820D1518, by native number): which
+  // script calls the loading window's time went to. Reported at window close.
+  static constexpr size_t kNatives=2048;
+  std::array<std::atomic<uint64_t>,kNatives> native_calls{},native_nanos{};
+  std::array<uint64_t,kNatives> native_calls_window{},native_nanos_window{};
+};
+NativeLoadTraceState& LoadTraceState() { static auto* state=new NativeLoadTraceState; return *state; }
+// The engine thread's kernel+user time in 100 ns units (GetThreadTimes'
+// granularity is the scheduler tick; fine against 250 ms windows).
+uint64_t LoadTraceEngineCpu(NativeLoadTraceState& state) {
+  const HANDLE engine=state.engine.load(std::memory_order_acquire);
+  FILETIME created{},exited{},kernel{},user{};
+  if(!engine || !GetThreadTimes(engine,&created,&exited,&kernel,&user)) return 0;
+  auto value=[](const FILETIME& time) { return (uint64_t(time.dwHighDateTime)<<32)|time.dwLowDateTime; };
+  return value(kernel)+value(user);
+}
+// The frame transition hook calls this on the engine thread: it tags the
+// thread for LoadTraceScope and keeps a handle for its CPU time.
+void LoadTraceMarkEngineThread() {
+  if(edf::native::native_load_trace_engine_thread) return;
+  edf::native::native_load_trace_engine_thread=true;
+  HANDLE handle=nullptr;
+  if(DuplicateHandle(GetCurrentProcess(),GetCurrentThread(),GetCurrentProcess(),&handle,
+                     THREAD_QUERY_LIMITED_INFORMATION,FALSE,0)) {
+    if(auto* previous=LoadTraceState().engine.exchange(handle)) CloseHandle(previous);
+  }
+}
+// Categories that mean loading work (not per-frame gameplay costs): a tick
+// outside a loading window is logged only if one of these moved, so the
+// intro's background streaming and the scene teardown show up as ticks while
+// steady gameplay stays quiet.
+bool LoadTraceLoadingActivity(const edf::native::LoadTraceSample& now,const edf::native::LoadTraceSample& before) {
+  using edf::native::LoadTraceKind;
+  for(const auto kind:{LoadTraceKind::FileRead,LoadTraceKind::TextureCreate,LoadTraceKind::TextureGuest,
+                       LoadTraceKind::ShaderRegistration,LoadTraceKind::ModelConstruct,LoadTraceKind::ModelRetire,
+                       LoadTraceKind::ResourceDestroy,LoadTraceKind::MapLoad})
+    if(now.calls[size_t(kind)]!=before.calls[size_t(kind)]) return true;
+  return false;
+}
+// Phase transition: logs what happened since the previous event. `open`
+// starts the loading window (ticks every 250 ms), `close` ends it and logs the
+// window's totals. `detail` is event-specific (manager, mode, caller).
+void LoadTraceEvent(const char* event,uint32_t detail,bool open=false,bool close=false) {
+  if(!LoadTraceOn()) return;
+  auto& state=LoadTraceState();
+  std::lock_guard lock(state.mutex);
+  const auto now=NativeLoadTraceState::Clock::now();
+  const auto sample=edf::native::NativeLoadTrace::Get().Sample();
+  const auto cpu=LoadTraceEngineCpu(state);
+  const auto frames=state.presenter_frames.load(std::memory_order_relaxed);
+  if(!state.started) {
+    state.started=true; state.origin=state.last_event=state.last_tick=now;
+    state.engine_cpu_event=state.engine_cpu_tick=cpu;
+  }
+  auto ms=[](auto duration) { return std::chrono::duration<double,std::milli>(duration).count(); };
+  REXLOG_INFO("Native load trace: event={} detail={:#x} thread={} t_ms={:.1f} dt_ms={:.1f} engine_cpu_ms={:.1f} "
+    "presenter_frames={} loading={} | {}",event,detail,GetCurrentThreadId(),ms(now-state.origin),ms(now-state.last_event),
+    double(cpu-state.engine_cpu_event)/1e4,frames-state.presenter_frames_event,state.loading.load(),
+    edf::native::NativeLoadTrace::Format(sample,state.at_event));
+  state.last_event=now; state.at_event=sample; state.engine_cpu_event=cpu; state.presenter_frames_event=frames;
+  if(close && state.loading.load()) {
+    REXLOG_INFO("Native load trace: window closed by {} wall_ms={:.1f} engine_cpu_ms={:.1f} presenter_frames={} | {}",
+      event,ms(now-state.window_start),double(cpu-state.engine_cpu_window)/1e4,frames-state.presenter_frames_window,
+      edf::native::NativeLoadTrace::Format(sample,state.at_window));
+    // The ten costliest mission script natives of the window (inclusive).
+    std::vector<std::pair<uint64_t,size_t>> natives;
+    for(size_t index=0;index<NativeLoadTraceState::kNatives;++index)
+      if(const auto nanos=state.native_nanos[index].load(std::memory_order_relaxed)-state.native_nanos_window[index])
+        natives.emplace_back(nanos,index);
+    std::sort(natives.begin(),natives.end(),[](const auto& a,const auto& b) { return a.first>b.first; });
+    std::string text;
+    char item[96];
+    for(size_t rank=0;rank<natives.size() && rank<10;++rank) {
+      const auto index=natives[rank].second;
+      std::snprintf(item,sizeof(item),"native%zu=%llu/%.1fms ",index,
+        (unsigned long long)(state.native_calls[index].load(std::memory_order_relaxed)-state.native_calls_window[index]),
+        double(natives[rank].first)/1e6);
+      text+=item;
+    }
+    if(!text.empty()) REXLOG_INFO("Native load trace: window script natives (mission dispatcher, inclusive) {}",text);
+    state.loading.store(false);
+  }
+  if(open && !state.loading.load()) {
+    state.window_start=now; state.at_window=sample; state.engine_cpu_window=cpu; state.presenter_frames_window=frames;
+    for(size_t index=0;index<NativeLoadTraceState::kNatives;++index) {
+      state.native_calls_window[index]=state.native_calls[index].load(std::memory_order_relaxed);
+      state.native_nanos_window[index]=state.native_nanos[index].load(std::memory_order_relaxed);
+    }
+    state.loading.store(true);
+  }
+  // Restart the tick clock at every event so a tick never repeats an event's span.
+  state.last_tick=now; state.at_tick=sample; state.engine_cpu_tick=cpu; state.presenter_frames_tick=frames;
+  state.next_tick.store((now+std::chrono::milliseconds(250)).time_since_epoch().count(),std::memory_order_relaxed);
+}
+// Called from frequent hooks (engine transition, presenter frame, model
+// retirement): one relaxed load and a clock read unless a tick is due.
+void LoadTraceTick() {
+  if(!LoadTraceOn()) return;
+  auto& state=LoadTraceState();
+  const auto now=NativeLoadTraceState::Clock::now();
+  if(now.time_since_epoch().count()<state.next_tick.load(std::memory_order_relaxed)) return;
+  std::unique_lock lock(state.mutex,std::try_to_lock);
+  if(!lock) return;
+  if(!state.started) {
+    state.started=true; state.origin=state.last_event=state.last_tick=now;
+    state.at_event=state.at_tick=edf::native::NativeLoadTrace::Get().Sample();
+    state.engine_cpu_event=state.engine_cpu_tick=LoadTraceEngineCpu(state);
+  }
+  if(now<state.last_tick+std::chrono::milliseconds(250)) return;
+  const auto sample=edf::native::NativeLoadTrace::Get().Sample();
+  const auto cpu=LoadTraceEngineCpu(state);
+  const auto frames=state.presenter_frames.load(std::memory_order_relaxed);
+  const bool loading=state.loading.load();
+  if(loading || LoadTraceLoadingActivity(sample,state.at_tick)) {
+    auto ms=[](auto duration) { return std::chrono::duration<double,std::milli>(duration).count(); };
+    REXLOG_INFO("Native load trace: tick t_ms={:.1f} span_ms={:.1f} engine_cpu_ms={:.1f} presenter_frames={} loading={} | {}",
+      ms(now-state.origin),ms(now-state.last_tick),double(cpu-state.engine_cpu_tick)/1e4,frames-state.presenter_frames_tick,
+      loading,edf::native::NativeLoadTrace::Format(sample,state.at_tick));
+  }
+  state.last_tick=now; state.at_tick=sample; state.engine_cpu_tick=cpu; state.presenter_frames_tick=frames;
+  state.next_tick.store((now+std::chrono::milliseconds(250)).time_since_epoch().count(),std::memory_order_relaxed);
+}
+// The loading presenter (clSatoCallback::slot6, 8216EBC0) runs on its own
+// thread; its scene setups are counted as presenter frames.
+thread_local bool native_load_trace_presenter_thread=false;
+}
 
 namespace edf::native {
 NativeSceneTreePublications& TreePublications() {
@@ -855,6 +1005,7 @@ class NativeTimedMutex {
   void lock() {
     if(mutex_.try_lock()) return;
     HookTiming timing(Phase);
+    LoadTraceScope trace(::LoadTraceOn(),LoadTraceKind::BridgeMutexWait);
     mutex_.lock();
   }
   bool try_lock() { return mutex_.try_lock(); }
@@ -1949,6 +2100,7 @@ void ImportTexture(PPCContext& ctx, uint8_t* base, Original original) {
   std::vector<uint8_t> image;
   try {
     HookTiming snapshot_timing(HookPhase::TextureSnapshot);
+    LoadTraceScope snapshot_trace(::LoadTraceOn(),LoadTraceKind::TextureSnapshot,ctx.r5.u32);
     // Shared D3DX image loader sub_82201458, reached by both engine loaders
     // and direct callers. The output parameter is at entry SP+148; the
     // function's 1520-byte frame accesses it at SP+1668.
@@ -1967,16 +2119,19 @@ void ImportTexture(PPCContext& ctx, uint8_t* base, Original original) {
       ~LoaderScope() { --texture_loader_depth; }
     } scope;
     HookTiming original_timing(HookPhase::TextureOriginal);
+    LoadTraceScope original_trace(::LoadTraceOn(),LoadTraceKind::TextureGuest);
     original(ctx, base);
   }
   if (image.empty() || ctx.r3.s32 < 0) return;
   auto& state = State();
   HookTiming lock_timing(HookPhase::TextureLock);
+  LoadTraceScope lock_trace(::LoadTraceOn(),LoadTraceKind::TextureLockWait);
   // CreateNativeDdsTexture uses device resource creation with initial data,
   // not immediate-context uploads. Registry publication is serialized below;
   // it must not wait for the rendering submission barrier's refresh sleeps.
   std::lock_guard lock(state.mutex);
   lock_timing.Finish();
+  lock_trace.Finish();
   try {
     const auto handle = reader.Word(output);
     if (!handle) throw std::runtime_error("guest texture creation returned null");
@@ -1985,8 +2140,10 @@ void ImportTexture(PPCContext& ctx, uint8_t* base, Original original) {
     state.textures.erase(handle);
     if (!state.initialized) throw std::runtime_error("native texture bridge not initialized");
     HookTiming create_timing(HookPhase::TextureCreate);
+    LoadTraceScope create_trace(::LoadTraceOn(),LoadTraceKind::TextureCreate,image.size());
     auto native = CreateNativeDdsTexture(EnsureSceneBackendLocked(state), image);
     create_timing.Finish();
+    create_trace.Finish();
     ++state.texture_loads;
     REXLOG_INFO("Native texture bridge: handle={:#x}, {}x{}, mips={}, cube={}, loads={}",
                 handle, native.width, native.height, native.mip_count, native.cube, state.texture_loads);
@@ -2043,6 +2200,7 @@ NativeDecodeWorkers& ShaderWorkers() {
 
 void RegisterShaders(const GuestReader& reader, uint32_t owner, const Effect& effect) {
   HookTiming registration_timing(HookPhase::ShaderRegistration);
+  LoadTraceScope registration_trace(::LoadTraceOn(),LoadTraceKind::ShaderRegistration);
   auto& state = State();
   HookTiming lock_timing(HookPhase::ShaderLock);
   // Compilation, device-only creation and registry replacement issue no
@@ -3931,7 +4089,23 @@ REX_HOOK_RAW(sub_820CBD28) {
     Scope() { ++map_load_depth; }
     ~Scope() { --map_load_depth; }
   } scope;
-  __imp__sub_820CBD28(ctx,base);
+  const uint32_t caller=uint32_t(ctx.lr);
+  LoadTraceEvent("map_load_begin",caller);
+  {
+    edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::MapLoad);
+    __imp__sub_820CBD28(ctx,base);
+  }
+  LoadTraceEvent("map_load_end",caller);
+}
+// clMissionSequence::Begin (loads the mission's .bvm, .xPath and .Cam, then
+// runs "main"): marks where the previous scene's teardown ends and the
+// mission's own load starts. Observation only.
+REX_EXTERN(__imp__sub_820CD448);
+REX_HOOK_RAW(sub_820CD448) {
+  const uint32_t caller=uint32_t(ctx.lr);
+  LoadTraceEvent("mission_begin",caller);
+  __imp__sub_820CD448(ctx,base);
+  LoadTraceEvent("mission_begin_end",caller);
 }
 // Inclusive nested timings, restricted to this thread's LoadMap call chain.
 // Address labels avoid assigning unverified semantic names to guest helpers.
@@ -3987,13 +4161,21 @@ REX_HOOK_RAW(sub_820C7220) {
 REX_EXTERN(__imp__sub_820D1518);
 REX_HOOK_RAW(sub_820D1518) {
   ScriptLoadTiming timing("mission",ctx.r6.u32,ctx.r7.u32);
+  if(!LoadTraceOn()) { __imp__sub_820D1518(ctx,base); return; }
+  const auto native=(std::min)(size_t(ctx.r7.u32),NativeLoadTraceState::kNatives-1);
+  const auto start=std::chrono::steady_clock::now();
   __imp__sub_820D1518(ctx,base);
+  auto& state=LoadTraceState();
+  state.native_calls[native].fetch_add(1,std::memory_order_relaxed);
+  state.native_nanos[native].fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now()-start).count()),std::memory_order_relaxed);
 }
 REX_EXTERN(__imp__sub_821A4170);
 REX_HOOK_RAW(sub_821A4170) {
   const bool trace=REXCVAR_GET(edf_native_load_timings);
   const uint32_t manager=ctx.r3.u32,mode=ctx.r4.u32;
   if(trace) REXLOG_INFO("Native load request: begin manager={:#x} mode={} caller={:#x}",manager,mode,ctx.lr);
+  LoadTraceEvent(mode?"begin_loading_mission":"begin_loading_menu",uint32_t(ctx.lr),true);
   __imp__sub_821A4170(ctx,base);
   if(trace) REXLOG_INFO("Native load request: armed manager={:#x}",manager);
 }
@@ -4002,6 +4184,7 @@ REX_HOOK_RAW(sub_821A41E8) {
   const bool trace=REXCVAR_GET(edf_native_load_timings);
   const uint32_t manager=ctx.r3.u32;
   if(trace) REXLOG_INFO("Native load request: finish manager={:#x} caller={:#x}",manager,ctx.lr);
+  LoadTraceEvent("end_loading",uint32_t(ctx.lr));
   __imp__sub_821A41E8(ctx,base);
   if(trace) REXLOG_INFO("Native load request: disarmed manager={:#x}",manager);
 }
@@ -4146,6 +4329,7 @@ EDF_RENDER_PHASE(821BE9D8, RenderSceneEnd)
       ~Function() { edf::native::native_guest_wait_function=previous; } \
     } function; \
     edf::native::HookTiming timing(edf::native::HookPhase::GuestWait); \
+    edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::GuestWait); \
     __imp__sub_##address(ctx,base); \
   }
 EDF_GUEST_WAIT(8214E328)
@@ -9584,8 +9768,10 @@ edf::native::NativeDecodeWorkers& RegistryWorker() {
 }
 REX_EXTERN(__imp__sub_821A4DE8);
 REX_HOOK_RAW(sub_821A4DE8) {
-  const bool trace=REXCVAR_GET(edf_native_load_timings);
+  const bool load_trace=LoadTraceOn();
+  const bool trace=REXCVAR_GET(edf_native_load_timings) || load_trace;
   const uint32_t manager=ctx.r3.u32;
+  if(load_trace) { LoadTraceMarkEngineThread(); LoadTraceTick(); }
   // These are the same valid manager fields immediately read by the original.
   // Snapshot before the call: desired/actual are not changed by instrumentation.
   uint32_t actual=0,desired=0;
@@ -9599,8 +9785,12 @@ REX_HOOK_RAW(sub_821A4DE8) {
     }
   }
   const bool edge=trace && actual!=desired;
-  if(edge) REXLOG_INFO("Native resource transition: begin manager={:#x} actual={} desired={}",
+  if(edge && REXCVAR_GET(edf_native_load_timings)) REXLOG_INFO("Native resource transition: begin manager={:#x} actual={} desired={}",
                       manager,actual,desired);
+  // The engine applies the requested loading state here: desired=1 starts the
+  // loading presenter thread, desired=0 waits for it to leave and releases it.
+  if(edge) LoadTraceEvent(desired?"transition_to_loading":"transition_to_play",manager);
+  edf::native::LoadTraceScope transition_trace(load_trace,edf::native::LoadTraceKind::EngineTransition);
   // Before the transition's timings: the render helper has been joined here,
   // so this is the engine thread's speed with the helper idle.
   edf::native::RunEngineCalibration(edf::native::EngineRegion::Transition);
@@ -9706,8 +9896,10 @@ REX_HOOK_RAW(sub_821A4DE8) {
     }
     if(EDF_NATIVE_FLAG(scene_preload)) {
       { edf::native::HookTiming preload(edf::native::HookPhase::SimPreloadGeometry);
+        edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::PreloadGeometry);
         edf::native::PreloadStaticSceneGeometryLocked(state,backing); }
       { edf::native::HookTiming preload(edf::native::HookPhase::SimPreloadMaterial);
+        edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::PreloadMaterial);
         edf::native::PreloadStaticSceneMaterialsLocked(state,backing); }
     }
     edf::native::HookTiming publish_timing(edf::native::HookPhase::SimPublish);
@@ -9735,7 +9927,10 @@ REX_HOOK_RAW(sub_821A4DE8) {
   if(registry_overlap) registry_join.Wait();
   else TickNativeRenderRegistry(base,manager,native_loop_budget.tick,render_only);
   timing.Finish();
-  if(edge) REXLOG_INFO("Native resource transition: end manager={:#x}",manager);
+  transition_trace.Finish();
+  if(edge && REXCVAR_GET(edf_native_load_timings)) REXLOG_INFO("Native resource transition: end manager={:#x}",manager);
+  // desired=0 returns once the presenter has left: the first play frame follows.
+  if(edge) LoadTraceEvent(desired?"loading_started":"play_resumed",manager,false,!desired);
 }
 
 REX_EXTERN(__imp__sub_82142050);
@@ -11945,6 +12140,7 @@ REX_HOOK_RAW(sub_822009B0) {
 REX_EXTERN(__imp__sub_82134220);
 REX_HOOK_RAW(sub_82134220) {
   if (EDF_NATIVE_FLAG(shader_bridge)) {
+    edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::ResourceDestroy);
     auto& state = edf::native::State();
     // Registry retirement issues no context commands. Submitted D3D work owns
     // its resource references; registry users are serialized by state.mutex.
@@ -12023,11 +12219,15 @@ void CleanupNativeModelBuffer(PPCContext& ctx,uint8_t* base,bool index) {
 }
 }
 REX_HOOK_RAW(sub_821D7468) {
+  edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::ModelRetire);
+  LoadTraceTick();
   RetireNativeModelBuffer(ctx.r3.u32);
   if(EDF_NATIVE_FLAG(shader_bridge)) { CleanupNativeModelBuffer(ctx,base,false); return; }
   __imp__sub_821D7468(ctx,base);
 }
 REX_HOOK_RAW(sub_821D75F8) {
+  edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::ModelRetire);
+  LoadTraceTick();
   RetireNativeModelBuffer(ctx.r3.u32);
   if(EDF_NATIVE_FLAG(shader_bridge)) { CleanupNativeModelBuffer(ctx,base,true); return; }
   __imp__sub_821D75F8(ctx,base);
@@ -12038,6 +12238,7 @@ REX_HOOK_RAW(sub_821D75F8) {
 REX_EXTERN(__imp__sub_821D3DC8);
 REX_HOOK_RAW(sub_821D3DC8) {
   if(EDF_NATIVE_FLAG(shader_bridge)) {
+    edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::PoolRetire);
     auto& state=edf::native::State();
     // Allocation ownership retirement is metadata-only, as above.
     std::lock_guard lock(state.mutex);
@@ -12062,6 +12263,7 @@ REX_HOOK_RAW(sub_821D3748) {
     if(block.bytes && (!extent || extent->all))
       throw std::runtime_error("invalid native pool block physical extent");
     if(extent) {
+      edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::PoolRetire,extent->bytes);
       // Exclude overlapping guarded acquisitions through the original helper,
       // including owners published after the registry retirement below.
       // Scope entry/exit takes only the queue lock, never across guest code.
@@ -12169,6 +12371,7 @@ namespace {
 void PublishNativeModelBuffer(uint8_t* base,uint32_t owner,edf::native::NativeModelBuffers::Kind kind,
                               uint32_t stride,uint32_t count) {
   if(!EDF_NATIVE_FLAG(shader_bridge)) return;
+  edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::ModelPublish,uint64_t(stride)*count);
   auto& state=edf::native::State();
   // Drain/apply write notifications and publish the generation atomically.
   // NativeIndexBuffer creates an immutable device resource with initial data;
@@ -12295,6 +12498,7 @@ void ConstructNativeModelBuffer(PPCContext& ctx,uint8_t* base,bool index) {
 }
 }
 REX_HOOK_RAW(sub_821D7530) {
+  edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::ModelConstruct,uint64_t(ctx.r5.u32)*ctx.r6.u32);
   if(EDF_NATIVE_FLAG(shader_bridge)) { ConstructNativeModelBuffer(ctx,base,false); return; }
   const auto owner=ctx.r3.u32,stride=ctx.r5.u32,count=ctx.r6.u32;
   __imp__sub_821D7530(ctx,base);
@@ -12302,6 +12506,7 @@ REX_HOOK_RAW(sub_821D7530) {
 }
 REX_EXTERN(__imp__sub_821D76A8);
 REX_HOOK_RAW(sub_821D76A8) {
+  edf::native::LoadTraceScope trace(LoadTraceOn(),edf::native::LoadTraceKind::ModelConstruct,uint64_t(ctx.r5.u32)*2);
   if(EDF_NATIVE_FLAG(shader_bridge)) { ConstructNativeModelBuffer(ctx,base,true); return; }
   const auto owner=ctx.r3.u32,count=ctx.r5.u32;
   __imp__sub_821D76A8(ctx,base);
@@ -12457,9 +12662,17 @@ REX_HOOK_RAW(edf_native_NtReadFile) {
   // event/completion-port and memory-invalidation work changes host metadata.
   // APC-capable calls retain global exclusion for their guest queue writes.
   const bool exact=!((ctx.r5.u32&~1u) && ctx.r6.u32);
+  const bool trace=LoadTraceOn();
+  std::optional<edf::native::LoadTraceScope> notify_trace;
+  if(trace) notify_trace.emplace(true,edf::native::LoadTraceKind::FileReadNotify);
   const auto writer=BeginNativeBufferWrite(base,destination,bytes,exact,edf::native::NativeBufferWrites::WriterKind::FileRead);
   const auto status_writer=BeginNativeBufferWrite(base,status,status?8u:0u,exact,edf::native::NativeBufferWrites::WriterKind::FileRead);
-  __imp__NtReadFile(ctx,base);
+  if(notify_trace) notify_trace->Finish();
+  {
+    edf::native::LoadTraceScope read_trace(trace,edf::native::LoadTraceKind::FileRead,bytes);
+    __imp__NtReadFile(ctx,base);
+  }
+  if(trace) notify_trace.emplace(true,edf::native::LoadTraceKind::FileReadNotify);
   NotifyCompletedNativeBufferWrite(base,destination,bytes,true);
   if(status) NotifyCompletedNativeBufferWrite(base,status,8,true);
 }
@@ -12839,8 +13052,26 @@ REX_HOOK_RAW(sub_82139A40) {
   }
   __imp__sub_82139A40(ctx,base);
 }
+// The loading screen's presenter thread body (clSatoCallback::slot6): it
+// loops drawing the loading screen while the resource manager's loading
+// flags (+2261 actual, +2262 requested) are set and returns as soon as both
+// are clear - the guest has no minimum display time here. Observation only.
+REX_EXTERN(__imp__sub_8216EBC0);
+REX_HOOK_RAW(sub_8216EBC0) {
+  native_load_trace_presenter_thread=true;
+  LoadTraceEvent("presenter_start",ctx.r4.u32,true);
+  __imp__sub_8216EBC0(ctx,base);
+  LoadTraceEvent("presenter_exit",0);
+  native_load_trace_presenter_thread=false;
+}
 REX_EXTERN(__imp__sub_8219C7A8);
 REX_HOOK_RAW(sub_8219C7A8) {
+  const bool presenter_trace=native_load_trace_presenter_thread && LoadTraceOn();
+  if(presenter_trace) {
+    LoadTraceState().presenter_frames.fetch_add(1,std::memory_order_relaxed);
+    LoadTraceTick();
+  }
+  edf::native::LoadTraceScope presenter_scope(presenter_trace,edf::native::LoadTraceKind::PresenterFrame);
   edf::native::HookTiming setup_timing(edf::native::HookPhase::SceneSetup);
   const auto owner=ctx.r3.u32;
   {

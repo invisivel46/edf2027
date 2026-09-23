@@ -1205,6 +1205,50 @@ int main() {
     Require(owners.empty(),"provenance query retained old owner interval");
   }
   {
+    // Incremental overlap index: interleaved publish/replace/retire/query (the
+    // teardown and loading pattern) must visit exactly the owners a brute-force
+    // overlap test finds, through pending, stale and rebuilt states, and must
+    // not rebuild per mutation.
+    using namespace edf::native;
+    NativeBufferWrites writes;
+    NativeModelBuffers buffers(&writes);
+    std::map<uint32_t,std::pair<uint32_t,uint32_t>> truth; // owner -> physical, bytes
+    uint64_t state=0x243F6A8885A308D3ull;
+    auto next=[&](uint32_t bound) { state=state*6364136223846793005ull+1442695040888963407ull; return uint32_t((state>>33)%bound); };
+    auto expected=[&](uint32_t address,uint32_t bytes) {
+      std::vector<uint32_t> owners;
+      for(const auto& [owner,extent]:truth)
+        if(uint64_t(address)+bytes>extent.first && uint64_t(extent.first)+extent.second>address) owners.push_back(owner);
+      return owners;
+    };
+    for(unsigned step=0;step<20000;++step) {
+      const auto operation=next(10);
+      const uint32_t owner=1+next(600);
+      if(operation<4) {
+        const uint32_t physical=0x10000+next(0x40000)*4,count=1+next(512);
+        buffers.Publish(owner,NativeModelBuffers::Kind::Vertex,0xa0000000u+physical,4,count,physical);
+        truth[owner]={physical,count*4};
+      } else if(operation<6) {
+        buffers.Retire(owner); truth.erase(owner);
+      } else {
+        const uint32_t address=0x10000+next(0x40000)*4,bytes=1+next(4096);
+        std::vector<uint32_t> owners;
+        buffers.VisitPhysicalOverlaps(address,bytes,[&](uint32_t visited,const auto&) { owners.push_back(visited); });
+        std::sort(owners.begin(),owners.end());
+        Require(std::adjacent_find(owners.begin(),owners.end())==owners.end(),"incremental index visited an owner twice");
+        Require(owners==expected(address,bytes),"incremental model index disagrees with brute force");
+        // Subscriptions mirror publications: a Record over the range must
+        // advance exactly the overlapping owners' revisions.
+        std::map<uint32_t,uint64_t> before;
+        for(const auto visited:owners) before[visited]=writes.Version(visited)->revision;
+        writes.Record(address,bytes);
+        writes.Drain();
+        for(const auto& [visited,revision]:before)
+          Require(writes.Version(visited)->revision==revision+1,"incremental subscription index missed an owner");
+      }
+    }
+  }
+  {
     using Buffers=edf::native::NativeModelBuffers;
     edf::native::NativeBufferWrites sites;
     sites.Subscribe(1,0x1000,16);
