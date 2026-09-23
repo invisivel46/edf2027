@@ -3,7 +3,11 @@
 #include "native_graphics/d3d12_backend.h"
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstring>
+#include <map>
+#include <string>
+#include <string_view>
 #include <cmath>
 #include <algorithm>
 #include <iostream>
@@ -659,6 +663,435 @@ void SkinnedBuild(std::shared_ptr<NativeRenderBackend> backend) {
   published=republished; ++generation;
   check("a moved published constant recaptures the row",0,1,0);
 }
+std::string SameModelFrame(const NativeFullFrameModelFrame& a,const NativeFullFrameModelFrame& b);
+// The draw states' carry rules, draw by draw: an unchanged frame and a moved
+// camera carry every object (only the batch views move); a new pose pointer
+// with the same values carries them; moved values remake only that item's;
+// a new generation asks the providers once per pass record and batch value
+// and carries the objects its sources did not change; a republished program
+// with a moved constant remakes every object of its row.
+void PersistentDraws(std::shared_ptr<NativeRenderBackend> backend) {
+  SkinnedFixture fixture(backend);
+  const auto layout=Layout(0x1000,true,3,{Mesh(0,true,false,{Batch(0x2000,{0x3000})}),Mesh(1,false,true,{Batch(0x2100,{0x3000})})});
+  std::vector<std::shared_ptr<NativeRenderEntry>> entries;
+  for(uint32_t i=0;i<3;++i) entries.push_back(Entry(i+1,{float(i),0,100},1,layout));
+  const auto snapshot=[&] {
+    NativeRenderRegistrySnapshot result;
+    for(const auto& entry:entries) result.entries.push_back(entry);
+    return result;
+  };
+  auto camera=MakeCamera();
+  const auto vp=[&](float scale) { for(size_t i=0;i<16;++i) camera.pass.view_projection[i]=std::bit_cast<uint32_t>(i%5?0.f:scale); };
+  vp(1.5f);
+  const auto pass=fixture.Pass();
+  uint64_t generation=1;
+  int programs=0,geometries=0;
+  auto published=std::make_shared<NativeSceneGroupMaterial>();
+  published->program=fixture.program; published->constants=fixture.constants;
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t) { ++programs; return std::shared_ptr<const NativeSceneGroupMaterial>(published); };
+  sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { ++geometries; return fixture.geometry; };
+  sources.generation=[&] { return generation; };
+  NativeFullFrameModels models;
+  const auto objects=[](const NativeFullFrameModelFrame& frame) {
+    std::vector<const NativeSceneInstance*> result;
+    for(const auto& batch:frame.batches) for(const auto& object:batch.snapshot.instances) result.push_back(object.get());
+    return result;
+  };
+  const auto first=models.Build(snapshot(),camera,pass,sources);
+  const auto drawn=objects(first);
+  Require(drawn.size()==6 && first.stats.derived==6 && first.stats.sourced==3 && programs==1 && geometries==2,
+    "the first frame makes every object, asking once per pass record and batch value");
+  const auto same=models.Build(snapshot(),camera,pass,sources);
+  Require(objects(same)==drawn && same.stats.reused==6 && same.stats.derived==0 && same.stats.sourced==0 &&
+    same.stats.rows==1 && same.stats.camera_rows==1 && programs==1 && geometries==2,"an unchanged frame carries every object");
+  vp(3.f);
+  const auto moved=models.Build(snapshot(),camera,pass,sources);
+  Require(objects(moved)==drawn && moved.stats.derived==0 && moved.stats.camera_rows==1 &&
+    !NativeSceneCameraIdentical(moved.batches[0].view,same.batches[0].view),"a moved camera carries the objects and moves the views");
+  // Entry 0: a new pose object with the same values; entry 1: moved values.
+  entries[0]->pose=std::make_shared<std::vector<NativePoseMatrix>>(*entries[0]->pose);
+  auto pose=std::make_shared<std::vector<NativePoseMatrix>>(*entries[1]->pose); (*pose)[1][0]+=1; entries[1]->pose=pose;
+  const auto posed=models.Build(snapshot(),camera,pass,sources);
+  const auto reposed=objects(posed);
+  size_t kept=0;
+  for(const auto* object:reposed) kept+=std::count(drawn.begin(),drawn.end(),object);
+  Require(posed.stats.derived==2 && posed.stats.reused==4 && kept==4,"only the moved pose's objects are made again");
+  // A new generation with the same answers: asked once per pass record and
+  // batch value, every object carried.
+  ++generation;
+  const auto regenerated=models.Build(snapshot(),camera,pass,sources);
+  Require(objects(regenerated)==reposed && regenerated.stats.sourced==3 && programs==2 && geometries==4,
+    "a new generation with the same sources carries the objects");
+  // A republished program with a moved constant: the row is captured again
+  // and all its objects are made again.
+  auto republished=std::make_shared<NativeSceneGroupMaterial>(*published);
+  republished->constants[3].registers[7]^=0x10;
+  published=republished; ++generation;
+  const auto recaptured=models.Build(snapshot(),camera,pass,sources);
+  Require(recaptured.stats.captures==1 && recaptured.stats.derived==6 && recaptured.stats.reused==0,
+    "a recaptured row makes its objects again");
+  // Every frame above is a fresh build's.
+  NativeFullFrameModels fresh;
+  const auto reason=SameModelFrame(recaptured,fresh.Build(snapshot(),camera,pass,sources));
+  Require(reason.empty(),"a persistent frame differs from a fresh build");
+}
+// A gameplay-like registry for the multi-frame checks and --models-bench:
+// 1600 entries on a grid around the camera, of which about 150 pass
+// visibility: skinned characters with three LOD models (a palette record and
+// a bone-uploading record each), rigid props (one of whose programs reads the
+// world animation), a mothership with instanced sphere worlds, and filed
+// (mode 1) transparents. Every second frame is a registry publication: a new
+// sources generation and animation, most skinned entries publish a new pose,
+// some move (crossing LOD thresholds and the frustum), one disappears and one
+// appears, and now and then a group material is republished with a moved
+// constant. The camera moves every frame.
+struct ModelsScene {
+  using Constant=NativeSceneMaterialInputs::Constant;
+  static constexpr uint32_t kEntries=1600,kBones=40,kSkinnedPasses=4,kRigidPasses=3;
+  std::shared_ptr<NativeRenderBackend> backend;
+  std::shared_ptr<NativeSceneMaterialProgram> skinned=std::make_shared<NativeSceneMaterialProgram>(),
+    rigid=std::make_shared<NativeSceneMaterialProgram>(),water=std::make_shared<NativeSceneMaterialProgram>();
+  std::vector<Constant> skinned_constants,rigid_constants,water_constants;
+  std::map<uint32_t,std::shared_ptr<const NativeSceneGroupMaterial>> published;  // By pass record.
+  std::vector<std::shared_ptr<const NativeIndexedMesh::RetainedDraw>> skinned_geometry,rigid_geometry;
+  std::vector<std::array<std::shared_ptr<const NativeModelLayout>,3>> characters;  // Three kinds, three LODs.
+  std::vector<std::shared_ptr<const NativeModelLayout>> props;
+  std::shared_ptr<const NativeModelLayout> sphere;
+  std::vector<std::shared_ptr<const NativeRenderEntry>> entries;
+  NativeFullFrameModelCamera camera=MakeCamera();
+  uint64_t generation=1;
+  uint32_t next_object=0,frame=0;
+  static std::vector<uint8_t> Floats(size_t count,float seed) {
+    std::vector<uint8_t> bytes(count*4);
+    for(size_t i=0;i<count;++i) SkinnedFixture::Word(bytes,i*4,std::bit_cast<uint32_t>(seed+float(i%37)*.125f));
+    return bytes;
+  }
+  void Compile(NativeSceneMaterialProgram& program,const char* source,const char* name) {
+    Effect effect; effect.source=source;
+    program.backend=backend;
+    program.vertex=program.reversed_vertex=CompileNativeShader(nullptr,effect,{false,"VS","vs_3_0"},name);
+    program.pixel=CompileNativeShader(nullptr,effect,{true,"PS","ps_3_0"},name);
+    NativeBackendTextureDesc texture; texture.width=texture.height=1; texture.format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    const uint8_t white[]{255,255,255,255};
+    program.inputs.textures.push_back({"image"}); program.inputs.textures.push_back({"imageSampler"});
+    program.textures={backend->CreateTexture(texture,white),{}};
+  }
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw> Geometry(const NativeSceneMaterialProgram& program,float scale) {
+    std::vector<uint8_t> declaration(12),vertices(48),indices{0,0,0,1,0,2,0,0,0,2,0,3};
+    SkinnedFixture::Word(declaration,4,0x2a23b9);
+    const float points[]{-.125f*scale,-.25f,.5f, -.125f*scale,.25f,.5f, .125f*scale,.25f,.5f, .125f*scale,-.25f,.5f};
+    for(size_t i=0;i<12;++i) SkinnedFixture::Word(vertices,i*4,std::bit_cast<uint32_t>(points[i]));
+    NativeIndexedMesh mesh(*backend,program.vertex,declaration,12,vertices,indices,2);
+    return std::make_shared<const NativeIndexedMesh::RetainedDraw>(mesh.RetainDraw(backend,0,6));
+  }
+  void Publish(uint32_t pass,const std::shared_ptr<NativeSceneMaterialProgram>& program,std::vector<Constant> constants) {
+    auto group=std::make_shared<NativeSceneGroupMaterial>();
+    group->group=pass; group->program=program; group->constants=std::move(constants);
+    published[pass]=group;
+  }
+  explicit ModelsScene(std::shared_ptr<NativeRenderBackend> with):backend(std::move(with)) {
+    // The palette shares $Globals with the world and camera matrices the
+    // capture zeroes and a block of material parameters, as the game's do.
+    Compile(*skinned,R"(
+      float4x3 g_mWorldArray[68];
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float4 g_vParams[48];
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0) {
+        V o; int bone=int(abs(position.z*67))%68;
+        float3 skinned=mul(float4(position,1),g_mWorldArray[bone]);
+        o.position=mul(mul(float4(skinned,1),g_mWorld),g_mViewProjection);
+        o.color=g_vParams[bone%48]; return o;
+      }
+      float4 tint;
+      Texture2D image; SamplerState imageSampler;
+      float4 PS(V v):SV_Target { return v.color*tint*image.Sample(imageSampler,float2(.5,.5)); }
+    )","models-bench-skinned.fx");
+    Compile(*rigid,R"(
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float4 g_vParams[16];
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0) {
+        V o; o.position=mul(mul(float4(position,1),g_mWorld),g_mViewProjection);
+        o.color=g_vParams[int(abs(position.x*15))%16]; return o;
+      }
+      float4 tint;
+      Texture2D image; SamplerState imageSampler;
+      float4 PS(V v):SV_Target { return v.color*tint*image.Sample(imageSampler,float2(.5,.5)); }
+    )","models-bench-rigid.fx");
+    Compile(*water,R"(
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float4 m_WaterTime;
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0) {
+        V o; o.position=mul(mul(float4(position,1),g_mWorld),g_mViewProjection);
+        o.color=m_WaterTime; return o;
+      }
+      float4 tint;
+      Texture2D image; SamplerState imageSampler;
+      float4 PS(V v):SV_Target { return v.color*tint*image.Sample(imageSampler,float2(.5,.5)); }
+    )","models-bench-water.fx");
+    const auto identity=SkinnedFixture::Floats({1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1});
+    skinned_constants={{false,"g_mWorldArray",std::vector<uint8_t>(68*48,0xcd),true},{false,"g_mWorld",identity,true},
+      {false,"g_mViewProjection",identity,true},{false,"g_vParams",Floats(48*4,.5f),true},{true,"tint",Floats(4,1),false}};
+    rigid_constants={{false,"g_mWorld",identity,true},{false,"g_mViewProjection",identity,true},
+      {false,"g_vParams",Floats(16*4,.25f),true},{true,"tint",Floats(4,.75f),false}};
+    water_constants={{false,"g_mWorld",identity,true},{false,"g_mViewProjection",identity,true},
+      {false,"m_WaterTime",std::vector<uint8_t>(16),true},{true,"tint",Floats(4,.5f),false}};
+    for(uint32_t p=0;p<kSkinnedPasses;++p) {
+      auto constants=skinned_constants; constants[3].registers[p*4+1]^=uint8_t(p+1);
+      Publish(0x3000+p*0x10,skinned,std::move(constants));
+    }
+    for(uint32_t p=0;p<kRigidPasses;++p) {
+      auto constants=p==2?water_constants:rigid_constants; constants[p==2?3:2].registers[5]^=uint8_t(p+1);
+      Publish(0x3800+p*0x10,p==2?water:rigid,std::move(constants));
+    }
+    for(uint32_t g=0;g<3;++g) { skinned_geometry.push_back(Geometry(*skinned,1+g*.5f)); rigid_geometry.push_back(Geometry(*rigid,1+g*.25f)); }
+    // Characters: LOD 0 has a palette record and a bone record with two
+    // passes, LODs 1 and 2 lose a pass each. Batches name their geometry by
+    // address (Geometry(): address bits 4-5).
+    for(uint32_t kind=0;kind<3;++kind) {
+      std::array<std::shared_ptr<const NativeModelLayout>,3> lods;
+      for(uint32_t lod=0;lod<3;++lod) {
+        const uint32_t node=0x100000+kind*0x10000+lod*0x1000,a=0x3000+((kind+lod)%kSkinnedPasses)*0x10,b=0x3000+((kind+2)%kSkinnedPasses)*0x10;
+        std::vector<NativeModelMeshLayout> meshes{Mesh(0,true,false,{Batch(node+0x10*((kind+lod)%3),{a})})};
+        if(lod<2) meshes.push_back(Mesh(kind%kBones,false,true,{Batch(node+0x100+0x10*(kind%3),lod?std::vector<uint32_t>{b}:std::vector<uint32_t>{b,a})}));
+        lods[lod]=Layout(node,true,kBones,std::move(meshes));
+      }
+      characters.push_back(lods);
+    }
+    for(uint32_t kind=0;kind<3;++kind)
+      props.push_back(Layout(0x200000+kind*0x1000,false,2,{Mesh(0,false,true,{Batch(0x200000+kind*0x1000+0x10*kind,{0x3800u+kind*0x10})}),
+        Mesh(1,false,true,{Batch(0x200800+kind*0x1000,{0x3800u+((kind+1)%kRigidPasses)*0x10})})}));
+    auto layout=std::make_shared<NativeModelLayout>();
+    layout->instance=0x9000; layout->node=0x300000; layout->single_world=true;
+    layout->meshes={Mesh(0,false,true,{Batch(0x300010,{0x3800})}),Mesh(0,true,false,{})};
+    sphere=layout;
+    for(uint32_t i=0;i<kEntries;++i) entries.push_back(Spawn(i));
+    camera.animation=NativeScenePassAnimation{0,0};
+  }
+  std::shared_ptr<const NativeRenderEntry> Spawn(uint32_t slot) {
+    auto entry=std::make_shared<NativeRenderEntry>();
+    entry->object=0x40000000u+slot*0x1000; entry->generation=++next_object;
+    // A jittered grid, so rows do not cross LOD and cull depths together.
+    const float x=float(int(slot%40)*20-390)+float(slot*37%17)*.9f,z=float(int(slot/40)*20-390)+float(slot*53%19)*.85f;
+    entry->centre={x,0,z,1}; entry->radius=6; entry->cull_distance=280;
+    const auto kind=slot%10;
+    if(kind<7) {
+      // A character: LOD thresholds 90 and 180.
+      entry->type=&kCharacter; entry->lod_thresholds={90,180};
+      for(const auto& lod:characters[slot%3]) entry->models.push_back({lod->instance,lod});
+      entry->pose=AnimatedPose(slot,0);
+      if(kind==6 && slot%3==0) { entry->mode=1; entry->sort_bias=float(1+slot%5); entry->cull_distance=1e6f; entry->radius=4; }
+    } else {
+      entry->type=&kPlain;
+      const auto& prop=props[slot%3];
+      entry->models.push_back({prop->instance,prop});
+      entry->pose=AnimatedPose(slot,0,2);
+      if(slot==47) {
+        auto worlds=std::make_shared<std::vector<NativePoseMatrix>>(8,NativePoseMatrix{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1});
+        for(size_t w=0;w<worlds->size();++w) (*worlds)[w][12]=float(w*3);
+        entry->instanced.push_back({{sphere->instance,sphere},worlds});
+      }
+    }
+    return entry;
+  }
+  static std::shared_ptr<const std::vector<NativePoseMatrix>> AnimatedPose(uint32_t slot,uint32_t step,uint32_t bones=kBones) {
+    auto pose=std::make_shared<std::vector<NativePoseMatrix>>(bones);
+    for(uint32_t b=0;b<bones;++b) {
+      auto& m=(*pose)[b];
+      m={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
+      m[12]=float(slot%40)+float(b)*.5f; m[13]=float(step%64)*.03125f+float(b); m[14]=float(slot/40);
+      m[1]=float((step+b)%9)*.01f;
+    }
+    return pose;
+  }
+  NativeFullFrameModelSources Sources() {
+    NativeFullFrameModelSources sources;
+    sources.program=[this](uint32_t pass) { const auto found=published.find(pass); return found==published.end()?nullptr:found->second; };
+    sources.geometry=[this](const NativeModelBatchLayout& batch,uint32_t pass) {
+      const auto& pool=pass>=0x3800?rigid_geometry:skinned_geometry;
+      return pool[(batch.address>>4)%pool.size()];
+    };
+    sources.generation=[this] { return generation; };
+    return sources;
+  }
+  NativeRenderRegistrySnapshot Snapshot() const {
+    NativeRenderRegistrySnapshot snapshot;
+    snapshot.generation=generation;
+    for(const auto& entry:entries) snapshot.entries.push_back(entry);
+    return snapshot;
+  }
+  // The next frame's inputs. Every second frame publishes.
+  void Step() {
+    ++frame;
+    auto& view=camera.visibility.matrix;
+    view[12]=std::sin(float(frame)*.05f)*30; view[14]=std::cos(float(frame)*.03f)*25;
+    for(size_t i=0;i<16;++i) camera.pass.view_projection[i]=std::bit_cast<uint32_t>(i%5?float(i)*.001f*float(frame%7):1.f+float(frame)*.01f);
+    camera.pass.view=camera.pass.view_projection;
+    if(frame%2) return;
+    ++generation;
+    const auto tick=frame/2;
+    camera.animation=NativeScenePassAnimation{tick,tick/3};
+    for(uint32_t slot=0;slot<entries.size();++slot) {
+      const bool animated=entries[slot]->type==&kCharacter && (slot*7+tick)%10<7;
+      const bool moved=(slot*13+tick*29)%97==0;
+      if(!animated && !moved) continue;
+      auto entry=std::make_shared<NativeRenderEntry>(*entries[slot]);
+      if(animated) entry->pose=AnimatedPose(slot,tick);
+      if(moved) { entry->centre[2]+=float(int(tick%5)-2)*40; entry->centre[0]+=float(int(tick%3)-1)*15; }
+      entries[slot]=entry;
+    }
+    // One entry dies and its slot is reborn as a new object (a new generation).
+    const auto dead=(tick*131)%entries.size();
+    entries[dead]=Spawn(uint32_t(dead));
+    // A disappearing entry: hidden for one publication, then shown again.
+    for(const auto [slot,hide]:{std::pair{((tick-1)*71)%entries.size(),false},std::pair{(tick*71)%entries.size(),true}}) {
+      auto toggled=std::make_shared<NativeRenderEntry>(*entries[slot]); toggled->hidden=hide; entries[slot]=toggled;
+    }
+    // Now and then a group material republishes with a moved constant (and,
+    // at other times, with equal constants: a new object, the same values).
+    if(tick%8==3) {
+      auto group=std::make_shared<NativeSceneGroupMaterial>(*published[0x3000+(tick%kSkinnedPasses)*0x10]);
+      group->constants[3].registers[9]=uint8_t(tick); published[group->group]=group;
+    }
+    if(tick%8==6) published[0x3810]=std::make_shared<NativeSceneGroupMaterial>(*published[0x3810]);
+  }
+  NativeFullFrameModelPass Pass() const {
+    NativeFullFrameModelPass pass;
+    pass.targets.rtv_format[0]=DXGI_FORMAT_R8G8B8A8_UNORM; pass.targets.dsv_format=DXGI_FORMAT_D32_FLOAT;
+    pass.viewport={0,0,1280,720,0,1}; pass.scissor={0,0,1280,720};
+    return pass;
+  }
+};
+// Whether two builds of the same inputs made the same frame: the same plan,
+// the same batches (view bit for bit, transparency, key, filing order) with
+// the same draws in the same order: geometry, pipeline, an equivalent material
+// (every constant byte, texture, sampler and blend factor), world and previous
+// bit for bit, and the same material sharing between neighbours (what the
+// renderer instances). Instance ids are lifetime tokens and not compared.
+std::string SameModelFrame(const NativeFullFrameModelFrame& a,const NativeFullFrameModelFrame& b) {
+  const auto same_bits=[](const auto& x,const auto& y) { return !std::memcmp(&x,&y,sizeof(x)); };
+  const auto same_items=[&](const std::vector<NativeFullFrameModelItem>& x,const std::vector<NativeFullFrameModelItem>& y) {
+    if(x.size()!=y.size()) return false;
+    for(size_t i=0;i<x.size();++i)
+      if(x[i].entry!=y[i].entry || x[i].model!=y[i].model || !same_bits(x[i].depth,y[i].depth) || !same_bits(x[i].view_z,y[i].view_z) ||
+         x[i].key!=y[i].key || x[i].transparent!=y[i].transparent || x[i].instanced!=y[i].instanced || x[i].world!=y[i].world) return false;
+    return true;
+  };
+  if(!same_items(a.plan.opaque,b.plan.opaque) || !same_items(a.plan.transparent,b.plan.transparent)) return "plan";
+  if(a.stats.items!=b.stats.items || a.stats.drawn!=b.stats.drawn || a.stats.draws!=b.stats.draws) return "draw counts";
+  if(a.batches.size()!=b.batches.size()) return "batch count";
+  for(size_t i=0;i<a.batches.size();++i) {
+    const auto& x=a.batches[i]; const auto& y=b.batches[i];
+    if(x.transparent!=y.transparent || x.key!=y.key || x.order!=y.order || x.snapshot.tick!=y.snapshot.tick) return "batch route";
+    if(!NativeSceneCameraIdentical(x.view,y.view) || !same_bits(x.view.viewport,y.view.viewport) ||
+       !same_bits(x.view.scissor,y.view.scissor) || x.view.scissor_enabled!=y.view.scissor_enabled) return "batch view";
+    if(x.snapshot.instances.size()!=y.snapshot.instances.size()) return "batch draw count";
+    for(size_t d=0;d<x.snapshot.instances.size();++d) {
+      const auto& p=*x.snapshot.instances[d]; const auto& q=*y.snapshot.instances[d];
+      if(p.object.geometry!=q.object.geometry || !p.object.material || !q.object.material ||
+         p.object.material->pipeline()!=q.object.material->pipeline() || !p.object.material->Equivalent(*q.object.material)) return "draw material";
+      if(!same_bits(p.object.world,q.object.world) || !same_bits(p.previous,q.previous) || p.changed_tick!=q.changed_tick ||
+         p.object.visible!=q.object.visible || p.object.order!=q.object.order || p.object.bounds!=q.object.bounds) return "draw world";
+      if(d && (x.snapshot.instances[d-1]->object.material==p.object.material)!=(y.snapshot.instances[d-1]->object.material==q.object.material))
+        return "material sharing";
+    }
+  }
+  return {};
+}
+bool models_bench=false;
+// NativeFullFrameModels across gameplay-like frames (ModelsScene): every
+// frame of one persistent instance equals a fresh instance's build of the
+// same inputs, through moves, LOD changes, appearing and disappearing
+// entries, camera moves, new poses, new generations and republished
+// materials. With --models-bench it runs 600 frames, checks every 50th and
+// prints the persistent build's mean and worst per-frame times.
+void ModelFrames(std::shared_ptr<NativeRenderBackend> backend) {
+  ModelsScene scene(backend);
+  const auto sources=scene.Sources();
+  auto pass=scene.Pass();
+  NativeFullFrameModels models;
+  const bool bench=models_bench;
+  const uint32_t frames=bench?600:40;
+  double total_ms=0,publication_ms=0,worst_ms=0;
+  std::array<double,3> stages_ms{};  // Visibility, programs, resolve.
+  uint64_t draws=0,items=0,publications=0;
+  NativeFullFrameModelFrame::Stats totals{};
+  for(uint32_t frame=0;frame<frames;++frame) {
+    scene.Step();
+    // Pass inputs move too, for a while: the filtering (every row resolves
+    // again) and the palette clamp (every skinned constant set is repacked).
+    // Not in the bench, which measures gameplay.
+    const bool filtered=!bench && frame>=17 && frame<21,clamped=!bench && frame>=25 && frame<31;
+    const bool pass_moved=filtered!=(pass.filtering==4) || clamped!=(pass.palette_limit==32);
+    pass.filtering=filtered?4:-1;
+    pass.palette_limit=clamped?32:kNativeBonePaletteShaderBones;
+    const auto snapshot=scene.Snapshot();
+    // Build's stages as the host times them (frame.native.models.*).
+    std::array<double,3> stage{};
+    auto mark=std::chrono::steady_clock::now();
+    int current=-1;
+    const auto timed=[&](NativeFullFrameModelPhase next) {
+      const auto now=std::chrono::steady_clock::now();
+      if(current>=0) stage[size_t(current)]+=std::chrono::duration<double,std::milli>(now-mark).count();
+      mark=now; current=next==NativeFullFrameModelPhase::Done?-1:int(next);
+    };
+    const auto t0=std::chrono::steady_clock::now();
+    const auto built=models.Build(snapshot,scene.camera,pass,sources,timed);
+    const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+    if(frame>=4) {
+      for(size_t i=0;i<stage.size();++i) stages_ms[i]+=stage[i];
+      total_ms+=ms; worst_ms=(std::max)(worst_ms,ms);
+      if(scene.frame%2==0) { publication_ms+=ms; ++publications; }
+    }
+    const auto& s=built.stats;
+    draws+=s.draws; items+=s.items;
+    totals.resolves+=s.resolves; totals.captures+=s.captures; totals.palettes+=s.palettes; totals.cache_hits+=s.cache_hits;
+    totals.reused+=s.reused; totals.derived+=s.derived; totals.sourced+=s.sourced; totals.programs+=s.programs;
+    totals.geometries+=s.geometries; totals.rows+=s.rows; totals.camera_rows+=s.camera_rows;
+    Require(s.failed==0 && s.missing_program==0 && s.missing_geometry==0 && s.palette==0,"a models bench draw failed");
+    Require(built.plan.opaque.size()>80 && s.draws>100 && !built.plan.transparent.empty(),"the models bench scene drew too little");
+    Require(s.reused+s.derived==s.draws,"every drawn object is carried or made");
+    if(frame>=2 && !pass_moved) {
+      if(scene.frame%2) {
+        // Between publications only the camera moved: only items the moved
+        // camera brought into view or to another LOD are gathered (the
+        // providers asked only for batch values new this generation), almost
+        // every object is carried and every row takes the camera in place.
+        Require(s.sourced*8<=s.items && (s.sourced || (s.programs==0 && s.geometries==0)) && s.reused*10>=s.draws*9 &&
+          s.camera_rows==s.rows,
+          "a camera-only models frame rebuilt what did not move");
+      } else {
+        // A publication: every item is gathered again at the new generation,
+        // the providers answer once per pass record and batch value, and the
+        // carried objects are those of entries whose poses did not move.
+        Require(s.sourced==s.items && s.programs<=ModelsScene::kSkinnedPasses+ModelsScene::kRigidPasses &&
+          s.geometries<=24 && s.reused*5>=s.draws,"a publication frame rebuilt what did not move");
+      }
+    }
+    if(bench && frame%50) continue;
+    NativeFullFrameModels fresh;
+    const auto reason=SameModelFrame(built,fresh.Build(snapshot,scene.camera,pass,sources));
+    if(!reason.empty()) throw std::runtime_error("a persistent models frame differs from a fresh build: "+reason+" (frame "+std::to_string(frame)+")");
+  }
+  if(bench) {
+    const auto measured=double(frames-4);
+    std::cout<<"models frames: build_ms="<<total_ms/measured<<" publication_ms="<<publication_ms/double(publications)
+      <<" other_ms="<<(total_ms-publication_ms)/(measured-double(publications))<<" worst_ms="<<worst_ms
+      <<" visibility_ms="<<stages_ms[0]/measured<<" programs_ms="<<stages_ms[1]/measured<<" resolve_ms="<<stages_ms[2]/measured
+      <<" items="<<items/frames<<" draws="<<draws/frames<<" resolves="<<double(totals.resolves)/frames
+      <<" captures="<<double(totals.captures)/frames<<" palettes="<<double(totals.palettes)/frames
+      <<" cache_hits="<<double(totals.cache_hits)/frames<<" reused="<<double(totals.reused)/frames
+      <<" derived="<<double(totals.derived)/frames<<" sourced="<<double(totals.sourced)/frames
+      <<" programs="<<double(totals.programs)/frames<<" geometries="<<double(totals.geometries)/frames
+      <<" rows="<<double(totals.rows)/frames<<" camera_rows="<<double(totals.camera_rows)/frames<<"\n";
+  }
+}
 }
 // clSky's registry row says another pass draws it (the sky pass): an entry of
 // such a class is never planned, even visible, posed and in either route.
@@ -673,8 +1106,14 @@ void OtherPassClasses() {
   Require(plan.stats.entries==3 && plan.stats.other_pass==2 && plan.opaque.size()==1 && plan.opaque[0].entry->object==3 &&
     plan.transparent.empty(),"a class drawn by another pass was planned by the models pass");
 }
-int main() {
+int main(int argc,char** argv) {
+  // --models-bench: ModelFrames runs 600 frames on D3D11 and prints its per-frame timings.
+  models_bench=argc>1 && std::string_view(argv[1])=="--models-bench";
   try {
+    if(models_bench) {
+      ModelFrames(std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false})));
+      return 0;
+    }
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
     SourceTable(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
     // The skinned material path against full captures, on both backends (WARP).
@@ -682,7 +1121,7 @@ int main() {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device);
+      PaletteCapture(device); SkinnedBuild(device); PersistentDraws(device); ModelFrames(device);
     }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";

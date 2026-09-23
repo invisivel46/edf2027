@@ -10,7 +10,9 @@
 #include <map>
 #include <optional>
 #include <span>
+#include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace edf::native {
@@ -216,12 +218,16 @@ inline NativeSceneMaterialPassState NativeFullFrameModelBaseState(const NativeFu
 // capture against a cached pipeline half, with its intern, in one call: the
 // bridge wraps it in a short hold of its locks, so Build itself runs off them.
 // program and geometry take their own holds. generation is the providers' change signal, asked once per Build (inside
-// its own hold when exclusive is set): program and geometry are fetched once
-// per (pass record, batch, layout) and generation, and reused while it holds
-// (NativeFullFrameModelSourceTable). It must advance whenever either provider
-// could return something else (a rebuilt program, refreshed constant values,
-// reloaded geometry). Without it every draw fetches. Cache rows themselves are
-// Build's own state and take no hold.
+// its own hold when exclusive is set): at one generation program must be a
+// function of its pass record and geometry of its batch value and pass
+// record. Build asks program once per pass record and geometry once per
+// (pass record, batch value) per generation, keeps the answers per (pass
+// record, batch, layout) (NativeFullFrameModelSourceTable) and per draw state,
+// and asks again only for draw states new at that generation. It must advance
+// whenever either provider could return something else (a rebuilt program,
+// refreshed constant values, reloaded geometry). Without it every draw
+// fetches every frame. Missing answers are never kept. Cache rows themselves
+// are Build's own state and take no hold.
 struct NativeFullFrameModelSources {
   std::function<std::shared_ptr<const NativeSceneGroupMaterial>(uint32_t pass)> program;
   std::function<std::shared_ptr<const NativeIndexedMesh::RetainedDraw>(const NativeModelBatchLayout&,uint32_t pass)> geometry;
@@ -265,29 +271,106 @@ struct NativeFullFrameModelFrame {
   struct Stats {
     // resolves: full program.Resolve calls (cache misses); captures: captures
     // against a cached pipeline half (rigid constant changes, a skinned row's
-    // pass constants moving); cache_hits: rigid draws and skinned rows whose
-    // cached row served; palettes: skinned draws derived from their row's
-    // capture (NativeScenePaletteCapture::With); source_hits/fetches: the
-    // program and geometry side table.
+    // pass constants moving); cache_hits: material rows (rigid or skinned)
+    // whose cached resolve served this frame; memo_hits: rigid draws after
+    // their row's first this frame; palettes: skinned draws derived this
+    // frame from their row's capture (NativeScenePaletteCapture::With);
+    // source_hits/fetches: the program and geometry side table; programs /
+    // geometries: provider calls behind its fetches (once per pass record, and
+    // per pass record and batch value, per source generation).
+    // Persistence (NativeFullFrameModels' draw states): reused, draws whose
+    // scene object was carried from an earlier frame; derived, draws whose
+    // object was made this frame (palettes included); sourced, items whose
+    // draws and sources were gathered this frame (new, relaid out, or a moved
+    // source generation); rows, material rows evaluated (once per row per
+    // frame); camera_rows, those whose pass constants took only the camera in
+    // place (the published constants and animation they read unchanged).
     uint64_t items=0,drawn=0,draws=0,resolves=0,memo_hits=0,missing_program=0,missing_geometry=0,
-      scissor=0,palette=0,failed=0,cache_hits=0,captures=0,palettes=0,source_hits=0,source_fetches=0;
+      scissor=0,palette=0,failed=0,cache_hits=0,captures=0,palettes=0,source_hits=0,source_fetches=0,
+      programs=0,geometries=0,reused=0,derived=0,sourced=0,rows=0,camera_rows=0;
   };
   NativeFullFrameModelPlan plan;
   std::vector<NativeFullFrameModelBatch> batches;  // Opaque, then transparent.
   Stats stats;
 };
-// Cross-frame state: object ids, the program/geometry side table and the
-// material cache. Materials are interned through the sources; rigid ones are
-// cached across frames per (pass record, program, geometry, base state,
-// targets, filtering) with the constants they were captured from, and
-// memoized within a frame, so identical entries share one material object
-// and instance with their own worlds; per frame only the camera (derived from
-// the pass constants) and each instance's world change. Skinned materials
-// carry their palette, so they never share: a skinned row keeps, with the
-// same constants rule, one capture of its pass constants (any palette), and
-// each draw derives its material from it with only its palette's registers
-// rebound (NativeScenePaletteCapture), which is what a full capture of the
-// palette-bound constants makes. Not synchronized.
+// Persistent per-object draw state of NativeFullFrameModels. One item state
+// per (object, registry generation, LOD model or instanced set and world):
+// the layout's draws in guest order with their program and geometry, the
+// constants the item's pose (or instanced world) makes, and each draw's scene
+// object with the material row result it was derived from. A registry entry
+// is immutable and its pose, layout and world vectors are shared objects, so
+// an unchanged pose pointer is an unchanged pose; a changed one is compared
+// by value before anything derived from it is dropped.
+struct NativeFullFrameModelDrawState {
+  NativeModelDraw draw;
+  uint32_t pass_index=0,batch=0;  // Position in its batch's pass list; the batch address (opaque order).
+  NativeFullFrameModelSourcePair source;
+  // The row result the object was made from: a skinned row's palette capture
+  // or a rigid row's interned material. Held, so its address is never reused.
+  std::shared_ptr<const void> made_from;
+  std::shared_ptr<const NativeSceneInstance> object;
+};
+struct NativeFullFrameModelItemState {
+  std::shared_ptr<const NativeModelLayout> layout;
+  NativeRenderPose pose;  // The entry's pose, or the instanced set's worlds.
+  uint32_t world=0,palette_limit=0;
+  uint64_t generation=kNativeFullFrameModelUnversioned;  // Source generation of the draws' sources.
+  bool sourced=false,valued=false;
+  std::vector<NativeFullFrameModelDrawState> draws;
+  NativeFullFrameModelConstants values;
+  uint64_t used=0;
+};
+// One material row's per-frame work, kept across frames: its pass constants
+// (the published constants with the pass camera and animation applied), the
+// g_mWorldArray constants a skinned draw binds its palette into, and this
+// frame's result (the capture, palette capture, view and scissor), which
+// every draw of the row shares. program and geometry are the row key's
+// identities and are held; group is the published material the constants
+// were copied from.
+struct NativeFullFrameModelRowState {
+  std::shared_ptr<const NativeSceneMaterialProgram> program;
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+  std::shared_ptr<const NativeSceneGroupMaterial> group;
+  std::vector<NativeSceneMaterialInputs::Constant> constants,palette_constants;
+  NativeScenePassCamera camera;
+  std::optional<NativeScenePassAnimation> animation;
+  bool animated=false,deferrable=false,same_backend=false;
+  uint64_t frame=0,used=0,draws=0;  // draws: rigid draws served this frame (memo_hits past the first).
+  bool failed=false;
+  std::string error;
+  NativeSceneMaterialCapture capture;
+  std::shared_ptr<NativeScenePaletteCapture> palette;
+  NativeSceneView view;
+  bool scissor=false;
+};
+// Cross-frame state: object ids, the program/geometry side table, the
+// material cache, the material rows and the draw states. Materials are
+// interned through the sources; rigid ones are cached across frames per (pass
+// record, program, geometry, base state, targets, filtering) with the
+// constants they were captured from, and shared by every draw of the row, so
+// identical entries share one material object and instance with their own
+// worlds. Skinned materials carry their palette, so they never share: a
+// skinned row keeps, with the same constants rule, one capture of its pass
+// constants (any palette), and each draw derives its material from it with
+// only its palette's registers rebound (NativeScenePaletteCapture), which is
+// what a full capture of the palette-bound constants makes.
+//
+// Per frame, Build touches:
+// - visibility, LOD and routing of every entry (PlanNativeFullFrameModels);
+// - each material row once: its pass constants take the camera in place
+//   (rebuilt only when the published material or a read animation moved),
+//   are compared with the cached row (Current), which derives the camera;
+// - the draw states of drawn items: their draws and sources only when the item
+//   is new, relaid out or the source generation moved (providers asked once
+//   per pass record, and per pass record and batch value, per generation);
+//   their constants only when the pose (or world) pointer or palette limit
+//   moved; a draw's scene object is made again only when those constants
+//   moved by value, its sources changed or its row's result is another
+//   object (a recapture, a new resolve). Every other draw carries last
+//   frame's object, whose material, geometry and world are what a fresh
+//   build makes; only the batch views (the row cameras) are per frame.
+// The output is a fresh instance's for the same inputs, except that carried
+// objects keep their ids. Not synchronized.
 class NativeFullFrameModels {
  public:
   // Everything is resolved before anything is recorded. An entry any of whose
@@ -301,10 +384,33 @@ class NativeFullFrameModels {
     const NativeFullFrameModelFrame& frame);
   const NativeFullFrameModelSourceTable<NativeFullFrameModelSourcePair>& source_table() const { return sources_; }
   const NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve>& material_cache() const { return materials_; }
+  size_t item_states() const { return items_.size(); }
+  size_t row_states() const { return rows_.size(); }
+  // (object, registry generation, instanced set or -1, LOD model or world).
+  using ItemKey=std::tuple<uint32_t,uint64_t,int32_t,uint32_t>;
+  using RowKey=std::tuple<uint32_t,const void*,const void*,bool>;  // (pass record, program, geometry, skinned)
  private:
-  uint64_t next_id_=(uint64_t(5)<<60);
+  struct ItemKeyHash {
+    size_t operator()(const ItemKey& key) const {
+      const auto mix=[](uint64_t x) { x^=x>>33; x*=0xff51afd7ed558ccdull; x^=x>>33; return x; };
+      return size_t(mix(uint64_t(std::get<0>(key))<<32^uint64_t(uint32_t(std::get<2>(key)))<<16^std::get<3>(key))^
+        mix(std::get<1>(key)));
+    }
+  };
+  // Rows and item states unused this long are dropped; past the limits, all.
+  static constexpr uint64_t kStateAge=64;
+  static constexpr size_t kItemLimit=16384,kRowLimit=4096;
+  uint64_t next_id_=(uint64_t(5)<<60),frame_=0;
   NativeFullFrameModelSourceTable<NativeFullFrameModelSourcePair> sources_;
   NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve> materials_;
+  std::unordered_map<ItemKey,NativeFullFrameModelItemState,ItemKeyHash> items_;
+  std::map<RowKey,NativeFullFrameModelRowState> rows_;
+  // The providers' answers at one source generation: a program per pass
+  // record, a geometry per pass record and batch value. Found ones only.
+  uint64_t provided_generation_=kNativeFullFrameModelUnversioned;
+  std::unordered_map<uint32_t,std::shared_ptr<const NativeSceneGroupMaterial>> provided_programs_;
+  std::map<std::pair<uint32_t,uint32_t>,std::vector<std::pair<NativeModelBatchLayout,
+    std::shared_ptr<const NativeIndexedMesh::RetainedDraw>>>> provided_geometry_;
 };
 // Build then Record. Returns the frame, which the caller keeps until submission.
 NativeFullFrameModelFrame RecordNativeModels(NativeFullFrameModels& models,const NativeRenderRegistrySnapshot& snapshot,

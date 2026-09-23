@@ -53,7 +53,11 @@ class NativeSceneMaterial {
   NativeSceneMaterial& operator=(const NativeSceneMaterial&)=delete;
   const NativeRenderBackend* backend() const { return backend_.get(); }
   bool Equivalent(const NativeSceneMaterial& other) const;
-  uint64_t fingerprint() const { return fingerprint_; }
+  // FNV-1a over the backend, pipeline, every constant byte and binding,
+  // texture, sampler and blend factor: the adapter's intern bucket. Computed
+  // at first use and kept (a racing first use computes the same value), so a
+  // material never interned (a model palette draw's) never hashes its images.
+  uint64_t fingerprint() const;
   NativeBackendPipeline* pipeline() const { return pipeline_; }
   const auto& constants() const { return constants_; }
   const auto& textures() const { return textures_; }
@@ -68,7 +72,7 @@ class NativeSceneMaterial {
   std::vector<std::pair<uint32_t,NativeBackendSampler*>> samplers_;
   std::optional<std::array<float,4>> blend_factor_;
   std::optional<NativeSceneMatrixBinding> instance_world_;
-  uint64_t fingerprint_=0;
+  mutable std::atomic<uint64_t> fingerprint_{0};  // 0: not computed yet.
 };
 
 struct NativeSceneBounds {
