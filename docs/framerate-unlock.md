@@ -35,7 +35,69 @@ Menus after a movie remain paced until a completed 3D scene restores the unlock.
   requested guest swap interval before acknowledging acceptance. GPU completion
   and presentation credits are separate obligations and must remain intact.
 - `edf_fps_cap` only adds a limit in the present wrapper; changing it cannot
-  bypass either timing gate.
+  bypass either timing gate. See "Render cap limiter" below.
+
+## Render cap limiter
+
+`edf_fps_cap` is enforced in the hook on the guest present wrapper `82151460`
+(`src/input_hooks.cpp`, logic in `src/frame_limiter.h`).
+
+Previous limiter (until 2026-09-23): after the wrapper returned it computed
+`max(now, previous deadline + period)`, called `std::this_thread::sleep_until`
+until `edf_frame_pacer_spin_us` (250 us) before it, then spun with
+`std::this_thread::yield`. The standard sleep is a millisecond `Sleep`, rounded
+up and woken on the next system timer tick, so it overslept by up to about 1-2
+ms, well past the 250 us spin margin. A late frame kept the grid (the next
+deadline did not move), so the next frame was short by the same amount: the
+120 FPS gameplay run `binding-validation-20260923-015919-ce696cac` shows p50
+8.3-8.5, p90 9.2-9.5 and p99 10.0-10.5 ms with a histogram from 6.5 to 10 ms
+around a mean of exactly 8.333 ms. Also, the wait ran after the present, so the
+next scene submission (where `edf_native_frame_times` samples) came one
+frame's work later; that work differs between frames with and without a 60 Hz
+simulation step, which added its variance to every present interval.
+
+Current limiter:
+
+- Schedule (`FrameDeadlineSchedule`): absolute grid, slot k = origin + k * 1e9
+  / cap computed from the slot index (no truncated-period drift). A release
+  that arrives after its slot by at most an eighth of a period (at most 1 ms)
+  goes at once and keeps the grid; one later than that is a hitch and restarts
+  the grid at now (no catch-up burst). A cap change, cap 0 or a placement change
+  restarts the grid. Cap 0 never waits.
+- Wait (`PreciseSleeper`): a `CreateWaitableTimerExW(...,
+  CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, ...)` relative timer until a margin
+  before the deadline, then a `_mm_pause` spin on `QueryPerformanceCounter`.
+  The margin (`SpinMarginController`) starts at 1 ms and follows the observed
+  timer oversleep + 100 us: it rises at once to a larger oversleep and decays
+  over about 32 waits, clamped to [`edf_frame_pacer_spin_us`, 2 ms]. Without the
+  high-resolution timer (before Windows 10 1803) a plain waitable timer is used
+  with a 1-4 ms margin.
+- Placement: with the unlock active (`NativeFramerateUnlockActive`: unlock on
+  and no movie pacing), VSync off and `edf_frame_pacer_before_present=true`
+  (default), the wait runs before the wrapper, so the finished frame is
+  submitted and published a short fixed time after each deadline whatever its
+  own work cost. The cost is latency: the frame waits up to one period minus
+  its work (about 3.8 ms at 120 FPS with 4.5 ms frames) before submission;
+  `edf_frame_pacer_before_present=false` restores the after-present placement.
+  With VSync on, with the unlock off, or while a movie paces the swap
+  (`movie_pacing_active`), the wait stays after the wrapper as before, where
+  the guest's own swap pacing has already run.
+- Presenter interaction: the D3D12 host presenter runs on its own thread
+  (frame-ready notification, waitable swap chain with maximum frame latency 1,
+  tearing present with VSync off) and does not block the guest thread. The
+  guest's `edf_native_swap_wait` bounds CPU lead with `edf_native_frame_latency`
+  (default 2) GPU completions and polls them with 1 ms sleeps; with
+  before-present pacing the older frame has had a whole period on the GPU, so
+  that wait is normally already satisfied and adds no jitter. A GPU-bound frame
+  still stalls there (outside the limiter).
+- With `edf_frametime_log`, a `FRAMEPACER:` line beside `FRAMETIME:` reports the
+  placement, timer kind, current margin, waited/paced frames, mean spin, mean
+  and maximum timer oversleep, the worst exit past a deadline, overruns kept on
+  the grid and hitch rebases.
+- Tests: `edf_frame_limiter_tests` (fake-clock schedule: grid, no drift over an
+  hour, small overrun, hitch rebase, cap changes, clock anomaly, a simulated
+  loop with 3-7 ms work; margin controller; a loose real-timer check that can be
+  skipped with `EDF_FRAME_LIMITER_SKIP_TIMING=1`).
 
 ## Static caller evidence
 

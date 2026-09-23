@@ -142,13 +142,4 @@ inline int64_t FramePeriodNanoseconds(int fps_cap) {
   return fps_cap > 0 ? 1000000000LL / fps_cap : 0;
 }
 
-inline std::chrono::steady_clock::time_point NextFrameDeadline(
-    std::chrono::steady_clock::time_point previous,
-    std::chrono::steady_clock::time_point now, int fps_cap, bool reset) {
-  if(reset || fps_cap<=0) return now;
-  // A cap is a minimum interval, not an extra delay after a slow frame.
-  // Rebase overdue frames without accumulating catch-up credits.
-  return std::max(now, previous+std::chrono::nanoseconds(FramePeriodNanoseconds(fps_cap)));
-}
-
 }  // namespace edf

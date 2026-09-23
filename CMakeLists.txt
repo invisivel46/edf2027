@@ -376,6 +376,10 @@ if(BUILD_TESTING)
     add_executable(edf2027_tests tests/unit_tests.cpp)
     target_include_directories(edf2027_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME edf2027_unit_tests COMMAND edf2027_tests)
+    add_executable(edf_frame_limiter_tests tests/frame_limiter_tests.cpp)
+    target_include_directories(edf_frame_limiter_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME edf_frame_limiter_tests COMMAND edf_frame_limiter_tests)
+    set_tests_properties(edf_frame_limiter_tests PROPERTIES TIMEOUT 60)
 endif()
 
 # ---------------------------------------------------------------------------
