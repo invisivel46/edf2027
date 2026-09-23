@@ -1,7 +1,9 @@
 #pragma once
 #include "guest_parameter_records.h"
 #include "native_render_state_decode.h"
+#include <array>
 #include <bit>
+#include <stdexcept>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -105,13 +107,35 @@ inline void ApplyNativeMaterialState(NativeMaterialRenderPass& pass,uint32_t off
       pass.words[0]=enabled?(separate?pass.blend_parameters:NativeMaterialUnifiedBlend(pass.blend_parameters)):0x10001;
   }
 }
+// One override's (device offset, word) CPU writes, in order. Fixed capacity:
+// the most any override writes is seven (a blend update's parameter or control
+// word, the four replicated blend words and the two dirty halves), and the
+// material activation computes one list per state override per activation -
+// hundreds a frame for the HUD alone - so it lives on the stack, not the heap.
+// Iterates, indexes and sizes as the vector it replaces.
+class NativeMaterialStateCpuWriteList {
+ public:
+  using value_type=std::pair<uint32_t,uint32_t>;
+  void emplace_back(uint32_t offset,uint32_t value) {
+    if(count_==items_.size()) throw std::runtime_error("native material state CPU write list overflow");
+    items_[count_++]={offset,value};
+  }
+  const value_type* begin() const { return items_.data(); }
+  const value_type* end() const { return items_.data()+count_; }
+  size_t size() const { return count_; }
+  bool empty() const { return !count_; }
+  const value_type& operator[](size_t index) const { return items_[index]; }
+ private:
+  std::array<value_type,8> items_{};
+  size_t count_=0;
+};
 // CPU mirrors for the remaining mixed renderer. Offsets are relative to the
 // device. Scissor enable also recomputes a rectangle and stays with that owner.
-inline std::optional<std::vector<std::pair<uint32_t,uint32_t>>> NativeMaterialStateCpuWrites(
+inline std::optional<NativeMaterialStateCpuWriteList> NativeMaterialStateCpuWrites(
     NativeMaterialRenderPass pass,uint32_t offset,uint32_t value,uint64_t dirty16,uint64_t dirty24) {
   if(offset==0xc8) return {};
   ApplyNativeMaterialState(pass,offset,value);
-  std::vector<std::pair<uint32_t,uint32_t>> writes;
+  NativeMaterialStateCpuWriteList writes;
   const auto write=[&](uint32_t address,uint32_t data) { writes.emplace_back(address,data); };
   uint64_t flags16=0,flags24=0;
   switch(offset) {

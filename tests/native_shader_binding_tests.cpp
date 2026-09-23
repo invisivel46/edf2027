@@ -13,7 +13,12 @@ struct Reader {
     if(size>memory.size() || at>memory.size()-size) throw std::runtime_error("range");
     return at+uint32_t(size);
   }
-  const uint8_t* Bytes(uint32_t at,size_t size) const { Add(at,size); return memory.data()+at; }
+  uint32_t readable_end=65536;  // Reads (not addresses) past this are refused.
+  const uint8_t* Bytes(uint32_t at,size_t size) const {
+    Add(at,size);
+    if(at+size>readable_end) throw std::runtime_error("unreadable");
+    return memory.data()+at;
+  }
   uint32_t Word(uint32_t at) const { const auto* p=Bytes(at,4); return uint32_t(p[0])<<24|uint32_t(p[1])<<16|uint32_t(p[2])<<8|p[3]; }
   void StoreWord(uint32_t at,uint32_t value) const { Add(at,4); if(at==watched_address) ++watched_writes; for(unsigned i=0;i<4;++i) memory[at+i]=uint8_t(value>>(24-i*8)); }
   void StoreDoubleWord(uint32_t at,uint64_t value) const { StoreWord(at,uint32_t(value>>32)); StoreWord(at+4,uint32_t(value)); }
@@ -38,6 +43,37 @@ void Run() {
   Require(reader.Word(device+28)==2,"shared defaults not dirtied");
   Require(reader.Word(device+1040)==0x11223344 && reader.Word(device+1044)==0x55667788 && reader.Word(device+1048)==0xaabbcc44,
     "shader copy/mask defaults decoded incorrectly");
+  // The windowed list read the binds use decodes what the word-by-word read
+  // does, into a list that keeps nothing of what it held before.
+  const auto same=[](const NativeShaderDefaults& a,const NativeShaderDefaults& b) {
+    if(a.present!=b.present || a.clear_constants!=b.clear_constants || a.dirty_shared!=b.dirty_shared ||
+       a.words.size()!=b.words.size()) return false;
+    for(size_t i=0;i<a.words.size();++i)
+      if(a.words[i].offset!=b.words[i].offset || a.words[i].keep!=b.words[i].keep || a.words[i].value!=b.words[i].value) return false;
+    return true;
+  };
+  NativeShaderDefaults windowed;
+  windowed.present=false; windowed.words.assign(40,{1,2,3});
+  ReadNativeShaderDefaults(reader,shader,true,windowed,true);
+  Require(same(windowed,ReadNativeShaderDefaults(reader,shader,true)) && windowed.words.size()==3,
+    "windowed shader defaults differ from the word-by-word read");
+  {
+    // A declared extent running past readable memory, with the list ending at
+    // its terminators well before: the window cannot be proven, and the list
+    // still decodes word by word, as the unwindowed read does.
+    Reader tail;
+    constexpr uint32_t near_end=0x8000,list=near_end+40+256+32;
+    tail.StoreWord(near_end+60,256);
+    tail.StoreWord(list-8,4096);
+    tail.readable_end=list+64;
+    for(const auto [index,word]:std::array<std::pair<uint32_t,uint32_t>,5>{{{0,0},{1,(16u<<16)|1},{2,0x12345678},{3,0},{4,0}}})
+      tail.StoreWord(list+index*4,word);
+    NativeShaderDefaults unproven;
+    ReadNativeShaderDefaults(tail,near_end,true,unproven,true);
+    Require(unproven.present && unproven.words.size()==1 && unproven.words[0].offset==16 &&
+      unproven.words[0].value==0x12345678 && same(unproven,ReadNativeShaderDefaults(tail,near_end,true)),
+      "unprovable default list extent was refused or decoded differently");
+  }
   reader.StoreWord(device+10780,37);
   SetNativeShaderResource(reader,device,0,true,[]{return 0u;},[]{return 0u;});
   Require(reader.Word(shader+8)==37 && reader.Word(device+12416)==0,"shader retirement fence or unbind failed");

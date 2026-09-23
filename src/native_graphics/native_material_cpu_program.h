@@ -35,10 +35,15 @@ bool UploadNativeMaterialConstant(const Reader& reader,uint32_t device,
 }
 // Same bounded input capture used by live activation. Execution remains ordered
 // shader bindings -> constants -> textures -> states; payloads are read at use.
+// Fills result in place, emptying it first: the live activation keeps one
+// program per thread, so its three lists keep their capacity instead of being
+// allocated and grown per activation. On a throw, result holds a partial
+// program and must not be executed.
 template<class Reader>
-NativeMaterialCpuProgram ReadNativeMaterialCpuProgram(const Reader& reader,uint32_t instance,uint32_t device) {
-  NativeMaterialCpuProgram result;
+void ReadNativeMaterialCpuProgram(const Reader& reader,uint32_t instance,uint32_t device,NativeMaterialCpuProgram& result) {
   auto& constants=result.constants; auto& textures=result.textures; auto& states=result.states;
+  constants.clear(); textures.clear(); states.clear();
+  result.vertex=result.pixel=0;
   const auto pass=reader.Word(reader.Add(instance,108));
   const auto vertex=reader.Word(reader.Word(pass));
   const auto pixel=reader.Word(reader.Add(reader.Word(reader.Add(pass,4)),4));
@@ -79,6 +84,11 @@ NativeMaterialCpuProgram ReadNativeMaterialCpuProgram(const Reader& reader,uint3
     states.push_back({value[0],setter,value[1]});
   }
   result.vertex=vertex; result.pixel=pixel;
+}
+template<class Reader>
+NativeMaterialCpuProgram ReadNativeMaterialCpuProgram(const Reader& reader,uint32_t instance,uint32_t device) {
+  NativeMaterialCpuProgram result;
+  ReadNativeMaterialCpuProgram(reader,instance,device,result);
   return result;
 }
 template<class Shader,class Constant,class Texture,class State>
