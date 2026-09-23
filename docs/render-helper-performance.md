@@ -1,3 +1,5 @@
+> Historical. The `win-amd64-release` tree built at `-O0` until `04ad5e2`, and when that started is not recorded, so these timings may be unoptimized (see [renderer-status.md](renderer-status.md), 2.1). With `--edf_native_renderer=native` the helper no longer runs.
+
 # Render helper profiling
 
 The September 18, 2026 gameplay profile instruments the original helper

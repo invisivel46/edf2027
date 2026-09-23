@@ -1,16 +1,34 @@
 # Renderer status
 
-Last updated 2026-09-22 (evening), at commit `b908b96` on
-`native-scene-renderer`.
+Last updated 2026-09-23, at commit `361f80b` on `native-scene-renderer`.
 
 This is the one current statement of the native renderer effort. Where another
 `docs/renderer-*.md` or `docs/native-scene-renderer*.md` file disagrees with it,
 this file wins. Those files are kept as history (see the last section).
 
+## Summary
+
+- The full-frame native renderer (`--edf_native_renderer=native`, the default
+  since `361f80b`) draws the 3D frame without running the guest render helper
+  `sub_821A5080`. `--edf_native_renderer=off` restores the guest renderer. The
+  helper's HUD phase loop and two view listeners are still guest code
+  (section 4).
+- On `-O2` builds, on the Mission 1 benchmark route, the native full frame at
+  `7c6fe92` runs gameplay at a median of 201.7 FPS with no frame cap. The
+  pre-native baseline `6e9c94b` runs at 68.6 (section 2).
+- On `7c6fe92`, the A/B image gate passes: 31 native frames, 0 failing.
+- The FPS figures recorded on this branch before 2026-09-23 came from `-O0`
+  builds (guest and host). They are not comparable with the figures above
+  (section 2.4).
+- Only Mission 1 has been verified in game. Commits after `7c6fe92` have not
+  been run in game (section 2.3).
+
 ## How to enable
 
-One switch, `--edf_native_renderer=off|world|full` (default `off`), replaces
-setting the individual cvars in section 5:
+One switch, `--edf_native_renderer=off|world|full|native`, replaces setting
+the individual cvars in section 6. Since `361f80b` the default is `native`:
+the full-frame renderer runs unless `--edf_native_renderer=off` restores the
+guest renderer. Before `361f80b` the default was `off`.
 
 - `world`: `edf_native_host`, `shader_bridge`, `seam_draws`,
   `material_activation`, `scene_queued`, `scene_preload`, the six
@@ -19,7 +37,10 @@ setting the individual cvars in section 5:
   `scene_tree_published`, `scene_visibility`, `frame_dispatch`,
   `scene_group_order` and `static_world_pass`.
 - `full`: `world` plus `model_publication`, `model_pass` (the rigid model
-  pass) and `post_finish`.
+  pass) and `post_finish`. These still run inside the guest helper.
+- `native`: `full` plus `full_frame`. The render helper hook runs the native
+  frame (section 4) instead of the guest helper. Turning on `full_frame` also
+  feeds the render registry, without `edf_native_render_registry`.
 
 Not in any preset: every audit, `bucket_dispatch` and `map_effect_list` (their
 in-game audit and census have not been run), and the optional
@@ -33,120 +54,238 @@ and add the rest by hand. The preset is read once at startup (restart to change
 it; an unknown name stops startup), and one line
 `Native renderer: preset=... on=[...] off=[...]` logs the effective flags.
 
+The measured runs in section 2 also unlock the frame rate (see
+[framerate-unlock.md](framerate-unlock.md)):
+`--edf_native_unlock_framerate=true --edf_native_vsync=false` with
+`--edf_fps_cap=120` (capped runs) or `--edf_fps_cap=0` (uncapped runs).
+
 ## 1. Goal
 
 "Native renderer" means one concrete thing: during a frame, the guest render
 helper `sub_821A5080` and the callbacks it drives do not run, and the frame is
 drawn from the scene publication (the data the game publishes at its
-simulation cadence) by native code. Until the helper's callbacks stop running,
-the helper's CPU cost is still paid, whatever is replaced underneath it.
+simulation cadence) by native code.
 
 Earlier work replaced single callees inside the guest traversal, each with a
-fallback to the guest. That removed no helper cost: the helper still ran, each
-native stage added eligibility, capture and locking work beside the guest work,
-and in practice the fallback was the normal case. Removing helper cost needs
-whole passes to be skipped at the helper level and drawn from the publication.
+fallback to the guest. That removed no helper cost, because the helper still
+ran. The `world` and `full` presets still work that way. The full frame
+(`1d14bbd`, restructured in `c9aa2ac`) replaces the helper itself. The 3D
+scene is now drawn that way. The HUD phase loop and the view listeners are
+not (section 4).
 
 ## 2. Measurements
 
-The metric is the median FPS reported by `tools/renderer-runtime-gate.py`,
-measured from mission entry +10 s to +150 s with the flicker script
-(`tools/native-flicker-input.txt`). Mission entry is the first scene draw
-after the loading screen. Baseline exe `6e9c94b` = 56.2.
+### 2.1 Build
 
-| Build | Flags | Median FPS | Min FPS | Notes |
-|---|---|---|---|---|
-| 8d9edd1 | default | 56.55 | — | |
-| 8d9edd1 | all scene flags, audit off | 6.7 | — | |
-| 8d9edd1 | all scene flags, audit on | 6.8 | — | |
-| 06e9ae7 | all scene flags | 11.8 | — | |
-| d7f0892 | all scene flags | 13.4 | 6.1 | first 3 fully native static groups |
+Until `04ad5e2`, the `win-amd64-release` tree built at clang `-O0`. Its CMake
+cache held an explicitly empty `CMAKE_CXX_FLAGS_RELEASE`, so neither the 81
+recompiled guest translation units nor the host code had an `-O` flag. The
+baseline exe `edf2027-baseline-6e9c94b` was built the same way. `04ad5e2`
+pins `CMAKE_CXX_FLAGS_RELEASE=-O2 -DNDEBUG` in `CMakePresets.json`. Configure
+now fails for a Release, RelWithDebInfo or MinSizeRel tree whose flags carry
+no `-O`, unless `EDF2027_ALLOW_UNOPTIMIZED_RELEASE=ON` is set. Every
+measurement in 2.2 is `-O2` against `-O2`.
 
-Separate note, not a result: in the window entry +115..190 s, the baseline
-measured 27.1, `8d9edd1` default 22.9, and `d7f0892` 57.2. The two runs appear
-to be in different mission phases, and image verification is pending. This is
-not a speedup and must not be quoted as one.
+### 2.2 Performance (-O2)
+
+All runs use the benchmark route `tools/native-benchmark-input.txt`: the
+Mission 1 street, timed on the game clock. FPS values are the medians from
+`tools/renderer-runtime-gate.py --phase all`. Frame times come from
+`tools/frame-time-report.py`. Run directories are under
+`out/native-bridge-run/`.
+
+| Build | Renderer | Cap | Intro | Loading | Gameplay median (min) | Run |
+|---|---|---|---|---|---|---|
+| `6e9c94b` | guest (pre-native baseline) | 120 | 115.9 | 111.8 | 65.5 (55.3) | `binding-validation-20260923-005234-74ae26ab` |
+| `3825033` | native full frame | 120 | 120.0 | 113.2 | 119.9 (118) | `binding-validation-20260923-010239-803d2a51` |
+| `6e9c94b` | guest (pre-native baseline) | off | | | 68.6 | `binding-validation-20260923-013455-5c626456` |
+| `7c6fe92` | native full frame | off | | | 201.7 (176.5) | `binding-validation-20260923-012450-19f6e574` |
 
 Reading the table:
 
-- The default path is unchanged in speed. The all-flags path is still about
-  four times slower than the baseline.
-- `06e9ae7` includes the PopulateGroup skip (`8b1dc21`), change-only tree
-  recapture (`0359810`) and owner-bounded retirement (`92f3e8d`).
-- `d7f0892` adds the change-driven preload (`665e3e1`), eligibility for
-  texture/state lists and blended materials (`cbc5d33`), explicit instance
-  resolution (`fbf95c9`), proportional publication (`74bd08e`), the draw-time
-  geometry comparison (`70a998e`) and the once-per-walk source generation
-  (`d7f0892`).
-- Nothing after `d7f0892` has been measured, including the native static world
-  pass (`71fc0a2`). `7927bf4` says in its message that it was not yet built.
+- The gameplay figure is the gate's window, entry +10..150 s. Later in the
+  capped baseline run (t=320-596 s), gameplay samples read about 70-92, mostly
+  around 80.
+- With the 120 cap, the native frame held 119-120 FPS in every sample from
+  t=141 s to t=591 s. The one low intro sample (7.2) was a single hitch. The
+  final counters were 285 static draws, 64 model draws and 7 sky draws, with
+  no declined groups and no `[error]` lines.
+- `7c6fe92`, uncapped, gameplay frame times: p50 4.5 ms, p90 5.5, p99 7.0,
+  p99.9 8.0 (106,800 frames). GPU time is about 1.0 ms of the 4.5 ms median
+  frame (`--edf_native_gpu_timings`).
+- Menus stay at about 58 FPS with the frame rate unlocked (section 8).
+
+Spikes in the `7c6fe92` uncapped run (48 in 106,800 gameplay frames):
+
+- The first gameplay frame takes 78 ms: 412 mesh builds and 10.7 MB of
+  buffers. The frame after it takes 76 ms, with 45 pipeline creations. The
+  first scene frame of the intro has the same 412-mesh upload (86 ms).
+- Mid-gameplay, one frame at t=536.9 s takes 39 ms, with 2 pipeline creations
+  (first use).
+- Menus and loading have spikes of 45-60 ms, with 5-17 shader compiles.
+
+A fix for the first-frame and first-use spikes is in progress. It is not on
+this branch yet.
+
+### 2.3 Correctness
+
+`tools/compare-renderer-ab-captures.py` passes on `7c6fe92`: 31 native frames,
+0 failing. The mean error is 0.038 against a motion noise of 0.39, and distant
+geometry and the weapon are present. Run:
+`binding-validation-20260923-011444-b358882a`. Captures are in
+`out/renderer-ab/ab-7c6fe92`, and the worst pair is in
+`out/renderer-ab/ab-7c6fe92-worst.png`. The capped `3825033` run was not
+image-checked.
+
+Not verified in game: the commits after `7c6fe92`. They are `3c2b59d` (effect
+eye from the pass camera), `6ec6af6` (effect-pool view globals), `de90a8e`
+(per-tick gating), `803e4ab` (vehicle weapons, turrets, treads and per-object
+constants) and `9122e52` (grass). Each comes with unit tests, but no FPS or
+image gate has been run on them. `361f80b` only changes the default preset. Missions other than Mission 1 have not been run
+with the full frame at all.
+
+### 2.4 Superseded -O0 measurements
+
+Every earlier table in this file, and the FPS figures quoted in this branch's
+commit messages up to `3825033`, were measured `-O0` against `-O0`.
+That includes the "Baseline exe `6e9c94b` = 56.2" reference, the per-phase
+table (intro 53.6, loading 57.3, gameplay 27.1), the all-scene-flags rows
+(6.7-13.4 FPS) and the full-frame runs that were reported as matching or
+beating the baseline. The earlier tables used the flicker script, not the
+benchmark route. They are kept in the previous version of this file
+(`e72da45:docs/renderer-status.md`) and in the epistemic KB. Do not compare them with section 2.2, and do not quote them as
+parity or speedup results.
 
 ## 3. Rules
 
 - A change counts only when it passes the runtime gate against the baseline
-  (median FPS no worse, same flicker script), plus an image A/B check wherever
-  it draws. For native-pass work, also pass `--min-native-groups` so that a run
-  which silently falls back does not count, and `--expect-drop` on the phase
-  the change is meant to shrink.
+  (median FPS no worse, same input script, both `-O2`). Where the change draws,
+  it must also pass the image A/B gate. For native-pass work on the guest-helper
+  route, also pass `--min-native-groups`, so that a run which silently falls
+  back does not count, and `--expect-drop` on the phase the change is meant to
+  shrink.
+- Performance comparisons use `tools/native-benchmark-input.txt`. The
+  default script of `tools/run-renderer-ab.ps1` is still the flicker script,
+  so pass `-Script tools/native-benchmark-input.txt`.
+- A capped run shows only that the cap is reached. Measure headroom uncapped,
+  with `--edf_native_frame_times`.
+- Rebuild the baseline exe at `-O2` before gating against it. The old
+  `edf2027-baseline-6e9c94b` exe is `-O0`.
 - Offline suites (`validate-renderer-offline.cmd`, the differential fixtures,
-  the scalar pipelines) are necessary but not sufficient: they prove narrow
-  contracts, not that the game got faster or draws the same image.
-- The gate's default `--tolerance` is 0.05; treat any drop as a failure unless
+  the unit tests that transcribe guest functions) are necessary but not
+  sufficient. They prove narrow contracts. They do not show that the game got
+  faster or draws the same image.
+- The gate's default `--tolerance` is 0.05. Treat any drop as a failure unless
   it is explained.
 
-## 4. Plan and status per pass
+## 4. Full-frame architecture
 
-Times are ms per frame from the 2026-09-18 hook timings. The hook phase is the
-`--expect-drop`/`--max-phase` name in the gate. Hook buckets are inclusive and
-overlap, so the times must not be summed.
+With `edf_native_full_frame` (preset `native`), the render helper hook runs
+`NativeFullFrame` on the scene that `8219C7A8` opened, instead of
+`sub_821A5080`, and leaves the scene for `8219C840` to publish. Frames that
+`edf_native_ab_alternate` puts on the guest side still run the guest helper.
 
-| Pass | ms/frame | Hook phase | State | Next step |
-|---|---|---|---|---|
-| Static world (`821C3BB8(owner+240)`) | ~7.0 | `render.queued` | native opt-in | Build `b908b96`, gate with all scene flags plus `edf_native_static_world_pass` and `--expect-drop render.queued`, A/B images with `edf_native_ab_alternate` |
-| Octree walk (`821C61D8`, `820B4038`) | ~1.8 | `render.children`, `render.gather` | native opt-in | Measure `43e1c3e` (one bridge lock per walk) against `d7f0892` |
-| Models (`821C9C20`) | ~2.65 | `render.model` | data published | Check `edf_native_model_publication_audit` in game, then draw models from the published layouts and poses |
-| Finish/post (`820B0B80`) | ~1.13 | `render.finish` | not started | Break down what the finish phase draws before choosing a boundary |
-| Map effects (`820B35A0`) | ~0.73 | `render.list` | native opt-in | Run the census; the list walk is native but each object still goes through the guest `sub_821C0C00` |
-| Buckets (`821A3BA0`, `821C0C00` insert) | <0.1 | `render.buckets` | native opt-in | Run `edf_native_bucket_dispatch_audit` in game; low priority by cost |
+Per view, `BeginView` first writes the effect pool's view globals, as the
+guest scene begin `821BE8D0` would through `821A17F8` and `821A19F0`
+(`6ec6af6`). The native passes then run in this order
+(`kNativeFramePassOrder`, `native_full_frame.h`):
 
-"Native opt-in" means code exists behind a default-off cvar. No pass has
-reached "measured" in the sense of section 3: the only measured native runs are
-the all-flags rows in section 2, which predate the world pass.
+| Pass | What it draws | Main commits |
+|---|---|---|
+| `sky` | `clSky` (z write off), then the `clMapEffectManager` walk: `clElectricWire` mode-0 strips and mode-0 grass in list order; mode-2 grass is filed into the transparent sequence | `50f10a9`, `46f7b7b`, `1df6ce5`, `8ab939a`, `20a7e24`, `9122e52` |
+| `static_world` | Static opaque world from the published tree, visibility, LOD and cached group materials; clustered culling | `f9c7132`, `708ad3e`, `c77e71e` |
+| `models` | Every model in the render registry's tick snapshot, rigid and skinned, with persistent draw state across frames, attachments (faces, weapons, vehicle weapon groups, alien tank turrets, tank treads, mothership spheres), pose interpolation and per-object shader constants | `73ba81e`, `c25ceab`, `0f11fcc`, `413d929`, `cd6307c`, `0f7755d`, `b84dba6`, `803e4ab` |
+| `effects` | `clEffectObjectManager`'s walk: mode 0 drawn in place, other items filed; `clSpark02`, `clEffectEtc01`, `clSmokeLine` and the ribbon/billboard classes | `f7c3689`, `9014e82`, `0e47d32`, `9318048`, `3c2b59d` |
+| `transparent` | One keyed sequence of model transparents, filed effects and filed map-effect items, in the guest's filing order | `9014e82`, `9122e52` |
+| `post` | The finish/post chain and bloom (`820B0B80`), with zero guest calls; the guest finish stage runs only if the native post fails | `33d9c6f`, `63f335e` |
 
-What each state rests on:
+Guest code the full frame still runs:
 
-- **Static world.** `06e9ae7` publishes each owner's group walk order at the
-  simulation step. `71fc0a2` replaces `821C3BB8(owner+240)` at the end of
-  `820B4310` and draws groups in that published order, resolving every
-  instance from publication and explicit pass inputs. Groups it cannot draw
-  run the guest group callback (see section 7). Eligibility was widened in
-  `cbc5d33` and tightened in `c468f10` (image constants and anisotropy entry
-  in the alias preflight; shader defaults on any traced pass mirror rejected).
-- **Octree walk.** Native tree traversal and visibility existed before this
-  branch. `d7f0892` resolves the source generation once per walk; `43e1c3e`
-  holds the bridge lock once per walk between guest calls and reads the view
-  once until a guest call.
-- **Models.** `b908b96` is data only: layouts are captured at first sight per
-  (instance, generation) and retired when `820B2510` frees the instance, its
-  model node or its pose storage; pose snapshots are published per tick in a
-  copy-on-write map beside the scene. Draws are unchanged.
-- **Map effects.** `79f1e50` adds the census (by vtable, mode and slot-4
-  method, over the `clMapEffectManager` list at manager+48) and the native list
-  walk, which keeps the guest's read points.
-- **Buckets.** `037acbf` ports the mode-1/2 depth key of `sub_821C0C00` and the
-  `sub_821A3B80` bucket head insert.
+- After the post, the output is bound on the guest device (`8219C930`,
+  `82135530(device,0)`, as `820B0B80` does; `45af766`). Then the guest runs
+  the view listeners and the HUD phase loop on the output.
+- The view listeners are `8216DA80` (`clSatoCallback`, which draws the
+  `clItem01` pickups) and `820D3FD0` (`clPlayerCamera` icons, trajectory and
+  lines). They read the view globals that `BeginView` writes.
+- The HUD phase loop draws movies, fonts, XUI and Utility 2D. Its draws go
+  through the per-draw hooks. `e81aa3d` and `f2acec5` cut their overhead and
+  batch draws whose state is identical.
+- The scene's output binding and publish (`8219C7A8`/`8219C840`).
 
-After the static world pass, the remaining passes are taken one at a time in
-order of cost, each skipped at the helper level and drawn from the
-publication. The helper can be dropped only when every pass is covered.
+On the simulation side, `821A4DE8` publishes the scene, the static walk and
+the render registry each tick. The registry tick runs on its own worker
+(`edf_native_registry_overlap`), and the static preloads are checked in
+parallel (`edf_native_preload_workers`; both `05c9007`). The render thread
+holds the bridge locks in short slices (`f8334ba`).
 
-## 5. Cvars added on this branch
+### Unlocked frame rate under the full frame
 
-All are in the `EDF2027` category and were added between `6e9c94b` and
-`b908b96`. All booleans default to `false`. "Requires" lists what must also be
-on for the cvar to have an effect.
+- The camera is interpolated (`821CDDF8` hook), as on the guest route. Since
+  `cd6307c`, the registry also keeps the previous tick's pose for every
+  published pose (model, attachments, instanced worlds). The models pass
+  blends between the two poses.
+- Since `de90a8e`, `NativeTickGate` picks, per frame, the render that
+  advances per-render guest state: the first render after a simulation step.
+  Only that render commits the effect lifetime (`clEffectEtc02` +612) and
+  draws the tone adaptation (`PS_Downsample_Tone`). Only that render lets the
+  radar shake (`82176708`) and the cursor fade (`8218ED68`) advance. Unit tests
+  compare these fields with a locked 60 Hz run. This behaviour has not been
+  checked in game (2.3).
+- Registry re-reads on render-only iterations are limited to new,
+  resubscribed and retrying objects (`9b5fe2e`,
+  `edf_native_render_registry_idle_skip`).
 
-**Static world pass**
+## 5. Guest-helper route (presets world and full)
+
+The per-callee passes of the older plan still exist behind the `world` and
+`full` presets: the static world pass at `821C3BB8(owner+240)` (`71fc0a2`),
+the native octree walk, the rigid and skinned model pass at `821C9C20`
+(`e13aee4`, `3c6d26b`), the native post finish (`b11c420`), bucket dispatch
+(`037acbf`) and the map-effect list walk (`79f1e50`). None of them has been
+measured at `-O2`. On this route, the static world pass still hands
+guest-queued, scissor and ineligible groups to the guest group callback
+`821D96D8`, then re-imports the pass from the device mirrors (`71fc0a2`).
+That handoff has not been image-checked.
+
+## 6. Cvars added on this branch
+
+All are in the `EDF2027` category and were added after `6e9c94b`. Booleans
+default to `false` unless the table says otherwise. "Requires" lists what must
+also be on for the cvar to have an effect.
+
+**Full frame and registry** (added after `b908b96`)
+
+| Cvar | Default | Purpose | Requires |
+|---|---|---|---|
+| `edf_native_renderer` | `native` (string; `off` before `361f80b`) | Preset: `off`, `world`, `full`, `native` | none |
+| `edf_native_full_frame` | false | Run the native frame instead of the guest helper `821A5080` | `edf_native_host`, `edf_native_shader_bridge` |
+| `edf_native_render_registry` | false | Track render objects from constructor, destructor and update subscription, and publish a per-tick renderable snapshot at the end of `821A4DE8` (implied by `full_frame`) | none |
+| `edf_native_render_registry_idle_skip` | true | On unlocked render-only iterations, re-read only new, resubscribed and retrying objects | the registry |
+| `edf_native_registry_overlap` | true | Run the registry's per-step tick on its own thread beside the step's publication and preloads | the registry |
+| `edf_native_preload_workers` | -1 (int, -1..16) | Helper threads that check the static preloads' groups each step; -1 picks 3 on 8+ cores, 1 on 4+, else 0 | `edf_native_scene_preload` |
+| `edf_native_scene_static_walk` | false | Publish a per-world static walk plan at the step and drive the native visibility walk from it | native visibility walk |
+| `edf_native_model_pass_skinned` | false | Also draw palette-skinned models in the guest-route model pass | `edf_native_model_pass` |
+| `edf_native_transient_batching` | true | Append UI/immediate list draws that differ only in vertices to the draw before them | none |
+| `edf_native_thread_qos` | 1 (int, 0..2) | Engine and render helper thread QoS: 0 OS default, 1 opt out of execution-speed throttling (HighQoS), 2 also prefer performance-core CPU sets | none |
+
+**Diagnostics** (added after `b908b96`)
+
+| Cvar | Default | Purpose |
+|---|---|---|
+| `edf_native_gpu_timings` | false | D3D12 timestamps at the full frame's pass boundaries and per HUD phase; logs `Native GPU timing:` lines |
+| `edf_native_memory_log` | false | Log private bytes, working set, handles and the simulation tick count beside the FPS line (`34403ba`) |
+| `edf_native_frame_times` | false | Present-to-present frame times: `Native frame times:` windows with percentiles and a histogram, and one `Native frame spike:` line per frame over 25 ms or twice the rolling median, with that frame's pipeline, shader, mesh and upload counters |
+| `edf_native_model_source_audit` | false | Full-frame models: fetch every kept draw's program and geometry again from the providers and log each one that differs |
+| `edf_native_render_registry_idle_audit` | false | Follow each render-only registry tick with a full one and log every entry the light tick missed |
+| `edf_native_render_registry_audit` | false | Walk scene+84 and scene+100 each tick and count mismatches with the registry |
+| `edf_native_scene_static_walk_audit` | false | Compare the published static walk plan with the live walk's reads |
+| `edf_native_post_finish_audit` | false | Compare the native finish plan with what `820B0B80` issues |
+
+With `edf_native_hook_timings`, the engine region probe (`a487f07`) also
+reports, for the step dispatch `821A4BA0` and the frame transition `821A4DE8`:
+on-CPU share, core class, migrations, guest waits and a calibration kernel.
+
+**Static world pass (guest-helper route)**
 
 | Cvar | Default | Purpose | Requires |
 |---|---|---|---|
@@ -182,10 +321,7 @@ change-driven behaviour (`665e3e1`) has no cvar.
 |---|---|---|---|
 | `edf_native_scene_reject_compatibility` | false | Diagnostic: reject counted static-group compatibility boundaries before calling them | native queued scene path |
 
-The eligibility rules (`cbc5d33`, `c468f10`) have no cvar of their own; they
-apply whenever the native queued scene path runs.
-
-**Walk, buckets and map effects**
+**Walk, buckets and map effects (guest-helper route)**
 
 | Cvar | Default | Purpose | Requires |
 |---|---|---|---|
@@ -193,23 +329,21 @@ apply whenever the native queued scene path runs.
 | `edf_native_bucket_dispatch` | false | Insert sort-mode 1/2 objects into the guest depth buckets natively instead of `sub_821C0C00` | none |
 | `edf_native_map_effect_list` | false | Walk the map-effect list (`sub_820B35A0`) natively; each object still goes through the hooked `sub_821C0C00` | none |
 
-**Models**
+**Models and post (guest-helper route)**
 
 | Cvar | Default | Purpose | Requires |
 |---|---|---|---|
-| `edf_native_model_publication` | false | Capture model draw layouts at first sight and publish per-tick pose snapshots; draws unchanged | none |
-
-**Post**
-
-No cvar was added for the finish/post pass on this branch.
+| `edf_native_model_publication` | false | Capture model draw layouts at first sight and publish per-tick pose snapshots | none |
+| `edf_native_model_pass` | false | Draw rigid published models natively at `821C9C20`; unsupported objects run the original draw | `edf_native_model_publication` and the static world pass scene flags |
+| `edf_native_post_finish` | false | Replace the post chain `820B09B0` and the bloom quad of the finish stage `820B0B80` with a native loop issuing the planned passes; a preflight failure runs the original for that frame | none |
 
 **A/B**
 
 | Cvar | Default | Purpose | Requires |
 |---|---|---|---|
-| `edf_native_ab_alternate` | 0 (int, 0..1000) | Alternate guest and native passes in runs of N indexed output frames from the capture start frame; odd runs are native, 0 is off. Also holds the static world pass on the guest side of alternate frames (`c8493c8`) | scene capture settings for the paired captures (see `compare-renderer-ab-captures.py`) |
+| `edf_native_ab_alternate` | 0 (int, 0..1000) | Alternate guest and native frames in runs of N indexed output frames from the capture start frame; odd runs are native, 0 is off. With the full frame, guest-side frames run the guest helper | scene capture settings for the paired captures (see `compare-renderer-ab-captures.py`) |
 
-**Audits (diagnostic, all default false)**
+**Audits of the guest-helper route (diagnostic, all default false)**
 
 | Cvar | Compares |
 |---|---|
@@ -221,26 +355,33 @@ No cvar was added for the finish/post pass on this branch.
 | `edf_native_model_publication_audit` | Published model layouts and poses with live memory at model draw entry |
 | `edf_native_map_effect_census` | Tallies map-effect objects by (vtable, mode, slot-4 method) and logs the top classes every 600 frames |
 
-## 6. Tools
+## 7. Tools
 
 - `tools/renderer-runtime-gate.py` compares a candidate `game.log` with a
-  baseline log from the same script: median FPS in the window (`--start`,
-  `--end`, default 10..150 s after mission entry), `--tolerance`, and
-  `--min-native-groups`. When both logs have `Native hook timing` lines
-  (`--edf_native_hook_timings=true`) it adds a `phases` report (ms per call and
-  ms per `engine.render_helper` frame). `--max-phase PHASE=MS` fails when the
-  candidate phase costs more than MS; `--expect-drop PHASE` fails unless the
-  candidate phase costs less than the baseline. Both are repeatable.
-  `python tools/renderer-runtime-gate.py cand/game.log --baseline base/game.log --min-native-groups 40 --expect-drop render.queued`
+  baseline log from the same script. `--phase all` (the default when both logs
+  show the mission-load marker) reports intro, loading and gameplay FPS
+  separately under `phases_fps`. It also finds mission entry in full-frame
+  runs (`98027fa`) and reads the rotated `game.N.log` parts that long unlocked
+  runs produce (`258864c`). Its other options are the window (`--start`,
+  `--end`, default 10..150 s after mission entry), `--tolerance` and
+  `--min-native-groups`. With `--edf_native_hook_timings=true` in both runs,
+  it adds a `phases` report (including the `frame.native.*` and `sim.*`
+  sub-phases). `--max-phase PHASE=MS` and `--expect-drop PHASE` gate on that
+  report.
+  `python tools/renderer-runtime-gate.py cand/game.log --baseline base/game.log --phase all`
+- `tools/frame-time-report.py` merges the `Native frame times:`, `Native frame
+  spike:` and `Native GPU timing:` lines per mission phase, using the gate's
+  markers. It prints p50/p90/p99/p99.9/max, spikes with their counters, and
+  GPU time per pass. `--json` prints the same as JSON.
+  `python tools/frame-time-report.py out/native-bridge-run/<run>/game.log`
 - `tools/run-renderer-ab.ps1` runs baseline and candidate exes interleaved on
   the same script, gates each pair and writes
   `out/renderer-ab/<timestamp>-<Name>/summary.json`. Only one game may run at
   a time; `-Seconds` (default 360) must cover loading plus 150 s.
-  `powershell -File tools/run-renderer-ab.ps1 -Baseline edf2027-baseline-6e9c94b -Candidate win-amd64-release -Repeat 2 -HookTimings -GateArgs '--expect-drop','render.queued'`
+  `powershell -File tools/run-renderer-ab.ps1 -Baseline <o2-baseline> -Candidate win-amd64-release -Script tools/native-benchmark-input.txt -Repeat 2`
 - `tools/compare-renderer-images.py` compares one guest image with one native
   image (BMP/PNG): share of pixels over `--threshold`, max difference, PSNR,
   optional `--mask`; exits nonzero above `--limit`.
-  `python tools/compare-renderer-images.py guest.bmp native.bmp --mask diff.png`
 - `tools/compare-renderer-ab-captures.py` is the image-correctness gate next
   to the FPS gate. It reads the captures of an `edf_native_ab_alternate` run
   and takes each frame's side from the `ab_alternate frame=F native=0|1` log
@@ -263,8 +404,7 @@ No cvar was added for the finish/post pass on this branch.
   native, bad tiles in red, and each block's error over its limit (red above
   it). Exits 0 on pass, 1 on fail, 2 on unusable input. `--self-test` runs
   `tools/test_compare_renderer_ab_captures.py`.
-  `python tools/compare-renderer-ab-captures.py out/renderer-ab/ab-skyfix game.log --prefix cap --diff-image worst.png`
-  `python tools/compare-renderer-ab-captures.py out/renderer-ab/ab-5c7d6e9 --period 1 --prefix cap`
+  `python tools/compare-renderer-ab-captures.py out/renderer-ab/ab-7c6fe92 game.log --prefix cap --diff-image worst.png`
   Calibration: `ab-5c7d6e9` is the known-bad set, in which native frames lose
   static geometry beyond about 100-150 m. It fails in 31 of 31 native frames,
   with 41-43% of tiles bad and 244 persistent tiles. Its guest-as-native
@@ -273,32 +413,66 @@ No cvar was added for the finish/post pass on this branch.
   synthetic damage fail in 30 of 30 frames each for a black frame, a missing
   radar, a far region cut to sky and a 160x120 px cut. A missing ammo-text box
   fails through the persistent-tile check.
+- Scenario runs beyond Mission 1 (`34403ba`, merged in `a02f5ad`). None of
+  these has been run yet.
+  - `tools/make-edf-save.py` writes a save seed that clears campaign missions
+    1..N-1 on Normal, selects mission N and can add armour for long runs.
+    `start-native-binding-validation.ps1 -SaveSeed` copies it into the fresh
+    user directory.
+  - `tools/run-renderer-scenario.ps1 -Scenario S -Variant V` runs one
+    scenario from `tools/renderer-scenarios.json`. The scenarios are
+    `benchmark` (Mission 1, M202), `cave` (Mission 11, M301, ants at close
+    range), `ufo-swarm` (Mission 6, M212) and `vehicle` (Mission 9, M211,
+    drives and fires a tank). The variants are `ab` (image A/B captures),
+    `unlocked` (120 cap, frame times and GPU timings), `soak-ab` and
+    `soak-unlocked`. `-DryRun` prints the plan only.
+  - `tools/soak-report.py` reports memory, renderer cache sizes and frame-time
+    percentiles per 5-minute window. It has gates for growth, late stutter and
+    leaving gameplay. It reads the `edf_native_memory_log` lines.
+  - `renderer-runtime-gate.py` gains `--expect-mission`. It handles missions
+    without a pre-mission scene and places its markers on the input script's
+    clock.
+- `cmake/edf_optimization.cmake` holds opt-in build experiments. All are empty
+  by default, so the default build flags do not change.
+  - `EDF_GUEST_OPT_PROFILE` and `EDF_HOST_OPT_PROFILE` take `O3`, `v3`
+    (`-march=x86-64-v3 -ffp-contract=off`) or `O3-v3`.
+  - `EDF_LTO=thin` turns on ThinLTO.
+  - `EDF_PGO=generate|use` turns on clang IR PGO.
 
-## 7. Known gaps
+  None of them has been measured in game. Micro-benchmarks put `O3` about
+  equal to `-O2`.
 
-- **Loading time.** The movie-pacing fix (`cdf0c66`, pacing released after
-  eight swaps with no new movie draw) has not been measured. Whether loading
-  is back to baseline speed is unknown.
-- **Static world pass handoff** (from `71fc0a2`):
-  - Guest-queued groups, scissor groups, ineligible groups and groups that
-    decline are not drawn natively. They run the hooked guest group callback
-    `821D96D8` after the owed device state is handed off.
-  - After such a guest group, the pass is re-imported from the device mirrors
-    rather than carried natively.
-  - The handoff replays only the last group's activation and each sampler
-    slot's last binder, then writes the combined render words, dirty masks and
-    sampler words and publishes the snapshots. Whether this is everything the
-    later guest stages read is not yet shown by an image A/B check.
-  - The pass has not been built, gated or image-checked.
-- **Unmeasured commits.** Everything after `d7f0892` (section 2).
-- **Earlier milestone figure.** The 6.3 FPS milestone quoted in `8b1dc21` came
-  from a separate run; the section 2 table is the current reference.
+## 8. Known gaps
 
-## 8. Corrections to older docs
+- **Mode-1 grass** and filed electric wires are not drawn by the full frame.
+  The map-effect walk counts them as unsupported (`9122e52`). A class census
+  found no `clGrassMap` on Map01. The grass path has not been exercised in
+  game.
+- **Per-object constant carry-over between draws.** Under investigation: when
+  per-object constants (`803e4ab`) are carried from one draw to the next.
+- **Tone history under unlock, guest-helper route.** `de90a8e` holds the tone
+  adaptation to once per tick in the native post. On the guest-helper route
+  (presets `world`/`full`), the tone history is not held that way under
+  unlock.
+- **Menus** run at about 58 FPS with the frame rate unlocked.
+- **Guest code in the frame.** The HUD phase loop and the view listeners
+  `8216DA80` and `820D3FD0` are still guest code (section 4).
+- **Coverage.** Only Mission 1 on the benchmark route has been verified in
+  game. Other missions, maps, weathers, vehicles and bosses have not been run
+  with the full frame. The scenario tooling for missions 6, 9 and 11 and for
+  a 30-minute soak exists (section 7) but has not been run. `803e4ab` and `9122e52` add draws for classes that
+  Mission 1 does not show.
+- **Spikes.** A 78 ms first gameplay frame and a 39 ms first-use pipeline
+  hitch (2.2). A fix is in progress.
+- **Unmeasured commits.** Everything after `7c6fe92` (2.3).
+- **Loading time.** The movie-pacing fix (`cdf0c66`) has not been measured
+  separately at `-O2`.
+
+## 9. Corrections to older docs
 
 These replace statements in `native-scene-renderer.md` and
 `native-scene-renderer-handoff.md`. The affected lines carry a
-"Corrected 2026-09-22" note pointing here.
+"Corrected 2026-09-22" or "Corrected 2026-09-23" note pointing here.
 
 - `820B4250` is a per-simulation-step update of `clMapObjectManager`. It is not
   part of the render helper, and it is not "RenderWorld". Its +364 and +356
@@ -309,12 +483,18 @@ These replace statements in `native-scene-renderer.md` and
   list.
 - The static world is drawn by the final call of `820B4310`,
   `821C3BB8(owner+240)`. That call is the boundary for a native static world
-  pass.
+  pass on the guest-helper route.
+- (2026-09-23) "The current helper still executes for each render iteration"
+  is no longer true with `--edf_native_renderer=native`: the full frame skips
+  `sub_821A5080` (section 4). The helper timings quoted there (about 11 ms,
+  13.88 ms, 7.04 ms for `821C3BB8`) may come from unoptimized builds (2.1).
 
-## 9. Older docs
+## 10. Older docs
 
 Nothing has been deleted. The files below are historical as of 2026-09-22.
-Planning and inventory docs carry a one-line banner saying so.
+Planning and inventory docs carry a one-line banner saying so. When the
+release tree started building at `-O0` is not recorded, so FPS and millisecond
+figures in all of them may be unoptimized (2.1).
 
 Planning, inventory and progress reports (bannered, historical):
 
@@ -345,21 +525,6 @@ Tool references (still describe how to run existing tools; no banner):
 
 `native-scene-renderer.md` and `native-scene-renderer-handoff.md` remain the
 detailed engineering record (data layouts, audits, evidence paths). They are
-not status; the lines contradicted by section 8 are marked in place.
-
-## Measurement phases (added 2026-09-22)
-
-The entry+10..150 s window mixes phases. After mission entry comes a
-pre-mission scene, then the mission load (`MISSION\M202\MISSION.CAM`) and a
-second loading screen (~70 s at 57 FPS), then gameplay, at different times in
-each run. `tools/renderer-runtime-gate.py --phase all` (the default when both
-logs show that loading screen) gates intro, loading and gameplay FPS
-separately under `phases_fps`. By phase:
-
-| Phase | 6e9c94b baseline | 8d9edd1 default flags | d7f0892 all scene flags |
-|---|---|---|---|
-| intro | 53.6 | 54.7 | 12.4 |
-| loading | 57.3 | 57.1 | 57.2 |
-| gameplay | 27.1 | 22.9 (single run, needs repeating) | not reached |
-
-The d7f0892 "57 FPS" late window was the loading screen, not gameplay.
+not status; the lines contradicted by section 9 are marked in place.
+`render-helper-performance.md` profiles the guest helper, possibly on an
+unoptimized build; it carries a banner saying so.

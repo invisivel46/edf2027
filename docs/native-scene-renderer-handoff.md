@@ -2,6 +2,12 @@
 
 Last updated: 2026-09-22. This records implementation progress, not a declaration of completion. Revalidate the worktree and process state before continuing.
 
+*Corrected 2026-09-23: this handoff predates the full-frame renderer and the
+`-O2` build fix. For the current state, measurements and gaps, read
+[renderer-status.md](renderer-status.md). The `win-amd64-release` tree built
+at `-O0` until `04ad5e2`, and when that started is not recorded, so FPS and
+timing figures below may be unoptimized.*
+
 ## September 22 implementation resumed
 
 The user expanded the Ghidra/Epistemic goal to resume renderer implementation

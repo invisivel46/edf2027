@@ -16,6 +16,11 @@ prepared-geometry comparison measured about 11 ms in that helper, versus an
 8.33 ms total budget for 120 FPS. Faster acquisition did not reduce the helper
 total. See [the measurement](prepared-geometry.md).
 
+*Corrected 2026-09-23: see [renderer-status.md](renderer-status.md). With
+`--edf_native_renderer=native` the helper no longer runs; the full-frame
+renderer draws the 3D frame natively. The helper timings above may come from
+an unoptimized build (the release tree built at `-O0` until `04ad5e2`).*
+
 ## Implemented foundation
 
 `NativeIndexedMesh::RetainDraw` creates an independently owned, immutable
