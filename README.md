@@ -200,6 +200,7 @@ edf2027.exe [--game_data_root <folder>] [--settings] [--fullscreen=true|false]
             [--edf_native_vsync=true|false] [--edf_fps_cap N] [--audio_mute=true|false] [--log_file run.log]
             [--edf_show_fps=true|false] [--edf_frametime_log=true|false] [--edf_rumble=true|false]
             [--edf_trace_input=true|false] [--edf_frame_pacer_spin_us N]
+            [--edf_frame_pacer_before_present=true|false]
 ```
 Use `--name=value` for config options on the command line. Boolean options also
 accept `--name` (true) or `--no-name` (false). Do not use `--name false`: the

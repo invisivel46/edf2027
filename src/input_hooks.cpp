@@ -12,6 +12,7 @@
 #include <rex/input/input.h>
 #include <rex/types.h>
 #include "frame_stats.h"
+#include "frame_limiter.h"
 #include "core_logic.h"
 #include "native_graphics/native_renderer_preset.h"
 #include "scripted_input_logic.h"
@@ -113,12 +114,84 @@ REX_HOOK_RAW(sub_820A6B10) {
 }
 
 // ---- frame pacer + frame-time statistics on the game's VdSwap wrapper ----
-// Independent rendering cap. Sleep until the configurable final spin interval;
-// frames already over budget must not receive another full period of delay.
+// Independent rendering cap (edf_fps_cap), see frame_limiter.h and
+// docs/framerate-unlock.md "Render cap limiter". Frames are released on an
+// absolute deadline grid; the wait is a high-resolution waitable timer until an
+// adaptive margin before the deadline, then a QPC spin.
+//
+// Placement. The guest present wrapper (this hook) reaches edf_native_swap_wait,
+// which submits the scene frame and publishes it to the host presenter; frame
+// times (edf_native_frame_times) are sampled at that entry. With the frame-rate
+// unlock active and VSync off the pacer therefore waits *before* the wrapper:
+// the frame is complete, it is released on the grid, and submission/publish
+// happens a fixed, short time after the deadline whatever the frame's own work
+// cost (including the heavier frames that carry a 60 Hz simulation step).
+// This costs up to one period minus the frame's work of extra latency;
+// edf_frame_pacer_before_present=false restores the lower-latency placement.
+// With VSync on, the unlock off or a movie pacing the swap (movie_pacing_active),
+// the pacer keeps its previous placement after the wrapper, where the guest's
+// own swap pacing has already run.
 REXCVAR_DECLARE(int32_t, edf_fps_cap);
 REXCVAR_DECLARE(bool, edf_frametime_log);
 REXCVAR_DECLARE(bool, edf_native_memory_log);
+REXCVAR_DECLARE(bool, edf_frame_pacer_before_present);
+#ifdef _WIN32
+REXCVAR_DECLARE(bool, edf_native_vsync);
+namespace edf::native { bool NativeFramerateUnlockActive(); }
+#endif
 namespace {
+// One pacer for the guest's swap thread: the schedule, the sleeper and the
+// 5 s window's statistics for the FRAMETIME log.
+struct FramePacer {
+  edf::FrameDeadlineSchedule schedule;
+  edf::PreciseSleeper sleeper;
+  uint64_t paced = 0, waited = 0, overruns = 0, rebases = 0;
+  int64_t spin_ns = 0, oversleep_ns = 0, oversleep_max_ns = 0, late_max_ns = 0;
+
+  void Pace(int cap) {
+    sleeper.SetMinimumMarginNs(int64_t(REXCVAR_GET(edf_frame_pacer_spin_us)) * 1000);
+    const int64_t now = edf::PacerClock::NowNs();
+    const auto release = schedule.Next(now, cap);
+    if (cap <= 0) return;
+    ++paced;
+    if (release.rebased) ++rebases;
+    if (release.deadline_ns <= now) {
+      if (!release.reset && !release.rebased) ++overruns;
+      return;
+    }
+    const auto result = sleeper.WaitUntil(release.deadline_ns);
+    ++waited;
+    spin_ns += result.spin_ns;
+    oversleep_ns += result.oversleep_ns;
+    oversleep_max_ns = std::max(oversleep_max_ns, result.oversleep_ns);
+    late_max_ns = std::max(late_max_ns, result.late_ns);
+  }
+  // One FRAMEPACER line per report window (with edf_frametime_log): how many
+  // releases waited, the spin cost, the timer's oversleep, the worst exit past
+  // a deadline, overruns kept on the grid and hitch rebases.
+  void Report(bool log, bool before_present) {
+    if (log && paced)
+      REXLOG_INFO("FRAMEPACER: placement={} timer={} margin_us={:.0f} waited={}/{} spin_avg_us={:.0f} "
+                  "oversleep_avg_us={:.0f} oversleep_max_us={:.0f} late_max_us={:.1f} overruns={} rebases={}",
+                  before_present ? "before_present" : "after_present",
+                  sleeper.high_resolution() ? "high_resolution" : "standard", sleeper.margin_ns() / 1e3,
+                  waited, paced, waited ? double(spin_ns) / waited / 1e3 : 0.0,
+                  waited ? double(oversleep_ns) / waited / 1e3 : 0.0, oversleep_max_ns / 1e3,
+                  late_max_ns / 1e3, overruns, rebases);
+    paced = waited = overruns = rebases = 0;
+    spin_ns = oversleep_ns = oversleep_max_ns = late_max_ns = 0;
+  }
+};
+FramePacer& Pacer() { static FramePacer pacer; return pacer; }
+bool PaceBeforePresent(int cap) {
+#ifdef _WIN32
+  return cap > 0 && REXCVAR_GET(edf_frame_pacer_before_present) && !REXCVAR_GET(edf_native_vsync) &&
+         edf::native::NativeFramerateUnlockActive();
+#else
+  (void)cap;
+  return false;
+#endif
+}
 // One "Native memory" line for tools/soak-report.py: process private bytes
 // (commit charge), working set and its peak, handle count, and the engine's
 // simulation ticks (the scripted pad's game clock, so a soak window can be
@@ -159,22 +232,20 @@ REX_HOOK_RAW(sub_82151460) {
   using clock = std::chrono::steady_clock;
   static auto t0 = clock::now();
   static auto last_frame = t0, last_report = t0;
-  static clock::time_point next_frame{};
   static std::vector<double> frame_ms;
   static uint32_t frames = 0, total = 0;
-  static int previous_cap = 0;
+  static bool previous_before_present = false;
+  auto& pacer = Pacer();
+  const int cap = REXCVAR_GET(edf_fps_cap);
+  // A placement switch moves the release point by the frame's work: restart
+  // the grid rather than count that as an overrun or a wait.
+  const bool before_present = PaceBeforePresent(cap);
+  if (before_present != previous_before_present) pacer.schedule.Reset();
+  previous_before_present = before_present;
+  if (before_present) pacer.Pace(cap);
   if(EDF_NATIVE_FLAG(host)) __imp__edf_native_present_cpu_tail(ctx, base);
   else __imp__sub_82151460(ctx, base);
-  int cap = REXCVAR_GET(edf_fps_cap);
-  if (cap > 0) {
-    auto now = clock::now();
-    next_frame = edf::NextFrameDeadline(next_frame,now,cap,cap!=previous_cap);
-    const auto spin = std::chrono::microseconds(REXCVAR_GET(edf_frame_pacer_spin_us));
-    auto sleep_until = next_frame - spin;
-    if (sleep_until > now) std::this_thread::sleep_until(sleep_until);
-    while (clock::now() < next_frame) std::this_thread::yield();
-  }
-  previous_cap = cap;
+  if (!before_present) pacer.Pace(cap);  // cap 0: releases at once and resets the grid
   auto now = clock::now();
   if (total != 0) frame_ms.push_back(std::chrono::duration<double, std::milli>(now - last_frame).count());
   last_frame = now; ++frames; ++total;
@@ -196,6 +267,7 @@ REX_HOOK_RAW(sub_82151460) {
     if (REXCVAR_GET(edf_native_memory_log)) LogProcessMemory(std::chrono::duration<double>(now - t0).count());
     if (REXCVAR_GET(edf_frametime_log))
       REXLOG_INFO("FRAMETIME: avg {:.2f} ms min {:.2f} max {:.2f} 1%-low {:.2f} ms (cap {})", average_ms, minimum_ms, maximum_ms, low_1_percent_ms, cap);
+    pacer.Report(REXCVAR_GET(edf_frametime_log), before_present);
     frame_ms.clear(); frames = 0; last_report = now;
   }
 }
