@@ -314,6 +314,86 @@ struct NativeSceneMaterialProgram {
     ps.EndResourceUpdate();
   }
 };
+// Capture(...,palette=true) split for a run of draws whose constants differ
+// only in some named constants' registers (the model pass's g_mWorldArray,
+// each object's packed bone palette): captured once, it keeps its own
+// bindings, and With derives a draw's capture by rebinding only those
+// constants and copying their variables' byte ranges (ShaderBindings::Range)
+// into a copy of the captured image. That is Capture's result for the
+// constants with those replaced, byte for byte: a replaced variable may not
+// be one of the capture's recorded matrices (refused; those are zeroed from
+// the image and read back as world or camera), so every other image byte,
+// the world, camera, textures, samplers and blend factor are the captured
+// ones. The palette itself is never read back (Capture keeps it as bound).
+// Construction takes Capture's hold (the backend's texture objects); With
+// touches only this object, the retained textures' counts and the pipeline's
+// fields, which its resolve set. Not synchronized. The pipeline is backend-owned.
+class NativeScenePaletteCapture {
+ public:
+  NativeScenePaletteCapture(const NativeSceneMaterialProgram& program,NativeBackendPipeline& pipeline,bool reversed,
+      std::span<const NativeSceneMaterialInputs::Constant> constants,std::span<NativeBackendSampler* const> samplers,
+      std::optional<std::array<float,4>> blend_factor={})
+      :backend_(program.backend),pipeline_(&pipeline),blend_factor_(blend_factor),
+       vertex_(std::make_unique<ShaderBindings>(nullptr,reversed?program.reversed_vertex:program.vertex)),
+       pixel_(std::make_unique<ShaderBindings>(nullptr,program.pixel)) {
+    if(program.textures.size()!=program.inputs.textures.size() || samplers.size()!=program.textures.size())
+      throw std::runtime_error("native scene material resources are incomplete");
+    ValidateNativeShaderLink(vertex_->shader(),pixel_->shader());
+    program.ApplyBindings(*vertex_,*pixel_,constants,samplers);
+    capture_=CaptureNativeSceneMaterial(backend_,pipeline,*vertex_,*pixel_,blend_factor,{},true);
+  }
+  NativeScenePaletteCapture(const NativeScenePaletteCapture&)=delete;
+  NativeScenePaletteCapture& operator=(const NativeScenePaletteCapture&)=delete;
+  // The capture of the constructor's constants.
+  const NativeSceneMaterialCapture& capture() const { return capture_; }
+  // A fresh material (never the captured object, as a per-draw Capture makes
+  // one): the captured one with each of replaced's variables rebound, in
+  // order, as ApplyBindings binds a constant (the last of a name wins).
+  NativeSceneMaterialCapture With(std::span<const NativeSceneMaterialInputs::Constant> replaced) {
+    patches_.clear();
+    for(const auto& constant:replaced) {
+      auto& bindings=constant.pixel?*pixel_:*vertex_;
+      const auto binding=bindings.ResolveFloatRegisters(constant.name);
+      const auto bytes=binding.bytes();
+      if(bytes>constant.registers.size() || (bytes && !constant.global && bytes!=constant.registers.size()))
+        throw std::runtime_error("native material shader changed register requirements");
+      if(!bytes) continue;
+      bindings.SetGuestFloatRegisters(binding,std::span(constant.registers).first(bytes));
+      patches_.push_back({constant.pixel?NativeBackendStage::Pixel:NativeBackendStage::Vertex,bindings.Range(binding)});
+    }
+    const auto& material=*capture_.material;
+    auto constants=material.constants();
+    for(const auto& [stage,range]:patches_) {
+      const auto image=std::find_if(constants.begin(),constants.end(),
+        [&](const auto& c) { return c.stage==stage && c.slot==range.slot; });
+      const auto sources=(stage==NativeBackendStage::Vertex?*vertex_:*pixel_).ConstantImages();
+      const auto source=std::find_if(sources.begin(),sources.end(),[&](const auto& i) { return i.slot==range.slot; });
+      if(image==constants.end() || source==sources.end() || source->bytes.size()!=image->bytes.size() ||
+         range.offset>image->bytes.size() || image->bytes.size()-range.offset<range.size)
+        throw std::runtime_error("native palette capture image missing");
+      for(const auto& matrix:image->matrices)
+        if(matrix.offset<uint64_t(range.offset)+range.size && uint64_t(matrix.offset)+64>range.offset)
+          throw std::runtime_error("native palette capture cannot replace a captured matrix");
+      std::copy_n(source->bytes.begin()+range.offset,range.size,image->bytes.begin()+range.offset);
+    }
+    std::vector<NativeSceneSampler> samplers;
+    samplers.reserve(material.samplers().size());
+    for(const auto& [slot,sampler]:material.samplers()) samplers.push_back({slot,sampler});
+    NativeSceneMaterialCapture result;
+    result.material=std::make_shared<NativeSceneMaterial>(backend_,*pipeline_,std::move(constants),
+      material.textures(),std::move(samplers),blend_factor_);
+    result.world=capture_.world; result.camera=capture_.camera;
+    return result;
+  }
+ private:
+  struct Patch { NativeBackendStage stage; ShaderBindings::FloatRegisterRange range; };
+  std::shared_ptr<NativeRenderBackend> backend_;
+  NativeBackendPipeline* pipeline_;
+  std::optional<std::array<float,4>> blend_factor_;
+  std::unique_ptr<ShaderBindings> vertex_,pixel_;
+  NativeSceneMaterialCapture capture_;
+  std::vector<Patch> patches_;
+};
 // An immutable value at a material boundary. Resolve both stages before
 // publishing the next value so an unsupported operation cannot partly advance
 // inherited state. Unmentioned sampler slots and requested state survive.

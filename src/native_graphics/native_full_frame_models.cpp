@@ -116,13 +116,15 @@ NativeFullFrameModelConstants NativeFullFrameModelInstancedConstants(const Nativ
   result.worlds.assign(layout.meshes.size(),NativeModelWorldRegisters(world));
   return result;
 }
+bool BindNativeFullFrameModelPalette(NativeSceneMaterialInputs::Constant& constant,std::span<const float> palette) {
+  if(!constant.global || constant.pixel || constant.registers.size()%16 || palette.size()*4>constant.registers.size()) return false;
+  std::fill(constant.registers.begin(),constant.registers.end(),uint8_t(0));
+  for(size_t i=0;i<palette.size();++i) StoreNativeGuestFloat(constant.registers.data()+i*4,palette[i]);
+  return true;
+}
 bool BindNativeFullFrameModelPalette(std::vector<NativeSceneMaterialInputs::Constant>& constants,std::span<const float> palette) {
-  for(auto& constant:constants) {
-    if(constant.name!="g_mWorldArray") continue;
-    if(!constant.global || constant.pixel || constant.registers.size()%16 || palette.size()*4>constant.registers.size()) return false;
-    std::fill(constant.registers.begin(),constant.registers.end(),uint8_t(0));
-    for(size_t i=0;i<palette.size();++i) StoreNativeGuestFloat(constant.registers.data()+i*4,palette[i]);
-  }
+  for(auto& constant:constants)
+    if(constant.name=="g_mWorldArray" && !BindNativeFullFrameModelPalette(constant,palette)) return false;
   return true;
 }
 std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::span<const NativeFullFrameModelItem> items,bool opaque) {
@@ -254,7 +256,16 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
   struct Memo { NativeSceneMaterialCapture capture; bool scissor=false; };
   using MemoKey=std::tuple<uint32_t,const NativeSceneMaterialProgram*,const NativeIndexedMesh::RetainedDraw*>;
   std::map<MemoKey,Memo> memo;
-  std::map<MemoKey,std::vector<NativeSceneMaterialInputs::Constant>> skinned_constants;
+  // A skinned row this frame: its pass constants (moved into the cache row once
+  // captured), its g_mWorldArray constants, which each draw binds its palette
+  // into, and the row capture with its camera (derived on a cache hit).
+  struct Skinned {
+    std::vector<NativeSceneMaterialInputs::Constant> constants,palette;
+    std::shared_ptr<NativeScenePaletteCapture> capture;
+    NativeSceneView camera;
+    bool scissor=false;
+  };
+  std::map<MemoKey,Skinned> skinned;
   struct Resolved { std::shared_ptr<const NativeSceneInstance> object; NativeSceneView view; };
   // Each resolve or capture (the backend's pipeline and sampler caches) with
   // its intern runs in one exclusive call: one short hold of the host's locks.
@@ -273,31 +284,51 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     Cache::Key cache_key{draw.pass,layout.skinned,material.program,geometry,base,pass.targets,pass.filtering};
     Memo resolved;
     if(layout.skinned) {
-      // The palette is per draw: capture against the row's pipeline half.
-      auto found=skinned_constants.find(key);
-      if(found==skinned_constants.end()) found=skinned_constants.emplace(key,PassConstants(material,camera)).first;
-      auto constants=found->second;
-      if(!BindNativeFullFrameModelPalette(constants,values.palette)) { ++stats.palette; return std::nullopt; }
-      if(const auto* entry=materials_.Candidate(cache_key)) {
-        const auto& cached=entry->material;
-        exclusive([&] {
-          resolved.capture=program.Capture(*cached.pipeline,pass.targets.reverse_depth,constants,cached.samplers,cached.blend_factor,true);
-        });
-        resolved.scissor=cached.scissor;
-        ++materials_.hits; ++stats.cache_hits; ++stats.captures;
-      } else {
-        std::optional<NativeSceneResolvedMaterial> result;
-        NativeFullFrameModelResolve half;
-        exclusive([&] {
-          result=ResolveMaterial(program,*geometry,pass,base,constants,true);
-          half.samplers=ResolvedSamplers(program,result->samplers,pass.filtering);
-        });
-        ++materials_.misses; ++stats.resolves;
-        half.pipeline=result->capture.material->pipeline(); half.blend_factor=result->capture.material->blend_factor();
-        half.scissor=result->render.words[5]!=0;
-        materials_.Store(std::move(cache_key),{},std::move(half),nullptr,result->capture.camera);
-        resolved={std::move(result->capture),result->render.words[5]!=0};
+      // The palette is per draw, everything else per row: the row's capture of
+      // its pass constants (cached across frames while Current, as a rigid
+      // row's), and per draw With over its palette-bound g_mWorldArray.
+      auto found=skinned.find(key);
+      if(found==skinned.end()) {
+        Skinned row;
+        row.constants=PassConstants(material,camera);
+        for(const auto& constant:row.constants) if(constant.name=="g_mWorldArray") row.palette.push_back(constant);
+        found=skinned.emplace(key,std::move(row)).first;
       }
+      auto& row=found->second;
+      // Refused before any capture, as BindNativeFullFrameModelPalette over the whole set.
+      for(auto& constant:row.palette)
+        if(!BindNativeFullFrameModelPalette(constant,values.palette)) { ++stats.palette; return std::nullopt; }
+      if(!row.capture) {
+        auto* entry=materials_.Candidate(cache_key);
+        const auto* cached=entry && entry->material.palette?entry->material.palette.get():nullptr;
+        NativeSceneView derived;
+        if(cached) derived=cached->capture().camera;
+        if(cached && Cache::Current(*entry,row.constants,cached->capture().material.get(),derived)) {
+          row.capture=entry->material.palette; row.scissor=entry->material.scissor; row.camera=derived;
+          ++materials_.hits; ++stats.cache_hits;
+        } else {
+          NativeFullFrameModelResolve half;
+          if(entry) half=entry->material;
+          exclusive([&] {
+            if(!entry) {
+              const auto result=ResolveMaterial(program,*geometry,pass,base,row.constants,true);
+              half.pipeline=result.capture.material->pipeline(); half.blend_factor=result.capture.material->blend_factor();
+              half.samplers=ResolvedSamplers(program,result.samplers,pass.filtering); half.scissor=result.render.words[5]!=0;
+            }
+            half.palette=std::make_shared<NativeScenePaletteCapture>(program,*half.pipeline,pass.targets.reverse_depth,
+              row.constants,half.samplers,half.blend_factor);
+          });
+          ++(entry?stats.captures:stats.resolves);
+          ++materials_.misses;
+          row.capture=half.palette; row.scissor=half.scissor; row.camera=half.palette->capture().camera;
+          materials_.Store(std::move(cache_key),std::move(row.constants),std::move(half),row.capture->capture().material.get(),row.camera);
+        }
+      }
+      // Off the locks: the row capture is Build's own.
+      resolved={row.capture->With(row.palette),row.scissor};
+      resolved.capture.camera.view=row.camera.view; resolved.capture.camera.projection=row.camera.projection;
+      resolved.capture.camera.view_projection=row.camera.view_projection;
+      ++stats.palettes;
     } else if(const auto found=memo.find(key);found!=memo.end()) { resolved=found->second; ++stats.memo_hits; }
     else {
       auto constants=PassConstants(material,camera);
