@@ -11,6 +11,7 @@ SelectCache::Candidate NativeFullFrameStaticCandidate(uint32_t owner,const Nativ
   result.owner=owner;
   result.view=sources?sources->FindCandidateView(owner):NativeSceneSources::CandidateView{};
   result.published=result.view.visibility && result.view.visibility->lod_count;
+  if(result.published) result.visibility=*result.view.visibility;
   if(result.published) for(uint32_t lod=0;lod<result.drawable.size();++lod)
     if(const auto parts=result.view.Lod(lod))
       result.drawable[lod]=std::ranges::none_of(*parts,[](const auto& part) { return !part.group; });
@@ -55,7 +56,8 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
         for(uint32_t i=0;i<order->size();++i) queues.slots.try_emplace((*order)[i],i);
       }
     }
-    const NativeSceneTreeImageReader tree(*image);
+    if(queues.regions!=image->regions) { NativeSceneTreeImageReader::Build(*image,queues.index); queues.regions=image->regions; }
+    const NativeSceneTreeImageReader tree(*image,&queues.index);
     lists.clear();
     WalkNativeSceneTree(tree,owner,[&](uint32_t node) {
       ++stats.nodes_classified;
@@ -81,7 +83,7 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
         ++stats.members;
         if(!c.seen.Insert(candidate.owner)) { ++stats.duplicates; continue; }
         if(!candidate.published) { ++stats.unpublished; continue; }
-        const auto& object=*candidate.view.visibility;
+        const auto& object=candidate.visibility;
         const auto selection=SelectNativeVisibility(view,object,NativeVisibilityCenter(view,object));
         if(!selection.in_range) { ++stats.culled_distance; continue; }
         if(!selection.visible()) { ++stats.culled_frustum; continue; }

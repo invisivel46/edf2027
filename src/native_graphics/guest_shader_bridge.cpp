@@ -6487,11 +6487,11 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     const auto& built=frame.stats;
     const auto& cached=world_.selection_cache.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame static world: frames={} skipped={} stale={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={} camera_only={} reused_draws={} reused_frame={} list_hits={} list_builds={} list_invalidations={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
+      REXLOG_INFO("Native full frame static world: frames={} skipped={} stale={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={} camera_only={} reused_draws={} reused_moved={} reused_instances={} moved={}/{} reused_frame={} list_hits={} list_builds={} list_invalidations={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
         frames_,skipped_,stale_,routes.reads,routes.slot_reads,routes.failures,selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,
         selected.unrouted,selected.not_direct,selected.unpublished,selected.undrawable,built.groups,built.draws,built.instances,drawn,
         built.resolves,built.cache_hits,built.declined,built.missing_group,built.missing_material,built.missing_geometry,built.world_declines,
-        built.camera_only,built.reused_draws,built.reused_frame,cached.list_hits,cached.list_builds,cached.invalidations,
+        built.camera_only,built.reused_draws,built.reused_moved,built.reused_instances,built.moved_owners,built.moved_instances,built.reused_frame,cached.list_hits,cached.list_builds,cached.invalidations,
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
