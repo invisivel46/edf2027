@@ -330,6 +330,124 @@ std::vector<Call> T_Muzzle(const Reader& m,uint32_t r31) {
   if(!second.empty()) calls.push_back({true,13,std::move(second),m.Word(r31+396),1,2,0});
   return calls;
 }
+// sub_821A88E8 (recomp.25.cpp:7724), loc_821A8994. r4 = 48-byte points, r5 count, S = r1.
+std::vector<uint8_t> T_ColourSegments(const Reader& m,uint32_t r4,uint32_t r5,uint32_t S=kScratch) {
+  if(int32_t(r5)<2) return {};
+  int32_t r28=int32_t(r5)>>1; if(int32_t(r5)<0 && (r5&1)) ++r28;  // srawi/addze
+  if(r28>100) r28=100;
+  copy_words(m,S+96,m.Word(0x8257C02C)+192,16);
+  const double f31=lfs(m,A::zero); stfs(m,S+88,f31); stfs(m,S+84,f31); stfs(m,S+80,f31);
+  const double f30=lfs(m,A::one); stfs(m,S+92,f30);
+  if(!r28) return {};
+  const double f29=lfs(m,S+104); uint32_t r31=S+116; const double f28=lfs(m,S+100); uint32_t r30=r4+52;
+  const double f27=lfs(m,S+96); int32_t r29=r28;
+  do {
+    double f12=lfs(m,r30-44),f0=lfs(m,r30-52); double f9=F(f12-f29); double f6=lfs(m,r30+4); double f11=F(f0-f27);
+    double f13=lfs(m,r30-48); f12=F(f6-f12); double f8=lfs(m,r30); double f10=F(f13-f28); f13=F(f8-f13);
+    double f7=lfs(m,r30-4); f0=F(f7-f0); const double f1=lfs(m,r30-20);
+    f7=F(f12*f11); f8=F(f13*f9); f6=F(f10*f0);
+    f0=fmsubs(f9,f0,f7); stfs(m,S+84,f0); f12=fmsubs(f12,f10,f8); stfs(m,S+80,f12); f0=fmsubs(f13,f11,f6); stfs(m,S+88,f0);
+    T_SetLength(m,S+80,f1);
+    f0=lfs(m,S+80); f11=lfs(m,r30-52); --r29; f13=F(f11+f0); stfs(m,r31-4,f13);
+    f13=lfs(m,S+84); f11=F(f11-f0); f10=lfs(m,r30-48); f12=F(f10+f13); stfs(m,r31+32,f11); stfs(m,r31,f12);
+    f11=F(f10-f13); f12=lfs(m,S+88); f9=lfs(m,r30-44); stfs(m,r31+36,f11); f11=F(f9-f12); f7=lfs(m,r30-4);
+    const double f2=F(f9+f12); stfs(m,r31+40,f11); f11=F(f7-f0); f6=lfs(m,r30); f0=F(f7+f0); stfs(m,r31+68,f11);
+    f11=F(f6-f13); stfs(m,r31+104,f0); f0=F(f6+f13); const double f5=lfs(m,r30+4); stfs(m,r31+72,f11);
+    f11=F(f5-f12); stfs(m,r31+108,f0); f0=F(f5+f12); f8=lfs(m,r30-12); stfs(m,r31+12,f8); stfs(m,r31+48,f8);
+    stfs(m,r31+76,f11); stfs(m,r31+112,f0);
+    const double f4=lfs(m,r30+36),f3=lfs(m,r30-36); f0=lfs(m,r30-32); f13=lfs(m,r30-28); f12=lfs(m,r30-24);
+    f11=lfs(m,r30+12); f10=lfs(m,r30+16); f9=lfs(m,r30+20); f8=lfs(m,r30+24); r30+=96;
+    stfs(m,r31+8,f31); stfs(m,r31+44,f30); stfs(m,r31+80,f30); stfs(m,r31+116,f31); stfs(m,r31+4,f2);
+    stfs(m,r31+84,f4); stfs(m,r31+120,f4); stfs(m,r31+52,f3); stfs(m,r31+16,f3); stfs(m,r31+56,f0); stfs(m,r31+20,f0);
+    stfs(m,r31+60,f13); stfs(m,r31+24,f13); stfs(m,r31+64,f12); stfs(m,r31+28,f12);
+    stfs(m,r31+124,f11); stfs(m,r31+88,f11); stfs(m,r31+128,f10); stfs(m,r31+92,f10);
+    stfs(m,r31+132,f9); stfs(m,r31+96,f9); stfs(m,r31+136,f8); stfs(m,r31+100,f8);
+    r31+=144;
+  } while(r29);
+  return m.Read(S+112,uint32_t(r28)*144);
+}
+// sub_821A8360 (recomp.70.cpp:7619), loc_821A8458. r29 = 48-byte points, r27 count.
+std::vector<uint8_t> T_ColourStrip(const Reader& m,uint32_t r29,uint32_t r27,uint32_t S=kScratch) {
+  if(int32_t(r27)<2) return {};
+  if(int32_t(r27)>100) r27=100;
+  double f12=lfs(m,r29+48),f0=lfs(m,r29); const uint32_t r30_start=r29+4; f0=F(f12-f0); stfs(m,S+96,f0);
+  uint32_t r28=0; double f11=lfs(m,r29+52),f13=lfs(m,r29+8); const double f30=lfs(m,A::zero);
+  f0=lfs(m,r30_start); f12=lfs(m,r29+56); f0=F(f11-f0); stfs(m,S+100,f0); f0=F(f12-f13);
+  stfs(m,S+120,f30); stfs(m,S+116,f30); stfs(m,S+104,f0);
+  copy_words(m,S+160,m.Word(0x8257C02C)+192,16);
+  stfs(m,S+88,f30); stfs(m,S+84,f30); stfs(m,S+80,f30);
+  const double f29=lfs(m,A::one); stfs(m,S+92,f29);
+  const double f28=lfs(m,S+168); const uint32_t r24=uint32_t(-52)-r29; const double f27=lfs(m,S+164),f26=lfs(m,S+160);
+  const uint32_t r26=r27-1; stfs(m,S+140,f29); uint32_t r31=S+180; stfs(m,S+156,f29); const uint32_t r25=uint32_t(-4)-r29;
+  const double f31=lfs(m,A::half);
+  uint32_t r30=r30_start;
+  do {
+    uint32_t r11=r25+r30; if(r28==r26) r11=r24+r30; r11+=r29;
+    f11=lfs(m,S+96); const double f1=lfs(m,r30+28); f13=lfs(m,r11+48); f0=lfs(m,r11); f0=F(f13-f0); f12=lfs(m,r11+52);
+    f13=lfs(m,r11+4); stfs(m,S+128,f0); double f10=lfs(m,r11+56); f11=F(f0+f11); stfs(m,S+144,f11); f0=F(f12-f13);
+    f12=lfs(m,S+100); stfs(m,S+132,f0); f13=lfs(m,r11+8); f11=F(f11*f31); f0=F(f0+f12); stfs(m,S+148,f0);
+    f0=F(f10-f13); f12=lfs(m,S+104); stfs(m,S+136,f0); f13=lfs(m,r11); f10=lfs(m,r11+8); f0=F(f0+f12); stfs(m,S+152,f0);
+    copy_words(m,S+112,S+144,16);
+    f12=lfs(m,r11+4); f0=F(f13-f26); f13=F(f12-f27); f12=F(f10-f28);
+    copy_words(m,S+96,S+128,16);
+    f10=lfs(m,S+116); double f9=lfs(m,S+120); f10=F(f10*f31); f9=F(f9*f31); stfs(m,S+116,f10); stfs(m,S+120,f9);
+    double f6=F(f13*f11),f8=F(f12*f10),f7=F(f9*f0);
+    f0=fmsubs(f10,f0,f6); stfs(m,S+88,f0); f13=fmsubs(f13,f9,f8); stfs(m,S+80,f13); f13=fmsubs(f12,f11,f7); stfs(m,S+84,f13);
+    T_SetLength(m,S+80,f1);
+    f0=lfs(m,r30-4); f8=lfs(m,S+80); f7=F(f0+f8); stfs(m,r31-4,f7); f13=lfs(m,r30); f0=F(f0-f8); f7=lfs(m,S+84);
+    f6=F(f13+f7); stfs(m,r31,f6); f12=lfs(m,r30+4); f6=lfs(m,S+88); stfs(m,r31+32,f0); f0=F(f13-f7); stfs(m,r31+36,f0);
+    const double f5=F(f12+f6); f11=lfs(m,r30+12); f0=F(f12-f6); f10=lfs(m,r30+16); f9=lfs(m,r30+20);
+    stfs(m,r31+4,f5); stfs(m,r31+40,f0); ++r28; f0=lfs(m,r30+24); f13=lfs(m,r30+36); r30+=48;
+    stfs(m,r31+52,f11); stfs(m,r31+16,f11); stfs(m,r31+56,f10); stfs(m,r31+20,f10); stfs(m,r31+60,f9); stfs(m,r31+24,f9);
+    stfs(m,r31+8,f30); stfs(m,r31+44,f29); stfs(m,r31+64,f0); stfs(m,r31+28,f0); stfs(m,r31+12,f13); stfs(m,r31+48,f13);
+    r31+=72;
+  } while(r28!=r27);
+  return m.Read(S+176,r27*72);
+}
+// clSpark02 slot 4 (recomp.15.cpp:3685): b 821A88E8(r4 +536, r5 +544, r6 +472, r7 1, r8 0).
+std::vector<Call> T_Spark02(const Reader& m,uint32_t r11) {
+  std::vector<Call> calls;
+  auto ribbon=T_ColourSegments(m,m.Word(r11+536),m.Word(r11+544));
+  if(!ribbon.empty()) calls.push_back({true,13,std::move(ribbon),m.Word(r11+472),1,2,0});
+  return calls;
+}
+// clSmokeLine slot 4 (recomp.78.cpp:3646): bltlr on +620 < 2 unsigned, then
+// b 821A8360(r4 +604, r5 +620, r6 +392, r7 +424, r8 0).
+std::vector<Call> T_SmokeLine(const Reader& m,uint32_t r11) {
+  std::vector<Call> calls;
+  const uint32_t r5=m.Word(r11+620);
+  if(r5<2) return calls;
+  auto ribbon=T_ColourStrip(m,m.Word(r11+604),r5);
+  if(!ribbon.empty()) calls.push_back({true,6,std::move(ribbon),m.Word(r11+392),int32_t(m.Word(r11+424)),2,0});
+  return calls;
+}
+// sub_8217EA40 (recomp.80.cpp:6377): one quad at r1+96, 821A7C70(r4 13, r6 1, r7 r5, r8 0, r9 0).
+Call T_Etc01Entry(const Reader& m,uint32_t r4,uint32_t r5,uint32_t r6,uint32_t r1) {
+  stfs(m,r1+80,lfs(m,r6)); stfs(m,r1+84,lfs(m,r6+4)); stfs(m,r1+88,lfs(m,r6+8)); stfs(m,r1+92,lfs(m,r6+12));
+  stfs(m,r1+96,lfs(m,r4)); stfs(m,r1+100,lfs(m,r4+4)); stfs(m,r1+104,lfs(m,r4+8));
+  stfs(m,r1+132,lfs(m,r4+16)); stfs(m,r1+136,lfs(m,r4+20));
+  const double f0=lfs(m,A::zero);
+  stfs(m,r1+172,lfs(m,r4+36)); stfs(m,r1+140,lfs(m,r4+24)); stfs(m,r1+176,lfs(m,r4+40));
+  stfs(m,r1+108,f0); stfs(m,r1+112,f0); stfs(m,r1+168,lfs(m,r4+32)); stfs(m,r1+148,f0);
+  stfs(m,r1+204,lfs(m,r4+48)); stfs(m,r1+216,f0);
+  const double f13=lfs(m,A::one);
+  stfs(m,r1+144,f13); stfs(m,r1+180,f13); stfs(m,r1+184,f13);
+  stfs(m,r1+208,lfs(m,r4+52)); stfs(m,r1+212,lfs(m,r4+56)); stfs(m,r1+220,f13);
+  for(uint32_t o:{116u,152u,188u,224u}) copy_words(m,r1+o,r1+80,16);
+  return {true,13,m.Read(r1+96,144),r5,0,2,0};
+}
+// clEffectEtc01 slot 4 (recomp.29.cpp:6570): 8217EA40 per entry while i < +612.
+std::vector<Call> T_Etc01(const Reader& m,uint32_t r31,uint32_t r1=kStack) {
+  std::vector<Call> calls;
+  if(int32_t(m.Word(r31+612))<=0) return calls;
+  const uint32_t r28=r31+656; uint32_t r30=0; int32_t r29=0;
+  do {
+    const uint32_t r11=m.Word(r31+704)+r30;
+    calls.push_back(T_Etc01Entry(m,r11+64,m.Word(r31+596),r28,r1));
+    ++r29; r30+=224;
+  } while(r29<int32_t(m.Word(r31+612)));
+  return calls;
+}
 std::vector<Call> Transcribe(const Reader& m,uint32_t object,NativeEffectClass type) {
   std::vector<Call> calls;
   const auto w=[&](uint32_t o) { return m.Word(object+o); };
@@ -347,6 +465,9 @@ std::vector<Call> Transcribe(const Reader& m,uint32_t object,NativeEffectClass t
     case NativeEffectClass::EffectEtc02: return T_Etc02(m,object);
     case NativeEffectClass::Spark01: return T_Spark01(m,object);
     case NativeEffectClass::MuzzleFlash: return T_Muzzle(m,object);
+    case NativeEffectClass::Spark02: return T_Spark02(m,object);
+    case NativeEffectClass::EffectEtc01: return T_Etc01(m,object);
+    case NativeEffectClass::SmokeLine: return T_SmokeLine(m,object);
     default: break;
   }
   return calls;
@@ -466,11 +587,56 @@ void TestBuilders() {
     CheckClass(m,0x821897A8,"clMuzzleFlash"+tag);
     FillObject(m,kObject,0x8252B718);
     CheckClass(m,0x8252B718,"blr slot 4"+tag);
+    // clSpark02: 48-byte points, per-point colour and per-pair width.
+    FillObject(m,kObject,0x8211F540);
+    const uint32_t spark_points=round==3?250:round==4?1:round==5?0xFFFFFFFEu:round==7?0x80000001u:2+uint32_t(round)*3;
+    FillFloats(m,kArray,(spark_points>250?2:spark_points)*48,-200,200);
+    if(round==2) for(uint32_t o:{48u,52u,56u}) m.StoreWord(kArray+o,m.Word(kArray+o-48));  // zero-length segment
+    if(round==8) for(uint32_t o:{32u,128u}) m.StoreFloat(kArray+o,0.f);                   // zero width
+    m.StoreWord(kObject+536,kArray); m.StoreWord(kObject+544,spark_points); m.StoreWord(kObject+472,0xA000+round);
+    CheckClass(m,0x8211F540,"clSpark02"+tag);
+    // clEffectEtc01: one quad per entry.
+    FillObject(m,kObject,0x8217ECB8);
+    const int32_t entries=round==5?-2:round==6?40:round%5;
+    FillFloats(m,kArray,uint32_t(std::max(entries,0))*224+64,-200,200);
+    m.StoreWord(kObject+704,kArray); m.StoreWord(kObject+612,uint32_t(entries)); m.StoreWord(kObject+596,0xB000+round);
+    CheckClass(m,0x8217ECB8,"clEffectEtc01"+tag);
+    // clSmokeLine: 48-byte strip points; the blend word is the object's.
+    FillObject(m,kObject,0x82121848);
+    const uint32_t smoke_points=round==3?150:round==4?1:round==5?0xFFFFFFFEu:round==6?0:2+uint32_t(round)*3;
+    FillFloats(m,kArray,std::min<uint32_t>(smoke_points,150)*48,-200,200);
+    if(round==2) for(uint32_t o:{48u,52u,56u}) m.StoreWord(kArray+o,m.Word(kArray+o-48));
+    m.StoreWord(kObject+604,kArray); m.StoreWord(kObject+620,smoke_points);
+    m.StoreWord(kObject+392,0xC000+round); m.StoreWord(kObject+424,uint32_t(round%3));
+    CheckClass(m,0x82121848,"clSmokeLine"+tag);
   }
-  // No builder: still unsupported, named for the log.
-  Require(ClassifyNativeEffect(0x8211F540)==NativeEffectClass::Unknown && std::string(NativeEffectSlotName(0x8211F540))=="clSpark02","clSpark02 unsupported");
-  Require(ClassifyNativeEffect(0x8217ECB8)==NativeEffectClass::Unknown && std::string(NativeEffectSlotName(0x8217ECB8))=="clEffectEtc01","clEffectEtc01 unsupported");
-  Require(!NativeEffectSlotName(0x82000000),"an unknown slot has no name");
+  // The three classes that had no builder now classify; nothing is named unsupported.
+  Require(ClassifyNativeEffect(0x8211F540)==NativeEffectClass::Spark02 && ClassifyNativeEffect(0x8217ECB8)==NativeEffectClass::EffectEtc01 &&
+          ClassifyNativeEffect(0x82121848)==NativeEffectClass::SmokeLine,"clSpark02, clEffectEtc01 and clSmokeLine classify");
+  Require(!NativeEffectSlotName(0x8211F540) && !NativeEffectSlotName(0x82000000),"no slot is named unsupported");
+  {
+    // Their slot 4s write nothing but the stack: the object is unchanged.
+    auto m=MakeMemory();
+    for(const uint32_t slot:{0x8211F540u,0x8217ECB8u,0x82121848u}) {
+      FillObject(m,kObject,slot);
+      FillFloats(m,kArray,40*224,-200,200);
+      for(uint32_t o:{536u,604u,704u}) m.StoreWord(kObject+o,kArray);
+      m.StoreWord(kObject+544,20); m.StoreWord(kObject+612,3); m.StoreWord(kObject+620,20);
+      const auto before=m.Read(kObject,4096);
+      NativeEffectItem item; item.object=kObject; item.slot4=slot; item.type=ClassifyNativeEffect(slot);
+      item.draws=BuildNativeEffectDraws(m,kObject,item.type,ReadNativeEffectInputs(m));
+      CommitNativeEffectDraw(m,item);
+      Require(!item.draws.empty() && m.Read(kObject,4096)==before,"slot 4 leaves the object as it was");
+    }
+  }
+  {
+    // A corrupt clEffectEtc01 count is refused rather than walked.
+    auto m=MakeMemory();
+    FillObject(m,kObject,0x8217ECB8); m.StoreWord(kObject+612,kNativeEffectEtc01EntryLimit+1);
+    bool threw=false;
+    try { BuildNativeEffectDraws(m,kObject,NativeEffectClass::EffectEtc01,ReadNativeEffectInputs(m)); } catch(const std::exception&) { threw=true; }
+    Require(threw,"clEffectEtc01 entry count limit");
+  }
 }
 // --- Technique material and sampler list (821A7640/821A7C70) --------------------
 void TestTechniqueMaterial() {

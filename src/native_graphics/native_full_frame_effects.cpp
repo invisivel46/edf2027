@@ -20,13 +20,15 @@ namespace {
 NativeFxVec3 Difference(const NativeFxVec3& a,const NativeFxVec3& b) {
   return {NativeFxSub(a[0],b[0]),NativeFxSub(a[1],b[1]),NativeFxSub(a[2],b[2])};
 }
-}
-// sub_821A8628. Per pair: e = P0 - eye, d = P1 - P0, side = SetLength(
-// (dz*ey - dy*ez, ez*dx - dz*ex, dy*ex - ey*dx), width), each component one
-// fmsubs of a separately rounded product. Quad P0+s, P0-s, P1-s, P1+s with U
-// 0,1,1,0 (the zero/one constants) and V from each point's +20.
-std::vector<NativeRibbonVertex> BuildNativeRibbonSegments(std::span<const NativeRibbonPoint> points,
-    const NativeFxVec4& colour,float width,const NativeFxVec3& eye,const NativeEffectConstants& k) {
+// sub_821A8628 and sub_821A88E8 (the same arithmetic, the same order). Per
+// pair: e = P0 - eye, d = P1 - P0, side = SetLength((dz*ey - dy*ez, ez*dx -
+// dz*ex, dy*ex - ey*dx), width), each component one fmsubs of a separately
+// rounded product. Quad P0+s, P0-s, P1-s, P1+s with U 0,1,1,0 (the zero/one
+// constants) and each point's V. `colour(p)` is the colour a vertex of p gets
+// and `width(p0)` the pair's width.
+template<class Point,class Colour,class Width>
+std::vector<NativeRibbonVertex> Segments(std::span<const Point> points,Colour colour,Width width,
+    const NativeFxVec3& eye,const NativeEffectConstants& k) {
   std::vector<NativeRibbonVertex> vertices;
   if(points.size()<2) return vertices;                                   // cmpwi r5,2; blt
   const size_t segments=std::min<size_t>(points.size()/2,kNativeRibbonPointLimit);  // srawi/addze, cap 100
@@ -41,28 +43,30 @@ std::vector<NativeRibbonVertex> BuildNativeRibbonSegments(std::span<const Native
     side[1]=NativeFxMsub(e[2],d[0],f7);
     side[0]=NativeFxMsub(d[2],e[1],f8);
     side[2]=NativeFxMsub(d[1],e[0],f6);
-    side=NativeFxSetLength(side,width,k);
+    side=NativeFxSetLength(side,width(p0),k);
     const auto plus=[&](const NativeFxVec3& p) {
       return NativeFxVec3{NativeFxAdd(p[0],side[0]),NativeFxAdd(p[1],side[1]),NativeFxAdd(p[2],side[2])};
     };
     const auto minus=[&](const NativeFxVec3& p) {
       return NativeFxVec3{NativeFxSub(p[0],side[0]),NativeFxSub(p[1],side[1]),NativeFxSub(p[2],side[2])};
     };
-    vertices.push_back({plus(p0.position),{k.zero,p0.v},colour});
-    vertices.push_back({minus(p0.position),{k.one,p0.v},colour});
-    vertices.push_back({minus(p1.position),{k.one,p1.v},colour});
-    vertices.push_back({plus(p1.position),{k.zero,p1.v},colour});
+    vertices.push_back({plus(p0.position),{k.zero,p0.v},colour(p0)});
+    vertices.push_back({minus(p0.position),{k.one,p0.v},colour(p0)});
+    vertices.push_back({minus(p1.position),{k.one,p1.v},colour(p1)});
+    vertices.push_back({plus(p1.position),{k.zero,p1.v},colour(p1)});
   }
   return vertices;
 }
-// sub_821A8090. D starts as P1 - P0. For point i the segment is A = P[i],
-// B = P[i+1], except the last point, which reuses P[n-2]..P[n-1]. C = B - A,
-// m = (C + D) * 0.5 per component (the x product is formed before the others,
-// the stored copy is unscaled - it is m that is used), D = C, e = A - eye and
-// side = SetLength((ey*mz - ez*my, ez*mx - mz*ex, my*ex - ey*mx), width). The
-// pair is P[i]+s (U 0) and P[i]-s (U 1), V from P[i]+20.
-std::vector<NativeRibbonVertex> BuildNativeRibbonStrip(std::span<const NativeRibbonPoint> points,
-    const NativeFxVec4& colour,float width,const NativeFxVec3& eye,const NativeEffectConstants& k) {
+// sub_821A8090 and sub_821A8360 (the same arithmetic, the same order). D
+// starts as P1 - P0. For point i the segment is A = P[i], B = P[i+1], except
+// the last point, which reuses P[n-2]..P[n-1]. C = B - A, m = (C + D) * 0.5
+// per component (the x product is formed before the others, the stored copy
+// is unscaled - it is m that is used), D = C, e = A - eye and side =
+// SetLength((ey*mz - ez*my, ez*mx - mz*ex, my*ex - ey*mx), width(P[i])). The
+// pair is P[i]+s (U 0) and P[i]-s (U 1), both with P[i]'s V and colour(P[i]).
+template<class Point,class Colour,class Width>
+std::vector<NativeRibbonVertex> Strip(std::span<const Point> points,Colour colour,Width width,
+    const NativeFxVec3& eye,const NativeEffectConstants& k) {
   std::vector<NativeRibbonVertex> vertices;
   if(points.size()<2) return vertices;
   const size_t count=std::min<size_t>(points.size(),kNativeRibbonPointLimit);
@@ -81,12 +85,38 @@ std::vector<NativeRibbonVertex> BuildNativeRibbonStrip(std::span<const NativeRib
     side[2]=NativeFxMsub(m[1],e[0],f6);
     side[0]=NativeFxMsub(e[1],m[2],f8);
     side[1]=NativeFxMsub(e[2],m[0],f7);
-    side=NativeFxSetLength(side,width,k);
+    side=NativeFxSetLength(side,width(points[i]),k);
     const auto& p=points[i].position;
-    vertices.push_back({{NativeFxAdd(side[0],p[0]),NativeFxAdd(p[1],side[1]),NativeFxAdd(p[2],side[2])},{k.zero,points[i].v},colour});
-    vertices.push_back({{NativeFxSub(p[0],side[0]),NativeFxSub(p[1],side[1]),NativeFxSub(p[2],side[2])},{k.one,points[i].v},colour});
+    vertices.push_back({{NativeFxAdd(side[0],p[0]),NativeFxAdd(p[1],side[1]),NativeFxAdd(p[2],side[2])},{k.zero,points[i].v},colour(points[i])});
+    vertices.push_back({{NativeFxSub(p[0],side[0]),NativeFxSub(p[1],side[1]),NativeFxSub(p[2],side[2])},{k.one,points[i].v},colour(points[i])});
   }
   return vertices;
+}
+NativeFxVec4 PointColour(const NativeColourRibbonPoint& point) { return point.colour; }
+float PointWidth(const NativeColourRibbonPoint& point) { return point.width; }
+}
+// sub_821A8628: one colour and width per call, V from each point's +20.
+std::vector<NativeRibbonVertex> BuildNativeRibbonSegments(std::span<const NativeRibbonPoint> points,
+    const NativeFxVec4& colour,float width,const NativeFxVec3& eye,const NativeEffectConstants& k) {
+  return Segments(points,[&](const NativeRibbonPoint&) { return colour; },[&](const NativeRibbonPoint&) { return width; },eye,k);
+}
+// sub_821A8090: one colour and width per call, V from P[i]+20.
+std::vector<NativeRibbonVertex> BuildNativeRibbonStrip(std::span<const NativeRibbonPoint> points,
+    const NativeFxVec4& colour,float width,const NativeFxVec3& eye,const NativeEffectConstants& k) {
+  return Strip(points,[&](const NativeRibbonPoint&) { return colour; },[&](const NativeRibbonPoint&) { return width; },eye,k);
+}
+// sub_821A88E8 (loc_821A8994): f1 = lfs P0+32 per pair; the vertices of P0
+// copy P0+16..+28 and those of P1 P1+16..+28; V from P0+40 and P1+40.
+std::vector<NativeRibbonVertex> BuildNativeColourRibbonSegments(std::span<const NativeColourRibbonPoint> points,
+    const NativeFxVec3& eye,const NativeEffectConstants& k) {
+  return Segments(points,PointColour,PointWidth,eye,k);
+}
+// sub_821A8360 (loc_821A8458): f1 = lfs P[i]+32 (28(r30), r30 = P[i]+4), even
+// for the last point, whose segment is P[n-2]..P[n-1]; colour P[i]+16..+28 on
+// both vertices, V P[i]+40.
+std::vector<NativeRibbonVertex> BuildNativeColourRibbonStrip(std::span<const NativeColourRibbonPoint> points,
+    const NativeFxVec3& eye,const NativeEffectConstants& k) {
+  return Strip(points,PointColour,PointWidth,eye,k);
 }
 std::vector<std::pair<uint32_t,uint32_t>> NativeEffectDrawCalls(const NativeEffectDraw& draw) {
   std::vector<std::pair<uint32_t,uint32_t>> calls;
