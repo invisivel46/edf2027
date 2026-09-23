@@ -6794,8 +6794,20 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
     if(!manager) { ++absent_; return; }
     uint32_t order=shared_->model_order;
     NativeEffectCollection collection;
-    try { collection=CollectNativeEffectManager(reader_,manager,context.guest_context,order); }
+    // The ribbons' eye is the pass camera's (NativeEffectEyeFromView), not
+    // [8257C02C]+192: 821BE8D0, its only writer, does not run in this mode.
+    const auto& eye_view=native_scene_pass_camera->view;
+    try { collection=CollectNativeEffectManager(reader_,manager,context.guest_context,eye_view,order); }
     catch(const std::exception& error) { NativeFullFrameDeclined("effects",error.what()); return; }
+    // Diagnostics: how often the guest's +192 differs from the derived eye
+    // (stale in this mode unless something rewrote the pool for this view).
+    if(reader_.Word(kNativeEffectCameraGlobal)) {
+      const auto derived=NativeEffectEyeFromView(eye_view,ReadNativeFxFloat(reader_,kNativeEffectEyeScale));
+      const auto guest=ReadNativeEffectGuestEye(reader_);
+      bool same=true;
+      for(size_t i=0;i<3;++i) same=same && std::bit_cast<uint32_t>(derived[i])==std::bit_cast<uint32_t>(guest[i]);
+      if(!same) ++stale_eyes_;
+    }
     for(const auto slot:collection.unsupported_slots)
       if(unsupported_.insert(slot).second) {
         const auto* name=NativeEffectSlotName(slot);
@@ -6817,16 +6829,16 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
       }
     }
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} absent={}",
+      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} absent={} stale_guest_eye={}",
         frames_,manager,collection.visited,collection.culled,collection.hidden,collection.immediate.size(),drawn,
-        collection.items.size(),collection.undrawn_keys,collection.unsupported,absent_);
+        collection.items.size(),collection.undrawn_keys,collection.unsupported,absent_,stale_eyes_);
     shared_->effects=std::move(collection.items);
   }
  private:
   const edf::native::GuestReader reader_;
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   std::set<uint32_t> unsupported_;
-  uint64_t frames_=0,absent_=0;
+  uint64_t frames_=0,absent_=0,stale_eyes_=0;
 };
 // The frame's one transparent sequence (sub_821A3BA0): the models' mode-1/2
 // batches and the effects' filed items merged by key descending, filing order
@@ -6930,7 +6942,8 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
       if(member.hidden) continue;  // 821C0C00: lhz 64 nonzero returns.
       if(member.kind==NativeMapEffectKind::ElectricWire && member.mode==0) {
         try {
-          if(!inputs) inputs=ReadNativeEffectInputs(walk);
+          // The wire's eye is the pass camera's, as for the effects pass.
+          if(!inputs) inputs=ReadNativeEffectInputs(walk,native_scene_pass_camera->view);
           for(auto& draw:BuildNativeElectricWireDraws(walk,member.object,context.view.scene,*inputs,&wires)) pending.push_back(std::move(draw));
         } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); }
         continue;
@@ -7358,7 +7371,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // the guest view/projection globals (821A17F8/821A19F0 on 8257C02C) and
   // 82135530(device,1); native passes take the pass camera and
   // context.viewport. The view's guest listeners (ViewOverlays) therefore see
-  // those two as the previous guest writer left them.
+  // those two as the previous guest writer left them. The same holds for the
+  // eye 821A19F0 stores at [8257C02C]+192: the native effect and wire builders
+  // derive it from the pass camera's view (NativeEffectEyeFromView).
   bool BeginView(edf::native::NativeFrameContext& context) override {
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeBegin);
     const auto scene=context.view.scene;

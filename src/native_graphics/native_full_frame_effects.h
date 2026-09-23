@@ -42,9 +42,23 @@ NativeEffectConstants ReadNativeEffectConstants(const Reader& r) {
 }
 // Globals. [0x8257C034] is the effect-shader object every slot 4 passes as r3
 // to 821A7640/821A8628/821A8090; [0x8257C02C]+192 is the eye the ribbons face.
+//
+// The eye's one writer is sub_821A19F0(pool [8257C02C], view), whose one
+// caller is the scene begin 821BE8D0 (r4 = scene+96: the view the pass camera
+// holds). The full-frame renderer never runs 821BE8D0 (the render helper
+// 821A5080 is skipped and BeginView does not replicate the pool writes), so in
+// that mode [8257C02C]+192 is whatever the last guest-rendered view left: a
+// previous frame, a menu, or nothing. The native builders therefore derive the
+// eye from the pass camera's view (NativeEffectEyeFromView) and read +192 only
+// for diagnostics (ReadNativeEffectGuestEye). The guest readers of +192 are
+// 821A7E08 (the electric wire strip), 821A8090, 821A8360, 821A8628 and
+// 821A88E8; 821A8360 is also called by the guest view listener 820D3FD0.
 inline constexpr uint32_t kNativeEffectShaderGlobal=0x8257C034;
 inline constexpr uint32_t kNativeEffectCameraGlobal=0x8257C02C;
 inline constexpr uint32_t kNativeEffectEyeOffset=192;
+// 821A19F0's lfs f0,5084(lis -32256): the factor the rotated translation is
+// scaled by (-1.0 in the image).
+inline constexpr uint32_t kNativeEffectEyeScale=0x820013DC;
 // clEffectEtc02's slot 4 picks its blend from this byte: nonzero -> 1 (ONE/ONE).
 inline constexpr uint32_t kNativeEffectEtc02BlendGlobal=0x82554BF0;
 // clEffectEtc02's slot 4 decrements this word on every call (8217C4B0..C0) and
@@ -71,6 +85,31 @@ inline NativeFxVec3 NativeFxSetLength(const NativeFxVec3& v,float length,const N
   if(sum==k.zero) return {k.zero,k.zero,k.zero};
   const float scale=NativeFxDiv(length,NativeFxSqrt(sum));
   return {NativeFxMul(v[0],scale),NativeFxMul(v[1],scale),NativeFxMul(v[2],scale)};
+}
+// sub_821A19F0's eye, [pool+192..+204], from the row-vector view it is given
+// (the 16 words at scene+96, as NativeScenePassCamera::view holds them):
+//  - the 64 bytes are copied to the stack and 821C8750 transposes their upper
+//    3x3 in place (1<->4, 2<->8, 6<->9);
+//  - 821B0130(out, in = row 3 at +48..+56, untouched by the transpose, M') is
+//    the row vector times the transposed 3x3, in its instruction order;
+//  - x, y, z are each fmuls'd by [820013DC]; w is the view's +60, copied with
+//    them by the 16-byte ld/std pair.
+// Bit-identical to the guest's store for the same view words.
+inline NativeFxVec4 NativeEffectEyeFromView(const std::array<uint32_t,16>& view,float scale) {
+  const auto m=[&](size_t i) { return std::bit_cast<float>(view[i]); };
+  // M' after 821C8750: M'[0]=M[0], M'[1]=M[4], M'[2]=M[8], M'[4]=M[1],
+  // M'[5]=M[5], M'[6]=M[9], M'[8]=M[2], M'[9]=M[6], M'[10]=M[10].
+  const float in0=m(12),in1=m(13),in2=m(14);
+  float f8=NativeFxMul(m(6),in2);              // fmuls  f8,[M'+36],in2
+  float f7=NativeFxMul(m(10),in2);             // fmuls  f7,[M'+40],in2
+  const float f9=NativeFxMul(m(0),in0);        // fmuls  f9,[M'+0],in0
+  f8=NativeFxMadd(m(5),in1,f8);                // fmadds f8,[M'+20],in1,f8
+  f7=NativeFxMadd(m(9),in1,f7);                // fmadds f7,[M'+24],in1,f7
+  const float y=NativeFxMadd(m(4),in0,f8);     // fmadds f11,[M'+4],in0,f8
+  const float f13=NativeFxMadd(m(1),in1,f9);   // fmadds f13,[M'+16],in1,f9
+  const float z=NativeFxMadd(m(8),in0,f7);     // fmadds f12,[M'+8],in0,f7
+  const float x=NativeFxMadd(in2,m(2),f13);    // fmadds f0,in2,[M'+32],f13
+  return {NativeFxMul(x,scale),NativeFxMul(y,scale),NativeFxMul(z,scale),m(15)};
 }
 template<class Reader> float ReadNativeFxFloat(const Reader& r,uint32_t at) { return std::bit_cast<float>(r.Word(at)); }
 template<class Reader> NativeFxVec3 ReadNativeFxVec3(const Reader& r,uint32_t at) {
@@ -328,13 +367,23 @@ struct NativeEffectInputs {
   NativeFxVec3 eye{};
   NativeEffectConstants k{};
 };
+// The inputs for the view whose row-vector view matrix is `view` (the pass
+// camera's view: the words 821BE8D0 hands 821A19F0). The eye is derived from
+// it, never read from [8257C02C]+192, which the full-frame renderer leaves as
+// the last guest-rendered view wrote it.
 template<class Reader>
-NativeEffectInputs ReadNativeEffectInputs(const Reader& r) {
+NativeEffectInputs ReadNativeEffectInputs(const Reader& r,const std::array<uint32_t,16>& view) {
   NativeEffectInputs in;
   in.effect=r.Word(kNativeEffectShaderGlobal);
-  in.eye=ReadNativeFxVec3(r,r.Add(r.Word(kNativeEffectCameraGlobal),kNativeEffectEyeOffset));
+  const auto eye=NativeEffectEyeFromView(view,ReadNativeFxFloat(r,kNativeEffectEyeScale));
+  in.eye={eye[0],eye[1],eye[2]};
   in.k=ReadNativeEffectConstants(r);
   return in;
+}
+// What [8257C02C]+192..+204 holds now: diagnostics only (the stale-eye count).
+template<class Reader>
+NativeFxVec4 ReadNativeEffectGuestEye(const Reader& r) {
+  return ReadNativeFxVec4(r,r.Add(r.Word(kNativeEffectCameraGlobal),kNativeEffectEyeOffset));
 }
 
 // The points 821A8628 reads for `count` (r5): none below 2 (signed), else
@@ -669,12 +718,13 @@ struct NativeEffectList {
 // No byte +36 test exists on this path: clGameObject_Manager::slot1 reads +36,
 // but that is the update walk, not the render walk.
 // `order` is the pass-wide filing counter (see NativeTransparentItem).
+// `eye_view` is the pass camera's view (ReadNativeEffectInputs).
 template<class Reader>
-NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32_t context,uint32_t& order,
-                                            std::unordered_set<uint32_t>* visited=nullptr) {
+NativeEffectCollection CollectNativeEffects(const Reader& r,uint32_t list,uint32_t context,const std::array<uint32_t,16>& eye_view,
+                                            uint32_t& order,std::unordered_set<uint32_t>* visited=nullptr) {
   NativeEffectCollection out;
   const auto view=ReadNativeSceneVisibilityView(r,context);
-  const auto in=ReadNativeEffectInputs(r);
+  const auto in=ReadNativeEffectInputs(r,eye_view);
   auto node=r.Word(r.Add(list,NativeEffectList::first));
   const auto end=r.Word(r.Add(list,NativeEffectList::end));
   for(uint32_t guard=0;node!=end;node=r.Word(r.Add(node,NativeEffectList::next))) {
@@ -730,9 +780,10 @@ std::vector<NativeTransparentItem> NativeEffectTransparentItems(std::vector<Nati
   return out;
 }
 template<class Reader>
-NativeEffectCollection CollectNativeEffectManager(const Reader& r,uint32_t manager,uint32_t context,uint32_t& order,
+NativeEffectCollection CollectNativeEffectManager(const Reader& r,uint32_t manager,uint32_t context,
+                                                  const std::array<uint32_t,16>& eye_view,uint32_t& order,
                                                   std::unordered_set<uint32_t>* visited=nullptr) {
   if(r.Word(manager)!=NativeEffectList::manager_vtable) throw std::runtime_error("not a clEffectObjectManager");
-  return CollectNativeEffects(r,r.Add(manager,NativeEffectList::manager_offset),context,order,visited);
+  return CollectNativeEffects(r,r.Add(manager,NativeEffectList::manager_offset),context,eye_view,order,visited);
 }
 }

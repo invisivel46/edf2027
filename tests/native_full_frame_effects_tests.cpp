@@ -473,18 +473,72 @@ std::vector<Call> Transcribe(const Reader& m,uint32_t object,NativeEffectClass t
   }
   return calls;
 }
+// --- The eye's writer: 821BE8D0 -> 821A19F0(pool, scene+96) ------------------
+// sub_821C8750 (recomp.79.cpp): the upper 3x3 transposed in place.
+void T_Transpose3(const Reader& m,uint32_t r3) {
+  double f0=lfs(m,r3+16),f13=lfs(m,r3+4); stfs(m,r3+16,f13); stfs(m,r3+4,f0);
+  f0=lfs(m,r3+32); f13=lfs(m,r3+8); stfs(m,r3+32,f13); stfs(m,r3+8,f0);
+  f0=lfs(m,r3+36); f13=lfs(m,r3+24); stfs(m,r3+36,f13); stfs(m,r3+24,f0);
+}
+// sub_821B0130 (r3 out, r4 vector, r5 matrix): every load precedes the stores.
+void T_Rotate(const Reader& m,uint32_t r3,uint32_t r4,uint32_t r5) {
+  double f0=lfs(m,r4+8),f8=lfs(m,r5+36); f8=F(f8*f0);
+  double f13=lfs(m,r4+4),f7=lfs(m,r5+40),f6=lfs(m,r5+20); f7=F(f7*f0);
+  double f12=lfs(m,r4),f9=lfs(m,r5); f9=F(f9*f12);
+  double f11=lfs(m,r5+4),f5=lfs(m,r5+24),f10=lfs(m,r5+8);
+  f8=fmadds(f6,f13,f8); f7=fmadds(f5,f13,f7); f11=fmadds(f11,f12,f8);
+  f8=lfs(m,r5+16); f13=fmadds(f8,f13,f9); f12=fmadds(f10,f12,f7);
+  f10=lfs(m,r5+32); stfs(m,r3+4,f11); stfs(m,r3+8,f12);
+  f0=fmadds(f0,f10,f13); stfs(m,r3,f0);
+}
+// sub_821A19F0 (recomp.37.cpp:7582), the eye half: r31 = pool, r30 = view,
+// r1 = S. The view is copied to S+144 (so S+192 is its row 3), transposed,
+// row 3 rotated by it into S+192, x/y/z scaled by [820013DC], and the 16
+// bytes at S+192 copied to pool+192 by ld/ld, std/std.
+void T_821A19F0Eye(const Reader& m,uint32_t r31,uint32_t r30,uint32_t S) {
+  copy_words(m,S+144,r30,64);
+  T_Transpose3(m,S+144);
+  T_Rotate(m,S+192,S+192,S+144);
+  const double f0=lfs(m,kNativeEffectEyeScale);
+  for(uint32_t at:{192u,196u,200u}) { const double f13=F(lfs(m,S+at)*f0); stfs(m,S+at,f13); }
+  copy_words(m,r31+192,S+192,16);
+}
 // --- Fixture ------------------------------------------------------------------
 std::mt19937 rng(20260922);
 float Random(float lo,float hi) { return std::uniform_real_distribution<float>(lo,hi)(rng); }
+constexpr uint32_t kScene=0x40004000,kEyeStack=0x6C000000;
+// A camera's row-vector view: rotation R from yaw/pitch/roll, row 3 = -eye*R
+// (computed in float, as a camera would), +60 = 1.
+std::array<float,16> RigidView(const std::array<float,3>& eye,float yaw,float pitch,float roll) {
+  const float cy=std::cos(yaw),sy=std::sin(yaw),cp=std::cos(pitch),sp=std::sin(pitch),cr=std::cos(roll),sr=std::sin(roll);
+  const float r[3][3]={{cy*cr+sy*sp*sr,cp*sr,-sy*cr+cy*sp*sr},{-cy*sr+sy*sp*cr,cp*cr,sy*sr+cy*sp*cr},{sy*cp,-sp,cy*cp}};
+  std::array<float,16> v{};
+  for(int i=0;i<3;++i) for(int j=0;j<3;++j) v[size_t(i*4+j)]=r[i][j];
+  for(int j=0;j<3;++j) v[size_t(12+j)]=-(eye[0]*r[0][j]+eye[1]*r[1][j]+eye[2]*r[2][j]);
+  v[15]=1;
+  return v;
+}
+std::array<uint32_t,16> ViewWords(const Reader& m,uint32_t scene=kScene) {
+  std::array<uint32_t,16> words{};
+  for(uint32_t i=0;i<16;++i) words[i]=m.Word(scene+96+i*4);
+  return words;
+}
+// The pass camera's view at scene+96 and the eye 821A19F0 stores for it.
+void SetView(const Reader& m,const std::array<float,16>& view) {
+  for(uint32_t i=0;i<16;++i) m.StoreFloat(kScene+96+i*4,view[i]);
+  T_821A19F0Eye(m,kCamera,kScene+96,kEyeStack);
+}
 Reader MakeMemory() {
   Reader m;
   const std::pair<uint32_t,float> constants[]={{A::zero,0.f},{A::one,1.f},{A::half,.5f},{A::quarter,.25f},
     {A::three_quarters,.75f},{A::fifth,.2f},{A::twelfth,0.0833333358f},{A::five,5.f},{A::web_scale,2.6f},
     {A::half_pi,1.57079637f},{A::pi,3.14159274f},{A::three_half_pi,4.71238899f}};
   for(const auto& [at,value]:constants) m.StoreFloat(at,value);
+  m.StoreWord(kNativeEffectEyeScale,0xbf800000u);  // -1.0, as guest_image.bin holds it
   m.StoreWord(kNativeEffectShaderGlobal,kEffect);
   m.StoreWord(kNativeEffectCameraGlobal,kCamera);
-  m.StoreFloat(kCamera+192,Random(-500,500)); m.StoreFloat(kCamera+196,Random(-50,50)); m.StoreFloat(kCamera+200,Random(-500,500));
+  m.Map(kEyeStack);
+  SetView(m,RigidView({Random(-500,500),Random(-50,50),Random(-500,500)},Random(-3.1f,3.1f),Random(-1.4f,1.4f),Random(-.3f,.3f)));
   m.StoreByte(0x82554BF0,1);
   m.Map(kStack); m.Map(kScratch);
   return m;
@@ -521,8 +575,16 @@ void Compare(const std::vector<NativeEffectDraw>& draws,const std::vector<Call>&
 void CheckClass(const Reader& m,uint32_t slot4,const std::string& name) {
   const auto type=ClassifyNativeEffect(slot4);
   Require(type!=NativeEffectClass::Unknown,name+": unclassified");
-  const auto inputs=ReadNativeEffectInputs(m);
+  // The native side runs as in full-frame mode: [8257C02C]+192 holds some
+  // other view's eye (821BE8D0 has not run), and the builder takes its eye
+  // from the pass camera's view. The transcription then reads the eye
+  // 821A19F0 stored for that view, as the guest helper path would.
+  std::array<uint32_t,4> saved{};
+  for(uint32_t i=0;i<4;++i) { saved[i]=m.Word(kCamera+192+i*4); m.StoreFloat(kCamera+192+i*4,Random(-900,900)); }
+  const auto inputs=ReadNativeEffectInputs(m,ViewWords(m));
   const auto draws=BuildNativeEffectDraws(m,kObject,type,inputs);
+  for(uint32_t i=0;i<4;++i) m.StoreWord(kCamera+192+i*4,saved[i]);
+  Require(std::bit_cast<std::array<uint32_t,3>>(inputs.eye)==std::array<uint32_t,3>{saved[0],saved[1],saved[2]},name+": native eye");
   Compare(draws,Transcribe(m,kObject,type),name);
 }
 // --- Builders against their transcriptions ------------------------------------
@@ -625,7 +687,7 @@ void TestBuilders() {
       m.StoreWord(kObject+544,20); m.StoreWord(kObject+612,3); m.StoreWord(kObject+620,20);
       const auto before=m.Read(kObject,4096);
       NativeEffectItem item; item.object=kObject; item.slot4=slot; item.type=ClassifyNativeEffect(slot);
-      item.draws=BuildNativeEffectDraws(m,kObject,item.type,ReadNativeEffectInputs(m));
+      item.draws=BuildNativeEffectDraws(m,kObject,item.type,ReadNativeEffectInputs(m,ViewWords(m)));
       CommitNativeEffectDraw(m,item);
       Require(!item.draws.empty() && m.Read(kObject,4096)==before,"slot 4 leaves the object as it was");
     }
@@ -635,7 +697,7 @@ void TestBuilders() {
     auto m=MakeMemory();
     FillObject(m,kObject,0x8217ECB8); m.StoreWord(kObject+612,kNativeEffectEtc01EntryLimit+1);
     bool threw=false;
-    try { BuildNativeEffectDraws(m,kObject,NativeEffectClass::EffectEtc01,ReadNativeEffectInputs(m)); } catch(const std::exception&) { threw=true; }
+    try { BuildNativeEffectDraws(m,kObject,NativeEffectClass::EffectEtc01,ReadNativeEffectInputs(m,ViewWords(m))); } catch(const std::exception&) { threw=true; }
     Require(threw,"clEffectEtc01 entry count limit");
   }
 }
@@ -810,7 +872,7 @@ void TestCollection() {
   }
   uint32_t order=40;
   std::unordered_set<uint32_t> visited;
-  const auto out=CollectNativeEffectManager(m,manager,context,order,&visited);
+  const auto out=CollectNativeEffectManager(m,manager,context,ViewWords(m),order,&visited);
   Require(out.visited==objects.size() && out.duplicates==1 && out.hidden==1 && out.culled==2 && out.undrawn_keys==1 &&
           out.unknown_modes==1 && out.unsupported==1 && out.unsupported_slots==std::vector<uint32_t>{0x82000000},"collection counters");
   Require(out.immediate.size()==1 && out.immediate[0].object==objects[6],"mode 0 runs at once");
@@ -869,8 +931,46 @@ void TestSharedActivation() {
   more.texture=0x56;
   Require(!NativeEffectDrawsShareActivation(particles,more),"particle draws with other textures shared their activation");
 }
+// --- The eye: NativeEffectEyeFromView against 821A19F0 --------------------------
+void TestEye() {
+  auto m=MakeMemory();
+  const float scale=std::bit_cast<float>(m.Word(kNativeEffectEyeScale));
+  std::uniform_int_distribution<uint32_t> any;
+  for(int round=0;round<4000;++round) {
+    std::array<float,16> view{};
+    std::array<float,3> eye{Random(-4000,4000),Random(-200,800),Random(-4000,4000)};
+    if(round%4==3) {
+      // Any view words at all, NaNs and infinities included: still the guest's bits.
+      for(auto& v:view) v=std::bit_cast<float>(round%8==3?any(rng):std::bit_cast<uint32_t>(Random(-1e4f,1e4f)));
+    } else {
+      view=RigidView(eye,Random(-3.2f,3.2f),Random(-1.5f,1.5f),round%4?Random(-.5f,.5f):0.f);
+      if(round%4==2) view[15]=Random(-2,2);  // w is copied, never computed
+    }
+    for(uint32_t i=0;i<4;++i) m.StoreWord(kCamera+192+i*4,0xDEADBEEF);
+    SetView(m,view);
+    const auto words=ViewWords(m);
+    const auto derived=NativeEffectEyeFromView(words,scale);
+    const auto guest=ReadNativeEffectGuestEye(m);
+    const auto tag=" (round "+std::to_string(round)+")";
+    Require(std::bit_cast<std::array<uint32_t,4>>(derived)==std::bit_cast<std::array<uint32_t,4>>(guest),"eye differs from 821A19F0's"+tag);
+    Require(std::bit_cast<std::array<uint32_t,3>>(ReadNativeEffectInputs(m,words).eye)==
+            std::array<uint32_t,3>{m.Word(kCamera+192),m.Word(kCamera+196),m.Word(kCamera+200)},"inputs eye"+tag);
+    if(round%4!=3) {
+      // For a rigid view it is the camera position the view was built from.
+      for(size_t i=0;i<3;++i)
+        Require(std::fabs(derived[i]-eye[i])<=1e-3f*std::max(1.f,std::fabs(eye[i])),"eye is not the camera position"+tag);
+    }
+  }
+  // The eye follows the view, not the pool: changing +192 changes nothing.
+  const auto words=ViewWords(m);
+  const auto before=ReadNativeEffectInputs(m,words).eye;
+  m.StoreFloat(kCamera+192,123.f); m.StoreFloat(kCamera+196,-45.f); m.StoreFloat(kCamera+200,6.f);
+  Require(std::bit_cast<std::array<uint32_t,3>>(ReadNativeEffectInputs(m,words).eye)==std::bit_cast<std::array<uint32_t,3>>(before),
+          "inputs read the pool's eye");
+}
 int main() {
   try {
+    TestEye();
     TestSharedActivation();
     TestExpansion();
     TestBuilders();

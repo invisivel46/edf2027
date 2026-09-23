@@ -465,11 +465,30 @@ void BuildWireWorld(const ImageMemory& m,uint32_t context,uint32_t scene,uint32_
   for(uint32_t i=0;i<26;++i) m.StoreFloat(scene+288+i*4,frustum[i]);
   m.StoreWord(context+16,scene);
   m.StoreWord(0x8257C034,effect); m.StoreWord(0x8257C02C,camera);
-  m.StoreFloat(camera+192,-3.5f); m.StoreFloat(camera+196,7.25f); m.StoreFloat(camera+200,-11.0f); m.StoreFloat(camera+204,1);
+  // The eye 821BE8D0 -> 821A19F0 would store for this view (the helper is
+  // checked bit for bit against a transcription of 821A19F0 in
+  // native_full_frame_effects_tests); the guest transcription reads it here.
+  m.StoreWord(kNativeEffectEyeScale,0xbf800000u);  // -1.0, as guest_image.bin holds it
+  std::array<uint32_t,16> words{};
+  for(uint32_t i=0;i<16;++i) words[i]=std::bit_cast<uint32_t>(view[i]);
+  const auto eye=NativeEffectEyeFromView(words,-1.f);
+  for(uint32_t i=0;i<4;++i) m.StoreFloat(camera+192+i*4,eye[i]);
   // lfs constants, as guest_image.bin holds them.
   m.StoreWord(0x820009A4,0x00000000u); m.StoreWord(0x820008CC,0x3f800000u); m.StoreWord(0x820008D4,0x3f000000u);
   m.StoreWord(0x82002710,0x47afc800u); m.StoreWord(0x82002714,0x3de38e39u); m.StoreWord(0x82002718,0x3eb2b8c3u);
   m.StoreWord(0x8200271C,0x3cf5c28fu);
+}
+// The native inputs for the scene's view: the eye from the pass camera's view
+// words (scene+96), never from [8257C02C]+192.
+NativeEffectInputs WireInputs(const ImageMemory& m,uint32_t scene) {
+  std::array<uint32_t,16> view{};
+  for(uint32_t i=0;i<16;++i) view[i]=m.Word(scene+96+i*4);
+  return ReadNativeEffectInputs(m,view);
+}
+// A stale guest eye (what the full-frame renderer leaves at +192): the native
+// builders must not see it.
+void StaleGuestEye(const ImageMemory& m,uint32_t camera) {
+  m.StoreFloat(camera+192,-3.5f); m.StoreFloat(camera+196,7.25f); m.StoreFloat(camera+200,-11.0f); m.StoreFloat(camera+204,1);
 }
 void WireRecord(const ImageMemory& m,uint32_t record,bool enabled,std::array<float,3> a,std::array<float,3> b,
     std::array<float,3> centre,float radius,float offset) {
@@ -491,8 +510,9 @@ void TestElectricWire() {
   m.StoreWord(wire+388,records); m.StoreWord(wire+392,records+5*96);
   const auto guest=Guest820B8D28(m,wire,context,stack,inner);
   Require(guest.size()==2,"guest transcription draw count");
+  StaleGuestEye(m,camera);  // full-frame mode: +192 left by some other view
   NativeElectricWireStats stats;
-  const auto draws=BuildNativeElectricWireDraws(m,wire,scene,ReadNativeEffectInputs(m),&stats);
+  const auto draws=BuildNativeElectricWireDraws(m,wire,scene,WireInputs(m,scene),&stats);
   Require(stats.records==5 && stats.disabled==1 && stats.distant==1 && stats.culled==1 && stats.drawn==2,"native wire statistics");
   Require(draws.size()==guest.size(),"native wire draw count");
   for(size_t i=0;i<draws.size();++i) {
@@ -525,7 +545,7 @@ void TestElectricWire() {
   // A torn record vector is refused, not walked.
   m.StoreWord(wire+392,records+5*96+4);
   bool refused=false;
-  try { BuildNativeElectricWireDraws(m,wire,scene,ReadNativeEffectInputs(m)); } catch(const std::exception&) { refused=true; }
+  try { BuildNativeElectricWireDraws(m,wire,scene,WireInputs(m,scene)); } catch(const std::exception&) { refused=true; }
   Require(refused,"torn wire vector accepted");
 }
 // NativeElectricWirePoints as first written: the sag and swing sines taken at
@@ -615,7 +635,7 @@ void TestElectricWireRandomized() {
     m.StoreWord(wire+388,records); m.StoreWord(wire+392,records+count*96);
     const auto guest=Guest820B8D28(m,wire,context,stack,inner);
     NativeElectricWireStats stats;
-    const auto draws=BuildNativeElectricWireDraws(m,wire,scene,ReadNativeEffectInputs(m),&stats);
+    const auto draws=BuildNativeElectricWireDraws(m,wire,scene,WireInputs(m,scene),&stats);
     Require(draws.size()==guest.size() && stats.drawn==draws.size() && stats.records==count &&
       stats.disabled+stats.distant+stats.culled+stats.drawn==count,"randomized wire draw count");
     for(size_t d=0;d<draws.size();++d)
@@ -626,7 +646,7 @@ void TestElectricWireRandomized() {
   // An empty record vector draws nothing and reads no record.
   m.StoreWord(wire+392,records);
   NativeElectricWireStats none;
-  Require(BuildNativeElectricWireDraws(m,wire,scene,ReadNativeEffectInputs(m),&none).empty() && !none.records,"empty wire drew");
+  Require(BuildNativeElectricWireDraws(m,wire,scene,WireInputs(m,scene),&none).empty() && !none.records,"empty wire drew");
 }
 // The walk's inputs: the manager on the helper's world list, then its members
 // in list order with their route words; nothing written.
