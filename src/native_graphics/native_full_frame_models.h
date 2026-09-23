@@ -424,7 +424,9 @@ inline NativeSceneMaterialPassState NativeFullFrameModelBaseState(const NativeFu
 // record, batch, layout) (NativeFullFrameModelSourceTable) and per draw state,
 // and asks again only for draw states new at that generation. It must advance
 // whenever either provider could return something else (a rebuilt program,
-// refreshed constant values, reloaded geometry). Without it every draw
+// refreshed constant values, reloaded geometry), except a program that
+// NativeFullFrameModelSameProgram finds equivalent to the one it held, which
+// Build uses exactly as it would use the new one. Without it every draw
 // fetches every frame. Missing answers are never kept. Cache rows themselves
 // are Build's own state and take no hold.
 struct NativeFullFrameModelSources {
@@ -440,6 +442,19 @@ struct NativeFullFrameModelSources {
   std::function<void(const NativeModelBatchLayout&,uint32_t pass,const std::pair<std::shared_ptr<const NativeSceneGroupMaterial>,
     std::shared_ptr<const NativeIndexedMesh::RetainedDraw>>& sources)> audit;
 };
+// Whether Build makes exactly the same frame from the published program `now`
+// as from `held`: the same program object, group and revision, and the same
+// constants except for the register values of the pass-owned globals
+// (NativeScenePassOwnedConstant: the camera matrices and the world animation),
+// which the pass replaces whole before any use (PassConstants: the pass camera
+// and animation, or the same throw for the same extent). The provider re-reads
+// every constant live, and the guest pool holds the camera of the render, so
+// without this a moving camera would re-source every drawn item each render.
+bool NativeFullFrameModelSameProgram(const NativeSceneGroupMaterial& held,const NativeSceneGroupMaterial& now);
+inline bool NativeFullFrameModelSameProgram(const std::shared_ptr<const NativeSceneGroupMaterial>& held,
+    const std::shared_ptr<const NativeSceneGroupMaterial>& now) {
+  return held==now || (held && now && NativeFullFrameModelSameProgram(*held,*now));
+}
 // Build's stages, reported as each begins (the host's sub-phase timings):
 // visibility (plan), programs (program and geometry sources of every drawn
 // item), resolve (materials and scene objects); Done ends the last.
@@ -494,8 +509,13 @@ struct NativeFullFrameModelFrame {
       scissor=0,palette=0,failed=0,cache_hits=0,captures=0,palettes=0,source_hits=0,source_fetches=0,
       programs=0,geometries=0,reused=0,derived=0,sourced=0,rows=0,camera_rows=0,
       blended=0,  // Drawn items whose pose or world is blended this frame (NativeRenderPoseBlender).
-      object_constants=0,  // Draw objects made this frame with per-object constants bound (a capture each).
+      object_constants=0,  // Draw objects made this frame with per-object constants bound.
       carried=0,           // Of those, draws binding a value another slot 4 stored (the pool carry).
+      // Rigid per-object materials made this frame: patched from their row's
+      // object capture (NativeFullFrameModelRowState::objects, one each per
+      // row and bound set), and full captures (reuse off, or a row whose
+      // bound globals cannot be patched).
+      object_patches=0,object_captures=0,
       reseeds=0;           // Pool names taken again from the guest pool (guest_frames moved).
   };
   NativeFullFrameModelPlan plan;
@@ -533,6 +553,10 @@ struct NativeFullFrameModelDrawState {
   // effective constants); empty when its material reads none. Another set
   // makes the object again.
   std::vector<NativeSceneMaterialInputs::Constant> bound;
+  // The row's per-object material the object was made with (a rigid draw's
+  // NativeFullFrameModelRowState::ObjectMaterial), held so the row keeps it
+  // while any draw state may make its object again; null otherwise.
+  std::shared_ptr<const void> patched;
 };
 struct NativeFullFrameModelItemState {
   std::shared_ptr<const NativeModelLayout> layout;
@@ -588,8 +612,37 @@ struct NativeFullFrameModelRowState {
   bool scissor=false;
   // Indexes into constants of the globals whose names the pool carry knows
   // (at names version object_names), which a draw's pool constants bind.
+  // object_patchable: no other constant of the row binds a variable of one
+  // of those names (a local of the name, a second global): a rigid draw's
+  // material is then its row's with only those variables rebound.
   std::vector<uint32_t> object_slots;
   uint64_t object_names=0;
+  bool object_patchable=false;
+  // A rigid row's per-object materials: Capture of its constants with a
+  // draw's bound pool constants replaced is, byte for byte, the row's
+  // capture with only those variables rebound (NativeScenePaletteCapture:
+  // for a program the rigid capture accepts, the palette capture is the same
+  // capture). objects is that capture of the row's constants, made at the
+  // first such draw against the row's capture `objects_for` (the capture's
+  // image holds no camera, so it serves every frame the row's capture is
+  // current); each distinct bound set's interned material is kept in
+  // `object_materials` (by a hash of the set) while it is used, and shared by
+  // every draw that binds the same values, as the adapter's intern shares them.
+  // One no draw state holds (NativeFullFrameModelDrawState::patched) and no
+  // draw used last frame or this one is dropped.
+  struct ObjectMaterial {
+    std::vector<NativeSceneMaterialInputs::Constant> bound;
+    NativeSceneMaterialCapture capture;
+    uint64_t used=0;  // The frame (frames_) it last served.
+    // Until interned (Build interns an emit's new ones in one hold), the
+    // objects made from it, which then take the interned material.
+    bool interned=false;
+    std::vector<NativeSceneInstance*> waiting;
+  };
+  std::shared_ptr<NativeScenePaletteCapture> objects;
+  std::shared_ptr<const NativeSceneMaterial> objects_for;
+  std::unordered_map<uint64_t,std::vector<std::shared_ptr<ObjectMaterial>>> object_materials;
+  size_t object_material_count=0;
 };
 // Cross-frame state: object ids, the program/geometry side table, the
 // material cache, the material rows and the draw states. Materials are
@@ -623,7 +676,11 @@ struct NativeFullFrameModelRowState {
 //   (a recapture, a new resolve) or the pool constants it binds moved (only a
 //   draw whose material reads one binds any). Every other draw carries last
 //   frame's object, whose material, geometry and world are what a fresh
-//   build makes; only the batch views (the row cameras) are per frame.
+//   build makes; only the batch views (the row cameras) are per frame. A
+//   remade object is a world over its row's result: a rigid draw's row
+//   material, or with pool constants bound the row's per-object material for
+//   those values (patched once per row and value set, kept while used; see
+//   NativeFullFrameModelRowState::objects), a skinned draw's palette capture.
 // The output is a fresh instance's for the same inputs, except that carried
 // objects keep their ids. Not synchronized.
 class NativeFullFrameModels {

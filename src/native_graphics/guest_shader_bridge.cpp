@@ -7267,7 +7267,10 @@ struct NativeFullFrameModelsShared {
 // slices, for every program and geometry a current draw state holds, so a
 // constant value moved by a step, by a 821A4DE8 listener on a render-only
 // iteration or by anything else is seen at the next frame, and frames where
-// nothing moved re-source nothing. Guest memory is read, never called.
+// nothing moved re-source nothing. A program republished with only its
+// pass-owned globals moved (the camera the guest pool holds, which moves
+// every render; NativeFullFrameModelSameProgram) is not a change: the pass
+// replaces those values whole. Guest memory is read, never called.
 // Between changes each draw carries its scene object and only the camera
 // moves. The snapshot is the render registry's (fed on with the full
 // frame); before its first tick there is none and this records nothing.
@@ -7397,9 +7400,11 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       // every program and geometry a current row holds, returns another
       // object (a rebuilt program, refreshed constant values, reloaded
       // geometry), whatever wrote the inputs and whether or not a simulation
-      // step ran. Rows are fetched only then, and served from the results
-      // just asked for. The providers are called directly here, the locks
-      // held once per chunk.
+      // step ran; a program equivalent to the one held
+      // (NativeFullFrameModelSameProgram: only pass-owned values moved) is
+      // not a change, and the held one keeps serving. Rows are fetched only
+      // then, and served from the results just asked for. The providers are
+      // called directly here, the locks held once per chunk.
       [&] {
         if(!reuse) return kNativeFullFrameModelUnversioned;
         return source_memo_.Validate(
@@ -7408,7 +7413,10 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
           [&](const GeometryInput& input) {
             return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,input.first,input.second),input.first);
           },
-          [&](const auto& work) { slices(work); });
+          [&](const auto& work) { slices(work); },
+          [](const std::shared_ptr<const NativeSceneGroupMaterial>& held,const std::shared_ptr<const NativeSceneGroupMaterial>& now) {
+            return NativeFullFrameModelSameProgram(held,now);
+          });
       }};
     // edf_native_model_source_audit: every draw state Build keeps at the
     // current generation (not re-sourced this frame) is fetched afresh from
@@ -7422,8 +7430,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
           const auto program=program_from(record,probe);
           const auto geometry=program && program->program?fetch_geometry(batch,record):nullptr;
           if(!program || !program->program) mismatch="program now missing";
-          else if(!kept.first || (program!=kept.first &&
-                  (program->program!=kept.first->program || !(program->constants==kept.first->constants))))
+          else if(!NativeFullFrameModelSameProgram(kept.first,program))
             mismatch=kept.first && program->program==kept.first->program?"constant values moved":"program rebuilt";
           else if(geometry!=kept.second) mismatch=geometry?"geometry reloaded":"geometry now missing";
         } catch(const std::exception&) { mismatch="refetch threw"; }
@@ -7481,18 +7488,19 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} attachments={} no_attachment={} items={} drawn={} blended={} interpolate={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} object_constants={} carried={} calls={} unlisted={} gathered={} pool_reseeds={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
-        "source_generation={} source_memo={} source_validated={} source_advances={}/{}/{}/{} source_reuses={} source_audits={}/{} source_probe_failures={}",
+      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} attachments={} no_attachment={} items={} drawn={} blended={} interpolate={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} object_constants={} object_materials={}/{} carried={} calls={} unlisted={} gathered={} pool_reseeds={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
+        "source_generation={} source_memo={} source_validated={} source_advances={}/{}/{}/{} source_equivalents={} source_reuses={} source_audits={}/{} source_probe_failures={}",
         frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
         planned.attachments,planned.no_attachment,
         built.items,built.drawn,built.blended,pass.motion.interpolate,built.draws,statistics.draws,built.resolves,built.captures,built.palettes,built.cache_hits,built.memo_hits,
-        built.reused,built.derived,built.object_constants,built.carried,planned.calls,planned.unlisted,pass.gather.objects.size(),built.reseeds,
+        built.reused,built.derived,built.object_constants,built.object_patches,built.object_captures,built.carried,planned.calls,planned.unlisted,pass.gather.objects.size(),built.reseeds,
         built.sourced,built.programs,built.geometries,built.camera_rows,built.rows,
         built.source_hits,built.source_fetches,models_.material_cache().size(),models_.source_table().size(),
         models_.item_states(),models_.row_states(),built.missing_program,built.missing_geometry,built.failed,broken_,
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()),
         source_memo_.generation(),source_memo_.size(),source_memo_.stats().validated,source_memo_.stats().advances,
-        source_memo_.stats().host_changes,source_memo_.stats().changes,source_memo_.stats().prunes,source_memo_.stats().reuses,
+        source_memo_.stats().host_changes,source_memo_.stats().changes,source_memo_.stats().prunes,source_memo_.stats().equivalents,
+        source_memo_.stats().reuses,
         source_audits_,source_mismatches_,source_probe_failures_);
   }
  private:

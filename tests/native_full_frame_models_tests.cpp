@@ -580,6 +580,42 @@ void SourceMemo() {
   bounded.ProgramFor(0x3000,[&] { return programs.at(0x3000); }); bounded.ProgramFor(0x3100,[&] { return programs.at(0x3100); });
   Require(bound()==held,"one stale result of three is within twice the live set");
   Require(bound()==held+1 && bounded.stats().prunes==1,"a memo whose results went stale past its limit is not pruned");
+  // An equivalent result (same() accepts it) is not a change: the remembered
+  // object keeps serving, and a non-equivalent one still advances.
+  Memo equivalent(16,64,0);
+  const auto equal_values=[&] {
+    return equivalent.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },
+      [&](uint32_t address) { return geometry.at(address); },[](const auto& work) { work(); },
+      [](const Program& held,const Program& now) { return *held==*now; });
+  };
+  const auto kept=equal_values();
+  const auto remembered=equivalent.ProgramFor(0x3000,[&] { return programs.at(0x3000); });
+  programs[0x3000]=std::make_shared<const int>(*remembered);
+  Require(equal_values()==kept && equivalent.stats().equivalents==1 && equivalent.ProgramFor(0x3000,[&] { return nullptr; })==remembered,
+    "an equivalent program advanced or replaced the remembered one");
+  programs[0x3000]=std::make_shared<const int>(*remembered+1);
+  Require(equal_values()==kept+1 && equivalent.ProgramFor(0x3000,[&] { return nullptr; })==programs[0x3000],
+    "a program with another value did not advance");
+  // NativeFullFrameModelSameProgram: only pass-owned globals' values may differ.
+  {
+    auto program=std::make_shared<NativeSceneMaterialProgram>();
+    NativeSceneGroupMaterial a;
+    a.group=0x3000; a.program=program;
+    a.constants={{false,"g_mViewProjection",std::vector<uint8_t>(64,1),true},{false,"g_mView",std::vector<uint8_t>(64,1),true},
+      {false,"m_WaterTime",std::vector<uint8_t>(16,1),true},{false,"g_Time",std::vector<uint8_t>(16,1),true},
+      {false,"g_mViewProjection",std::vector<uint8_t>(64,1),false},{true,"tint",std::vector<uint8_t>(16,1),false}};
+    const auto with=[&](size_t index,auto&& change) { auto b=a; change(b.constants[index]); return NativeFullFrameModelSameProgram(a,b); };
+    Require(NativeFullFrameModelSameProgram(a,a),"a program is its own equivalent");
+    Require(with(0,[](auto& c) { c.registers[5]^=1; }) && with(1,[](auto& c) { c.registers[63]^=1; }) &&
+      with(2,[](auto& c) { c.registers[0]^=1; }),"a moved camera or animation global is equivalent");
+    Require(!with(3,[](auto& c) { c.registers[0]^=1; }) && !with(4,[](auto& c) { c.registers[0]^=1; }) &&
+      !with(5,[](auto& c) { c.registers[0]^=1; }),"another constant's value (a local of a pass-owned name too) is not");
+    Require(!with(0,[](auto& c) { c.registers.resize(48); }) && !with(1,[](auto& c) { c.pixel=true; }),
+      "a pass-owned global's extent or stage is not a value");
+    auto rebuilt=a; rebuilt.program=std::make_shared<NativeSceneMaterialProgram>();
+    auto regrouped=a; regrouped.group=0x3100;
+    Require(!NativeFullFrameModelSameProgram(a,rebuilt) && !NativeFullFrameModelSameProgram(a,regrouped),"another program or group");
+  }
   // Nothing stale: an idle memo is never pruned for its age.
   Memo idle(16,64,2,4);
   const auto idle_validate=[&] { return idle.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },
@@ -1319,6 +1355,95 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
     Require(material.Equivalent(*full.material),"a skinned draw binds its palette and its object's constants");
   }
 }
+// Rigid draws with per-object constants over frames, against full captures:
+// each row and set of bound values is patched once from the row's object
+// capture and interned, shared by the draws that bind the same values, and
+// kept while used (a moved pose remakes the object over the kept material);
+// a recaptured row patches again; a row where another constant binds a
+// variable of a pool name (a local of the name) captures each in full.
+void ObjectPatches(std::shared_ptr<NativeRenderBackend> backend) {
+  auto fixture=MakeObjectFixture(backend);
+  std::vector<std::shared_ptr<NativeRenderEntry>> entries;
+  for(uint32_t i=0;i<4;++i) entries.push_back(Entry(i+1,{float(i),0,100},1,fixture.layout));
+  entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{1,0,0,1})});
+  entries[1]->constants=ObjectConstants({ObjectConstant("g_Highlight",{1,0,0,1})});
+  entries[2]->constants=ObjectConstants({ObjectConstant("g_Highlight",{0,1,0,1})});
+  const auto snapshot=[&] {
+    NativeRenderRegistrySnapshot result;
+    for(const auto& entry:entries) result.entries.push_back(entry);
+    return result;
+  };
+  auto camera=MakeCamera();
+  SkinnedFixture skinned(backend);
+  auto pass=skinned.Pass();
+  pass.gather.objects={1,2,3,4};
+  auto published=fixture.published;
+  std::map<uint64_t,std::vector<std::shared_ptr<const NativeSceneMaterial>>> interned;
+  size_t interns=0;
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t) { return std::shared_ptr<const NativeSceneGroupMaterial>(published); };
+  sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { return fixture.geometry; };
+  uint64_t generation=1;
+  sources.generation=[&] { return generation; };
+  sources.intern=[&](std::shared_ptr<const NativeSceneMaterial> material) {
+    ++interns;
+    auto& bucket=interned[material->fingerprint()];
+    for(const auto& known:bucket) if(known->pipeline()==material->pipeline() && known->Equivalent(*material)) return known;
+    bucket.push_back(material);
+    return material;
+  };
+  NativeFullFrameModels models;
+  GuestPool guest;
+  std::vector<const NativeSceneMaterial*> last;
+  const auto check=[&](const char* name,uint64_t derived,uint64_t patches,uint64_t captures) {
+    const auto frame=models.Build(snapshot(),camera,pass,sources);
+    Require(frame.stats.drawn==4 && frame.stats.draws==4 && frame.stats.failed==0 && frame.stats.derived==derived &&
+      frame.stats.object_patches==patches && frame.stats.object_captures==captures,name);
+    const auto before=guest.Run(frame.plan.calls);
+    auto constants=published->constants;
+    for(auto& constant:constants) camera.pass.Apply(constant);
+    std::vector<const NativeSceneInstance*> drawn;
+    for(const auto& batch:frame.batches) for(const auto& object:batch.snapshot.instances) drawn.push_back(object.get());
+    const auto refs=OrderNativeFullFrameModelDraws(frame.plan.opaque,true);
+    Require(drawn.size()==4 && refs.size()==4,name);
+    last.assign(4,nullptr);
+    for(size_t d=0;d<refs.size();++d) {
+      const auto& item=frame.plan.opaque[refs[d].item];
+      const auto bound=GuestBound(constants,before.at(item.entry),item.entry->constants);
+      const auto& material=*drawn[d]->object.material;
+      NativeBackendSampler* sampler=material.samplers().at(0).second;
+      const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
+      auto full=fixture.program->Capture(*material.pipeline(),false,bound,samplers,material.blend_factor(),false);
+      full.material=sources.intern(full.material);
+      Require(drawn[d]->object.material==full.material,"a patched draw's material is the interned full capture");
+      last[item.entry->object-1]=drawn[d]->object.material.get();
+    }
+    // Entries 0 and 1 bind the same value, and so do 2 and 3 (3 sees 2's store).
+    Require(last[0]==last[1] && last[2]==last[3] && last[0]!=last[2],"draws binding the same values share their material");
+  };
+  check("each row and value set is patched once",4,2,0);
+  check("an unchanged frame carries every object",0,0,0);
+  const auto kept=last;
+  auto moved=std::make_shared<std::vector<NativePoseMatrix>>(*entries[0]->pose); (*moved)[0][12]+=1; entries[0]->pose=moved;
+  check("a moved pose remakes its object over the kept material",1,0,0);
+  Require(last==kept,"the kept material");
+  entries[2]->constants=ObjectConstants({ObjectConstant("g_Highlight",{0,0,1,1})});
+  check("a moved value patches its set again",2,1,0);
+  // A republished material with a moved constant: the row's capture and so
+  // every per-object material is made again.
+  auto republished=std::make_shared<NativeSceneGroupMaterial>(*published);
+  republished->constants[4].registers[1]^=0x10;
+  published=republished; ++generation;
+  check("a recaptured row patches again",4,2,0);
+  // A local of a pool name in the same stage binds the same variable: full captures.
+  auto local=std::make_shared<NativeSceneGroupMaterial>(*published);
+  local->constants.push_back({false,"g_Highlight",SkinnedFixture::Floats({.25f,.25f,.25f,1}),false});
+  published=local; ++generation;
+  NativeFullFrameModels shadowed;
+  const auto frame=shadowed.Build(snapshot(),camera,pass,sources);
+  Require(frame.stats.drawn==4 && frame.stats.object_patches==0 && frame.stats.object_captures==4,
+    "a row with a local of a pool name is captured in full");
+}
 // 821A5080's slot-4 call order: the mode-0 entries as the walks gather them
 // (820B4038 -> 821C0C00 calls slot 4 at once), then the filed ones in
 // 821A3BA0's order (key descending, ties in filing = gather order); a hidden,
@@ -1629,10 +1754,12 @@ void MemoDrivenBuild(std::shared_ptr<NativeRenderBackend> backend) {
   };
   sources.generation=[&] {
     return memo.Validate([] { return 1; },[&](uint32_t record) { ++asked; return provide_program(record); },
-      [&](const Input& input) { ++asked; return provide_geometry(input.first,input.second); },[](const auto& work) { work(); });
+      [&](const Input& input) { ++asked; return provide_geometry(input.first,input.second); },[](const auto& work) { work(); },
+      [](const Program& held,const Program& now) { return NativeFullFrameModelSameProgram(held,now); });
   };
   sources.audit=[&](const NativeModelBatchLayout& batch,uint32_t record,const NativeFullFrameModelSourcePair& kept) {
-    ++audited; stale+=kept.first!=provide_program(record) || kept.second!=provide_geometry(batch,record);
+    ++audited;
+    stale+=!NativeFullFrameModelSameProgram(kept.first,provide_program(record)) || kept.second!=provide_geometry(batch,record);
   };
   NativeFullFrameModels models;
   const auto first=models.Build(snapshot,camera,pass,sources);
@@ -1643,15 +1770,39 @@ void MemoDrivenBuild(std::shared_ptr<NativeRenderBackend> backend) {
     Require(same.stats.sourced==0 && same.stats.reused==6 && fetched==3,"an unchanged frame re-sourced or fetched");
   }
   Require(asked==9 && audited==18 && !stale,"each unchanged frame validates three results and audits six kept draws");
+  // Republished with only the camera moved (the guest pool holds the
+  // render's camera, a pass-owned global the pass replaces): not a change.
+  const auto generation=memo.generation();
+  for(int frame=0;frame<3;++frame) {
+    auto camera_only=std::make_shared<NativeSceneGroupMaterial>(*published);
+    for(auto& constant:camera_only->constants)
+      if(constant.name=="g_mViewProjection") constant.registers[frame*4]^=0x21;
+    published=camera_only;
+    const auto held=models.Build(snapshot,camera,pass,sources);
+    Require(held.stats.sourced==0 && held.stats.reused==6 && held.stats.captures==0 && fetched==3 && !stale,
+      "a program republished with only a pass-owned constant moved re-sourced or remade the draws");
+  }
+  Require(memo.generation()==generation && memo.stats().equivalents==3 && asked==18 && audited==36,
+    "an equivalent program advanced the source generation");
+  {
+    // The equivalent program's frame is a fresh build's of the new program.
+    NativeFullFrameModels fresh;
+    NativeFullFrameModelSources direct;
+    direct.program=[&](uint32_t record) { return provide_program(record); };
+    direct.geometry=[&](const NativeModelBatchLayout& batch,uint32_t record) { return provide_geometry(batch,record); };
+    const auto reason=SameModelFrame(models.Build(snapshot,camera,pass,sources),fresh.Build(snapshot,camera,pass,direct));
+    Require(reason.empty(),"a frame over an equivalent held program differs from a fresh build of the new one");
+    audited-=6; asked-=3;
+  }
   // A constant value moved (a republished program, whoever wrote it).
   auto republished=std::make_shared<NativeSceneGroupMaterial>(*published);
   republished->constants[3].registers[7]^=0x10;
   published=republished;
   const auto moved=models.Build(snapshot,camera,pass,sources);
-  Require(moved.stats.sourced==3 && moved.stats.captures==1 && moved.stats.derived==6 && fetched==3 && asked==12 && audited==18,
+  Require(moved.stats.sourced==3 && moved.stats.captures==1 && moved.stats.derived==6 && fetched==3 && asked==21 && audited==36,
     "a moved constant re-sources every item from the validation's answers");
   const auto after=models.Build(snapshot,camera,pass,sources);
-  Require(after.stats.sourced==0 && after.stats.reused==6 && audited==24 && !stale,"the new generation holds");
+  Require(after.stats.sourced==0 && after.stats.reused==6 && audited==42 && !stale,"the new generation holds");
 }
 // A material whose native parameters are unpublished (its model resource was
 // released: the material retired, "unpublished native material parameters")
@@ -2095,6 +2246,369 @@ void ModelFrames(std::shared_ptr<NativeRenderBackend> backend) {
       <<" rows="<<double(totals.rows)/frames<<" camera_rows="<<double(totals.camera_rows)/frames<<"\n";
   }
 }
+// The UFO swarm mission (M212) as the models pass sees it, for the multi-frame
+// checks and --models-bench: 1700 entries, of which 172 are drawn: 66 UFOs
+// (three rigid records each, 198 draws whose material reads g_Highlight and
+// g_Time; each UFO stores both every tick, g_Time a new value every tick),
+// 50 skinned soldiers (a palette record and a bone record) and 56 static
+// props. The UFOs and 48 soldiers move every tick (114 moving items), and
+// every tick renders twice with pose interpolation (a tick frame, then a
+// render-only frame). The sources are wired as the bridge wires them: a
+// NativeFullFrameModelSourceMemo over providers that republish every group
+// material each render with the camera the guest pool now holds (the
+// published g_mViewProjection: a pass-owned constant the pass replaces; the
+// game's source generation advanced at almost every render), and materials
+// interned as the adapter interns them. One prop material's own constants
+// move every tick, and one UFO material's every fourth tick.
+struct UfoScene {
+  using Constant=NativeSceneMaterialInputs::Constant;
+  using Program=std::shared_ptr<const NativeSceneGroupMaterial>;
+  using Geometry=std::shared_ptr<const NativeIndexedMesh::RetainedDraw>;
+  using Input=std::pair<NativeModelBatchLayout,uint32_t>;
+  static constexpr uint32_t kUfos=66,kSoldiers=50,kProps=56,kHidden=1528,kUfoPasses=12,kPropPasses=8,kSkinnedPasses=7,kBones=24;
+  std::shared_ptr<NativeRenderBackend> backend;
+  std::shared_ptr<NativeSceneMaterialProgram> ufo=std::make_shared<NativeSceneMaterialProgram>(),
+    rigid=std::make_shared<NativeSceneMaterialProgram>(),skinned=std::make_shared<NativeSceneMaterialProgram>();
+  std::map<uint32_t,Program> published;
+  std::array<std::vector<Geometry>,3> geometry;  // Skinned, UFO, prop programs.
+  std::array<std::shared_ptr<const NativeModelLayout>,3> ufos;
+  std::array<std::shared_ptr<const NativeModelLayout>,2> soldiers;
+  std::vector<std::shared_ptr<const NativeModelLayout>> props;
+  std::vector<std::shared_ptr<const NativeRenderEntry>> entries;
+  NativeFullFrameModelCamera camera=MakeCamera();
+  uint64_t tick=1;
+  uint32_t frame=0;
+  bool tick_frame=true;
+  float fraction=1;
+  std::map<uint64_t,std::vector<std::shared_ptr<const NativeSceneMaterial>>> interned;
+  NativeFullFrameModelSourceMemo<int,Program,std::pair<uint32_t,uint32_t>,Input,Geometry> memo;
+  void Compile(NativeSceneMaterialProgram& program,const char* source,const char* name) {
+    Effect effect; effect.source=source;
+    program.backend=backend;
+    program.vertex=program.reversed_vertex=CompileNativeShader(nullptr,effect,{false,"VS","vs_3_0"},name);
+    program.pixel=CompileNativeShader(nullptr,effect,{true,"PS","ps_3_0"},name);
+    NativeBackendTextureDesc texture; texture.width=texture.height=1; texture.format=DXGI_FORMAT_R8G8B8A8_UNORM;
+    const uint8_t white[]{255,255,255,255};
+    program.inputs.textures.push_back({"image"}); program.inputs.textures.push_back({"imageSampler"});
+    program.textures={backend->CreateTexture(texture,white),{}};
+  }
+  Geometry MakeGeometry(const NativeSceneMaterialProgram& program,float scale) {
+    std::vector<uint8_t> declaration(12),vertices(48),indices{0,0,0,1,0,2,0,0,0,2,0,3};
+    SkinnedFixture::Word(declaration,4,0x2a23b9);
+    const float points[]{-.125f*scale,-.25f,.5f, -.125f*scale,.25f,.5f, .125f*scale,.25f,.5f, .125f*scale,-.25f,.5f};
+    for(size_t i=0;i<12;++i) SkinnedFixture::Word(vertices,i*4,std::bit_cast<uint32_t>(points[i]));
+    NativeIndexedMesh mesh(*backend,program.vertex,declaration,12,vertices,indices,2);
+    return std::make_shared<const NativeIndexedMesh::RetainedDraw>(mesh.RetainDraw(backend,0,6));
+  }
+  static std::vector<uint8_t> Matrix(const std::array<uint32_t,16>& words) {
+    std::vector<uint8_t> bytes(64);
+    for(size_t i=0;i<16;++i) SkinnedFixture::Word(bytes,i*4,words[i]);
+    return bytes;
+  }
+  // Every group material republished with the camera the guest pool holds
+  // now: a new object whose only moved bytes are a pass-owned constant's.
+  void Republish() {
+    for(auto& [pass,group]:published) {
+      auto next=std::make_shared<NativeSceneGroupMaterial>(*group);
+      for(auto& constant:next->constants) if(constant.name=="g_mViewProjection") constant.registers=Matrix(camera.pass.view_projection);
+      group=next;
+    }
+  }
+  explicit UfoScene(std::shared_ptr<NativeRenderBackend> with):backend(std::move(with)) {
+    Compile(*ufo,R"(
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float4 g_Highlight;
+      float4 g_Time;
+      float4 g_vParams[24];
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0) {
+        V o; o.position=mul(mul(float4(position,1),g_mWorld),g_mViewProjection);
+        o.color=g_Highlight+g_Time.xxxx*g_vParams[int(abs(position.x*23))%24]; return o;
+      }
+      float4 tint;
+      Texture2D image; SamplerState imageSampler;
+      float4 PS(V v):SV_Target { return v.color*tint*image.Sample(imageSampler,float2(.5,.5)); }
+    )","ufo-bench-ufo.fx");
+    Compile(*rigid,R"(
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float4 g_vParams[16];
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0) {
+        V o; o.position=mul(mul(float4(position,1),g_mWorld),g_mViewProjection);
+        o.color=g_vParams[int(abs(position.x*15))%16]; return o;
+      }
+      float4 tint;
+      Texture2D image; SamplerState imageSampler;
+      float4 PS(V v):SV_Target { return v.color*tint*image.Sample(imageSampler,float2(.5,.5)); }
+    )","ufo-bench-rigid.fx");
+    Compile(*skinned,R"(
+      float4x3 g_mWorldArray[68];
+      row_major float4x4 g_mWorld;
+      row_major float4x4 g_mViewProjection;
+      float4 g_vParams[48];
+      struct V { float4 position:SV_Position; float4 color:COLOR0; };
+      V VS(float3 position:POSITION0) {
+        V o; int bone=int(abs(position.z*67))%68;
+        float3 skinned=mul(float4(position,1),g_mWorldArray[bone]);
+        o.position=mul(mul(float4(skinned,1),g_mWorld),g_mViewProjection);
+        o.color=g_vParams[bone%48]; return o;
+      }
+      float4 tint;
+      Texture2D image; SamplerState imageSampler;
+      float4 PS(V v):SV_Target { return v.color*tint*image.Sample(imageSampler,float2(.5,.5)); }
+    )","ufo-bench-skinned.fx");
+    const auto identity=SkinnedFixture::Floats({1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1});
+    const auto publish=[&](uint32_t pass,const std::shared_ptr<NativeSceneMaterialProgram>& program,std::vector<Constant> constants) {
+      auto group=std::make_shared<NativeSceneGroupMaterial>();
+      group->group=pass; group->program=program; group->constants=std::move(constants);
+      published[pass]=group;
+    };
+    for(uint32_t p=0;p<kUfoPasses;++p)
+      publish(0x3800+p*0x10,ufo,{{false,"g_mWorld",identity,true},{false,"g_mViewProjection",identity,true},
+        {false,"g_Highlight",ModelsScene::Floats(4,0),true},{false,"g_Time",ModelsScene::Floats(4,3),true},
+        {false,"g_vParams",ModelsScene::Floats(24*4,.25f+float(p)*.5f),true},{true,"tint",ModelsScene::Floats(4,.75f),false}});
+    for(uint32_t p=0;p<kPropPasses;++p)
+      publish(0x3900+p*0x10,rigid,{{false,"g_mWorld",identity,true},{false,"g_mViewProjection",identity,true},
+        {false,"g_vParams",ModelsScene::Floats(16*4,.125f+float(p)),true},{true,"tint",ModelsScene::Floats(4,.5f),false}});
+    for(uint32_t p=0;p<kSkinnedPasses;++p)
+      publish(0x3000+p*0x10,skinned,{{false,"g_mWorldArray",std::vector<uint8_t>(68*48,0xcd),true},{false,"g_mWorld",identity,true},
+        {false,"g_mViewProjection",identity,true},{false,"g_vParams",ModelsScene::Floats(48*4,.5f+float(p)),true},
+        {true,"tint",ModelsScene::Floats(4,1),false}});
+    for(uint32_t g=0;g<3;++g) {
+      geometry[0].push_back(MakeGeometry(*skinned,1+g*.5f));
+      geometry[1].push_back(MakeGeometry(*ufo,1+g*.25f));
+      geometry[2].push_back(MakeGeometry(*rigid,1+g*.125f));
+    }
+    // A UFO kind: three records on three bones, each its own material.
+    for(uint32_t kind=0;kind<3;++kind) {
+      const uint32_t node=0x200000+kind*0x1000;
+      std::vector<NativeModelMeshLayout> meshes;
+      for(uint32_t m=0;m<3;++m) meshes.push_back(Mesh(m,false,true,{Batch(node+0x10*((kind+m)%3),{0x3800u+((kind*4+m)%kUfoPasses)*0x10})}));
+      ufos[kind]=Layout(node,false,3,std::move(meshes));
+    }
+    for(uint32_t kind=0;kind<2;++kind) {
+      const uint32_t node=0x100000+kind*0x1000;
+      soldiers[kind]=Layout(node,true,kBones,{Mesh(0,true,false,{Batch(node+0x10*kind,{0x3000u+(kind*3%kSkinnedPasses)*0x10})}),
+        Mesh(kind+1,false,true,{Batch(node+0x100+0x10*(kind+1),{0x3000u+((kind*3+2)%kSkinnedPasses)*0x10})})});
+    }
+    for(uint32_t kind=0;kind<kPropPasses;++kind) {
+      const uint32_t node=0x300000+kind*0x1000;
+      props.push_back(Layout(node,false,1,{Mesh(0,false,true,{Batch(node+0x10*(kind%3),{0x3900u+kind*0x10})})}));
+    }
+    for(uint32_t slot=0;slot<kUfos+kSoldiers+kProps+kHidden;++slot) entries.push_back(Spawn(slot));
+    Republish();
+  }
+  // Drawn entries in front of the camera (z 60..240, inside the side planes),
+  // the rest behind it (frustum culled).
+  std::shared_ptr<NativeRenderEntry> Spawn(uint32_t slot) {
+    auto entry=std::make_shared<NativeRenderEntry>();
+    entry->object=0x40000000u+slot*0x1000; entry->generation=slot+1;
+    const float z=60+float(slot*37%181),x=(float(slot*53%101)-50)*z/120,y=float(slot*29%41)-20;
+    entry->centre={x,y,slot<kUfos+kSoldiers+kProps?z:-z,1}; entry->radius=4; entry->cull_distance=1e5f;
+    entry->type=&kPlain;
+    if(slot<kUfos) {
+      const auto& layout=ufos[slot%3];
+      entry->models.push_back({layout->instance,layout});
+      entry->pose=UfoPose(slot,tick);
+      entry->constants=UfoConstants(slot,tick);
+    } else if(slot<kUfos+kSoldiers) {
+      entry->type=&kCharacter;
+      const auto& layout=soldiers[slot%2];
+      entry->models.push_back({layout->instance,layout});
+      entry->pose=MovingPose(slot,tick,kBones);
+    } else {
+      const auto& layout=props[slot%kPropPasses];
+      entry->models.push_back({layout->instance,layout});
+      entry->pose=Pose(1);
+    }
+    return entry;
+  }
+  // Rigid bones (a rotation about y and a translation) that move a little
+  // every tick, so an interpolated render draws them between two ticks.
+  static std::shared_ptr<const std::vector<NativePoseMatrix>> MovingPose(uint32_t slot,uint64_t at,uint32_t bones) {
+    auto pose=std::make_shared<std::vector<NativePoseMatrix>>(bones);
+    for(uint32_t b=0;b<bones;++b) {
+      const float t=float(at)*.05f+float(slot)+float(b)*.3f,c=std::cos(t),s=std::sin(t);
+      (*pose)[b]={c,0,-s,0, 0,1,0,0, s,0,c,0, std::sin(t)*4+float(b),std::cos(t*.7f)*2,float(slot%7)+float(b)*.5f,1};
+    }
+    return pose;
+  }
+  static std::shared_ptr<const std::vector<NativePoseMatrix>> UfoPose(uint32_t slot,uint64_t at) { return MovingPose(slot,at,3); }
+  // g_Highlight flashes now and then (a hit); g_Time moves every tick.
+  static NativeRenderConstants UfoConstants(uint32_t slot,uint64_t at) {
+    const float highlight=(slot+at/4)%9==0?1.f:0.f;
+    return ObjectConstants({ObjectConstant("g_Highlight",{highlight,0,0,1}),
+      ObjectConstant("g_Time",{float(at)*(1.f/60)+float(slot)*.1f,0,0,1})});
+  }
+  // The next render: the camera moves and the group materials republish
+  // every render; every second render is a new tick (its first render),
+  // which moves the UFOs and most soldiers, each blending from its last pose.
+  void Step() {
+    ++frame;
+    tick_frame=frame%2==1;
+    fraction=tick_frame?.35f:.85f;
+    auto& view=camera.visibility.matrix;
+    view[12]=std::sin(float(frame)*.02f)*3; view[13]=std::cos(float(frame)*.03f)*2;
+    for(size_t i=0;i<16;++i) camera.pass.view_projection[i]=std::bit_cast<uint32_t>(i%5?float(i)*.001f*float(frame%11):1.f+float(frame)*.001f);
+    camera.pass.view=camera.pass.view_projection;
+    Republish();
+    if(!tick_frame) return;
+    ++tick;
+    // Materials whose own constants move every tick (a prop's) and every
+    // fourth tick (a UFO material's: its rows' per-object materials are made
+    // against the new capture).
+    const auto moved=[&](uint32_t pass) {
+      auto next=std::make_shared<NativeSceneGroupMaterial>(*published[pass]);
+      for(auto& constant:next->constants) if(constant.name=="g_vParams") constant.registers[3]=uint8_t(tick);
+      published[pass]=next;
+    };
+    moved(0x3970);
+    if(tick%4==0) moved(0x3810);
+    for(uint32_t slot=0;slot<kUfos+kSoldiers;++slot) {
+      if(slot>=kUfos+kSoldiers-2) continue;  // Two soldiers stand still.
+      auto entry=std::make_shared<NativeRenderEntry>(*entries[slot]);
+      entry->motion={entry->pose,tick,false};
+      if(slot<kUfos) { entry->pose=UfoPose(slot,tick); entry->constants=UfoConstants(slot,tick); }
+      else entry->pose=MovingPose(slot,tick,kBones);
+      entries[slot]=entry;
+    }
+  }
+  NativeRenderRegistrySnapshot Snapshot() const {
+    NativeRenderRegistrySnapshot snapshot;
+    snapshot.generation=tick;
+    for(const auto& entry:entries) snapshot.entries.push_back(entry);
+    return snapshot;
+  }
+  NativeFullFrameModelPass Pass() const {
+    NativeFullFrameModelPass pass;
+    pass.targets.rtv_format[0]=DXGI_FORMAT_R8G8B8A8_UNORM; pass.targets.dsv_format=DXGI_FORMAT_D32_FLOAT;
+    pass.viewport={0,0,1280,720,0,1}; pass.scissor={0,0,1280,720};
+    pass.motion={tick,fraction,1,true,true};
+    pass.tick_frame=tick_frame;
+    return pass;
+  }
+  Program Provide(uint32_t pass) const { const auto found=published.find(pass); return found==published.end()?nullptr:found->second; }
+  Geometry ProvideGeometry(const NativeModelBatchLayout& batch,uint32_t pass) const {
+    const auto& pool=geometry[pass>=0x3900?2:pass>=0x3800?1:0];
+    return pool[(batch.address>>4)%pool.size()];
+  }
+  // The adapter's intern: one object per equivalent material.
+  std::shared_ptr<const NativeSceneMaterial> Intern(std::shared_ptr<const NativeSceneMaterial> material) {
+    auto& bucket=interned[material->fingerprint()];
+    for(const auto& known:bucket) if(known->pipeline()==material->pipeline() && known->Equivalent(*material)) return known;
+    bucket.push_back(material);
+    return material;
+  }
+  // As the bridge wires them: the memo in front of the providers and its change signal.
+  NativeFullFrameModelSources Sources() {
+    NativeFullFrameModelSources sources;
+    sources.program=[this](uint32_t record) { return memo.ProgramFor(record,[&] { return Provide(record); }); };
+    sources.geometry=[this](const NativeModelBatchLayout& batch,uint32_t record) {
+      return memo.GeometryFor({record,batch.address},Input{batch,record},[&] { return ProvideGeometry(batch,record); });
+    };
+    sources.intern=[this](std::shared_ptr<const NativeSceneMaterial> material) { return Intern(std::move(material)); };
+    sources.exclusive=[](const std::function<void()>& work) { work(); };
+    sources.generation=[this] {
+      return memo.Validate([] { return 1; },[&](uint32_t record) { return Provide(record); },
+        [&](const Input& input) { return ProvideGeometry(input.first,input.second); },[](const auto& work) { work(); },
+        [](const Program& held,const Program& now) { return NativeFullFrameModelSameProgram(held,now); });
+    };
+    return sources;
+  }
+  // The reuse-off wiring: the providers directly, no change signal.
+  NativeFullFrameModelSources Direct() {
+    NativeFullFrameModelSources sources;
+    sources.program=[this](uint32_t record) { return Provide(record); };
+    sources.geometry=[this](const NativeModelBatchLayout& batch,uint32_t record) { return ProvideGeometry(batch,record); };
+    sources.intern=[this](std::shared_ptr<const NativeSceneMaterial> material) { return Intern(std::move(material)); };
+    sources.exclusive=[](const std::function<void()>& work) { work(); };
+    return sources;
+  }
+};
+// NativeFullFrameModels over the UFO swarm (UfoScene) against a reuse-off
+// instance (every draw captured in full from the providers' fresh answers,
+// per-object constants included) built from the same inputs every render:
+// every checked frame is the same frame. With --models-bench it runs 600
+// renders, checks every 50th and prints the persistent build's timings.
+void UfoFrames(std::shared_ptr<NativeRenderBackend> backend) {
+  UfoScene scene(backend);
+  const auto sources=scene.Sources(),direct=scene.Direct();
+  NativeFullFrameModels models,reference;
+  const bool bench=models_bench;
+  const uint32_t frames=bench?600:24;
+  double total_ms=0,tick_ms=0,worst_ms=0;
+  std::array<double,3> stages_ms{};
+  uint64_t measured=0,ticks=0;
+  NativeFullFrameModelFrame::Stats totals{};
+  for(uint32_t frame=0;frame<frames;++frame) {
+    scene.Step();
+    const auto pass=scene.Pass();
+    const auto snapshot=scene.Snapshot();
+    std::array<double,3> stage{};
+    auto mark=std::chrono::steady_clock::now();
+    int current=-1;
+    const auto timed=[&](NativeFullFrameModelPhase next) {
+      const auto now=std::chrono::steady_clock::now();
+      if(current>=0) stage[size_t(current)]+=std::chrono::duration<double,std::milli>(now-mark).count();
+      mark=now; current=next==NativeFullFrameModelPhase::Done?-1:int(next);
+    };
+    const auto t0=std::chrono::steady_clock::now();
+    const auto built=models.Build(snapshot,scene.camera,pass,sources,timed);
+    const auto ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+    NativeFullFrameModelFrame full;
+    {
+      const NativeReuseOffLatch latch(true);
+      full=reference.Build(snapshot,scene.camera,pass,direct);
+    }
+    const auto& s=built.stats;
+    Require(s.failed==0 && s.missing_program==0 && s.missing_geometry==0 && s.palette==0,"a UFO frame draw failed");
+    Require(s.items==UfoScene::kUfos+UfoScene::kSoldiers+UfoScene::kProps && s.drawn==s.items && s.draws==354,
+      "the UFO scene draws every item in front of the camera");
+    Require(frame<1 || s.blended==UfoScene::kUfos+UfoScene::kSoldiers-2,"the moving items blend");
+    Require(s.reused+s.derived==s.draws,"every drawn object is carried or made");
+    Require(s.object_captures==0,"a UFO draw captured its object constants in full");
+    if(frame>=2) {
+      // A render-only frame: the camera and the published camera moved, and
+      // the blends; nothing is re-sourced and no per-object value moved (the
+      // moving UFOs' objects take their kept materials with new worlds). A
+      // tick: every UFO's g_Time moved (one patch per UFO record), and the
+      // materials whose own constants moved are captured again.
+      if(!scene.tick_frame)
+        Require(s.sourced==0 && s.object_constants==UfoScene::kUfos*3 && s.object_patches==0 && s.captures==0 &&
+          s.camera_rows==s.rows,"a render-only UFO frame re-sourced or remade what did not move");
+      else
+        Require(s.object_constants==UfoScene::kUfos*3 && s.object_patches==UfoScene::kUfos*3 && s.captures>=1 && s.captures<=2,
+          "a UFO tick frame");
+      // The static props (bar the moved material's) carry their objects.
+      Require(s.reused>=40,"the static props were remade");
+    }
+    if(frame>=4) {
+      for(size_t i=0;i<stage.size();++i) stages_ms[i]+=stage[i];
+      total_ms+=ms; worst_ms=(std::max)(worst_ms,ms); ++measured;
+      if(scene.tick_frame) { tick_ms+=ms; ++ticks; }
+      totals.reused+=s.reused; totals.derived+=s.derived; totals.sourced+=s.sourced; totals.object_constants+=s.object_constants;
+      totals.captures+=s.captures; totals.palettes+=s.palettes; totals.resolves+=s.resolves; totals.rows+=s.rows;
+      totals.camera_rows+=s.camera_rows; totals.blended+=s.blended; totals.memo_hits+=s.memo_hits;
+      totals.object_patches+=s.object_patches; totals.object_captures+=s.object_captures;
+    }
+    if(bench && frame%50) continue;
+    const auto reason=SameModelFrame(built,full);
+    if(!reason.empty()) throw std::runtime_error("a UFO models frame differs from the full-capture build: "+reason+" (frame "+std::to_string(frame)+")");
+  }
+  if(bench) {
+    const auto n=double(measured);
+    std::cout<<"ufo frames: build_ms="<<total_ms/n<<" tick_ms="<<tick_ms/double(ticks)<<" render_only_ms="<<(total_ms-tick_ms)/(n-double(ticks))
+      <<" worst_ms="<<worst_ms<<" visibility_ms="<<stages_ms[0]/n<<" programs_ms="<<stages_ms[1]/n<<" resolve_ms="<<stages_ms[2]/n
+      <<" reused="<<double(totals.reused)/n<<" derived="<<double(totals.derived)/n<<" sourced="<<double(totals.sourced)/n
+      <<" object_constants="<<double(totals.object_constants)/n<<" object_patches="<<double(totals.object_patches)/n
+      <<" object_captures="<<double(totals.object_captures)/n<<" captures="<<double(totals.captures)/n
+      <<" palettes="<<double(totals.palettes)/n<<" rows="<<double(totals.rows)/n<<" camera_rows="<<double(totals.camera_rows)/n
+      <<" blended="<<double(totals.blended)/n<<" source_advances="<<scene.memo.stats().advances
+      <<" source_equivalents="<<scene.memo.stats().equivalents<<"\n";
+  }
+}
 // edf_native_reuse_off (native_reuse.h) across gameplay-like frames with pose
 // interpolation: one instance with reuse on, one with every frame's reuse off
 // and one alternating (off on even frames, as edf_native_reuse_off_alternate=1
@@ -2301,7 +2815,9 @@ int main(int argc,char** argv) {
   models_bench=argc>1 && std::string_view(argv[1])=="--models-bench";
   try {
     if(models_bench) {
-      ModelFrames(std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false})));
+      const std::shared_ptr<NativeRenderBackend> device(CreateNativeD3D11Backend({true,false}));
+      ModelFrames(device);
+      UfoFrames(device);
       return 0;
     }
     Visibility(); MovingVisibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
@@ -2312,8 +2828,8 @@ int main(int argc,char** argv) {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); UnpublishedMaterial(device); ObjectConstantBuild(device); PoolCarryFrames(device); ModelFrames(device); VelocityBuild(device);
-      ReuseOffFrames(device);
+      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); UnpublishedMaterial(device); ObjectConstantBuild(device); ObjectPatches(device); PoolCarryFrames(device); ModelFrames(device); VelocityBuild(device);
+      ReuseOffFrames(device); UfoFrames(device);
     }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";

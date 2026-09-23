@@ -177,7 +177,11 @@ class NativeFullFrameModelMaterialCache {
 // they return changes (a rebuilt program, refreshed constant values, reloaded
 // geometry), and they are held here, so an address is never reused: a result
 // that is not the same object, or null, or a provider that throws, advances
-// the generation. The signal is thus exactly as complete as the providers'
+// the generation, unless `same` (optional) accepts the new result as the one
+// remembered: an equivalent result (Build would make exactly what it makes
+// from the remembered one, e.g. a program republished with only constants
+// the pass replaces moved) is not a change; the remembered object is kept
+// and served. The signal is thus exactly as complete as the providers'
 // own checks, whoever wrote their inputs (a simulation step, a 821A4DE8
 // listener on a render-only iteration, a loader): a row the table reuses at
 // the current generation was fetched at it, so its results are remembered
@@ -198,11 +202,20 @@ class NativeFullFrameModelMaterialCache {
 template<class Host,class Program,class GeometryKey,class GeometryInput,class Geometry>
 class NativeFullFrameModelSourceMemo {
  public:
-  struct Stats { uint64_t validates=0,validated=0,advances=0,host_changes=0,changes=0,prunes=0,reuses=0,fetches=0,slices=0; };
+  // equivalents: validated programs another object than the one remembered
+  // that `same` accepted (not a change).
+  struct Stats { uint64_t validates=0,validated=0,advances=0,host_changes=0,changes=0,prunes=0,reuses=0,fetches=0,slices=0,
+    equivalents=0; };
   explicit NativeFullFrameModelSourceMemo(size_t chunk=16,size_t limit=2048,uint64_t age=256,uint64_t recent=8)
     :chunk_(chunk?chunk:1),limit_(limit),age_(age),recent_(recent?recent:1) {}
   template<class HostFn,class ProgramFn,class GeometryFn,class Run>
   uint64_t Validate(HostFn&& host,ProgramFn&& program,GeometryFn&& geometry,Run&& run) {
+    return Validate(host,program,geometry,run,[](const Program&,const Program&) { return false; });
+  }
+  // same(remembered,now): whether a non-null `now` that is another object
+  // than the remembered program is equivalent to it (kept, not a change).
+  template<class HostFn,class ProgramFn,class GeometryFn,class Run,class Same>
+  uint64_t Validate(HostFn&& host,ProgramFn&& program,GeometryFn&& geometry,Run&& run,Same&& same) {
     ++stats_.validates;
     carried_programs_.clear(); carried_geometry_.clear();
     bool host_changed=false,changed=false,first=true;
@@ -224,6 +237,7 @@ class NativeFullFrameModelSourceMemo {
           if(p!=programs_.end()) {
             Program now{};
             try { now=program(p->first); } catch(...) { now=Program{}; }
+            if(now && now!=p->second.value && same(p->second.value,now)) { ++stats_.equivalents; now=p->second.value; }
             if(!now || now!=p->second.value) changed=true;
             live+=current(p->second.asked);
             if(now) fresh_programs.emplace(p->first,std::move(now));
