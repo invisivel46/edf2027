@@ -71,6 +71,7 @@
 #include "native_render_entry.h"
 #include "native_render_instances.h"
 #include "native_render_motion.h"
+#include "native_reuse.h"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -238,6 +239,9 @@ class NativeRenderRegistry {
   std::shared_ptr<const NativeRenderRegistrySnapshot> Tick(const Reader& reader,uint32_t scene,uint64_t tick,const Decode& decode,
       bool refresh=true) {
     active_.store(true,std::memory_order_relaxed);
+    // Reuse off (native_reuse.h): every tick is a full one (no idle return, no
+    // light tick's skipped reads).
+    if(!NativeReuseAllowed()) refresh=true;
     const bool events=Drain();
     if(!refresh && seeded_ && !events && pending_.empty() && !RetryDue(tick)) {
       std::lock_guard lock(publish_mutex_);
@@ -423,7 +427,9 @@ class NativeRenderRegistry {
     else retry_[object]=tick+(uint64_t(1)<<std::min<uint32_t>(record.retries++,10));
     const auto* previous=objects_.Find(object);
     if(!built) { if(previous) Unpublish(object); return; }
-    if(previous && SameNativeRenderEntry(**previous,scratch_)) { ++stats_.unchanged; return; }
+    // Reuse off (native_reuse.h): an unchanged entry is published anew (its
+    // pose, world and layout pointers are still shared: pose motion needs them).
+    if(previous && NativeReuseAllowed() && SameNativeRenderEntry(**previous,scratch_)) { ++stats_.unchanged; return; }
     // Changed: the one allocation (and chunk clone) per changed entry.
     Publish(object,std::make_shared<const NativeRenderEntry>(scratch_));
     ++stats_.changed;
@@ -553,7 +559,7 @@ class NativeRenderRegistry {
   // one while equal, null when there are none.
   NativeRenderConstants ShareConstants(const NativeRenderConstants& previous) {
     if(constants_.empty()) return nullptr;
-    if(previous && *previous==constants_) return previous;
+    if(previous && *previous==constants_ && NativeReuseAllowed()) return previous;
     ++stats_.constant_changes;
     return std::make_shared<const std::vector<NativeRenderObjectConstant>>(constants_);
   }
@@ -581,7 +587,9 @@ class NativeRenderRegistry {
     const auto& hierarchy=record.hierarchy.Acquire(reader,object+type.instance+NativeModelTree::instance_offset);
     const auto root=ReadNativeGuestMatrix(reader,object+type.frame_root);
     const auto bits=std::bit_cast<std::array<uint32_t,16>>(root);
-    if(record.frame_pose && record.frame_builds==record.hierarchy.builds() && record.frame_root==bits) {
+    // Reuse off (native_reuse.h): computed again (and still shared with the
+    // published pose below when bitwise equal).
+    if(record.frame_pose && record.frame_builds==record.hierarchy.builds() && record.frame_root==bits && NativeReuseAllowed()) {
       ++stats_.frame_pose_reuses; return record.frame_pose;
     }
     auto palette=ComputeNativeModelHierarchyPose(hierarchy,root).palette;

@@ -130,6 +130,9 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
     const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRouteRead& route,NativeFullFrameStaticSelectCache* cache) {
   SelectCache local;
   auto& c=cache?*cache:local;
+  // Reuse off (native_reuse.h): the image walk instead of the flattened tree,
+  // and every published member tested one by one instead of the cluster cull.
+  const bool reuse=NativeReuseAllowed();
   NativeFullFrameStaticSelection result;
   auto& stats=result.stats;
   const auto* membership=publication.membership.get();
@@ -191,7 +194,7 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
       if(!queues.tree.Build(NativeSceneTreeImageReader(*image),owner)) NativeSceneTreeImageReader::Build(*image,queues.index);
     }
     lists.clear();
-    if(queues.tree.valid) {
+    if(queues.tree.valid && reuse) {
       // The walk of WalkNativeSceneTree over the flattened image.
       const auto& tree=queues.tree;
       ++stats.flat_walks;
@@ -210,7 +213,8 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
       };
       for(const auto root:tree.roots) walk(walk,root,false);
     } else {
-      const NativeSceneTreeImageReader tree(*image,&queues.index);
+      // The flat index exists only for an image that could not be flattened.
+      const NativeSceneTreeImageReader tree(*image,queues.index.empty()?nullptr:&queues.index);
       WalkNativeSceneTree(tree,owner,[&](uint32_t node) {
         ++stats.nodes_classified;
         return ClassifyNativeSceneTreeNode(tree,node,view).result;
@@ -239,7 +243,7 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
       auto& pending=c.pending;
       pending.clear();
       if(!entry.clusters.empty()) {
-        if(cull.valid()) {
+        if(cull.valid() && reuse) {
           auto& stack=c.stack;
           stack.assign(1,0u);
           while(!stack.empty()) {
@@ -314,7 +318,8 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
 }
 const NativeFullFrameStaticSelection& NativeFullFrameStaticWorld::Select(const NativeScenePublication& publication,
     const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRouteRead& route) {
-  auto next=SelectNativeFullFrameStaticWorld(publication,camera,route,&selection_cache);
+  // Reuse off: selected with a frame-local cache, selection_cache left as it was.
+  auto next=SelectNativeFullFrameStaticWorld(publication,camera,route,NativeReuseAllowed()?&selection_cache:nullptr);
   // Whether BuildSelected would draw the same groups and instances as it drew last.
   const auto& last=frame_.selection.owners;
   same_selection_=built_.valid && std::ranges::equal(next.owners,last,[](const auto& a,const auto& b) {

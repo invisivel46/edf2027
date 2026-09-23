@@ -64,6 +64,13 @@ int main() {
       get(0x100,0x204,2,2); Require(computed==4,"another pair reused a classification");
       Require(get(0x100,0x200,2,2)==0x300 && computed==4,"another pair evicted a live classification");
       memo.Clear(); get(0x100,0x204,2,2); Require(computed==5,"cleared memo kept an entry");
+      // edf_native_reuse_off (native_reuse.h): classified again every time,
+      // the same answer, and stored for the next reuse-on lookup.
+      for(int i=0;i<2;++i) {
+        const NativeReuseOffLatch latch(true);
+        Require(get(0x100,0x204,2,2)==0x304 && computed==6+i,"a reuse-off lookup was served from the memo");
+      }
+      Require(get(0x100,0x204,2,2)==0x304 && computed==7,"a reuse-off classification was not kept");
     }
     for(size_t group=0;group<4;++group)
       for(const auto entry:{"VS_2D","VS_2DTex","PS_2D","VS_3D"})

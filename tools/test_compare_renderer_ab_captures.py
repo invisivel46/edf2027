@@ -102,6 +102,13 @@ class SideTests(unittest.TestCase):
         with self.assertRaises(ab.AbError):
             ab.parse_log("ab_alternate frame=5 native=0\nab_alternate frame=5 native=1\n")
 
+    def test_parse_log_reuse_tag(self):
+        # edf_native_reuse_off_alternate logs its own tag; each tag reads only its own lines.
+        text = "reuse_alternate frame=600 native=0\nreuse_alternate frame=601 native=1\nab_alternate frame=9 native=1\n"
+        self.assertEqual(ab.parse_log(text, "reuse_alternate"), {600: False, 601: True})
+        self.assertEqual(ab.parse_log(text), {9: True})
+        self.assertEqual(ab.parse_log("xreuse_alternate frame=3 native=1\n", "reuse_alternate"), {})
+
     def test_period_sides_match_the_game(self):
         # AbSide in native_ab_alternate.h: runs of N from the start frame, odd runs native.
         self.assertEqual(ab.period_sides(range(10, 16), 10, 1), {10: False, 11: True, 12: False, 13: True,

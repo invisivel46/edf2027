@@ -319,6 +319,14 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
   NativeFullFrameModelFrame frame;
   auto& stats=frame.stats;
   ++frame_;
+  if(!NativeReuseAllowed()) {
+    // Reuse off (native_reuse.h): every draw state, carried object, material
+    // row, cached resolve and side-table answer is dropped and made again
+    // below, as on a first frame; poses_ (pose motion) is kept and asked
+    // afresh (its own predicate). The ids keep counting.
+    items_.clear(); rows_.clear(); sources_.Clear(); materials_.Clear();
+    provided_programs_.clear(); provided_geometry_.clear(); provided_generation_=kNativeFullFrameModelUnversioned;
+  }
   enter(Phase::Visibility);
   frame.plan=PlanNativeFullFrameModels(snapshot,camera,pass.gather);
   // The pool carry: what each slot-4 call finds in the pool, from the pool as
@@ -350,7 +358,8 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
   // generation a program is a function of its pass record and a geometry of
   // its batch and pass record. Missing answers are asked again.
   enter(Phase::Programs);
-  const auto generation=sources.generation?sources.generation():kNativeFullFrameModelUnversioned;
+  // Reuse off: unversioned, so every draw asks the providers and no answer is kept.
+  const auto generation=sources.generation && NativeReuseAllowed()?sources.generation():kNativeFullFrameModelUnversioned;
   const bool versioned=generation!=kNativeFullFrameModelUnversioned;
   if(generation!=provided_generation_ || !versioned) {
     provided_programs_.clear(); provided_geometry_.clear(); provided_generation_=generation;
@@ -507,6 +516,8 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         if(cached) derived=cached->capture().camera;
         if(cached && Cache::Current(*entry,row.constants,cached->capture().material.get(),derived)) {
           row.palette=entry->material.palette; row.scissor=entry->material.scissor;
+          row.pipeline=entry->material.pipeline; row.samplers=entry->material.samplers;
+          row.blend_factor=entry->material.blend_factor;
           ++materials_.hits; ++stats.cache_hits;
         } else {
           NativeFullFrameModelResolve half;
@@ -523,9 +534,11 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           ++(entry?stats.captures:stats.resolves);
           ++materials_.misses;
           row.palette=half.palette; row.scissor=half.scissor; derived=half.palette->capture().camera;
+          row.pipeline=half.pipeline; row.samplers=half.samplers; row.blend_factor=half.blend_factor;
           materials_.Store(std::move(cache_key),row.constants,std::move(half),row.palette->capture().material.get(),derived);
         }
-        row.capture={}; row.pipeline=nullptr; row.samplers.clear(); row.blend_factor.reset();
+        // The pipeline half stays for reuse-off draws' full captures.
+        row.capture={};
       } else {
         if(entry) derived=entry->material.capture.camera;
         if(entry && Cache::Current(*entry,row.constants,entry->material.capture.material.get(),derived)) {
@@ -648,12 +661,30 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
               // g_mWorldArray, and the last of a name wins in With).
               auto objects=bound;
               if(!objects.empty()) {
-                objects.insert(objects.begin(),row.palette_constants.begin(),row.palette_constants.end());
                 ++stats.object_constants;
                 if(carried(bound)) ++stats.carried;
               }
-              auto capture=row.palette->With(objects.empty()?std::span<const NativeSceneMaterialInputs::Constant>(row.palette_constants):
-                std::span<const NativeSceneMaterialInputs::Constant>(objects));
+              NativeSceneMaterialCapture capture;
+              if(!NativeReuseAllowed()) {
+                // Reuse off (native_reuse.h): the full capture With stands
+                // for, of the row's pass constants with this draw's palette
+                // and pool constants bound, against its pipeline half.
+                if(!row.pipeline) throw std::runtime_error("native full-frame model row has no pipeline half");
+                auto full=row.constants;
+                size_t next=0;
+                for(auto& constant:full)
+                  if(constant.name=="g_mWorldArray" && next<row.palette_constants.size()) constant=row.palette_constants[next++];
+                for(const auto& object:objects)
+                  for(auto& constant:full)
+                    if(constant.global && constant.pixel==object.pixel && constant.name==object.name) constant=object;
+                exclusive([&] {
+                  capture=row.program->Capture(*row.pipeline,pass.targets.reverse_depth,full,row.samplers,row.blend_factor,true);
+                });
+              } else {
+                if(!objects.empty()) objects.insert(objects.begin(),row.palette_constants.begin(),row.palette_constants.end());
+                capture=row.palette->With(objects.empty()?std::span<const NativeSceneMaterialInputs::Constant>(row.palette_constants):
+                  std::span<const NativeSceneMaterialInputs::Constant>(objects));
+              }
               // g_mWorld as 821A17D8 stores it; a palette shader need not declare it.
               if(NativeSceneCaptureBindsWorld(capture)) ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
               draw.object=make(draw,capture); draw.made_from=row.palette; draw.bound=std::move(bound);

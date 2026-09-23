@@ -3,6 +3,7 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -291,6 +292,65 @@ void BrokenObjectPoseMatchesGuest(bool bind) {
   Require(rejected && !(*rejected)->pose && !(*rejected)->models[0].layout && registry.stats().frame_pose_failures==1 &&
     registry.stats().retrying==1,"a rejected tree publishes the entry unposed and retries");
 }
+// edf_native_reuse_off (native_reuse.h): the sky's pose walk with its layout
+// and hierarchy caches bypassed records, frame by frame, what the cached walk
+// records (pose, draws, end state) through camera moves, a buffer generation
+// change and a bone table change; and a clBrokenObject registry ticked with
+// reuse off (no frame-pose memo, every hierarchy acquire a verification)
+// publishes the cached registry's poses and motion.
+void ReuseOffSky() {
+  std::vector<uint8_t> bytes(0x10000); const Memory memory{bytes};
+  BuildSky(memory,false); BuildModel(memory,1);
+  NativeSkyPassState on,off;
+  NativeSkyFrameInputs inputs;
+  inputs.start.depth_target=1; inputs.start.words[1]=2|4|(3u<<4);
+  uint64_t generation=1;
+  const auto lookup=[&](uint32_t,NativeModelBuffers::Kind) -> uint64_t { return generation; };
+  const auto same_bits=[](const auto& a,const auto& b) { return a.size()==b.size() && (a.empty() || !std::memcmp(a.data(),b.data(),a.size()*sizeof(a[0]))); };
+  for(uint32_t frame=0;frame<8;++frame) {
+    inputs.camera_world=CameraWorld(memory);
+    inputs.camera_world[12]+=float(frame)*3.5f; inputs.camera_world[14]-=float(frame)*1.25f;
+    if(frame==3) ++generation;              // Reloaded buffers: a new layout.
+    if(frame==5) memory.StoreWord(kSky+448,3);  // A new bone table.
+    std::vector<NativeSkyDraw> a,b;
+    const auto kept=RecordNativeSky(memory,on,inputs,kSky,lookup,[&](const NativeSkyDraw& draw) { a.push_back(draw); });
+    NativeSkyRecord fresh;
+    {
+      const NativeReuseOffLatch latch(true);
+      fresh=RecordNativeSky(memory,off,inputs,kSky,lookup,[&](const NativeSkyDraw& draw) { b.push_back(draw); });
+    }
+    Require(kept.status==fresh.status && kept.draws==fresh.draws && a.size()==b.size(),"a reuse-off sky frame records other draws");
+    Require(!std::memcmp(kept.pose.world.data(),fresh.pose.world.data(),sizeof(kept.pose.world)) &&
+      same_bits(kept.pose.nodes,fresh.pose.nodes) && same_bits(kept.pose.palette,fresh.pose.palette) && kept.palette==fresh.palette &&
+      kept.end.words==fresh.end.words,"a reuse-off sky pose differs from the cached walk's");
+    for(size_t i=0;i<a.size();++i)
+      Require(a[i].mesh==b[i].mesh && a[i].batch==b[i].batch && a[i].pass==b[i].pass && *a[i].geometry==*b[i].geometry &&
+        a[i].world==b[i].world && a[i].render.words==b[i].render.words && a[i].depth==b[i].depth,"a reuse-off sky draw differs");
+  }
+  Require(off.decodes>on.decodes+4 && off.hierarchy.verifications()>=5,"the reuse-off walk decoded and verified every frame");
+  // clBrokenObject through the registry, cached and reuse-off, tick by tick.
+  std::vector<uint8_t> broken_bytes(0x10000); const Memory broken{broken_bytes};
+  BuildBrokenObject(broken,false);
+  NativeRenderRegistry cached(0),reuse_off(0);
+  size_t decodes=0,off_decodes=0;
+  const auto decode=BrokenDecoder(broken,decodes);
+  const auto off_decode=BrokenDecoder(broken,off_decodes);
+  cached.Born(kBroken); reuse_off.Born(kBroken);
+  for(uint64_t tick=1;tick<=6;++tick) {
+    if(tick==3 || tick==5) StoreMatrix(broken,kBroken+640,Rigid(-1.05f,0.3f+float(tick)*.01f,812.5f,-6.75f,-2210.0f,1.0625f));
+    const auto a=*cached.Tick(broken,kScene,tick,decode)->objects.Find(kBroken);
+    std::shared_ptr<const NativeRenderEntry> b;
+    {
+      const NativeReuseOffLatch latch(true);
+      b=*reuse_off.Tick(broken,kScene,tick,off_decode)->objects.Find(kBroken);
+    }
+    Require(a->pose && b->pose && same_bits(*a->pose,*b->pose) && !a->motion.previous==!b->motion.previous &&
+      (!a->motion.previous || same_bits(*a->motion.previous,*b->motion.previous)) && a->motion.tick==b->motion.tick &&
+      a->motion.render_dependent==b->motion.render_dependent,"a reuse-off clBrokenObject pose or motion differs");
+  }
+  Require(cached.stats().frame_pose_reuses>0 && reuse_off.stats().frame_pose_reuses==0 && off_decodes==decodes,
+    "the reuse-off registry recomputed every frame pose (and kept its layout capture)");
+}
 }
 int main() {
   try {
@@ -300,6 +360,7 @@ int main() {
     RecordsSkyDraws();
     BrokenObjectPoseMatchesGuest(false);
     BrokenObjectPoseMatchesGuest(true);
+    ReuseOffSky();
   } catch(const std::exception& error) { std::cerr<<"native full-frame sky test failed: "<<error.what()<<"\n"; return 1; }
   std::cout<<"native full-frame sky tests passed\n";
   return 0;

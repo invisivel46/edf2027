@@ -9,6 +9,12 @@ runs of N from S and odd runs are native. Each render helper call logs
 Sides come from that log; without a log, --period N (and --start S, default
 the first captured frame) recomputes them the way the game does.
 
+The same gate compares reuse-off frames with reuse-on frames: run with
+--edf_native_reuse_off_alternate=N instead of edf_native_ab_alternate. The
+same rule picks the sides (reuse off on the reference side, reuse on judged),
+logged as `reuse_alternate frame=F native=0|1`; pass --tag reuse_alternate
+with the log, or --period N as above.
+
 Every native frame F is judged against its nearest captured guest frames
 before (P) and after (Q), at most --max-gap frames away. The scene moves
 between frames, so the native error is held to the guest-vs-guest error
@@ -79,6 +85,12 @@ def _load_images():
 images = _load_images()
 
 LOG_LINE = re.compile(r"ab_alternate frame=(\d+) native=([01])")
+TAGS = ("ab_alternate", "reuse_alternate")
+
+
+def log_line(tag: str) -> re.Pattern:
+    """The side line one alternation logs (edf_native_ab_alternate, edf_native_reuse_off_alternate)."""
+    return re.compile(r"(?<![A-Za-z0-9_])" + re.escape(tag) + r" frame=(\d+) native=([01])")
 CAPTURE_NAME = re.compile(r"\.output\.(\d+)\.(?:bmp|png)$", re.IGNORECASE)
 
 # Calibrated on out/renderer-ab/ab-5c7d6e9 (distant static geometry lost past
@@ -105,10 +117,10 @@ class AbError(Exception):
     pass
 
 
-def parse_log(text: str) -> dict[int, bool]:
-    """Frame -> native side, from `ab_alternate frame=F native=0|1` lines."""
+def parse_log(text: str, tag: str = "ab_alternate") -> dict[int, bool]:
+    """Frame -> native side, from `<tag> frame=F native=0|1` lines."""
     sides: dict[int, bool] = {}
-    for match in LOG_LINE.finditer(text):
+    for match in (LOG_LINE if tag == "ab_alternate" else log_line(tag)).finditer(text):
         frame, native = int(match.group(1)), match.group(2) == "1"
         if sides.get(frame, native) != native:
             raise AbError(f"frame {frame} logged as both sides")
@@ -419,6 +431,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("log", type=Path, nargs="?", help="game log containing ab_alternate lines")
     parser.add_argument("--prefix", help="capture file-name prefix (base name of edf_native_scene_capture)")
     parser.add_argument("--period", type=int, help="edf_native_ab_alternate value, when there is no log")
+    parser.add_argument("--tag", choices=TAGS, default="ab_alternate",
+                        help="the log's side lines: ab_alternate (default) or reuse_alternate "
+                             "(edf_native_reuse_off_alternate: reuse off is the reference side)")
     parser.add_argument("--start", type=int, help="capture start frame with --period (default: first capture)")
     parser.add_argument("--max-gap", type=int, default=DEFAULTS["max_gap"],
                         help="farthest guest neighbour, in frames (default %(default)s)")
@@ -472,9 +487,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         captures = find_captures(args.captures, args.prefix)
         if args.log is not None:
-            sides = parse_log(args.log.read_text(encoding="utf-8", errors="replace"))
+            sides = parse_log(args.log.read_text(encoding="utf-8", errors="replace"), args.tag)
             if not sides:
-                raise AbError("log has no ab_alternate lines (edf_native_ab_alternate off?)")
+                raise AbError(f"log has no {args.tag} lines (edf_native_ab_alternate / edf_native_reuse_off_alternate off?)")
             source = "log"
         else:
             if not captures:
