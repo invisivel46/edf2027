@@ -499,7 +499,14 @@ change-driven behaviour (`665e3e1`) has no cvar.
 - `cmake/edf_optimization.cmake` holds opt-in build experiments. All are empty
   by default, so the default build flags do not change.
   - `EDF_GUEST_OPT_PROFILE` and `EDF_HOST_OPT_PROFILE` take `O3`, `v3`
-    (`-march=x86-64-v3 -ffp-contract=off`) or `O3-v3`.
+    (`-march=x86-64-v3 -ffp-contract=off`) or `O3-v3`. The
+    `win-amd64-release` preset sets both to `v3` (`50c1d8f`), so that build
+    needs an AVX2/FMA CPU (Intel Haswell / AMD Zen or newer). Its entry
+    point, `src/cpu_check_entry.cpp` (object library `edf_cpu_check`, never
+    given the v3 flags), checks CPUID/XGETBV before the C runtime and any
+    static initializer run, and exits with a message box on an older CPU or
+    an OS without AVX state support. The check is compiled out
+    (`EDF_CPU_CHECK_REQUIRE_X86_64_V3=0`) when neither profile is v3.
   - `EDF_LTO=thin` turns on ThinLTO.
   - `EDF_PGO=generate|use` turns on clang IR PGO.
 

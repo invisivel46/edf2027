@@ -91,6 +91,10 @@ or `sha1sum <file>.iso` elsewhere.
 
 ## Quick start (Windows)
 
+The Windows release build needs a 64-bit CPU with AVX2 and FMA: Intel
+Haswell (4th-generation Core, 2013) / AMD Zen (Ryzen, 2017) or newer. On an
+older CPU the game shows "This build requires a CPU with AVX2/FMA" and exits.
+
 1. Unzip anywhere, run `edf2027.exe`.
 2. On first run the setup screen appears. Click **Select disc image (.iso)…**
    and pick your dump. The game is extracted (about 6 GB) into your user
@@ -244,6 +248,10 @@ scene backend. See [the migration status](docs/native-backend-migration.md).
 * Black window / GPU error: this worktree defaults to native Direct3D 12 on Windows.
   Check the log for native shader, draw or presentation failures. Installing a
   Xenos plugin is not a fix; this port no longer selects one.
+* *"This build requires a CPU with AVX2/FMA"*: the release build is compiled
+  for x86-64-v3 (AVX2, FMA, BMI1/2, LZCNT, MOVBE, F16C). Build from source
+  with `EDF_GUEST_OPT_PROFILE` and `EDF_HOST_OPT_PROFILE` set to empty (for
+  example the `win-amd64-relwithdebinfo` preset) to run on older CPUs.
 * Logs: `--log_file run.log` writes next to the exe.
 
 ## Licenses
@@ -256,6 +264,10 @@ D3 Publisher / Sandlot.
 ## Building from source
 
 Requirements: CMake 3.25 or newer, Ninja, Clang, and ReXGlue SDK 0.10.0.
+The `win-amd64-release` preset compiles guest and host code with
+`-march=x86-64-v3` (see `cmake/edf_optimization.cmake`); the resulting
+executable checks the CPU at its entry point (`src/cpu_check_entry.cpp`)
+before any of that code runs.
 Point `CMAKE_PREFIX_PATH` at an installed SDK (or set `REXSDK_DIR` to an SDK
 source checkout), then configure and build:
 

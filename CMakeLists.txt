@@ -91,6 +91,24 @@ set_target_properties(edf2027 PROPERTIES OUTPUT_NAME "${EDF2027_EXECUTABLE_NAME}
 # Opt-in -O3 / x86-64-v3 / ThinLTO / PGO experiments; all off by default.
 include(cmake/edf_optimization.cmake)
 
+# Start-up CPU check (src/cpu_check_entry.cpp): the executable's entry point,
+# which runs before the CRT and every static initializer and, in an
+# x86-64-v3 build, shows a message box instead of crashing on an older CPU.
+# An object library of its own, so it never gets the v3 target options that
+# edf_optimization.cmake gives edf2027; the source #errors if it does.
+if(WIN32)
+    add_library(edf_cpu_check OBJECT src/cpu_check_entry.cpp src/cpu_check_logic.cpp)
+    if(EDF_GUEST_OPT_PROFILE MATCHES "v3" OR EDF_HOST_OPT_PROFILE MATCHES "v3")
+        set(_edf_require_v3 1)
+    else()
+        set(_edf_require_v3 0)
+    endif()
+    target_compile_definitions(edf_cpu_check PRIVATE EDF_CPU_CHECK_REQUIRE_X86_64_V3=${_edf_require_v3})
+    target_link_libraries(edf_cpu_check PUBLIC user32)
+    target_link_libraries(edf2027 PRIVATE edf_cpu_check)
+    target_link_options(edf2027 PRIVATE "LINKER:/ENTRY:edf_cpu_check_entry")
+endif()
+
 # Read-only import/staging check, including transitive non-system dependencies.
 # Run from the VS developer environment so CMake can use dumpbin.
 add_custom_target(audit_native_dependencies
@@ -395,6 +413,9 @@ if(BUILD_TESTING)
     target_include_directories(edf_frame_limiter_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME edf_frame_limiter_tests COMMAND edf_frame_limiter_tests)
     set_tests_properties(edf_frame_limiter_tests PROPERTIES TIMEOUT 60)
+    add_executable(edf_cpu_check_tests tests/cpu_check_tests.cpp src/cpu_check_logic.cpp)
+    target_include_directories(edf_cpu_check_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME edf_cpu_check_tests COMMAND edf_cpu_check_tests)
 endif()
 
 # ---------------------------------------------------------------------------

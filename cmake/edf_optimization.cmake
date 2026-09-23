@@ -17,6 +17,9 @@
 #               -ffp-contract=off keeps the compiler from fusing any a*b+c
 #               that is not an explicit std::fma, so no float result changes.
 #       O3-v3   both
+#               The executable then needs such a CPU: edf_cpu_check (the entry
+#               point, CMakeLists.txt) is deliberately left out of the targets
+#               below and refuses older CPUs with a message box.
 #     Any non-empty profile also adds -fno-strict-aliasing -fwrapv
 #     -fno-math-errno: the first two only restate what the guest code needs
 #     (clang already defaults to no TBAA for the MSVC target), the third only
@@ -77,6 +80,7 @@ set(_edf_guest_targets)
 if(TARGET edf2027_recomp)
     list(APPEND _edf_guest_targets edf2027_recomp)
 endif()
+# Never add edf_cpu_check here: it must run on CPUs that cannot run the rest.
 set(_edf_host_targets)
 foreach(_t edf2027 edf_native_sdk_ui edf_native_effects edf_native_d3d11 edf_native_d3d12)
     if(TARGET ${_t})
