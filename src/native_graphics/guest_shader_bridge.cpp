@@ -14754,8 +14754,8 @@ bool NativeModelPassEnabled() {
   return true;
 }
 }
-REXCVAR_DEFINE_STRING(edf_native_renderer,"off","EDF2027",
-  "Native renderer preset: off, world (static world pass and every scene flag it requires), full (world plus model publication, the rigid model pass and the native post finish) or native (full plus the full-frame renderer, edf_native_full_frame). Adds to the individual edf_native_* cvars and never turns one off; read once at startup");
+REXCVAR_DEFINE_STRING(edf_native_renderer,"native","EDF2027",
+  "Native renderer preset (default native; off restores the guest renderer): off, world (static world pass and every scene flag it requires), full (world plus model publication, the rigid model pass and the native post finish) or native (full plus the full-frame renderer, edf_native_full_frame). Adds to the individual edf_native_* cvars and never turns one off; read once at startup");
 namespace edf::native {
 void ResolveNativeRendererPreset() {
   const auto& name=REXCVAR_GET(edf_native_renderer);
