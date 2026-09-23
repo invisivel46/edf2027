@@ -1,6 +1,7 @@
 #pragma once
 #include "native_render_state_decode.h"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -138,6 +139,12 @@ struct NativeBackendStatistics {
   // Transient list draws a packet recorder appended to the draw before them.
   uint64_t geometry_transient_appends=0;
   uint64_t geometry_world_constant_reuses=0,geometry_constant_snapshot_bytes=0;
+  // Constant binds that reused an image the frame already held, the bytes not
+  // copied; worker ranges handed over before their flush; constant images
+  // staged in upload memory and binds that reused a staged image.
+  uint64_t geometry_constant_interned=0,geometry_constant_interned_bytes=0;
+  uint64_t geometry_streamed_jobs=0;
+  uint64_t geometry_constant_uploads=0,geometry_constant_upload_reuses=0;
   uint32_t geometry_max_concurrent=0;
   // Times a frame had to wait for the GPU to give back upload memory or
   // shader-visible descriptors. Anything but zero is a budget that is too small
@@ -184,6 +191,18 @@ struct NativeBackendViewport {
 };
 struct NativeBackendScissor {
   int32_t left=0,top=0,right=0,bottom=0;
+};
+
+// Constant bytes a packet recorder owns for a whole frame and may bind many
+// times, from several recording threads. A backend that stages constants in
+// fenced upload memory may stage an image once per submission and bind that
+// slice again (SetConstantImage): `staged_address` is valid for the
+// submission `staged_frame` names. Recorders write the pair (address first,
+// frame with release); the owner calls Invalidate whenever `bytes` change.
+struct NativeBackendConstantImage {
+  std::vector<uint8_t> bytes;
+  mutable std::atomic<uint64_t> staged_frame{0},staged_address{0};
+  void Invalidate() { staged_frame.store(0,std::memory_order_relaxed); }
 };
 
 // Records work for one thread. On D3D11 this wraps the immediate context and
@@ -240,6 +259,12 @@ class NativeBackendRecorder {
   // is a backend decision (UpdateSubresource here, an upload ring with fencing
   // on a second backend) and callers must not depend on either.
   virtual void SetConstants(NativeBackendStage stage,uint32_t slot,std::span<const uint8_t> bytes)=0;
+  // The same bind from a frame-owned image (see NativeBackendConstantImage).
+  // The shader reads exactly image.bytes either way; only where they are
+  // staged may differ.
+  virtual void SetConstantImage(NativeBackendStage stage,uint32_t slot,const NativeBackendConstantImage& image) {
+    SetConstants(stage,slot,image.bytes);
+  }
   virtual void SetTexture(NativeBackendStage stage,uint32_t slot,NativeBackendTexture* texture)=0;
   virtual void SetSampler(NativeBackendStage stage,uint32_t slot,NativeBackendSampler* sampler)=0;
 
