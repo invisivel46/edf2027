@@ -187,11 +187,15 @@ inline NativeSceneMaterialPassState NativeFullFrameModelBaseState(const NativeFu
 // BuildNativeSceneMaterialLocked): the program and constant values of one
 // 112-byte pass record. geometry is the retained batch geometry under the
 // pass's vertex shader (Bridge::model_geometry_loads). intern is the adapter's
-// InternMaterial. Missing results skip the whole entry.
+// InternMaterial. Missing results skip the whole entry. exclusive, when set,
+// runs each material resolve (the backend's pipeline and sampler caches) and
+// its intern in one call: the bridge wraps it in a short hold of its locks,
+// so Build itself runs off them. program and geometry take their own holds.
 struct NativeFullFrameModelSources {
   std::function<std::shared_ptr<const NativeSceneGroupMaterial>(uint32_t pass)> program;
   std::function<std::shared_ptr<const NativeIndexedMesh::RetainedDraw>(const NativeModelBatchLayout&,uint32_t pass)> geometry;
   std::function<std::shared_ptr<const NativeSceneMaterial>(std::shared_ptr<const NativeSceneMaterial>)> intern;
+  std::function<void(const std::function<void()>&)> exclusive;
 };
 // One NativeSceneRenderer::Render call: adjacent draws sharing a view. The
 // snapshot holds the objects (and so geometry and materials) until the frame

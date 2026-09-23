@@ -196,10 +196,14 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     else {
       auto constants=PassConstants(*material,camera);
       if(layout.skinned && !BindNativeFullFrameModelPalette(constants,values.palette)) { ++stats.palette; return std::nullopt; }
-      auto result=ResolveMaterial(program,*geometry,pass,base,constants,layout.skinned);
+      std::optional<NativeSceneResolvedMaterial> result;
+      const auto work=[&] {
+        result=ResolveMaterial(program,*geometry,pass,base,constants,layout.skinned);
+        if(!layout.skinned && sources.intern) result->capture.material=sources.intern(std::move(result->capture.material));
+      };
+      if(sources.exclusive) sources.exclusive(work); else work();
       ++stats.resolves;
-      if(!layout.skinned && sources.intern) result.capture.material=sources.intern(std::move(result.capture.material));
-      resolved={std::move(result.capture),result.render.words[5]!=0};
+      resolved={std::move(result->capture),result->render.words[5]!=0};
       if(!layout.skinned) memo.emplace(key,resolved);
     }
     // g_mWorld as 821A17D8 stores it; a palette shader need not declare it.

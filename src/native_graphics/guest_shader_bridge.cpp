@@ -7,6 +7,7 @@
 #include "native_backend_frame.h"
 #include "native_backend_frame_queue.h"
 #include "native_frame_flight.h"
+#include "native_lock_slices.h"
 #include "d3d11_backend.h"
 #include "d3d12_backend.h"
 #include "native_render_backend.h"
@@ -889,6 +890,31 @@ NativePacingState& PacingState() {
 struct Bridge {
   // Game command ordering is separate from immediate-context access. A swap
   // may hold this gate while releasing mutex between polls so the host can paint.
+  //
+  // Full frame vs simulation (the render helper's thread and the main loop):
+  // - The simulation's per-step work takes the mutex alone, not the gate: the
+  //   step's publication (membership, preloads, adapter Publish), cameras,
+  //   world updates (820B2DF8), walk plans (PublishStaticWalkPlans), registry
+  //   layout decodes and the list-link touches. (Object birth/retirement, 820B33B0/820B2870/
+  //   820B2AC0, still takes both; it is not per step.) The gate is held by the
+  //   swap across its GPU and pacing wait, so a step that took it waited out
+  //   the render thread's pacing. What it hands the frame is swapped in as immutable
+  //   generations (publication, cameras, world animations, registry snapshot,
+  //   trees), which AcquireInputs takes once per frame. The static world's
+  //   route words are read live from guest memory at selection
+  //   (NativeFullFrameLiveRoutes), which needs no bridge lock.
+  // - The full frame's passes plan off both locks over those generations and
+  //   take gate and mutex together only in short slices (NativeLockSlices)
+  //   around what they share with the simulation and other hooks: the model
+  //   pass caches (model_pass_loads, model_geometry_loads, over model_buffers,
+  //   shaders and declarations), the backend's pipeline/sampler caches and
+  //   mesh cache (program Resolve, geometry retention), the adapter's material
+  //   intern table, and the scene recorder/targets. Nothing a slice returns
+  //   points into locked state except through a shared_ptr, and the recording
+  //   slice re-validates the active scene, backend and targets it planned for.
+  // - Recorder state (scene recorder, active targets, bind_generation,
+  //   recorded, scene_recorded_*) is written only by the render thread, under
+  //   both locks; the simulation never records.
   std::recursive_mutex submissions;
   std::mutex mutex;
   std::filesystem::path root;
@@ -5270,7 +5296,8 @@ REX_HOOK_RAW(sub_820B2DF8) {
   // Objects the scene sources never saw born have no generation: skip both locks.
   if(EDF_NATIVE_FLAG(scene_queued) && edf::native::SceneSourceOwners().MayContain(owner)) {
     auto& state=edf::native::State();
-    std::lock_guard submission(state.submissions);
+    // The bridge mutex alone, as the step's publication: a world update submits
+    // nothing, and the submission gate would make it wait out the swap's pacing.
     std::lock_guard lock(state.mutex);
     if(const auto generation=state.scene_sources.Generation(owner)) {
       const auto world=edf::native::ReadNativeStaticWorld(edf::native::GuestReader(base),owner);
@@ -5924,19 +5951,29 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     pass.palette_limit=NativeFullFramePaletteLimit(reader_);
     pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
     auto& state=State();
-    std::lock_guard submission(state.submissions);
-    std::lock_guard lock(state.mutex);
+    // The bridge locks in short holds (NativeLockSlices): the targets, each use
+    // of the model pass caches (program, geometry) and each resolve with its
+    // intern, then the recording. Planning, culling and pose constants run off
+    // them over the registry snapshot, an immutable generation.
+    NativeLockSlices slices(state.submissions,state.mutex);
     NativeViewportState viewport;
-    const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,pass.targets,pass.viewport,pass.scissor,viewport);
-    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) { ++empty_; return; }
+    decltype(ActiveTargetsLocked(state)) targets{};
+    std::shared_ptr<NativeRenderBackend> backend;
+    if(!slices([&] {
+      targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,pass.targets,pass.viewport,pass.scissor,viewport);
+      backend=state.scene_backend;
+      return state.active_scene==context.renderer && targets.count && targets.depth && backend;
+    })) { ++empty_; return; }
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("models",reason); };
     const NativeFullFrameModelSources sources{
-      [&](uint32_t record) { return NativeModelPassProgramLocked(state,window,record,true,report); },
+      [&](uint32_t record) { return slices([&] { return NativeModelPassProgramLocked(state,window,record,true,report); }); },
       [&](const NativeModelBatchLayout& batch,uint32_t record) {
-        return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,batch,record),batch);
+        return slices([&] { return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,batch,record),batch); });
       },
-      [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); }};
+      // Called only inside exclusive, which holds the locks.
+      [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); },
+      [&](const std::function<void()>& work) { slices(work); }};
     auto frame=std::make_shared<NativeFullFrameModelFrame>(models_.Build(*registry,camera,pass,sources));
     // Helper side effect (clBrokenObject render 8211FAA8, slot 4): obj+712 =
     // obj+708 for every object the traversal reaches, which the plan's items
@@ -5951,30 +5988,38 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     for(auto& batch:frame->batches) if(batch.transparent) transparent->batches.push_back(std::move(batch));
     std::erase_if(frame->batches,[](const NativeFullFrameModelBatch& batch) { return batch.transparent; });
     NativeSceneRenderStatistics statistics;
-    if(!frame->batches.empty()) {
-      SceneRecorderLocked(state).SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
-      statistics=NativeFullFrameModels::Record(*state.scene_backend,state.scene_renderer,*frame);
-      ++state.bind_generation;
-      state.recorded={};
-    }
-    // Kept until submission: the batches' snapshots, and the registry entries the plan points into.
-    state.scene_recorded_frames.push_back(frame);
-    state.scene_recorded_frames.push_back(registry);
-    if(!transparent->batches.empty()) shared_->transparent=std::move(transparent);
+    // Recorded only onto the targets the batches were resolved for: re-validated,
+    // since the locks were released while building.
+    const bool current=slices([&] {
+      if(state.active_scene!=context.renderer || state.scene_backend!=backend || !(ActiveTargetsLocked(state)==targets)) return false;
+      if(!frame->batches.empty()) {
+        SceneRecorderLocked(state).SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
+        statistics=NativeFullFrameModels::Record(*state.scene_backend,state.scene_renderer,*frame);
+        ++state.bind_generation;
+        state.recorded={};
+      }
+      // Kept until submission: the batches' snapshots, and the registry entries the plan points into.
+      state.scene_recorded_frames.push_back(frame);
+      state.scene_recorded_frames.push_back(registry);
+      return true;
+    });
+    if(!current) ++stale_;
+    else if(!transparent->batches.empty()) shared_->transparent=std::move(transparent);
     shared_->model_order=uint32_t(frame->plan.transparent.size());
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame models: frames={} empty={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} missing={}/{} failed={} broken_objects={}",
-        frames_,empty_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
-        built.items,built.drawn,built.draws,statistics.draws,built.resolves,built.missing_program,built.missing_geometry,built.failed,broken_);
+      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
+        frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
+        built.items,built.drawn,built.draws,statistics.draws,built.resolves,built.missing_program,built.missing_geometry,built.failed,broken_,
+        slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
   static constexpr uint32_t kBrokenObject=0x820077d8;  // clBrokenObject vtable.
   const edf::native::GuestReader reader_;
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   edf::native::NativeFullFrameModels models_;
-  uint64_t frames_=0,empty_=0,broken_=0;
+  uint64_t frames_=0,empty_=0,stale_=0,broken_=0;
 };
 // The full frame's Effects pass: CollectNativeEffectManager over the
 // clEffectObjectManager (vtable 820072D4) the helper's world list (owner+44)
@@ -6111,62 +6156,80 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     inputs.camera_world=ReadNativeVisibilityFloats<16>(reader_,reader_.Add(context.view.scene,NativeSkyScene::world));
     inputs.palette_limit=NativeFullFramePaletteLimit(reader_);
     auto& state=State();
-    std::lock_guard submission(state.submissions);
-    std::lock_guard lock(state.mutex);
+    // The bridge locks in short holds (NativeLockSlices): the targets, each
+    // buffer generation the pose walk looks up, then the draws' resolve and
+    // recording (a handful). The hierarchy walk and pose run off them.
+    NativeLockSlices slices(state.submissions,state.mutex);
     NativeFullFramePassTargets formats; NativeBackendViewport backend_viewport; NativeBackendScissor scissor; NativeViewportState viewport;
-    const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
-    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) return;
+    decltype(ActiveTargetsLocked(state)) targets{};
+    std::shared_ptr<NativeRenderBackend> backend;
+    if(!slices([&] {
+      targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
+      backend=state.scene_backend;
+      return state.active_scene==context.renderer && targets.count && targets.depth && backend;
+    })) return;
     const auto base=NativeFullFrameBaseState(formats);
     inputs.start=base.render;
     std::vector<NativeSkyDraw> draws;
     const auto record=RecordNativeSky(reader_,sky_,inputs,sky,
       [&](uint32_t owner,NativeModelBuffers::Kind kind)->uint64_t {
-        const auto* found=state.model_buffers.Find(owner,kind);
-        return found?found->generation:0;
+        return slices([&]()->uint64_t {
+          const auto* found=state.model_buffers.Find(owner,kind);
+          return found?found->generation:0;
+        });
       },[&](const NativeSkyDraw& draw) { draws.push_back(draw); });
     const auto decline=[&](const std::string& reason) { ++declined_; NativeFullFrameDeclined("sky",reason); };
     if(record.status!=NativeSkyStatus::Recorded) { if(record.status==NativeSkyStatus::Declined) decline(record.reason); return; }
     if(!record.palette.empty()) return decline("palette-skinned sky");
     const NativeSceneCpuWindow window(reader_);
     std::vector<std::pair<std::shared_ptr<const NativeSceneInstance>,NativeSceneView>> resolved;
-    auto before=base.render;
-    for(const auto& draw:draws) {
-      const auto material=NativeModelPassProgramLocked(state,window,draw.pass,false,decline);
-      if(!material || !material->program) return decline("sky pass has no program");
-      const auto& program=*material->program;
-      if(!program.CanDeferCpuActivation()) return decline("sky pass needs a scissor rectangle");
-      const auto geometry=NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,*draw.geometry,draw.pass),*draw.geometry);
-      if(!geometry || geometry->backend()!=state.scene_backend.get()) return decline("sky geometry not retained");
-      auto constants=material->constants;
-      for(auto& constant:constants) native_scene_pass_camera->Apply(constant);
-      std::array<uint8_t,64> world{};
-      for(size_t i=0;i<16;++i) for(size_t byte=0;byte<4;++byte) world[i*4+byte]=uint8_t(draw.world[i]>>(24-byte*8));
-      try {
-        NativeBackendPipelineDesc desc;
-        desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(formats.reverse_depth);
-        desc.pixel_id=program.inputs.pixel;
-        desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
-        desc.render_targets=formats.count; desc.rtv_format=formats.rtv_format;
-        desc.dsv_format=formats.dsv_format; desc.sample_count=formats.samples;
-        auto result=program.Resolve(desc,formats.reverse_depth,constants,before,base.samplers,
-          REXCVAR_GET(edf_native_anisotropic_filtering));
-        result.capture.material=state.scene_adapter.InternMaterial(std::move(result.capture.material));
-        ApplyNativeScenePublishedWorld(result.capture,world);
-        auto object=std::make_shared<NativeSceneInstance>();
-        object->id=(uint64_t(7)<<60)+ ++ids_; object->changed_tick=UINT64_MAX;
-        object->object.geometry=geometry; object->object.material=result.capture.material;
-        object->object.world=result.capture.world; object->previous=result.capture.world;
-        resolved.emplace_back(std::move(object),NativeStaticInstanceView(result.capture.camera,viewport,result.render.words[5]!=0));
-      } catch(const std::exception& error) { return decline(error.what()); }
-      before=draw.render;  // The next pass chains from this one's state, as RecordNativeSky computed it.
-    }
-    SceneRecorderLocked(state).SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
-    for(auto& [object,view]:resolved) {
-      state.scene_recorded_snapshots.push_back(NativeSceneSnapshot{0,NativeSceneInstances(std::vector{std::move(object)})});
-      state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),view,1);
-    }
-    ++state.bind_generation;
-    state.recorded={};
+    const bool recorded=slices([&] {
+      const auto refuse=[&](const std::string& reason) { decline(reason); return false; };
+      // Resolved and recorded in one hold, onto the targets checked at the start
+      // (re-validated: the locks were released during the pose walk).
+      if(state.active_scene!=context.renderer || state.scene_backend!=backend || !(ActiveTargetsLocked(state)==targets))
+        return refuse("scene targets changed during the pose walk");
+      auto before=base.render;
+      for(const auto& draw:draws) {
+        const auto material=NativeModelPassProgramLocked(state,window,draw.pass,false,decline);
+        if(!material || !material->program) return refuse("sky pass has no program");
+        const auto& program=*material->program;
+        if(!program.CanDeferCpuActivation()) return refuse("sky pass needs a scissor rectangle");
+        const auto geometry=NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,*draw.geometry,draw.pass),*draw.geometry);
+        if(!geometry || geometry->backend()!=state.scene_backend.get()) return refuse("sky geometry not retained");
+        auto constants=material->constants;
+        for(auto& constant:constants) native_scene_pass_camera->Apply(constant);
+        std::array<uint8_t,64> world{};
+        for(size_t i=0;i<16;++i) for(size_t byte=0;byte<4;++byte) world[i*4+byte]=uint8_t(draw.world[i]>>(24-byte*8));
+        try {
+          NativeBackendPipelineDesc desc;
+          desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(formats.reverse_depth);
+          desc.pixel_id=program.inputs.pixel;
+          desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
+          desc.render_targets=formats.count; desc.rtv_format=formats.rtv_format;
+          desc.dsv_format=formats.dsv_format; desc.sample_count=formats.samples;
+          auto result=program.Resolve(desc,formats.reverse_depth,constants,before,base.samplers,
+            REXCVAR_GET(edf_native_anisotropic_filtering));
+          result.capture.material=state.scene_adapter.InternMaterial(std::move(result.capture.material));
+          ApplyNativeScenePublishedWorld(result.capture,world);
+          auto object=std::make_shared<NativeSceneInstance>();
+          object->id=(uint64_t(7)<<60)+ ++ids_; object->changed_tick=UINT64_MAX;
+          object->object.geometry=geometry; object->object.material=result.capture.material;
+          object->object.world=result.capture.world; object->previous=result.capture.world;
+          resolved.emplace_back(std::move(object),NativeStaticInstanceView(result.capture.camera,viewport,result.render.words[5]!=0));
+        } catch(const std::exception& error) { return refuse(error.what()); }
+        before=draw.render;  // The next pass chains from this one's state, as RecordNativeSky computed it.
+      }
+      SceneRecorderLocked(state).SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
+      for(auto& [object,view]:resolved) {
+        state.scene_recorded_snapshots.push_back(NativeSceneSnapshot{0,NativeSceneInstances(std::vector{std::move(object)})});
+        state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),view,1);
+      }
+      ++state.bind_generation;
+      state.recorded={};
+      return true;
+    });
+    if(!recorded) return;
     if(++frames_<=4 || frames_%1000==0)
       REXLOG_INFO("Native full frame sky: frames={} sky={:#x} draws={} declined={} hierarchy_builds={} layout_decodes={}",
         frames_,sky,resolved.size(),declined_,sky_.hierarchy.builds(),sky_.decodes);
@@ -6204,12 +6267,21 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     if(const auto& animations=context.inputs.animations;animations && animations->size()==1)
       camera.animation=animations->begin()->second;
     auto& state=State();
-    std::lock_guard submission(state.submissions);
-    std::lock_guard lock(state.mutex);
+    // The bridge locks in short holds (NativeLockSlices): the targets, a cache
+    // miss's resolve, then the recording. Selection and instancing run off
+    // them: every input is an immutable generation (the frame's publication,
+    // the pass camera), this pass's own cache, or guest memory read through
+    // the live route reader (no bridge state).
+    NativeLockSlices slices(state.submissions,state.mutex);
+    decltype(ActiveTargetsLocked(state)) targets{};
+    std::shared_ptr<NativeRenderBackend> backend;
+    if(!slices([&] {
+      targets=ActiveTargetsLocked(state);
+      backend=state.scene_backend;
+      return state.active_scene==context.renderer && targets.count && targets.depth && backend;
+    })) { ++skipped_; return; }
     const NativeSceneCpuWindow window(reader_);
     const NativeFullFrameLiveRoutes routes(window);
-    const auto targets=ActiveTargetsLocked(state);
-    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) { ++skipped_; return; }
     const auto& v=context.viewport;
     const auto viewport=MakeNativeDrawViewport(v.x,v.y,v.width,v.height,v.min_depth,v.max_depth,false,{});
     NativeFullFrameStaticPass pass;
@@ -6220,10 +6292,19 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     pass.viewport={d.TopLeftX,d.TopLeftY,d.Width,d.Height,d.MinDepth,d.MaxDepth};
     pass.scissor={s.left,s.top,s.right,s.bottom};
     pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
-    const auto frame=world_.Build(*publication,camera,std::cref(routes),pass,NativeFullFrameStaticResolver(pass,
-      [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); }));
+    // A cache miss's resolve creates backend pipelines and samplers and interns
+    // the material: one slice each (the resolver's intern runs inside it).
+    const auto resolver=NativeFullFrameStaticResolver(pass,
+      [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); });
+    const auto frame=world_.Build(*publication,camera,std::cref(routes),pass,[&](const auto&... arguments) {
+      return slices([&] { return resolver(arguments...); });
+    });
     uint64_t drawn=0;
-    if(!frame.draws.empty()) {
+    // Recorded only onto the targets the draws were resolved for: re-validated,
+    // since the locks were released while building.
+    const bool current=slices([&] {
+      if(state.active_scene!=context.renderer || state.scene_backend!=backend || !(ActiveTargetsLocked(state)==targets)) return false;
+      if(frame.draws.empty()) return true;
       auto& recorder=SceneRecorderLocked(state);
       recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
       for(const auto& draw:frame.draws) {
@@ -6234,19 +6315,22 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
       // The batch bound its own targets and pipelines.
       ++state.bind_generation;
       state.recorded={};
-    }
+      return true;
+    });
+    if(!current) ++stale_;
     const auto& selected=frame.selection.stats;
     const auto& built=frame.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame static world: frames={} skipped={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={}",
-        frames_,skipped_,routes.reads,routes.slot_reads,routes.failures,selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,
+      REXLOG_INFO("Native full frame static world: frames={} skipped={} stale={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
+        frames_,skipped_,stale_,routes.reads,routes.slot_reads,routes.failures,selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,
         selected.unrouted,selected.not_direct,selected.unpublished,selected.undrawable,built.groups,built.draws,built.instances,drawn,
-        built.resolves,built.cache_hits,built.declined,built.missing_group,built.missing_material,built.missing_geometry,built.world_declines);
+        built.resolves,built.cache_hits,built.declined,built.missing_group,built.missing_material,built.missing_geometry,built.world_declines,
+        slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
   const edf::native::GuestReader reader_;
   edf::native::NativeFullFrameStaticWorld world_;  // Cross-frame material cache and instance reuse.
-  uint64_t frames_=0,skipped_=0;
+  uint64_t frames_=0,skipped_=0,stale_=0;
 };
 // NativeFullFrame's view of the bridge for one render helper call. Native
 // work reads guest memory and writes only owner+136 and the guest frame
@@ -6263,11 +6347,15 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // under the producer lock, as the hook acquires them; the motion budget and
   // its publication were already acquired by the hook, which restores all of
   // them on exit. The thread-locals are the ones existing native pass code reads.
+  //
+  // Every input is an immutable generation (shared_ptr to const) taken once
+  // here, so all views and passes of the frame see one consistent step: the
+  // simulation publishes a new generation instead of mutating one a frame
+  // holds. The bridge mutex alone guards the swap of the adapter's pointers.
   edf::native::NativeFrameInputs AcquireInputs() override {
     auto& state=edf::native::State();
     std::shared_ptr<const edf::native::NativeRenderRegistrySnapshot> registry;
     {
-      std::lock_guard submission(state.submissions);
       std::lock_guard lock(state.mutex);
       edf::native::native_scene_publication=state.scene_adapter.AcquirePublication();
       edf::native::native_scene_pass_cameras=EDF_NATIVE_FLAG(scene_camera_owned)?state.scene_adapter.AcquireCameras():nullptr;
@@ -7188,8 +7276,16 @@ REX_HOOK_RAW(sub_821A4DE8) {
     // The rest mutates bridge state: the geometry and material preloads keep
     // the published group assets (which the full frame's static world draws)
     // current, and the adapter publication is what every frame acquires.
+    //
+    // The bridge mutex alone, not the submission gate: nothing here submits or
+    // orders game commands, and the gate is held by the render thread's swap
+    // for its whole GPU and pacing wait (releasing only the mutex between
+    // polls), so taking it made every step wait out the render thread's frame
+    // pacing. Lock order is unchanged (gate, then mutex; never the gate under
+    // the mutex). The full-frame passes hold the mutex only in short slices
+    // (NativeLockSlices) and read this step's results as the immutable
+    // generations Publish swaps in, so a pass never sees a half-published step.
     edf::native::HookTiming wait(edf::native::HookPhase::SimLockWait);
-    std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
     wait.Finish();
     state.scene_publication_tick+=std::max(1u,native_loop_budget.steps);
