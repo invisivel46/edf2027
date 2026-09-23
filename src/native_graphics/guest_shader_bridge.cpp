@@ -377,6 +377,7 @@ enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, Instanc
                        FrameNative, FrameNativeBegin, FrameNativeSky, FrameNativeStaticWorld,
                        FrameNativeModels, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
                        FrameNativeEnd, FrameNativeOverlays, FrameNativePhases,
+                       FrameNativeModelsVisibility, FrameNativeModelsPrograms, FrameNativeModelsResolve, FrameNativeModelsRecord,
                        SimRegistry, SimStaticWalk, SimPreloadGeometry, SimPreloadMaterial,
                        SimTrees, SimMembership, SimPublish, SimPoses, SimLockWait,
                        TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
@@ -438,6 +439,7 @@ class HookTiming {
       "frame.native","frame.native.begin","frame.native.sky","frame.native.static_world",
       "frame.native.models","frame.native.effects","frame.native.transparent","frame.native.post",
       "frame.native.end","frame.native.view_overlays","frame.native.phases",
+      "frame.native.models.visibility","frame.native.models.programs","frame.native.models.resolve","frame.native.models.record",
       "sim.registry","sim.static_walk","sim.preload_geometry","sim.preload_material",
       "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait",
       "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
@@ -5926,8 +5928,11 @@ struct NativeFullFrameModelsShared {
 // renderable registry snapshot and the view's camera; the opaque batches are
 // recorded here, the transparent ones (bucket-key order) by the Transparent
 // pass. Program and geometry come from the model pass caches
-// (NativeModelPassProgramLocked / NativeModelGeometryLocked); guest memory is
-// read, never called. The snapshot is the render registry's (fed on with the full
+// (NativeModelPassProgramLocked / NativeModelGeometryLocked) through the
+// models' side table, once per (pass record, batch, layout) per source
+// generation (a registry publication, shader or backend change), so frames
+// between publications read no guest memory for them; guest memory is read,
+// never called. The snapshot is the render registry's (fed on with the full
 // frame); before its first tick there is none and this records nothing.
 class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
  public:
@@ -5973,8 +5978,33 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       },
       // Called only inside exclusive, which holds the locks.
       [&state](std::shared_ptr<const NativeSceneMaterial> material) { return state.scene_adapter.InternMaterial(std::move(material)); },
-      [&](const std::function<void()>& work) { slices(work); }};
-    auto frame=std::make_shared<NativeFullFrameModelFrame>(models_.Build(*registry,camera,pass,sources));
+      [&](const std::function<void()>& work) { slices(work); },
+      // The providers' change signal: a registry publication (a simulation
+      // step, after which guest program bytes and constant values may have
+      // moved), a shader registration or release, or a backend replacement.
+      // Frames between publications read no guest memory for programs or
+      // geometry; each (pass record, batch, layout) is fetched once after one.
+      [&] {
+        const auto inputs=slices([&] {
+          return std::tuple<uint64_t,uint64_t,const void*>{registry->generation,state.shader_registry_generation,state.scene_backend.get()};
+        });
+        if(inputs!=source_inputs_) { source_inputs_=inputs; ++source_generation_; }
+        return source_generation_;
+      }};
+    // frame.native.models.{visibility,programs,resolve}: Build's stages, each
+    // timed from its start to the next's.
+    std::optional<HookTiming> stage;
+    const auto phase=[&](NativeFullFrameModelPhase next) {
+      stage.reset();
+      switch(next) {
+        case NativeFullFrameModelPhase::Visibility: stage.emplace(HookPhase::FrameNativeModelsVisibility); break;
+        case NativeFullFrameModelPhase::Programs: stage.emplace(HookPhase::FrameNativeModelsPrograms); break;
+        case NativeFullFrameModelPhase::Resolve: stage.emplace(HookPhase::FrameNativeModelsResolve); break;
+        case NativeFullFrameModelPhase::Done: break;
+      }
+    };
+    auto frame=std::make_shared<NativeFullFrameModelFrame>(models_.Build(*registry,camera,pass,sources,phase));
+    stage.reset();
     // Helper side effect (clBrokenObject render 8211FAA8, slot 4): obj+712 =
     // obj+708 for every object the traversal reaches, which the plan's items
     // are (visible, routed, LOD chosen); its tick kills it when +708 - +712 > 10.
@@ -5993,6 +6023,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const bool current=slices([&] {
       if(state.active_scene!=context.renderer || state.scene_backend!=backend || !(ActiveTargetsLocked(state)==targets)) return false;
       if(!frame->batches.empty()) {
+        HookTiming record_timing(HookPhase::FrameNativeModelsRecord);
         SceneRecorderLocked(state).SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
         statistics=NativeFullFrameModels::Record(*state.scene_backend,state.scene_renderer,*frame);
         ++state.bind_generation;
@@ -6009,9 +6040,11 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
+      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} captures={} cache_hits={} memo_hits={} sources={}/{} cached={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
         frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
-        built.items,built.drawn,built.draws,statistics.draws,built.resolves,built.missing_program,built.missing_geometry,built.failed,broken_,
+        built.items,built.drawn,built.draws,statistics.draws,built.resolves,built.captures,built.cache_hits,built.memo_hits,
+        built.source_hits,built.source_fetches,models_.material_cache().size(),models_.source_table().size(),
+        built.missing_program,built.missing_geometry,built.failed,broken_,
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
@@ -6019,6 +6052,8 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
   const edf::native::GuestReader reader_;
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   edf::native::NativeFullFrameModels models_;
+  std::tuple<uint64_t,uint64_t,const void*> source_inputs_{UINT64_MAX,UINT64_MAX,nullptr};
+  uint64_t source_generation_=0;
   uint64_t frames_=0,empty_=0,stale_=0,broken_=0;
 };
 // The full frame's Effects pass: CollectNativeEffectManager over the

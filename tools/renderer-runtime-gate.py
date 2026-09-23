@@ -76,6 +76,10 @@ PHASES = ('engine.render_helper', 'render.queued', 'render.material_group', 'ren
           'frame.native', 'frame.native.begin', 'frame.native.static_world', 'frame.native.models',
           'frame.native.sky', 'frame.native.effects', 'frame.native.transparent', 'frame.native.post',
           'frame.native.end', 'frame.native.view_overlays', 'frame.native.phases',
+          # Sub-phases of frame.native.models: Build's plan, program/geometry
+          # sources, material resolve and scene objects, and the opaque recording.
+          'frame.native.models.visibility', 'frame.native.models.programs', 'frame.native.models.resolve',
+          'frame.native.models.record',
           # The simulation-step publication (821A4DE8 exit, 820B4250 post-hook)
           # inside engine.simulation_dispatch. Inclusive of each step's own
           # lock waits; sim.lock_wait isolates the bridge-lock acquisitions.

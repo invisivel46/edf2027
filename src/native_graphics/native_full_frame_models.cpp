@@ -169,42 +169,161 @@ bool SameView(const NativeSceneView& a,const NativeSceneView& b) {
   return a.view==b.view && a.projection==b.projection && a.view_projection==b.view_projection &&
     a.scissor_enabled==b.scissor_enabled;
 }
+const std::shared_ptr<const NativeModelLayout>& ItemLayoutObject(const NativeFullFrameModelItem& item) {
+  return item.instanced<0?item.entry->models[item.model].layout:item.entry->instanced[size_t(item.instanced)].model.layout;
+}
+// The sampler objects program.Resolve bound, in program texture order, from
+// its resolved sampler pass (the backend's sampler cache returns the same
+// object for the same description).
+std::vector<NativeBackendSampler*> ResolvedSamplers(const NativeSceneMaterialProgram& program,
+    const std::array<NativeMaterialSamplerPass,16>& samplers,int filtering) {
+  std::vector<NativeBackendSampler*> resources;
+  resources.reserve(program.inputs.textures.size());
+  for(const auto& texture:program.inputs.textures) {
+    if(texture.slot>=samplers.size()) throw std::runtime_error("native material sampler slot is invalid");
+    resources.push_back(&program.backend->CreateSampler(DecodeNativeGuestSampler(NativeFilteringKey(samplers[texture.slot].words,filtering))));
+  }
+  return resources;
+}
 }
 NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistrySnapshot& snapshot,
-    const NativeFullFrameModelCamera& camera,const NativeFullFrameModelPass& pass,const NativeFullFrameModelSources& sources) {
+    const NativeFullFrameModelCamera& camera,const NativeFullFrameModelPass& pass,const NativeFullFrameModelSources& sources,
+    const std::function<void(NativeFullFrameModelPhase)>& phase) {
+  using Phase=NativeFullFrameModelPhase;
+  using Cache=NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve>;
+  const auto enter=[&](Phase next) { if(phase) phase(next); };
   NativeFullFrameModelFrame frame;
-  frame.plan=PlanNativeFullFrameModels(snapshot,camera);
   auto& stats=frame.stats;
+  enter(Phase::Visibility);
+  frame.plan=PlanNativeFullFrameModels(snapshot,camera);
+  // Programs: the program and geometry of every draw of every item, from the
+  // side table (the providers only when the generation moved or a row is new).
+  enter(Phase::Programs);
+  const auto generation=sources.generation?sources.generation():kNativeFullFrameModelUnversioned;
+  const auto source_hits=sources_.hits,source_fetches=sources_.fetches;
+  struct Gathered {
+    std::vector<NativeModelDraw> draws;
+    std::vector<NativeFullFrameModelSourcePair> sources;
+    bool complete=false;
+  };
+  const std::array<std::span<const NativeFullFrameModelItem>,2> lists{
+    std::span<const NativeFullFrameModelItem>(frame.plan.opaque),std::span<const NativeFullFrameModelItem>(frame.plan.transparent)};
+  std::array<std::vector<Gathered>,2> gathered;
+  for(size_t list=0;list<lists.size();++list) {
+    gathered[list].resize(lists[list].size());
+    for(size_t index=0;index<lists[list].size();++index) {
+      const auto& item=lists[list][index];
+      // The item's layout object: the posed LOD model's, or its instanced set's.
+      const auto& layout_object=ItemLayoutObject(item);
+      const auto& layout=*layout_object;
+      auto& result=gathered[list][index];
+      ++stats.items;
+      try {
+        result.draws=NativeModelDrawPlan(layout);
+        result.sources.reserve(result.draws.size());
+        result.complete=true;
+        for(const auto& draw:result.draws) {
+          const auto& batch=layout.meshes[draw.mesh].batches[draw.batch];
+          auto source=sources_.Get(draw.pass,batch.address,layout_object,generation,[&] {
+            NativeFullFrameModelSourcePair fetched{sources.program?sources.program(draw.pass):nullptr,nullptr};
+            if(fetched.first && fetched.first->program && sources.geometry) fetched.second=sources.geometry(batch,draw.pass);
+            return fetched;
+          },[](const NativeFullFrameModelSourcePair& value) { return value.first && value.first->program && value.second; });
+          if(!source.first || !source.first->program) { ++stats.missing_program; result.complete=false; break; }
+          if(!source.second) { ++stats.missing_geometry; result.complete=false; break; }
+          result.sources.push_back(std::move(source));
+        }
+      } catch(const std::exception&) { ++stats.failed; result.complete=false; }
+      if(!result.complete) { result.draws.clear(); result.sources.clear(); }
+    }
+  }
+  stats.source_hits=sources_.hits-source_hits; stats.source_fetches=sources_.fetches-source_fetches;
+  // Resolve: each draw's material from the cache (the pass constants compared,
+  // the camera derived from them) or a resolve, then its scene object.
+  enter(Phase::Resolve);
   const auto base=NativeFullFrameModelBaseState(pass.targets);
   struct Memo { NativeSceneMaterialCapture capture; bool scissor=false; };
-  std::map<std::tuple<uint32_t,const NativeSceneMaterialProgram*,const NativeIndexedMesh::RetainedDraw*>,Memo> memo;
+  using MemoKey=std::tuple<uint32_t,const NativeSceneMaterialProgram*,const NativeIndexedMesh::RetainedDraw*>;
+  std::map<MemoKey,Memo> memo;
+  std::map<MemoKey,std::vector<NativeSceneMaterialInputs::Constant>> skinned_constants;
   struct Resolved { std::shared_ptr<const NativeSceneInstance> object; NativeSceneView view; };
+  // Each resolve or capture (the backend's pipeline and sampler caches) with
+  // its intern runs in one exclusive call: one short hold of the host's locks.
+  // The cache rows are Build's own state and are used outside it.
+  const auto exclusive=[&](const std::function<void()>& work) { if(sources.exclusive) sources.exclusive(work); else work(); };
   // Resolves one draw, or throws / returns nothing (counted) when it cannot.
   const auto resolve=[&](const NativeModelLayout& layout,const NativeFullFrameModelConstants& values,
-      const NativeModelDraw& draw) -> std::optional<Resolved> {
-    const auto& batch=layout.meshes[draw.mesh].batches[draw.batch];
-    const auto material=sources.program?sources.program(draw.pass):nullptr;
-    if(!material || !material->program) { ++stats.missing_program; return std::nullopt; }
-    const auto& program=*material->program;
+      const NativeModelDraw& draw,const NativeFullFrameModelSourcePair& source) -> std::optional<Resolved> {
+    const auto& material=*source.first;
+    const auto& program=*material.program;
     // Scissor enable's rectangle is not a pass input (as in the world pass).
     if(!program.CanDeferCpuActivation()) { ++stats.scissor; return std::nullopt; }
-    const auto geometry=sources.geometry?sources.geometry(batch,draw.pass):nullptr;
-    if(!geometry || !program.backend || geometry->backend()!=program.backend.get()) { ++stats.missing_geometry; return std::nullopt; }
-    const auto key=std::tuple(draw.pass,&program,geometry.get());
+    const auto& geometry=source.second;
+    if(!program.backend || geometry->backend()!=program.backend.get()) { ++stats.missing_geometry; return std::nullopt; }
+    const auto key=MemoKey(draw.pass,&program,geometry.get());
+    Cache::Key cache_key{draw.pass,layout.skinned,material.program,geometry,base,pass.targets,pass.filtering};
     Memo resolved;
-    if(const auto found=layout.skinned?memo.end():memo.find(key);found!=memo.end()) { resolved=found->second; ++stats.memo_hits; }
+    if(layout.skinned) {
+      // The palette is per draw: capture against the row's pipeline half.
+      auto found=skinned_constants.find(key);
+      if(found==skinned_constants.end()) found=skinned_constants.emplace(key,PassConstants(material,camera)).first;
+      auto constants=found->second;
+      if(!BindNativeFullFrameModelPalette(constants,values.palette)) { ++stats.palette; return std::nullopt; }
+      if(const auto* entry=materials_.Candidate(cache_key)) {
+        const auto& cached=entry->material;
+        exclusive([&] {
+          resolved.capture=program.Capture(*cached.pipeline,pass.targets.reverse_depth,constants,cached.samplers,cached.blend_factor,true);
+        });
+        resolved.scissor=cached.scissor;
+        ++materials_.hits; ++stats.cache_hits; ++stats.captures;
+      } else {
+        std::optional<NativeSceneResolvedMaterial> result;
+        NativeFullFrameModelResolve half;
+        exclusive([&] {
+          result=ResolveMaterial(program,*geometry,pass,base,constants,true);
+          half.samplers=ResolvedSamplers(program,result->samplers,pass.filtering);
+        });
+        ++materials_.misses; ++stats.resolves;
+        half.pipeline=result->capture.material->pipeline(); half.blend_factor=result->capture.material->blend_factor();
+        half.scissor=result->render.words[5]!=0;
+        materials_.Store(std::move(cache_key),{},std::move(half),nullptr,result->capture.camera);
+        resolved={std::move(result->capture),result->render.words[5]!=0};
+      }
+    } else if(const auto found=memo.find(key);found!=memo.end()) { resolved=found->second; ++stats.memo_hits; }
     else {
-      auto constants=PassConstants(*material,camera);
-      if(layout.skinned && !BindNativeFullFrameModelPalette(constants,values.palette)) { ++stats.palette; return std::nullopt; }
-      std::optional<NativeSceneResolvedMaterial> result;
-      const auto work=[&] {
-        result=ResolveMaterial(program,*geometry,pass,base,constants,layout.skinned);
-        if(!layout.skinned && sources.intern) result->capture.material=sources.intern(std::move(result->capture.material));
-      };
-      if(sources.exclusive) sources.exclusive(work); else work();
-      ++stats.resolves;
-      resolved={std::move(result->capture),result->render.words[5]!=0};
-      if(!layout.skinned) memo.emplace(key,resolved);
+      auto constants=PassConstants(material,camera);
+      auto* entry=materials_.Candidate(cache_key);
+      NativeSceneView derived;
+      if(entry) derived=entry->material.capture.camera;
+      if(entry && Cache::Current(*entry,constants,entry->material.capture.material.get(),derived)) {
+        resolved={entry->material.capture,entry->material.scissor};
+        resolved.capture.camera.view=derived.view; resolved.capture.camera.projection=derived.projection;
+        resolved.capture.camera.view_projection=derived.view_projection;
+        ++materials_.hits; ++stats.cache_hits;
+      } else {
+        NativeFullFrameModelResolve half;
+        if(entry) half=entry->material;
+        exclusive([&] {
+          if(entry) {
+            // Same pipeline half; a constant moved: capture again.
+            half.capture=program.Capture(*half.pipeline,pass.targets.reverse_depth,constants,half.samplers,half.blend_factor,false);
+          } else {
+            auto result=ResolveMaterial(program,*geometry,pass,base,constants,false);
+            half.pipeline=result.capture.material->pipeline();
+            half.samplers=ResolvedSamplers(program,result.samplers,pass.filtering);
+            half.blend_factor=result.capture.material->blend_factor(); half.scissor=result.render.words[5]!=0;
+            half.capture=std::move(result.capture);
+          }
+          if(sources.intern) half.capture.material=sources.intern(std::move(half.capture.material));
+        });
+        ++(entry?stats.captures:stats.resolves);
+        ++materials_.misses;
+        resolved={half.capture,half.scissor};
+        const auto* captured=half.capture.material.get();
+        const auto captured_camera=half.capture.camera;
+        materials_.Store(std::move(cache_key),std::move(constants),std::move(half),captured,captured_camera);
+      }
+      memo.emplace(key,resolved);
     }
     // g_mWorld as 821A17D8 stores it; a palette shader need not declare it.
     if(!layout.skinned || NativeSceneCaptureBindsWorld(resolved.capture))
@@ -217,20 +336,21 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     view.viewport=pass.viewport; view.scissor=pass.scissor; view.scissor_enabled=resolved.scissor;
     return Resolved{std::move(object),std::move(view)};
   };
-  const auto emit=[&](std::span<const NativeFullFrameModelItem> items,bool transparent) {
+  const auto emit=[&](std::span<const NativeFullFrameModelItem> items,std::span<const Gathered> sourced,bool transparent) {
     // Every draw of every item first; an item with any failure draws nothing.
     std::vector<std::vector<Resolved>> resolved(items.size());
     for(size_t index=0;index<items.size();++index) {
       const auto& item=items[index];
       const auto& layout=NativeFullFrameModelItemLayout(item);
-      ++stats.items;
+      const auto& sourced_item=sourced[index];
+      if(!sourced_item.complete) continue;
       try {
         const auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,*item.entry->pose,pass.palette_limit):
           NativeFullFrameModelInstancedConstants(layout,item.entry->instanced[size_t(item.instanced)].worlds->at(item.world));
         std::vector<Resolved> draws;
         bool complete=true;
-        for(const auto& draw:NativeModelDrawPlan(layout)) {
-          auto result=resolve(layout,values,draw);
+        for(size_t d=0;d<sourced_item.draws.size();++d) {
+          auto result=resolve(layout,values,sourced_item.draws[d],sourced_item.sources[d]);
           if(!result) { complete=false; break; }
           draws.push_back(std::move(*result));
         }
@@ -260,8 +380,10 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     }
     flush();
   };
-  emit(frame.plan.opaque,false);
-  emit(frame.plan.transparent,true);
+  emit(frame.plan.opaque,gathered[0],false);
+  emit(frame.plan.transparent,gathered[1],true);
+  sources_.EndFrame(); materials_.EndFrame();
+  enter(Phase::Done);
   return frame;
 }
 NativeSceneRenderStatistics NativeFullFrameModels::Record(NativeRenderBackend& backend,NativeSceneRenderer& renderer,

@@ -1,6 +1,7 @@
 #pragma once
 #include "native_bucket_dispatch.h"
 #include "native_full_frame_base_state.h"
+#include "native_full_frame_model_cache.h"
 #include "native_model_pass.h"
 #include "native_render_entry.h"
 #include "native_scene_adapter.h"
@@ -188,15 +189,40 @@ inline NativeSceneMaterialPassState NativeFullFrameModelBaseState(const NativeFu
 // 112-byte pass record. geometry is the retained batch geometry under the
 // pass's vertex shader (Bridge::model_geometry_loads). intern is the adapter's
 // InternMaterial. Missing results skip the whole entry. exclusive, when set,
-// runs each material resolve (the backend's pipeline and sampler caches) and
-// its intern in one call: the bridge wraps it in a short hold of its locks,
-// so Build itself runs off them. program and geometry take their own holds.
+// runs each material resolve (the backend's pipeline and sampler caches) or
+// capture against a cached pipeline half, with its intern, in one call: the
+// bridge wraps it in a short hold of its locks, so Build itself runs off them.
+// program and geometry take their own holds. generation is the providers' change signal, asked once per Build (inside
+// its own hold when exclusive is set): program and geometry are fetched once
+// per (pass record, batch, layout) and generation, and reused while it holds
+// (NativeFullFrameModelSourceTable). It must advance whenever either provider
+// could return something else (a rebuilt program, refreshed constant values,
+// reloaded geometry). Without it every draw fetches. Cache rows themselves are
+// Build's own state and take no hold.
 struct NativeFullFrameModelSources {
   std::function<std::shared_ptr<const NativeSceneGroupMaterial>(uint32_t pass)> program;
   std::function<std::shared_ptr<const NativeIndexedMesh::RetainedDraw>(const NativeModelBatchLayout&,uint32_t pass)> geometry;
   std::function<std::shared_ptr<const NativeSceneMaterial>(std::shared_ptr<const NativeSceneMaterial>)> intern;
   std::function<void(const std::function<void()>&)> exclusive;
+  std::function<uint64_t()> generation;
 };
+// Build's stages, reported as each begins (the host's sub-phase timings):
+// visibility (plan), programs (program and geometry sources of every drawn
+// item), resolve (materials and scene objects); Done ends the last.
+enum class NativeFullFrameModelPhase : uint8_t { Visibility, Programs, Resolve, Done };
+// The pipeline half of one resolve, which no constant reaches: the pipeline,
+// the sampler objects in program texture order, the blend factor and whether
+// the resolved state enables scissor. capture is the rigid draw's interned
+// capture (skinned draws capture per draw).
+struct NativeFullFrameModelResolve {
+  NativeBackendPipeline* pipeline=nullptr;
+  std::vector<NativeBackendSampler*> samplers;
+  std::optional<std::array<float,4>> blend_factor;
+  bool scissor=false;
+  NativeSceneMaterialCapture capture;
+};
+using NativeFullFrameModelSourcePair=std::pair<std::shared_ptr<const NativeSceneGroupMaterial>,
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw>>;
 // One NativeSceneRenderer::Render call: adjacent draws sharing a view. The
 // snapshot holds the objects (and so geometry and materials) until the frame
 // is dropped, which must not happen before the recording is submitted.
@@ -212,29 +238,43 @@ struct NativeFullFrameModelBatch {
 };
 struct NativeFullFrameModelFrame {
   struct Stats {
+    // resolves: full program.Resolve calls (cache misses); captures: captures
+    // against a cached pipeline half (skinned draws, rigid constant changes);
+    // cache_hits: draws whose cached row served; source_hits/fetches: the
+    // program and geometry side table.
     uint64_t items=0,drawn=0,draws=0,resolves=0,memo_hits=0,missing_program=0,missing_geometry=0,
-      scissor=0,palette=0,failed=0;
+      scissor=0,palette=0,failed=0,cache_hits=0,captures=0,source_hits=0,source_fetches=0;
   };
   NativeFullFrameModelPlan plan;
   std::vector<NativeFullFrameModelBatch> batches;  // Opaque, then transparent.
   Stats stats;
 };
-// Cross-frame state: object ids only. Materials are interned through the
-// sources; rigid ones are also memoized within a frame by (pass record,
-// program, geometry), so identical entries share one material object and
-// instance. Skinned materials carry their palette and never share. Not
-// synchronized.
+// Cross-frame state: object ids, the program/geometry side table and the
+// material cache. Materials are interned through the sources; rigid ones are
+// cached across frames per (pass record, program, geometry, base state,
+// targets, filtering) with the constants they were captured from, and
+// memoized within a frame, so identical entries share one material object
+// and instance with their own worlds; per frame only the camera (derived from
+// the pass constants) and each instance's world change. Skinned materials
+// carry their palette: each draw captures against its row's cached pipeline
+// half and never shares. Not synchronized.
 class NativeFullFrameModels {
  public:
   // Everything is resolved before anything is recorded. An entry any of whose
-  // draws cannot be resolved is skipped whole (no partial objects).
+  // draws cannot be resolved is skipped whole (no partial objects). phase,
+  // when given, is told as each stage begins and once when all end.
   NativeFullFrameModelFrame Build(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera,
-    const NativeFullFrameModelPass& pass,const NativeFullFrameModelSources& sources);
+    const NativeFullFrameModelPass& pass,const NativeFullFrameModelSources& sources,
+    const std::function<void(NativeFullFrameModelPhase)>& phase={});
   // The caller has bound the pass's render targets (the frame host's BeginView).
   static NativeSceneRenderStatistics Record(NativeRenderBackend& backend,NativeSceneRenderer& renderer,
     const NativeFullFrameModelFrame& frame);
+  const NativeFullFrameModelSourceTable<NativeFullFrameModelSourcePair>& source_table() const { return sources_; }
+  const NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve>& material_cache() const { return materials_; }
  private:
   uint64_t next_id_=(uint64_t(5)<<60);
+  NativeFullFrameModelSourceTable<NativeFullFrameModelSourcePair> sources_;
+  NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve> materials_;
 };
 // Build then Record. Returns the frame, which the caller keeps until submission.
 NativeFullFrameModelFrame RecordNativeModels(NativeFullFrameModels& models,const NativeRenderRegistrySnapshot& snapshot,

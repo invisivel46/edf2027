@@ -276,10 +276,157 @@ void BaseState() {
   targets.count=1;
   Require(NativeFullFrameModelBaseState(targets)==NativeFullFrameBaseState(targets),"models share the full-frame base state");
 }
+using SourcePair=std::pair<std::shared_ptr<const int>,std::shared_ptr<const int>>;
+void SourceTable() {
+  NativeFullFrameModelSourceTable<SourcePair> table;
+  const auto layout=Layout(0x1000,false,1,{Mesh(0,false,true,{Batch(0x2000,{0x3000})})});
+  auto program=std::make_shared<const int>(1),geometry=std::make_shared<const int>(2);
+  int fetched=0;
+  const auto fetch=[&] { ++fetched; return SourcePair{program,geometry}; };
+  const auto keep=[](const SourcePair& value) { return value.first && value.second; };
+  const auto first=table.Get(0x3000,0x2000,layout,1,fetch,keep);
+  Require(fetched==1 && first.first==program && first.second==geometry,"the first frame fetches the sources");
+  table.EndFrame();
+  const auto second=table.Get(0x3000,0x2000,layout,1,fetch,keep);
+  Require(fetched==1 && second==first && table.hits==1,"the second frame reuses them without the providers");
+  // The providers' generation moves with a rebuilt program or reloaded geometry.
+  program=std::make_shared<const int>(3);
+  const auto rebuilt=table.Get(0x3000,0x2000,layout,2,fetch,keep);
+  Require(fetched==2 && rebuilt.first==program,"a new generation fetches the rebuilt program");
+  geometry=std::make_shared<const int>(4);
+  const auto reloaded=table.Get(0x3000,0x2000,layout,3,fetch,keep);
+  Require(fetched==3 && reloaded.second==geometry,"a new generation fetches the reloaded geometry");
+  Require(table.Get(0x3000,0x2000,layout,3,fetch,keep)==reloaded && fetched==3,"the refetched row is reused at its generation");
+  // A new layout generation is a new layout object: its own row.
+  const auto relayout=Layout(0x1000,false,1,{Mesh(0,false,true,{Batch(0x2000,{0x3000})})});
+  table.Get(0x3000,0x2000,relayout,3,fetch,keep);
+  Require(fetched==4 && table.size()==2,"a new layout fetches its own sources");
+  // A missing source is asked again; an unversioned source is never kept.
+  geometry=nullptr;
+  table.Get(0x3100,0x2000,layout,3,fetch,keep); table.Get(0x3100,0x2000,layout,3,fetch,keep);
+  Require(fetched==6,"a missing geometry is not stored");
+  geometry=std::make_shared<const int>(5);
+  table.Get(0x3000,0x2000,layout,kNativeFullFrameModelUnversioned,fetch,keep);
+  table.Get(0x3000,0x2000,layout,kNativeFullFrameModelUnversioned,fetch,keep);
+  Require(fetched==8,"without a generation every use fetches");
+}
+NativeFullFrameModelMaterialKey MaterialKey(uint32_t pass,std::shared_ptr<const void> program,std::shared_ptr<const void> geometry) {
+  NativeFullFrameModelTargets targets; targets.dsv_format=1;
+  return {pass,false,std::move(program),std::move(geometry),NativeFullFrameModelBaseState(targets),targets,-1};
+}
+void MaterialCache() {
+  using Cache=NativeFullFrameModelMaterialCache<int>;
+  Cache cache;
+  const auto key=MaterialKey(0x3000,std::make_shared<const int>(1),std::make_shared<const int>(2));
+  const std::vector<NativeSceneMaterialInputs::Constant> constants{{false,"g_vColor",std::vector<uint8_t>(16,1),false}};
+  Require(!cache.Candidate(key),"the first frame misses");
+  cache.Store(key,constants,7,nullptr,{});
+  cache.EndFrame();
+  NativeSceneView camera;
+  auto* entry=cache.Candidate(key);
+  Require(entry && entry->material==7 && Cache::Current(*entry,constants,nullptr,camera),"the second frame hits the stored resolve");
+  auto moved=constants; moved[0].registers[0]=2;
+  Require(!Cache::Current(*entry,moved,nullptr,camera),"a moved constant is not current");
+  auto program=key; program.program=std::make_shared<const int>(1);
+  Require(!cache.Candidate(program),"a rebuilt program misses");
+  auto geometry=key; geometry.geometry=std::make_shared<const int>(2);
+  Require(!cache.Candidate(geometry),"reloaded geometry misses");
+  auto filtering=key; filtering.filtering=4;
+  Require(!cache.Candidate(filtering),"a filtering change misses");
+  auto targets=key; targets.targets.reverse_depth=true;
+  Require(!cache.Candidate(targets),"a target change misses");
+  auto skinned=key; skinned.skinned=true;
+  Require(!cache.Candidate(skinned),"skinned and rigid rows are distinct");
+  // The rebuilt program's resolve is its own row; the old one ages out.
+  cache.Store(program,constants,8,nullptr,{});
+  Require(cache.Candidate(program)->material==8 && cache.Candidate(key)->material==7 && cache.size()==2,
+    "each program generation keeps its own resolve");
+  for(int frame=0;frame<600;++frame) { cache.Candidate(program); cache.EndFrame(); }
+  Require(!cache.Candidate(key) && cache.Candidate(program) && cache.size()==1,"unused rows age out");
+}
+void RigidInstancing() {
+  // Three identical rigid entries with their own poses: every draw finds the
+  // one material row, the draws are adjacent and each keeps its own world.
+  const auto layout=Layout(0x1000,false,1,{Mesh(0,false,true,{Batch(0x2000,{0x3000})})});
+  NativeRenderRegistrySnapshot snapshot;
+  for(uint32_t i=0;i<3;++i) {
+    auto entry=Entry(i+1,{float(i),0,100},1,layout);
+    auto pose=std::make_shared<std::vector<NativePoseMatrix>>(1,NativePoseMatrix{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1});
+    (*pose)[0][12]=float(i*10);
+    entry->pose=pose;
+    snapshot.entries.push_back(entry);
+  }
+  const auto plan=PlanNativeFullFrameModels(snapshot,MakeCamera());
+  Require(plan.opaque.size()==3,"identical rigid entries are visible");
+  const auto draws=OrderNativeFullFrameModelDraws(plan.opaque,true);
+  Require(draws.size()==3 && draws[0].item==0 && draws[1].item==1 && draws[2].item==2,"identical draws are adjacent");
+  NativeFullFrameModelMaterialCache<int> cache;
+  const auto program=std::make_shared<const int>(1),geometry=std::make_shared<const int>(2);
+  int stored=0;
+  std::vector<int> materials;
+  std::vector<std::array<uint8_t,64>> worlds;
+  for(int frame=0;frame<2;++frame) {
+    for(const auto& ref:draws) {
+      const auto& item=plan.opaque[ref.item];
+      const auto& model=*item.entry->models[item.model].layout;
+      const auto key=MaterialKey(ref.draw.pass,program,geometry);
+      auto* entry=cache.Candidate(key);
+      if(!entry) entry=&cache.Store(key,{},stored++,nullptr,{});
+      materials.push_back(entry->material);
+      worlds.push_back(NativeFullFrameModelConstantsFor(model,*item.entry->pose,68).worlds[ref.draw.mesh]);
+    }
+    cache.EndFrame();
+  }
+  Require(stored==1 && cache.size()==1 && std::count(materials.begin(),materials.end(),0)==6,
+    "identical rigid entries share one material across frames");
+  Require(worlds[0]!=worlds[1] && worlds[1]!=worlds[2] && worlds[0]==worlds[3],"each instance keeps its own world");
+}
+void InstancedCache() {
+  // The mothership's single-world sphere items: every world's draw uses one
+  // source row (the set's layout object) and one material row across frames,
+  // with its own world, so the renderer instances them.
+  auto sphere=std::make_shared<NativeModelLayout>();
+  sphere->instance=0x9000; sphere->node=0x9100; sphere->single_world=true;
+  sphere->meshes={Mesh(0,false,true,{Batch(0x9200,{0x9300})})};
+  auto worlds=std::make_shared<std::vector<NativePoseMatrix>>(4,NativePoseMatrix{1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1});
+  for(size_t w=0;w<worlds->size();++w) (*worlds)[w][12]=float(w*10);
+  auto mother=Entry(1,{0,0,100});
+  mother->instanced.push_back({{sphere->instance,sphere},worlds});
+  NativeRenderRegistrySnapshot snapshot;
+  snapshot.entries.push_back(mother);
+  const auto plan=PlanNativeFullFrameModels(snapshot,MakeCamera());
+  Require(plan.opaque.size()==5 && plan.stats.instances==4,"the model and four sphere worlds");
+  NativeFullFrameModelSourceTable<SourcePair> table;
+  NativeFullFrameModelMaterialCache<int> cache;
+  const auto program=std::make_shared<const int>(1),geometry=std::make_shared<const int>(2);
+  int fetched=0,stored=0;
+  const auto fetch=[&] { ++fetched; return SourcePair{program,geometry}; };
+  const auto keep=[](const SourcePair& value) { return value.first && value.second; };
+  std::vector<std::array<uint8_t,64>> sphere_worlds;
+  for(int frame=0;frame<2;++frame) {
+    for(const auto& ref:OrderNativeFullFrameModelDraws(plan.opaque,true)) {
+      const auto& item=plan.opaque[ref.item];
+      if(item.instanced<0) continue;
+      const auto& set=item.entry->instanced[size_t(item.instanced)];
+      const auto& layout=NativeFullFrameModelItemLayout(item);
+      Require(&layout==sphere.get(),"an instance item draws the set's layout");
+      const auto source=table.Get(ref.draw.pass,layout.meshes[ref.draw.mesh].batches[ref.draw.batch].address,set.model.layout,1,fetch,keep);
+      const auto key=MaterialKey(ref.draw.pass,source.first,source.second);
+      if(!cache.Candidate(key)) cache.Store(key,{},stored++,nullptr,{});
+      if(!frame) sphere_worlds.push_back(NativeFullFrameModelInstancedConstants(layout,set.worlds->at(item.world)).worlds[ref.draw.mesh]);
+    }
+    table.EndFrame(); cache.EndFrame();
+  }
+  Require(fetched==1 && table.size()==1,"every sphere world shares one source row across frames");
+  Require(stored==1 && cache.size()==1,"every sphere world shares one material row across frames");
+  Require(sphere_worlds.size()==4 && sphere_worlds[0]!=sphere_worlds[1] && sphere_worlds[2]!=sphere_worlds[3],
+    "each sphere instance keeps its own world");
+}
 }
 int main() {
   try {
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
+    SourceTable(); MaterialCache(); RigidInstancing(); InstancedCache();
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
     return 1;
