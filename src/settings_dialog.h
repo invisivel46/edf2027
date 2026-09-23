@@ -769,6 +769,20 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     EndRow("Waits for the display's refresh, which removes tearing. Off lets frames out as soon as they are "
            "ready: lowest delay, and a variable-refresh (G-Sync/FreeSync) display stays smooth.");
 
+    if (Exists("edf_low_latency")) {
+      BeginRow("Low latency");
+      bool low_latency = GetBool(Get("edf_low_latency"));
+      ImGui::BeginDisabled(!d3d12);
+      if (ImGui::Checkbox("##low_latency", &low_latency))
+        rex::cvar::SetFlagByName("edf_low_latency", low_latency ? "true" : "false");
+      ImGui::EndDisabled();
+      EndRow(d3d12 ? "Shows the newest frame as late as the display allows and, with VSync on, keeps the game at "
+                     "most one frame ahead of the display instead of queueing several behind it. Mouse aim also "
+                     "takes the newest movement. Less input delay; with VSync on and a frame rate above the "
+                     "display's, it can cost frame rate when the GPU is the limit. Applies immediately."
+                   : "Needs Direct3D 12 (Graphics > Graphics API).");
+    }
+
     if (Exists("edf_frame_pacer_before_present")) {
       BeginRow("Frame pacing");
       int pacing = GetBool(Get("edf_frame_pacer_before_present")) ? 0 : 1;
@@ -1249,8 +1263,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
         break;
       case 2:
         for (const char* cvar : {"edf_native_unlock_framerate", "edf_fps_cap", "edf_native_vsync",
-                                 "edf_frame_pacer_before_present", "edf_native_thread_qos", "edf_show_fps",
-                                 "edf_perf_overlay_detail"})
+                                 "edf_low_latency", "edf_frame_pacer_before_present", "edf_native_thread_qos",
+                                 "edf_show_fps", "edf_perf_overlay_detail"})
           ResetOne(cvar);
         break;
       case 3:

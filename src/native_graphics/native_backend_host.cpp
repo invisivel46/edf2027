@@ -1,6 +1,7 @@
 #include "native_backend_host.h"
 #include "d3d11_texture.h"
 #include "bridge/native_cvars.h"  // edf_native_unlock_framerate
+#include "../input_latency.h"
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <fstream>
@@ -29,6 +30,21 @@ std::shared_ptr<NativeBackendHost> NativeBackendHost::Create(HWND window,
   });
   SetNativeBackendFrameReadyCallback([ready=host->ticker_->FrameReadyCallback()] {
     if(NativeFramerateUnlockActive()) ready();
+  });
+  // edf_low_latency: wait for the display on the ticker thread, just before the paint is
+  // dispatched, so the paint takes the newest image right after a flip and presents it
+  // without waiting, and the UI thread (which delivers keyboard and mouse input) is never
+  // blocked on the display. Present spends the credit instead of waiting itself.
+  host->ticker_->SetBeforeDispatch([backend=std::weak_ptr<NativeRenderBackend>(host->backend_)] {
+    if(!edf::latency::LowLatency()) return;
+    const auto pinned=backend.lock();
+    if(!pinned) return;
+    const auto begin=edf::latency::NowNs();
+    const bool held=pinned->WaitPresentSlot(100);
+    const auto end=edf::latency::NowNs();
+    // A wait that blocked ended at a flip: the display's refresh (NativeFrameCreditPolicy)
+    // and the trace's estimated photon of the presents before it.
+    if(held && end-begin>=250000) edf::latency::OnDisplayFlip(end);
   });
   return host;
 }
@@ -69,6 +85,8 @@ void NativeBackendHost::Paint() {
     using Clock=std::chrono::steady_clock;
     const bool timed=REXCVAR_GET(edf_native_host_timings);
     const auto entered=timed?Clock::now():Clock::time_point{};
+    const bool traced=edf::latency::Enabled();
+    const auto paint_begin=traced?edf::latency::NowNs():0;
     auto milliseconds=[](auto duration) { return std::chrono::duration<double,std::milli>(duration).count(); };
     NativeBackendFrameVisitTiming visit_timing;
     VisitNativeBackendFrame(sequence_,[&](const NativeBackendPublishedFrame& frame) {
@@ -100,6 +118,7 @@ void NativeBackendHost::Paint() {
       backend_->Submit();
       auto completion=backend_->MarkCompletion();
       sequence_=frame.sequence; gamma_=frame.gamma;
+      if(traced) edf::latency::OnFrameAcquired(frame.sequence);
       return NativeBackendFrameCopied{nullptr,0,std::move(completion)};
     },timed?&visit_timing:nullptr);
     if(timed && visit_timing.lock_ms+visit_timing.copy_ms+visit_timing.release_ms>=5)
@@ -138,8 +157,21 @@ void NativeBackendHost::Paint() {
       REXLOG_INFO("Native D3D12 host GPU capture: {}; elapsed_ms={}, image={}",capture,elapsed,bool(snapshot_));
     }
     const auto before_present=timed?Clock::now():Clock::time_point{};
+    const auto present_begin=traced?edf::latency::NowNs():0;
     backend_->Present(REXCVAR_GET(edf_native_vsync));
     const double present_ms=timed?milliseconds(Clock::now()-before_present):0;
+    if(traced) {
+      // Input latency trace: the paint blocked the UI thread from paint_begin; a Present
+      // that waited for the frame-latency object returned at a flip (the estimated photon of
+      // the earlier presents); DXGI's statistics give the exact vblank of the latest present
+      // that reached the screen when the swap chain reports them.
+      const auto present_end=edf::latency::NowNs();
+      const auto stats=backend_->PresentationStatistics();
+      if(present_end-present_begin>=250000 && (!stats || stats->result<0)) edf::latency::OnDisplaySignal(present_end);
+      edf::latency::OnFramePresented(stats && stats->last_present_result>=0?stats->last_present_count:0,
+                                     paint_begin,present_end);
+      if(stats && stats->result>=0 && stats->sync_qpc) edf::latency::OnPhotonQpc(stats->present_count,stats->sync_qpc);
+    }
     if(display_trace_.is_open()) {
       if(const auto stats=backend_->PresentationStatistics()) {
         LARGE_INTEGER now{},frequency{}; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&frequency);

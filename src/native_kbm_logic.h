@@ -205,29 +205,68 @@ class MouseRouter {
       ++polls_since_aim_;
       pending_x_ += dx;
       pending_y_ += dy;
+      late_allowed_ = true;
       return {};
     }
     pending_x_ = pending_y_ = 0.0f;  // nothing on foot will ever collect these
+    late_allowed_ = false;
     return {std::clamp(dx * mouse_sensitivity * kStickPerCount, -1.0f, 1.0f),
             std::clamp(-dy * mouse_sensitivity * kStickPerCount, -1.0f, 1.0f)};
   }
 
-  // The on-foot aim update ran; hand it everything since the last one.
-  void OnAim(float& dx, float& dy) {
+  // The on-foot aim update ran; hand it everything since the last one. With `late`
+  // (edf_low_latency) it also takes the motion that arrived after the step's pad poll,
+  // which the poll would otherwise leave for the next step, a whole tick later: `late` is
+  // called only when that poll routed the mouse to the on-foot aim (every gate passed), and
+  // returns the newest accumulated counts, which it drains from the shared input.
+  template <class Late>
+  void OnAim(float& dx, float& dy, Late&& late) {
     dx = pending_x_;
     dy = pending_y_;
+    if (late_allowed_) {
+      float late_x = 0.0f, late_y = 0.0f;
+      late(late_x, late_y);
+      dx += late_x;
+      dy += late_y;
+    }
     pending_x_ = pending_y_ = 0.0f;
     polls_since_aim_ = 0;
   }
+  void OnAim(float& dx, float& dy) {
+    OnAim(dx, dy, [](float&, float&) {});
+  }
+  // Whether the last poll handed the mouse to the on-foot aim (the late sample may run).
+  bool late_allowed() const { return late_allowed_; }
 
   void Reset() {
     pending_x_ = pending_y_ = 0.0f;
     polls_since_aim_ = kOnFootGracePolls;
+    late_allowed_ = false;
   }
 
  private:
   float pending_x_ = 0.0f, pending_y_ = 0.0f;
   uint32_t polls_since_aim_ = kOnFootGracePolls;
+  bool late_allowed_ = false;
 };
+
+// Diagnostic mouse sweep (edf_kbm_test_sweep): counts to emit for the time [from_ms, to_ms)
+// of a 2 s cycle - right at `rate` counts per millisecond for 500 ms, still for 500 ms, left
+// for 500 ms, still for 500 ms - so a latency trace has step changes of motion to follow
+// with nobody at the mouse. Integral of the square wave, so any wake-up cadence emits the
+// same total.
+inline float SweepCounts(double from_ms, double to_ms, float rate) {
+  const auto integral = [rate](double t) {
+    const double cycle = std::floor(t / 2000.0);
+    const double phase = t - cycle * 2000.0;
+    // Each full cycle nets zero. Within one: +rate over [0,500), 0 over [500,1000),
+    // -rate over [1000,1500), 0 over [1500,2000).
+    double sum = 0.0;
+    sum += std::min(phase, 500.0);
+    if (phase > 1000.0) sum -= std::min(phase - 1000.0, 500.0);
+    return sum * double(rate);
+  };
+  return to_ms > from_ms ? float(integral(to_ms) - integral(from_ms)) : 0.0f;
+}
 
 }  // namespace edf::kbm

@@ -627,6 +627,11 @@ class NativeRenderBackend {
   // buffer, and holding the old one writes to something being displayed.
   virtual NativeBackendRenderTarget* BackBuffer()=0;
   virtual void Present(bool vsync)=0;
+  // Just-in-time presentation (edf_low_latency, native_present_slot.h): waits, on any
+  // thread, up to timeout_ms for the swap chain to accept another present, and holds that
+  // as a credit the next Present spends instead of waiting itself. False when it timed out,
+  // there is no window, or the backend has no such object (Present then waits as before).
+  virtual bool WaitPresentSlot(uint32_t timeout_ms) { (void)timeout_ms; return false; }
   virtual std::optional<NativeBackendPresentationStatistics> PresentationStatistics() const {
     return std::nullopt;
   }

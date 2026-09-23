@@ -3,6 +3,7 @@
 #include "d3d12_pipeline.h"
 #include "native_d3d12_raw.h"
 #include "native_parallel_recorder.h"
+#include "native_present_slot.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -925,6 +926,7 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
 
   void ReleaseFrameLatency() {
     if(!frame_latency_) return;
+    present_slot_.Attach(nullptr);
     CloseHandle(frame_latency_);
     frame_latency_=nullptr;
   }
@@ -1601,6 +1603,7 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
     // scene it is showing.
     swap_chain_->SetMaximumFrameLatency(1);
     frame_latency_=swap_chain_->GetFrameLatencyWaitableObject();
+    present_slot_.Attach(frame_latency_);
 
     for(uint32_t index=0;index<kBackBuffers;++index) {
       TrackedResource tracked;
@@ -1638,6 +1641,7 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
   // producer on another device. A completed value below the awaited one says
   // the producer never signalled, which is a different bug from anything this
   // device's own command lists did.
+  bool WaitPresentSlot(uint32_t timeout_ms) override { return present_slot_.Acquire(timeout_ms); }
   std::optional<NativeBackendPresentationStatistics> PresentationStatistics() const override {
     if(!swap_chain_) return std::nullopt;
     NativeBackendPresentationStatistics result;
@@ -1673,7 +1677,8 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
     if(open_) throw std::runtime_error("Present inside an open frame; submit it first");
     // Throttle once per presentation, never once per command submission:
     // snapshot copies and readbacks also open frames without presenting.
-    if(frame_latency_ && WaitForSingleObject(frame_latency_,1000)==WAIT_TIMEOUT)
+    // A wait already taken just in time (WaitPresentSlot) is spent instead.
+    if(frame_latency_ && !present_slot_.Spend() && WaitForSingleObject(frame_latency_,1000)==WAIT_TIMEOUT)
       ++present_waits_timed_out_;
     // The host uses windowed/borderless presentation, never DXGI exclusive
     // fullscreen. Explicit VSync-off must permit tearing where supported;
@@ -1852,6 +1857,17 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
   // Signalled when the swap chain is ready for another frame. Waited on before
   // recording rather than inside Present; see AttachWindow.
   HANDLE frame_latency_=nullptr;
+  // The one wait per Present on frame_latency_, which the presenter may take ahead of
+  // Present on another thread (edf_low_latency; native_present_slot.h).
+  NativePresentSlot present_slot_{{
+    [](void* handle) -> void* {
+      HANDLE duplicate=nullptr;
+      const HANDLE process=GetCurrentProcess();
+      return DuplicateHandle(process,static_cast<HANDLE>(handle),process,&duplicate,SYNCHRONIZE,FALSE,0)
+        ? static_cast<void*>(duplicate) : nullptr;
+    },
+    [](void* handle,uint32_t timeout_ms) { return WaitForSingleObject(static_cast<HANDLE>(handle),timeout_ms)==WAIT_OBJECT_0; },
+    [](void* handle) { CloseHandle(static_cast<HANDLE>(handle)); }}};
   bool allow_tearing_=false;
   uint64_t present_waits_timed_out_=0;
   void* shared_fence_handle_=nullptr;

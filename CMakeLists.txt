@@ -44,6 +44,7 @@ set(EDF2027_SOURCES
     src/launcher_cvars.cpp
     src/native_kbm.cpp
     src/manual_reload.cpp
+    src/input_latency.cpp
 )
 
 if(WIN32)
@@ -400,7 +401,7 @@ if(BUILD_TESTING)
         target_link_options(edf_native_backend_sdk_ui_tests PRIVATE "LINKER:/DELAYLOAD:d3d11.dll")
         add_test(NAME edf_native_backend_sdk_ui_tests COMMAND edf_native_backend_sdk_ui_tests)
         add_executable(edf_native_backend_host_tests tests/native_backend_host_tests.cpp
-            src/native_graphics/native_backend_host.cpp)
+            src/native_graphics/native_backend_host.cpp src/input_latency.cpp)
         target_link_libraries(edf_native_backend_host_tests PRIVATE edf_native_d3d11 rex::runtime comctl32)
         add_test(NAME edf_native_backend_host_tests COMMAND edf_native_backend_host_tests)
         set_tests_properties(edf_native_backend_host_tests PROPERTIES TIMEOUT 30)
@@ -418,6 +419,17 @@ if(BUILD_TESTING)
     add_executable(edf2027_tests tests/unit_tests.cpp)
     target_include_directories(edf2027_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME edf2027_unit_tests COMMAND edf2027_tests)
+    # Input latency: the trace, the low-latency presentation pieces and the mouse path
+    # (input_latency_logic.h, native_present_slot.h, native_backend_frame_queue.h, ui_ticker.h).
+    add_executable(edf_input_latency_tests tests/input_latency_tests.cpp)
+    target_include_directories(edf_input_latency_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME edf_input_latency_tests COMMAND edf_input_latency_tests)
+    set_tests_properties(edf_input_latency_tests PROPERTIES TIMEOUT 60)
+    add_custom_target(edf_latency_report_tests
+        COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_latency_report
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} VERBATIM)
+    add_test(NAME edf_latency_report_tests COMMAND ${Python3_EXECUTABLE} -m unittest tests.test_latency_report)
+    set_tests_properties(edf_latency_report_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
     add_executable(edf_frame_limiter_tests tests/frame_limiter_tests.cpp)
     target_include_directories(edf_frame_limiter_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME edf_frame_limiter_tests COMMAND edf_frame_limiter_tests)
