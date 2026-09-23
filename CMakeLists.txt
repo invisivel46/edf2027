@@ -55,6 +55,11 @@ if(WIN32)
     # hook timing and bridge locks, and the shared bridge state (State()).
     target_sources(edf2027 PRIVATE src/native_graphics/bridge/native_cvars.cpp
         src/native_graphics/bridge/hook_timing.cpp src/native_graphics/bridge/bridge_state.cpp)
+    # The full frame's host and passes, out of the bridge the same way (bridge_helpers.h is what they share).
+    target_sources(edf2027 PRIVATE src/native_graphics/edf/full_frame/full_frame_shared.cpp
+        src/native_graphics/edf/full_frame/host.cpp src/native_graphics/edf/full_frame/sky_pass.cpp
+        src/native_graphics/edf/full_frame/static_world_pass.cpp src/native_graphics/edf/full_frame/models_pass.cpp
+        src/native_graphics/edf/full_frame/effects_pass.cpp src/native_graphics/edf/full_frame/transparent_pass.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_full_frame_sky.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
