@@ -43,6 +43,9 @@ constexpr NativeRenderClass Highlighted(uint32_t vtable,const char* name,uint32_
 }
 // 8219A2D0 (C_VehicleBase and the classes sharing it): 8210AE48, then
 // 82199DD8(obj+1824): elements at +36, count +44.
+// None of them stores a pool constant: C_PowerLoader's powerloader.Dxm is
+// c_Mech01 and reads g_Highlight/g_Time as the previous writer left them
+// (the models pass's pool carry).
 constexpr NativeRenderClass Vehicle(uint32_t vtable,const char* name) {
   auto type=Character(vtable,name);
   type.weapon_groups[0]={1824,36,44};

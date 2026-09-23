@@ -5011,6 +5011,11 @@ REXCVAR_DEFINE_BOOL(edf_native_map_effect_list,false,"EDF2027",
 namespace {
 // Render helper entries (sub_821A5080), one per frame; census periods count these.
 std::atomic<uint64_t> native_render_frames{0};
+// Render helper entries whose model slot 4s ran as guest code (the guest
+// helper or frame dispatch, e.g. A/B alternate frames): their 821A1730 stores
+// are in the guest effect pool, which the full-frame models' pool carry then
+// takes again (NativeFullFrameModelPass::guest_frames).
+std::atomic<uint64_t> native_guest_slot4_frames{0};
 // Unvalidated big-endian words at the same host address REX_LOAD_U32 and
 // REX_STORE_U32 use, so the native walk faults exactly where the guest would.
 struct NativeRawGuestWords {
@@ -6591,9 +6596,10 @@ void NativeFullFrameDeclined(const char* pass,const std::string& reason) {
 // What the Models, Sky (map effects) and Effects passes of one view hand to its
 // Transparent pass: the models' transparent batches (one item each, keyed),
 // the map effects' and the effects' filed items, and the filing counts that
-// place them in one sequence (the registry is unordered, so every model is
+// place them in one sequence. The models' filing order is the guest's gather
+// order among models (ReadNativeFullFrameModelGather), but every model is
 // taken as filed before every effect; the two managers file in world-list
-// order, NativeMapEffectFilingBases; only equal keys can tell).
+// order (NativeMapEffectFilingBases); only equal keys can tell.
 struct NativeFullFrameModelsShared {
   std::shared_ptr<edf::native::NativeFullFrameModelFrame> transparent;
   std::vector<edf::native::NativeEffectItem> effects;
@@ -6652,6 +6658,26 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     pass.palette_limit=NativeFullFramePaletteLimit(reader_);
     pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
     pass.motion=context.inputs.motion;
+    // The guest's slot-4 order (its gather walk over the owner+44 managers)
+    // and the pool carry's inputs. Without the order every entry is taken as
+    // unlisted (snapshot order), which only an equal key or a pool store can tell.
+    if(context.owner) {
+      try { pass.gather=ReadNativeFullFrameModelGather(NativeSceneCpuWindow(reader_),context.owner); }
+      catch(const std::exception& error) { pass.gather={}; NativeFullFrameDeclined("models gather order",error.what()); }
+    }
+    pass.tick_frame=context.inputs.tick_frame;
+    pass.view=context.view.index;
+    pass.guest_frames=native_guest_slot4_frames.load(std::memory_order_relaxed);
+    pass.pool=[this](const std::string& name) -> std::optional<std::array<uint8_t,16>> {
+      try {
+        const GuestPostMemory memory(reader_);
+        const auto value=ReadPostPoolVector(memory,name.c_str());
+        if(!value) return std::nullopt;
+        std::array<uint8_t,16> registers;
+        for(size_t i=0;i<16;++i) registers[i]=uint8_t(std::bit_cast<uint32_t>((*value)[i/4])>>(24-(i%4)*8));
+        return registers;
+      } catch(const std::exception&) { return std::nullopt; }
+    };
     auto& state=State();
     // The bridge locks in short holds (NativeLockSlices): the targets, each use
     // of the model pass caches (program, geometry) and each resolve with its
@@ -6767,12 +6793,13 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} attachments={} no_attachment={} items={} drawn={} blended={} interpolate={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} object_constants={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
+      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} attachments={} no_attachment={} items={} drawn={} blended={} interpolate={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} object_constants={} carried={} calls={} unlisted={} gathered={} pool_reseeds={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
         "source_generation={} source_memo={} source_validated={} source_advances={}/{}/{}/{} source_reuses={} source_audits={}/{}",
         frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
         planned.attachments,planned.no_attachment,
         built.items,built.drawn,built.blended,pass.motion.interpolate,built.draws,statistics.draws,built.resolves,built.captures,built.palettes,built.cache_hits,built.memo_hits,
-        built.reused,built.derived,built.object_constants,built.sourced,built.programs,built.geometries,built.camera_rows,built.rows,
+        built.reused,built.derived,built.object_constants,built.carried,planned.calls,planned.unlisted,pass.gather.objects.size(),built.reseeds,
+        built.sourced,built.programs,built.geometries,built.camera_rows,built.rows,
         built.source_hits,built.source_fetches,models_.material_cache().size(),models_.source_table().size(),
         models_.item_states(),models_.row_states(),built.missing_program,built.missing_geometry,built.failed,broken_,
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()),
@@ -7830,6 +7857,7 @@ REX_HOOK_RAW(sub_821A5080) {
       REXLOG_INFO("Native full frame dispatch: frames={} view_passes={} frame_passes={} (guest helper not called; view listeners, finish fallback and HUD phases remain guest)",
         frames,full_frame.view_passes().size(),full_frame.frame_passes().size());
   } else if(route==edf::native::NativeFrameRoute::frame_dispatch) {
+    native_guest_slot4_frames.fetch_add(1,std::memory_order_relaxed);
     native_render_tick_frame=GuestRenderTickFrame();
     const edf::native::GuestReader reader(base);
     auto work=ctx;
@@ -7860,6 +7888,7 @@ REX_HOOK_RAW(sub_821A5080) {
       REXLOG_INFO("Native frame dispatch: frames={} (native outer and bucket traversal; world/overlay/presentation callbacks retained)",frame_count);
     ctx.r3=work.r3;
   } else {
+    native_guest_slot4_frames.fetch_add(1,std::memory_order_relaxed);
     native_render_tick_frame=GuestRenderTickFrame();
     __imp__sub_821A5080(ctx,base);
   }

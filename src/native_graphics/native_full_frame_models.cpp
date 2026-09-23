@@ -39,13 +39,32 @@ std::optional<uint32_t> SelectNativeFullFrameModelLod(const NativeRenderEntry& e
   if(!model.instance || !model.layout) return std::nullopt;
   return chosen;
 }
-NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera) {
+NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera,
+    const NativeFullFrameModelGather& gather) {
   using C=NativeFullFrameModelCull;
   NativeFullFrameModelPlan plan;
   auto& stats=plan.stats;
-  for(const auto& shared:snapshot.entries) {
-    if(!shared) continue;
-    const auto& entry=*shared;
+  // Gather order: a listed object at 2i+1, the unlisted at 2*unlisted (before
+  // objects[unlisted]), ties (the unlisted) in snapshot order.
+  std::vector<std::pair<uint64_t,const NativeRenderEntry*>> order;
+  order.reserve(snapshot.entries.size());
+  {
+    std::unordered_map<uint32_t,uint32_t> rank;
+    rank.reserve(gather.objects.size());
+    for(uint32_t i=0;i<gather.objects.size();++i) rank.emplace(gather.objects[i],i);
+    const uint64_t unlisted=2*uint64_t(std::min<size_t>(gather.unlisted,gather.objects.size()));
+    for(const auto& shared:snapshot.entries) {
+      if(!shared) continue;
+      const auto found=rank.find(shared->object);
+      if(found==rank.end()) ++stats.unlisted;
+      order.emplace_back(found==rank.end()?unlisted:2*uint64_t(found->second)+1,shared.get());
+    }
+    std::stable_sort(order.begin(),order.end(),[](const auto& a,const auto& b) { return a.first<b.first; });
+  }
+  // The filed entries whose slot 4 821A3BA0 calls, in filing order.
+  std::vector<std::pair<uint16_t,const NativeRenderEntry*>> filed;
+  for(const auto& [position,pointer]:order) {
+    const auto& entry=*pointer;
     ++stats.entries;
     // Drawn by its own pass (clSky: the sky pass); the registry never
     // publishes one, and an entry that says so is still not drawn twice.
@@ -58,6 +77,13 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
       case C::Distance: ++stats.distance; continue;
       case C::Frustum: ++stats.frustum; continue;
       case C::Box: ++stats.box; continue;
+    }
+    // 821C0C00: mode 0 calls slot 4 now; 1/2 file it, and 821A3BA0 calls it
+    // after the walks unless the key is below 256.
+    if(entry.mode==0) plan.calls.push_back(&entry);
+    else {
+      const auto key=NativeFullFrameModelKey(entry.mode,visibility.centre[2],entry.sort_bias,camera.key_scale,camera.key_offset);
+      if(key>=256) filed.emplace_back(key,&entry);
     }
     const auto model=SelectNativeFullFrameModelLod(entry,visibility.depth);
     const bool posed=model && entry.pose && entry.pose->size()==entry.models[*model].layout->bones;
@@ -101,8 +127,43 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
   }
   std::stable_sort(plan.transparent.begin(),plan.transparent.end(),
     [](const auto& a,const auto& b) { return a.key>b.key; });
-  stats.opaque=plan.opaque.size(); stats.transparent=plan.transparent.size();
+  std::stable_sort(filed.begin(),filed.end(),[](const auto& a,const auto& b) { return a.first>b.first; });
+  for(const auto& [key,entry]:filed) plan.calls.push_back(entry);
+  stats.opaque=plan.opaque.size(); stats.transparent=plan.transparent.size(); stats.calls=plan.calls.size();
   return plan;
+}
+void ApplyNativeFullFrameModelPool(std::vector<NativeRenderObjectConstant>& state,const NativeRenderConstants& stores) {
+  if(!stores) return;
+  for(const auto& store:*stores) {
+    const auto same=std::find_if(state.begin(),state.end(),[&](const auto& c) { return c.name==store.name; });
+    if(same!=state.end()) same->registers=store.registers;
+    else state.push_back(store);
+  }
+}
+NativeFullFrameModelPoolCarry CarryNativeFullFrameModelPool(const NativeFullFrameModelPlan& plan,
+    std::span<const NativeRenderObjectConstant> start) {
+  NativeFullFrameModelPoolCarry carry;
+  carry.end.assign(start.begin(),start.end());
+  NativeRenderConstants current=carry.end.empty()?nullptr:std::make_shared<const std::vector<NativeRenderObjectConstant>>(carry.end);
+  carry.before.reserve(plan.calls.size());
+  for(const auto* entry:plan.calls) {
+    carry.before.insert_or_assign(entry,current);
+    bool stores=entry->constants!=nullptr;
+    for(const auto& attachment:entry->attachments) stores=stores || attachment.constants!=nullptr;
+    if(!stores) continue;
+    const auto previous=carry.end;
+    ApplyNativeFullFrameModelPool(carry.end,entry->constants);
+    for(const auto& attachment:entry->attachments) ApplyNativeFullFrameModelPool(carry.end,attachment.constants);
+    if(carry.end!=previous) current=std::make_shared<const std::vector<NativeRenderObjectConstant>>(carry.end);
+  }
+  return carry;
+}
+std::vector<NativeRenderObjectConstant> NativeFullFrameModelEffectiveConstants(const NativeRenderConstants& before,
+    const NativeRenderConstants& own) {
+  std::vector<NativeRenderObjectConstant> result;
+  if(before) result=*before;
+  ApplyNativeFullFrameModelPool(result,own);
+  return result;
 }
 std::vector<const NativeRenderEntry*> NativeFullFrameBrokenObjects(const NativeRenderRegistrySnapshot& snapshot,
     const NativeFullFrameModelCamera& camera) {
@@ -139,6 +200,22 @@ std::vector<NativeSceneMaterialInputs::Constant> NativeFullFrameModelObjectConst
   std::vector<NativeSceneMaterialInputs::Constant> result;
   if(objects.empty()) return result;
   for(const auto& constant:pass) {
+    if(!constant.global || constant.registers.size()<16) continue;
+    const auto object=std::find_if(objects.begin(),objects.end(),[&](const auto& o) { return o.name==constant.name; });
+    if(object==objects.end()) continue;
+    auto& replaced=result.emplace_back(constant);
+    std::copy(object->registers.begin(),object->registers.end(),replaced.registers.begin());
+  }
+  return result;
+}
+std::vector<NativeSceneMaterialInputs::Constant> NativeFullFrameModelObjectConstants(
+    std::span<const NativeSceneMaterialInputs::Constant> pass,std::span<const uint32_t> slots,
+    std::span<const NativeRenderObjectConstant> objects) {
+  std::vector<NativeSceneMaterialInputs::Constant> result;
+  if(objects.empty()) return result;
+  for(const auto slot:slots) {
+    if(slot>=pass.size()) throw std::runtime_error("native full-frame model object slot outside the pass constants");
+    const auto& constant=pass[slot];
     if(!constant.global || constant.registers.size()<16) continue;
     const auto object=std::find_if(objects.begin(),objects.end(),[&](const auto& o) { return o.name==constant.name; });
     if(object==objects.end()) continue;
@@ -227,7 +304,7 @@ std::vector<NativeBackendSampler*> ResolvedSamplers(const NativeSceneMaterialPro
 // Whether two sets of an item's constants are the same bytes (the palette
 // floats compared as bits: a NaN is itself, -0 is not 0).
 bool SameConstants(const NativeFullFrameModelConstants& a,const NativeFullFrameModelConstants& b) {
-  return a.skinned==b.skinned && a.bones==b.bones && a.worlds==b.worlds && a.objects==b.objects && a.palette.size()==b.palette.size() &&
+  return a.skinned==b.skinned && a.bones==b.bones && a.worlds==b.worlds && a.palette.size()==b.palette.size() &&
     (a.palette.empty() || !std::memcmp(a.palette.data(),b.palette.data(),a.palette.size()*sizeof(float)));
 }
 }
@@ -243,7 +320,26 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
   auto& stats=frame.stats;
   ++frame_;
   enter(Phase::Visibility);
-  frame.plan=PlanNativeFullFrameModels(snapshot,camera);
+  frame.plan=PlanNativeFullFrameModels(snapshot,camera,pass.gather);
+  // The pool carry: what each slot-4 call finds in the pool, from the pool as
+  // this view starts (NativeFullFrameModelPass::tick_frame, view,
+  // guest_frames). Renders whose slot 4s were the guest's left their stores
+  // in the guest pool: every name the carry knows is taken from it again.
+  if(pass.guest_frames!=pool_guest_frames_) {
+    if(pass.pool)
+      for(auto& constant:pool_committed_)
+        if(const auto value=pass.pool(constant.name)) { constant.registers=*value; ++stats.reseeds; }
+    pool_guest_frames_=pass.guest_frames;
+    pool_tick_start_=pool_view_end_=pool_committed_;
+  }
+  if(pass.view==0 && pass.tick_frame) pool_tick_start_=pool_committed_;
+  const auto carry=CarryNativeFullFrameModelPool(frame.plan,pass.view>0?pool_view_end_:pass.tick_frame?pool_committed_:pool_tick_start_);
+  pool_view_end_=carry.end;
+  if(pass.tick_frame) pool_committed_=carry.end;
+  for(const auto& constant:carry.end)
+    if(std::find(pool_names_.begin(),pool_names_.end(),constant.name)==pool_names_.end()) {
+      pool_names_.push_back(constant.name); ++pool_names_version_;
+    }
   // Programs: each drawn item's draw state, found by (object, generation, LOD
   // model or instanced world). Its draws and their program and geometry are
   // gathered only when the state is new, its layout object changed or the
@@ -379,7 +475,7 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
       // camera constants can differ, and the camera writes each of them whole:
       // it is applied in place.
       if(row.group!=material || row.constants.empty() || (row.animated && row.animation!=camera.animation)) {
-        row.group.reset(); row.palette_constants.clear();
+        row.group.reset(); row.palette_constants.clear(); row.object_names=0;
         row.constants=PassConstants(*material,camera);
         row.animated=std::any_of(row.constants.begin(),row.constants.end(),[](const auto& constant) {
           return constant.global && (constant.name=="m_WaterTime" || constant.name=="g_SignalBrightness");
@@ -390,6 +486,16 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
       } else {
         if(!(row.camera==camera.pass)) { for(auto& constant:row.constants) camera.pass.Apply(constant); row.camera=camera.pass; }
         ++stats.camera_rows;
+      }
+      // The globals a draw's pool constants bind: those of a name the carry knows.
+      if(row.object_names!=pool_names_version_) {
+        row.object_slots.clear();
+        for(uint32_t i=0;i<row.constants.size();++i) {
+          const auto& constant=row.constants[i];
+          if(constant.global && constant.registers.size()>=16 &&
+             std::find(pool_names_.begin(),pool_names_.end(),constant.name)!=pool_names_.end()) row.object_slots.push_back(i);
+        }
+        row.object_names=pool_names_version_;
       }
       Cache::Key cache_key{draw.pass,skinned,material->program,source.second,base,pass.targets,pass.filtering};
       auto* entry=materials_.Candidate(cache_key);
@@ -459,7 +565,7 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     } catch(const std::exception& error) {
       // Evaluated again next frame from the published constants.
       row.failed=true; row.error=error.what();
-      row.group.reset(); row.constants.clear(); row.palette_constants.clear();
+      row.group.reset(); row.constants.clear(); row.palette_constants.clear(); row.object_slots.clear(); row.object_names=0;
       throw;
     }
     return row;
@@ -491,19 +597,35 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         const uint32_t world=item.instanced<0?0:item.world;
         const auto blend=NativeRenderBlendOf(pose,*motion_of,pass.motion);
         if(blend.previous) ++stats.blended;
-        const auto& object_constants=NativeFullFrameModelItemConstants(item);
-        if(!state->valued || state->pose!=pose || state->blend!=blend || state->world!=world || state->palette_limit!=pass.palette_limit ||
-           state->constants!=object_constants) {
+        if(!state->valued || state->pose!=pose || state->blend!=blend || state->world!=world || state->palette_limit!=pass.palette_limit) {
           // Pose source: the published pose, or blended from the previous tick's.
           auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,poses_.Pose(pose,*motion_of,pass.motion),pass.palette_limit):
             NativeFullFrameModelInstancedConstants(layout,poses_.Matrix(pose,*motion_of,world,pass.motion));
-          if(object_constants) values.objects=*object_constants;
           if(!state->valued || !SameConstants(values,state->values))
             for(auto& draw:state->draws) { draw.object.reset(); draw.made_from.reset(); }
           state->values=std::move(values); state->pose=pose; state->blend=blend; state->world=world; state->palette_limit=pass.palette_limit;
-          state->constants=object_constants; state->valued=true;
+          state->valued=true;
         }
         const auto& values=state->values;
+        // The pool constants in effect at the item's draw: its entry's slot 4
+        // found the carried pool, its own stores (the entry's, a part's) over
+        // it. Made at the first draw whose material reads one; each such draw
+        // binds the ones its material reads.
+        const auto& own=NativeFullFrameModelItemConstants(item);
+        std::optional<std::vector<NativeRenderObjectConstant>> effective;
+        const auto bound_of=[&](const RowState& row) {
+          if(row.object_slots.empty()) return std::vector<NativeSceneMaterialInputs::Constant>{};
+          if(!effective) {
+            const auto before=carry.before.find(item.entry);
+            effective=NativeFullFrameModelEffectiveConstants(before==carry.before.end()?nullptr:before->second,own);
+          }
+          return NativeFullFrameModelObjectConstants(row.constants,row.object_slots,*effective);
+        };
+        const auto carried=[&](const std::vector<NativeSceneMaterialInputs::Constant>& bound) {
+          for(const auto& constant:bound)
+            if(!own || std::none_of(own->begin(),own->end(),[&](const auto& o) { return o.name==constant.name; })) return true;
+          return false;
+        };
         auto& drawn=views[index];
         drawn.assign(state->draws.size(),nullptr);
         bool complete=true;
@@ -512,8 +634,9 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           auto& row=row_of(layout.skinned,draw.draw,draw.source);
           if(!row.deferrable) { ++stats.scissor; complete=false; break; }
           if(!row.same_backend) { ++stats.missing_geometry; complete=false; break; }
+          auto bound=bound_of(row);
           if(layout.skinned) {
-            if(draw.object && draw.made_from.get()==row.palette.get()) ++stats.reused;
+            if(draw.object && draw.made_from.get()==row.palette.get() && draw.bound==bound) ++stats.reused;
             else {
               // The palette is per draw, everything else per row: With over
               // its palette-bound g_mWorldArray. Refused before any capture,
@@ -521,43 +644,44 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
               for(auto& constant:row.palette_constants)
                 if(!BindNativeFullFrameModelPalette(constant,values.palette)) { complete=false; break; }
               if(!complete) { ++stats.palette; break; }
-              // Per-object constants rebind like the palette (after it: none
-              // is g_mWorldArray, and the last of a name wins in With).
-              auto objects=NativeFullFrameModelObjectConstants(row.constants,values.objects);
+              // Pool constants rebind like the palette (after it: none is
+              // g_mWorldArray, and the last of a name wins in With).
+              auto objects=bound;
               if(!objects.empty()) {
                 objects.insert(objects.begin(),row.palette_constants.begin(),row.palette_constants.end());
                 ++stats.object_constants;
+                if(carried(bound)) ++stats.carried;
               }
               auto capture=row.palette->With(objects.empty()?std::span<const NativeSceneMaterialInputs::Constant>(row.palette_constants):
                 std::span<const NativeSceneMaterialInputs::Constant>(objects));
               // g_mWorld as 821A17D8 stores it; a palette shader need not declare it.
               if(NativeSceneCaptureBindsWorld(capture)) ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
-              draw.object=make(draw,capture); draw.made_from=row.palette;
+              draw.object=make(draw,capture); draw.made_from=row.palette; draw.bound=std::move(bound);
               ++stats.palettes;
             }
           } else {
             if(row.draws++) ++stats.memo_hits;
-            if(draw.object && draw.made_from.get()==row.capture.material.get()) ++stats.reused;
+            if(draw.object && draw.made_from.get()==row.capture.material.get() && draw.bound==bound) ++stats.reused;
             else {
               auto capture=row.capture;
-              // Per-object constants: the row's constants with theirs bound,
+              // Pool constants: the row's constants with the draw's bound,
               // captured against the row's pipeline half (the row's material
               // is shared by every draw of it, so never patched).
-              const auto objects=NativeFullFrameModelObjectConstants(row.constants,values.objects);
-              if(!objects.empty()) {
+              if(!bound.empty()) {
                 if(!row.pipeline) throw std::runtime_error("native full-frame model row has no pipeline half");
-                auto bound=row.constants;
-                for(const auto& object:objects)
-                  for(auto& constant:bound)
+                auto constants=row.constants;
+                for(const auto& object:bound)
+                  for(auto& constant:constants)
                     if(constant.global && constant.pixel==object.pixel && constant.name==object.name) constant=object;
                 exclusive([&] {
-                  capture=row.program->Capture(*row.pipeline,pass.targets.reverse_depth,bound,row.samplers,row.blend_factor,false);
+                  capture=row.program->Capture(*row.pipeline,pass.targets.reverse_depth,constants,row.samplers,row.blend_factor,false);
                   if(sources.intern) capture.material=sources.intern(std::move(capture.material));
                 });
                 ++stats.object_constants;
+                if(carried(bound)) ++stats.carried;
               }
               ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
-              draw.object=make(draw,capture); draw.made_from=row.capture.material;
+              draw.object=make(draw,capture); draw.made_from=row.capture.material; draw.bound=std::move(bound);
             }
           }
           drawn[d]=&row.view;

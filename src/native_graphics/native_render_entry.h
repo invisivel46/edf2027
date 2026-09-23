@@ -22,7 +22,10 @@ enum class NativeRenderLodKind : uint8_t { None, FieldParts, Character };
 // in the shared effect pool (the pool map node + 40), looked up once by the
 // class constructor (e.g. 820FC6F0: g_Highlight -> +1296, g_Time -> +1300);
 // every material whose global of that name the draw activates reads it. The
-// value is sticky: a later draw of the same slot 4 that stores nothing sees it.
+// value is sticky: a later draw of the same slot 4 that stores nothing sees it,
+// and so does a later slot 4 of another object (NativeFullFrameModelPoolCarry).
+// base+value is written by the tick (slot 3 into a source block, slot 2 copying
+// it to base+value; native_render_registry.h), never by slot 4.
 // scroll: the value is not an object float4 but (-x, 0, 0, 1) with x the
 // float at base+value (821E7C50: g_Scroll from tread+60, 0.0 [820009A4],
 // 1.0 [820008CC]). handle 0: unused.
