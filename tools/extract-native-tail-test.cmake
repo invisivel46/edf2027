@@ -2,6 +2,8 @@
 # imitation. Generated game code stays in the build directory.
 set(result "// Generated native-tail test fixture. Do not edit.\n")
 string(APPEND result "#include \"native_graphics/native_scene_execution.h\"\nnamespace edf::native { void EnterNativeSceneBoundary(NativeSceneBoundary); }\n")
+# The extracted hooks time themselves under edf_native_load_trace; off here.
+string(APPEND result "#include \"native_graphics/native_load_trace.h\"\nstatic bool LoadTraceOn() { return false; }\n")
 set(enclosing_items "66:sub_8214ECD8" "74:sub_82134408" "46:sub_821E8740")
 list(APPEND enclosing_items "32:sub_8213AD70")
 list(APPEND enclosing_items "25:sub_821EA320")
