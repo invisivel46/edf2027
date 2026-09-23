@@ -7579,8 +7579,16 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
           NativeCoverageMark{NativeCoverageStatus::Covered,vtable,nullptr,"effects"});
       }
     census.Add(marks);
-    for(const auto& [vtable,slot4,count]:collection.unsupported_classes)
-      census.Add(NativeCoverageStatus::Uncovered,vtable,{},"effect_no_builder",count,std::format("slot=0x{:08X}",slot4));
+    // Effect-manager members without an effect builder: the model classes
+    // (kNativeEffectUnbuiltSlots::model) are drawn and counted by the models
+    // pass; the debug test classes (clIKTest, clDrawTestObject) only draw
+    // debug lines and are counted as parity.
+    for(const auto& [vtable,slot4,count]:collection.unsupported_classes) {
+      const auto* known=FindNativeEffectUnbuiltSlot(slot4);
+      if(known && known->model) continue;
+      if(known) census.Add(NativeCoverageStatus::Parity,vtable,{},"effect_debug_only",count,std::format("slot=0x{:08X}",slot4));
+      else census.Add(NativeCoverageStatus::Uncovered,vtable,{},"effect_no_builder",count,std::format("slot=0x{:08X}",slot4));
+    }
     census.Add(NativeCoverageStatus::Uncovered,0,"effect_object","effect_unknown_mode",collection.unknown_modes);
     census.Add(NativeCoverageStatus::Parity,0,"effect_object","undrawn_key",collection.undrawn_keys);
   }
