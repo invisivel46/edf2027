@@ -23,9 +23,6 @@ void OnFfxMessage(uint32_t type,const wchar_t* message) {
   std::lock_guard lock(MessageMutex());
   if(Messages().size()<256) Messages().push_back(std::move(text));
 }
-bool Close(float a,float b,float relative) {
-  return std::abs(a-b)<=relative*(std::max)(std::abs(a),std::abs(b));
-}
 }  // namespace
 
 std::optional<NativeFsrMode> ParseNativeFsrMode(std::string_view text) {
@@ -103,9 +100,17 @@ std::array<uint32_t,16> NativeFsrJitterGuestMatrix(const std::array<uint32_t,16>
 
 NativeFsrCameraParams NativeFsrCameraFromProjection(const std::array<float,16>& p) {
   NativeFsrCameraParams params;
-  // Perspective: w = z (P[2][3] = 1, P[3][3] = 0), and a y scale.
-  if(!(std::abs(p[11]-1.0f)<1e-3f) || !(std::abs(p[15])<1e-3f) || !(p[5]>1e-6f)) return params;
-  const float a=p[10],b=p[14];
+  // Perspective: w = s z with s = P[2][3] = +1 (left-handed) or -1
+  // (right-handed), P[3][3] = 0, and a y scale. The game's projection is
+  // right-handed: 821C82C0 stores P[1][1] = cot(fov/2), P[2][2] = -f/(f-n),
+  // P[3][2] = -n f/(f-n) and P[2][3] = -1.0 ([820013DC]), a forward matrix
+  // made reversed-Z by the viewport. With the view depth d = s z (positive in
+  // front) both handednesses are z_ndc = s P[2][2] + P[3][2] / d, the
+  // left-handed form in (a, b). A reversed matrix (a = -n/(f-n)) gives the
+  // planes swapped, which the min/max below puts back in order.
+  const float s=p[11];
+  if(!(std::abs(std::abs(s)-1.0f)<1e-3f) || !(std::abs(p[15])<1e-3f) || !(p[5]>1e-6f)) return params;
+  const float a=s<0?-p[10]:p[10],b=p[14];
   if(!std::isfinite(a) || !std::isfinite(b) || a==0) return params;
   const float n=-b/a;
   const float f=a==1.0f?std::numeric_limits<float>::infinity():-b/(a-1.0f);
@@ -147,8 +152,14 @@ uint32_t NativeFsrResetTracker::Next(const NativeFsrFrameFacts& facts) {
     if(last.ab_native!=facts.ab_native) reasons|=kNativeFsrResetAbSide;
     if(last.mode!=facts.mode) reasons|=kNativeFsrResetMode;
     const auto& a=last.camera; const auto& b=facts.camera;
-    if(a.derived!=b.derived || !Close(a.fov_y,b.fov_y,1e-3f) || !Close(a.near_plane,b.near_plane,1e-2f) ||
-       !Close(a.far_plane,b.far_plane,1e-2f)) reasons|=kNativeFsrResetCut;
+    // A cut, not a zoom: the motion vectors reproject through both frames'
+    // projections, so a continuous fov change (aiming, a scope) or a moved
+    // near/far plane keeps the history. The fov limit is workstream B's
+    // (NativeCameraHistory::CutWith, 0.25 rad), the planes a factor of 2.
+    const auto ratio=[](float x,float y) { return (std::max)(x,y)/(std::max)((std::min)(x,y),1e-30f); };
+    if(a.derived!=b.derived || std::abs(a.fov_y-b.fov_y)>kNativeFsrCutFov ||
+       ratio(a.near_plane,b.near_plane)>kNativeFsrCutPlaneRatio || ratio(a.far_plane,b.far_plane)>kNativeFsrCutPlaneRatio)
+      reasons|=kNativeFsrResetCut;
   }
   if(facts.motion_reset) reasons|=kNativeFsrResetMotion;
   last_=facts;

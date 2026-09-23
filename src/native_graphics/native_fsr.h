@@ -114,13 +114,28 @@ template<class Camera> Camera NativeFsrJitterCamera(const Camera& camera,const N
 // ---------------------------------------------------------------------------
 // The camera FSR needs (near, far, vertical fov), from a row-vector D3D
 // perspective projection: P[1][1] = cot(fov/2), P[2][2] = f/(f-n),
-// P[3][2] = -n f/(f-n), P[2][3] = 1. The scene is reversed-Z through the
-// viewport depth range, not the matrix, so the matrix is a forward one; any
-// other shape (orthographic, degenerate) keeps the defaults and derived=false.
+// P[3][2] = -n f/(f-n), P[2][3] = 1 (left-handed), or the right-handed form
+// the game builds (821C82C0: P[2][2] = -f/(f-n), P[2][3] = -1). The scene is
+// reversed-Z through the viewport depth range, not the matrix, so the matrix
+// is a forward one; any other shape (orthographic, degenerate) keeps the
+// defaults and derived=false.
+//
+// What the dispatch is given: cameraNear = n, cameraFar = f, finite, with
+// the context's DEPTH_INVERTED and without DEPTH_INFINITE. FFX's
+// setupDeviceDepthToViewSpaceDepthParams (ffx_fsr3upscaler.cpp) takes
+// min/max of the two and lets the flags pick the transform, so their order
+// does not matter; the FidelityFX sample's cameraNear = FLT_MAX, cameraFar =
+// near is its infinite reversed projection, which this game does not use (a
+// forward finite matrix through a [1, 0] viewport is exactly the finite
+// reversed transform).
 struct NativeFsrCameraParams {
   float near_plane=0.1f,far_plane=10000.f,fov_y=1.0f;
   bool derived=false;
 };
+// A projection change larger than these between two dispatched frames is a
+// camera cut (history reset); smaller ones (a zoom) are reprojected.
+inline constexpr float kNativeFsrCutFov=0.25f;        // radians, as NativeCameraHistory::CutWith
+inline constexpr float kNativeFsrCutPlaneRatio=2.0f;  // near or far, either way
 NativeFsrCameraParams NativeFsrCameraFromProjection(const std::array<float,16>& projection);
 NativeFsrCameraParams NativeFsrCameraFromProjectionWords(const std::array<uint32_t,16>& projection);
 
@@ -144,7 +159,7 @@ enum NativeFsrReset : uint32_t {
   kNativeFsrResetFormat=1u<<2,   // colour format changed (context recreated)
   kNativeFsrResetRoute=1u<<3,    // a helper call in between did not dispatch (guest route, skipped view, direct frame)
   kNativeFsrResetAbSide=1u<<4,   // the A/B side changed
-  kNativeFsrResetCut=1u<<5,      // the projection changed (fov, near or far): a camera cut
+  kNativeFsrResetCut=1u<<5,      // the projection jumped (kNativeFsrCutFov, kNativeFsrCutPlaneRatio): a camera cut
   kNativeFsrResetMotion=1u<<6,   // the motion vectors asked for it (B's cut, or none)
   kNativeFsrResetMode=1u<<7,     // edf_native_fsr changed mode
 };
