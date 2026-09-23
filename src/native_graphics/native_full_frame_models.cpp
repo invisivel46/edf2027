@@ -284,6 +284,16 @@ std::vector<NativeFullFrameModelDrawRef> OrderNativeFullFrameModelDraws(std::spa
   }
   return result;
 }
+bool NativeFullFrameModelSameProgram(const NativeSceneGroupMaterial& held,const NativeSceneGroupMaterial& now) {
+  if(held.program!=now.program || held.group!=now.group || held.revision!=now.revision ||
+     held.constants.size()!=now.constants.size()) return false;
+  for(size_t i=0;i<held.constants.size();++i) {
+    const auto& a=held.constants[i]; const auto& b=now.constants[i];
+    if(a.pixel!=b.pixel || a.global!=b.global || a.name!=b.name || a.registers.size()!=b.registers.size()) return false;
+    if(!NativeScenePassOwnedConstant(a.global,a.name) && a.registers!=b.registers) return false;
+  }
+  return true;
+}
 namespace {
 std::vector<NativeSceneMaterialInputs::Constant> PassConstants(const NativeSceneGroupMaterial& material,
     const NativeFullFrameModelCamera& camera) {
@@ -566,6 +576,16 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
       row.deferrable=program.CanDeferCpuActivation();
       row.same_backend=program.backend && source.second->backend()==program.backend.get();
     }
+    // Per-object materials no draw state holds and no draw used last frame
+    // or this one are dropped.
+    if(row.used!=frames_ && row.object_material_count) {
+      row.object_material_count=0;
+      for(auto it=row.object_materials.begin();it!=row.object_materials.end();) {
+        std::erase_if(it->second,[&](const auto& made) { return made.use_count()==1 && made->used+1<frames_; });
+        row.object_material_count+=it->second.size();
+        it=it->second.empty()?row.object_materials.erase(it):std::next(it);
+      }
+    }
     row.frame=frame_; row.used=frames_; row.draws=0; row.failed=false;
     if(!row.deferrable || !row.same_backend) return row;
     ++stats.rows;
@@ -596,6 +616,11 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           if(constant.global && constant.registers.size()>=16 &&
              std::find(pool_names_.begin(),pool_names_.end(),constant.name)!=pool_names_.end()) row.object_slots.push_back(i);
         }
+        row.object_patchable=true;
+        for(const auto slot:row.object_slots)
+          for(uint32_t i=0;i<row.constants.size();++i)
+            if(i!=slot && row.constants[i].pixel==row.constants[slot].pixel && row.constants[i].name==row.constants[slot].name)
+              row.object_patchable=false;
         row.object_names=pool_names_version_;
       }
       Cache::Key cache_key{draw.pass,skinned,material->program,source.second,base,pass.targets,pass.filtering};
@@ -671,9 +696,26 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
       // Evaluated again next frame from the published constants.
       row.failed=true; row.error=error.what();
       row.group.reset(); row.constants.clear(); row.palette_constants.clear(); row.object_slots.clear(); row.object_names=0;
+      row.objects.reset(); row.objects_for.reset(); row.object_materials.clear(); row.object_material_count=0;
       throw;
     }
     return row;
+  };
+  // Rigid per-object materials patched this emit and not yet interned, with
+  // the objects made from them: interned together in one exclusive call
+  // once the emit's draws are made, and the objects take the interned one.
+  using ObjectMaterial=RowState::ObjectMaterial;
+  std::vector<std::shared_ptr<ObjectMaterial>> pending;
+  const auto object_hash=[](std::span<const NativeSceneMaterialInputs::Constant> bound) {
+    uint64_t hash=1469598103934665603ull;
+    const auto mix=[&](uint8_t byte) { hash=(hash^byte)*1099511628211ull; };
+    for(const auto& constant:bound) {
+      mix(uint8_t(constant.pixel)); mix(uint8_t(constant.global));
+      for(const auto c:constant.name) mix(uint8_t(c));
+      mix(0);
+      for(const auto b:constant.registers) mix(b);
+    }
+    return hash;
   };
   const auto make=[&](const NativeFullFrameModelDrawState& draw,const NativeSceneMaterialCapture& capture) {
     auto object=std::make_shared<NativeSceneInstance>();
@@ -799,24 +841,64 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
             if(draw.object && draw.made_from.get()==row.capture.material.get() && draw.bound==bound) ++stats.reused;
             else {
               auto capture=row.capture;
-              // Pool constants: the row's constants with the draw's bound,
-              // captured against the row's pipeline half (the row's material
-              // is shared by every draw of it, so never patched).
+              std::shared_ptr<ObjectMaterial> patched;
+              // Pool constants: the row's constants with the draw's bound
+              // (the row's material is shared by every draw of it, so never
+              // patched in place): the row's object capture with only those
+              // rebound, one interned material per row and bound set; with
+              // reuse off, or where the row cannot be patched, the full
+              // capture against the row's pipeline half.
               if(!bound.empty()) {
                 if(!row.pipeline) throw std::runtime_error("native full-frame model row has no pipeline half");
-                auto constants=row.constants;
-                for(const auto& object:bound)
-                  for(auto& constant:constants)
-                    if(constant.global && constant.pixel==object.pixel && constant.name==object.name) constant=object;
-                exclusive([&] {
-                  capture=row.program->Capture(*row.pipeline,pass.targets.reverse_depth,constants,row.samplers,row.blend_factor,false);
-                  if(sources.intern) capture.material=sources.intern(std::move(capture.material));
-                });
+                if(NativeReuseAllowed() && row.object_patchable) {
+                  if(row.objects_for!=row.capture.material) {
+                    row.objects.reset(); row.objects_for.reset(); row.object_materials.clear(); row.object_material_count=0;
+                    try {
+                      exclusive([&] {
+                        row.objects=std::make_shared<NativeScenePaletteCapture>(*row.program,*row.pipeline,pass.targets.reverse_depth,
+                          row.constants,row.samplers,row.blend_factor);
+                      });
+                      row.objects_for=row.capture.material;
+                    } catch(const std::exception&) { row.objects.reset(); row.object_patchable=false; }
+                  }
+                }
+                if(NativeReuseAllowed() && row.object_patchable) {
+                  auto& bucket=row.object_materials[object_hash(bound)];
+                  const auto found=std::find_if(bucket.begin(),bucket.end(),[&](const auto& known) { return known->bound==bound; });
+                  if(found!=bucket.end()) patched=*found;
+                  else {
+                    try {
+                      auto material=std::make_shared<ObjectMaterial>();
+                      material->capture=row.objects->With(bound);
+                      material->bound=bound;
+                      bucket.push_back(material); ++row.object_material_count;
+                      pending.push_back(material);
+                      patched=std::move(material);
+                      ++stats.object_patches;
+                    } catch(const std::exception&) { row.object_patchable=false; }
+                  }
+                  if(patched) { patched->used=frames_; capture.material=patched->capture.material; }
+                }
+                if(!patched) {
+                  auto constants=row.constants;
+                  for(const auto& object:bound)
+                    for(auto& constant:constants)
+                      if(constant.global && constant.pixel==object.pixel && constant.name==object.name) constant=object;
+                  exclusive([&] {
+                    capture=row.program->Capture(*row.pipeline,pass.targets.reverse_depth,constants,row.samplers,row.blend_factor,false);
+                    if(sources.intern) capture.material=sources.intern(std::move(capture.material));
+                  });
+                  ++stats.object_captures;
+                }
                 ++stats.object_constants;
                 if(carried(bound)) ++stats.carried;
               }
               ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
-              draw.object=make(draw,capture); draw.made_from=row.capture.material; draw.bound=std::move(bound);
+              auto object=make(draw,capture);
+              // Not interned yet: takes the interned material with the others.
+              if(patched && !patched->interned) patched->waiting.push_back(object.get());
+              draw.object=std::move(object); draw.made_from=row.capture.material; draw.bound=std::move(bound);
+              draw.patched=std::move(patched);
             }
           }
           drawn[d]=&row.view;
@@ -827,6 +909,23 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         if(complete && pass.velocity && !transparent && state->moved_frame==frames_ && state->last_frame+1==frames_)
           AppendVelocity(item,*state,frame.velocity);
       } catch(const std::exception&) { ++stats.failed; views[index].clear(); mark(item,NativeCoverageStatus::Uncovered,"models_failed"); }
+    }
+    // The per-object materials patched above, interned in one hold; the
+    // objects made from them take the interned material (the one a full
+    // capture of the same constants would intern to).
+    if(!pending.empty()) {
+      if(sources.intern)
+        exclusive([&] {
+          for(auto& material:pending) {
+            auto interned=sources.intern(material->capture.material);
+            if(interned) material->capture.material=std::move(interned);
+          }
+        });
+      for(auto& material:pending) {
+        for(auto* object:material->waiting) object->object.material=material->capture.material;
+        material->waiting.clear(); material->interned=true;
+      }
+      pending.clear();
     }
     // OrderNativeFullFrameModelDraws over the drawn items (a stable order of a
     // subsequence is the subsequence of the stable order), from the states.
