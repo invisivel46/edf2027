@@ -15,6 +15,7 @@ void Require(bool value,const char* message) { if(!value) throw std::runtime_err
 // Synthetic big-endian guest memory, as in the model publication tests.
 struct Memory {
   std::vector<uint8_t>& bytes;
+  uint32_t Add(uint32_t address,uint32_t offset) const { return address+offset; }
   uint32_t Word(uint32_t at) const {
     uint32_t value=0; for(unsigned i=0;i<4;++i) value=(value<<8)|bytes.at(at+i); return value;
   }
@@ -74,9 +75,9 @@ void BuildTree(const Memory& memory,uint32_t object,bool subscribed=false,uint32
   BuildPose(memory,object+400,object+0x600,bones,1.0f);
 }
 auto Decoder(const Memory& memory,size_t* decodes=nullptr) {
-  return [&memory,decodes](uint32_t instance,uint32_t vector) {
+  return [&memory,decodes](uint32_t instance,uint32_t vector,uint32_t bones) {
     if(decodes) ++*decodes;
-    return DecodeNativeModelLayoutWith(memory,instance,vector,[](uint32_t,NativeModelBuffers::Kind)->uint64_t { return 0; });
+    return DecodeNativeModelLayoutWith(memory,instance,vector,[](uint32_t,NativeModelBuffers::Kind)->uint64_t { return 0; },bones);
   };
 }
 std::shared_ptr<const NativeRenderEntry> EntryOf(const NativeRenderRegistrySnapshot& snapshot,uint32_t object) {
@@ -102,7 +103,9 @@ void ClassTableLookup() {
   const auto* sky=FindNativeRenderClass(0x8200284Cu);
   Require(sky && sky->cadence==NativeRenderPoseCadence::Frame && sky->instance==412 && sky->pose==384,"clSky row");
   const auto* broken=FindNativeRenderClass(0x820077D8u);
-  Require(broken && broken->cadence==NativeRenderPoseCadence::Frame && broken->instance==384 && broken->pose==428,"clBrokenObject row");
+  Require(broken && broken->cadence==NativeRenderPoseCadence::Frame && broken->instance==384 && broken->pose==428 &&
+    broken->frame_root==640,"clBrokenObject row: posed by the registry from +640");
+  Require(!sky->frame_root,"clSky is posed by the sky pass, not the registry");
   const auto* missile=FindNativeRenderClass(0x82007478u);
   Require(missile && missile->instance==892 && missile->pose==936,"clMissileAmmo01 row");
   const auto* parts=FindNativeRenderClass(0x82002760u);

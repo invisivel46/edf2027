@@ -86,6 +86,15 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
   stats.opaque=plan.opaque.size(); stats.transparent=plan.transparent.size();
   return plan;
 }
+std::vector<const NativeRenderEntry*> NativeFullFrameBrokenObjects(const NativeRenderRegistrySnapshot& snapshot,
+    const NativeFullFrameModelCamera& camera) {
+  std::vector<const NativeRenderEntry*> result;
+  for(const auto& shared:snapshot.entries) {
+    if(!shared || !shared->type || shared->type->vtable!=NativeBrokenObject::vtable) continue;
+    if(NativeFullFrameModelDispatched(ClassifyNativeFullFrameModel(*shared,camera.visibility),*shared,camera)) result.push_back(shared.get());
+  }
+  return result;
+}
 NativeFullFrameModelConstants NativeFullFrameModelConstantsFor(const NativeModelLayout& layout,
     std::span<const NativePoseMatrix> pose,uint32_t palette_limit) {
   NativeFullFrameModelConstants result;

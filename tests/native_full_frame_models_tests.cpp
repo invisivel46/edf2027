@@ -48,6 +48,7 @@ std::shared_ptr<const std::vector<NativePoseMatrix>> Pose(size_t bones) {
 const NativeRenderClass kPlain{0x82000000,"plain",NativeRenderPoseCadence::Tick,NativeRenderLodKind::None};
 const NativeRenderClass kCharacter{0x82000100,"character",NativeRenderPoseCadence::Tick,NativeRenderLodKind::Character};
 const NativeRenderClass kFieldParts{0x82000200,"fieldparts",NativeRenderPoseCadence::Tick,NativeRenderLodKind::FieldParts};
+const NativeRenderClass kBroken{NativeBrokenObject::vtable,"clBrokenObject",NativeRenderPoseCadence::Frame,NativeRenderLodKind::None,384,428};
 // A one-bone rigid model with one batch and one pass: node, batch and pass
 // addresses identify the model resource and material.
 std::shared_ptr<NativeRenderEntry> Entry(uint32_t object,std::array<float,3> centre,float radius=1,
@@ -422,11 +423,46 @@ void InstancedCache() {
   Require(sphere_worlds.size()==4 && sphere_worlds[0]!=sphere_worlds[1] && sphere_worlds[2]!=sphere_worlds[3],
     "each sphere instance keeps its own world");
 }
+// The +712 = +708 set: every clBrokenObject 821C0C00 would hand to slot 4
+// (visible, mode 0 or a traversed bucket), drawn or not; nothing else.
+void BrokenObjects() {
+  const auto camera=MakeCamera();
+  NativeRenderRegistrySnapshot snapshot;
+  const auto add=[&](uint32_t object,std::array<float,3> centre,const NativeRenderClass* type=&kBroken) {
+    auto entry=Entry(object,centre); entry->type=type; snapshot.entries.push_back(entry); return entry;
+  };
+  const auto drawn=add(1,{0,0,100});                                               // Posed and laid out: drawn.
+  const auto unposed=add(2,{0,0,120}); unposed->pose.reset();                        // No native pose yet.
+  const auto undecoded=add(3,{0,0,140}); undecoded->models[0].layout.reset();        // No layout yet.
+  const auto modelless=add(4,{0,0,160}); modelless->models.clear(); modelless->pose.reset();
+  const auto hidden=add(5,{0,0,100}); hidden->hidden=true;
+  const auto outside=add(6,{500,0,100});
+  const auto distant=add(7,{0,0,20000});
+  const auto boxed=add(8,{105,0,100}); boxed->radius=10; boxed->axes={0.1f,0,0,0, 0,0.1f,0,0, 0,0,0.1f,0};
+  const auto filed=add(9,{0,0,300}); filed->mode=1; filed->sort_bias=1;             // Key 300: traversed.
+  const auto bucket_zero=add(10,{0,0,100}); bucket_zero->mode=1; bucket_zero->sort_bias=1; // Key 100: never traversed.
+  const auto unsupported=add(11,{0,0,100}); unsupported->mode=3;
+  const auto other=add(12,{0,0,100},&kPlain);                                        // Visible, not a clBrokenObject.
+  const auto set=NativeFullFrameBrokenObjects(snapshot,camera);
+  const std::vector<const NativeRenderEntry*> expected{drawn.get(),unposed.get(),undecoded.get(),modelless.get(),filed.get()};
+  Require(set==expected,"every dispatched clBrokenObject is in the +712 set, drawn or not, in snapshot order");
+  // The draw plan is the posed subset: the set is not.
+  const auto plan=PlanNativeFullFrameModels(snapshot,camera);
+  size_t drawn_broken=0;
+  for(const auto* items:{&plan.opaque,&plan.transparent}) for(const auto& item:*items) drawn_broken+=item.entry->type==&kBroken;
+  Require(drawn_broken==2 && plan.stats.no_model==2,"only the posed, laid-out objects are drawn");
+  // Visibility decides: moving a hidden object back into view adds it.
+  hidden->hidden=false; outside->centre={0,0,100,1};
+  Require(NativeFullFrameBrokenObjects(snapshot,camera).size()==expected.size()+2,"visible again, stored again");
+  Require(NativeFullFrameModelDispatched(ClassifyNativeFullFrameModel(*filed,camera.visibility),*filed,camera) &&
+    !NativeFullFrameModelDispatched(ClassifyNativeFullFrameModel(*bucket_zero,camera.visibility),*bucket_zero,camera),
+    "a filed object's slot 4 runs only from a traversed bucket");
+}
 }
 int main() {
   try {
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
-    SourceTable(); MaterialCache(); RigidInstancing(); InstancedCache();
+    SourceTable(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects();
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
     return 1;

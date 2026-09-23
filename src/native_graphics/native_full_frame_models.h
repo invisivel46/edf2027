@@ -113,6 +113,27 @@ struct NativeFullFrameModelPlan {
   std::vector<NativeFullFrameModelItem> transparent;  // Draw order: key descending, ties in snapshot order.
   Stats stats;
 };
+// clBrokenObject (vtable 820077D8): slot 4 8211FAA8 copies obj+708 into
+// obj+712 before it poses and draws; its slot 3 8211FAF8 releases the object
+// (821C0ED8) once obj+708 - obj+712 > 10, so a frame that skips the store
+// kills the debris early.
+struct NativeBrokenObject { static constexpr uint32_t vtable=0x820077D8u,render=0x8211FAA8u,update=0x8211FAF8u,counter=708,drawn=712; };
+// Whether the guest calls the entry's slot 4 this view: 820B4038's
+// visibility (ClassifyNativeFullFrameModel), then 821C0C00's route: mode 0
+// calls it at once, modes 1/2 file it under key (821A3B80) and 821A3BA0
+// calls it unless the key's high byte is 0. Independent of the model, pose
+// and layout the native draw needs.
+inline bool NativeFullFrameModelDispatched(const NativeFullFrameModelVisibility& visibility,const NativeRenderEntry& entry,
+    const NativeFullFrameModelCamera& camera) {
+  if(!visibility) return false;
+  return entry.mode==0 || NativeFullFrameModelKey(entry.mode,visibility.centre[2],entry.sort_bias,camera.key_scale,camera.key_offset)>=256;
+}
+// Every clBrokenObject entry whose slot 4 the guest would call this view, in
+// snapshot order, whether or not it is drawn (no layout or pose yet, a
+// declined or failed draw, no targets): the frame host stores +712 = +708 for
+// each, which is all of 8211FAA8 that simulation reads.
+std::vector<const NativeRenderEntry*> NativeFullFrameBrokenObjects(const NativeRenderRegistrySnapshot& snapshot,
+  const NativeFullFrameModelCamera& camera);
 // Visibility, LOD and routing for every entry: its posed LOD model, then each
 // instanced world in record order. Transparents follow 821A3BA0:
 // buckets by high key byte 255 down to 1, each by low byte descending, equal

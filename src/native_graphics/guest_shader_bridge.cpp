@@ -5946,14 +5946,25 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     shared_->transparent.reset();
     shared_->model_order=0;
     const auto registry=context.inputs.registry;
-    if(!registry || registry->entries.empty() || !native_scene_pass_camera || !context.renderer) { ++empty_; return; }
+    if(!registry || registry->entries.empty() || !context.view.scene) { ++empty_; return; }
     NativeFullFrameModelCamera camera;
     camera.visibility=NativeFullFrameVisibilityView(reader_,context.view.scene);
-    camera.pass=*native_scene_pass_camera;
-    camera.animation=NativeFullFrameAnimation(context.inputs);
     // context+0/+4 as 821A5080 stores them per view: the mode-1 bucket key.
     camera.key_scale=std::bit_cast<float>(reader_.Word(0x8201711c));
     camera.key_offset=std::bit_cast<float>(reader_.Word(0x82017120));
+    // Helper side effect (clBrokenObject slot 4 8211FAA8): obj+712 = obj+708
+    // for every object whose slot 4 the guest would call this view, before
+    // and whatever the native draw does (no layout or pose yet, declined, no
+    // targets); its tick 8211FAF8 releases it once +708 - +712 > 10. The
+    // vtable is re-read so an object released since the snapshot is skipped.
+    for(const auto* entry:NativeFullFrameBrokenObjects(*registry,camera)) {
+      if(reader_.Word(entry->object)!=NativeBrokenObject::vtable) continue;
+      reader_.StoreWord(reader_.Add(entry->object,NativeBrokenObject::drawn),reader_.Word(reader_.Add(entry->object,NativeBrokenObject::counter)));
+      ++broken_;
+    }
+    if(!native_scene_pass_camera || !context.renderer) { ++empty_; return; }
+    camera.pass=*native_scene_pass_camera;
+    camera.animation=NativeFullFrameAnimation(context.inputs);
     NativeFullFrameModelPass pass;
     pass.palette_limit=NativeFullFramePaletteLimit(reader_);
     pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
@@ -6007,15 +6018,6 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     };
     auto frame=std::make_shared<NativeFullFrameModelFrame>(models_.Build(*registry,camera,pass,sources,phase));
     stage.reset();
-    // Helper side effect (clBrokenObject render 8211FAA8, slot 4): obj+712 =
-    // obj+708 for every object the traversal reaches, which the plan's items
-    // are (visible, routed, LOD chosen); its tick kills it when +708 - +712 > 10.
-    for(const auto* items:{&frame->plan.opaque,&frame->plan.transparent}) for(const auto& item:*items) {
-      const auto* entry=item.entry;
-      if(!entry || !entry->type || entry->type->vtable!=kBrokenObject || reader_.Word(entry->object)!=kBrokenObject) continue;
-      reader_.StoreWord(reader_.Add(entry->object,712),reader_.Word(reader_.Add(entry->object,708)));
-      ++broken_;
-    }
     auto transparent=std::make_shared<NativeFullFrameModelFrame>();
     for(auto& batch:frame->batches) if(batch.transparent) transparent->batches.push_back(std::move(batch));
     std::erase_if(frame->batches,[](const NativeFullFrameModelBatch& batch) { return batch.transparent; });
@@ -6050,7 +6052,6 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
-  static constexpr uint32_t kBrokenObject=0x820077d8;  // clBrokenObject vtable.
   const edf::native::GuestReader reader_;
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   edf::native::NativeFullFrameModels models_;
@@ -7212,14 +7213,14 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
     // Object headers, LOD tables and poses of the re-read objects share pages.
     const edf::native::NativeSceneCpuWindow window(reader);
     // Buffer identities are read under the bridge lock, first sight only.
-    const auto decode=[&](uint32_t instance,uint32_t vector) {
+    const auto decode=[&](uint32_t instance,uint32_t vector,uint32_t bones) {
       auto& state=edf::native::State();
       std::lock_guard lock(state.mutex);
       return edf::native::DecodeNativeModelLayoutWith(reader,instance,vector,
         [&](uint32_t owner,edf::native::NativeModelBuffers::Kind kind)->uint64_t {
           const auto* found=state.model_buffers.Find(owner,kind);
           return found?found->generation:0;
-        });
+        },bones);
     };
     const auto snapshot=registry.Tick(window,scene,native_loop_budget.tick,decode);
     static uint64_t ticks=0;
@@ -7228,10 +7229,10 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene) {
       const auto stats=registry.stats();
       REXLOG_INFO("Native render registry: generation={} tick={} entries={} records={} subscribed={} births={} seeded={} deaths={} "
         "rebirths={} unknown_deaths={} unknown_classes={} deferred={} foreign={} builds={} changed={} unchanged={} pose_reuses={} "
-        "read_failures={} layouts={} layout_failures={} retrying={}",snapshot->generation,snapshot->tick,snapshot->entries.size(),stats.records,
+        "read_failures={} layouts={} layout_failures={} retrying={} frame_poses={}/{}/{}",snapshot->generation,snapshot->tick,snapshot->entries.size(),stats.records,
         stats.subscribed,stats.births,stats.seeded,stats.deaths,stats.rebirths,stats.unknown_deaths,stats.unknown_classes,
         stats.deferred,stats.foreign,stats.builds,stats.changed,stats.unchanged,stats.pose_reuses,stats.read_failures,
-        stats.layout_captures,stats.layout_failures,stats.retrying);
+        stats.layout_captures,stats.layout_failures,stats.retrying,stats.frame_poses,stats.frame_pose_reuses,stats.frame_pose_failures);
     }
     if(REXCVAR_GET(edf_native_render_registry_audit)) {
       const auto audit=registry.AuditScene(reader,scene);

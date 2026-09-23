@@ -15,6 +15,11 @@
 //   waiting for their first layout (backed off) and a small round-robin
 //   refresh of the rest, and publishes a snapshot whose unchanged entries are
 //   the previous pointers.
+// Frame-cadence classes with a root (NativeRenderClass::frame_root, e.g.
+// clBrokenObject) build their pose inside slot 4, which full-frame mode never
+// runs: the registry re-reads them every tick and computes that pose natively
+// (native_model_hierarchy.h), so their layout is captured with the tree's
+// bone count and never waits for the guest pose vector to be sized.
 //
 // Cost per tick is O(re-read objects + changes), never O(entries): a re-read
 // builds into a reused scratch entry and compares it with the published one
@@ -26,6 +31,7 @@
 // append to a locked event list. Tick, AuditScene, Clear and stats run on the
 // engine thread. AcquireSnapshot is safe from any thread; snapshots and their
 // entries are immutable.
+#include "native_model_hierarchy.h"
 #include "native_model_publication.h"
 #include "native_render_entry.h"
 #include "native_render_instances.h"
@@ -35,6 +41,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <unordered_map>
@@ -109,7 +116,7 @@ class NativeRenderRegistry {
   struct Stats {
     uint64_t ticks=0,births=0,seeded=0,rebirths=0,deaths=0,unknown_deaths=0,subscriptions=0,unknown_subscriptions=0,
       unknown_classes=0,reclassified=0,deferred=0,foreign=0,builds=0,changed=0,unchanged=0,pose_reuses=0,read_failures=0,
-      layout_captures=0,layout_failures=0,instanced_worlds=0;
+      layout_captures=0,layout_failures=0,instanced_worlds=0,frame_poses=0,frame_pose_reuses=0,frame_pose_failures=0;
     size_t records=0,subscribed=0,published=0,retrying=0;
   };
   // In-game check (edf_native_render_registry_audit): scene+84 against the
@@ -130,7 +137,8 @@ class NativeRenderRegistry {
   bool active() const { return active_.load(std::memory_order_relaxed); }
 
   // Engine thread, at the end of 821A4DE8 (after its scene+100 slot-2 walk).
-  // decode(instance,pose_vector) returns a NativeModelLayout or throws.
+  // decode(instance,pose_vector,bones) returns a NativeModelLayout sized for
+  // `bones` pose entries (DecodeNativeModelLayoutWith's override) or throws.
   template<class Reader,class Decode>
   std::shared_ptr<const NativeRenderRegistrySnapshot> Tick(const Reader& reader,uint32_t scene,uint64_t tick,const Decode& decode) {
     active_.store(true,std::memory_order_relaxed);
@@ -219,6 +227,12 @@ class NativeRenderRegistry {
     bool subscribed=false;
     uint32_t retries=0;
     std::vector<Capture> captures;
+    // Frame-posed classes: the tree, and the pose last computed with the
+    // root bits and hierarchy build it came from.
+    NativeModelHierarchyCache hierarchy;
+    NativeRenderPose frame_pose;
+    std::array<uint32_t,16> frame_root{};
+    uint64_t frame_builds=0;
   };
   void Push(uint32_t object,Event event) {
     { std::lock_guard lock(events_mutex_); events_.push_back({object,event}); }
@@ -278,8 +292,12 @@ class NativeRenderRegistry {
           pending_.erase(object);
         }
         record.vtable=vtable; record.type=FindNativeRenderClass(vtable); record.captures.clear();
+        record.hierarchy.Reset(); record.frame_pose.reset();
         if(!record.type) ++stats_.unknown_classes;
-        if(record.type && (record.type->attachments&kNativeRenderMotherSpheres)) animated_.insert(object); else animated_.erase(object);
+        // Re-read every tick: inputs that advance outside scene+100 (instanced
+        // worlds in slot 3, a frame-posed root).
+        if(record.type && ((record.type->attachments&kNativeRenderMotherSpheres) || record.type->frame_root)) animated_.insert(object);
+        else animated_.erase(object);
       }
       if(record.scene!=scene) ++stats_.foreign;
       else if(record.type && !record.type->scene_source && !record.type->effect) { Build(reader,object,record,decode,complete); built=true; }
@@ -316,8 +334,19 @@ class NativeRenderRegistry {
     entry->hidden=(hidden[0]|hidden[1])!=0;
     if(!type.instance || !type.pose) return; // Tracked, no model: visibility only.
     entry->pose_vector=object+type.pose;
-    entry->pose=ReadPose(reader,entry->pose_vector,old?old->pose:nullptr);
-    entry->models.push_back(Model(reader,record,object+type.instance,entry->pose_vector,decode,complete));
+    if(type.frame_root) {
+      // A tree the walk rejects publishes the entry unposed (visibility and
+      // routing still apply) and retries.
+      std::optional<uint32_t> bones;
+      try {
+        entry->pose=FramePose(reader,object,record,old?old->pose:nullptr);
+        bones=uint32_t(entry->pose->size());
+      } catch(const std::exception&) { entry->pose.reset(); record.frame_pose.reset(); ++stats_.frame_pose_failures; complete=false; }
+      entry->models.push_back(Model(reader,record,object+type.instance,entry->pose_vector,decode,complete,bones.value_or(0)));
+    } else {
+      entry->pose=ReadPose(reader,entry->pose_vector,old?old->pose:nullptr);
+      entry->models.push_back(Model(reader,record,object+type.instance,entry->pose_vector,decode,complete));
+    }
     if(type.lod==NativeRenderLodKind::Character) {
       const auto records=reader.Word(object+kNativeRenderLodRecords),count=reader.Word(object+kNativeRenderLodCount);
       if(count>kNativeRenderLodMax || (count && !records)) throw std::runtime_error("invalid native render LOD table");
@@ -374,15 +403,40 @@ class NativeRenderRegistry {
       (*matrices)[bone][i]=std::bit_cast<float>(GuestBlockWord(bytes+bone*64+i*4));
     return matrices;
   }
+  // Frame cadence (NativeRenderClass::frame_root): slot 4's
+  // 821C8C58(obj+instance+16, obj+frame_root) and 821C9478 computed from the
+  // tick's object fields, the values a render between this tick and the next
+  // would build. Recomputed only when the root's bits or the tree changed;
+  // shared with the published pose while bitwise equal. Throws on a tree the
+  // walk rejects.
+  template<class Reader>
+  NativeRenderPose FramePose(const Reader& reader,uint32_t object,Record& record,const NativeRenderPose& previous) {
+    const auto& type=*record.type;
+    const auto& hierarchy=record.hierarchy.Acquire(reader,object+type.instance+NativeModelTree::instance_offset);
+    const auto root=ReadNativeGuestMatrix(reader,object+type.frame_root);
+    const auto bits=std::bit_cast<std::array<uint32_t,16>>(root);
+    if(record.frame_pose && record.frame_builds==record.hierarchy.builds() && record.frame_root==bits) {
+      ++stats_.frame_pose_reuses; return record.frame_pose;
+    }
+    auto palette=ComputeNativeModelHierarchyPose(hierarchy,root).palette;
+    ++stats_.frame_poses;
+    record.frame_root=bits; record.frame_builds=record.hierarchy.builds();
+    if(previous && SameNativeModelPose(*previous,palette)) record.frame_pose=previous;
+    else record.frame_pose=std::make_shared<const std::vector<NativePoseMatrix>>(std::move(palette));
+    return record.frame_pose;
+  }
   // Captured once per (instance, container, node, pose vector, bone count),
   // and only when the model is assigned and its pose vector is sized: the
   // first tick after the constructor, after this tick's slot-2 pose build.
   // vector 0 is a 821C9DA8 model (single world, no pose): assigned suffices.
+  // sized: the natively computed pose's count, for a frame-posed class whose
+  // guest vector full-frame mode never sizes (0: no pose, not captured).
   template<class Reader,class Decode>
-  NativeRenderModel Model(const Reader& reader,Record& record,uint32_t instance,uint32_t vector,const Decode& decode,bool& complete) {
+  NativeRenderModel Model(const Reader& reader,Record& record,uint32_t instance,uint32_t vector,const Decode& decode,bool& complete,
+      std::optional<uint32_t> sized=std::nullopt) {
     NativeRenderModel model; model.instance=instance;
     const auto container=reader.Word(instance),node=reader.Word(instance+4);
-    const auto bones=vector?ReadNativeModelPoseRange(reader,vector).count:0;
+    const auto bones=sized?*sized:vector?ReadNativeModelPoseRange(reader,vector).count:0;
     auto capture=std::find_if(record.captures.begin(),record.captures.end(),[&](const Capture& c) { return c.instance==instance; });
     if(capture!=record.captures.end() && capture->container==container && capture->node==node && capture->pose_vector==vector &&
        (capture->rejected || (capture->layout && capture->layout->bones==bones))) {
@@ -394,7 +448,7 @@ class NativeRenderRegistry {
     capture->layout.reset(); capture->rejected=false;
     if(!container || !node || (vector && !bones)) { complete=false; return model; }
     try {
-      capture->layout=std::make_shared<const NativeModelLayout>(decode(instance,vector));
+      capture->layout=std::make_shared<const NativeModelLayout>(decode(instance,vector,bones));
       ++stats_.layout_captures;
     } catch(const std::exception&) { capture->rejected=true; ++stats_.layout_failures; }
     model.layout=capture->layout;

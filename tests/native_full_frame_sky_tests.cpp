@@ -1,4 +1,5 @@
 #include "native_graphics/native_full_frame_sky.h"
+#include "native_graphics/native_render_registry.h"
 #include <array>
 #include <bit>
 #include <cmath>
@@ -104,11 +105,9 @@ NativeSkyMatrix Rigid(float yaw,float pitch,float x,float y,float z,float scale=
 }
 // Two roots; root 0 has two children, child 1 has one child. Four bones in a
 // different order than the walk.
-void BuildSky(const Memory& m,bool bind) {
-  m.StoreWord(kSky,NativeSkyObject::vtable);
-  StoreMatrix(m,kSky+224,Rigid(0.7f,0,-3.25f,17.5f,9.125f));
-  m.StoreWord(kSky+428,kRoots); m.StoreWord(kSky+436,2);
-  m.StoreWord(kSky+440,kBones); m.StoreWord(kSky+448,4); m.StoreByte(kSky+452,bind);
+void BuildTree(const Memory& m,uint32_t tree,bool bind) {
+  m.StoreWord(tree,kRoots); m.StoreWord(tree+8,2);
+  m.StoreWord(tree+12,kBones); m.StoreWord(tree+20,4); m.StoreByte(tree+24,bind);
   const std::array<uint32_t,5> nodes{kRoots,kRoots+304,kChildren,kChildren+304,kGrandchild};
   for(size_t i=0;i<nodes.size();++i) {
     StoreMatrix(m,nodes[i]+176,Rigid(0.3f*float(i)+0.11f,0.05f*float(i),1.5f*float(i)-2,0.25f+float(i),-0.75f*float(i),1+0.125f*float(i)));
@@ -118,6 +117,11 @@ void BuildSky(const Memory& m,bool bind) {
   m.StoreWord(kChildren+304+80,kGrandchild); m.StoreWord(kChildren+304+88,1);
   for(const auto [i,node]:std::array<std::pair<uint32_t,uint32_t>,4>{{{0,kGrandchild},{1,kRoots+304},{2,kRoots},{3,kChildren}}})
     m.StoreWord(kBones+i*4,node);
+}
+void BuildSky(const Memory& m,bool bind) {
+  m.StoreWord(kSky,NativeSkyObject::vtable);
+  StoreMatrix(m,kSky+224,Rigid(0.7f,0,-3.25f,17.5f,9.125f));
+  BuildTree(m,kSky+428,bind);
   m.StoreWord(kSky+384+4,kPose); m.StoreWord(kSky+384+8,kPose+4*64);
   m.StoreWord(kContext+16,kScene);
   for(const auto [w,value]:std::array<std::pair<uint32_t,float>,4>{{{0,1234.5f},{1,-87.25f},{2,40961.125f},{3,1.0f}}})
@@ -165,8 +169,7 @@ void CacheReusesAndDetectsChange() {
   Require(rejected,"a cyclic tree is rejected");
 }
 // One rigid mesh record, one batch, one pass whose ops turn depth test and write off.
-void BuildModel(const Memory& m,uint32_t bone) {
-  const auto instance=kSky+412;
+void BuildModel(const Memory& m,uint32_t bone,uint32_t instance=kSky+412) {
   m.StoreWord(instance,kContainer); m.StoreWord(instance+4,kModelNode); m.StoreByte(instance+12,0);
   m.StoreWord(kContainer+4,kContainer+0x40);
   m.StoreWord(kModelNode+44,kRecords); m.StoreWord(kModelNode+52,1);
@@ -214,6 +217,80 @@ void RecordsSkyDraws() {
   registry.Destroyed(kSky);
   Require(registry.Current()==0,"the sky's destruction clears it");
 }
+// ---- clBrokenObject (vtable 820077D8): the same walk from obj+640. ----
+// sub_8211FAA8 (edf2017_recomp.78.cpp:3596) up to its 821C9C20 draw.
+void Guest8211FAA8(const Memory& m,uint32_t object) {
+  m.StoreWord(object+712,m.Word(object+708));
+  Guest821C8C58(m,object+400,object+640);
+  Guest821C9478(m,object+400,object+428);
+}
+constexpr uint32_t kBroken=0x1000,kBrokenVtable=0x820077D8u,kSceneEnd=0x7F00;
+// A full-frame clBrokenObject: model instance +384 (tree +400), root +640,
+// and the pose vector +428 empty, since slot 4 never ran to size it.
+void BuildBrokenObject(const Memory& m,bool bind) {
+  m.StoreWord(kBroken,kBrokenVtable); m.StoreWord(kBroken+kNativeRenderObjectScene,kScene);
+  m.StoreFloat(kBroken+kNativeRenderObjectRadius,5.0f); m.StoreFloat(kBroken+kNativeRenderObjectCull,300.0f);
+  StoreMatrix(m,kBroken+640,Rigid(-1.1f,0.35f,812.625f,-4.5f,-2210.25f,1.0625f));
+  BuildTree(m,kBroken+400,bind);
+  BuildModel(m,2,kBroken+384);
+  m.StoreWord(kBroken+708,57); m.StoreWord(kBroken+712,40);
+  for(const auto list:{kScene+kNativeRenderSceneObjects,kScene+kNativeRenderSceneUpdates}) { m.StoreWord(list,kSceneEnd); m.StoreWord(list+12,kSceneEnd); }
+}
+auto BrokenDecoder(const Memory& memory,size_t& decodes) {
+  return [&memory,&decodes](uint32_t instance,uint32_t vector,uint32_t bones) {
+    ++decodes;
+    return DecodeNativeModelLayoutWith(memory,instance,vector,[](uint32_t,NativeModelBuffers::Kind)->uint64_t { return 1; },bones);
+  };
+}
+// The registry poses the object natively and captures its layout from the
+// tree's bone count; the pose is the guest's 8211FAA8 pose bit for bit.
+void BrokenObjectPoseMatchesGuest(bool bind) {
+  std::vector<uint8_t> bytes(0x10000); const Memory memory{bytes};
+  BuildBrokenObject(memory,bind);
+  const auto* type=FindNativeRenderClass(kBrokenVtable);
+  Require(type && type->cadence==NativeRenderPoseCadence::Frame && type->frame_root==640 && type->instance+16==400 && type->pose==428,
+    "clBrokenObject row names 8211FAA8's root, tree and pose vector");
+  NativeRenderRegistry registry(0);
+  size_t decodes=0;
+  const auto decode=BrokenDecoder(memory,decodes);
+  registry.Born(kBroken);
+  auto snapshot=registry.Tick(memory,kScene,1,decode);
+  const auto* found=snapshot->objects.Find(kBroken);
+  Require(found && (*found)->pose && (*found)->pose->size()==4,"the unsized guest vector still publishes a four-bone pose");
+  const auto entry=*found;
+  Require(entry->models.size()==1 && entry->models[0].layout && entry->models[0].layout->bones==4 && decodes==1 &&
+    registry.stats().retrying==0 && registry.stats().frame_poses==1,"the layout is captured from the tree's bone count, no retry");
+  Require(memory.Word(kBroken+432)==0 && memory.Word(kBroken+712)==40,"the registry writes no guest memory");
+  // The guest, with the vector sized as 821C9400 would.
+  memory.StoreWord(kBroken+428+4,kPose); memory.StoreWord(kBroken+428+8,kPose+4*64);
+  const auto hierarchy=ReadNativeModelHierarchy(memory,kBroken+400);
+  const auto pose=ComputeNativeModelHierarchyPose(hierarchy,ReadNativeGuestMatrix(memory,kBroken+640));
+  Guest8211FAA8(memory,kBroken);
+  Require(memory.Word(kBroken+712)==57,"8211FAA8 stores +708 into +712");
+  for(size_t i=0;i<hierarchy.nodes.size();++i) Require(SameBits(pose.nodes[i],memory,hierarchy.nodes[i].address+240),"node world matches node+240");
+  for(uint32_t i=0;i<4;++i) {
+    Require(SameBits((*entry->pose)[i],memory,kPose+i*64),"registry pose entry matches the guest pose vector");
+    Require(SameBits(pose.palette[i],memory,kPose+i*64),"computed pose entry matches the guest pose vector");
+  }
+  // Unchanged inputs keep the published pose and entry.
+  snapshot=registry.Tick(memory,kScene,2,decode);
+  Require(*snapshot->objects.Find(kBroken)==entry && registry.stats().frame_pose_reuses==1 && decodes==1,"unchanged root reuses the pose");
+  // The root moves (debris settles): recomputed, still the guest's.
+  StoreMatrix(memory,kBroken+640,Rigid(-1.05f,0.3f,812.5f,-6.75f,-2210.0f,1.0625f));
+  snapshot=registry.Tick(memory,kScene,3,decode);
+  const auto moved=*snapshot->objects.Find(kBroken);
+  Require(moved!=entry && moved->pose!=entry->pose && moved->models[0].layout==entry->models[0].layout && decodes==1,
+    "a moved root republishes the pose and keeps the layout");
+  Guest8211FAA8(memory,kBroken);
+  for(uint32_t i=0;i<4;++i) Require(SameBits((*moved->pose)[i],memory,kPose+i*64),"moved pose matches the guest");
+  // A tree the walk rejects keeps the entry (its +712 store still happens) unposed and retrying.
+  memory.StoreWord(kChildren+304+80,kRoots); memory.StoreWord(kChildren+304+88,1);
+  memory.StoreWord(kBroken+420,3); // A header change rebuilds at once.
+  snapshot=registry.Tick(memory,kScene,4,decode);
+  const auto* rejected=snapshot->objects.Find(kBroken);
+  Require(rejected && !(*rejected)->pose && !(*rejected)->models[0].layout && registry.stats().frame_pose_failures==1 &&
+    registry.stats().retrying==1,"a rejected tree publishes the entry unposed and retries");
+}
 }
 int main() {
   try {
@@ -221,6 +298,8 @@ int main() {
     PoseMatchesGuest(true);
     CacheReusesAndDetectsChange();
     RecordsSkyDraws();
+    BrokenObjectPoseMatchesGuest(false);
+    BrokenObjectPoseMatchesGuest(true);
   } catch(const std::exception& error) { std::cerr<<"native full-frame sky test failed: "<<error.what()<<"\n"; return 1; }
   std::cout<<"native full-frame sky tests passed\n";
   return 0;

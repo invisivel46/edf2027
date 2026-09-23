@@ -27,6 +27,11 @@ struct NativeRenderClass {
   uint8_t attachments=0;
   // Tracked but not snapshotted: its draws come from the existing scene sources.
   bool scene_source=false;
+  // Frame cadence posed by the registry: the object offset of the root matrix
+  // slot 4 passes to 821C8C58 with the tree at instance+16 before 821C9478
+  // fills the pose vector (native_model_hierarchy.h). 0: not posed natively
+  // (clSky: the sky pass poses it from the rendered camera).
+  uint32_t frame_root=0;
 };
 // NativeRenderClass::attachments bits. Face: 820DB268 draws obj+1588 with pose
 // obj+1636 when byte obj+1584 is set. Weapons: 820DE790 walks obj+1824 (count

@@ -1,6 +1,7 @@
 #pragma once
 #include "guest_block.h"
 #include "native_material_render_state.h"
+#include "native_model_hierarchy.h"
 #include "native_model_pass.h"
 #include "native_model_publication.h"
 #include "native_render_instances.h"
@@ -48,125 +49,33 @@ struct NativeSkyObject {
   static constexpr uint32_t vtable=0x8200284C,constructor=0x820BB460,destructor=0x820BB3D8,render=0x820BB270;
   static constexpr uint32_t dead=36,mode=52,hidden=64,world=224,translation=272,pose_vector=384,instance=412,tree=428;
 };
-struct NativeSkyTree { static constexpr uint32_t roots=0,root_count=8,bones=12,bone_count=20,bind=24; };
-struct NativeSkyNode { static constexpr uint32_t size=304,children=80,child_count=88,inverse_bind=112,local=176,world=240; };
+// The node tree and its walk (steps 2 and 3) are native_model_hierarchy.h's,
+// shared with clBrokenObject (8211FAA8: root this+640, tree this+400).
+using NativeSkyTree=NativeModelTree;
+using NativeSkyNode=NativeModelTreeNode;
 // Render context of 821A5080 (stack r1+80) and the scene fields the sky reads.
 struct NativeSkyScene { static constexpr uint32_t context_scene=16,world=224,translation=272,camera=416; };
-inline constexpr uint32_t kNativeSkyMaxNodes=4096,kNativeSkyMaxDepth=256;
+inline constexpr uint32_t kNativeSkyMaxNodes=kNativeModelHierarchyMaxNodes,kNativeSkyMaxDepth=kNativeModelHierarchyMaxDepth;
 using NativeSkyMatrix=NativeGuestMatrix;
 
 // 821C8198(out,a,b): out = a x b, row-vector (NativeGuestMatrixMultiply,
 // native_render_instances.h, which documents the DPPS order).
 inline NativeSkyMatrix NativeSkyMultiply(const NativeSkyMatrix& a,const NativeSkyMatrix& b) { return NativeGuestMatrixMultiply(a,b); }
 template<class Reader>
-NativeSkyMatrix ReadNativeSkyMatrix(const Reader& reader,uint32_t address) {
-  const auto* bytes=reader.Bytes(address,64);
-  NativeSkyMatrix out{};
-  for(size_t i=0;i<16;++i) out[i]=std::bit_cast<float>(GuestBlockWord(bytes+i*4));
-  return out;
-}
-// The node tree of one bound model, in the guest's walk order (roots, each
-// followed depth first by its children). parent is an index into nodes, or -1
-// for a root, whose parent matrix is the sky world. Locals and inverse binds
-// are the guest's bytes as floats.
-struct NativeSkyHierarchy {
-  struct Node { uint32_t address=0; int32_t parent=-1; NativeSkyMatrix local{},inverse_bind{}; };
-  uint32_t sky=0,tree=0,roots=0,root_count=0,bone_table=0,bone_count=0;
-  bool bind=false;
-  std::vector<Node> nodes;
-  std::vector<uint32_t> bones; // Node index per pose entry.
-};
-// Reads the tree the way 821C8C58/821D1688/821C9478 walk it. A cycle, an
-// oversized or unaligned table, or a bone outside the walked nodes (the guest
-// would copy a stale +240) throws.
+NativeSkyMatrix ReadNativeSkyMatrix(const Reader& reader,uint32_t address) { return ReadNativeGuestMatrix(reader,address); }
+// The sky's tree (this+428); a root's parent matrix is the sky world.
+using NativeSkyHierarchy=NativeModelHierarchy;
 template<class Reader>
 NativeSkyHierarchy ReadNativeSkyHierarchy(const Reader& reader,uint32_t sky) {
   if(!sky || sky%4) throw std::runtime_error("invalid native sky object");
-  NativeSkyHierarchy result; result.sky=sky;
-  result.tree=reader.Add(sky,NativeSkyObject::tree);
-  const auto header=ReadGuestWords<6>(reader,result.tree);
-  result.roots=header[0]; result.root_count=header[2]; result.bone_table=header[3]; result.bone_count=header[5];
-  result.bind=reader.Bytes(reader.Add(result.tree,NativeSkyTree::bind),1)[0]!=0;
-  std::unordered_map<uint32_t,uint32_t> index;
-  struct Pending { uint32_t table=0,count=0,next=0; int32_t parent=-1; };
-  const auto table=[&](uint32_t address,uint32_t count) {
-    if(count>kNativeSkyMaxNodes || (count && (!address || address%4))) throw std::runtime_error("invalid native sky node table");
-    if(count) reader.Bytes(address,size_t(count)*NativeSkyNode::size);
-  };
-  table(result.roots,result.root_count);
-  std::vector<Pending> stack{{result.roots,result.root_count,0,-1}};
-  while(!stack.empty()) {
-    auto& top=stack.back();
-    if(top.next==top.count) { stack.pop_back(); continue; }
-    const auto address=top.table+top.next++*NativeSkyNode::size;
-    const auto parent=top.parent;
-    if(result.nodes.size()>=kNativeSkyMaxNodes || !index.emplace(address,uint32_t(result.nodes.size())).second)
-      throw std::runtime_error("native sky node tree is cyclic or too large");
-    auto& node=result.nodes.emplace_back();
-    node.address=address; node.parent=parent;
-    node.local=ReadNativeSkyMatrix(reader,address+NativeSkyNode::local);
-    node.inverse_bind=ReadNativeSkyMatrix(reader,address+NativeSkyNode::inverse_bind);
-    const auto children=reader.Word(address+NativeSkyNode::children),count=reader.Word(address+NativeSkyNode::child_count);
-    table(children,count);
-    if(count) {
-      if(stack.size()>=kNativeSkyMaxDepth) throw std::runtime_error("native sky node tree too deep");
-      stack.push_back({children,count,0,int32_t(result.nodes.size()-1)});
-    }
-  }
-  if(result.bone_count>kNativeModelMaxBones || (result.bone_count && (!result.bone_table || result.bone_table%4)))
-    throw std::runtime_error("invalid native sky bone table");
-  if(result.bone_count) {
-    const auto* bytes=reader.Bytes(result.bone_table,size_t(result.bone_count)*4);
-    result.bones.reserve(result.bone_count);
-    for(uint32_t bone=0;bone<result.bone_count;++bone) {
-      const auto found=index.find(GuestBlockWord(bytes+bone*4));
-      if(found==index.end()) throw std::runtime_error("native sky bone is not a walked node");
-      result.bones.push_back(found->second);
-    }
-  }
-  return result;
+  return ReadNativeModelHierarchy(reader,reader.Add(sky,NativeSkyObject::tree));
 }
-// Cached hierarchy: rebuilt when the sky, its tree header or bind byte change,
-// and every verify_interval acquisitions the node bytes are re-read and
-// compared, so a local that did change after all is caught (and counted).
-class NativeSkyHierarchyCache {
+class NativeSkyHierarchyCache : public NativeModelHierarchyCache {
  public:
-  uint32_t verify_interval=120;
   template<class Reader>
   const NativeSkyHierarchy& Acquire(const Reader& reader,uint32_t sky) {
-    const auto tree=reader.Add(sky,NativeSkyObject::tree);
-    const auto header=ReadGuestWords<6>(reader,tree);
-    const bool bind=reader.Bytes(reader.Add(tree,NativeSkyTree::bind),1)[0]!=0;
-    const bool same=cached_ && cached_->sky==sky && cached_->roots==header[0] && cached_->root_count==header[2] &&
-      cached_->bone_table==header[3] && cached_->bone_count==header[5] && cached_->bind==bind;
-    if(same && (!verify_interval || ++uses_<verify_interval)) return *cached_;
-    auto fresh=ReadNativeSkyHierarchy(reader,sky);
-    if(same) {
-      ++verifications_;
-      if(Same(*cached_,fresh)) { uses_=0; return *cached_; }
-      ++changes_;
-    }
-    cached_=std::move(fresh); uses_=0; ++builds_;
-    return *cached_;
+    return NativeModelHierarchyCache::Acquire(reader,reader.Add(sky,NativeSkyObject::tree));
   }
-  void Reset() { cached_.reset(); uses_=0; }
-  uint64_t builds() const { return builds_; }
-  uint64_t verifications() const { return verifications_; }
-  uint64_t changes() const { return changes_; }
- private:
-  static bool Same(const NativeSkyHierarchy& a,const NativeSkyHierarchy& b) {
-    if(a.nodes.size()!=b.nodes.size() || a.bones!=b.bones) return false;
-    for(size_t i=0;i<a.nodes.size();++i) {
-      const auto& x=a.nodes[i],&y=b.nodes[i];
-      if(x.address!=y.address || x.parent!=y.parent ||
-         std::bit_cast<std::array<uint32_t,16>>(x.local)!=std::bit_cast<std::array<uint32_t,16>>(y.local) ||
-         std::bit_cast<std::array<uint32_t,16>>(x.inverse_bind)!=std::bit_cast<std::array<uint32_t,16>>(y.inverse_bind)) return false;
-    }
-    return true;
-  }
-  std::optional<NativeSkyHierarchy> cached_;
-  uint32_t uses_=0;
-  uint64_t builds_=0,verifications_=0,changes_=0;
 };
 // The camera translation row as 820BB270 copies it: the rendered camera
 // world's row 3 (row-vector camera-to-world, NativeCameraPose::world),
@@ -181,24 +90,10 @@ NativeSkyMatrix NativeSkyWorld(const Reader& reader,uint32_t sky,const std::arra
   for(size_t i=0;i<4;++i) world[12+i]=translation[i];
   return world;
 }
-// Steps 2 and 3: every node's +240 and the pose vector's entries.
-struct NativeSkyPose {
-  NativeSkyMatrix world{};
-  std::vector<NativeSkyMatrix> nodes;       // node+240, in hierarchy order.
-  std::vector<NativePoseMatrix> palette;    // Pose vector entries (this+384).
-};
+// Steps 2 and 3: every node's +240 and the pose vector's entries (this+384).
+using NativeSkyPose=NativeModelHierarchyPose;
 inline NativeSkyPose ComputeNativeSkyPose(const NativeSkyHierarchy& hierarchy,const NativeSkyMatrix& world) {
-  NativeSkyPose pose; pose.world=world;
-  pose.nodes.resize(hierarchy.nodes.size());
-  // Parents precede children in walk order, so one forward pass suffices.
-  for(size_t i=0;i<hierarchy.nodes.size();++i) {
-    const auto& node=hierarchy.nodes[i];
-    pose.nodes[i]=NativeSkyMultiply(node.local,node.parent<0?world:pose.nodes[size_t(node.parent)]);
-  }
-  pose.palette.reserve(hierarchy.bones.size());
-  for(const auto bone:hierarchy.bones)
-    pose.palette.push_back(hierarchy.bind?NativeSkyMultiply(hierarchy.nodes[bone].inverse_bind,pose.nodes[bone]):pose.nodes[bone]);
-  return pose;
+  return ComputeNativeModelHierarchyPose(hierarchy,world);
 }
 // Material state operations of one pass record (the activation's list at
 // +96: records of {state offset, value}), in activation order.

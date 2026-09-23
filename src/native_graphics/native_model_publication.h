@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -133,8 +134,12 @@ NativeModelBatchLayout DecodeNativeModelBatch(const Reader& reader,uint32_t addr
   return batch;
 }
 // lookup(owner,kind) returns the NativeModelBuffers generation, or 0.
+// bones, when given, is the pose count the draw will use instead of the pose
+// vector's current extent: a pose the slot-4 body sizes itself (821C9478
+// resizes the vector to tree+20) and the registry computes natively.
 template<class Reader,class Lookup>
-NativeModelLayout DecodeNativeModelLayoutWith(const Reader& reader,uint32_t instance,uint32_t pose_vector,const Lookup& lookup) {
+NativeModelLayout DecodeNativeModelLayoutWith(const Reader& reader,uint32_t instance,uint32_t pose_vector,const Lookup& lookup,
+    std::optional<uint32_t> bones=std::nullopt) {
   if(!instance || instance%4) throw std::runtime_error("invalid native model instance");
   NativeModelLayout layout; layout.instance=instance; layout.pose_vector=pose_vector;
   layout.container=reader.Word(instance);
@@ -143,7 +148,8 @@ NativeModelLayout DecodeNativeModelLayoutWith(const Reader& reader,uint32_t inst
     throw std::runtime_error("native model instance names no model resource");
   layout.single_world=!pose_vector;
   layout.skinned=!layout.single_world && reader.Bytes(NativeModelAddress(instance,12),1)[0]!=0;
-  layout.bones=layout.single_world?0:ReadNativeModelPoseRange(reader,pose_vector).count;
+  if(bones && *bones>kNativeModelMaxBones) throw std::runtime_error("native model pose count out of range");
+  layout.bones=layout.single_world?0:bones?*bones:ReadNativeModelPoseRange(reader,pose_vector).count;
   if(layout.skinned && !layout.bones) throw std::runtime_error("native skinned model has an empty pose");
   const auto records=reader.Word(NativeModelAddress(layout.node,44)),count=reader.Word(NativeModelAddress(layout.node,52));
   if(count>kNativeModelMaxMeshes || (count && (!records || records%4)))

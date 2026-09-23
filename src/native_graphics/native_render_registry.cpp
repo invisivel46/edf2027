@@ -13,8 +13,13 @@ constexpr uint32_t kCharacterInstance=1168,kCharacterPose=1088;
 // call site passes r3=this. Cadence: Constructed = pose built once in the
 // constructor (clTree 820BB460), Frame = built inside slot 4 itself (never in
 // full-frame mode), Tick = built by slot 2 from the 821A4DE8 scene+100 walk.
+// A Frame class with a root (Posed) has that slot-4 pose built by the
+// registry from the tick's object fields; clSky's is the sky pass's.
 constexpr NativeRenderClass Rigid(uint32_t vtable,const char* name,uint32_t instance,uint32_t pose,Cadence cadence=Cadence::Tick) {
   return {.vtable=vtable,.name=name,.cadence=cadence,.lod=Lod::None,.instance=instance,.pose=pose};
+}
+constexpr NativeRenderClass Posed(uint32_t vtable,const char* name,uint32_t instance,uint32_t pose,uint32_t root) {
+  return {.vtable=vtable,.name=name,.cadence=Cadence::Frame,.lod=Lod::None,.instance=instance,.pose=pose,.frame_root=root};
 }
 constexpr NativeRenderClass Character(uint32_t vtable,const char* name,uint8_t attachments=0) {
   return {.vtable=vtable,.name=name,.cadence=Cadence::Tick,.lod=Lod::Character,
@@ -57,7 +62,8 @@ constexpr std::array kClasses{
   Rigid(0x820073C4u,"clCentryGun01",932,976),                        // 82115AE8
   Rigid(0x8200740Cu,"clGrenadeAmmo01",904,948),                      // 82117298
   Rigid(0x82007478u,"clMissileAmmo01",892,936),                      // 82118648
-  Rigid(0x820077D8u,"clBrokenObject",384,428,Cadence::Frame),        // 8211FAA8
+  // 8211FAA8: +712 = +708, 821C8C58(+400,+640), 821C9478(+400,+428), 821C9C20(+384,+428).
+  Posed(0x820077D8u,"clBrokenObject",384,428,640),
   Rigid(0x820077F4u,"clBrokenPiece",384,428),                        // 82120168
   Rigid(0x82014D4Cu,"clShellCase01",544,588),                        // 8218A658
   Character(0x82015E94u,"C_VehicleBase"),                            // 8219A2D0
