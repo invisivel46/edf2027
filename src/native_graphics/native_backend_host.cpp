@@ -13,6 +13,12 @@ REXCVAR_DECLARE(int32_t,edf_native_host_capture_after_ms);
 REXCVAR_DECLARE(bool,edf_native_host_capture_require_image);
 REXCVAR_DEFINE_STRING(edf_native_display_trace,"","EDF2027",
   "Optional CSV of DXGI display feedback; empty disables display tracing.");
+// The SDK's letterbox switch: edf_aspect=stretch clears it (settings_dialog.h).
+REXCVAR_DECLARE(bool,present_letterbox);
+REXCVAR_DEFINE_STRING(edf_present_filter,"auto","EDF2027",
+  "How the frame is scaled into the window (native_display_layout.h): auto places it on whole pixels, replicates it "
+  "exactly at whole scale factors, area-filters a render size larger than the window and is bilinear otherwise; "
+  "bilinear is the original single bilinear sample. Applies live").allowed({"auto","bilinear"});
 namespace edf::native {
 std::shared_ptr<NativeBackendHost> NativeBackendHost::Create(HWND window,
     std::shared_ptr<NativeRenderBackend> backend,Overlay overlay,NativeUiTicker::Dispatch dispatch) {
@@ -107,7 +113,11 @@ void NativeBackendHost::Paint() {
     backend_->BeginFrame();
     auto* target=backend_->BackBuffer();
     if(!target) throw std::runtime_error("backend host has no back buffer");
-    if(snapshot_) compositor_.Draw(backend_->Recorder(),*snapshot_,*target,true,gamma_?&*gamma_:nullptr);
+    // Letterboxed unless edf_aspect=stretch; the render size is fixed for the
+    // run, so after a resize the frame is fitted to the new window until the
+    // next start renders at its shape.
+    if(snapshot_) compositor_.Draw(backend_->Recorder(),*snapshot_,*target,REXCVAR_GET(present_letterbox),
+                                   gamma_?&*gamma_:nullptr,REXCVAR_GET(edf_present_filter)!="bilinear");
     else backend_->Recorder().ClearColor(*target,{0,0,0,1});
     try { overlay_(*target); }
     catch(...) { backend_->Submit(); throw; }

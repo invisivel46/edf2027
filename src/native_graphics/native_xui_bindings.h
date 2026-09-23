@@ -1,28 +1,13 @@
 #pragma once
 #include "d3d11_bindings.h"
+#include "native_canvas_constants.h"
 #include <stdexcept>
 #include <bit>
 #include <cmath>
 
 namespace edf::native {
-// Map the authored canvas to the full output while retaining homogeneous
-// translation/depth. X grows from the left edge and Y from the top edge.
-inline std::array<float,16> NativeXuiCanvasProjection(std::span<const uint8_t> bytes,
-                                                     float scale_x,float scale_y) {
-  if(bytes.size()!=64 || !std::isfinite(scale_x) || !std::isfinite(scale_y) ||
-     scale_x<=0 || scale_y<=0) throw std::runtime_error("invalid XUI canvas projection");
-  std::array<float,16> matrix{};
-  for(size_t i=0;i<16;++i) {
-    uint32_t word=0;
-    for(size_t b=0;b<4;++b) word=(word<<8)|bytes[i*4+b];
-    matrix[i]=std::bit_cast<float>(word);
-  }
-  for(size_t i=0;i<4;++i) {
-    matrix[i]=scale_x*matrix[i]+(scale_x-1)*matrix[12+i];
-    matrix[4+i]=scale_y*matrix[4+i]+(1-scale_y)*matrix[12+i];
-  }
-  return matrix;
-}
+// NativeXuiCanvasProjection and NativeXuiClipBounds live in
+// native_canvas_constants.h (no D3D dependency, unit-tested there).
 class NativeXuiPixelBindings {
  public:
   NativeXuiPixelBindings(const ShaderBindings& shader,bool solid)
@@ -63,7 +48,8 @@ class NativeXuiVertexBindings {
       if(constants_[i].bytes()!=sizes[i]) throw std::runtime_error("invalid native XUI vertex layout");
   }
   void SetConstants(ShaderBindings& shader,std::span<const uint8_t> registers,
-                    std::span<const uint8_t> bias,float scale_x=1,float scale_y=1) const {
+                    std::span<const uint8_t> bias,float scale_x=1,float scale_y=1,
+                    const NativeClipAffine& affine={}) const {
     if(registers.size()!=192 || bias.size()!=16) throw std::runtime_error("invalid native XUI register blocks");
     for(const auto& binding:constants_)
       if(!shader.Owns(binding)) throw std::runtime_error("stale native XUI vertex bindings");
@@ -71,15 +57,16 @@ class NativeXuiVertexBindings {
     constexpr size_t sizes[]{64,64,16,16,32};
     // Validate before updating any binding; default path keeps exact bytes.
     std::array<uint8_t,64> scaled_projection{};
-    if(scale_x!=1 || scale_y!=1) {
-      const auto projection=NativeXuiCanvasProjection(registers.subspan(64,64),scale_x,scale_y);
+    const bool mapped=scale_x!=1 || scale_y!=1 || !affine.identity();
+    if(mapped) {
+      const auto projection=NativeXuiCanvasProjection(registers.subspan(64,64),scale_x,scale_y,affine);
       for(size_t i=0;i<16;++i) {
         const auto word=std::bit_cast<uint32_t>(projection[i]);
         for(size_t b=0;b<4;++b) scaled_projection[i*4+b]=uint8_t(word>>(24-b*8));
       }
     }
     for(size_t i=0;i<5;++i) {
-      if(i==1 && (scale_x!=1 || scale_y!=1))
+      if(i==1 && mapped)
         shader.SetGuestFloatRegisters(constants_[i],scaled_projection);
       else shader.SetGuestFloatRegisters(constants_[i],registers.subspan(offsets[i],sizes[i]));
     }

@@ -116,19 +116,27 @@ void TestGraphicsMapping() {
   CHECK(edf::ValidNativeRenderMode(1920,1080));
   CHECK(edf::ValidNativeRenderMode(640,480));
   CHECK(edf::ValidNativeRenderMode(4095,4095));
-  CHECK(!edf::ValidNativeRenderMode(0,720));
+  // Height-only requests take the width from the window's shape; (0,-1) is the window.
+  CHECK(edf::ValidNativeRenderMode(0,720) && edf::ValidNativeRenderMode(0,-1));
+  CHECK(edf::ValidNativeRenderMode(4096,2160) && edf::ValidNativeRenderMode(5120,1440));
   CHECK(!edf::ValidNativeRenderMode(1280,0));
-  CHECK(!edf::ValidNativeRenderMode(4096,2160));
+  CHECK(!edf::ValidNativeRenderMode(7680,4320));
   CHECK(!edf::ValidNativeRenderMode(640,479));
   CHECK(mode.width == 1920 && mode.height == 1080);
+  // The guest always sees a 16:9 video mode (its widescreen flag); the render size
+  // follows the window separately.
+  mode = edf::GuestVideoMode(1280, 720, "native");
+  CHECK(mode.width == 1280 && mode.height == 720);
   mode = edf::GuestVideoMode(1920, 1200, "native");
-  CHECK(mode.width == 1920 && mode.height == 1200);
+  CHECK(mode.width == 2133 && mode.height == 1200);
   mode = edf::GuestVideoMode(1920, 1200, "letterbox");
   CHECK(mode.width == 2133 && mode.height == 1200);
   mode = edf::GuestVideoMode(3440, 1440, "ultrawide");
-  CHECK(mode.width == 3440 && mode.height == 1440);
+  CHECK(mode.width == 2560 && mode.height == 1440);
   mode = edf::GuestVideoMode(5120, 1440, "ultrawide");
-  CHECK(mode.width == 5120 && mode.height == 1440);
+  CHECK(mode.width == 2560 && mode.height == 1440);
+  mode = edf::GuestVideoMode(1024, 768, "native");
+  CHECK(mode.width == 1365 && mode.height == 768);
   mode = edf::GuestVideoMode(800, 600, "stretch");
   CHECK(mode.width == 1280 && mode.height == 720);
   CHECK(edf::PresentLetterbox("native") && edf::PresentLetterbox("letterbox"));
