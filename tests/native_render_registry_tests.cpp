@@ -671,7 +671,7 @@ void SingleWorldLayoutFollows821C9DA8() {
   memory.StoreWord(kMeshes+44,0); memory.StoreByte(kMeshes+48,1);
   memory.StoreWord(kMeshes+4,0x10); memory.StoreWord(kMeshes+8,0x5); // Unreadable batches: never walked.
   memory.StoreWord(kMeshes+52+44,9); memory.StoreByte(kMeshes+52+48,0);
-  const auto layout=Decoder(memory)(kInstance,0);
+  const auto layout=Decoder(memory)(kInstance,0,0);
   Require(layout.single_world && !layout.skinned && !layout.bones && !layout.pose_vector && layout.meshes.size()==2,"single-world layout");
   Require(!layout.meshes[0].uploads_bone && layout.meshes[0].batches.empty(),"a rec+48 record is neither uploaded nor drawn");
   Require(layout.meshes[1].uploads_bone && layout.meshes[1].bone==9,"a rec+48==0 record uploads the world whatever its bone");
