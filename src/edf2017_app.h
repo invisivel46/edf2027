@@ -279,6 +279,8 @@ class Edf2017App : public rex::ReXApp {
   }
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    // The SDK titles the window "<name> <SDK build stamp>"; show only the game's name.
+    if (window()) window()->SetTitle("EDF2027");
     auto* overlay = new edf::PerfOverlay(drawer, [this] { return PhysicalHeight(); });
     edf::PerfOverlay::Current() = overlay;
     rex::ui::RegisterBind("bind_edf_settings", "F1", "EDF2027 settings", [this]() { ToggleSettings(); });
