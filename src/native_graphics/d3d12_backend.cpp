@@ -1222,6 +1222,7 @@ class D3D12Backend final : public NativeRenderBackend {
                               std::make_unique<D3D12Pipeline>(state,Topology(desc.topology),
                                                               decoded.requires_blend_factor,
                                                               decoded.replicate_blend_alpha)).first;
+    if(!found->second->identity) StampNativeBackendPipelineIdentity(*found->second,desc);
     return *found->second;
   }
 
