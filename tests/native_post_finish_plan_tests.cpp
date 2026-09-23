@@ -516,6 +516,7 @@ void TestFullFrameRecording() {
 class SyntheticMemory final:public PostGuestMemory {
  public:
   SyntheticMemory() { regions_[0x82570000u].resize(0x10000); regions_[0x40000000u].resize(0x10000); }
+  void Map(uint32_t base,size_t size) { regions_[base].resize(size); }
   const uint8_t* Bytes(uint32_t address,size_t size) const override {
     for(const auto& [base,bytes]:regions_)
       if(address>=base && size_t(address-base)+size<=bytes.size()) return bytes.data()+(address-base);
@@ -691,6 +692,208 @@ void TestToneHistoryPerTick() {
     CHECK(ungated.tone_draws==240 && ungated.history!=locked.history);
   }
 }
+
+// Post samplers (ResolveNativePostSamplers). The post owner's techniques with
+// PostEffect's texture records, laid out as 821B8E48 reads them, and the image
+// defaults the base derives from.
+constexpr uint32_t kTechniques=0x60000000u,kStrings=0x61000000u;
+struct PostRecordSpec { const char* name; uint32_t slot; std::array<uint32_t,4> settings; };
+constexpr std::array<uint32_t,4> kPoint{0,0,0,0};   // 821BCF28(0.0,0,0,0): bias, mip, min, mag
+constexpr std::array<uint32_t,4> kLinear{0,1,1,1};  // mip, min, mag linear
+struct PostEffectMemory {
+  SyntheticMemory memory;
+  PostFinishInput input=Input();
+  uint32_t next_string=kStrings;
+  PostEffectMemory() {
+    memory.Map(kTechniques,0x10000); memory.Map(kStrings,0x1000);
+    for(const uint32_t texture:{0x50000000u,0x51000000u,0x52000000u,0x53000000u}) memory.Map(texture,0x1000);
+    memory.Map(0x82552000u,0x1000); memory.Map(0x82009000u,0x1000); memory.Map(0x82017000u,0x1000);
+    // 825529A8: (getter, setter, default) per sampler state, the image's defaults.
+    constexpr std::array<uint32_t,20> defaults{0,0,0,0,0,0,2,0,0,1,0,0,0,13,0,0,0,0,0,1};
+    for(uint32_t i=0;i<20;++i) memory.Put(PostSamplerLayout::kResetTable+i*12+8,defaults[i]);
+    constexpr std::array<uint32_t,8> anisotropy{0,0,2,2,3,3,3,4}; // 82009608
+    for(uint32_t i=0;i<8;++i) memory.Put(PostSamplerLayout::kAnisotropyTable+i*4,anisotropy[i]);
+    for(uint32_t slot=0;slot<4;++slot) {                           // 82017670
+      constexpr std::array<uint32_t,4> states{0x14,0x10,0x0,0x4};
+      for(uint32_t i=0;i<4;++i) {
+        memory.Put(PostSamplerLayout::kScopeSaved+(slot*4+i)*8,slot);
+        memory.Put(PostSamplerLayout::kScopeSaved+(slot*4+i)*8+4,states[i]);
+      }
+    }
+    // Render-target texture headers: one level (+44 LOD 0..0), filter-high clear.
+    // Input()'s handles are one byte apart; spread them so headers do not overlap.
+    for(uint32_t k=0;k<5;++k) input.first[k].texture=0x51000000u+k*0x40;
+    for(uint32_t i=0;i<input.second.size();++i) input.second[i].texture=0x52000000u+i*0x40;
+    input.blur_vertical.texture=0x53000040u;
+    for(uint32_t k=0;k<5;++k) Header(input.first[k].texture);
+    for(const auto& record:input.second) Header(record.texture);
+    Header(input.scene_texture); Header(input.blur.texture); Header(input.blur_vertical.texture);
+    input.mono_technique=Technique(0,{{kPostDiffuse0,0,kPoint}});
+    input.downsample_technique=Technique(1,{{kPostDiffuse0,0,kPoint}});
+    input.downsample_tone_technique=Technique(2,{{kPostDiffuse0,0,kPoint},{kPostOldTone,1,kPoint}});
+    input.tone_technique=Technique(3,{{kPostDiffuse0,0,kPoint},{kPostTone,1,kLinear}});  // m_Tone: set per frame
+    input.blur_technique=Technique(4,{{kPostDiffuse0,0,kPoint}});
+    // No guest post has run yet: the bloom's per-frame records hold load values.
+    input.bloom_technique=Technique(5,{{kPostDiffuse0,0,kLinear},{kPostDiffuse1,1,kLinear},{kPostTone,2,kLinear}});
+  }
+  void Header(uint32_t texture) {
+    memory.Put(texture+40,0x0000abcdu);  // filter-high (bit 31) clear
+    memory.Put(texture+44,0xfff00c03u);  // LOD fields (0x3fc) zero: one level
+  }
+  uint32_t Technique(uint32_t index,const std::vector<PostRecordSpec>& records) {
+    const auto technique=kTechniques+index*0x1000;
+    const auto begin=technique+0x100;
+    memory.Put(technique+PostSamplerLayout::kLocalTextures,begin);
+    memory.Put(technique+PostSamplerLayout::kLocalTextures+8,uint32_t(records.size()));
+    memory.Put(technique+PostSamplerLayout::kGlobalTextures+8,0);
+    for(size_t i=0;i<records.size();++i) {
+      const auto record=begin+uint32_t(i)*PostSamplerLayout::kLocalStride;
+      const std::string name=records[i].name;
+      std::memcpy(memory.At(next_string,name.size()+1),name.c_str(),name.size()+1);
+      memory.Put(record,next_string); next_string+=uint32_t(name.size()+1);
+      memory.Put(record+4,0xdead0000u);  // stale: the plan's texture setter replaces it
+      memory.Put(record+8,records[i].slot);
+      for(uint32_t w=0;w<4;++w) memory.Put(record+12+w*4,records[i].settings[w]);
+    }
+    return technique;
+  }
+  uint32_t RecordAddress(uint32_t technique,size_t index) {
+    return memory.Word(technique+PostSamplerLayout::kLocalTextures)+uint32_t(index)*PostSamplerLayout::kLocalStride;
+  }
+  void SetRecord(uint32_t technique,size_t index,const std::array<uint32_t,4>& settings) {
+    for(uint32_t w=0;w<4;++w) memory.Put(RecordAddress(technique,index)+12+w*4,settings[w]);
+  }
+  std::vector<NativePostDraw> Draws() {
+    RecordingSink sink;
+    RecordNativePost(sink,input,Tone(),NativePostHistory::Advance,&memory);
+    return sink.draws;
+  }
+};
+bool SameDesc(const NativeBackendSamplerDesc& a,const NativeBackendSamplerDesc& b) {
+  return a.min==b.min && a.mag==b.mag && a.mip==b.mip && a.u==b.u && a.v==b.v && a.w==b.w &&
+    a.min_lod==b.min_lod && a.max_lod==b.max_lod && a.mip_lod_bias==b.mip_lod_bias && a.max_anisotropy==b.max_anisotropy;
+}
+void TestPostSamplers() {
+  // The base: every slot reset (wrap, point, mip 2, LOD bytes 0..13), slots
+  // 0..3 then min/mag linear and U/V clamp from the 2D scope.
+  const auto base=NativePostSamplerBase();
+  for(uint32_t slot=0;slot<16;++slot) {
+    const auto& pass=base[slot];
+    const uint32_t address=slot<4?(2u<<10)|(2u<<13):0u;
+    CHECK(pass.words[0]==address && pass.words[3]==0);
+    CHECK(((pass.words[1]>>19)&3)==(slot<4?1u:0u) && ((pass.words[1]>>21)&3)==(slot<4?1u:0u));
+    CHECK(((pass.words[1]>>23)&3)==2 && ((pass.words[1]>>25)&7)==0);
+    CHECK(pass.min_lod==0 && pass.max_lod==13 && pass.anisotropy==0 && pass.mip_override==0);
+  }
+  PostEffectMemory fixture;
+  CheckNativePostSamplerImage(fixture.memory);
+  const auto draws=fixture.Draws();
+  CHECK(draws.size()==14);
+  // The guest route's decode of every post input, as the 2026-09-10 exact-input
+  // capture logged it (out/native-bridge-run/native-post-chain-20260910.log,
+  // frame 600, all 14 passes): filter 0 (point), address 3/3/1 (D3D11
+  // clamp/clamp/wrap), LOD 0..0, bias 0 - except the bloom's
+  // m_DiffuseTexture1, filter 21 (min/mag/mip linear).
+  NativeBackendSamplerDesc point{};
+  point.min=point.mag=point.mip=NativeBackendFilter::Point;
+  point.u=point.v=NativeBackendAddress::Clamp; point.w=NativeBackendAddress::Wrap;
+  point.min_lod=point.max_lod=0; point.mip_lod_bias=0; point.max_anisotropy=1;
+  auto linear=point; linear.min=linear.mag=linear.mip=NativeBackendFilter::Linear;
+  size_t inputs=0;
+  for(const auto& draw:draws) for(const auto& texture:draw.textures) {
+    ++inputs;
+    const auto* state=FindPostSamplerState(draw,texture.name);
+    CHECK(state);
+    if(!state) continue;
+    const bool bloom_image=draw.kind==PostPassKind::Bloom && texture.name==kPostDiffuse1;
+    const auto decoded=DecodeNativeGuestSampler(NativeFilteringKey(state->words,-1));
+    if(!SameDesc(decoded,bloom_image?linear:point))
+      std::cerr<<PostPassName(draw.kind)<<" "<<texture.name<<": filter "<<int(decoded.min)<<int(decoded.mag)<<int(decoded.mip)
+               <<" address "<<int(decoded.u)<<int(decoded.v)<<int(decoded.w)<<" lod "<<decoded.min_lod<<".."<<decoded.max_lod
+               <<" bias "<<decoded.mip_lod_bias<<" aniso "<<decoded.max_anisotropy<<'\n';
+    CHECK(SameDesc(decoded,bloom_image?linear:point));
+    // Forced anisotropic filtering changes only the all-linear bloom image, as on the guest route.
+    CHECK((NativeFilteringKey(state->words,3)!=NativeFilteringKey(state->words,-1))==bloom_image);
+  }
+  CHECK(inputs==18);
+  const auto& bloom=draws.back();
+  CHECK(bloom.sampler_states.size()==3 && FindPostSamplerState(bloom,kPostTone)->slot==2);
+  // Independent of whether a guest post ran first: after one, 821BCF28 has
+  // left Tone's m_Tone and the bloom's scene/tone records point; before, they
+  // hold load values. The plan's setters stand in for those writes, so every
+  // state is the same either way.
+  fixture.SetRecord(fixture.input.tone_technique,1,kPoint);
+  fixture.SetRecord(fixture.input.bloom_technique,0,kPoint);
+  fixture.SetRecord(fixture.input.bloom_technique,2,kPoint);
+  const auto after=fixture.Draws();
+  CHECK(after.size()==draws.size());
+  for(size_t d=0;d<std::min(after.size(),draws.size());++d) {
+    CHECK(after[d].sampler_states.size()==draws[d].sampler_states.size());
+    for(size_t i=0;i<std::min(after[d].sampler_states.size(),draws[d].sampler_states.size());++i)
+      CHECK(after[d].sampler_states[i].words==draws[d].sampler_states[i].words);
+  }
+  // A record the plan does not set is the effect's own: changing it shows.
+  fixture.SetRecord(fixture.input.bloom_technique,1,kPoint);
+  CHECK(fixture.Draws().back().sampler_states[1].words!=draws.back().sampler_states[1].words);
+  fixture.SetRecord(fixture.input.bloom_technique,1,kLinear);
+  // Two records on one slot: both names sample what the last one left.
+  {
+    auto two=fixture;
+    two.memory.Put(two.RecordAddress(two.input.tone_technique,1)+8,0);
+    two.SetRecord(two.input.tone_technique,0,kLinear);
+    const auto shared=two.Draws();
+    const auto& tone=shared[10];
+    CHECK(tone.kind==PostPassKind::Tone);
+    CHECK(FindPostSamplerState(tone,kPostDiffuse0)->words==FindPostSamplerState(tone,kPostTone)->words);
+    CHECK(DecodeNativeGuestSampler(FindPostSamplerState(tone,kPostDiffuse0)->words).min==NativeBackendFilter::Point);
+  }
+  // The device state chains through the frame: a slot a draw's records do not
+  // write keeps the previous draw's words (Tone's m_Tone moved to slot 5 reads
+  // the reset state there, not slot 1's).
+  {
+    auto moved=fixture;
+    moved.memory.Put(moved.RecordAddress(moved.input.tone_technique,1)+8,5);
+    const auto chained=moved.Draws();
+    const auto& tone=chained[10];
+    CHECK(FindPostSamplerState(tone,kPostTone)->slot==5);
+    const auto desc=DecodeNativeGuestSampler(FindPostSamplerState(tone,kPostTone)->words);
+    CHECK(desc.u==NativeBackendAddress::Wrap && desc.v==NativeBackendAddress::Wrap && desc.min==NativeBackendFilter::Point);
+  }
+  // A texture header's LOD range and a record's bias reach the words.
+  {
+    auto lod=fixture;
+    lod.memory.Put(lod.input.scene_texture+44,(0u<<2)|(3u<<6));
+    lod.SetRecord(lod.input.downsample_technique,0,{std::bit_cast<uint32_t>(-0.5f),0,0,0});
+    const auto desc=DecodeNativeGuestSampler(lod.Draws()[0].sampler_states[0].words);
+    CHECK(desc.max_lod==3 && desc.min_lod==0 && desc.mip_lod_bias==-0.5f);
+  }
+  // Malformed records are refused, not guessed.
+  const auto refused=[&](auto&& mutate) {
+    auto bad=fixture; mutate(bad);
+    bool threw=false;
+    try { bad.Draws(); } catch(const std::runtime_error&) { threw=true; }
+    return threw;
+  };
+  CHECK(refused([](PostEffectMemory& m) { m.memory.Put(m.RecordAddress(m.input.blur_technique,0)+8,16); }));
+  CHECK(refused([](PostEffectMemory& m) { m.memory.Put(m.input.blur_technique+PostSamplerLayout::kLocalTextures+8,65); }));
+  CHECK(!refused([](PostEffectMemory&) {}));
+  // The image check: a changed reset default or scope save list is loud.
+  {
+    auto image=fixture;
+    image.memory.Put(PostSamplerLayout::kResetTable+13*12+8,15);
+    bool threw=false;
+    try { CheckNativePostSamplerImage(image.memory); } catch(const std::runtime_error&) { threw=true; }
+    CHECK(threw);
+    image=fixture; image.memory.Put(PostSamplerLayout::kScopeSaved+4,0x8);
+    threw=false;
+    try { CheckNativePostSamplerImage(image.memory); } catch(const std::runtime_error&) { threw=true; }
+    CHECK(threw);
+  }
+  // Without memory nothing is resolved (the renderer's sink would refuse the frame).
+  RecordingSink bare;
+  RecordNativePost(bare,fixture.input,Tone());
+  CHECK(std::all_of(bare.draws.begin(),bare.draws.end(),[](const auto& d) { return d.sampler_states.empty(); }));
+}
 }
 
 int main() {
@@ -706,6 +909,8 @@ int main() {
   TestLogPolicy();
   TestFullFrameRecording();
   TestToneSource();
+  try { TestPostSamplers(); }
+  catch(const std::exception& error) { std::cerr<<"post samplers: "<<error.what()<<'\n'; ++failures; }
   if(failures) std::cerr<<failures<<" post finish plan failures\n";
   else std::cout<<"post finish plan tests passed\n";
   return failures?1:0;

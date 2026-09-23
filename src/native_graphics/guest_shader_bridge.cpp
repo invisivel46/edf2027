@@ -4982,22 +4982,8 @@ class GuestPostMemory final:public PostGuestMemory {
  private:
   const GuestReader& reader_;
 };
-struct FullFramePostStats { uint64_t frames=0,draws=0,failures=0,uninitialized=0,fallback_samplers=0,history_held=0; };
+struct FullFramePostStats { uint64_t frames=0,draws=0,failures=0,uninitialized=0,history_held=0; };
 FullFramePostStats& FullPostStats() { static FullFramePostStats stats; return stats; }
-// Clamped point or linear, one mip. Only where the pixel bindings hold no
-// sampler from a guest-activated frame (see NativePostSampler).
-NativeBackendSampler* FullPostSampler(Bridge& state,bool point) {
-  auto& backend=EnsureSceneBackendLocked(state);
-  static std::map<std::pair<const NativeRenderBackend*,bool>,NativeBackendSampler*> cache;
-  auto& cached=cache[{&backend,point}];
-  if(!cached) {
-    NativeBackendSamplerDesc desc{};
-    desc.min=desc.mag=point?NativeBackendFilter::Point:NativeBackendFilter::Linear; desc.mip=NativeBackendFilter::Point;
-    desc.u=desc.v=desc.w=NativeBackendAddress::Clamp; desc.max_lod=0;
-    cached=&backend.CreateSampler(desc);
-  }
-  return cached;
-}
 // The engine's big-endian float4 register stream, as the setters leave it.
 std::vector<uint8_t> GuestFloatBytes(std::span<const float> values) {
   std::vector<uint8_t> bytes(values.size()*4);
@@ -5047,19 +5033,19 @@ class BridgePostSink final:public NativePostSink {
         target->sampled.width,target->sampled.height,draw.width,draw.height));
     // Constants by name: a name the native compiler optimized out is skipped.
     for(const auto& constant:draw.constants) ps.SetGuestFloatRegisters(constant.name,GuestFloatBytes(constant.values));
-    // Textures and samplers by name. A sampler the bindings already hold was
-    // decoded from the guest's own sampler words on a guest-activated frame and
-    // is kept; otherwise 821BCF28's records (words 0) get point and the rest
-    // linear, both clamped.
+    // Textures and samplers by name. Each sampler is the device state the
+    // guest's activation leaves in the record's slot (ResolveNativePostSamplers),
+    // decoded as the guest route decodes it, never read back from the shared
+    // bindings: the post samples with the game's states from its first frame,
+    // whatever ran before it.
     std::vector<std::pair<const NativePostTexture*,NativeBackendSampler*>> inputs;
     for(const auto& texture:draw.textures) {
-      auto* sampler=ps.ReadSampler(texture.name);
-      if(!sampler) {
-        const bool point=std::any_of(draw.samplers.begin(),draw.samplers.end(),[&](const auto& s) {
-          return s.name==texture.name && s.words==std::array<uint32_t,3>{}; });
-        sampler=FullPostSampler(state,point); ++FullPostStats().fallback_samplers;
-      }
-      inputs.emplace_back(&texture,sampler);
+      const auto* sampler=FindPostSamplerState(draw,texture.name);
+      if(!sampler)
+        throw std::runtime_error(std::format("{} technique {:#x} has no texture record for {}",
+          PostPassName(draw.kind),draw.technique,texture.name));
+      inputs.emplace_back(&texture,SamplerLocked(state,NativeFilteringKey(sampler->words,
+        REXCVAR_GET(edf_native_anisotropic_filtering))));
     }
     ps.BeginResourceUpdate();
     try {
@@ -5166,17 +5152,28 @@ bool RecordNativeFullFramePost(uint8_t* base,uint32_t self,bool resolve_scene,st
     scene.output.content_valid=false;
     const auto device=reader.Word(reader.Add(owner,8));
     const float center=REXCVAR_GET(edf_native_pixel_centers) ? GuestPixelCenterOffset(ReadVertexCenterWord(reader,device)) : 0.f;
+    // The image defaults the post's sampler base derives from, once.
+    static bool sampler_image_checked=false;
+    if(!sampler_image_checked) { CheckNativePostSamplerImage(memory); sampler_image_checked=true; }
     BridgePostSink sink(state,reader,owner,device,center);
     const auto frame=RecordNativePost(sink,memory,self,history);
     if(frame.history_held) ++stats.history_held;
+    // The derived sampler table, once: what the confirming shadow run compares.
+    if(!stats.frames) for(const auto& draw:frame.draws) for(const auto& sampler:draw.sampler_states) {
+      const auto desc=DecodeNativeGuestSampler(NativeFilteringKey(sampler.words,REXCVAR_GET(edf_native_anisotropic_filtering)));
+      REXLOG_INFO("Native full-frame post sampler: pass={} ({}), name={}, slot={}, words={:#x},{:#x},{:#x},{:#x}, "
+        "filter={}/{}/{}, address={}/{}/{}, lod={}..{}, bias={}",draw.pass,PostPassName(draw.kind),sampler.name,sampler.slot,
+        sampler.words[0],sampler.words[1],sampler.words[2],sampler.words[3],uint32_t(desc.min),uint32_t(desc.mag),uint32_t(desc.mip),
+        uint32_t(desc.u),uint32_t(desc.v),uint32_t(desc.w),desc.min_lod,desc.max_lod,desc.mip_lod_bias);
+    }
     // Leave the composite as the active ordinary output: the end-frame
     // publication (8219C840 hook) presents it.
     state.active_target=0; state.active_scene=0; state.active_output=owner;
     BindActiveTarget(state);
     if(ShouldLogPostFinish(++stats.frames))
-      REXLOG_INFO("Native full-frame post: frames={}, draws={}, owner={:#x}, tone={},{},{}, uninitialized={}, fallback_samplers={}, failures={}, history_held={}",
+      REXLOG_INFO("Native full-frame post: frames={}, draws={}, owner={:#x}, tone={},{},{}, uninitialized={}, failures={}, history_held={}",
         stats.frames,frame.draws.size(),owner,frame.tone.middle_gray[0],frame.tone.luminance_white[0],frame.tone.tone_map[0],
-        stats.uninitialized,stats.fallback_samplers,stats.failures,stats.history_held);
+        stats.uninitialized,stats.failures,stats.history_held);
     return true;
   } catch(const std::exception& failure) {
     if(ShouldLogPostFinish(++stats.failures)) REXLOG_ERROR("Native full-frame post: {} (failures={})",failure.what(),stats.failures);

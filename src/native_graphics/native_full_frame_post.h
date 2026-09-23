@@ -1,5 +1,6 @@
 #pragma once
 #include "native_graphics/native_post_finish_plan.h"
+#include "native_graphics/native_material_sampler.h"
 #include <array>
 #include <cstdint>
 #include <optional>
@@ -84,6 +85,12 @@ struct NativePostTexture { std::string name; uint32_t handle=0; };
 // call it have one, the others keep the effect's own sampler state.
 struct NativePostSampler { std::string name; std::array<uint32_t,3> words{}; float value=0; };
 struct NativePostConstant { std::string name; std::vector<float> values; }; // float4s
+// The device's sampler words for one texture record's slot as the draw samples
+// it: after the whole activation 821B94E8 -> 821B8E48 of the draw's technique,
+// in the fetch-constant layout ReadSamplerWords reads (dwords 0,3,4,5 of
+// device+1024+slot*24). What the guest route decodes after the original
+// activation; the full-frame sink binds DecodeNativeGuestSampler of it.
+struct NativePostSamplerState { std::string name; uint32_t slot=0; SamplerStateWords words{}; };
 struct NativePostDraw {
   PostPassKind kind=PostPassKind::Downsample;
   size_t pass=0;
@@ -94,6 +101,9 @@ struct NativePostDraw {
   std::vector<NativePostTexture> textures;
   std::vector<NativePostSampler> samplers;
   std::vector<NativePostConstant> constants;
+  // Every texture record of the technique, in activation order (locals, then
+  // globals); filled by ResolveNativePostSamplers.
+  std::vector<NativePostSamplerState> sampler_states;
   PostQuad quad{};
 };
 struct NativePostFrame {
@@ -121,6 +131,59 @@ const NativePostTexture* FindPostTexture(const NativePostDraw& draw,const char* 
 // Any other self-read is a plan error.
 bool NativePostReadsOwnResolve(const NativePostDraw& draw);
 bool NativePostOwnResolveAllowed(const NativePostDraw& draw);
+
+// Post sampler state, owned: derived from the guest's own sequence instead of
+// read back from the shared shader bindings (which hold a sampler only after a
+// guest-activated post frame decoded one into them).
+//
+// On the device, a post draw samples slot S with the words the sequence below
+// leaves there; nothing else in 820B0B80's call tree writes sampler state.
+// 1. Device reset 821470A8: every slot, every sampler state, from the table at
+//    825529A8 (12-byte entries getter,setter,default): AddressU/V/W (states
+//    0..2) 0 = wrap, mag/min (4,5) 0 = point, mip (6) 2, min LOD byte (8) 0,
+//    max anisotropy byte (9) 1 -> 82009608[1] = 0, max LOD byte (13) 13,
+//    dword5 fields (3,14,15,18) 0. AddressW is never written again (its only
+//    writer is the dispatch setter 82136ED0), so it stays wrap.
+// 2. 2D scope 821A7270 (820B0B80 calls it before the chain; 821A73F8 restores
+//    what it saved, the 16 (slot,state) pairs at 82017670): slots 0..3 get
+//    min 82136700(1), mag 82136888(1), AddressU=2 (rlwimi 1,11,19,21) and
+//    AddressV=2 (rlwimi 1,14,16,18): clamp.
+// 3. Each activation 821B8E48 over the technique's texture records: locals at
+//    technique+72 (28 bytes: +0 name, +4 texture, +8 slot, +12 bias f32, +16
+//    mip, +20 min, +24 mag), then globals at technique+84 (8 bytes: +0 node,
+//    +4 slot; node +28 texture, +32..+44 the same four settings): SetTexture
+//    8213BA98 (texture header +40/+44 merged under the device's sampler bits),
+//    mag 82136888, min 82136700, mip (rlwimi 23,7,8 into dword3), bias
+//    82136C20. ApplyNativeMaterialSampler is that sequence.
+// The record settings come from the effect: 820B1028 calls 821BCF28(0.0,0,0,0)
+// (point, mip 0, bias 0) on Mono/Downsample/DownsampleTone/Tone/GaussBlur's
+// m_DiffuseTexture0, DownsampleTone's m_OldTone and Tone's m_Tone; the frame
+// sets Tone's m_Tone (820B04B8) and the Bloom's m_DiffuseTexture0/m_Tone
+// (820B0B80) the same way each frame - those are the plan's Sampler setters,
+// which override the record here; the Bloom's m_DiffuseTexture1 keeps the
+// effect's own record (linear). The state chains through the frame's draws
+// in order, as the device does. The words kept are SamplerStateKey's.
+struct PostSamplerLayout {
+  static constexpr uint32_t kLocalTextures=72,kGlobalTextures=84,kLocalStride=28,kGlobalStride=8;
+  static constexpr uint32_t kLocalName=0,kLocalTexture=4,kLocalSlot=8,kLocalSettings=12;
+  static constexpr uint32_t kGlobalNode=0,kGlobalSlot=4,kNodeTexture=28,kNodeSettings=32,kNodeKey=28;
+  static constexpr uint32_t kTextureHeader=40,kMaxRecords=64,kSlots=16,kScopeSlots=4;
+  // Image values the constants below are derived from, checked by
+  // CheckNativePostSamplerImage.
+  static constexpr uint32_t kResetTable=0x825529A8u,kResetStride=12,kResetDefault=8;
+  static constexpr uint32_t kAnisotropyTable=0x82009608u,kScopeSaved=0x82017670u;
+};
+// The per-slot state after 1 and 2: the post's starting point every frame.
+std::array<NativeMaterialSamplerPass,16> NativePostSamplerBase();
+// Throws when the image no longer holds the defaults NativePostSamplerBase
+// derives from (reset table, anisotropy table, 2D scope save list).
+void CheckNativePostSamplerImage(const PostGuestMemory& memory);
+// Fills every draw's sampler_states from the technique records in `memory`,
+// with the plan's 821BCF28 setters and texture setters in place of the record
+// values they would have written. Throws on an unreadable or malformed record.
+void ResolveNativePostSamplers(NativePostFrame& frame,const PostGuestMemory& memory);
+// The sampler state of the draw's slot for `name` (the last record so named).
+const NativePostSamplerState* FindPostSamplerState(const NativePostDraw& draw,const std::string& name);
 
 // What records the draws. One call per draw, in order; the chain passes each
 // draw into and then resolve their record's target, the bloom draws into the
@@ -152,8 +215,11 @@ enum class NativePostHistory:uint8_t { Advance, Hold };
 // (clSgsCoreRender), from guest memory alone. Returns what was recorded.
 NativePostFrame RecordNativePost(NativePostSink& sink,const PostGuestMemory& memory,uint32_t self,
                                  NativePostHistory history=NativePostHistory::Advance);
+// With `memory`, the draws' sampler states are resolved from it
+// (ResolveNativePostSamplers); without, they are left empty.
 NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& input,const NativePostTone& tone,
-                                 NativePostHistory history=NativePostHistory::Advance);
+                                 NativePostHistory history=NativePostHistory::Advance,
+                                 const PostGuestMemory* memory=nullptr);
 
 // The renderer's sink, in guest_shader_bridge.cpp: resolves the HDR scene of
 // the screen owner [8257BFB4] into owner+104 as the 8219C930 hook does (mode

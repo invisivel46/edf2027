@@ -434,6 +434,18 @@ change-driven behaviour (`665e3e1`) has no cvar.
   and every later native frame posted with those. The shadow now restores every
   sampler slot, and the draw lists now record samplers, so the next run shows
   the native post as it renders without a shadow and names the samplers.
+  Fixed since: the full-frame post no longer reads samplers back from the
+  bindings. `ResolveNativePostSamplers` (native_full_frame_post.h) derives each
+  draw's device sampler words from the guest's own sequence - the sampler reset
+  defaults (825529A8), the 2D scope 821A7270 (slots 0..3 min/mag linear, U/V
+  clamp) and each activation 821B8E48 over the technique's texture records,
+  with the plan's 821BCF28 setters - and the sink binds their decode through
+  the same `NativeFilteringKey` as the guest route; a texture without a record
+  fails the frame. Result: every post input point-filtered, U/V clamp, W wrap,
+  LOD 0..0, bias 0, except the bloom's m_DiffuseTexture1 (linear, the effect's
+  own record) - the table the 2026-09-10 exact-input capture logged on the
+  guest route. The fallback had sampled every input except the three per-frame
+  821BCF28 ones bilinearly: the whole downsample/tone/blur chain.
 - `tools/compare-renderer-ab-captures.py` is the image-correctness gate next
   to the FPS gate. It reads the captures of an `edf_native_ab_alternate` run
   and takes each frame's side from the `ab_alternate frame=F native=0|1` log

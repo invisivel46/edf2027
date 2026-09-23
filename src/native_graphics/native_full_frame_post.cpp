@@ -190,10 +190,140 @@ bool NativePostOwnResolveAllowed(const NativePostDraw& draw) {
     draw.kind==PostPassKind::DownsampleTone || draw.kind==PostPassKind::BlurHorizontal;
 }
 
+namespace {
+using S=PostSamplerLayout;
+// A guest C string of at most `limit` bytes before its terminator.
+std::string ReadCString(const PostGuestMemory& memory,uint32_t address,size_t limit) {
+  std::string value;
+  for(;;) {
+    const auto c=memory.Byte(Add(address,uint32_t(value.size())));
+    if(!c) return value;
+    if(value.size()==limit) throw std::runtime_error(std::format("post sampler record name at {:#x} is unterminated",address));
+    value.push_back(char(c));
+  }
+}
+// The global node's name: 821A2178 returns node+40, the key is node+12 in the
+// 820A62E8 layout (as ReadTextureParameters reads it).
+std::string ReadNodeKey(const PostGuestMemory& memory,uint32_t value) {
+  if(value<S::kNodeKey) throw std::runtime_error("invalid post global texture node");
+  return ReadKey(memory,value-S::kNodeKey);
+}
+struct PostTextureRecord {
+  std::string name;
+  uint32_t slot=0,handle=0;
+  std::array<uint32_t,4> settings{}; // bias (f32 bits), mip, min, mag
+};
+std::array<uint32_t,4> ReadSettings(const PostGuestMemory& memory,uint32_t address) {
+  return {memory.Word(address),memory.Word(Add(address,4)),memory.Word(Add(address,8)),memory.Word(Add(address,12))};
+}
+// 821B8E48's two record loops, in its order.
+std::vector<PostTextureRecord> ReadTechniqueTextures(const PostGuestMemory& memory,uint32_t technique) {
+  std::vector<PostTextureRecord> records;
+  for(const bool global:{false,true}) {
+    const auto vector=Add(technique,global?S::kGlobalTextures:S::kLocalTextures);
+    const auto begin=memory.Word(vector),count=memory.Word(Add(vector,8));
+    if(count>S::kMaxRecords) throw std::runtime_error(std::format("post technique {:#x} has {} texture records",technique,count));
+    for(uint32_t i=0;i<count;++i) {
+      const auto record=Add(begin,i*(global?S::kGlobalStride:S::kLocalStride));
+      PostTextureRecord r;
+      if(global) {
+        const auto node=memory.Word(Add(record,S::kGlobalNode));
+        r.name=ReadNodeKey(memory,node);
+        r.slot=memory.Word(Add(record,S::kGlobalSlot));
+        r.handle=memory.Word(Add(node,S::kNodeTexture));
+        r.settings=ReadSettings(memory,Add(node,S::kNodeSettings));
+      } else {
+        r.name=ReadCString(memory,memory.Word(Add(record,S::kLocalName)),256);
+        r.slot=memory.Word(Add(record,S::kLocalSlot));
+        r.handle=memory.Word(Add(record,S::kLocalTexture));
+        r.settings=ReadSettings(memory,Add(record,S::kLocalSettings));
+      }
+      if(r.slot>=S::kSlots) throw std::runtime_error(std::format("post technique {:#x} record {} uses sampler slot {}",technique,r.name,r.slot));
+      records.push_back(std::move(r));
+    }
+  }
+  return records;
+}
+}
+
+std::array<NativeMaterialSamplerPass,16> NativePostSamplerBase() {
+  // 1. 821470A8's reset through the setters of 825529A8, per slot.
+  NativeMaterialSamplerPass reset;
+  reset.words={}; // AddressU/V/W 0 (wrap), dword5 fields 0
+  reset.anisotropy=0; // 82009608[1]
+  reset.min_lod=0; reset.max_lod=13; reset.mip_override=0;
+  ApplyNativeMaterialFilter(reset,0,true);  // state 4, 82136888(0)
+  ApplyNativeMaterialFilter(reset,0,false); // state 5, 82136700(0)
+  reset.words[1]=(reset.words[1]&~0x01800000u)|(2u<<23); // state 6, 82136A10(2)
+  std::array<NativeMaterialSamplerPass,16> slots;
+  slots.fill(reset);
+  // 2. 821A7270: min, mag, then clamp U and V on slots 0..3.
+  for(uint32_t slot=0;slot<S::kScopeSlots;++slot) {
+    auto& pass=slots[slot];
+    ApplyNativeMaterialFilter(pass,1,false);
+    ApplyNativeMaterialFilter(pass,1,true);
+    pass.words[0]=(pass.words[0]&~(7u<<10))|(2u<<10);
+    pass.words[0]=(pass.words[0]&~(7u<<13))|(2u<<13);
+  }
+  return slots;
+}
+
+void CheckNativePostSamplerImage(const PostGuestMemory& memory) {
+  // (state, default) pairs NativePostSamplerBase assumes, from the reset table.
+  constexpr std::array<std::pair<uint32_t,uint32_t>,11> defaults{{
+    {0,0},{1,0},{2,0},{3,0},{4,0},{5,0},{6,2},{8,0},{9,1},{13,13},{14,0}}};
+  for(const auto& [state,value]:defaults) {
+    const auto actual=memory.Word(S::kResetTable+state*S::kResetStride+S::kResetDefault);
+    if(actual!=value) throw std::runtime_error(std::format("sampler reset default {} is {}, the post base assumes {}",state,actual,value));
+  }
+  if(const auto aniso=memory.Word(S::kAnisotropyTable+4);aniso!=0)
+    throw std::runtime_error(std::format("anisotropy table [1] is {}, the post base assumes 0",aniso));
+  // 821A7270 saves (and 821A73F8 restores) exactly min/mag/U/V of slots 0..3.
+  for(uint32_t slot=0;slot<S::kScopeSlots;++slot) {
+    constexpr std::array<uint32_t,4> states{0x14,0x10,0x0,0x4};
+    for(uint32_t i=0;i<4;++i) {
+      const auto entry=S::kScopeSaved+(slot*4+i)*8;
+      if(memory.Word(entry)!=slot || memory.Word(entry+4)!=states[i])
+        throw std::runtime_error(std::format("2D scope save list entry {} changed",slot*4+i));
+    }
+  }
+}
+
+void ResolveNativePostSamplers(NativePostFrame& frame,const PostGuestMemory& memory) {
+  auto device=NativePostSamplerBase();
+  for(auto& draw:frame.draws) {
+    draw.sampler_states.clear();
+    for(auto& record:ReadTechniqueTextures(memory,draw.technique)) {
+      // The plan's setters wrote these records just before the activation.
+      if(const auto* texture=FindPostTexture(draw,record.name.c_str())) record.handle=texture->handle;
+      for(const auto& sampler:draw.samplers) if(sampler.name==record.name)
+        record.settings={std::bit_cast<uint32_t>(sampler.value),sampler.words[0],sampler.words[1],sampler.words[2]};
+      NativeMaterialSamplerOperation operation;
+      operation.slot=record.slot; operation.settings=record.settings;
+      if(record.handle) {
+        const auto header=Add(record.handle,S::kTextureHeader);
+        operation.texture_filter_high=memory.Word(header)&0x80000000u;
+        operation.texture_lod=memory.Word(Add(header,4))&0x3fcu;
+      }
+      device[record.slot]=ApplyNativeMaterialSampler(device[record.slot],operation);
+      draw.sampler_states.push_back({std::move(record.name),record.slot,{}});
+    }
+    // What the draw samples: each record's slot after the whole activation.
+    for(auto& state:draw.sampler_states) state.words=SamplerStateKey(device[state.slot].words);
+  }
+}
+
+const NativePostSamplerState* FindPostSamplerState(const NativePostDraw& draw,const std::string& name) {
+  const NativePostSamplerState* found=nullptr;
+  for(const auto& state:draw.sampler_states) if(state.name==name) found=&state;
+  return found;
+}
+
 NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& input,const NativePostTone& tone,
-                                 NativePostHistory history) {
+                                 NativePostHistory history,const PostGuestMemory* memory) {
   auto in=input; in.tone=tone.Scalars(); in.tone_source=PostToneSource::SharedPool;
   auto frame=BuildNativePostFrame(BuildPostFinishPlan(in),tone);
+  if(memory) ResolveNativePostSamplers(frame,*memory);
   for(const auto& draw:frame.draws) {
     if(history==NativePostHistory::Hold && draw.kind==PostPassKind::DownsampleTone && sink.HasToneHistory(draw)) {
       frame.history_held=true;
@@ -205,6 +335,6 @@ NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& inp
 }
 NativePostFrame RecordNativePost(NativePostSink& sink,const PostGuestMemory& memory,uint32_t self,NativePostHistory history) {
   const auto tone=ReadNativePostTone(memory);
-  return RecordNativePost(sink,ReadNativePostInput(memory,self,tone),tone,history);
+  return RecordNativePost(sink,ReadNativePostInput(memory,self,tone),tone,history,&memory);
 }
 }

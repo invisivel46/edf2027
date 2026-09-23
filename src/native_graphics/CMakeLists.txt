@@ -93,6 +93,10 @@ if(WIN32)
         add_executable(edf_native_d3d12_backend_tests ../../tests/native_d3d12_backend_tests.cpp)
         target_link_libraries(edf_native_d3d12_backend_tests PRIVATE edf_native_d3d12)
         add_test(NAME edf_native_d3d12_backend_tests COMMAND edf_native_d3d12_backend_tests)
+        # The full-frame post's derived sampler state against the old fallback, on WARP.
+        add_executable(edf_native_post_sampler_render_tests ../../tests/native_post_sampler_render_tests.cpp)
+        target_link_libraries(edf_native_post_sampler_render_tests PRIVATE edf_native_d3d12)
+        add_test(NAME edf_native_post_sampler_render_tests COMMAND edf_native_post_sampler_render_tests)
         # FSR foundations on WARP: depth SRV, compute-writable textures, raw
         # D3D12 passes and their ordering, scissor rounding, the FFX loader.
         add_executable(edf_native_fsr_foundation_tests ../../tests/native_fsr_foundation_tests.cpp)
