@@ -3011,6 +3011,37 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
     Require(!Cache::Current(entry,longer,resolved.capture.material.get(),reused),"resized world constant reused the material");
     auto pixel_world=program_constants; pixel_world[0].pixel=true;
     Require(!Cache::Current(entry,pixel_world,resolved.capture.material.get(),reused),"pixel g_mWorld reused the material");
+    // The full-frame sky keeps its draws' resolves in the same cache, keyed by
+    // draw with the chained state, and resolves with pass-owned operations
+    // appended (z write off). A hit must be that resolve: the same material,
+    // the same scissor word and the camera the moved constants resolve to.
+    constexpr std::array<std::array<uint32_t,2>,1> no_depth_write{{{0x30,0}}};
+    using SkyCache=NativeStaticWorldGroupCache<int,std::pair<NativeSceneMaterialCapture,bool>>;
+    SkyCache sky;
+    SkyCache::Key sky_key; sky_key.group=0; sky_key.pass=NativeSceneMaterialPassState{pass_state,pass_samplers};
+    const auto sky_first=material_program->Resolve(material_desc,false,program_constants,pass_state,pass_samplers,-1,false,no_depth_write);
+    Require(!(sky_first.render.words[1]&4u),"sky resolve kept z write");
+    sky.Store(sky_key,program_constants,{},{},{},{sky_first.capture,sky_first.render.words[5]!=0},
+      sky_first.capture.material.get(),sky_first.capture.camera);
+    auto* sky_entry=sky.Candidate(sky_key);
+    Require(sky_entry && sky_entry->derived,"sky resolve not stored with a derivable camera");
+    for(const auto* constants:{&program_constants,&camera_constants,&world}) {
+      const auto fresh=material_program->Resolve(material_desc,false,*constants,pass_state,pass_samplers,-1,false,no_depth_write);
+      NativeSceneView camera=sky_entry->material.first.camera;
+      Require(SkyCache::Current(*sky_entry,*constants,sky_entry->material.first.material.get(),camera),"sky resolve missed its cache");
+      Require(fresh.capture.material->Equivalent(*sky_entry->material.first.material),"sky cache hit material differs from a resolve");
+      Require(NativeSceneCameraIdentical(camera,fresh.capture.camera),"sky cache hit camera differs from a resolve");
+      Require((fresh.render.words[5]!=0)==sky_entry->material.second && fresh.render.words==sky_first.render.words,
+        "sky cache hit scissor or state differs from a resolve");
+    }
+    // Another chained state is another key: never served from this row.
+    auto other_state=pass_state; other_state.words[1]^=4;
+    SkyCache::Key other_key=sky_key; other_key.pass=NativeSceneMaterialPassState{other_state,pass_samplers};
+    Require(!sky.Candidate(other_key),"sky cache served another chained state");
+    auto tinted_sky=program_constants; tinted_sky[3].registers[3]^=1;
+    NativeSceneView ignored;
+    Require(!SkyCache::Current(*sky.Candidate(sky_key),tinted_sky,sky_entry->material.first.material.get(),ignored),
+      "sky cache reused a material whose constant moved");
   }
   NativeSceneMaterialPassState inherited{pass_state,pass_samplers};
   inherited.samplers[7].words[0]=0x12400;

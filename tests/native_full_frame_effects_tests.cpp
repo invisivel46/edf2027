@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <random>
@@ -838,8 +839,39 @@ void TestCollection() {
   Require(order==40+6,"one filing number per keyed object that reached sub_821C0C00");
 }
 }
+// The recording activates a run of adjacent draws once when this holds: it
+// must hold for draws that differ only in their vertices (clElectricWire's
+// strips) and fail when any field the activation reads differs.
+void TestSharedActivation() {
+  const NativeEffectConstants k{};
+  const auto strip=[](float x) {
+    return MakeNativeColourStripDraw(0x4000,{{{x,1,2},0xFF404040u},{{x+1,1,2},0xFF404040u},{{x,2,2},0xFF404040u}},kNativeEffectBlendAlpha,1);
+  };
+  const auto a=strip(0),b=strip(5);
+  Require(NativeEffectDrawsShareActivation(a,b) && NativeEffectDrawsShareActivation(a,a),"wire strips do not share their activation");
+  const std::vector<std::function<void(NativeEffectDraw&)>> changes{
+    [](NativeEffectDraw& d) { d.effect^=0x10; },
+    [](NativeEffectDraw& d) { d.texture=0x1234; },
+    [](NativeEffectDraw& d) { d.blend=kNativeEffectBlendAdditive; },
+    [](NativeEffectDraw& d) { d.depth_write=!d.depth_write; },
+    [](NativeEffectDraw& d) { d.sets_depth_write=!d.sets_depth_write; },
+    [](NativeEffectDraw& d) { d.technique=NativeEffectTechnique::Ribbon; },
+    [](NativeEffectDraw& d) { d.kind=NativeEffectDraw::Kind::RibbonStrip; }};
+  for(size_t i=0;i<changes.size();++i) {
+    auto changed=b; changes[i](changed);
+    Require(!NativeEffectDrawsShareActivation(a,changed) && !NativeEffectDrawsShareActivation(changed,a),
+      "draws with another activation field shared it ("+std::to_string(i)+")");
+  }
+  // Particles and ribbons share it by the same fields; their vertices never matter.
+  const auto particles=MakeNativeParticleDraw(0x4000,{NativeParticleRecord{}},0x55,1,0,k);
+  auto more=MakeNativeParticleDraw(0x4000,{NativeParticleRecord{},NativeParticleRecord{}},0x55,1,0,k);
+  Require(NativeEffectDrawsShareActivation(particles,more),"particle draws of one technique do not share their activation");
+  more.texture=0x56;
+  Require(!NativeEffectDrawsShareActivation(particles,more),"particle draws with other textures shared their activation");
+}
 int main() {
   try {
+    TestSharedActivation();
     TestExpansion();
     TestBuilders();
     TestTechniqueMaterial();

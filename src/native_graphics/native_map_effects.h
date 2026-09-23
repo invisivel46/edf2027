@@ -225,27 +225,48 @@ inline bool NativeWireSphereVisible(const std::array<float,26>& f,const NativeFx
   if(NativeFxMadd(f[21],c[1],NativeFxMul(f[22],c[2]))>radius) return false;
   return true;
 }
+// The sag of each of the ten points: frsp(sin(angle)) with the angle a running
+// fadds from 0.0 by the step. It depends on image constants alone, so one table
+// serves every record of every wire (the guest recomputes it per point).
+using NativeElectricWireSines=std::array<float,NativeElectricWire::points>;
+inline NativeElectricWireSines NativeElectricWireSag(const NativeEffectConstants& k,const NativeElectricWireConstants& w) {
+  NativeElectricWireSines sines{};
+  float angle=k.zero;                                           // f31
+  for(auto& s:sines) {
+    s=float(NativeGuestSin(double(angle)));                     // frsp f30
+    angle=NativeFxAdd(angle,w.angle_step);
+  }
+  return sines;
+}
 // The ten points of one record as 820B8D28's inner loop leaves them at r1+144.
+// sines is NativeElectricWireSag(k, w); the swing sin(phase + offset), which
+// the guest recomputes at every point from the same two floats, is taken once.
+// The same bits as recomputing both per point, except the sign of a NaN (a NaN
+// phase or step), which NativeGuestSin's host fma does not fix either way.
 inline std::array<NativeFxVec3,NativeElectricWire::points> NativeElectricWirePoints(const NativeFxVec3& a,const NativeFxVec3& b,
-    float phase,float offset,const NativeEffectConstants& k,const NativeElectricWireConstants& w) {
+    float phase,float offset,const NativeEffectConstants& k,const NativeElectricWireConstants& w,const NativeElectricWireSines& sines) {
   const float sx=NativeFxMul(NativeFxSub(b[0],a[0]),w.ninth);   // f26
   const float sy=NativeFxMul(NativeFxSub(b[1],a[1]),w.ninth);   // f25
   const float sz=NativeFxMul(NativeFxSub(b[2],a[2]),w.ninth);   // f24
-  float px=a[0],py=a[1],pz=a[2],angle=k.zero;                  // f29 f28 f27 f31
+  float px=a[0],py=a[1],pz=a[2];                               // f29 f28 f27
+  const float swing=float(NativeGuestSin(double(NativeFxAdd(phase,offset))));
   std::array<NativeFxVec3,NativeElectricWire::points> out{};
-  for(auto& point:out) {
+  for(size_t i=0;i<out.size();++i) {
+    auto& point=out[i];
     point={px,py,pz};                                           // the 16-byte copy of r1+112
-    const float s=float(NativeGuestSin(double(angle)));         // frsp f30
-    float t=float(NativeGuestSin(double(NativeFxAdd(phase,offset))));
+    const float s=sines[i];
     px=NativeFxAdd(sx,px);
     point[1]=NativeFxSub(point[1],s);
     py=NativeFxAdd(py,sy); pz=NativeFxAdd(pz,sz);
-    angle=NativeFxAdd(angle,w.angle_step);
-    t=NativeFxMul(t,k.half); t=NativeFxMul(t,s);
+    float t=NativeFxMul(swing,k.half); t=NativeFxMul(t,s);
     point[0]=NativeFxAdd(point[0],t);
     point[2]=NativeFxAdd(t,point[2]);
   }
   return out;
+}
+inline std::array<NativeFxVec3,NativeElectricWire::points> NativeElectricWirePoints(const NativeFxVec3& a,const NativeFxVec3& b,
+    float phase,float offset,const NativeEffectConstants& k,const NativeElectricWireConstants& w) {
+  return NativeElectricWirePoints(a,b,phase,offset,k,w,NativeElectricWireSag(k,w));
 }
 struct NativeElectricWireStats { uint32_t records=0,disabled=0,distant=0,culled=0,drawn=0; };
 // Every draw 820B8D28 issues for `wire` in the view whose scene is `scene`
@@ -263,11 +284,21 @@ std::vector<NativeEffectDraw> BuildNativeElectricWireDraws(const Reader& r,uint3
   if(begin>end || (end-begin)%W::stride || (end-begin)/W::stride>W::max_records)
     throw std::runtime_error("invalid native electric wire records");
   const float phase=ReadNativeFxFloat(r,r.Add(wire,W::phase));
+  const auto sines=NativeElectricWireSag(in.k,w);
   std::vector<NativeEffectDraw> draws;
-  for(uint32_t record=begin;record!=end;record+=W::stride) {
+  // The record vector is read as one block (the fields are its bytes; an
+  // unreadable vector throws before any draw, as a trap on any record loses
+  // the whole wire's draws anyway).
+  const auto* bytes=end!=begin?r.Bytes(begin,end-begin):nullptr;
+  const auto field=[](const uint8_t* at) {
+    return std::bit_cast<float>(uint32_t(at[0])<<24|uint32_t(at[1])<<16|uint32_t(at[2])<<8|uint32_t(at[3]));
+  };
+  const auto vec3=[&](const uint8_t* at) { return NativeFxVec3{field(at),field(at+4),field(at+8)}; };
+  for(uint32_t index=0;index<(end-begin)/W::stride;++index) {
+    const auto* record=bytes+size_t(index)*W::stride;
     ++count.records;
-    if(!r.Bytes(r.Add(record,W::enabled),1)[0]) { ++count.disabled; continue; }
-    const auto a=ReadNativeFxVec3(r,r.Add(record,W::a)),b=ReadNativeFxVec3(r,r.Add(record,W::b));
+    if(!record[W::enabled]) { ++count.disabled; continue; }
+    const auto a=vec3(record+W::a),b=vec3(record+W::b);
     const auto va=NativeWireTransform(a,matrix);
     float sum=NativeFxMul(va[1],va[1]);
     sum=NativeFxMadd(va[2],va[2],sum); sum=NativeFxMadd(va[0],va[0],sum);
@@ -277,9 +308,9 @@ std::vector<NativeEffectDraw> BuildNativeElectricWireDraws(const Reader& r,uint3
       sum=NativeFxMadd(vb[0],vb[0],sum); sum=NativeFxMadd(vb[2],vb[2],sum);
       if(sum>w.distance) { ++count.distant; continue; }
     }
-    const auto centre=NativeWireTransform(ReadNativeFxVec3(r,r.Add(record,W::centre)),matrix);
-    if(!NativeWireSphereVisible(frustum,centre,ReadNativeFxFloat(r,r.Add(record,W::radius)))) { ++count.culled; continue; }
-    const auto points=NativeElectricWirePoints(a,b,phase,ReadNativeFxFloat(r,r.Add(record,W::offset)),in.k,w);
+    const auto centre=NativeWireTransform(vec3(record+W::centre),matrix);
+    if(!NativeWireSphereVisible(frustum,centre,field(record+W::radius))) { ++count.culled; continue; }
+    const auto points=NativeElectricWirePoints(a,b,phase,field(record+W::offset),in.k,w,sines);
     auto vertices=BuildNativeColourStrip(points,W::colour,w.width,in.eye,in.k);
     if(vertices.empty()) continue;
     draws.push_back(MakeNativeColourStripDraw(in.effect,std::move(vertices),W::blend,W::depth_flag));
