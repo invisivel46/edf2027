@@ -118,6 +118,19 @@ std::vector<NativeRibbonVertex> BuildNativeColourRibbonStrip(std::span<const Nat
     const NativeFxVec3& eye,const NativeEffectConstants& k) {
   return Strip(points,PointColour,PointWidth,eye,k);
 }
+std::vector<NativeColourVertex> BuildNativeColourStrip(std::span<const NativeFxVec3> points,uint32_t colour,float width,
+    const NativeFxVec3& eye,const NativeEffectConstants& k) {
+  std::vector<NativeColourVertex> vertices;
+  if(points.size()<2) return vertices;                                   // cmpwi r27,2; blt
+  const size_t count=std::min<size_t>(points.size(),kNativeRibbonPointLimit);  // cmpwi r27,100; ble / li r27,100
+  std::vector<NativeRibbonPoint> strip;
+  strip.reserve(count);
+  for(size_t i=0;i<count;++i) strip.push_back({points[i],k.zero});
+  const auto ribbon=BuildNativeRibbonStrip(strip,{},width,eye,k);
+  vertices.reserve(ribbon.size());
+  for(const auto& vertex:ribbon) vertices.push_back({vertex.position,colour});  // stw r26,8(r31) / 24(r31)
+  return vertices;
+}
 std::vector<std::pair<uint32_t,uint32_t>> NativeEffectDrawCalls(const NativeEffectDraw& draw) {
   std::vector<std::pair<uint32_t,uint32_t>> calls;
   const auto total=draw.vertex_count();
@@ -142,6 +155,10 @@ std::vector<uint8_t> EncodeNativeEffectVertices(const NativeEffectDraw& draw,uin
       for(const float f:v.uv) put(f);
       put(v.angle); put(v.radius);
       for(const float f:v.colour) put(f);
+    } else if(draw.kind==NativeEffectDraw::Kind::ColourStrip) {
+      const auto& v=draw.colour_vertices[i];
+      for(const float f:v.position) put(f);
+      for(int shift=24;shift>=0;shift-=8) bytes.push_back(uint8_t(v.colour>>shift));
     } else {
       const auto& v=draw.ribbon_vertices[i];
       for(const float f:v.position) put(f);

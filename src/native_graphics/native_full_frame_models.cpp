@@ -46,6 +46,9 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
     if(!shared) continue;
     const auto& entry=*shared;
     ++stats.entries;
+    // Drawn by its own pass (clSky: the sky pass); the registry never
+    // publishes one, and an entry that says so is still not drawn twice.
+    if(entry.type && entry.type->other_pass) { ++stats.other_pass; continue; }
     const auto visibility=ClassifyNativeFullFrameModel(entry,camera.visibility);
     switch(visibility.cull) {
       case C::Visible: break;

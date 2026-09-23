@@ -61,7 +61,7 @@ bool PlannedNativeStaticDirect(const NativeStaticWalkMember& member,uint32_t vta
   return member.vtable==vtable?member.direct:read_method(vtable)==kNativeStaticDirectRender;
 }
 inline bool SameNativeSceneCandidate(const NativeSceneSources::CandidateView& a,const NativeSceneSources::CandidateView& b) {
-  if(a.registered!=b.registered || bool(a.visibility)!=bool(b.visibility)) return false;
+  if(a.registered!=b.registered || a.fixed!=b.fixed || bool(a.visibility)!=bool(b.visibility)) return false;
   if(a.visibility && a.visibility!=b.visibility && *a.visibility!=*b.visibility) return false;
   for(size_t lod=0;lod<a.lods.size();++lod)
     if(!std::equal(a.lods[lod].begin(),a.lods[lod].end(),b.lods[lod].begin(),b.lods[lod].end())) return false;

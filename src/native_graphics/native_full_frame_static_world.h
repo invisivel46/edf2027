@@ -47,12 +47,22 @@ struct NativeFullFrameStaticCamera {
 // are not published: the selection reads them live at render time, for the
 // objects that survive tree and frustum culling only, as 820B4038 reads them
 // in the guest's own render walk (the same race with the simulation).
+// fixed: vtable+16==820BAF90 (clRock, NativeSceneFixedRecord), the other slot 4
+// that only publishes a group: `addi r3,r3,396; b 821BEE68`, one record and no
+// LOD choice. direct and fixed are exclusive; either routes mode 0 as Direct.
 struct NativeFullFrameStaticRoute {
   bool direct=false;
   uint32_t mode=0;
   uint16_t hidden=0;
+  bool fixed=false;
   bool operator==(const NativeFullFrameStaticRoute&) const=default;
 };
+// The slot-4 kinds the static world draws, by vtable+16.
+enum class NativeFullFrameStaticSlot : uint8_t { Other, Lod, Fixed };
+constexpr NativeFullFrameStaticSlot ClassifyNativeFullFrameStaticSlot(uint32_t render) {
+  return render==kNativeStaticDirectRender?NativeFullFrameStaticSlot::Lod:
+    render==NativeSceneFixedRecord::render?NativeFullFrameStaticSlot::Fixed:NativeFullFrameStaticSlot::Other;
+}
 // Reads one owner's route words; nullopt when its header cannot be read.
 using NativeFullFrameStaticRouteRead=std::function<std::optional<NativeFullFrameStaticRoute>(uint32_t owner)>;
 // The production route reader over a reader (typically a page window): one
@@ -72,15 +82,20 @@ class NativeFullFrameLiveRoutes {
       NativeFullFrameStaticRoute route{false,GuestBlockWord(header+52),uint16_t(GuestBlockWord(header+64)>>16)};
       ++reads;
       if(route.hidden || route.mode) return route;
-      if(const auto found=direct_.find(vtable);found!=direct_.end()) route.direct=found->second;
-      else { route.direct=reader_.Word(reader_.Add(vtable,16))==kNativeStaticDirectRender; direct_.emplace(vtable,route.direct); ++slot_reads; }
+      auto found=slots_.find(vtable);
+      if(found==slots_.end()) {
+        found=slots_.emplace(vtable,ClassifyNativeFullFrameStaticSlot(reader_.Word(reader_.Add(vtable,16)))).first;
+        ++slot_reads;
+      }
+      route.direct=found->second==NativeFullFrameStaticSlot::Lod;
+      route.fixed=found->second==NativeFullFrameStaticSlot::Fixed;
       return route;
     } catch(const std::exception&) { ++failures; return std::nullopt; }
   }
   mutable uint64_t reads=0,slot_reads=0,failures=0;
  private:
   const Reader& reader_;
-  mutable std::unordered_map<uint32_t,bool> direct_;
+  mutable std::unordered_map<uint32_t,NativeFullFrameStaticSlot> slots_;
 };
 // Addresses of the published tree image only: every read is a captured byte,
 // and anything else throws rather than reaching guest memory.
@@ -121,6 +136,7 @@ struct NativeFullFrameStaticSelection {
     uint64_t worlds=0,missing_orders=0,nodes_classified=0,tree_reads=0,lists=0,missing_lists=0,members=0,duplicates=0;
     uint64_t route_reads=0,unrouted=0,not_direct=0,unpublished=0,culled_distance=0,culled_frustum=0,visible=0,missing_lod=0,undrawable=0;
     uint64_t selected=0,parts=0,unordered_groups=0,unordered_parts=0;
+    uint64_t fixed=0,route_mismatch=0;  // Fixed-record objects selected; route kind unlike the source's.
   };
   std::vector<NativeFullFrameStaticOwner> owners;
   // Every object selected natively, in walk order, with the LOD it chose.
@@ -206,9 +222,10 @@ struct NativeFullFrameStaticSelectCache {
 // cull by the published visibility record and pick the LOD
 // (SelectNativeVisibility, shared with the 820B4038 hook); route by the words
 // route() reads for the survivors only (hidden, then mode 0 with direct
-// 820B2670 dispatch; buckets, virtual and unknown routes are other passes'
-// objects; an unreadable header is unrouted); push each part of
-// that LOD into its group. A part without a group makes the whole object
+// 820B2670 or fixed 820BAF90 dispatch; buckets, virtual and unknown routes are
+// other passes' objects; an unreadable header is unrouted); push each part of
+// that LOD into its group - for a fixed route the owner's one record (its
+// source's LOD 0; a source of the other kind is a route mismatch, dropped). A part without a group makes the whole object
 // undrawable here, as it sends the object back to the guest in the hook.
 // Selections of a group outside the owner's published order are counted and
 // dropped: 821C3BB8 never reaches them.

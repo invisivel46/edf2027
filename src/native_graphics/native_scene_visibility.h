@@ -155,6 +155,18 @@ NativeSceneVisibility ReadNativeSceneVisibility(const Reader& reader,uint32_t ow
   }
   return result;
 }
+// A fixed-record owner (clRock, NativeSceneFixedRecord): the same bound, and
+// one LOD with no thresholds - +404 is inside its +396 record, not a count.
+template<class Reader>
+NativeSceneVisibility ReadNativeFixedSceneVisibility(const Reader& reader,uint32_t owner) {
+  auto result=ReadNativeSceneVisibility(reader,owner,false);
+  result.lod_count=1;
+  return result;
+}
+template<class Reader>
+NativeSceneVisibility ReadNativeSceneOwnerVisibility(const Reader& reader,uint32_t owner,bool fixed) {
+  return fixed?ReadNativeFixedSceneVisibility(reader,owner):ReadNativeSceneVisibility(reader,owner,true);
+}
 template<class Reader>
 NativeSceneVisibilityView ReadNativeSceneVisibilityView(const Reader& reader,uint32_t context) {
   NativeSceneVisibilityView result;

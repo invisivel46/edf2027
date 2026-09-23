@@ -90,13 +90,17 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
         ++stats.route_reads;
         const auto words=route(candidate.owner);
         if(!words) { ++stats.unrouted; continue; }
-        if(ClassifyNativeStaticWalk(words->hidden,words->mode,words->direct)!=NativeStaticWalkRoute::Direct) {
+        if(ClassifyNativeStaticWalk(words->hidden,words->mode,words->direct || words->fixed)!=NativeStaticWalkRoute::Direct) {
           ++stats.not_direct; continue;
         }
+        // 820B2670 picks the LOD record; 820BAF90 publishes its one +396 record,
+        // which its source files as LOD 0 whatever the depth.
+        if(words->fixed!=candidate.view.fixed) { ++stats.route_mismatch; continue; }
         ++stats.visible;
-        const auto parts=candidate.view.Lod(selection.lod);
+        const auto lod=words->fixed?0u:selection.lod;
+        const auto parts=candidate.view.Lod(lod);
         if(!parts) { ++stats.missing_lod; continue; }
-        if(!candidate.drawable[selection.lod]) { ++stats.undrawable; continue; }
+        if(!candidate.drawable[lod]) { ++stats.undrawable; continue; }
         for(const auto& part:*parts) {
           const auto slot=queues.slots.find(part.group);
           if(slot==queues.slots.end()) { ++queues.unordered[part.group]; continue; }
@@ -104,8 +108,8 @@ NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScen
           if(queue.empty()) queues.touched.push_back(slot->second);
           queue.push_back(part.instance);
         }
-        stats.parts+=parts->size(); ++stats.selected;
-        result.objects.push_back({candidate.owner,selection.lod});
+        stats.parts+=parts->size(); ++stats.selected; stats.fixed+=words->fixed;
+        result.objects.push_back({candidate.owner,lod});
       }
     }
     NativeFullFrameStaticOwner drawn{owner,{}};

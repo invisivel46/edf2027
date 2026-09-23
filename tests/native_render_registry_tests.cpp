@@ -101,7 +101,8 @@ void ClassTableLookup() {
   const auto* people=FindNativeRenderClass(0x820042BCu);
   Require(people && people->attachments==kNativeRenderFace,"clFriendPeople draws a face and no weapons");
   const auto* sky=FindNativeRenderClass(0x8200284Cu);
-  Require(sky && sky->cadence==NativeRenderPoseCadence::Frame && sky->instance==412 && sky->pose==384,"clSky row");
+  Require(sky && sky->cadence==NativeRenderPoseCadence::Frame && sky->instance==412 && sky->pose==384 && sky->other_pass,"clSky row");
+  for(const auto& type:classes) Require(!type.other_pass || type.vtable==0x8200284Cu,"only clSky is drawn by another pass");
   const auto* broken=FindNativeRenderClass(0x820077D8u);
   Require(broken && broken->cadence==NativeRenderPoseCadence::Frame && broken->instance==384 && broken->pose==428 &&
     broken->frame_root==640,"clBrokenObject row: posed by the registry from +640");
@@ -156,6 +157,25 @@ void BirthAndDeath() {
   Require(!registry.active() && !registry.AcquireSnapshot() && !registry.stats().records,"clear drops everything");
 }
 
+// clSky is tracked (born, audited) but never published: the sky pass draws it
+// from its node tree and the camera, and its pose vector - written only by its
+// own slot 4, which never runs in full-frame mode - may hold a stale pose.
+void SkyIsNotPublished() {
+  std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kSky=0x3000,kTree=0x5000;
+  BuildObject(memory,kSky,0x8200284Cu,false);
+  memory.StoreWord(kSky+kNativeRenderObjectMode,0);
+  BuildInstance(memory,kSky+412);
+  BuildPose(memory,kSky+384,kSky+0x800,1,3.0f);  // A sized pose, as a guest render leaves one.
+  BuildTree(memory,kTree);
+  registry.Born(kSky); registry.Born(kTree);
+  const auto snapshot=registry.Tick(memory,kScene,1,decode);
+  Require(snapshot->entries.size()==1 && EntryOf(*snapshot,kTree) && !EntryOf(*snapshot,kSky),
+    "clSky published to the models pass");
+  Require(!registry.AuditScene(memory,kScene).mismatches(),"the unpublished sky is still tracked");
+}
 void ResolvesClassAfterDerivedConstructor() {
   std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
   NativeRenderRegistry registry(0);
@@ -711,6 +731,7 @@ int main() {
   try {
     ClassTableLookup();
     BirthAndDeath();
+    SkyIsNotPublished();
     ResolvesClassAfterDerivedConstructor();
     SubscriptionDrivesRereads();
     LayoutCaptureWaitsForSizedPose();

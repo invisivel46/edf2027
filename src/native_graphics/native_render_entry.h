@@ -32,6 +32,12 @@ struct NativeRenderClass {
   // fills the pose vector (native_model_hierarchy.h). 0: not posed natively
   // (clSky: the sky pass poses it from the rendered camera).
   uint32_t frame_root=0;
+  // Tracked but not snapshotted: another full-frame pass draws it (clSky: the
+  // sky pass poses it from the camera and its static node tree). Its pose
+  // vector +384 is written only by its own slot 4 820BB270, which never runs in
+  // full-frame mode, so a snapshot would hold whatever pose the last guest
+  // render left: the models pass would draw the dome a second time with it.
+  bool other_pass=false;
 };
 // NativeRenderClass::attachments bits. Face: 820DB268 draws obj+1588 with pose
 // obj+1636 when byte obj+1584 is set. Weapons: 820DE790 walks obj+1824 (count

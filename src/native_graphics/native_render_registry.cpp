@@ -29,7 +29,8 @@ constexpr uint8_t kPeople=kNativeRenderFace,kSoldier=kNativeRenderFace|kNativeRe
 constexpr std::array kClasses{
   // Static map parts: drawn from the existing scene sources (LODs at obj+448+44i).
   NativeRenderClass{.vtable=0x82002760u,.name="clFieldParts",.lod=Lod::FieldParts,.scene_source=true},
-  Rigid(0x8200284Cu,"clSky",412,384,Cadence::Frame),                 // 820BB270
+  // 820BB270; drawn by the sky pass (native_full_frame_sky.h), never by the models pass.
+  NativeRenderClass{.vtable=0x8200284Cu,.name="clSky",.cadence=Cadence::Frame,.lod=Lod::None,.instance=412,.pose=384,.other_pass=true},
   Rigid(0x820028F8u,"clTree",416,400,Cadence::Constructed),          // 820BBA48
   Character(0x820042BCu,"clFriendPeople",kPeople),                   // 820D7448 -> 820DB268
   Character(0x8200452Cu,"clFriendSoldier",kSoldier),                 // 820DEA08

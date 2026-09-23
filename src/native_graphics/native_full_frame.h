@@ -100,7 +100,9 @@ class NativeFrameHost {
 };
 // Stable pass order; timing phases frame.native.<name> follow it. The sky dome
 // goes first, as the guest's map-effect walk draws it before the world: drawn
-// after, its depth-tested dome covered everything beyond its radius. The first
+// after, its depth-tested dome covered everything beyond its radius. "sky" is
+// that whole walk (clMapEffectManager's list in order: the sky and the
+// electric wires' strips; native_map_effects.h). The first
 // kNativeFrameViewPassCount run per view, the rest once per frame.
 inline constexpr std::string_view kNativeFramePassOrder[]{
   "sky","static_world","models","effects","transparent","post"};

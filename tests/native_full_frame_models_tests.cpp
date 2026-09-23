@@ -459,10 +459,23 @@ void BrokenObjects() {
     "a filed object's slot 4 runs only from a traversed bucket");
 }
 }
+// clSky's registry row says another pass draws it (the sky pass): an entry of
+// such a class is never planned, even visible, posed and in either route.
+void OtherPassClasses() {
+  const NativeRenderClass sky{.vtable=0x8200284Cu,.name="clSky",.cadence=NativeRenderPoseCadence::Frame,
+    .lod=NativeRenderLodKind::None,.instance=412,.pose=384,.other_pass=true};
+  NativeRenderRegistrySnapshot snapshot;
+  auto opaque=Entry(1,{0,0,100}); opaque->type=&sky; snapshot.entries.push_back(opaque);
+  auto filed=Entry(2,{0,0,1000}); filed->type=&sky; filed->mode=1; filed->sort_bias=1; snapshot.entries.push_back(filed);
+  snapshot.entries.push_back(Entry(3,{0,0,100}));
+  const auto plan=PlanNativeFullFrameModels(snapshot,MakeCamera());
+  Require(plan.stats.entries==3 && plan.stats.other_pass==2 && plan.opaque.size()==1 && plan.opaque[0].entry->object==3 &&
+    plan.transparent.empty(),"a class drawn by another pass was planned by the models pass");
+}
 int main() {
   try {
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
-    SourceTable(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects();
+    SourceTable(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
     return 1;

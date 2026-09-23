@@ -107,7 +107,7 @@ inline const NativeModelLayout& NativeFullFrameModelItemLayout(const NativeFullF
 struct NativeFullFrameModelPlan {
   struct Stats {
     uint64_t entries=0,hidden=0,mode=0,distance=0,frustum=0,box=0,no_model=0,no_pose=0,bucket_zero=0,opaque=0,transparent=0,
-      instances=0,no_instanced=0;
+      instances=0,no_instanced=0,other_pass=0;
   };
   std::vector<NativeFullFrameModelItem> opaque;       // Snapshot order.
   std::vector<NativeFullFrameModelItem> transparent;  // Draw order: key descending, ties in snapshot order.

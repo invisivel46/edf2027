@@ -1373,6 +1373,99 @@ void FullFrameLiveRoutes() {
   const NativeFullFrameStaticRouteRead erased=std::cref(routes);
   Require(erased(B)==NativeFullFrameStaticRoute{false,0,0} && routes.reads==6,"erased route reader");
 }
+// clRock (NativeSceneFixedRecord): slot 4 820BAF90 is `addi r3,r3,396; b
+// 821BEE68`. Its +396 record is a scene source filed as LOD 0 and found by
+// LodParts(owner+396) for a fixed owner only; the live route reads vtable+16
+// 820BAF90 as fixed; the full-frame selection takes the one record whatever
+// the depth selects, and a route of the other kind than the source is dropped.
+void FullFrameFixedRecord() {
+  std::vector<uint8_t> memory(0x10000);
+  const GeometryRetryReader r{memory};
+  const auto store=[&](uint32_t at,std::initializer_list<float> values) {
+    for(const auto value:values) { r.StoreWord(at,std::bit_cast<uint32_t>(value)); at+=4; }
+  };
+  constexpr uint32_t rock=0x2000,lod_owner=0x3000,instances=0x5000,G1=0x8100,G2=0x8200;
+  constexpr uint32_t rock_table=0x100,lod_table=0x200;
+  // The record at +396: instance vector +400/+404 (two 28-byte instances,
+  // group at +8), no parameter at +424.
+  r.StoreWord(rock+400,instances); r.StoreWord(rock+404,instances+56);
+  r.StoreWord(instances+8,G1); r.StoreWord(instances+28+8,G2);
+  // +404 is the vector's end pointer, not an LOD count: the LOD readers reject it.
+  Reject([&] { ReadNativeStaticSceneParts(r,rock); });
+  Reject([&] { ReadNativeSceneVisibility(r,rock,true); });
+  using P=NativeSceneSources::Part;
+  const auto parts=ReadNativeFixedSceneParts(r,rock);
+  Require(parts==std::vector<P>{{instances,0,0,0,G1},{instances+28,0,1,0,G2}} &&
+    ReadNativeSceneOwnerParts(r,rock,true)==parts,"fixed record parts");
+  store(rock+288,{0,0,300,1}); r.StoreWord(rock+352,std::bit_cast<uint32_t>(2.0f)); r.StoreWord(rock+76,std::bit_cast<uint32_t>(1000.0f));
+  const auto bounds=ReadNativeFixedSceneVisibility(r,rock);
+  Require(bounds.lod_count==1 && bounds.box[2]==300 && bounds.radius==2 && bounds.distance==1000 &&
+    ReadNativeSceneOwnerVisibility(r,rock,true)==bounds,"fixed record visibility");
+  // Sources: the rock's record answers LodParts(rock+396); an LOD owner's
+  // +396 and the rock's +408 answer nothing.
+  NativeSceneSources sources;
+  sources.Born(rock,true); sources.Born(lod_owner);
+  Require(sources.Observe(rock,parts) && sources.Observe(lod_owner,std::vector<P>{{0x6000,0,0,0,G1}}),"fixture parts");
+  Require(sources.Fixed(rock) && !sources.Fixed(lod_owner) && sources.LodParts(rock+396)->size()==2 &&
+    !sources.LodParts(rock+408) && sources.LodParts(lod_owner+408)->size()==1 && !sources.LodParts(lod_owner+396),
+    "fixed record lookup");
+  Require(sources.FindCandidateView(rock).fixed && sources.FindCandidate(rock).fixed && !sources.FindCandidateView(lod_owner).fixed &&
+    !SameNativeSceneCandidate(sources.FindCandidateView(rock),NativeSceneSources::CandidateView{true,false,nullptr,
+      sources.FindCandidateView(rock).lods}),"candidate fixed flag");
+  // Live routes: 820BAF90 is fixed, 820B2670 direct; each vtable slot read once.
+  r.StoreWord(rock_table+16,NativeSceneFixedRecord::render); r.StoreWord(lod_table+16,kNativeStaticDirectRender);
+  r.StoreWord(rock,rock_table); r.StoreWord(lod_owner,lod_table);
+  const NativeFullFrameLiveRoutes live_routes(r);
+  Require(live_routes(rock)==NativeFullFrameStaticRoute{false,0,0,true} && live_routes(lod_owner)==NativeFullFrameStaticRoute{true,0,0,false} &&
+    live_routes(rock)==NativeFullFrameStaticRoute{false,0,0,true} && live_routes.slot_reads==2,"fixed live route");
+  r.StoreWord(rock+52,1);
+  Require(live_routes(rock)==NativeFullFrameStaticRoute{false,1,0,false},"a filed rock took the render slot");
+  r.StoreWord(rock+52,0);
+  // One inside leaf holding both objects (identity view, depth = z).
+  constexpr uint32_t world=0x1000,levels=0x1800,root=0x3800;
+  r.StoreWord(world+52,levels); r.StoreWord(world+56,levels+32);
+  r.StoreWord(levels+20,root); r.StoreWord(levels+24,root+144);
+  r.StoreWord(root+116,1); store(root+32,{0,0,50,1,5,5,5,0,5});
+  const std::shared_ptr<const NativeSceneTreeImage> image=CaptureNativeSceneTree(r,world);
+  const auto visibility=[&](uint32_t owner,float z,uint32_t lods) {
+    NativeSceneVisibility value;
+    value.box={0,0,z,1, 1,0,0,0, 0,1,0,0, 0,0,1,0};
+    value.radius=1.7f; value.distance=1000; value.lod_count=lods; value.lod_thresholds={100,0};
+    sources.PublishVisibility(owner,value);
+  };
+  // The rock's depth (300) is past the LOD threshold of a two-LOD record: 820BAF90
+  // still publishes its one record (LOD 0).
+  visibility(rock,300,2); visibility(lod_owner,50,1);
+  auto lists=std::make_shared<NativeSceneMembership::Publication>();
+  auto snapshot=std::make_shared<NativeSceneMembership::Snapshot>(); snapshot->end=root+120+8;
+  for(const auto owner:{lod_owner,rock}) snapshot->members.push_back({owner+0x10,owner});
+  lists->lists.Set(root+120,std::move(snapshot));
+  NativeScenePublication publication;
+  publication.sources=sources.AcquireSnapshot(); publication.membership=lists; publication.trees[world]=image;
+  publication.group_order.Set(world,std::make_shared<const NativeSceneGroupOrder>(NativeSceneGroupOrder{G2,G1}));
+  NativeFullFrameStaticCamera camera;
+  camera.visibility.matrix=kNativeSceneIdentity; camera.visibility.depth_scale=-1;
+  auto& f=camera.visibility.frustum;
+  f[8]=1; f[10]=-1; f[12]=-1; f[14]=-1; f[17]=1; f[18]=-1; f[21]=-1; f[22]=-1; f[24]=1; f[25]=1000;
+  std::map<uint32_t,NativeFullFrameStaticRoute> live{{rock,{false,0,0,true}},{lod_owner,{true,0,0,false}}};
+  const NativeFullFrameStaticRouteRead routes=[&](uint32_t owner)->std::optional<NativeFullFrameStaticRoute> { return live.at(owner); };
+  using Object=NativeFullFrameStaticSelection::Object;
+  const auto selection=SelectNativeFullFrameStaticWorld(publication,camera,routes);
+  Require(selection.objects==std::vector<Object>{{lod_owner,0},{rock,0}} && selection.stats.fixed==1 &&
+    !selection.stats.route_mismatch && selection.stats.parts==3,"fixed record not selected as its one record");
+  Require(selection.owners.size()==1 && selection.owners[0].groups.size()==2 &&
+    selection.owners[0].groups[0].group==G2 && selection.owners[0].groups[0].instances==std::vector<uint32_t>{instances+28} &&
+    selection.owners[0].groups[1].group==G1 && selection.owners[0].groups[1].instances==std::vector<uint32_t>{instances,0x6000},
+    "fixed record parts lost their groups or queue order");
+  // Through the live reader: the same selection.
+  Require(SelectNativeFullFrameStaticWorld(publication,camera,std::cref(live_routes)).objects==selection.objects,
+    "fixed record selection through the live route reader");
+  // A route of the other kind than the source (a vtable rewrite the sources
+  // never saw) is dropped, not drawn from the wrong parts.
+  live[rock]={true,0,0,false}; live[lod_owner]={false,0,0,true};
+  const auto mismatched=SelectNativeFullFrameStaticWorld(publication,camera,routes);
+  Require(mismatched.objects.empty() && mismatched.stats.route_mismatch==2 && !mismatched.stats.fixed,"route kind mismatch was drawn");
+}
 void GroupOrder() {
   std::vector<uint8_t> memory(0x1000);
   const GeometryRetryReader reader{memory};
@@ -2959,7 +3052,7 @@ int main() {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
-    AddressFilter(); FullFrameLiveRoutes();
+    AddressFilter(); FullFrameLiveRoutes(); FullFrameFixedRecord();
     GroupOrder(); FullFrameStaticWorld(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
