@@ -160,4 +160,122 @@ class NativeFullFrameModelMaterialCache {
   std::map<SlotKey,Entry> entries_;
   uint64_t frame_=0;
 };
+// The host's side of NativeFullFrameModelSources: the change signal
+// (generation) and a memo in front of the program and geometry providers, so
+// the signal advances only when a provider would now return something else,
+// not whenever time passed.
+//
+// Every provider result handed out since the last advance is remembered: one
+// program per pass record, one geometry per GeometryKey (whatever identifies
+// the geometry provider's inputs; input is what it is called with). Validate,
+// once per Build before any row is asked for, compares host (every host
+// identity the caller wants compared whole; a change drops everything) and
+// then asks the providers again for every remembered result, in chunks, each
+// chunk inside one run(work) call (the host's lock slice). The providers'
+// results are shared objects that are replaced, never mutated, whenever what
+// they return changes (a rebuilt program, refreshed constant values, reloaded
+// geometry), and they are held here, so an address is never reused: a result
+// that is not the same object, or null, or a provider that throws, advances
+// the generation. The signal is thus exactly as complete as the providers'
+// own checks, whoever wrote their inputs (a simulation step, a 821A4DE8
+// listener on a render-only iteration, a loader): a row the table reuses at
+// the current generation was fetched at it, so its results are remembered
+// here, and every one of them was just asked again.
+//
+// On an advance the results just asked for are carried: a row refetched at
+// the new generation is served from them without a provider call (null
+// results are not carried: those are asked again). What no row asks for
+// before the next Validate is dropped, so what is remembered is the working
+// set of rows current at this generation. Past `limit` results, or after
+// `age` Validates without an advance, the generation advances anyway
+// (carrying, so it costs no provider call) to shed results no visible row
+// still uses. Not synchronized.
+template<class Host,class Program,class GeometryKey,class GeometryInput,class Geometry>
+class NativeFullFrameModelSourceMemo {
+ public:
+  struct Stats { uint64_t validates=0,validated=0,advances=0,host_changes=0,changes=0,prunes=0,reuses=0,fetches=0,slices=0; };
+  explicit NativeFullFrameModelSourceMemo(size_t chunk=16,size_t limit=2048,uint64_t age=256)
+    :chunk_(chunk?chunk:1),limit_(limit),age_(age) {}
+  template<class HostFn,class ProgramFn,class GeometryFn,class Run>
+  uint64_t Validate(HostFn&& host,ProgramFn&& program,GeometryFn&& geometry,Run&& run) {
+    ++stats_.validates;
+    carried_programs_.clear(); carried_geometry_.clear();
+    bool host_changed=false,changed=false,first=true;
+    std::map<uint32_t,Program> fresh_programs;
+    std::map<GeometryKey,std::pair<GeometryInput,Geometry>> fresh_geometry;
+    auto p=programs_.begin(); auto g=geometry_.begin();
+    while(first || p!=programs_.end() || g!=geometry_.end()) {
+      ++stats_.slices;
+      run([&] {
+        if(first) {
+          first=false;
+          auto now=host();
+          if(!host_ || !(*host_==now)) { host_=std::move(now); host_changed=true; return; }
+        }
+        for(size_t n=0;n<chunk_ && (p!=programs_.end() || g!=geometry_.end());++n) {
+          ++stats_.validated;
+          if(p!=programs_.end()) {
+            Program now{};
+            try { now=program(p->first); } catch(...) { now=Program{}; }
+            if(!now || now!=p->second) changed=true;
+            if(now) fresh_programs.emplace(p->first,std::move(now));
+            ++p;
+          } else {
+            Geometry now{};
+            try { now=geometry(g->second.first); } catch(...) { now=Geometry{}; }
+            if(!now || now!=g->second.second) changed=true;
+            if(now) fresh_geometry.emplace(g->first,std::pair<GeometryInput,Geometry>{g->second.first,std::move(now)});
+            ++g;
+          }
+        }
+      });
+      if(host_changed) break;
+    }
+    const bool prune=!host_changed && !changed &&
+      (programs_.size()+geometry_.size()>limit_ || (age_ && ++idle_>=age_));
+    if(host_changed || changed || prune) {
+      ++generation_; ++stats_.advances; idle_=0;
+      if(host_changed) ++stats_.host_changes; else if(changed) ++stats_.changes; else ++stats_.prunes;
+      programs_.clear(); geometry_.clear();
+      if(!host_changed) { carried_programs_=std::move(fresh_programs); carried_geometry_=std::move(fresh_geometry); }
+    }
+    return generation_;
+  }
+  // The program of pass: remembered, carried, or fetch() (remembered unless null).
+  template<class Fetch>
+  Program ProgramFor(uint32_t pass,Fetch&& fetch) {
+    if(const auto found=programs_.find(pass);found!=programs_.end()) { ++stats_.reuses; return found->second; }
+    if(const auto carried=carried_programs_.find(pass);carried!=carried_programs_.end()) {
+      auto value=carried->second; carried_programs_.erase(carried);
+      programs_.emplace(pass,value); ++stats_.reuses;
+      return value;
+    }
+    Program value=fetch(); ++stats_.fetches;
+    if(value) programs_.emplace(pass,value);
+    return value;
+  }
+  // The geometry of key (called with input): remembered, carried, or fetch().
+  template<class Fetch>
+  Geometry GeometryFor(const GeometryKey& key,const GeometryInput& input,Fetch&& fetch) {
+    if(const auto found=geometry_.find(key);found!=geometry_.end()) { ++stats_.reuses; return found->second.second; }
+    if(const auto carried=carried_geometry_.find(key);carried!=carried_geometry_.end()) {
+      auto value=carried->second.second; carried_geometry_.erase(carried);
+      geometry_.emplace(key,std::pair<GeometryInput,Geometry>{input,value}); ++stats_.reuses;
+      return value;
+    }
+    Geometry value=fetch(); ++stats_.fetches;
+    if(value) geometry_.emplace(key,std::pair<GeometryInput,Geometry>{input,value});
+    return value;
+  }
+  uint64_t generation() const { return generation_; }
+  size_t size() const { return programs_.size()+geometry_.size(); }
+  const Stats& stats() const { return stats_; }
+ private:
+  size_t chunk_,limit_;
+  uint64_t age_,idle_=0,generation_=0;
+  std::optional<Host> host_;
+  std::map<uint32_t,Program> programs_,carried_programs_;
+  std::map<GeometryKey,std::pair<GeometryInput,Geometry>> geometry_,carried_geometry_;
+  Stats stats_;
+};
 }

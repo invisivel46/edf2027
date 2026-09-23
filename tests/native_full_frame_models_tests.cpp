@@ -11,6 +11,7 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <vector>
 
@@ -317,6 +318,105 @@ void SourceTable() {
   table.Get(0x3000,0x2000,layout,kNativeFullFrameModelUnversioned,fetch,keep);
   table.Get(0x3000,0x2000,layout,kNativeFullFrameModelUnversioned,fetch,keep);
   Require(fetched==8,"without a generation every use fetches");
+}
+// The host's change signal (NativeFullFrameModelSourceMemo): it advances only
+// when a provider, asked again for every result a current row holds, returns
+// another object (or none, or throws) or a host identity moved; rows
+// refetched after an advance are served from the results just asked for.
+void SourceMemo() {
+  using Program=std::shared_ptr<const int>;
+  using Memo=NativeFullFrameModelSourceMemo<int,Program,uint32_t,uint32_t,Program>;
+  Memo memo(2,64,0);
+  int host=1;
+  std::map<uint32_t,Program> programs{{0x3000,std::make_shared<const int>(1)},{0x3100,std::make_shared<const int>(2)},
+    {0x3200,std::make_shared<const int>(3)}};
+  std::map<uint32_t,Program> geometry{{0x2000,std::make_shared<const int>(10)},{0x2100,std::make_shared<const int>(11)}};
+  bool throws=false;
+  size_t asked=0,runs=0,fetched=0;
+  const auto validate=[&] {
+    return memo.Validate([&] { return host; },
+      [&](uint32_t pass) { ++asked; if(throws) throw std::runtime_error("provider"); return programs.at(pass); },
+      [&](uint32_t batch) { ++asked; return geometry.at(batch); },
+      [&](const auto& work) { ++runs; work(); });
+  };
+  const auto program=[&](uint32_t pass) { return memo.ProgramFor(pass,[&] { ++fetched; return programs.at(pass); }); };
+  const auto batch=[&](uint32_t address) { return memo.GeometryFor(address,address,[&] { ++fetched; return geometry.at(address); }); };
+  const auto first=validate();
+  Require(first==1 && asked==0 && runs==1,"the first Build advances on its host");
+  Require(program(0x3000)==programs[0x3000] && program(0x3100)==programs[0x3100] && program(0x3000)==programs[0x3000] &&
+    batch(0x2000)==geometry[0x2000] && batch(0x2100)==geometry[0x2100] && fetched==4 && memo.size()==4,
+    "each distinct program and geometry is fetched once");
+  // Unchanged: every remembered result asked again, in chunks of two, one
+  // slice each; the generation holds and nothing is fetched.
+  asked=0; runs=0;
+  Require(validate()==first && asked==4 && runs==2 && memo.stats().validated==4,"an unchanged Build moved the generation");
+  // A refreshed program (a constant value moved on any iteration): the
+  // generation advances, and refetched rows are served from what was just
+  // asked, the new program included, without a provider call.
+  programs[0x3100]=std::make_shared<const int>(20);
+  const auto second=validate();
+  Require(second==first+1 && memo.stats().changes==1,"a refreshed program did not advance the generation");
+  fetched=0;
+  Require(program(0x3100)==programs[0x3100] && program(0x3000)==programs[0x3000] && batch(0x2000)==geometry[0x2000] && fetched==0,
+    "rows refetched after an advance called a provider");
+  // What no row asked for since the advance (0x2100) is dropped.
+  asked=0;
+  Require(validate()==second && asked==3,"a result no current row holds was still validated");
+  Require(batch(0x2100)==geometry[0x2100] && fetched==1,"a dropped result is fetched again");
+  // Reloaded geometry advances too.
+  geometry[0x2000]=std::make_shared<const int>(12);
+  const auto third=validate();
+  Require(third==second+1 && batch(0x2000)==geometry[0x2000] && fetched==1,"reloaded geometry");
+  // A result that is now missing: advance, not carried, asked again.
+  Require(program(0x3000)==programs[0x3000] && program(0x3100)==programs[0x3100] && fetched==1,"carried programs");
+  auto missing=programs[0x3000]; programs[0x3000]=nullptr;
+  const auto fourth=validate();
+  Require(fourth==third+1 && !program(0x3000) && fetched==2,"a missing program was carried or not asked again");
+  programs[0x3000]=missing;
+  Require(program(0x3000)==missing && fetched==3,"a missing program is not remembered");
+  program(0x3100); batch(0x2000);
+  // A provider that throws advances.
+  throws=true;
+  const auto fifth=validate();
+  throws=false;
+  Require(fifth==fourth+1,"a throwing provider did not advance");
+  // A host change advances without asking the providers and carries nothing.
+  program(0x3000); fetched=0; asked=0;
+  host=2;
+  Require(validate()==fifth+1 && asked==0 && memo.stats().host_changes==2,"a host change");
+  Require(program(0x3000)==programs[0x3000] && fetched==1,"a host change carried a result");
+  // The side table over the memo's generation: rows hit while it holds.
+  NativeFullFrameModelSourceTable<SourcePair> table;
+  const auto layout=Layout(0x1000,false,1,{Mesh(0,false,true,{Batch(0x2000,{0x3000})})});
+  size_t rows=0;
+  const auto row=[&](uint64_t generation) {
+    return table.Get(0x3000,0x2000,layout,generation,[&] { ++rows; return SourcePair{program(0x3000),batch(0x2000)}; },
+      [](const SourcePair& value) { return value.first && value.second; });
+  };
+  auto generation=validate(); row(generation);
+  for(int frame=0;frame<3;++frame) { generation=validate(); row(generation); }
+  Require(rows==1 && table.hits==3,"rows are fetched once while nothing changes");
+  programs[0x3000]=std::make_shared<const int>(30);
+  generation=validate(); row(generation);
+  Require(rows==2 && row(generation).first==programs[0x3000],"a changed program refetches its rows");
+  // Pruning: after `age` idle Builds the generation advances without a
+  // provider call; past `limit` results as well.
+  Memo aging(16,64,3);
+  const auto age=[&] { return aging.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },
+    [&](uint32_t address) { return geometry.at(address); },[](const auto& work) { work(); }); };
+  const auto start=age();
+  aging.ProgramFor(0x3000,[&] { return programs.at(0x3000); });
+  Require(age()==start && age()==start && age()==start+1 && aging.stats().prunes==1,"an idle memo is pruned after its age");
+  fetched=0;
+  Require(aging.ProgramFor(0x3000,[&] { ++fetched; return programs.at(0x3000); })==programs[0x3000] && fetched==0,
+    "a prune carries what it asked");
+  Memo bounded(16,1,0);
+  bounded.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },[&](uint32_t address) { return geometry.at(address); },
+    [](const auto& work) { work(); });
+  bounded.ProgramFor(0x3000,[&] { return programs.at(0x3000); }); bounded.ProgramFor(0x3100,[&] { return programs.at(0x3100); });
+  const auto before=bounded.generation();
+  Require(bounded.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },
+    [&](uint32_t address) { return geometry.at(address); },[](const auto& work) { work(); })==before+1,"a memo past its limit is pruned");
 }
 NativeFullFrameModelMaterialKey MaterialKey(uint32_t pass,std::shared_ptr<const void> program,std::shared_ptr<const void> geometry) {
   NativeFullFrameModelTargets targets; targets.dsv_format=1;
@@ -736,6 +836,58 @@ void PersistentDraws(std::shared_ptr<NativeRenderBackend> backend) {
   const auto reason=SameModelFrame(recaptured,fresh.Build(snapshot(),camera,pass,sources));
   Require(reason.empty(),"a persistent frame differs from a fresh build");
 }
+// Build over the host's memo (as the bridge wires it): an unchanged frame
+// asks the providers only to validate, re-sources nothing and hands every
+// kept draw to the audit; a republished program advances the generation, and
+// re-sourcing is served from what the validation asked, with no fetch.
+void MemoDrivenBuild(std::shared_ptr<NativeRenderBackend> backend) {
+  SkinnedFixture fixture(backend);
+  const auto layout=Layout(0x1000,true,3,{Mesh(0,true,false,{Batch(0x2000,{0x3000})}),Mesh(1,false,true,{Batch(0x2100,{0x3000})})});
+  NativeRenderRegistrySnapshot snapshot;
+  for(uint32_t i=0;i<3;++i) snapshot.entries.push_back(Entry(i+1,{float(i),0,100},1,layout));
+  auto camera=MakeCamera();
+  for(size_t i=0;i<16;++i) camera.pass.view_projection[i]=std::bit_cast<uint32_t>(i%5?0.f:1.5f);
+  const auto pass=fixture.Pass();
+  auto published=std::make_shared<NativeSceneGroupMaterial>();
+  published->program=fixture.program; published->constants=fixture.constants;
+  using Program=std::shared_ptr<const NativeSceneGroupMaterial>;
+  using Geometry=std::shared_ptr<const NativeIndexedMesh::RetainedDraw>;
+  using Input=std::pair<NativeModelBatchLayout,uint32_t>;
+  NativeFullFrameModelSourceMemo<int,Program,std::pair<uint32_t,uint32_t>,Input,Geometry> memo;
+  int asked=0,fetched=0,audited=0,stale=0;
+  const auto provide_program=[&](uint32_t) { return Program(published); };
+  const auto provide_geometry=[&](const NativeModelBatchLayout&,uint32_t) { return fixture.geometry; };
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t record) { return memo.ProgramFor(record,[&] { ++fetched; return provide_program(record); }); };
+  sources.geometry=[&](const NativeModelBatchLayout& batch,uint32_t record) {
+    return memo.GeometryFor({record,batch.address},Input{batch,record},[&] { ++fetched; return provide_geometry(batch,record); });
+  };
+  sources.generation=[&] {
+    return memo.Validate([] { return 1; },[&](uint32_t record) { ++asked; return provide_program(record); },
+      [&](const Input& input) { ++asked; return provide_geometry(input.first,input.second); },[](const auto& work) { work(); });
+  };
+  sources.audit=[&](const NativeModelBatchLayout& batch,uint32_t record,const NativeFullFrameModelSourcePair& kept) {
+    ++audited; stale+=kept.first!=provide_program(record) || kept.second!=provide_geometry(batch,record);
+  };
+  NativeFullFrameModels models;
+  const auto first=models.Build(snapshot,camera,pass,sources);
+  Require(first.stats.sourced==3 && first.stats.derived==6 && fetched==3 && asked==0 && audited==0,
+    "the first frame fetches one program and two geometries");
+  for(int frame=0;frame<3;++frame) {
+    const auto same=models.Build(snapshot,camera,pass,sources);
+    Require(same.stats.sourced==0 && same.stats.reused==6 && fetched==3,"an unchanged frame re-sourced or fetched");
+  }
+  Require(asked==9 && audited==18 && !stale,"each unchanged frame validates three results and audits six kept draws");
+  // A constant value moved (a republished program, whoever wrote it).
+  auto republished=std::make_shared<NativeSceneGroupMaterial>(*published);
+  republished->constants[3].registers[7]^=0x10;
+  published=republished;
+  const auto moved=models.Build(snapshot,camera,pass,sources);
+  Require(moved.stats.sourced==3 && moved.stats.captures==1 && moved.stats.derived==6 && fetched==3 && asked==12 && audited==18,
+    "a moved constant re-sources every item from the validation's answers");
+  const auto after=models.Build(snapshot,camera,pass,sources);
+  Require(after.stats.sourced==0 && after.stats.reused==6 && audited==24 && !stale,"the new generation holds");
+}
 // A gameplay-like registry for the multi-frame checks and --models-bench:
 // 1600 entries on a grid around the camera, of which about 150 pass
 // visibility: skinned characters with three LOD models (a palette record and
@@ -1115,13 +1267,13 @@ int main(int argc,char** argv) {
       return 0;
     }
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
-    SourceTable(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
+    SourceTable(); SourceMemo(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
     // The skinned material path against full captures, on both backends (WARP).
     for(int backend=0;backend<2;++backend) {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device); PersistentDraws(device); ModelFrames(device);
+      PaletteCapture(device); SkinnedBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ModelFrames(device);
     }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
