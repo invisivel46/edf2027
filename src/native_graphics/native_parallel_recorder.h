@@ -54,6 +54,8 @@ class NativeParallelRecorder final : public NativeBackendRecorder {
   void UpdateTexture(NativeBackendTexture&,std::span<const uint8_t>) override;
   void BeginQuery(NativeBackendQuery&) override;
   void EndQuery(NativeBackendQuery&) override;
+  void WriteTimestamp(NativeBackendTimestamps&,uint32_t) override;
+  void ResolveTimestamps(NativeBackendTimestamps&,uint32_t,uint32_t) override;
   void PushState() override;
   void PopState() override;
  private:
