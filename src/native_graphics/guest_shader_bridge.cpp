@@ -3758,6 +3758,14 @@ thread_local std::vector<uint32_t>* native_model_dirty_poses=nullptr;
 thread_local std::vector<uint32_t> native_step_trees;
 thread_local NativeLoopBudget native_render_budget;
 thread_local uint64_t native_render_publication=0;
+// Whether the guest render helper running on this thread (the 821A5080 hook's
+// guest-helper and frame-dispatch routes) is its tick's advancing render
+// (edf::native::NativeTickGate over native_render_budget). True outside a
+// helper and on every locked render, so guest code there is unchanged; false
+// only on an unlocked render that dispatched no simulation step. The
+// clEffectEtc02 slot 4 hook (8217C4A0) keeps +612 on such a render. The full
+// frame reads NativeFrameInputs::tick_frame instead.
+thread_local bool native_render_tick_frame=true;
 struct NativeModelRenderContext {
   uint32_t source=0;
   const std::vector<edf::native::NativePoseMatrix>* poses=nullptr;
@@ -4372,7 +4380,7 @@ class GuestPostMemory final:public PostGuestMemory {
  private:
   const GuestReader& reader_;
 };
-struct FullFramePostStats { uint64_t frames=0,draws=0,failures=0,uninitialized=0,fallback_samplers=0; };
+struct FullFramePostStats { uint64_t frames=0,draws=0,failures=0,uninitialized=0,fallback_samplers=0,history_held=0; };
 FullFramePostStats& FullPostStats() { static FullFramePostStats stats; return stats; }
 // Clamped point or linear, one mip. Only where the pixel bindings hold no
 // sampler from a guest-activated frame (see NativePostSampler).
@@ -4402,6 +4410,19 @@ class BridgePostSink final:public NativePostSink {
  public:
   BridgePostSink(Bridge& state,const GuestReader& reader,uint32_t owner,uint32_t device,float center)
     : state_(state),reader_(reader),owner_(owner),device_(device),center_(center) {}
+  // The history a held frame keeps: the DownsampleTone record still registered
+  // with the planned texture, and that texture's last resolve initialized and
+  // the one the record's own sampled texture holds (not a stale or replaced one).
+  bool HasToneHistory(const NativePostDraw& draw) const override {
+    if(draw.output || draw.kind!=PostPassKind::DownsampleTone) return false;
+    const auto target=state_.render_targets.find(draw.target);
+    if(target==state_.render_targets.end() || target->second.texture_handle!=draw.target_texture) return false;
+    const auto& sampled=target->second.native.sampled;
+    if(int64_t(sampled.width)!=draw.width || int64_t(sampled.height)!=draw.height) return false;
+    const auto texture=state_.textures.find(draw.target_texture);
+    return texture!=state_.textures.end() && texture->second.content_valid && texture->second.backend &&
+      texture->second.backend==sampled.backend && sampled.content_valid;
+  }
   void Draw(const NativePostDraw& draw) override {
     auto& state=state_;
     // Technique -> pass (+108) -> shader handles, as ObserveActivation reads them.
@@ -4514,7 +4535,7 @@ class BridgePostSink final:public NativePostSink {
   float center_;
 };
 }
-bool RecordNativeFullFramePost(uint8_t* base,uint32_t self,bool resolve_scene,std::string* error) {
+bool RecordNativeFullFramePost(uint8_t* base,uint32_t self,bool resolve_scene,std::string* error,NativePostHistory history) {
   auto& stats=FullPostStats();
   try {
     if(!EDF_NATIVE_FLAG(shader_bridge) || !EDF_NATIVE_FLAG(seam_draws))
@@ -4550,15 +4571,16 @@ bool RecordNativeFullFramePost(uint8_t* base,uint32_t self,bool resolve_scene,st
     const auto device=reader.Word(reader.Add(owner,8));
     const float center=REXCVAR_GET(edf_native_pixel_centers) ? GuestPixelCenterOffset(ReadVertexCenterWord(reader,device)) : 0.f;
     BridgePostSink sink(state,reader,owner,device,center);
-    const auto frame=RecordNativePost(sink,memory,self);
+    const auto frame=RecordNativePost(sink,memory,self,history);
+    if(frame.history_held) ++stats.history_held;
     // Leave the composite as the active ordinary output: the end-frame
     // publication (8219C840 hook) presents it.
     state.active_target=0; state.active_scene=0; state.active_output=owner;
     BindActiveTarget(state);
     if(ShouldLogPostFinish(++stats.frames))
-      REXLOG_INFO("Native full-frame post: frames={}, draws={}, owner={:#x}, tone={},{},{}, uninitialized={}, fallback_samplers={}, failures={}",
+      REXLOG_INFO("Native full-frame post: frames={}, draws={}, owner={:#x}, tone={},{},{}, uninitialized={}, fallback_samplers={}, failures={}, history_held={}",
         stats.frames,frame.draws.size(),owner,frame.tone.middle_gray[0],frame.tone.luminance_white[0],frame.tone.tone_map[0],
-        stats.uninitialized,stats.fallback_samplers,stats.failures);
+        stats.uninitialized,stats.fallback_samplers,stats.failures,stats.history_held);
     return true;
   } catch(const std::exception& failure) {
     if(ShouldLogPostFinish(++stats.failures)) REXLOG_ERROR("Native full-frame post: {} (failures={})",failure.what(),stats.failures);
@@ -6794,11 +6816,14 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
     const auto manager=FindNativeWorldListObject(reader_,context.owner,NativeEffectList::manager_vtable);
     if(!manager) { ++absent_; return; }
     uint32_t order=shared_->model_order;
+    if(!context.inputs.tick_frame) ++held_frames_;
     NativeEffectCollection collection;
     // The ribbons' eye is the pass camera's (NativeEffectEyeFromView), not
     // [8257C02C]+192: 821BE8D0, its only writer, does not run in this mode.
+    // Unlocked render-only frames withhold clEffectEtc02's +612 commit, so its
+    // draw-counted lifetime still counts once per simulation tick.
     const auto& eye_view=native_scene_pass_camera->view;
-    try { collection=CollectNativeEffectManager(reader_,manager,context.guest_context,eye_view,order); }
+    try { collection=CollectNativeEffectManager(reader_,manager,context.guest_context,eye_view,order,nullptr,context.inputs.tick_frame); }
     catch(const std::exception& error) { NativeFullFrameDeclined("effects",error.what()); return; }
     // Diagnostics: how often the guest's +192 differs from the derived eye
     // (stale in this mode unless something rewrote the pool for this view).
@@ -6830,16 +6855,16 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
       }
     }
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} absent={} stale_guest_eye={}",
+      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} absent={} stale_guest_eye={} held_frames={}",
         frames_,manager,collection.visited,collection.culled,collection.hidden,collection.immediate.size(),drawn,
-        collection.items.size(),collection.undrawn_keys,collection.unsupported,absent_,stale_eyes_);
+        collection.items.size(),collection.undrawn_keys,collection.unsupported,absent_,stale_eyes_,held_frames_);
     shared_->effects=std::move(collection.items);
   }
  private:
   const edf::native::GuestReader reader_;
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   std::set<uint32_t> unsupported_;
-  uint64_t frames_=0,absent_=0,stale_eyes_=0;
+  uint64_t frames_=0,absent_=0,stale_eyes_=0,held_frames_=0;
 };
 // The frame's one transparent sequence (sub_821A3BA0): the models' mode-1/2
 // batches and the effects' filed items merged by key descending, filing order
@@ -7463,6 +7488,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // Not called: clSgsCoreRender +8 (821BE9D8, 82135530(device,0)), the
   // counterpart of the +4 setter the frame does not call either.
   void ViewOverlays(edf::native::NativeFrameContext& context) override {
+    // The guest listeners' per-render state follows this frame's tick gate
+    // (native_render_tick_frame; the 821A5080 hook restores it on exit).
+    native_render_tick_frame=context.inputs.tick_frame;
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativeOverlays);
     const GpuPassSpan gpu("view_overlays");
     RemainingGuestCall(0);
@@ -7489,12 +7517,15 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // as the HUD's per-draw hooks require it (NativeOutputBound): the bridge's
   // active output and the guest device's bound color surface. The native post
   // sets the first and BindOutput the second; the guest stage's 8219C930 both.
-  bool Finish(edf::native::NativeFrameContext&) override {
+  bool Finish(edf::native::NativeFrameContext& context) override {
     const auto post=Word(132);
     const auto renderer=reader_.Word(kRenderer);
     const bool resolve_scene=*reader_.Bytes(reader_.Add(reader_.Word(0x8257c030),2260),1)==0;
     std::string error;
-    if(edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error)) BindOutput(renderer,resolve_scene);
+    // An unlocked render-only frame holds the tone history (NativePostHistory):
+    // its 0.025-per-draw blend stays once per simulation tick.
+    const auto history=context.inputs.tick_frame?edf::native::NativePostHistory::Advance:edf::native::NativePostHistory::Hold;
+    if(edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error,history)) BindOutput(renderer,resolve_scene);
     else {
       edf::native::FrameEventCounters().post_fallbacks.fetch_add(1,std::memory_order_relaxed);
       static std::atomic<bool> reported=false;
@@ -7559,7 +7590,10 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // REMAINING GUEST CALLS: the phase loop, which draws the HUD/XUI onto the
   // output (clNoguchiCallback 820A4DD0, clSatoCallback 8216E630); each draw
   // is translated by the per-draw hooks (821FD8F8). The output is bound first.
-  void Phases(edf::native::NativeFrameContext&) override {
+  void Phases(edf::native::NativeFrameContext& context) override {
+    // The HUD's two draw-counted advances (clGaugeRader 82176708, the window
+    // cursor fade 8218ED68) follow this frame's tick gate; see their hooks.
+    native_render_tick_frame=context.inputs.tick_frame;
     edf::native::HookTiming timing(edf::native::HookPhase::FrameNativePhases);
     {
       auto& state=edf::native::State();
@@ -7626,6 +7660,17 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   GuestCall guest_;
 };
 }
+namespace {
+// The guest routes' tick gate: one per process, as the helper runs one at a
+// time (821A6508 joins each call). Only a render with steps advances it, and
+// the tick changes with every step, so it can never count a tick twice with
+// the full frame's own gate (A/B alternation).
+bool GuestRenderTickFrame() {
+  static edf::native::NativeTickGate gate;
+  return gate.Advance(edf::native::MakeNativeFrameMotion(native_render_budget.unlocked,native_render_budget.divisor,
+    native_render_budget.tick,native_render_budget.fraction,native_render_budget.steps,false));
+}
+}
 REXCVAR_DEFINE_INT32(edf_native_ab_alternate,0,"EDF2027",
   "A/B diagnostics: alternate guest and native passes in runs of N indexed output frames from the capture start frame; odd runs are native, 0 off (development)").range(0,1000);
 REX_HOOK_RAW(sub_821A5080) {
@@ -7651,6 +7696,10 @@ REX_HOOK_RAW(sub_821A5080) {
   }
   const edf::native::NativeAbSideLatch ab_latch(ab_native);
   native_render_frames.fetch_add(1,std::memory_order_relaxed);
+  struct RestoreTickFrame {
+    bool saved=native_render_tick_frame;
+    ~RestoreTickFrame() { native_render_tick_frame=saved; }
+  } restore_tick_frame;
   edf::native::NativeSceneQueues queues;
   struct RestoreSceneQueues {
     uint32_t animation_owner=edf::native::native_scene_animation_owner;
@@ -7751,6 +7800,7 @@ REX_HOOK_RAW(sub_821A5080) {
       REXLOG_INFO("Native full frame dispatch: frames={} view_passes={} frame_passes={} (guest helper not called; view listeners, finish fallback and HUD phases remain guest)",
         frames,full_frame.view_passes().size(),full_frame.frame_passes().size());
   } else if(route==edf::native::NativeFrameRoute::frame_dispatch) {
+    native_render_tick_frame=GuestRenderTickFrame();
     const edf::native::GuestReader reader(base);
     auto work=ctx;
     if(work.r1.u32<224) throw std::runtime_error("invalid native frame dispatch stack");
@@ -7779,8 +7829,59 @@ REX_HOOK_RAW(sub_821A5080) {
     if(frame_count<=4 || frame_count%1000==0)
       REXLOG_INFO("Native frame dispatch: frames={} (native outer and bucket traversal; world/overlay/presentation callbacks retained)",frame_count);
     ctx.r3=work.r3;
-  } else __imp__sub_821A5080(ctx,base);
+  } else {
+    native_render_tick_frame=GuestRenderTickFrame();
+    __imp__sub_821A5080(ctx,base);
+  }
   if(!queues.empty()) throw std::runtime_error("native scene selections survived their render helper");
+}
+// clEffectEtc02::slot4 (vtable 0x82012C78): its first store decrements the
+// +612 lifetime (8217C4B0..C0) that slot 3 (8217C3A8) kills the object on, so
+// the lifetime is counted in draws. The guest helper draws it every render; on
+// an unlocked render that dispatched no step (native_render_tick_frame false)
+// the word is put back after the call, so it still counts once per tick as at
+// the retail 60 Hz. Nothing else in the slot reads +612 (it goes on to read
+// +544/+592..+640 and draw), so restoring after the call equals skipping the
+// store. Every other render, and every call outside a render helper, runs the
+// original alone. The full frame's effects pass does the same through
+// CollectNativeEffects(commit) and never calls this slot.
+// The HUD phase loop (owner+140..+144 x listener +16) runs every render, and
+// all its phases are draws: the XUI clock (clXuiManager slot4 82173CD8, Sato
+// phase 1) and timers (slot5 82173A58 -> 823F79F8, phase 3) already advance by
+// elapsed time (mftb / the kernel millisecond tick), so they stay per render.
+// Two draws advance a counter by a fixed step per call instead; on an unlocked
+// render that dispatched no step (native_render_tick_frame false) the fields
+// are put back, so they step once per tick as at the retail 60 Hz. Each is put
+// back only when the call made exactly that one step, so any other writer
+// (the tick-side arming or reset) is never undone.
+// clGaugeRader::slot3 (Noguchi phase 0): while +296 != 0 and byte
+// [8257C030]+2260 is clear, 821768A0..B0 store +296 - 1 (the damage shake's
+// frames left, armed with 30 by slot2 82175FFC) and +300 * [r31+28] (the
+// shake offset, decaying by -0.99). The draw reads them before the store.
+REX_EXTERN(__imp__sub_82176708);
+REX_HOOK_RAW(sub_82176708) {
+  if(native_render_tick_frame) { __imp__sub_82176708(ctx,base); return; }
+  const edf::native::GuestReader reader(base);
+  const auto gauge=ctx.r3.u32;
+  edf::native::NativeRenderStepOncePerTick(reader,false,reader.Add(gauge,edf::native::kNativeRadarShakeFrames),0xFFFFFFFFu,
+    std::array{reader.Add(gauge,edf::native::kNativeRadarShakeOffset)},[&] { __imp__sub_82176708(ctx,base); });
+}
+// sub_8218ED68, the window cursor highlight draw (via 8218EFA0 from the window
+// slot 10 draws, Noguchi phase 2): 8218ED90..A8 store +68 + 1, a fade-in
+// counter (alpha min(n,10) * 0.1) that the cursor move 8218F138 resets to 0.
+REX_EXTERN(__imp__sub_8218ED68);
+REX_HOOK_RAW(sub_8218ED68) {
+  if(native_render_tick_frame) { __imp__sub_8218ED68(ctx,base); return; }
+  const edf::native::GuestReader reader(base);
+  edf::native::NativeRenderStepOncePerTick(reader,false,reader.Add(ctx.r3.u32,edf::native::kNativeCursorFade),1u,
+    std::array<uint32_t,0>{},[&] { __imp__sub_8218ED68(ctx,base); });
+}
+REX_EXTERN(__imp__sub_8217C4A0);
+REX_HOOK_RAW(sub_8217C4A0) {
+  if(native_render_tick_frame) { __imp__sub_8217C4A0(ctx,base); return; }
+  const edf::native::GuestReader reader(base);
+  edf::native::NativeRenderStepOncePerTick(reader,false,reader.Add(ctx.r3.u32,edf::native::kNativeEffectEtc02Lifetime),0xFFFFFFFFu,
+    std::array<uint32_t,0>{},[&] { __imp__sub_8217C4A0(ctx,base); });
 }
 REX_EXTERN(__imp__sub_820B2510);
 REX_HOOK_RAW(sub_820B2510) {

@@ -1,5 +1,8 @@
 #include "native_graphics/native_full_frame.h"
 #include "native_graphics/native_ab_alternate.h"
+#include <array>
+#include <bit>
+#include <map>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -133,6 +136,111 @@ int main() {
     check(!MakeNativeFrameMotion(true,2,5,.5f,1,true).interpolate,"divisor 2 does not interpolate models");
     check(!MakeNativeFrameMotion(true,1,5,.5f,1,false).interpolate,"edf_native_model_interpolation=false does not interpolate");
     check(!NativeFrameInputs{}.motion.interpolate,"default inputs do not interpolate");
+    check(host.acquired.unlocked && !MakeNativeFrameMotion(false,1,5,.5f,1,true).unlocked,"the frame motion carries the loop mode");
+  }
+  // Per-tick state (NativeTickGate -> NativeFrameInputs::tick_frame): Run
+  // decides once per frame, before any view, and every view, pass and the
+  // finish/phases see that one answer. Locked frames always advance; unlocked
+  // at two renders per tick, only the first render after a step.
+  {
+    class TickHost final : public NativeFrameHost {
+     public:
+      NativeFrameMotion acquired;
+      std::vector<bool> seen;
+      NativeFrameInputs AcquireInputs() override { NativeFrameInputs inputs; inputs.motion=acquired; inputs.tick_frame=false; return inputs; }
+      std::vector<uint32_t> Views() override { return {1,2}; }
+      uint32_t AdvanceSerial(uint32_t) override { return 0; }
+      bool BeginView(NativeFrameContext&) override { return true; }
+      void RunPass(size_t,NativeFramePass&,NativeFrameContext& context) override { seen.push_back(context.inputs.tick_frame); }
+      bool Finish(NativeFrameContext& context) override { seen.push_back(context.inputs.tick_frame); return false; }
+      void Phases(NativeFrameContext& context) override { seen.push_back(context.inputs.tick_frame); }
+      void EndScene(const NativeFrameInputs& inputs,bool) override { seen.push_back(inputs.tick_frame); }
+    };
+    const auto run=[&](NativeFullFrame& frame,const NativeFrameMotion& motion) {
+      TickHost host; host.acquired=motion;
+      frame.Run(host);
+      check(!host.seen.empty(),"the tick host saw the frame");
+      for(const bool value:host.seen) check(value==host.seen.front(),"one tick_frame answer per frame");
+      return host.seen.front();
+    };
+    NativeFullFrame locked;
+    for(uint64_t tick=1;tick<=3;++tick)
+      for(const uint32_t steps:{1u,0u,2u}) check(run(locked,MakeNativeFrameMotion(false,1,tick,1,steps,true)),"locked frames always advance");
+    check(locked.held_frames()==0,"locked holds nothing");
+    NativeFullFrame unlocked;
+    uint32_t advanced=0;
+    for(uint64_t tick=1;tick<=60;++tick)
+      for(uint32_t render=0;render<2;++render) {
+        const bool tick_frame=run(unlocked,MakeNativeFrameMotion(true,1,tick,render?.5f:0.f,render?0u:1u,true));
+        check(tick_frame==(render==0),"unlocked: the first render of a tick advances, the render-only one holds");
+        advanced+=tick_frame;
+      }
+    check(advanced==60 && unlocked.frames()==120 && unlocked.held_frames()==60,"120 renders over 60 ticks advance 60 times");
+    // The gate alone: a two-step render counts once, a repeated tick never.
+    NativeTickGate gate;
+    check(!gate.Advance(MakeNativeFrameMotion(true,1,7,.2f,0,true)) && !gate.committed(),"a render-only frame before any step holds");
+    check(gate.Advance(MakeNativeFrameMotion(true,1,9,0,2,true)) && gate.tick()==9,"a catch-up render advances once");
+    check(!gate.Advance(MakeNativeFrameMotion(true,1,9,0,2,true)),"the same tick never advances twice");
+    check(gate.Advance(MakeNativeFrameMotion(false,1,9,0,0,true)),"locked always advances, even at the same tick");
+    check(NativeFrameInputs{}.tick_frame,"default inputs advance");
+  }
+  // Draw-counted guest steps (NativeRenderStepOncePerTick, the clEffectEtc02,
+  // clGaugeRader and cursor-fade hooks): modelled on their stores, locked
+  // renders step as before, and unlocked at two renders per tick the fields end
+  // each tick bit-identical to the locked run.
+  {
+    struct Memory {
+      mutable std::map<uint32_t,uint32_t> words;
+      uint32_t Word(uint32_t at) const { return words[at]; }
+      void StoreWord(uint32_t at,uint32_t value) const { words[at]=value; }
+    };
+    constexpr uint32_t gauge=0x40001000,cursor=0x40002000;
+    constexpr float decay=-0.99f;
+    // clGaugeRader::slot3 821768A0..B0: when +296 != 0, +300 *= -0.99 and +296 -= 1.
+    const auto radar=[&](const Memory& m) {
+      const auto frames=m.Word(gauge+kNativeRadarShakeFrames);
+      if(!frames) return;
+      m.StoreWord(gauge+kNativeRadarShakeOffset,std::bit_cast<uint32_t>(std::bit_cast<float>(m.Word(gauge+kNativeRadarShakeOffset))*decay));
+      m.StoreWord(gauge+kNativeRadarShakeFrames,frames-1);
+    };
+    const auto cursor_fade=[&](const Memory& m) { m.StoreWord(cursor+kNativeCursorFade,m.Word(cursor+kNativeCursorFade)+1); };
+    const auto render=[&](const Memory& m,bool tick_frame) {
+      NativeRenderStepOncePerTick(m,tick_frame,gauge+kNativeRadarShakeFrames,0xFFFFFFFFu,
+        std::array{uint32_t(gauge+kNativeRadarShakeOffset)},[&] { radar(m); });
+      NativeRenderStepOncePerTick(m,tick_frame,cursor+kNativeCursorFade,1u,std::array<uint32_t,0>{},[&] { cursor_fade(m); });
+    };
+    const auto arm=[&](const Memory& m) {  // clGaugeRader slot2 82175FFC: 30 frames, 20.0
+      m.StoreWord(gauge+kNativeRadarShakeFrames,30); m.StoreWord(gauge+kNativeRadarShakeOffset,std::bit_cast<uint32_t>(20.f));
+      m.StoreWord(cursor+kNativeCursorFade,0);
+    };
+    Memory locked,unlocked,ungated;
+    arm(locked); arm(unlocked); arm(ungated);
+    NativeTickGate locked_gate,unlocked_gate;
+    for(uint64_t tick=1;tick<=40;++tick) {
+      const bool locked_frame=locked_gate.Advance(MakeNativeFrameMotion(false,1,tick,1,1,true));
+      render(locked,locked_frame);
+      for(uint32_t r=0;r<2;++r) {
+        const bool tick_frame=unlocked_gate.Advance(MakeNativeFrameMotion(true,1,tick,r?.5f:0.f,r?0u:1u,true));
+        render(unlocked,tick_frame);
+        render(ungated,true);
+      }
+      check(locked.words==unlocked.words,"unlocked fields match the locked run after every tick");
+    }
+    check(locked.Word(gauge+kNativeRadarShakeFrames)==0 && locked.Word(cursor+kNativeCursorFade)==40,"locked: one step per render");
+    check(ungated.Word(cursor+kNativeCursorFade)==80,"without the gate the unlocked fade would count 80");
+    // A held render never undoes another writer: a cursor move resetting the
+    // fade inside the call (8218F138) stays reset.
+    Memory moved; moved.StoreWord(cursor+kNativeCursorFade,7);
+    check(!NativeRenderStepOncePerTick(moved,false,cursor+kNativeCursorFade,1u,std::array<uint32_t,0>{},
+      [&] { moved.StoreWord(cursor+kNativeCursorFade,0); }) && moved.Word(cursor+kNativeCursorFade)==0,"another writer is kept");
+    // An idle shake (+296 == 0) is not touched on a held render.
+    Memory idle; idle.StoreWord(gauge+kNativeRadarShakeOffset,123);
+    check(!NativeRenderStepOncePerTick(idle,false,gauge+kNativeRadarShakeFrames,0xFFFFFFFFu,
+      std::array{uint32_t(gauge+kNativeRadarShakeOffset)},[&] { radar(idle); }) && idle.Word(gauge+kNativeRadarShakeOffset)==123,"idle shake");
+    // Locked (tick frame): the call alone, nothing put back.
+    Memory plain; plain.StoreWord(cursor+kNativeCursorFade,3);
+    check(!NativeRenderStepOncePerTick(plain,true,cursor+kNativeCursorFade,1u,std::array<uint32_t,0>{},[&] { cursor_fade(plain); }) &&
+      plain.Word(cursor+kNativeCursorFade)==4,"a tick frame steps");
   }
   // Routing: full frame only on the native side with bridge and host; guest
   // side frames take today's path for frame-by-frame A/B comparison.

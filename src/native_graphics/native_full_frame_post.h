@@ -100,6 +100,9 @@ struct NativePostFrame {
   PostFinishPlan plan;
   NativePostTone tone;
   std::vector<NativePostDraw> draws;
+  // The DownsampleTone draw was not recorded: the frame held the tone history
+  // (NativePostHistory::Hold) and the sink had a resolved one to keep.
+  bool history_held=false;
 };
 // The plan's setters as bindings, plus the four pool constants on every draw
 // (the sink sets a name only where the native shader reflects it). Throws on a
@@ -126,11 +129,31 @@ class NativePostSink {
  public:
   virtual ~NativePostSink()=default;
   virtual void Draw(const NativePostDraw& draw)=0;
+  // Whether the DownsampleTone draw's own record already holds a resolved
+  // history texture (its m_OldTone) that a held frame can leave in place for
+  // the Tone and Bloom passes to read. False draws it anyway: an unresolved
+  // history (the first frame, a recreated target) is never kept.
+  virtual bool HasToneHistory(const NativePostDraw& draw) const { (void)draw; return false; }
 };
+// The tone history's per-render step. PS_Downsample_Tone (the last reduction,
+// 1x1) averages its four samples, blends red toward MiddleGray by ToneMap, then
+// moves its own previous resolve (m_OldTone) toward that by a fixed 0.025 per
+// DRAW: old + (new - old) * 0.025, a literal in the retail shader, not one of
+// the pool constants (tools/native_post_arithmetic.h checks that arithmetic
+// against the compiled shader). So eye adaptation is counted in renders; at the
+// retail 60 Hz once per tick. Hold, on an unlocked render that dispatched no
+// simulation step (NativeFrameInputs::tick_frame false), skips that one draw
+// and its resolve, so the history keeps the value its tick's frame resolved -
+// what the 60 Hz game shows for the whole tick - instead of blending again.
+// Scaling the step instead would need a shader constant the retail shader does
+// not have. Advance records every draw: the locked path, unchanged.
+enum class NativePostHistory:uint8_t { Advance, Hold };
 // The post chain and bloom composite of 820B0B80 for post owner `self`
 // (clSgsCoreRender), from guest memory alone. Returns what was recorded.
-NativePostFrame RecordNativePost(NativePostSink& sink,const PostGuestMemory& memory,uint32_t self);
-NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& input,const NativePostTone& tone);
+NativePostFrame RecordNativePost(NativePostSink& sink,const PostGuestMemory& memory,uint32_t self,
+                                 NativePostHistory history=NativePostHistory::Advance);
+NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& input,const NativePostTone& tone,
+                                 NativePostHistory history=NativePostHistory::Advance);
 
 // The renderer's sink, in guest_shader_bridge.cpp: resolves the HDR scene of
 // the screen owner [8257BFB4] into owner+104 as the 8219C930 hook does (mode
@@ -139,5 +162,6 @@ NativePostFrame RecordNativePost(NativePostSink& sink,const PostFinishInput& inp
 // ordinary output, which it leaves active for presentation. False, with the
 // reason, when the frame could not be recorded; draws already recorded stay
 // recorded and the output is left invalid.
-bool RecordNativeFullFramePost(uint8_t* base,uint32_t self,bool resolve_scene,std::string* error=nullptr);
+bool RecordNativeFullFramePost(uint8_t* base,uint32_t self,bool resolve_scene,std::string* error=nullptr,
+                               NativePostHistory history=NativePostHistory::Advance);
 }

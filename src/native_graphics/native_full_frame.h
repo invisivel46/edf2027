@@ -52,6 +52,14 @@ struct NativeFrameInputs {
   // The motion budget of this render (tick, fraction, steps, whether model
   // poses interpolate): the one the camera's 821CDDF8 interpolation used.
   NativeFrameMotion motion;
+  // Whether this render advances the state the guest advances once per render
+  // (NativeTickGate over `motion`): NativeFullFrame::Run sets it once per
+  // frame, before any view. Always true locked; unlocked, true only on the
+  // first render after a simulation step. The effects pass commits
+  // clEffectEtc02's +612 and the post advances its tone history only then;
+  // the host's guest HUD phases step the radar shake and cursor fade only
+  // then (the bridge's 82176708/8218ED68 hooks).
+  bool tick_frame=true;
 };
 struct NativeFrameView {
   uint32_t scene=0,index=0;
@@ -130,9 +138,12 @@ class NativeFullFrame {
   // Replaces the pass named `name` (either list); false when there is none.
   bool Replace(std::unique_ptr<NativeFramePass> pass);
   uint64_t frames() const { return frames_; }
+  // Frames whose inputs.tick_frame was false (unlocked render-only frames).
+  uint64_t held_frames() const { return held_frames_; }
  private:
   std::vector<std::unique_ptr<NativeFramePass>> view_passes_,frame_passes_;
-  uint64_t frames_=0;
+  NativeTickGate tick_gate_;
+  uint64_t frames_=0,held_frames_=0;
 };
 // Stubs for the view passes, in order.
 std::vector<std::unique_ptr<NativeFramePass>> MakeNativeFramePasses();

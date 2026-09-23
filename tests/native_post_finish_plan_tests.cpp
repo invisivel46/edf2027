@@ -1,5 +1,6 @@
 #include "native_graphics/native_post_finish_plan.h"
 #include "native_graphics/native_full_frame_post.h"
+#include "native_graphics/native_frame_motion.h"
 #include <algorithm>
 #include <bit>
 #include <cstring>
@@ -530,9 +531,91 @@ void TestToneSource() {
     CHECK(threw);
   }
 }
+// The tone history per tick (NativePostHistory). A sink that models the one
+// stateful draw: PS_Downsample_Tone moves its own resolve toward the frame's
+// value by 0.025 per draw (tools/native_post_arithmetic.h checks that math
+// against the retail shader); the Tone and Bloom passes read the resolve.
+struct HistorySink:NativePostSink {
+  float history=0.2f,scene=1.0f,read=-1;
+  bool resolved=true;
+  size_t draws=0,tone_draws=0;
+  void Draw(const NativePostDraw& draw) override {
+    ++draws;
+    if(draw.kind==PostPassKind::DownsampleTone) {
+      ++tone_draws;
+      history=history+(scene-history)*0.025f;  // old + (new - old) * 0.025
+      resolved=true;
+    }
+    if(draw.kind==PostPassKind::Tone) read=history;
+  }
+  bool HasToneHistory(const NativePostDraw& draw) const override { return draw.kind==PostPassKind::DownsampleTone && resolved; }
+};
+void TestToneHistoryPerTick() {
+  const auto input=Input();
+  const auto tone=Tone();
+  // Advance (locked, and every tick frame): every draw, the frame as before.
+  {
+    RecordingSink all;
+    const auto frame=RecordNativePost(all,input,tone,NativePostHistory::Advance);
+    RecordingSink plain;
+    RecordNativePost(plain,input,tone);
+    CHECK(all.draws.size()==14 && plain.draws.size()==14 && !frame.history_held);
+    for(size_t p=0;p<plain.draws.size();++p)
+      CHECK(all.draws[p].kind==plain.draws[p].kind && all.draws[p].target==plain.draws[p].target && all.draws[p].quad==plain.draws[p].quad);
+  }
+  // Hold: only the DownsampleTone draw is left out, when its history exists.
+  {
+    HistorySink sink;
+    const auto frame=RecordNativePost(sink,input,tone,NativePostHistory::Hold);
+    CHECK(frame.history_held && sink.draws==13 && sink.tone_draws==0 && frame.draws.size()==14);
+    CHECK(sink.read==0.2f);  // Tone reads the kept resolve
+  }
+  // Hold without a resolved history (first frame, recreated target) draws it.
+  {
+    HistorySink sink; sink.resolved=false;
+    const auto frame=RecordNativePost(sink,input,tone,NativePostHistory::Hold);
+    CHECK(!frame.history_held && sink.draws==14 && sink.tone_draws==1);
+  }
+  // A plain sink (no HasToneHistory) never holds.
+  {
+    RecordingSink sink;
+    const auto frame=RecordNativePost(sink,input,tone,NativePostHistory::Hold);
+    CHECK(!frame.history_held && sink.draws.size()==14);
+  }
+  // 60 Hz locked (one render per tick) against unlocked at two renders per tick,
+  // with the history gated by NativeTickGate: the same history after every tick,
+  // and the tone every render reads is its tick's.
+  {
+    HistorySink locked,unlocked;
+    NativeTickGate locked_gate,unlocked_gate;
+    for(uint64_t tick=1;tick<=120;++tick) {
+      locked.scene=unlocked.scene=float(tick%7)*0.3f;
+      const bool locked_frame=locked_gate.Advance(MakeNativeFrameMotion(false,1,tick,1,1,true));
+      CHECK(locked_frame);
+      RecordNativePost(locked,input,tone,locked_frame?NativePostHistory::Advance:NativePostHistory::Hold);
+      for(uint32_t render=0;render<2;++render) {
+        const auto motion=MakeNativeFrameMotion(true,1,tick,render?.5f:0.f,render?0u:1u,true);
+        const bool tick_frame=unlocked_gate.Advance(motion);
+        CHECK(tick_frame==(render==0));
+        RecordNativePost(unlocked,input,tone,tick_frame?NativePostHistory::Advance:NativePostHistory::Hold);
+        CHECK(std::bit_cast<uint32_t>(unlocked.read)==std::bit_cast<uint32_t>(locked.read));
+      }
+      CHECK(std::bit_cast<uint32_t>(unlocked.history)==std::bit_cast<uint32_t>(locked.history));
+    }
+    CHECK(locked.tone_draws==120 && unlocked.tone_draws==120);
+    // Without the gate the unlocked history would blend 240 times.
+    HistorySink ungated;
+    for(uint64_t tick=1;tick<=120;++tick) {
+      ungated.scene=float(tick%7)*0.3f;
+      for(uint32_t render=0;render<2;++render) RecordNativePost(ungated,input,tone);
+    }
+    CHECK(ungated.tone_draws==240 && ungated.history!=locked.history);
+  }
+}
 }
 
 int main() {
+  TestToneHistoryPerTick();
   TestBlurWeights();
   TestOffsetsAndQuad();
   TestPlan();
