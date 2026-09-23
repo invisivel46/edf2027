@@ -1,5 +1,6 @@
 #include "native_full_frame_models.h"
 #include <algorithm>
+#include <cstring>
 
 namespace edf::native {
 NativeFullFrameModelVisibility ClassifyNativeFullFrameModel(const NativeRenderEntry& entry,const NativeSceneVisibilityView& view) {
@@ -199,122 +200,185 @@ std::vector<NativeBackendSampler*> ResolvedSamplers(const NativeSceneMaterialPro
   }
   return resources;
 }
+// Whether two sets of an item's constants are the same bytes (the palette
+// floats compared as bits: a NaN is itself, -0 is not 0).
+bool SameConstants(const NativeFullFrameModelConstants& a,const NativeFullFrameModelConstants& b) {
+  return a.skinned==b.skinned && a.bones==b.bones && a.worlds==b.worlds && a.palette.size()==b.palette.size() &&
+    (a.palette.empty() || !std::memcmp(a.palette.data(),b.palette.data(),a.palette.size()*sizeof(float)));
+}
 }
 NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistrySnapshot& snapshot,
     const NativeFullFrameModelCamera& camera,const NativeFullFrameModelPass& pass,const NativeFullFrameModelSources& sources,
     const std::function<void(NativeFullFrameModelPhase)>& phase) {
   using Phase=NativeFullFrameModelPhase;
   using Cache=NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve>;
+  using ItemState=NativeFullFrameModelItemState;
+  using RowState=NativeFullFrameModelRowState;
   const auto enter=[&](Phase next) { if(phase) phase(next); };
   NativeFullFrameModelFrame frame;
   auto& stats=frame.stats;
+  ++frame_;
   enter(Phase::Visibility);
   frame.plan=PlanNativeFullFrameModels(snapshot,camera);
-  // Programs: the program and geometry of every draw of every item, from the
-  // side table (the providers only when the generation moved or a row is new).
+  // Programs: each drawn item's draw state, found by (object, generation, LOD
+  // model or instanced world). Its draws and their program and geometry are
+  // gathered only when the state is new, its layout object changed or the
+  // source generation moved: the side table then serves each (pass record,
+  // batch, layout), and behind it the providers are asked once per pass
+  // record, and per pass record and batch value, per generation. That is the
+  // providers' contract (NativeFullFrameModelSources::generation): at one
+  // generation a program is a function of its pass record and a geometry of
+  // its batch and pass record. Missing answers are asked again.
   enter(Phase::Programs);
   const auto generation=sources.generation?sources.generation():kNativeFullFrameModelUnversioned;
-  const auto source_hits=sources_.hits,source_fetches=sources_.fetches;
-  struct Gathered {
-    std::vector<NativeModelDraw> draws;
-    std::vector<NativeFullFrameModelSourcePair> sources;
-    bool complete=false;
+  const bool versioned=generation!=kNativeFullFrameModelUnversioned;
+  if(generation!=provided_generation_ || !versioned) {
+    provided_programs_.clear(); provided_geometry_.clear(); provided_generation_=generation;
+  }
+  const auto program_of=[&](uint32_t record) -> std::shared_ptr<const NativeSceneGroupMaterial> {
+    if(!sources.program) return nullptr;
+    if(versioned) if(const auto found=provided_programs_.find(record);found!=provided_programs_.end()) return found->second;
+    auto program=sources.program(record);
+    ++stats.programs;
+    if(versioned && program && program->program) provided_programs_.emplace(record,program);
+    return program;
   };
+  const auto geometry_of=[&](const NativeModelBatchLayout& batch,uint32_t record) {
+    std::vector<std::pair<NativeModelBatchLayout,std::shared_ptr<const NativeIndexedMesh::RetainedDraw>>>* provided=nullptr;
+    if(versioned) {
+      provided=&provided_geometry_[{record,batch.address}];
+      for(const auto& [value,geometry]:*provided) if(value==batch) return geometry;
+    }
+    auto geometry=sources.geometry(batch,record);
+    ++stats.geometries;
+    if(provided && geometry) provided->emplace_back(batch,geometry);
+    return geometry;
+  };
+  const auto source_hits=sources_.hits,source_fetches=sources_.fetches;
   const std::array<std::span<const NativeFullFrameModelItem>,2> lists{
     std::span<const NativeFullFrameModelItem>(frame.plan.opaque),std::span<const NativeFullFrameModelItem>(frame.plan.transparent)};
-  std::array<std::vector<Gathered>,2> gathered;
+  // Each list's item states in list order; null for an item without complete
+  // sources. An entry the registry published twice (it never does) gets a
+  // state of this frame only for its second item, so neither sees the other's.
+  std::array<std::vector<ItemState*>,2> states;
+  std::vector<std::unique_ptr<ItemState>> duplicates;
   for(size_t list=0;list<lists.size();++list) {
-    gathered[list].resize(lists[list].size());
+    states[list].resize(lists[list].size());
     for(size_t index=0;index<lists[list].size();++index) {
       const auto& item=lists[list][index];
+      ++stats.items;
       // The item's layout object: the posed LOD model's, or its instanced set's.
       const auto& layout_object=ItemLayoutObject(item);
       const auto& layout=*layout_object;
-      auto& result=gathered[list][index];
-      ++stats.items;
+      auto* state=&items_[ItemKey{item.entry->object,item.entry->generation,item.instanced,
+        item.instanced<0?item.model:item.world}];
+      if(state->used==frame_) state=duplicates.emplace_back(std::make_unique<ItemState>()).get();
+      state->used=frame_;
       try {
-        result.draws=NativeModelDrawPlan(layout);
-        result.sources.reserve(result.draws.size());
-        result.complete=true;
-        for(const auto& draw:result.draws) {
-          const auto& batch=layout.meshes[draw.mesh].batches[draw.batch];
-          auto source=sources_.Get(draw.pass,batch.address,layout_object,generation,[&] {
-            NativeFullFrameModelSourcePair fetched{sources.program?sources.program(draw.pass):nullptr,nullptr};
-            if(fetched.first && fetched.first->program && sources.geometry) fetched.second=sources.geometry(batch,draw.pass);
-            return fetched;
-          },[](const NativeFullFrameModelSourcePair& value) { return value.first && value.first->program && value.second; });
-          if(!source.first || !source.first->program) { ++stats.missing_program; result.complete=false; break; }
-          if(!source.second) { ++stats.missing_geometry; result.complete=false; break; }
-          result.sources.push_back(std::move(source));
+        if(state->layout!=layout_object) {
+          // New, or relaid out (a new layout generation): its draws in guest
+          // order, each with its batch's address and its index in the batch's
+          // pass list (OrderNativeFullFrameModelDraws' keys).
+          *state=ItemState{layout_object};
+          state->used=frame_;
+          for(const auto& draw:NativeModelDrawPlan(layout)) {
+            const auto& passes=layout.meshes[draw.mesh].batches[draw.batch].passes;
+            state->draws.push_back({draw,uint32_t(std::find(passes.begin(),passes.end(),draw.pass)-passes.begin()),
+              layout.meshes[draw.mesh].batches[draw.batch].address});
+          }
         }
-      } catch(const std::exception&) { ++stats.failed; result.complete=false; }
-      if(!result.complete) { result.draws.clear(); result.sources.clear(); }
+        if(!state->sourced || state->generation!=generation || !versioned) {
+          ++stats.sourced;
+          state->sourced=false;
+          bool complete=true;
+          for(auto& draw:state->draws) {
+            const auto& batch=layout.meshes[draw.draw.mesh].batches[draw.draw.batch];
+            auto source=sources_.Get(draw.draw.pass,batch.address,layout_object,generation,[&] {
+              NativeFullFrameModelSourcePair fetched{program_of(draw.draw.pass),nullptr};
+              if(fetched.first && fetched.first->program && sources.geometry) fetched.second=geometry_of(batch,draw.draw.pass);
+              return fetched;
+            },[](const NativeFullFrameModelSourcePair& value) { return value.first && value.first->program && value.second; });
+            if(!source.first || !source.first->program) { ++stats.missing_program; complete=false; break; }
+            if(!source.second) { ++stats.missing_geometry; complete=false; break; }
+            // Other sources are another row: the object is made again.
+            if(source!=draw.source) { draw.object.reset(); draw.made_from.reset(); draw.source=std::move(source); }
+          }
+          state->sourced=complete; state->generation=generation;
+        }
+      } catch(const std::exception&) { ++stats.failed; state->sourced=false; }
+      if(state->sourced) states[list][index]=state;
     }
   }
   stats.source_hits=sources_.hits-source_hits; stats.source_fetches=sources_.fetches-source_fetches;
-  // Resolve: each draw's material from the cache (the pass constants compared,
-  // the camera derived from them) or a resolve, then its scene object.
+  // Resolve: each material row once (its pass constants against the cache:
+  // the camera derived from them, or a capture or resolve), then each draw's
+  // scene object: carried from its state while nothing it is made from moved,
+  // else made from its row's result and its item's constants.
   enter(Phase::Resolve);
   const auto base=NativeFullFrameModelBaseState(pass.targets);
-  struct Memo { NativeSceneMaterialCapture capture; bool scissor=false; };
-  using MemoKey=std::tuple<uint32_t,const NativeSceneMaterialProgram*,const NativeIndexedMesh::RetainedDraw*>;
-  std::map<MemoKey,Memo> memo;
-  // A skinned row this frame: its pass constants (moved into the cache row once
-  // captured), its g_mWorldArray constants, which each draw binds its palette
-  // into, and the row capture with its camera (derived on a cache hit).
-  struct Skinned {
-    std::vector<NativeSceneMaterialInputs::Constant> constants,palette;
-    std::shared_ptr<NativeScenePaletteCapture> capture;
-    NativeSceneView camera;
-    bool scissor=false;
-  };
-  std::map<MemoKey,Skinned> skinned;
-  struct Resolved { std::shared_ptr<const NativeSceneInstance> object; NativeSceneView view; };
   // Each resolve or capture (the backend's pipeline and sampler caches) with
   // its intern runs in one exclusive call: one short hold of the host's locks.
   // The cache rows are Build's own state and are used outside it.
   const auto exclusive=[&](const std::function<void()>& work) { if(sources.exclusive) sources.exclusive(work); else work(); };
-  // Resolves one draw, or throws / returns nothing (counted) when it cannot.
-  const auto resolve=[&](const NativeModelLayout& layout,const NativeFullFrameModelConstants& values,
-      const NativeModelDraw& draw,const NativeFullFrameModelSourcePair& source) -> std::optional<Resolved> {
-    const auto& material=*source.first;
-    const auto& program=*material.program;
-    // Scissor enable's rectangle is not a pass input (as in the world pass).
-    if(!program.CanDeferCpuActivation()) { ++stats.scissor; return std::nullopt; }
-    const auto& geometry=source.second;
-    if(!program.backend || geometry->backend()!=program.backend.get()) { ++stats.missing_geometry; return std::nullopt; }
-    const auto key=MemoKey(draw.pass,&program,geometry.get());
-    Cache::Key cache_key{draw.pass,layout.skinned,material.program,geometry,base,pass.targets,pass.filtering};
-    Memo resolved;
-    if(layout.skinned) {
-      // The palette is per draw, everything else per row: the row's capture of
-      // its pass constants (cached across frames while Current, as a rigid
-      // row's), and per draw With over its palette-bound g_mWorldArray.
-      auto found=skinned.find(key);
-      if(found==skinned.end()) {
-        Skinned row;
-        row.constants=PassConstants(material,camera);
-        for(const auto& constant:row.constants) if(constant.name=="g_mWorldArray") row.palette.push_back(constant);
-        found=skinned.emplace(key,std::move(row)).first;
+  // The row of one draw, evaluated at its first draw this frame. A row that
+  // could not be evaluated throws its error for each of its draws, as each
+  // draw's own resolve would; one whose program cannot defer its CPU
+  // activation or whose geometry is another backend's is not evaluated (the
+  // draw declines first).
+  const auto row_of=[&](bool skinned,const NativeModelDraw& draw,const NativeFullFrameModelSourcePair& source) -> RowState& {
+    const auto& material=source.first;
+    const auto& program=*material->program;
+    auto& row=rows_[RowKey{draw.pass,&program,source.second.get(),skinned}];
+    if(row.frame==frame_) {
+      if(row.failed) throw std::runtime_error(row.error);
+      return row;
+    }
+    if(!row.program) {
+      // Fixed by the key's program and geometry, which the row holds.
+      row.program=material->program; row.geometry=source.second;
+      // Scissor enable's rectangle is not a pass input (as in the world pass).
+      row.deferrable=program.CanDeferCpuActivation();
+      row.same_backend=program.backend && source.second->backend()==program.backend.get();
+    }
+    row.frame=frame_; row.used=frame_; row.draws=0; row.failed=false;
+    if(!row.deferrable || !row.same_backend) return row;
+    ++stats.rows;
+    try {
+      // The pass constants: the published constants with the camera and
+      // animation applied (PassConstants). While the published material is
+      // the same object and the animation it reads is the same, only the
+      // camera constants can differ, and the camera writes each of them whole:
+      // it is applied in place.
+      if(row.group!=material || row.constants.empty() || (row.animated && row.animation!=camera.animation)) {
+        row.group.reset(); row.palette_constants.clear();
+        row.constants=PassConstants(*material,camera);
+        row.animated=std::any_of(row.constants.begin(),row.constants.end(),[](const auto& constant) {
+          return constant.global && (constant.name=="m_WaterTime" || constant.name=="g_SignalBrightness");
+        });
+        // A skinned draw binds its palette into these (every g_mWorldArray).
+        if(skinned) for(const auto& constant:row.constants) if(constant.name=="g_mWorldArray") row.palette_constants.push_back(constant);
+        row.group=material; row.animation=camera.animation; row.camera=camera.pass;
+      } else {
+        if(!(row.camera==camera.pass)) { for(auto& constant:row.constants) camera.pass.Apply(constant); row.camera=camera.pass; }
+        ++stats.camera_rows;
       }
-      auto& row=found->second;
-      // Refused before any capture, as BindNativeFullFrameModelPalette over the whole set.
-      for(auto& constant:row.palette)
-        if(!BindNativeFullFrameModelPalette(constant,values.palette)) { ++stats.palette; return std::nullopt; }
-      if(!row.capture) {
-        auto* entry=materials_.Candidate(cache_key);
+      Cache::Key cache_key{draw.pass,skinned,material->program,source.second,base,pass.targets,pass.filtering};
+      auto* entry=materials_.Candidate(cache_key);
+      NativeSceneView derived;
+      if(skinned) {
+        // The row's capture of its pass constants (any palette), cached across
+        // frames while Current; each draw derives its own material from it.
         const auto* cached=entry && entry->material.palette?entry->material.palette.get():nullptr;
-        NativeSceneView derived;
         if(cached) derived=cached->capture().camera;
         if(cached && Cache::Current(*entry,row.constants,cached->capture().material.get(),derived)) {
-          row.capture=entry->material.palette; row.scissor=entry->material.scissor; row.camera=derived;
+          row.palette=entry->material.palette; row.scissor=entry->material.scissor;
           ++materials_.hits; ++stats.cache_hits;
         } else {
           NativeFullFrameModelResolve half;
           if(entry) half=entry->material;
           exclusive([&] {
             if(!entry) {
-              const auto result=ResolveMaterial(program,*geometry,pass,base,row.constants,true);
+              const auto result=ResolveMaterial(program,*source.second,pass,base,row.constants,true);
               half.pipeline=result.capture.material->pipeline(); half.blend_factor=result.capture.material->blend_factor();
               half.samplers=ResolvedSamplers(program,result.samplers,pass.filtering); half.scissor=result.render.words[5]!=0;
             }
@@ -323,109 +387,166 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
           });
           ++(entry?stats.captures:stats.resolves);
           ++materials_.misses;
-          row.capture=half.palette; row.scissor=half.scissor; row.camera=half.palette->capture().camera;
-          materials_.Store(std::move(cache_key),std::move(row.constants),std::move(half),row.capture->capture().material.get(),row.camera);
+          row.palette=half.palette; row.scissor=half.scissor; derived=half.palette->capture().camera;
+          materials_.Store(std::move(cache_key),row.constants,std::move(half),row.palette->capture().material.get(),derived);
         }
-      }
-      // Off the locks: the row capture is Build's own.
-      resolved={row.capture->With(row.palette),row.scissor};
-      resolved.capture.camera.view=row.camera.view; resolved.capture.camera.projection=row.camera.projection;
-      resolved.capture.camera.view_projection=row.camera.view_projection;
-      ++stats.palettes;
-    } else if(const auto found=memo.find(key);found!=memo.end()) { resolved=found->second; ++stats.memo_hits; }
-    else {
-      auto constants=PassConstants(material,camera);
-      auto* entry=materials_.Candidate(cache_key);
-      NativeSceneView derived;
-      if(entry) derived=entry->material.capture.camera;
-      if(entry && Cache::Current(*entry,constants,entry->material.capture.material.get(),derived)) {
-        resolved={entry->material.capture,entry->material.scissor};
-        resolved.capture.camera.view=derived.view; resolved.capture.camera.projection=derived.projection;
-        resolved.capture.camera.view_projection=derived.view_projection;
-        ++materials_.hits; ++stats.cache_hits;
+        row.capture={};
       } else {
-        NativeFullFrameModelResolve half;
-        if(entry) half=entry->material;
-        exclusive([&] {
-          if(entry) {
-            // Same pipeline half; a constant moved: capture again.
-            half.capture=program.Capture(*half.pipeline,pass.targets.reverse_depth,constants,half.samplers,half.blend_factor,false);
-          } else {
-            auto result=ResolveMaterial(program,*geometry,pass,base,constants,false);
-            half.pipeline=result.capture.material->pipeline();
-            half.samplers=ResolvedSamplers(program,result.samplers,pass.filtering);
-            half.blend_factor=result.capture.material->blend_factor(); half.scissor=result.render.words[5]!=0;
-            half.capture=std::move(result.capture);
-          }
-          if(sources.intern) half.capture.material=sources.intern(std::move(half.capture.material));
-        });
-        ++(entry?stats.captures:stats.resolves);
-        ++materials_.misses;
-        resolved={half.capture,half.scissor};
-        const auto* captured=half.capture.material.get();
-        const auto captured_camera=half.capture.camera;
-        materials_.Store(std::move(cache_key),std::move(constants),std::move(half),captured,captured_camera);
+        if(entry) derived=entry->material.capture.camera;
+        if(entry && Cache::Current(*entry,row.constants,entry->material.capture.material.get(),derived)) {
+          row.capture=entry->material.capture; row.scissor=entry->material.scissor;
+          ++materials_.hits; ++stats.cache_hits;
+        } else {
+          NativeFullFrameModelResolve half;
+          if(entry) half=entry->material;
+          exclusive([&] {
+            if(entry) {
+              // Same pipeline half; a constant moved: capture again.
+              half.capture=program.Capture(*half.pipeline,pass.targets.reverse_depth,row.constants,half.samplers,half.blend_factor,false);
+            } else {
+              auto result=ResolveMaterial(program,*source.second,pass,base,row.constants,false);
+              half.pipeline=result.capture.material->pipeline();
+              half.samplers=ResolvedSamplers(program,result.samplers,pass.filtering);
+              half.blend_factor=result.capture.material->blend_factor(); half.scissor=result.render.words[5]!=0;
+              half.capture=std::move(result.capture);
+            }
+            if(sources.intern) half.capture.material=sources.intern(std::move(half.capture.material));
+          });
+          ++(entry?stats.captures:stats.resolves);
+          ++materials_.misses;
+          row.capture=half.capture; row.scissor=half.scissor; derived=half.capture.camera;
+          const auto* captured=half.capture.material.get();
+          materials_.Store(std::move(cache_key),row.constants,std::move(half),captured,derived);
+        }
+        row.palette.reset();
       }
-      memo.emplace(key,resolved);
+      // The view every draw of the row records with this frame.
+      row.view=NativeSceneView{};
+      row.view.view=derived.view; row.view.projection=derived.projection; row.view.view_projection=derived.view_projection;
+      row.view.viewport=pass.viewport; row.view.scissor=pass.scissor; row.view.scissor_enabled=row.scissor;
+    } catch(const std::exception& error) {
+      // Evaluated again next frame from the published constants.
+      row.failed=true; row.error=error.what();
+      row.group.reset(); row.constants.clear(); row.palette_constants.clear();
+      throw;
     }
-    // g_mWorld as 821A17D8 stores it; a palette shader need not declare it.
-    if(!layout.skinned || NativeSceneCaptureBindsWorld(resolved.capture))
-      ApplyNativeScenePublishedWorld(resolved.capture,values.worlds[draw.mesh]);
+    return row;
+  };
+  const auto make=[&](const NativeFullFrameModelDrawState& draw,const NativeSceneMaterialCapture& capture) {
     auto object=std::make_shared<NativeSceneInstance>();
     object->id=++next_id_; object->changed_tick=UINT64_MAX;
-    object->object.geometry=geometry; object->object.material=resolved.capture.material;
-    object->object.world=resolved.capture.world; object->previous=resolved.capture.world;
-    auto view=resolved.capture.camera;
-    view.viewport=pass.viewport; view.scissor=pass.scissor; view.scissor_enabled=resolved.scissor;
-    return Resolved{std::move(object),std::move(view)};
+    object->object.geometry=draw.source.second; object->object.material=capture.material;
+    object->object.world=capture.world; object->previous=capture.world;
+    ++stats.derived;
+    return object;
   };
-  const auto emit=[&](std::span<const NativeFullFrameModelItem> items,std::span<const Gathered> sourced,bool transparent) {
+  const auto emit=[&](std::span<const NativeFullFrameModelItem> items,std::span<ItemState* const> item_states,bool transparent) {
     // Every draw of every item first; an item with any failure draws nothing.
-    std::vector<std::vector<Resolved>> resolved(items.size());
+    // views[item][draw]: the row view the draw records with; empty when the
+    // item is not drawn.
+    std::vector<std::vector<const NativeSceneView*>> views(items.size());
     for(size_t index=0;index<items.size();++index) {
+      auto* state=item_states[index];
+      if(!state) continue;
       const auto& item=items[index];
-      const auto& layout=NativeFullFrameModelItemLayout(item);
-      const auto& sourced_item=sourced[index];
-      if(!sourced_item.complete) continue;
+      const auto& layout=*state->layout;
       try {
-        const auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,*item.entry->pose,pass.palette_limit):
-          NativeFullFrameModelInstancedConstants(layout,item.entry->instanced[size_t(item.instanced)].worlds->at(item.world));
-        std::vector<Resolved> draws;
-        bool complete=true;
-        for(size_t d=0;d<sourced_item.draws.size();++d) {
-          auto result=resolve(layout,values,sourced_item.draws[d],sourced_item.sources[d]);
-          if(!result) { complete=false; break; }
-          draws.push_back(std::move(*result));
+        // The item's constants (worlds, palette) when their inputs moved; if
+        // they moved by value, every object made from them goes.
+        const auto& pose=item.instanced<0?item.entry->pose:item.entry->instanced[size_t(item.instanced)].worlds;
+        const uint32_t world=item.instanced<0?0:item.world;
+        if(!state->valued || state->pose!=pose || state->world!=world || state->palette_limit!=pass.palette_limit) {
+          auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,*pose,pass.palette_limit):
+            NativeFullFrameModelInstancedConstants(layout,pose->at(world));
+          if(!state->valued || !SameConstants(values,state->values))
+            for(auto& draw:state->draws) { draw.object.reset(); draw.made_from.reset(); }
+          state->values=std::move(values); state->pose=pose; state->world=world; state->palette_limit=pass.palette_limit;
+          state->valued=true;
         }
-        if(complete) { resolved[index]=std::move(draws); ++stats.drawn; }
-        else resolved[index].clear();
-      } catch(const std::exception&) { ++stats.failed; resolved[index].clear(); }
+        const auto& values=state->values;
+        auto& drawn=views[index];
+        drawn.assign(state->draws.size(),nullptr);
+        bool complete=true;
+        for(size_t d=0;d<state->draws.size() && complete;++d) {
+          auto& draw=state->draws[d];
+          auto& row=row_of(layout.skinned,draw.draw,draw.source);
+          if(!row.deferrable) { ++stats.scissor; complete=false; break; }
+          if(!row.same_backend) { ++stats.missing_geometry; complete=false; break; }
+          if(layout.skinned) {
+            if(draw.object && draw.made_from.get()==row.palette.get()) ++stats.reused;
+            else {
+              // The palette is per draw, everything else per row: With over
+              // its palette-bound g_mWorldArray. Refused before any capture,
+              // as BindNativeFullFrameModelPalette over the whole set.
+              for(auto& constant:row.palette_constants)
+                if(!BindNativeFullFrameModelPalette(constant,values.palette)) { complete=false; break; }
+              if(!complete) { ++stats.palette; break; }
+              auto capture=row.palette->With(row.palette_constants);
+              // g_mWorld as 821A17D8 stores it; a palette shader need not declare it.
+              if(NativeSceneCaptureBindsWorld(capture)) ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
+              draw.object=make(draw,capture); draw.made_from=row.palette;
+              ++stats.palettes;
+            }
+          } else {
+            if(row.draws++) ++stats.memo_hits;
+            if(draw.object && draw.made_from.get()==row.capture.material.get()) ++stats.reused;
+            else {
+              auto capture=row.capture;
+              ApplyNativeScenePublishedWorld(capture,values.worlds[draw.draw.mesh]);
+              draw.object=make(draw,capture); draw.made_from=row.capture.material;
+            }
+          }
+          drawn[d]=&row.view;
+        }
+        if(complete) ++stats.drawn;
+        else drawn.clear();
+      } catch(const std::exception&) { ++stats.failed; views[index].clear(); }
     }
+    // OrderNativeFullFrameModelDraws over the drawn items (a stable order of a
+    // subsequence is the subsequence of the stable order), from the states.
+    struct Ref { uint32_t item,index,pass_index,batch,pass; };
+    std::vector<Ref> refs;
+    for(uint32_t item=0;item<items.size();++item) {
+      if(views[item].empty()) continue;
+      const auto& draws=item_states[item]->draws;
+      for(uint32_t index=0;index<draws.size();++index)
+        refs.push_back({item,index,draws[index].pass_index,draws[index].batch,draws[index].draw.pass});
+    }
+    if(!transparent)
+      std::stable_sort(refs.begin(),refs.end(),[](const Ref& a,const Ref& b) {
+        return std::tie(a.pass_index,a.batch,a.pass)<std::tie(b.pass_index,b.batch,b.pass);
+      });
     std::vector<std::shared_ptr<const NativeSceneInstance>> objects;
-    NativeSceneView view;
+    const NativeSceneView* view=nullptr;
     uint32_t current=0;
     // A transparent batch never spans items: each carries its item's key and
     // filing order, so it can merge with other producers' transparents.
     const auto flush=[&] {
       if(objects.empty()) return;
-      frame.batches.push_back({view,NativeSceneSnapshot{0,NativeSceneInstances(objects)},transparent,
+      frame.batches.push_back({*view,NativeSceneSnapshot{0,NativeSceneInstances(objects)},transparent,
         transparent?items[current].key:uint16_t(0),transparent?current:0u});
       objects.clear();
     };
-    for(const auto& ref:OrderNativeFullFrameModelDraws(items,!transparent)) {
-      auto& draws=resolved[ref.item];
-      if(draws.empty()) continue;
-      auto& draw=draws.at(ref.index);
-      if(!objects.empty() && (!SameView(view,draw.view) || (transparent && ref.item!=current))) flush();
+    for(const auto& ref:refs) {
+      const auto* next=views[ref.item][ref.index];
+      if(!objects.empty() && ((view!=next && !SameView(*view,*next)) || (transparent && ref.item!=current))) flush();
       current=ref.item;
-      view=draw.view; objects.push_back(std::move(draw.object));
+      view=next; objects.push_back(item_states[ref.item]->draws[ref.index].object);
       ++stats.draws;
     }
     flush();
   };
-  emit(frame.plan.opaque,gathered[0],false);
-  emit(frame.plan.transparent,gathered[1],true);
+  emit(frame.plan.opaque,states[0],false);
+  emit(frame.plan.transparent,states[1],true);
   sources_.EndFrame(); materials_.EndFrame();
+  // Draw states and rows of objects, layouts, programs or geometry no longer
+  // drawn release what they hold.
+  if(items_.size()>kItemLimit) items_.clear();
+  if(rows_.size()>kRowLimit) rows_.clear();
+  if(frame_%kStateAge==0) {
+    std::erase_if(items_,[&](const auto& item) { return frame_-item.second.used>kStateAge; });
+    std::erase_if(rows_,[&](const auto& row) { return frame_-row.second.used>kStateAge; });
+  }
   enter(Phase::Done);
   return frame;
 }

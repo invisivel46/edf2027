@@ -126,8 +126,11 @@ NativeSceneMaterial::NativeSceneMaterial(std::shared_ptr<NativeRenderBackend> ba
     sampler_slots|=1u<<sampler.slot;
     samplers_.emplace_back(sampler.slot,sampler.sampler);
   }
-  fingerprint_=1469598103934665603ull;
-  const auto mix=[&](uint64_t value) { fingerprint_^=value; fingerprint_*=1099511628211ull; };
+}
+uint64_t NativeSceneMaterial::fingerprint() const {
+  if(const auto cached=fingerprint_.load(std::memory_order_relaxed)) return cached;
+  uint64_t fingerprint=1469598103934665603ull;
+  const auto mix=[&](uint64_t value) { fingerprint^=value; fingerprint*=1099511628211ull; };
   mix(uintptr_t(backend_.get())); mix(uintptr_t(pipeline_));
   for(const auto& c:constants_) {
     mix(uint32_t(c.stage)); mix(c.slot); mix(c.bytes.size());
@@ -137,6 +140,8 @@ NativeSceneMaterial::NativeSceneMaterial(std::shared_ptr<NativeRenderBackend> ba
   for(const auto& t:textures_) { mix(t.slot); mix(uintptr_t(t.texture.get())); }
   for(const auto& [slot,sampler]:samplers_) { mix(slot); mix(uintptr_t(sampler)); }
   if(blend_factor_) for(auto value:*blend_factor_) { uint32_t bits; std::memcpy(&bits,&value,4); mix(bits); }
+  fingerprint_.store(fingerprint,std::memory_order_relaxed);
+  return fingerprint;
 }
 bool NativeSceneMaterial::Equivalent(const NativeSceneMaterial& other) const {
   return backend_==other.backend_ && pipeline_==other.pipeline_ && constants_==other.constants_ &&

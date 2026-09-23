@@ -6116,10 +6116,12 @@ struct NativeFullFrameModelsShared {
 // recorded here, the transparent ones (bucket-key order) by the Transparent
 // pass. Program and geometry come from the model pass caches
 // (NativeModelPassProgramLocked / NativeModelGeometryLocked) through the
-// models' side table, once per (pass record, batch, layout) per source
-// generation (a registry publication, shader or backend change), so frames
-// between publications read no guest memory for them; guest memory is read,
-// never called. The snapshot is the render registry's (fed on with the full
+// models' draw states and side table: gathered only for items new to the
+// persistent draw states or at a new source generation (a registry
+// publication, shader or backend change), and then asked once per pass record
+// and per pass record and batch value, so frames between publications read no
+// guest memory for them; guest memory is read, never called. Between
+// publications each draw carries its scene object and only the camera moves. The snapshot is the render registry's (fed on with the full
 // frame); before its first tick there is none and this records nothing.
 class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
  public:
@@ -6229,11 +6231,12 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} sources={}/{} cached={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
+      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
         frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
         built.items,built.drawn,built.draws,statistics.draws,built.resolves,built.captures,built.palettes,built.cache_hits,built.memo_hits,
+        built.reused,built.derived,built.sourced,built.programs,built.geometries,built.camera_rows,built.rows,
         built.source_hits,built.source_fetches,models_.material_cache().size(),models_.source_table().size(),
-        built.missing_program,built.missing_geometry,built.failed,broken_,
+        models_.item_states(),models_.row_states(),built.missing_program,built.missing_geometry,built.failed,broken_,
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
