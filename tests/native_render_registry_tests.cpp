@@ -1010,14 +1010,15 @@ void AttachmentAndInstancedMotion() {
 }
 }
 
-// A render-only iteration (refresh false): the published snapshot is returned
-// as is while no event arrived and nothing is pending, whatever a subscribed
-// object's memory holds; events (a birth, a death, a subscription) are still
-// applied and published at the same tick; the next full tick re-reads the
-// subscribers. CountNativeRenderSnapshotChanges is what the idle audit logs.
+// A render-only iteration (refresh false) without probes: the published
+// snapshot is returned as is while no event arrived and nothing is pending,
+// whatever a subscribed object's memory holds; events (a birth, a death, a
+// subscription) are still applied and published at the same tick; the next
+// full tick re-reads the subscribers. The idle audit (AuditLight) counts what
+// a full tick would change without publishing or moving any motion.
 void RenderOnlyTicks() {
   std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
-  NativeRenderRegistry registry(8);
+  NativeRenderRegistry registry(8,0);
   const auto decode=Decoder(memory);
   constexpr uint32_t kMoving=0x2000,kStill=0x3000,kLate=0x4000;
   BuildTree(memory,kMoving,true); BuildTree(memory,kStill);
@@ -1027,45 +1028,207 @@ void RenderOnlyTicks() {
   // Nothing happened: the same snapshot, no new generation, nothing read.
   const auto builds=registry.stats().builds;
   const auto idle=registry.Tick(memory,kScene,1,decode,false);
-  Require(idle==stepped && registry.stats().builds==builds && registry.stats().idle_ticks==1 && registry.stats().light_ticks==0,
+  Require(idle==stepped && registry.stats().builds==builds && registry.stats().idle_ticks==1 && registry.stats().light_ticks==1,
     "an idle render-only tick read or published something");
   // A subscriber's pose moved without a step (what the idle audit looks for):
-  // the light tick leaves it; a full tick at the same tick catches it, and the
-  // count names the one entry.
+  // the light tick leaves it (no probe); the audit counts the one entry and
+  // leaves the published entry, its motion and the live set alone.
   BuildPose(memory,kMoving+400,kMoving+0x600,2,40.0f);
   Require(registry.Tick(memory,kScene,1,decode,false)==stepped,"a light tick re-read a subscriber");
-  const auto full=registry.Tick(memory,kScene,1,decode,true);
-  Require(full!=stepped && (*EntryOf(*full,kMoving)->pose)[0][0]==40.0f && CountNativeRenderSnapshotChanges(*stepped,*full)==1 &&
-    CountNativeRenderSnapshotChanges(*full,*full)==0,"the full tick catches the moved subscriber, and only it");
+  const auto stats=registry.stats();
+  Require(registry.AuditLight(memory,kScene,1,decode)==1,"the audit counts the moved subscriber, and only it");
+  Require(registry.AcquireSnapshot()==stepped && !EntryOf(*stepped,kMoving)->motion.render_dependent &&
+    registry.stats().live==0 && registry.stats().builds==stats.builds && registry.stats().changed==stats.changed,
+    "the audit published, counted or marked something");
+  Require(registry.Tick(memory,kScene,1,decode,false)==stepped,"the audit made the next light tick publish");
   // A birth and a subscription on a render-only iteration: applied, read and
   // published at the same tick, without re-reading the other subscribers.
   BuildPose(memory,kMoving+400,kMoving+0x600,2,80.0f);
   BuildTree(memory,kLate);
   registry.Born(kLate);
   const auto born=registry.Tick(memory,kScene,1,decode,false);
-  Require(born!=full && born->generation==full->generation+1 && born->tick==1 && EntryOf(*born,kLate) &&
-    EntryOf(*born,kMoving)==EntryOf(*full,kMoving) && registry.stats().light_ticks==1,"a render-only birth");
-  Require(CountNativeRenderSnapshotChanges(*full,*born)==1 && CountNativeRenderSnapshotChanges(*born,*full)==1,
-    "an added entry counts once either way");
+  Require(born!=stepped && born->generation==stepped->generation+1 && born->tick==1 && EntryOf(*born,kLate) &&
+    EntryOf(*born,kMoving)==EntryOf(*stepped,kMoving) && registry.stats().light_ticks==4,"a render-only birth");
+  Require(CountNativeRenderSnapshotChanges(*stepped,*born)==1 && CountNativeRenderSnapshotChanges(*born,*stepped)==1 &&
+    CountNativeRenderSnapshotChanges(*born,*born)==0,"an added entry counts once either way");
   registry.Subscribed(kStill,true); Link(memory,kUpdatesList,kStill+120,kStill);
   memory.StoreWord(kStill+kNativeRenderObjectSubscribed,1);
   memory.StoreByte(kStill+kNativeRenderObjectHidden,1);
   const auto subscribed=registry.Tick(memory,kScene,1,decode,false);
-  Require(EntryOf(*subscribed,kStill)->hidden && EntryOf(*subscribed,kMoving)==EntryOf(*full,kMoving) &&
+  Require(EntryOf(*subscribed,kStill)->hidden && EntryOf(*subscribed,kMoving)==EntryOf(*stepped,kMoving) &&
     registry.stats().subscribed==2,"a render-only subscription reads its object");
   // A death on a render-only iteration is unpublished at once.
   registry.Died(kLate); Unlink(memory,kLate+108);
   const auto dead=registry.Tick(memory,kScene,1,decode,false);
   Require(!EntryOf(*dead,kLate) && dead->entries.size()==2 && CountNativeRenderSnapshotChanges(*subscribed,*dead)==1,
     "a render-only death");
-  // The next step re-reads every subscriber.
+  // The next step re-reads every subscriber; the pose moved since tick 1 blends.
   const auto next=registry.Tick(memory,kScene,2,decode);
-  Require((*EntryOf(*next,kMoving)->pose)[0][0]==80.0f && next->tick==2,"the next step reads what the light ticks left");
+  const auto moving=EntryOf(*next,kMoving);
+  Require((*moving->pose)[0][0]==80.0f && next->tick==2 && moving->motion.previous==EntryOf(*stepped,kMoving)->pose &&
+    !moving->motion.render_dependent,"the next step reads what the light ticks left");
   Require(!registry.AuditScene(memory,kScene).mismatches(),"light ticks keep the registry matching the scene");
   // Before any publication a render-only tick publishes (seeds) anyway.
   NativeRenderRegistry fresh(0);
   const auto first=fresh.Tick(memory,kScene,5,decode,false);
   Require(first && first->entries.size()==2 && fresh.stats().seeded==2,"a first render-only tick seeds and publishes");
+}
+// Render-only iterations with the probe: a light tick re-reads `probe`
+// update members round robin, so a member whose pose a render-only iteration
+// moves is found within members/probe light ticks; its pose is then
+// render-dependent (drawn as read), and it is live: read on every light tick
+// until kLiveQuiet light reads leave it unchanged. Idempotent members publish
+// nothing, so an unchanged light tick is still no new generation.
+void RenderOnlyProbes() {
+  std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0,1);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kA=0x2000,kB=0x3000,kC=0x4000;
+  BuildTree(memory,kA,true); BuildTree(memory,kB,true); BuildTree(memory,kC);
+  registry.Born(kA); registry.Born(kB); registry.Born(kC);
+  const auto stepped=registry.Tick(memory,kScene,1,decode);
+  // Idempotent members: probed, unchanged, no new generation.
+  const auto builds=registry.stats().builds;
+  Require(registry.Tick(memory,kScene,1,decode,false)==stepped && registry.stats().builds==builds+1 &&
+    registry.stats().probes==1 && registry.stats().idle_ticks==1,"an unchanged probe published");
+  Require(registry.Tick(memory,kScene,1,decode,false)==stepped && registry.stats().probes==2,"the probe moves on");
+  // kB's slot 2 poses on render-only iterations: found within two light ticks
+  // (two members, one probe each); kC (no subscription) is never probed.
+  BuildPose(memory,kB+400,kB+0x600,2,40.0f);
+  BuildPose(memory,kC+400,kC+0x600,2,40.0f);
+  std::shared_ptr<const NativeRenderRegistrySnapshot> found;
+  for(int i=0;i<2 && !found;++i) {
+    const auto light=registry.Tick(memory,kScene,1,decode,false);
+    if(light!=stepped) found=light;
+  }
+  Require(found && found->tick==1 && (*EntryOf(*found,kB)->pose)[0][0]==40.0f,"the probe missed a render-posed member");
+  Require(EntryOf(*found,kB)->motion.render_dependent && !EntryOf(*found,kB)->motion.previous &&
+    registry.stats().same_tick_changes==1 && registry.stats().live==1,"a render-only change is render-dependent and live");
+  Require(EntryOf(*found,kC)==EntryOf(*stepped,kC) && EntryOf(*found,kA)==EntryOf(*stepped,kA),"only the moved member changed");
+  // Live: read on every light tick, drawn as read.
+  BuildPose(memory,kB+400,kB+0x600,2,41.0f);
+  const auto live=registry.Tick(memory,kScene,1,decode,false);
+  Require((*EntryOf(*live,kB)->pose)[0][0]==41.0f && registry.stats().live_reads>=1,"a live member is read every light tick");
+  // A step: still render-dependent (sticky), not blended.
+  BuildPose(memory,kB+400,kB+0x600,2,42.0f);
+  const auto next=registry.Tick(memory,kScene,2,decode);
+  Require(EntryOf(*next,kB)->motion.render_dependent && !EntryOf(*next,kB)->motion.previous,"render dependence is sticky");
+  // Quiet: kLiveQuiet unchanged light reads return it to the probe.
+  for(int i=0;i<300 && registry.stats().live;++i) registry.Tick(memory,kScene,2,decode,false);
+  Require(!registry.stats().live,"a quiet live member stays live");
+  // A death drops it from the probe.
+  registry.Died(kA); Unlink(memory,kA+108); Unlink(memory,kA+120);
+  registry.Tick(memory,kScene,3,decode);
+  for(int i=0;i<4;++i) registry.Tick(memory,kScene,3,decode,false);
+  Require(!registry.AuditScene(memory,kScene).mismatches(),"probing kept the registry matching the scene");
+}
+// An object whose vtable stays the base's is re-read at spaced ticks, not at
+// every tick: light ticks in between stay idle.
+void PermanentlyDeferredBacksOff() {
+  std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0,0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kTree=0x2000,kBase=0x3000;
+  BuildTree(memory,kTree);
+  BuildObject(memory,kBase,kNativeRenderBaseVtable,false);
+  registry.Born(kTree); registry.Born(kBase);
+  const auto first=registry.Tick(memory,kScene,1,decode);
+  Require(registry.stats().deferred==1,"the base-vtable object is deferred");
+  // Light ticks of the same tick: nothing due, idle.
+  for(int i=0;i<4;++i) Require(registry.Tick(memory,kScene,1,decode,false)==first,"a deferred object kept a light tick busy");
+  Require(registry.stats().deferred==1 && registry.stats().idle_ticks==4,"a deferred object was re-read at the same tick");
+  // Across ticks the reads spread out: 1, 2, 4, 8 ... ticks apart.
+  for(uint64_t tick=2;tick<=64;++tick) {
+    registry.Tick(memory,kScene,tick,decode);
+    for(int i=0;i<2;++i) registry.Tick(memory,kScene,tick,decode,false);
+  }
+  Require(registry.stats().deferred<=8,"deferred reads are not backed off");
+  // Resolved when the derived vtable arrives (at the next due read).
+  memory.StoreWord(kBase,kTreeVtable);
+  BuildInstance(memory,kBase+416); BuildPose(memory,kBase+400,kBase+0x600,2,1.0f);
+  std::shared_ptr<const NativeRenderRegistrySnapshot> resolved;
+  for(uint64_t tick=65;tick<=200 && !(resolved && EntryOf(*resolved,kBase));++tick) resolved=registry.Tick(memory,kScene,tick,decode);
+  Require(resolved && EntryOf(*resolved,kBase),"a backed-off object never resolved");
+}
+// Alive: an entry's lifetime ends at its object's destructor or at another
+// constructor at its address, as soon as the hook runs (before a Tick).
+void LifetimeTokens() {
+  std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kTree=0x2000;
+  BuildTree(memory,kTree);
+  registry.Born(kTree);
+  const auto entry=EntryOf(*registry.Tick(memory,kScene,1,decode),kTree);
+  Require(entry && registry.Alive(kTree,entry->generation) && !registry.Alive(kTree,entry->generation+1) && !registry.Alive(0x5000,1),
+    "a published entry is alive");
+  registry.Died(kTree);
+  Require(!registry.Alive(kTree,entry->generation),"a death ends the lifetime before the tick");
+  registry.Born(kTree);  // Same address, same vtable.
+  Require(!registry.Alive(kTree,entry->generation),"a rebirth is not the old lifetime");
+  const auto reborn=EntryOf(*registry.Tick(memory,kScene,2,decode),kTree);
+  Require(reborn->generation!=entry->generation && registry.Alive(kTree,reborn->generation) && !registry.Alive(kTree,entry->generation),
+    "the new lifetime is the new entry's");
+  // A birth and a death drained together leave no lifetime.
+  registry.Died(kTree); registry.Born(kTree); registry.Died(kTree);
+  registry.Tick(memory,kScene,3,decode);
+  Require(!registry.Alive(kTree,reborn->generation) && !registry.Alive(kTree,reborn->generation+1),"a dead object is alive");
+  registry.Born(kTree);
+  const auto last=EntryOf(*registry.Tick(memory,kScene,4,decode),kTree);
+  Require(registry.Alive(kTree,last->generation),"a later birth is alive");
+  registry.Clear();
+  Require(!registry.Alive(kTree,last->generation),"Clear keeps lifetimes");
+}
+// Captures of instances a Build no longer draws (a weapon array moved) are
+// released once kCaptureAge builds pass without them.
+void CapturesArePruned() {
+  std::vector<uint8_t> bytes(0x60000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kSoldier=0x4000;
+  BuildObject(memory,kSoldier,kSoldierVtable,true);
+  BuildInstance(memory,kSoldier+1168); BuildPose(memory,kSoldier+1088,0x9000,3,1.0f);
+  memory.StoreWord(kSoldier+kNativeRenderWeaponCount,1);
+  registry.Born(kSoldier);
+  // Each tick the weapon array is somewhere else: a new instance address.
+  for(uint64_t tick=1;tick<=200;++tick) {
+    const uint32_t weapons=0x10000+uint32_t(tick%100)*0x800;
+    memory.StoreWord(kSoldier+kNativeRenderWeaponArray,weapons);
+    memory.StoreByte(weapons+1404,1); memory.StoreByte(weapons+1405,1); memory.StoreWord(weapons+108,0x1234);
+    BuildInstance(memory,weapons+100); BuildPose(memory,weapons+144,weapons+0x600,1,2.0f);
+    const auto entry=EntryOf(*registry.Tick(memory,kScene,tick,decode),kSoldier);
+    Require(entry && entry->attachments.size()==1 && entry->attachments[0].model.layout,"the moved weapon is drawn");
+  }
+  Require(registry.stats().captures_pruned>=100,"captures of instances no longer drawn were kept");
+}
+// The previous tick's bound: carried while the object is read on consecutive
+// ticks and the bound moves; kept while unchanged; reset by an unread tick.
+void BoundMotion() {
+  std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kTree=0x2000;
+  BuildTree(memory,kTree,true);
+  registry.Born(kTree);
+  const auto tick=[&](uint64_t at,bool refresh=true) { return EntryOf(*registry.Tick(memory,kScene,at,decode,refresh),kTree); };
+  const auto first=tick(1);
+  Require(!first->bound_motion.valid,"a first read has no previous bound");
+  Require(tick(2)==first,"an unchanged bound keeps the entry");
+  memory.StoreFloat(kTree+kNativeRenderObjectCentre,50.0f); memory.StoreFloat(kTree+kNativeRenderObjectRadius,6.0f);
+  const auto moved=tick(3);
+  Require(moved->bound_motion.valid && moved->bound_motion.tick==3 && moved->bound_motion.centre[0]==1.0f &&
+    moved->bound_motion.radius==5.0f && moved->bound_motion.axes==first->axes,"a moved bound carries the previous tick's");
+  Require(tick(4)==moved,"an unchanged bound keeps its motion");
+  memory.StoreFloat(kTree+kNativeRenderObjectCentre+8,9.0f);
+  const auto again=tick(5);
+  Require(again->bound_motion.tick==5 && again->bound_motion.centre[0]==50.0f && again->bound_motion.centre[2]==3.0f,
+    "a bound moving after a stationary tick has that tick's");
+  memory.StoreFloat(kTree+kNativeRenderObjectCentre+8,10.0f);
+  const auto same_tick=tick(5,false);
+  Require(same_tick->bound_motion.tick==5 && same_tick->bound_motion.centre[2]==3.0f,
+    "a render-only move keeps the previous tick's bound");
+  memory.StoreFloat(kTree+kNativeRenderObjectCentre+8,11.0f);
+  Require(!tick(7)->bound_motion.valid,"an unread tick resets");
 }
 
 // The box half axes decide the partial-sphere box test: a change to them alone
@@ -1086,6 +1249,11 @@ int main() {
     ResolvesClassAfterDerivedConstructor();
     SubscriptionDrivesRereads();
     RenderOnlyTicks();
+    RenderOnlyProbes();
+    PermanentlyDeferredBacksOff();
+    LifetimeTokens();
+    CapturesArePruned();
+    BoundMotion();
     LayoutCaptureWaitsForSizedPose();
     CharacterLodAndAttachments();
     ClassConstantsAndParts();

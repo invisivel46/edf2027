@@ -72,6 +72,9 @@ struct NativeFullFrameModelVisibility {
   std::array<float,4> centre{};  // View-space centre (what the guest stores at context+32).
   float depth=0;                 // d=-float(z*depth_scale), the LOD and cull distance.
   uint32_t sphere=0,box=0;       // 821C3070 / 821C33E8 results (box only after a partial sphere).
+  // Visible only at the previous tick's bound (NativeFullFrameModelVisibleMoving);
+  // centre and depth are still the current bound's.
+  bool previous=false;
   explicit operator bool() const { return cull==NativeFullFrameModelCull::Visible; }
 };
 // Hidden (obj+64) and an unsupported sort mode (not 0/1/2) reject first; then
@@ -80,6 +83,16 @@ struct NativeFullFrameModelVisibility {
 // box test on centre+axes, which rejects only when every corner is outside one
 // plane. Boundary comparisons are NativeVisibilitySphere/Box's (821C3070/821C33E8).
 NativeFullFrameModelVisibility ClassifyNativeFullFrameModel(const NativeRenderEntry& entry,const NativeSceneVisibilityView& view);
+// The models pass's visibility on a frame drawn at `motion`: an interpolated
+// frame draws poses blended from the previous tick's, so an entry whose bound
+// moved since that tick (NativeRenderEntry::bound_motion, of this tick) is
+// visible when either bound is: a distance, frustum or box cull at the
+// current bound is overridden (previous set) when the previous bound passes.
+// The centre, depth (so the LOD and key) stay the current bound's, as the
+// guest's. Without interpolation (locked mode), a fraction of 1 or a bound
+// motion of another tick it is ClassifyNativeFullFrameModel.
+NativeFullFrameModelVisibility ClassifyNativeFullFrameModelMoving(const NativeRenderEntry& entry,const NativeSceneVisibilityView& view,
+  const NativeFrameMotion& motion);
 // The model index into entry.models, stateless, or none when the choice has
 // no model. None: models[0]. Character (8210AE48): thresholds[i] selects
 // models[i+1]; the last i with d > thresholds[i] wins, else models[0].
@@ -198,7 +211,8 @@ struct NativeFullFrameModelPlan {
   struct Stats {
     uint64_t entries=0,hidden=0,mode=0,distance=0,frustum=0,box=0,no_model=0,no_pose=0,bucket_zero=0,opaque=0,transparent=0,
       instances=0,no_instanced=0,other_pass=0,attachments=0,no_attachment=0,
-      calls=0,unlisted=0;  // Slot-4 calls (`calls`); entries the gather order does not list.
+      calls=0,unlisted=0,  // Slot-4 calls (`calls`); entries the gather order does not list.
+      previous=0;          // Entries visible only at their previous tick's bound (interpolating).
   };
   std::vector<NativeFullFrameModelItem> opaque;       // Gather order.
   std::vector<NativeFullFrameModelItem> transparent;  // Draw order: key descending, ties in gather order.
@@ -238,9 +252,12 @@ std::vector<const NativeRenderEntry*> NativeFullFrameBrokenObjects(const NativeR
 // keys in gather order. High bucket 0 (key < 256) is never traversed there,
 // so those entries are dropped (stats.bucket_zero). The registry snapshot is
 // ordered by object; entries are taken in `gather` order (unlisted ones at
-// its `unlisted` position, among themselves in snapshot order).
+// its `unlisted` position, among themselves in snapshot order). motion: the
+// frame's (ClassifyNativeFullFrameModelMoving); an entry visible only at its
+// previous bound is drawn but is not one of `calls` (the guest's slot 4 of
+// this tick would not run for it; its draws see no pool carry).
 NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera,
-  const NativeFullFrameModelGather& gather={});
+  const NativeFullFrameModelGather& gather={},const NativeFrameMotion& motion={});
 
 // The shared effect pool as the model slot 4s leave it (821A1730 ->
 // 821A16D8: one float4 over a named pool value, sticky until the next store).
@@ -502,7 +519,7 @@ struct NativeFullFrameModelItemState {
   bool sourced=false,valued=false;
   std::vector<NativeFullFrameModelDrawState> draws;
   NativeFullFrameModelConstants values;
-  uint64_t used=0;
+  uint64_t used=0,seen=0;  // The Build (duplicates) and the frame (aging) it was last drawn in.
 };
 // One material row's per-frame work, kept across frames: its pass constants
 // (the published constants with the pass camera and animation applied), the
@@ -519,7 +536,9 @@ struct NativeFullFrameModelRowState {
   NativeScenePassCamera camera;
   std::optional<NativeScenePassAnimation> animation;
   bool animated=false,deferrable=false,same_backend=false;
-  uint64_t frame=0,used=0,draws=0;  // draws: rigid draws served this frame (memo_hits past the first).
+  // frame: the Build it last served; used: the frame (NativeFullFrameModels'
+  // frames_, aging). draws: rigid draws served this Build (memo_hits past the first).
+  uint64_t frame=0,used=0,draws=0;
   bool failed=false;
   std::string error;
   NativeSceneMaterialCapture capture;
@@ -600,10 +619,13 @@ class NativeFullFrameModels {
         mix(std::get<1>(key)));
     }
   };
-  // Rows and item states unused this long are dropped; past the limits, all.
+  // Rows and item states unused this many frames are dropped; past the
+  // limits, all. frame_ counts Builds (one per view); frames_ counts frames
+  // (a Build of view 0 starts one), which every cache ages by, so a frame of
+  // several views ages its rows once.
   static constexpr uint64_t kStateAge=64;
   static constexpr size_t kItemLimit=16384,kRowLimit=4096;
-  uint64_t next_id_=(uint64_t(5)<<60),frame_=0;
+  uint64_t next_id_=(uint64_t(5)<<60),frame_=0,frames_=0;
   NativeFullFrameModelSourceTable<NativeFullFrameModelSourcePair> sources_;
   NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve> materials_;
   std::unordered_map<ItemKey,NativeFullFrameModelItemState,ItemKeyHash> items_;

@@ -123,6 +123,45 @@ void Visibility() {
       "plan routes every rejection");
   }
 }
+// Interpolated frames draw poses blended from the previous tick's, so an
+// entry culled at its tick's bound but visible at the previous tick's is
+// drawn (not a slot-4 call), with the LOD and key of its current bound;
+// locked frames, alpha 1 and a bound motion of another tick cull as before.
+void MovingVisibility() {
+  const auto camera=MakeCamera();
+  const auto& view=camera.visibility;
+  const auto layout=Layout(0x1000,false,1,{Mesh(0,false,true,{Batch(0x2000,{0x3000})})});
+  auto entry=Entry(1,{500,0,300},1,layout);
+  entry->type=&kCharacter; entry->lod_thresholds={100,200};
+  entry->models={{0x5000,layout},{0x5001,layout},{0x5002,layout}};
+  entry->bound_motion={true,7,{0,0,50,1},{},1};
+  const NativeFrameMotion interpolated{7,.5f,1,true,true},locked{7,.5f,1,false,false};
+  Require(ClassifyNativeFullFrameModel(*entry,view).cull==C::Frustum,"the current bound is outside");
+  const auto moving=ClassifyNativeFullFrameModelMoving(*entry,view,interpolated);
+  Require(moving && moving.previous && moving.depth==300,"an entry visible at its previous bound is culled while interpolating");
+  Require(ClassifyNativeFullFrameModelMoving(*entry,view,locked).cull==C::Frustum,"locked mode keeps the tick's bound");
+  auto whole=interpolated; whole.fraction=1;
+  Require(ClassifyNativeFullFrameModelMoving(*entry,view,whole).cull==C::Frustum,"alpha 1 draws the tick's bound");
+  auto later=interpolated; later.tick=8;
+  Require(ClassifyNativeFullFrameModelMoving(*entry,view,later).cull==C::Frustum,"a bound motion of an earlier tick is stationary");
+  NativeRenderRegistrySnapshot snapshot;
+  snapshot.entries.push_back(entry);
+  const auto plan=PlanNativeFullFrameModels(snapshot,camera,{},interpolated);
+  Require(plan.opaque.size()==1 && plan.opaque[0].model==2 && plan.opaque[0].depth==300 && plan.calls.empty() &&
+    plan.stats.previous==1 && plan.stats.frustum==0,"the previous bound draws with the tick's LOD and is no slot-4 call");
+  const auto still=PlanNativeFullFrameModels(snapshot,camera,{},locked);
+  Require(still.opaque.empty() && still.stats.frustum==1 && !still.stats.previous,"locked mode planned a previous bound");
+  // Visible at the tick: unchanged, whatever the previous bound.
+  entry->centre={0,0,300,1}; entry->bound_motion.centre={500,0,300,1};
+  const auto current=ClassifyNativeFullFrameModelMoving(*entry,view,interpolated);
+  Require(current && !current.previous,"a visible entry is marked previous");
+  // A hidden entry stays hidden.
+  entry->centre={500,0,300,1}; entry->bound_motion.centre={0,0,50,1}; entry->hidden=true;
+  Require(ClassifyNativeFullFrameModelMoving(*entry,view,interpolated).cull==C::Hidden,"a hidden entry was drawn at its previous bound");
+  // Distance and box culls take the previous bound too.
+  entry->hidden=false; entry->centre={0,0,600,1}; entry->cull_distance=500;
+  Require(ClassifyNativeFullFrameModelMoving(*entry,view,interpolated).previous,"a distance cull ignored the previous bound");
+}
 void Lod() {
   const auto layout=Layout(0x1000,false,1,{Mesh(0,false,true,{})});
   NativeRenderEntry entry;
@@ -497,9 +536,10 @@ void SourceMemo() {
   programs[0x3000]=std::make_shared<const int>(30);
   generation=validate(); row(generation);
   Require(rows==2 && row(generation).first==programs[0x3000],"a changed program refetches its rows");
-  // Pruning: after `age` idle Builds the generation advances without a
-  // provider call; past `limit` results as well.
-  Memo aging(16,64,3);
+  // Pruning: while some result is stale (no row asked for it in the last
+  // `recent` Validates), after `age` idle Builds the generation advances
+  // without a provider call; past max(`limit`, twice the live results) as well.
+  Memo aging(16,64,3,1);
   const auto age=[&] { return aging.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },
     [&](uint32_t address) { return geometry.at(address); },[](const auto& work) { work(); }); };
   const auto start=age();
@@ -508,13 +548,30 @@ void SourceMemo() {
   fetched=0;
   Require(aging.ProgramFor(0x3000,[&] { ++fetched; return programs.at(0x3000); })==programs[0x3000] && fetched==0,
     "a prune carries what it asked");
-  Memo bounded(16,1,0);
-  bounded.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },[&](uint32_t address) { return geometry.at(address); },
-    [](const auto& work) { work(); });
+  // A live working set over `limit` is kept at its generation (not shed and
+  // re-sourced at every Validate); once part of it goes stale and the rest is
+  // under half of what is remembered, it is pruned.
+  Memo bounded(16,1,0,1);
+  const auto bound=[&] { return bounded.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },
+    [&](uint32_t address) { return geometry.at(address); },[](const auto& work) { work(); }); };
+  const auto held=bound();
+  for(int frame=0;frame<8;++frame) {
+    for(const auto pass:{0x3000u,0x3100u,0x3200u}) bounded.ProgramFor(pass,[&] { return programs.at(pass); });
+    Require(bound()==held,"a live working set over the limit was pruned");
+  }
+  Require(bounded.stats().prunes==0 && bounded.size()==3,"a live working set was shed");
   bounded.ProgramFor(0x3000,[&] { return programs.at(0x3000); }); bounded.ProgramFor(0x3100,[&] { return programs.at(0x3100); });
-  const auto before=bounded.generation();
-  Require(bounded.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },
-    [&](uint32_t address) { return geometry.at(address); },[](const auto& work) { work(); })==before+1,"a memo past its limit is pruned");
+  Require(bound()==held,"one stale result of three is within twice the live set");
+  Require(bound()==held+1 && bounded.stats().prunes==1,"a memo whose results went stale past its limit is not pruned");
+  // Nothing stale: an idle memo is never pruned for its age.
+  Memo idle(16,64,2,4);
+  const auto idle_validate=[&] { return idle.Validate([&] { return host; },[&](uint32_t pass) { return programs.at(pass); },
+    [&](uint32_t address) { return geometry.at(address); },[](const auto& work) { work(); }); };
+  const auto idle_start=idle_validate();
+  for(int frame=0;frame<8;++frame) {
+    idle.ProgramFor(0x3000,[&] { return programs.at(0x3000); });
+    Require(idle_validate()==idle_start,"a memo with nothing stale was pruned for its age");
+  }
 }
 NativeFullFrameModelMaterialKey MaterialKey(uint32_t pass,std::shared_ptr<const void> program,std::shared_ptr<const void> geometry) {
   NativeFullFrameModelTargets targets; targets.dsv_format=1;
@@ -900,6 +957,32 @@ void SkinnedBuild(std::shared_ptr<NativeRenderBackend> backend) {
   const auto carried=models.Build(snapshot,camera,pass,sources);
   Require(carried.stats.reused==6 && carried.stats.derived==0 && carried.stats.blended==0,
     "a pose of an earlier tick keeps carrying its objects");
+  // Several views a frame age the caches once per frame: a blend prepared
+  // in view 0 is reused next frame after three more views drew nothing, and
+  // an item state outlives kStateAge Builds of views that do not draw it.
+  for(size_t e=0;e<entries.size();++e) {
+    auto from=std::make_shared<std::vector<NativePoseMatrix>>(),to=std::make_shared<std::vector<NativePoseMatrix>>();
+    for(size_t b=0;b<3;++b) {
+      from->push_back(Bone(.2f*float(b),{1,1,1},{float(e),0,0}));
+      to->push_back(Bone(.2f*float(b)+.4f,{1,1.5f,1},{float(e)+3,1,0}));
+    }
+    entries[e]->pose=to; entries[e]->motion={from,11,false};
+  }
+  const NativeRenderRegistrySnapshot empty;
+  const auto views=[&](const NativeRenderRegistrySnapshot& first,uint32_t count) {
+    for(uint32_t v=0;v<count;++v) { pass.view=v; models.Build(v?empty:first,camera,pass,sources); }
+    pass.view=0;
+  };
+  pass.motion={11,.5f,1,true};
+  views(snapshot,4);
+  const auto prepared=models.poses().stats().prepared;
+  views(snapshot,4);
+  Require(models.poses().stats().prepared==prepared,"a blend was prepared again after the views of one frame");
+  const auto states=models.item_states();
+  for(int frame=0;frame<40;++frame) views(empty,4);
+  Require(models.item_states()==states,"item states aged by views, not frames");
+  for(int frame=0;frame<140;++frame) views(empty,1);
+  Require(models.item_states()==0,"item states unused for kStateAge frames were kept");
 }
 // Attachments through Build: the face draws after the model with its own
 // layout, pose and constants, in its own draw state; moving only the face
@@ -1893,7 +1976,7 @@ int main(int argc,char** argv) {
       ModelFrames(std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false})));
       return 0;
     }
-    Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
+    Visibility(); MovingVisibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
     SourceTable(); SourceMemo(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
     AttachmentsFollowTheModel(); PoseSource(); ObjectConstantOverrides(); PoolCallOrder(); PoolCarry(); GatherWalk();
     // The skinned material path against full captures, on both backends (WARP).

@@ -129,6 +129,20 @@ struct NativeRenderPoseMotion {
   bool render_dependent=false;
   bool operator==(const NativeRenderPoseMotion&) const=default;
 };
+// The bound an entry had at the tick before `tick` (centre, half axes,
+// radius), when the registry read the object on both ticks and the bound
+// moved between them: an interpolated frame draws the pose blended from that
+// tick's, so the models pass keeps an object visible at either bound
+// (PlanNativeFullFrameModels with an interpolating motion). Invalid when the
+// bound did not move since the object's first read, or after a reset (a new
+// generation, an unread tick). An unchanged bound keeps its motion.
+struct NativeRenderBoundMotion {
+  bool valid=false;
+  uint64_t tick=0;
+  std::array<float,4> centre{};
+  std::array<float,12> axes{};
+  float radius=0;
+};
 // A model drawn with its own pose vector (face, weapons), in guest draw order.
 struct NativeRenderAttachment {
   NativeRenderModel model;
@@ -161,6 +175,7 @@ struct NativeRenderEntry {
   // obj+304/+320/+336 (float4 each), the box 821C33E8 tests on a partial sphere.
   std::array<float,12> axes{};
   float radius=0,cull_distance=0,sort_bias=0;
+  NativeRenderBoundMotion bound_motion;  // The previous tick's centre, axes and radius.
   int32_t mode=0;
   bool hidden=false;
   // LOD thresholds (8210AE48: 48-byte records at *(obj+1128); 820B2670:

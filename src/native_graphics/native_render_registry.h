@@ -12,9 +12,9 @@
 // - 821A4DE8 exit: Tick. Events are applied in hook order, then the tick
 //   re-reads only new objects, scene+100 members, objects with instanced
 //   worlds (their inputs advance in slot 3, not through scene+100), objects
-//   waiting for their first layout (backed off) and a small round-robin
-//   refresh of the rest, and publishes a snapshot whose unchanged entries are
-//   the previous pointers.
+//   waiting for their first layout or derived vtable (backed off) and a small
+//   round-robin refresh of the rest, and publishes a snapshot whose unchanged
+//   entries are the previous pointers.
 // Frame-cadence classes with a root (NativeRenderClass::frame_root, e.g.
 // clBrokenObject) build their pose inside slot 4, which full-frame mode never
 // runs: the registry re-reads them every tick and computes that pose natively
@@ -54,7 +54,24 @@
 // re-read publishes (the model's, each attachment's and each instanced set's
 // worlds) carries the previous tick's pose while the object was read on
 // consecutive ticks, for the models pass to interpolate in unlocked mode; an
-// unchanged pose keeps its motion, so unchanged entries stay shared.
+// unchanged pose keeps its motion, so unchanged entries stay shared. The
+// bound (centre, axes, radius) carries its previous tick's the same way
+// (NativeRenderBoundMotion), for conservative culling of a blended pose.
+//
+// Render-only iterations: 821A4DE8 runs its camera loop and the scene+100
+// slot-2 walk on every iteration, stepped or not. Every slot 2 of the class
+// table is idempotent (static reading of generated/default): it copies node
+// world matrices (node+240) that only slot 3 moves into the pose vectors
+// (821C9478 via 8210AE08 for the LOD pose +1088; 820DB220 the face +1636;
+// 820E1A48 each people / vehicle weapon's w+144; 820F0188 and 821E7B60 the
+// parts; the rigid ammo, shell and broken-piece bodies their own vector),
+// plus "previous = current" 32-byte copies; none reads the camera, a clock
+// or accumulates, and none calls slot 8. The one camera-dependent pose is
+// clSky's, built in its slot 4 820BB270 (other_pass: the sky pass poses it).
+// So no class is marked; instead a light tick probes the update members round
+// robin, and a member a render-only iteration did change (a class missed
+// here, or the unread scene+2228 list's writers) is found within
+// members/probe iterations, published live and made render-dependent.
 //
 // Cost per tick is O(re-read objects + changes), never O(entries): a re-read
 // builds into a reused scratch entry and compares it with the published one
@@ -182,6 +199,12 @@ inline bool SameNativeRenderEntry(const NativeRenderEntry& a,const NativeRenderE
   for(size_t i=0;i<4;++i) if(bits(a.centre[i])!=bits(b.centre[i])) return false;
   // The box half axes feed the partial-sphere box test (ClassifyNativeFullFrameModel).
   for(size_t i=0;i<a.axes.size();++i) if(bits(a.axes[i])!=bits(b.axes[i])) return false;
+  const auto& x=a.bound_motion,&y=b.bound_motion;
+  if(x.valid!=y.valid || (x.valid && (x.tick!=y.tick || bits(x.radius)!=bits(y.radius)))) return false;
+  if(x.valid) {
+    for(size_t i=0;i<4;++i) if(bits(x.centre[i])!=bits(y.centre[i])) return false;
+    for(size_t i=0;i<x.axes.size();++i) if(bits(x.axes[i])!=bits(y.axes[i])) return false;
+  }
   for(size_t i=0;i<a.lod_thresholds.size();++i) if(bits(a.lod_thresholds[i])!=bits(b.lod_thresholds[i])) return false;
   for(size_t i=0;i<a.models.size();++i) if(!same_models(a.models[i],b.models[i])) return false;
   for(size_t i=0;i<a.attachments.size();++i) {
@@ -203,8 +226,12 @@ class NativeRenderRegistry {
     uint64_t ticks=0,light_ticks=0,idle_ticks=0,births=0,seeded=0,rebirths=0,deaths=0,unknown_deaths=0,subscriptions=0,unknown_subscriptions=0,
       unknown_classes=0,reclassified=0,deferred=0,foreign=0,builds=0,changed=0,unchanged=0,pose_reuses=0,read_failures=0,
       layout_captures=0,layout_failures=0,instanced_worlds=0,frame_poses=0,frame_pose_reuses=0,frame_pose_failures=0,
-      constant_changes=0;  // Per-object constant sets published anew (NativeRenderEntry::constants and attachments').
-    size_t records=0,subscribed=0,published=0,retrying=0;
+      constant_changes=0,  // Per-object constant sets published anew (NativeRenderEntry::constants and attachments').
+      // Light-tick reads of update members (probes: the rotating sample;
+      // live_reads: members known to change on render-only iterations) and
+      // re-reads that changed an entry read earlier at the same tick.
+      probes=0,live_reads=0,same_tick_changes=0,captures_pruned=0;
+    size_t records=0,subscribed=0,published=0,retrying=0,live=0;
   };
   // In-game check (edf_native_render_registry_audit): scene+84 against the
   // registry's records of that scene, scene+100 against its subscriptions.
@@ -214,7 +241,11 @@ class NativeRenderRegistry {
   };
   // refresh: records outside scene+100 re-read per tick, round robin, so
   // visibility changes made without a subscription still reach the snapshot.
-  explicit NativeRenderRegistry(size_t refresh=32):refresh_(refresh) {}
+  // probe: update members (scene+100 subscribers and the animated set)
+  // re-read per render-only (light) tick, round robin, so a member whose
+  // slot 2 changes its entry on render-only iterations is found within
+  // members/probe such iterations (then read on every one: `live`).
+  explicit NativeRenderRegistry(size_t refresh=32,size_t probe=32):refresh_(refresh),probe_(probe) {}
 
   // Hooks, any thread; the caller checks the enable cvar first.
   void Born(uint32_t object) { Push(object,Event::Birth); }
@@ -228,21 +259,23 @@ class NativeRenderRegistry {
   // `bones` pose entries (DecodeNativeModelLayoutWith's override) or throws.
   //
   // refresh false: a render-only iteration (unlocked, no simulation step, so
-  // the tick has not advanced). Only what an event or a first sight asks for
-  // is read: the hooks' events are applied, and pending (new, resubscribed,
-  // deferred) objects and due retries are re-read, but not the scene+100
-  // members, the animated set or the round-robin refresh, whose inputs a
-  // simulation step writes. When that leaves nothing to read and no event
-  // arrived, the published snapshot is returned as is: no new generation.
+  // the tick has not advanced). The hooks' events are applied, pending (new,
+  // resubscribed) objects and due retries are re-read, and of the update
+  // members (whose slot 2 821A4DE8 runs on every iteration) only the live
+  // ones and `probe` more, round robin: not every member, the animated set
+  // or the round-robin refresh, whose inputs a simulation step writes. A
+  // member whose entry a light read finds changed since its read at the same
+  // tick changes on render-only iterations: it is live, read on every light
+  // tick (its pose becomes render-dependent, drawn as read, never blended),
+  // until kLiveQuiet light reads in a row leave it unchanged. When a light
+  // tick publishes no change the published snapshot is returned as is: no
+  // new generation.
   template<class Reader,class Decode>
   std::shared_ptr<const NativeRenderRegistrySnapshot> Tick(const Reader& reader,uint32_t scene,uint64_t tick,const Decode& decode,
       bool refresh=true) {
     active_.store(true,std::memory_order_relaxed);
-    const bool events=Drain();
-    if(!refresh && seeded_ && !events && pending_.empty() && !RetryDue(tick)) {
-      std::lock_guard lock(publish_mutex_);
-      if(published_) { ++stats_.idle_ticks; return published_; }
-    }
+    dirty_=false;
+    Drain();
     ++stats_.ticks;
     if(!refresh) ++stats_.light_ticks;
     // Enabled mid-game (or first tick): adopt what the scene already holds.
@@ -257,6 +290,18 @@ class NativeRenderRegistry {
     if(refresh) {
       work.insert(work.end(),subscribed_.begin(),subscribed_.end());
       work.insert(work.end(),animated_.begin(),animated_.end());
+    } else {
+      for(const auto& [object,quiet]:live_) { work.push_back(object); ++stats_.live_reads; }
+      for(size_t visited=0;visited<probe_ && !probes_.empty();++visited) {
+        if(probe_cursor_>=probes_.size()) probe_cursor_=0;
+        const auto [object,generation]=probes_[probe_cursor_];
+        const auto found=records_.find(object);
+        if(found==records_.end() || found->second.generation!=generation || !Updating(object,found->second)) {
+          if(found!=records_.end() && found->second.generation==generation) found->second.probed=false;
+          probes_[probe_cursor_]=probes_.back(); probes_.pop_back(); continue;
+        }
+        work.push_back(object); ++probe_cursor_; ++stats_.probes;
+      }
     }
     for(auto at=retry_.begin();at!=retry_.end();) {
       if(at->second<=tick) { work.push_back(at->first); at=retry_.erase(at); } else ++at;
@@ -272,7 +317,19 @@ class NativeRenderRegistry {
     work.erase(std::unique(work.begin(),work.end()),work.end());
     for(const auto object:work) {
       const auto found=records_.find(object);
-      if(found!=records_.end()) Update(reader,scene,tick,object,found->second,decode);
+      if(found==records_.end()) continue;
+      auto& record=found->second;
+      const bool same_tick=Update(reader,scene,tick,object,record,decode);
+      if(same_tick) { ++stats_.same_tick_changes; if(Updating(object,record)) live_.insert_or_assign(object,0u); }
+      else if(!refresh) {
+        // A live member's quiet light reads.
+        const auto live=live_.find(object);
+        if(live!=live_.end() && ++live->second>=kLiveQuiet) live_.erase(live);
+      }
+    }
+    if(!refresh && !dirty_) {
+      std::lock_guard lock(publish_mutex_);
+      if(published_ && published_->tick==tick) { ++stats_.idle_ticks; return published_; }
     }
     auto snapshot=std::make_shared<NativeRenderRegistrySnapshot>();
     snapshot->tick=tick; snapshot->generation=++publications_; snapshot->objects=objects_; snapshot->entries=entries_;
@@ -295,6 +352,47 @@ class NativeRenderRegistry {
     }
     return audit;
   }
+  // Whether `object` is still the render object of registry lifetime
+  // `generation` (NativeRenderEntry::generation): false once its destructor
+  // or another constructor at its address ran (the hooks' events count at
+  // once, before a Tick applies them). Any thread.
+  bool Alive(uint32_t object,uint64_t generation) const {
+    std::lock_guard lock(events_mutex_);
+    const auto found=lifetimes_.find(object);
+    return found!=lifetimes_.end() && found->second==generation;
+  }
+  // edf_native_render_registry_idle_audit, after a light tick: the entries a
+  // full tick at the same tick would change among the update members (the
+  // scene+100 subscribers and the animated set), which the light tick left
+  // unread. Compare only: nothing is published, and no record's read state,
+  // retry, subscription, live set or pose motion moves (an audit that
+  // published would mark exactly the poses it reports render-dependent).
+  // A member whose vtable changed or that is not yet resolved is counted
+  // changed without being read; a failed read counts when it would unpublish.
+  template<class Reader,class Decode>
+  size_t AuditLight(const Reader& reader,uint32_t scene,uint64_t tick,const Decode& decode) {
+    const auto stats=stats_;
+    std::vector<uint32_t> work(subscribed_.begin(),subscribed_.end());
+    work.insert(work.end(),animated_.begin(),animated_.end());
+    std::sort(work.begin(),work.end());
+    work.erase(std::unique(work.begin(),work.end()),work.end());
+    size_t changes=0;
+    for(const auto object:work) {
+      const auto found=records_.find(object);
+      if(found==records_.end()) continue;
+      auto& record=found->second;
+      const auto* previous=objects_.Find(object);
+      try {
+        if(!record.vtable || reader.Word(object)!=record.vtable) { ++changes; continue; }
+        if(record.scene!=scene || !Drawable(record)) continue;
+        bool complete=true;
+        Build(reader,tick,object,record,decode,complete);
+        changes+=!previous || !SameNativeRenderEntry(**previous,scratch_);
+      } catch(const std::exception&) { changes+=previous!=nullptr; }
+    }
+    stats_=stats;
+    return changes;
+  }
   std::shared_ptr<const NativeRenderRegistrySnapshot> AcquireSnapshot() const {
     std::lock_guard lock(publish_mutex_);
     return published_;
@@ -302,14 +400,16 @@ class NativeRenderRegistry {
   Stats stats() const {
     auto stats=stats_;
     stats.records=records_.size(); stats.subscribed=subscribed_.size();
-    stats.published=objects_.size(); stats.retrying=retry_.size();
+    stats.published=objects_.size(); stats.retrying=retry_.size(); stats.live=live_.size();
     return stats;
   }
   void Clear() {
     { std::lock_guard lock(events_mutex_); events_.clear(); }
+    { std::lock_guard lock(events_mutex_); lifetimes_.clear(); }
     records_.clear(); pending_.clear(); subscribed_.clear(); animated_.clear(); retry_.clear(); ring_.clear();
+    live_.clear(); probes_.clear();
     objects_=decltype(objects_){}; entries_.clear();
-    cursor_=0; seeded_=false;
+    cursor_=0; probe_cursor_=0; seeded_=false;
     { std::lock_guard lock(publish_mutex_); published_.reset(); }
     active_.store(false,std::memory_order_relaxed);
   }
@@ -322,6 +422,7 @@ class NativeRenderRegistry {
     uint32_t instance=0,container=0,node=0,pose_vector=0;
     std::shared_ptr<const NativeModelLayout> layout;
     bool rejected=false;
+    uint64_t used=0;  // Record::builds at the last Build that drew this instance.
   };
   struct Record {
     uint64_t generation=0;
@@ -339,13 +440,23 @@ class NativeRenderRegistry {
     // The tick of the last read that published the entry (pose motion).
     uint64_t read_tick=0;
     bool read=false;
+    // Reads that found the base vtable (the derived constructor has not run):
+    // the next one is 2^deferrals ticks later (capped), so an object that
+    // never leaves it does not keep every light tick busy.
+    uint32_t deferrals=0;
+    // In probes_ (the light ticks' round robin over update members).
+    bool probed=false;
+    // Builds of this record (captures unused for kCaptureAge of them go).
+    uint64_t builds=0;
   };
   void Push(uint32_t object,Event event) {
-    { std::lock_guard lock(events_mutex_); events_.push_back({object,event}); }
+    {
+      std::lock_guard lock(events_mutex_);
+      events_.push_back({object,event});
+      // A constructor or destructor ends the lifetime Alive answers for.
+      if(event==Event::Birth || event==Event::Death) lifetimes_.erase(object);
+    }
     active_.store(true,std::memory_order_relaxed);
-  }
-  bool RetryDue(uint64_t tick) const {
-    return std::any_of(retry_.begin(),retry_.end(),[&](const auto& item) { return item.second<=tick; });
   }
   // Whether any event was applied.
   bool Drain() {
@@ -368,33 +479,72 @@ class NativeRenderRegistry {
   void Birth(uint32_t object) {
     auto& record=records_[object];
     record.generation=++generation_;
+    {
+      // Unless another constructor or destructor at this address is queued
+      // behind this birth (Drain applies the list it swapped out).
+      std::lock_guard lock(events_mutex_);
+      const bool later=std::any_of(events_.begin(),events_.end(),[&](const Pending& e) { return e.object==object && e.event!=Event::Subscribe && e.event!=Event::Unsubscribe; });
+      if(!later) lifetimes_.insert_or_assign(object,record.generation);
+    }
     pending_.insert(object);
     ring_.emplace_back(object,record.generation);
     ++stats_.births;
   }
   void Forget(uint32_t object) {
+    if(const auto found=records_.find(object);found!=records_.end()) {
+      std::lock_guard lock(events_mutex_);
+      const auto lifetime=lifetimes_.find(object);
+      if(lifetime!=lifetimes_.end() && lifetime->second==found->second.generation) lifetimes_.erase(lifetime);
+    }
     records_.erase(object); pending_.erase(object); subscribed_.erase(object); animated_.erase(object); retry_.erase(object);
+    live_.erase(object);
     Unpublish(object);
   }
   struct EntryObject { uint32_t operator()(const std::shared_ptr<const NativeRenderEntry>& entry) const { return entry->object; } };
   void Publish(uint32_t object,std::shared_ptr<const NativeRenderEntry> entry) {
-    entries_.Assign(entry,EntryObject{}); objects_.Set(object,std::move(entry));
+    dirty_=true; entries_.Assign(entry,EntryObject{}); objects_.Set(object,std::move(entry));
   }
-  bool Unpublish(uint32_t object) { entries_.Erase(object,EntryObject{}); return objects_.Erase(object); }
+  bool Unpublish(uint32_t object) {
+    entries_.Erase(object,EntryObject{});
+    const bool erased=objects_.Erase(object);
+    dirty_=dirty_ || erased;
+    return erased;
+  }
+  // An update member: 821A4DE8 runs its slot 2 on every iteration (scene+100),
+  // or its inputs advance outside it (the animated set).
+  bool Updating(uint32_t object,const Record& record) const { return record.subscribed || animated_.contains(object); }
+  void Probe(uint32_t object,Record& record) {
+    if(record.probed) return;
+    record.probed=true; probes_.emplace_back(object,record.generation);
+  }
+  void Classify(uint32_t object,Record& record) { if(Updating(object,record)) Probe(object,record); }
+  static bool Drawable(const Record& record) {
+    return record.type && !record.type->scene_source && !record.type->effect && !record.type->other_pass;
+  }
   // An unsubscribe still gets one last read: the final pose stays published.
   void Subscribe(uint32_t object,Record& record,bool subscribed) {
     record.subscribed=subscribed;
     if(subscribed) subscribed_.insert(object); else subscribed_.erase(object);
+    Classify(object,record);
     pending_.insert(object);
   }
+  // Returns whether the read changed an entry published by a read at this
+  // same tick (a render-only iteration moved it).
   template<class Reader,class Decode>
-  void Update(const Reader& reader,uint32_t scene,uint64_t tick,uint32_t object,Record& record,const Decode& decode) {
+  bool Update(const Reader& reader,uint32_t scene,uint64_t tick,uint32_t object,Record& record,const Decode& decode) {
     ++stats_.builds;
     bool built=false,complete=true;
+    const bool read_now=record.read && record.read_tick==tick;
     try {
       const auto vtable=reader.Word(object);
-      // The derived constructor has not stored its vtable yet: resolve next tick.
-      if(vtable==kNativeRenderBaseVtable || vtable==kNativeRenderBaseVtableEarly) { ++stats_.deferred; pending_.insert(object); return; }
+      // The derived constructor has not stored its vtable yet: resolve at a
+      // later tick, backed off (1, 2, 4 ... 2^kDeferralShift ticks).
+      if(vtable==kNativeRenderBaseVtable || vtable==kNativeRenderBaseVtableEarly) {
+        ++stats_.deferred;
+        retry_[object]=tick+(uint64_t(1)<<std::min(record.deferrals++,kDeferralShift));
+        return false;
+      }
+      record.deferrals=0;
       if(vtable!=record.vtable) {
         if(record.vtable) ++stats_.reclassified;
         else {
@@ -414,19 +564,23 @@ class NativeRenderRegistry {
         if(record.type && ((record.type->attachments&kNativeRenderMotherSpheres) || record.type->frame_root ||
            NativeRenderClassHasConstants(*record.type))) animated_.insert(object);
         else animated_.erase(object);
+        live_.erase(object);
+        Classify(object,record);
       }
       if(record.scene!=scene) ++stats_.foreign;
-      else if(record.type && !record.type->scene_source && !record.type->effect && !record.type->other_pass) { Build(reader,tick,object,record,decode,complete); built=true; }
+      else if(Drawable(record)) { Build(reader,tick,object,record,decode,complete); built=true; }
     } catch(const std::exception&) { ++stats_.read_failures; built=false; complete=false; }
     record.read=built; record.read_tick=tick;
     if(complete) { record.retries=0; retry_.erase(object); }
     else retry_[object]=tick+(uint64_t(1)<<std::min<uint32_t>(record.retries++,10));
     const auto* previous=objects_.Find(object);
-    if(!built) { if(previous) Unpublish(object); return; }
-    if(previous && SameNativeRenderEntry(**previous,scratch_)) { ++stats_.unchanged; return; }
+    if(!built) { if(previous) Unpublish(object); return false; }
+    if(previous && SameNativeRenderEntry(**previous,scratch_)) { ++stats_.unchanged; return false; }
     // Changed: the one allocation (and chunk clone) per changed entry.
+    const bool same_tick=read_now && previous;
     Publish(object,std::make_shared<const NativeRenderEntry>(scratch_));
     ++stats_.changed;
+    return same_tick;
   }
   // Fills scratch_ (vectors keep their capacity across builds); poses equal
   // to the published entry's are that entry's shared pointers.
@@ -456,6 +610,8 @@ class NativeRenderRegistry {
     entry->mode=int32_t(reader.Word(object+kNativeRenderObjectMode));
     const auto* hidden=reader.Bytes(object+kNativeRenderObjectHidden,2);
     entry->hidden=(hidden[0]|hidden[1])!=0;
+    entry->bound_motion=AdvanceNativeRenderBoundMotion(*entry,old,same_generation,read,tick);
+    ++record.builds;
     if(!type.instance || !type.pose) return; // Tracked, no model: visibility only.
     // The pool constants slot 4 stores before its first draw (821A1730), in
     // effect for every later draw of this slot 4 until one is stored again.
@@ -606,10 +762,19 @@ class NativeRenderRegistry {
     auto capture=std::find_if(record.captures.begin(),record.captures.end(),[&](const Capture& c) { return c.instance==instance; });
     if(capture!=record.captures.end() && capture->container==container && capture->node==node && capture->pose_vector==vector &&
        (capture->rejected || (capture->layout && capture->layout->bones==bones))) {
+      capture->used=record.builds;
       model.layout=capture->layout;
       return model;
     }
-    if(capture==record.captures.end()) capture=record.captures.insert(record.captures.end(),Capture{instance});
+    if(capture==record.captures.end()) {
+      // Captures of instances no Build drew for kCaptureAge builds (a weapon
+      // array reallocated, a LOD table replaced) release their layouts.
+      const auto before=record.captures.size();
+      std::erase_if(record.captures,[&](const Capture& c) { return c.used+kCaptureAge<record.builds; });
+      stats_.captures_pruned+=before-record.captures.size();
+      capture=record.captures.insert(record.captures.end(),Capture{instance});
+    }
+    capture->used=record.builds;
     capture->container=container; capture->node=node; capture->pose_vector=vector;
     capture->layout.reset(); capture->rejected=false;
     if(!container || !node || (vector && !bones)) { complete=false; return model; }
@@ -621,17 +786,24 @@ class NativeRenderRegistry {
     return model;
   }
 
-  size_t refresh_;
+  static constexpr uint32_t kDeferralShift=6;   // At most 64 ticks between reads of a base-vtable object.
+  static constexpr uint32_t kLiveQuiet=240;     // Unchanged light reads before a live member is probed again.
+  static constexpr uint64_t kCaptureAge=64;     // Builds a capture survives unused.
+  size_t refresh_,probe_;
   std::atomic<bool> active_{false};
-  std::mutex events_mutex_;
+  mutable std::mutex events_mutex_;
   std::vector<Pending> events_;
+  // object -> the generation of its current lifetime (Alive); guarded by events_mutex_.
+  std::unordered_map<uint32_t,uint64_t> lifetimes_;
   // Engine thread only.
   std::unordered_map<uint32_t,Record> records_;
   std::unordered_set<uint32_t> pending_,subscribed_,animated_;  // animated_: re-read every tick (instanced worlds)
   std::unordered_map<uint32_t,uint64_t> retry_;              // object -> next tick to retry
   std::vector<std::pair<uint32_t,uint64_t>> ring_;           // (object, generation), lazily pruned
-  size_t cursor_=0;
-  bool seeded_=false;
+  std::vector<std::pair<uint32_t,uint64_t>> probes_;         // Update members (object, generation), lazily pruned
+  std::unordered_map<uint32_t,uint32_t> live_;               // object -> unchanged light reads in a row
+  size_t cursor_=0,probe_cursor_=0;
+  bool seeded_=false,dirty_=false;
   uint64_t generation_=0,publications_=0;
   NativeSharedMap<uint32_t,std::shared_ptr<const NativeRenderEntry>> objects_;
   NativeSharedVector<std::shared_ptr<const NativeRenderEntry>> entries_;  // objects_' values, same order

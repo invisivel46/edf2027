@@ -1,5 +1,6 @@
 #include "native_full_frame_models.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 namespace edf::native {
@@ -22,6 +23,19 @@ NativeFullFrameModelVisibility ClassifyNativeFullFrameModel(const NativeRenderEn
   if(!result.box) result.cull=C::Box;
   return result;
 }
+NativeFullFrameModelVisibility ClassifyNativeFullFrameModelMoving(const NativeRenderEntry& entry,const NativeSceneVisibilityView& view,
+    const NativeFrameMotion& motion) {
+  using C=NativeFullFrameModelCull;
+  auto result=ClassifyNativeFullFrameModel(entry,view);
+  const auto& bound=entry.bound_motion;
+  if(result || (result.cull!=C::Distance && result.cull!=C::Frustum && result.cull!=C::Box) || !motion.interpolate ||
+     !bound.valid || bound.tick!=motion.tick || !std::isfinite(motion.fraction) || motion.fraction>=1) return result;
+  auto previous=entry;
+  previous.centre=bound.centre; previous.axes=bound.axes; previous.radius=bound.radius;
+  if(!ClassifyNativeFullFrameModel(previous,view)) return result;
+  result.cull=C::Visible; result.previous=true;
+  return result;
+}
 std::optional<uint32_t> SelectNativeFullFrameModelLod(const NativeRenderEntry& entry,float depth) {
   const auto& thresholds=entry.lod_thresholds;
   uint32_t chosen=0;
@@ -40,7 +54,7 @@ std::optional<uint32_t> SelectNativeFullFrameModelLod(const NativeRenderEntry& e
   return chosen;
 }
 NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera,
-    const NativeFullFrameModelGather& gather) {
+    const NativeFullFrameModelGather& gather,const NativeFrameMotion& motion) {
   using C=NativeFullFrameModelCull;
   NativeFullFrameModelPlan plan;
   auto& stats=plan.stats;
@@ -69,7 +83,7 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
     // Drawn by its own pass (clSky: the sky pass); the registry never
     // publishes one, and an entry that says so is still not drawn twice.
     if(entry.type && entry.type->other_pass) { ++stats.other_pass; continue; }
-    const auto visibility=ClassifyNativeFullFrameModel(entry,camera.visibility);
+    const auto visibility=ClassifyNativeFullFrameModelMoving(entry,camera.visibility,motion);
     switch(visibility.cull) {
       case C::Visible: break;
       case C::Hidden: ++stats.hidden; continue;
@@ -80,7 +94,8 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
     }
     // 821C0C00: mode 0 calls slot 4 now; 1/2 file it, and 821A3BA0 calls it
     // after the walks unless the key is below 256.
-    if(entry.mode==0) plan.calls.push_back(&entry);
+    if(visibility.previous) ++stats.previous;
+    else if(entry.mode==0) plan.calls.push_back(&entry);
     else {
       const auto key=NativeFullFrameModelKey(entry.mode,visibility.centre[2],entry.sort_bias,camera.key_scale,camera.key_offset);
       if(key>=256) filed.emplace_back(key,&entry);
@@ -319,8 +334,21 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
   NativeFullFrameModelFrame frame;
   auto& stats=frame.stats;
   ++frame_;
+  // A frame's first view ends the previous frame: the caches age once per
+  // frame, however many views it drew (a row a later view of the same frame
+  // uses is as current as one the first view used).
+  if(pass.view==0 || !frames_) {
+    if(frames_) {
+      sources_.EndFrame(); materials_.EndFrame(); poses_.EndFrame();
+      if(frames_%kStateAge==0) {
+        std::erase_if(items_,[&](const auto& item) { return frames_-item.second.seen>kStateAge; });
+        std::erase_if(rows_,[&](const auto& row) { return frames_-row.second.used>kStateAge; });
+      }
+    }
+    ++frames_;
+  }
   enter(Phase::Visibility);
-  frame.plan=PlanNativeFullFrameModels(snapshot,camera,pass.gather);
+  frame.plan=PlanNativeFullFrameModels(snapshot,camera,pass.gather,pass.motion);
   // The pool carry: what each slot-4 call finds in the pool, from the pool as
   // this view starts (NativeFullFrameModelPass::tick_frame, view,
   // guest_frames). Renders whose slot 4s were the guest's left their stores
@@ -395,14 +423,14 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
         ItemKey{item.entry->object,item.entry->generation,-2,item.entry->attachments[size_t(item.attachment)].pose_vector}:
         ItemKey{item.entry->object,item.entry->generation,item.instanced,item.instanced<0?item.model:item.world}];
       if(state->used==frame_) state=duplicates.emplace_back(std::make_unique<ItemState>()).get();
-      state->used=frame_;
+      state->used=frame_; state->seen=frames_;
       try {
         if(state->layout!=layout_object) {
           // New, or relaid out (a new layout generation): its draws in guest
           // order, each with its batch's address and its index in the batch's
           // pass list (OrderNativeFullFrameModelDraws' keys).
           *state=ItemState{layout_object};
-          state->used=frame_;
+          state->used=frame_; state->seen=frames_;
           for(const auto& draw:NativeModelDrawPlan(layout)) {
             const auto& passes=layout.meshes[draw.mesh].batches[draw.batch].passes;
             state->draws.push_back({draw,uint32_t(std::find(passes.begin(),passes.end(),draw.pass)-passes.begin()),
@@ -465,7 +493,7 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
       row.deferrable=program.CanDeferCpuActivation();
       row.same_backend=program.backend && source.second->backend()==program.backend.get();
     }
-    row.frame=frame_; row.used=frame_; row.draws=0; row.failed=false;
+    row.frame=frame_; row.used=frames_; row.draws=0; row.failed=false;
     if(!row.deferrable || !row.same_backend) return row;
     ++stats.rows;
     try {
@@ -726,15 +754,10 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
   };
   emit(frame.plan.opaque,states[0],false);
   emit(frame.plan.transparent,states[1],true);
-  sources_.EndFrame(); materials_.EndFrame(); poses_.EndFrame();
   // Draw states and rows of objects, layouts, programs or geometry no longer
-  // drawn release what they hold.
+  // drawn release what they hold (aged at the next frame's first view).
   if(items_.size()>kItemLimit) items_.clear();
   if(rows_.size()>kRowLimit) rows_.clear();
-  if(frame_%kStateAge==0) {
-    std::erase_if(items_,[&](const auto& item) { return frame_-item.second.used>kStateAge; });
-    std::erase_if(rows_,[&](const auto& row) { return frame_-row.second.used>kStateAge; });
-  }
   enter(Phase::Done);
   return frame;
 }

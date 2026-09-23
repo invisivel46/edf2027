@@ -250,9 +250,9 @@ REXCVAR_DEFINE_BOOL(edf_native_render_registry_audit,false,"EDF2027",
 REXCVAR_DEFINE_BOOL(edf_native_model_source_audit,false,"EDF2027",
                    "Full-frame Models pass: fetch the program and geometry of every draw kept at the current source generation afresh from the providers and log each one that differs (a provider input the source generation missed) (development)");
 REXCVAR_DEFINE_BOOL(edf_native_render_registry_idle_skip,true,"EDF2027",
-                   "On an unlocked render-only iteration (no simulation step) the render registry applies its events and reads only new, resubscribed and retrying objects, not every scene+100 member, animated object and round-robin refresh; false re-reads them every iteration");
+                   "On an unlocked render-only iteration (no simulation step) the render registry applies its events and reads only new, resubscribed and retrying objects plus a round-robin probe of the update members (and those a probe found changing on such iterations), not every scene+100 member, animated object and round-robin refresh; false re-reads them every iteration");
 REXCVAR_DEFINE_BOOL(edf_native_render_registry_idle_audit,false,"EDF2027",
-                   "Follow each render-only light registry tick with a full one and log every entry the full tick changed (what the light tick missed until the next step) (development)");
+                   "Follow each render-only light registry tick with a compare-only read of every update member and log the entries a full tick would change (what the light tick left unread); publishes nothing (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_pass,false,"EDF2027",
                    "Draw rigid published models natively at 821C9C20; any unsupported object runs the original draw. Requires edf_native_model_publication and the static world pass scene flags (development)");
 REXCVAR_DEFINE_BOOL(edf_native_model_pass_skinned,false,"EDF2027",
@@ -6676,10 +6676,13 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     // Helper side effect (clBrokenObject slot 4 8211FAA8): obj+712 = obj+708
     // for every object whose slot 4 the guest would call this view, before
     // and whatever the native draw does (no layout or pose yet, declined, no
-    // targets); its tick 8211FAF8 releases it once +708 - +712 > 10. The
-    // vtable is re-read so an object released since the snapshot is skipped.
+    // targets); its tick 8211FAF8 releases it once +708 - +712 > 10. An
+    // object released since the snapshot is skipped: its registry lifetime
+    // must still be the entry's (a new object born at the address since has
+    // another, whatever its vtable), and the vtable is re-read.
     for(const auto* entry:NativeFullFrameBrokenObjects(*registry,camera)) {
-      if(reader_.Word(entry->object)!=NativeBrokenObject::vtable) continue;
+      if(!RenderRegistry().Alive(entry->object,entry->generation) ||
+         reader_.Word(entry->object)!=NativeBrokenObject::vtable) continue;
       reader_.StoreWord(reader_.Add(entry->object,NativeBrokenObject::drawn),reader_.Word(reader_.Add(entry->object,NativeBrokenObject::counter)));
       ++broken_;
     }
@@ -8373,14 +8376,15 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool re
     // updates on such an iteration, over state no step has moved, and the
     // unlock notes measured source poses changing only at the 60 Hz step
     // cadence. edf_native_render_registry_idle_audit checks that claim: it
-    // follows each such light tick with a full one and logs every entry the
-    // full tick changed, which the light tick would have left until the next
-    // step.
+    // follows each such light tick with a compare-only read of every update
+    // member and logs the entries a full tick would have changed, which the
+    // light tick left until its probe reaches them or the next step. It
+    // publishes nothing and moves no pose motion, so it cannot itself mark
+    // the poses it reports render-dependent.
     const bool light=render_only && REXCVAR_GET(edf_native_render_registry_idle_skip);
     auto snapshot=registry.Tick(window,scene,tick,decode,!light);
     if(light && REXCVAR_GET(edf_native_render_registry_idle_audit)) {
-      const auto full=registry.Tick(window,scene,tick,decode,true);
-      const auto changes=snapshot && full?edf::native::CountNativeRenderSnapshotChanges(*snapshot,*full):size_t(0);
+      const auto changes=registry.AuditLight(window,scene,tick,decode);
       static uint64_t audited=0,mismatched=0,changed=0;
       ++audited; mismatched+=changes!=0; changed+=changes;
       if(changes && (mismatched<=16 || !(mismatched&(mismatched-1))))
@@ -8388,7 +8392,6 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool re
           tick,changes,audited,mismatched,changed);
       else if(!changes && (audited<=4 || audited%1000==0))
         REXLOG_INFO("Native render registry idle audit: audited={} mismatched={} total_changed={}",audited,mismatched,changed);
-      snapshot=full;
     }
     static uint64_t ticks=0;
     const bool report=++ticks<=4 || ticks%1000==0;
@@ -8396,12 +8399,13 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool re
       const auto stats=registry.stats();
       REXLOG_INFO("Native render registry: generation={} tick={} entries={} light_ticks={} idle_ticks={} records={} subscribed={} births={} seeded={} deaths={} "
         "rebirths={} unknown_deaths={} unknown_classes={} deferred={} foreign={} builds={} changed={} unchanged={} pose_reuses={} "
-        "read_failures={} layouts={} layout_failures={} retrying={} frame_poses={}/{}/{} constant_changes={}",snapshot->generation,snapshot->tick,snapshot->entries.size(),
+        "read_failures={} layouts={} layout_failures={} retrying={} frame_poses={}/{}/{} constant_changes={} probes={} live={} live_reads={} "
+        "same_tick_changes={} captures_pruned={}",snapshot->generation,snapshot->tick,snapshot->entries.size(),
         stats.light_ticks,stats.idle_ticks,stats.records,
         stats.subscribed,stats.births,stats.seeded,stats.deaths,stats.rebirths,stats.unknown_deaths,stats.unknown_classes,
         stats.deferred,stats.foreign,stats.builds,stats.changed,stats.unchanged,stats.pose_reuses,stats.read_failures,
         stats.layout_captures,stats.layout_failures,stats.retrying,stats.frame_poses,stats.frame_pose_reuses,stats.frame_pose_failures,
-        stats.constant_changes);
+        stats.constant_changes,stats.probes,stats.live,stats.live_reads,stats.same_tick_changes,stats.captures_pruned);
     }
     if(REXCVAR_GET(edf_native_render_registry_audit)) {
       const auto audit=registry.AuditScene(reader,scene);

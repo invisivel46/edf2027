@@ -49,6 +49,27 @@ inline NativeRenderPoseMotion AdvanceNativeRenderPoseMotion(const NativeRenderPo
   return {*published,tick,false};
 }
 
+// The bound motion of `entry` (its centre, axes and radius just read at
+// `tick`) against the published entry `published`, as poses advance:
+// - an unchanged bound keeps the published motion;
+// - a bound that moved since a read at tick-1 has that bound as previous;
+// - a bound that moved since a read at this same tick (a render-only
+//   iteration moved it) keeps a previous of this tick's (the tick-1 bound the
+//   drawn pose may still blend from), else takes the published bound;
+// - anything else (no published entry, another generation, an unread tick)
+//   has none.
+inline NativeRenderBoundMotion AdvanceNativeRenderBoundMotion(const NativeRenderEntry& entry,const NativeRenderEntry* published,
+    bool same_generation,std::optional<uint64_t> read,uint64_t tick) {
+  if(!published || !same_generation || !read || (*read!=tick && *read+1!=tick)) return {};
+  const auto bits=[](float value) { return std::bit_cast<uint32_t>(value); };
+  bool same=bits(entry.radius)==bits(published->radius);
+  for(size_t i=0;same && i<4;++i) same=bits(entry.centre[i])==bits(published->centre[i]);
+  for(size_t i=0;same && i<entry.axes.size();++i) same=bits(entry.axes[i])==bits(published->axes[i]);
+  if(same) return published->bound_motion;
+  if(*read==tick && published->bound_motion.valid && published->bound_motion.tick==tick) return published->bound_motion;
+  return {true,tick,published->centre,published->axes,published->radius};
+}
+
 // The fraction a pose with `motion` blends at this frame, or none when the
 // frame draws it as published: interpolation off, no previous pose, a pose
 // of another tick than the frame's (an older one is stationary since), a
