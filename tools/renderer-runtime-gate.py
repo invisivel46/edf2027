@@ -79,6 +79,13 @@ PHASES = ('engine.render_helper', 'render.queued', 'render.material_group', 'ren
 # The first scene draw after the loading screen. Loading takes anywhere from
 # seconds to minutes, so windows are measured from here, not from launch.
 ENTRY = 'Native indexed input: draw=1,'
+# Full-frame mode issues no guest indexed draws: its first native world pass
+# marks the same first 3D scene.
+FULL_FRAME_ENTRY = 'Native full frame static world: frames=1 '
+
+
+def is_entry(line):
+    return ENTRY in line or FULL_FRAME_ENTRY in line
 # Loading starts: the mission camera file lookup (M202 for mission 1) or the
 # loading-screen presenter thread's first frame.
 LOAD = re.compile(r"MISSION\\[^'\\]+\\MISSION\.CAM'|Native untiled scene viewport: caller=0x8219c828,")
@@ -100,7 +107,7 @@ def stamped(lines):
 
 def mission_entry(lines):
     for offset, line in stamped(lines):
-        if ENTRY in line:
+        if is_entry(line):
             return offset
     return None
 
@@ -112,7 +119,7 @@ def segments(lines):
     for offset, line in stamped(lines):
         last = offset if last is None else max(last, offset)
         if not out:
-            if ENTRY in line:
+            if is_entry(line):
                 m = THREAD.search(line)
                 thread = m.group(1) if m else None
                 out.append(['scene', offset, None])
