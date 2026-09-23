@@ -126,6 +126,28 @@ int main() {
     }
     static_assert(SelectNativeFrameRoute(true,false,true,true,true)==NativeFrameRoute::full_frame);
   }
+  // Output identity for the HUD phase loop: the bridge's active output alone
+  // (what the native post sets) is refused until the guest device's bound
+  // color surface is the output's owner+112 (what 8219C930 binds).
+  {
+    constexpr uint32_t renderer=0x40001cd0,output=0x40a00000,scene_surface=0x40b00000;
+    const NativeOutputBinding bound{renderer,0,0,output,output};
+    check(NativeOutputBound(renderer,bound),"output bound on bridge and device");
+    auto native_post_only=bound; native_post_only.device_surface=scene_surface;
+    check(!NativeOutputBound(renderer,native_post_only),"device still on the scene surface is refused");
+    auto no_surface=bound; no_surface.device_surface=0;
+    check(!NativeOutputBound(renderer,no_surface),"no bound device surface is refused");
+    auto no_output=bound; no_output.output_surface=0; no_output.device_surface=0;
+    check(!NativeOutputBound(renderer,no_output),"no output surface is refused");
+    auto target=bound; target.active_target=0x40c00000;
+    check(!NativeOutputBound(renderer,target),"an open target is not the output");
+    auto scene=bound; scene.active_scene=renderer;
+    check(!NativeOutputBound(renderer,scene),"an open scene is not the output");
+    auto other=bound; other.active_output=0x40001d00;
+    check(!NativeOutputBound(renderer,other),"another owner's output");
+    check(!NativeOutputBound(0,NativeOutputBinding{}),"no renderer");
+    static_assert(NativeOutputBound(1,{1,0,0,2,2}) && !NativeOutputBound(1,{1,0,0,2,3}));
+  }
   if(failures) std::cerr<<failures<<" native full frame checks failed\n";
   return failures?1:0;
 }

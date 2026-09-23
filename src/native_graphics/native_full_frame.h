@@ -108,7 +108,8 @@ inline constexpr std::string_view kNativeFrameRemainingGuestCalls[]{
   "view listeners owner+2232 +12 (clSatoCallback 8216DA80)",
   "view +16 (clPlayerCamera 820D3FD0: follow/talk icons, trajectory ribbon)",
   "finish stage 820B0B80, only when the native post reports an error",
-  "phase loop owner+140..+144 x listener +16 (HUD: clNoguchiCallback 820A4DD0, clSatoCallback 8216E630)"};
+  "phase loop owner+140..+144 x listener +16 (HUD: clNoguchiCallback 820A4DD0, clSatoCallback 8216E630)",
+  "output bind after the native post: 8219C930 (target owner+112, depth owner+120, owner+96, untiled end) and 82135530(device,0)"};
 class NativeFullFrame {
  public:
   NativeFullFrame();  // The default ordered passes (stubs but for Post).
@@ -139,5 +140,23 @@ constexpr NativeFrameRoute SelectNativeFrameRoute(bool full_frame,bool frame_dis
   if(full_frame && shader_bridge && host && ab_native_side) return NativeFrameRoute::full_frame;
   if(frame_dispatch && shader_bridge) return NativeFrameRoute::frame_dispatch;
   return NativeFrameRoute::guest_helper;
+}
+
+// The ordinary-output identity the per-draw hook 821FD8F8 requires of a HUD
+// draw outside any target or scene (movie, font, XUI textured and Utility
+// quads alike): the bridge's active output is the renderer with no target or
+// scene open, and the guest device's bound color surface (device+12168, the
+// SetRenderTarget 82137F98 mirror) is that output's surface owner+112. The
+// bridge half alone is not enough: the native post sets it without any guest
+// call, and until 8219C930 binds owner+112 the device still holds the scene's
+// surface, so every HUD draw is refused as "unsupported ... output".
+struct NativeOutputBinding {
+  uint32_t active_output=0,active_target=0,active_scene=0;
+  uint32_t output_surface=0;  // The native scene's output_surface (owner+112 once created).
+  uint32_t device_surface=0;  // device+12168.
+};
+constexpr bool NativeOutputBound(uint32_t renderer,const NativeOutputBinding& binding) {
+  return renderer && binding.active_output==renderer && !binding.active_target && !binding.active_scene &&
+    binding.output_surface && binding.device_surface==binding.output_surface;
 }
 }

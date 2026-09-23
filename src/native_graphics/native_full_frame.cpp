@@ -13,7 +13,9 @@ class NativeFrameStubPass final : public NativeFramePass {
   const char* name_;
 };
 // The finish stage: the host records the native post (RecordNativeFullFramePost)
-// and falls back to the guest 820B0B80 only when that reports an error.
+// and binds its output on the guest device as 8219C930 does (the HUD's draws
+// check that binding), falling back to the guest 820B0B80 only when the post
+// reports an error. output_ready is NativeOutputBound.
 class NativeFramePostPass final : public NativeFramePass {
  public:
   const char* name() const override { return "post"; }

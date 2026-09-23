@@ -6382,16 +6382,20 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   // body (branch to the blr at 8252B718) and needs nothing.
   void SideEffects(const edf::native::NativeFrameInputs&) override {}
   // The finish stage (clSgsCoreRender +12, 820B0B80): the native post with
-  // zero guest calls; the guest stage only when that reports an error, and
-  // then as a remaining guest call. 820B0B80 resolves the scene (mode 1) only
-  // while byte 2260 of [8257C030] is clear; the native post takes the same.
-  // Either way the output is the active target when it returns true: the
-  // native post leaves it so, and the guest's 8219C930 hook activates it.
+  // zero guest calls, then the output bind (BindOutput); the guest stage only
+  // when the post reports an error, and then as a remaining guest call.
+  // 820B0B80 resolves the scene (mode 1) only while byte 2260 of [8257C030] is
+  // clear; the native post takes the same. Returns whether the output is bound
+  // as the HUD's per-draw hooks require it (NativeOutputBound): the bridge's
+  // active output and the guest device's bound color surface. The native post
+  // sets the first and BindOutput the second; the guest stage's 8219C930 both.
   bool Finish(edf::native::NativeFrameContext&) override {
     const auto post=Word(132);
+    const auto renderer=reader_.Word(kRenderer);
     const bool resolve_scene=*reader_.Bytes(reader_.Add(reader_.Word(0x8257c030),2260),1)==0;
     std::string error;
-    if(!edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error)) {
+    if(edf::native::RecordNativeFullFramePost(base_,post,resolve_scene,&error)) BindOutput(renderer,resolve_scene);
+    else {
       static std::atomic<bool> reported=false;
       if(!reported.exchange(true))
         REXLOG_WARN("Native full frame post failed, guest finish stage 820B0B80 used: {} (logged once)",error);
@@ -6401,8 +6405,55 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     auto& state=edf::native::State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
-    const auto renderer=reader_.Word(kRenderer);
-    return renderer && state.active_output==renderer && !state.active_scene;
+    const auto scene=renderer?state.scenes.find(renderer):state.scenes.end();
+    const edf::native::NativeOutputBinding binding{state.active_output,state.active_target,state.active_scene,
+      scene!=state.scenes.end()?scene->second.output_surface:0u,
+      renderer?reader_.Word(reader_.Add(reader_.Word(reader_.Add(renderer,8)),12168)):0u};
+    const bool bound=edf::native::NativeOutputBound(renderer,binding);
+    if(!bound && renderer && binding.active_output==renderer) {
+      static std::atomic<uint64_t> unbound=0;
+      if(const auto count=++unbound;count<=4 || !(count&(count-1)))
+        REXLOG_WARN("Native full frame output not bound on the guest device: output_surface={:#x} device_surface={:#x} target={:#x} scene={:#x} (HUD draws are refused; count={})",
+          binding.output_surface,binding.device_surface,binding.active_target,binding.active_scene,count);
+    }
+    return bound;
+  }
+  // What 820B0B80 does around its post chain that the native post does not,
+  // and what the HUD phase loop inherits from it in the guest. 8219C930's tail
+  // binds the ordinary output owner+112 as color target 0 (82137F98: the
+  // device+12168 mirror every HUD per-draw hook compares with the output) and
+  // owner+120 as depth (82137CB8, whose hook publishes render state), sets
+  // owner+96 so 8219C840 takes its ordinary-output path (8213FAF8) as in guest
+  // mode, and ends the untiled scope 821409A0 opened (82140E98; without this,
+  // 8219C840 -> 8219C678 ends it). 82135530(device,0) then turns the depth
+  // test off, which the Utility hook requires of output draws. The 2D scope
+  // 821A7270/821A73F8 is a balanced state push/pop that leaves nothing, and
+  // the HUD's 821A71F0 wrap sets its own 2D viewport, so neither is repeated.
+  //
+  // Minimal guest calls rather than written mirrors: 82137F98 also keeps the
+  // surface-info and dirty words the guest device derives with the surface,
+  // and both calls go through their hooks as 820B0B80's own would, with its
+  // return addresses. The 8219C930 hook finds the scene already closed and
+  // resolved by the native post, so it only re-derives the same output
+  // (created by the post) and makes it active; its reset of content_valid,
+  // meant for a guest post still to draw, is undone, since the native post
+  // has already drawn this frame's output.
+  void BindOutput(uint32_t renderer,bool resolve_scene) {
+    if(!renderer) return;
+    auto& state=edf::native::State();
+    bool valid=false;
+    {
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      if(state.active_output!=renderer || state.active_scene) return;
+      valid=state.scenes.at(renderer).output.content_valid;
+    }
+    RemainingGuestCall(4);
+    guest_(0x8219C930,renderer,resolve_scene?1:0,0,0x820B0BC0);
+    guest_(0x82135530,reader_.Word(reader_.Add(renderer,8)),0,0,0x820B0BD0);
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    if(state.active_output==renderer) state.scenes.at(renderer).output.content_valid=valid;
   }
   // REMAINING GUEST CALLS: the phase loop, which draws the HUD/XUI onto the
   // output (clNoguchiCallback 820A4DD0, clSatoCallback 8216E630); each draw
