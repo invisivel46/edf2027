@@ -1725,6 +1725,11 @@ void FullFrameStaticWorldFrames(bool rotating) {
   auto& f=camera.visibility.frustum;
   f[8]=1; f[10]=-1; f[12]=-1; f[14]=-1; f[17]=1; f[18]=-1; f[21]=-1; f[22]=-1; f[24]=1; f[25]=1000;
   NativeFullFrameStaticWorld cached;
+  // edf_native_reuse_off (native_reuse.h): one instance with every frame's
+  // reuse off, one alternating (off on even frames, as
+  // edf_native_reuse_off_alternate=1 runs it); both must draw the reuse-on frame.
+  NativeFullFrameStaticWorld reuse_off,alternating;
+  uint64_t alternating_reused=0;
   const auto same_frame=[](const NativeFullFrameStaticFrame& a,const NativeFullFrameStaticFrame& b) {
     if(a.selection.objects!=b.selection.objects || a.draws.size()!=b.draws.size()) return false;
     // The selection itself: owners, their groups in order and each group's
@@ -1842,7 +1847,27 @@ void FullFrameStaticWorldFrames(bool rotating) {
     NativeFullFrameStaticWorld fresh;
     Require(same_frame(built,fresh.Build(publication,camera,routes,pass,resolve)),
       "a cached full-frame static world frame differs from a fresh build");
+    if(bench) continue;
+    {
+      const NativeReuseOffLatch latch(true);
+      const auto& off=reuse_off.Build(publication,camera,routes,pass,resolve);
+      const auto& o=off.stats;
+      const auto& w=off.selection.stats;
+      Require(o.reused_frame==0 && o.reused_draws==0 && o.reused_instances==0 && o.reused_moved==0 && o.camera_only==0 &&
+        o.keyed==0 && o.cache_hits==0 && w.flat_walks==0 && w.culled_bulk==0 && w.clusters==0,
+        "a reuse-off static world frame reused something");
+      Require(reuse_off.selection_cache.stats.list_builds==0 && reuse_off.selection_cache.lists.empty(),
+        "a reuse-off selection used the kept selection cache");
+      Require(same_frame(built,off),"a reuse-off full-frame static world frame differs from the reuse-on frame");
+    }
+    {
+      const NativeReuseOffLatch latch(frame%2==0);
+      const auto& mixed=alternating.Build(publication,camera,routes,pass,resolve);
+      if(frame%2) alternating_reused+=mixed.stats.reused_instances;
+      Require(same_frame(built,mixed),"an alternating reuse-off/on static world frame differs from the reuse-on frame");
+    }
   }
+  Require(bench || alternating_reused>0,"the alternating instance's reuse-on frames never reused");
   Require(totals.draws>frames*100 && totals.instances>frames*1000 && uniform>=totals.draws*9/10,"full-frame frames fixture drew too little");
   if(bench)
     std::cout<<"static world frames ("<<(rotating?"rotating":"sliding")<<"): select_ms="<<select_ms/(frames-2)

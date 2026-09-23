@@ -5,6 +5,7 @@
 #include "native_model_pass.h"
 #include "native_render_entry.h"
 #include "native_render_motion.h"
+#include "native_reuse.h"
 #include "native_scene_adapter.h"
 #include "native_scene_visibility.h"
 #include <functional>

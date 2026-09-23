@@ -9,6 +9,7 @@
 #include "native_frame_motion.h"
 #include "native_model_pose_history.h"
 #include "native_render_entry.h"
+#include "native_reuse.h"
 #include <bit>
 #include <cmath>
 #include <optional>
@@ -143,7 +144,8 @@ class NativeRenderPoseBlender {
   const std::vector<NativePoseBone>& Decompose(const NativeRenderPose& pose) {
     auto& row=decomposed_[pose.get()];
     row.used=frame_;
-    if(row.pose!=pose) {
+    // Reuse off (native_reuse.h): decomposed again and stored.
+    if(row.pose!=pose || !NativeReuseAllowed()) {
       row.pose=pose;
       if(row.bones.empty() && !spare_bones_.empty()) { row.bones=std::move(spare_bones_.back()); spare_bones_.pop_back(); }
       row.bones.resize(pose->size());
@@ -155,7 +157,7 @@ class NativeRenderPoseBlender {
   const Row& Prepared(const NativeRenderPose& current,const NativeRenderPose& previous) {
     auto& row=rows_[current.get()];
     row.used=frame_;
-    if(row.current==current && row.previous==previous) { ++stats_.reused; return row; }
+    if(row.current==current && row.previous==previous && NativeReuseAllowed()) { ++stats_.reused; return row; }
     row.current=current; row.previous=previous;
     if(row.bones.empty() && !spare_blends_.empty()) { row.bones=std::move(spare_blends_.back()); spare_blends_.pop_back(); }
     // Unordered-map references stay valid across the second insertion.

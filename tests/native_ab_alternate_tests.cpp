@@ -1,4 +1,5 @@
 #include "native_graphics/native_ab_alternate.h"
+#include "native_graphics/native_reuse.h"
 #include "native_graphics/native_renderer_preset.h"
 #include <iostream>
 #include <thread>
@@ -45,6 +46,40 @@ int main() {
     check(other_latched && !edf::native::NativeAbNativeSide());
   }
   check(edf::native::NativeAbNativeSide());
+  {
+    // edf_native_reuse_off_alternate=N follows AbSide: reuse off on the
+    // reference side (native=0), so compare-renderer-ab-captures.py pairs the
+    // frames by the same rule (--period N --start S) or the logged tags.
+    using edf::native::NativeReuseOffSide; using edf::native::NativeReuseAllowed;
+    for (uint64_t frame = 0; frame < 100; ++frame) {
+      check(!NativeReuseOffSide(frame, 0, 0) && !NativeReuseOffSide(frame, 600, -1));
+      for (int64_t period : {1, 2, 5})
+        for (int64_t start : {int64_t(0), int64_t(7), int64_t(-3)})
+          check(NativeReuseOffSide(frame, start, period) == !AbSide(frame, start, period));
+    }
+    check(NativeReuseOffSide(599, 600, 1) && NativeReuseOffSide(600, 600, 1) && !NativeReuseOffSide(601, 600, 1));
+    // The predicate: the thread's latch or the process-wide switch.
+    check(NativeReuseAllowed());
+    {
+      edf::native::NativeReuseOffLatch outer(true);
+      check(!NativeReuseAllowed());
+      { edf::native::NativeReuseOffLatch inner(false); check(NativeReuseAllowed()); }
+      check(!NativeReuseAllowed());
+      bool other = false;
+      std::thread thread([&] { other = NativeReuseAllowed(); });
+      thread.join();
+      check(other);  // Another thread does not see this frame's latch.
+    }
+    check(NativeReuseAllowed());
+    edf::native::native_reuse_off_all = true;
+    bool other = true;
+    std::thread thread([&] { other = NativeReuseAllowed(); });
+    thread.join();
+    check(!other && !NativeReuseAllowed());  // edf_native_reuse_off reaches every thread.
+    { edf::native::NativeReuseOffLatch latch(false); check(!NativeReuseAllowed()); }
+    edf::native::native_reuse_off_all = false;
+    check(NativeReuseAllowed());
+  }
   {
     // edf_native_renderer preset -> flag mapping.
     using edf::native::NativeRendererFlag; using edf::native::NativeRendererPreset;

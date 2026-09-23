@@ -5,6 +5,7 @@
 #include "native_model_pass.h"
 #include "native_model_publication.h"
 #include "native_render_instances.h"
+#include "native_reuse.h"
 #include <array>
 #include <atomic>
 #include <bit>
@@ -180,7 +181,8 @@ template<class Reader,class Lookup>
 const NativeModelLayout& AcquireNativeSkyLayout(const Reader& reader,NativeSkyPassState& state,uint32_t sky,const Lookup& lookup) {
   const auto instance=reader.Add(sky,NativeSkyObject::instance),vector=reader.Add(sky,NativeSkyObject::pose_vector);
   const auto identity=ReadGuestWords<2>(reader,instance);
-  bool same=state.layout && state.layout->instance==instance && state.layout->container==identity[0] &&
+  // Reuse off (native_reuse.h): decoded again every frame.
+  bool same=NativeReuseAllowed() && state.layout && state.layout->instance==instance && state.layout->container==identity[0] &&
     state.layout->node==identity[1] && state.layout->pose_vector==vector &&
     state.layout->bones==ReadNativeModelPoseRange(reader,vector).count &&
     state.layout->skinned==(reader.Bytes(reader.Add(instance,12),1)[0]!=0);

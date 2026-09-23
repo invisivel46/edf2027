@@ -3,9 +3,11 @@
 #include <array>
 #include <bit>
 #include <climits>
+#include <cstring>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -1062,8 +1064,121 @@ void RenderOnlyTicks() {
   Require(first && first->entries.size()==2 && fresh.stats().seeded==2,"a first render-only tick seeds and publishes");
 }
 
+// edf_native_reuse_off (native_reuse.h): a registry ticked with reuse off
+// publishes, tick for tick, the values a reuse-on registry publishes (poses,
+// pose motion, layouts, constants, attachments, instanced worlds), through
+// steps, render-only iterations, unchanged re-reads, moves, a birth and a
+// skipped tick; it takes no idle or light tick, shares no unchanged entry or
+// constant set, and still shares an unchanged pose (pose motion needs it).
+bool SamePose(const NativeRenderPose& a,const NativeRenderPose& b) {
+  if(!a || !b) return !a && !b;
+  return a->size()==b->size() && (a->empty() || !std::memcmp(a->data(),b->data(),a->size()*sizeof((*a)[0])));
+}
+bool SameMotion(const NativeRenderPoseMotion& a,const NativeRenderPoseMotion& b) {
+  return SamePose(a.previous,b.previous) && a.tick==b.tick && a.render_dependent==b.render_dependent;
+}
+bool SameModel(const NativeRenderModel& a,const NativeRenderModel& b) {
+  if(a.instance!=b.instance || !a.layout!=!b.layout) return false;
+  return !a.layout || *a.layout==*b.layout;
+}
+bool SameConstantSet(const NativeRenderConstants& a,const NativeRenderConstants& b) {
+  if(!a || !b) return !a && !b;
+  return *a==*b;
+}
+std::string SameValues(const NativeRenderRegistrySnapshot& a,const NativeRenderRegistrySnapshot& b) {
+  if(a.tick!=b.tick || a.entries.size()!=b.entries.size()) return "snapshot";
+  const auto bits=[](const auto& x,const auto& y) { return !std::memcmp(&x,&y,sizeof(x)); };
+  for(size_t i=0;i<a.entries.size();++i) {
+    const auto& x=*a.entries[i]; const auto& y=*b.entries[i];
+    if(x.object!=y.object || x.generation!=y.generation || x.type!=y.type || x.mode!=y.mode || x.hidden!=y.hidden ||
+       !bits(x.centre,y.centre) || !bits(x.axes,y.axes) || !bits(x.radius,y.radius) || !bits(x.cull_distance,y.cull_distance) ||
+       !bits(x.sort_bias,y.sort_bias) || x.lod_thresholds!=y.lod_thresholds) return "visibility";
+    if(x.models.size()!=y.models.size()) return "models";
+    for(size_t m=0;m<x.models.size();++m) if(!SameModel(x.models[m],y.models[m])) return "model layout";
+    if(!SamePose(x.pose,y.pose) || x.pose_vector!=y.pose_vector) return "pose";
+    if(!SameMotion(x.motion,y.motion)) return "pose motion";
+    if(!SameConstantSet(x.constants,y.constants)) return "constants";
+    if(x.attachments.size()!=y.attachments.size()) return "attachments";
+    for(size_t t=0;t<x.attachments.size();++t) {
+      const auto& p=x.attachments[t]; const auto& q=y.attachments[t];
+      if(p.pose_vector!=q.pose_vector || !SameModel(p.model,q.model) || !SamePose(p.pose,q.pose) || !SameMotion(p.motion,q.motion) ||
+         !SameConstantSet(p.constants,q.constants)) return "attachment";
+    }
+    if(x.instanced.size()!=y.instanced.size()) return "instanced";
+    for(size_t s=0;s<x.instanced.size();++s) {
+      const auto& p=x.instanced[s]; const auto& q=y.instanced[s];
+      if(!SameModel(p.model,q.model) || !SamePose(p.worlds,q.worlds) || !SameMotion(p.motion,q.motion)) return "instanced worlds";
+    }
+  }
+  return {};
+}
+void ReuseOffTicks() {
+  std::vector<uint8_t> bytes(0x40000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry on(4),off(4);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kTree=0x2000,kStill=0x3000,kUfo=0x4000,kSoldier=0x8000,kWeapons=0x10000,kMother=0x14000,kRecords=0x1B000,
+    kPool=0x20000,kLate=0x1C000;
+  BuildTree(memory,kTree,true); BuildTree(memory,kStill);
+  const auto highlight=BuildPoolNode(memory,kPool,"g_Highlight",0x21000);
+  BuildObject(memory,kUfo,0x820052C0u,false);
+  BuildInstance(memory,kUfo+1168); BuildPose(memory,kUfo+1088,0x9000,2,1.0f);
+  memory.StoreWord(kUfo+2288,highlight); StoreVector(memory,kUfo+2336,{1,.5f,.25f,0});
+  BuildObject(memory,kSoldier,kSoldierVtable,true);
+  BuildInstance(memory,kSoldier+1168); BuildPose(memory,kSoldier+1088,0x9200,3,1.0f);
+  memory.StoreByte(kSoldier+kNativeRenderFaceFlag,1);
+  BuildInstance(memory,kSoldier+kNativeRenderFaceInstance); BuildPose(memory,kSoldier+kNativeRenderFacePose,0x9600,1,7.0f);
+  memory.StoreWord(kSoldier+kNativeRenderWeaponArray,kWeapons); memory.StoreWord(kSoldier+kNativeRenderWeaponCount,1);
+  memory.StoreByte(kWeapons+1404,1); memory.StoreByte(kWeapons+1405,1); memory.StoreWord(kWeapons+108,0x1234);
+  BuildInstance(memory,kWeapons+100); BuildPose(memory,kWeapons+144,0x9800,1,2.0f);
+  BuildMother(memory,kMother,kRecords,6,5.0f);
+  for(auto* registry:{&on,&off})
+    for(const auto object:{kTree,kStill,kUfo,kSoldier,kMother}) registry->Born(object);
+  uint32_t checked=0;
+  // One iteration on both registries: a step (refresh) or a render-only one.
+  const auto tick=[&](uint64_t at,bool step,const char* name) {
+    const auto reused=on.Tick(memory,kScene,at,decode,step);
+    std::shared_ptr<const NativeRenderRegistrySnapshot> fresh;
+    {
+      const NativeReuseOffLatch latch(true);
+      fresh=off.Tick(memory,kScene,at,decode,step);
+    }
+    const auto reason=SameValues(*reused,*fresh);
+    if(!reason.empty()) throw std::runtime_error(std::string("a reuse-off registry tick differs (")+reason+"): "+name);
+    ++checked;
+    return std::pair{reused,fresh};
+  };
+  const auto first=tick(1,true,"the first step");
+  tick(1,false,"an idle render-only iteration");
+  const auto again=tick(2,true,"an unchanged step");
+  Require(EntryOf(*again.second,kTree)!=EntryOf(*first.second,kTree) &&
+    EntryOf(*again.second,kTree)->pose==EntryOf(*first.second,kTree)->pose,
+    "reuse off publishes an unchanged entry anew and still shares its pose");
+  Require(EntryOf(*again.first,kTree)==EntryOf(*first.first,kTree),"reuse on keeps the unchanged entry");
+  BuildPose(memory,kTree+400,kTree+0x600,2,9.0f);
+  BuildPose(memory,kSoldier+kNativeRenderFacePose,0x9600,1,8.0f);
+  tick(3,true,"moved poses and a moved face");
+  tick(3,false,"a render-only iteration after the move");
+  StoreVector(memory,kUfo+2336,{2,.5f,.25f,0});
+  memory.StoreFloat(kMother+NativeMotherSpheres::phase,5.01f);
+  tick(4,true,"a moved constant and moved instanced worlds");
+  BuildTree(memory,kLate);
+  on.Born(kLate); off.Born(kLate);
+  tick(4,false,"a render-only birth");
+  BuildPose(memory,kTree+400,kTree+0x600,2,10.0f);
+  tick(6,true,"a skipped tick resets motion");
+  tick(7,true,"motion resumes");
+  on.Died(kLate); off.Died(kLate); Unlink(memory,kLate+108);
+  tick(7,false,"a render-only death");
+  const auto stats=off.stats();
+  Require(checked==10,"every iteration was compared");
+  Require(stats.idle_ticks==0 && stats.light_ticks==0 && stats.unchanged==0,
+    "a reuse-off registry took an idle or light tick, or kept an unchanged entry");
+  Require(on.stats().idle_ticks>0 && on.stats().unchanged>0,"the reuse-on registry reused nothing");
+}
+
 int main() {
   try {
+    ReuseOffTicks();
     ClassTableLookup();
     BirthAndDeath();
     SkyIsNotPublished();

@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include "native_reuse.h"
 #include <cstdint>
 #include <string_view>
 
@@ -81,8 +82,9 @@ class NativeImmediatePairMemo {
   template<class Compute>
   const Entry& Get(uint32_t vertex,uint32_t pixel,uint64_t shaders,uint64_t embedded,Compute&& compute) {
     auto& entry=entries_[((vertex>>2)^(pixel>>2)^(pixel>>7))%Slots];
+    // Reuse off (native_reuse.h): classified again and stored.
     if(entry.valid && entry.vertex==vertex && entry.pixel==pixel &&
-       entry.shaders==shaders && entry.embedded==embedded) { ++hits_; return entry; }
+       entry.shaders==shaders && entry.embedded==embedded && NativeReuseAllowed()) { ++hits_; return entry; }
     ++misses_;
     entry.valid=false;
     compute(entry.kind,entry.payload);

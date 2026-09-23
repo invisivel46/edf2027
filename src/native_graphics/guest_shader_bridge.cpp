@@ -113,6 +113,7 @@
 #include "movie_effect.h"
 #include "xui_effect.h"
 #include "native_transient_batching.h"
+#include "native_reuse.h"
 #include "native_immediate_classify.h"
 #include "font_effect.h"
 #include <rex/cvar.h>
@@ -315,8 +316,17 @@ REXCVAR_DEFINE_BOOL(edf_native_world_constant_reuse,true,"EDF2027",
                    "Retain shared vertex constants when only an instance world matrix changes");
 REXCVAR_DEFINE_BOOL(edf_native_transient_batching,true,"EDF2027",
                    "Record a UI/immediate list draw (XUI brush, font run, Utility 2D quad or line) as the continuation of the draw before it when the two differ only in their vertices; the Utility 2D path then records its quads non-indexed. Set false to record every draw as its own");
+REXCVAR_DEFINE_BOOL(edf_native_reuse_off,false,"EDF2027",
+                   "Correctness diagnostics: disable every cross-frame reuse of the full-frame renderer (native_reuse.h): the models' draw states, carried objects, material rows and caches, source memo and pose-blend cache; the static world's frame, group memos, material cache, instance reuse, selection cache, flattened tree, cluster cull and uniform recording; the sky's material, layout and hierarchy caches; the registry's render-only light ticks, frame-pose memo and unchanged-entry/constant pointer sharing; shared effect activation, transient batching (implies edf_native_transient_batching off) and the UI lookup memos. Output should be identical, only slower (development)");
+REXCVAR_DEFINE_INT32(edf_native_reuse_off_alternate,0,"EDF2027",
+  "Correctness diagnostics: render with reuse off (edf_native_reuse_off) in runs of N indexed output frames from the capture start frame, the edf_native_ab_alternate rule: even runs (the reference, logged reuse_alternate frame=F native=0) reuse off, odd runs (judged, native=1) reuse on; 0 off, ignored while edf_native_ab_alternate is on (development)").range(0,1000);
 REXCVAR_DEFINE_BOOL(edf_native_prepared_geometry,true,"EDF2027",
                    "Reuse prepared queued geometry after guarded snapshot validation");
+// Transient batching (edf_native_transient_batching), off whenever reuse is
+// (native_reuse.h): a batched run is recorded as its separate draws.
+static bool NativeTransientBatchingEnabled() {
+  return REXCVAR_GET(edf_native_transient_batching) && edf::native::NativeReuseAllowed();
+}
 REXCVAR_DEFINE_INT32(edf_native_hook_sample_period,0,"EDF2027",
   "Sample one in N bridge timing scopes (0 disables); independent of full hook/load instrumentation").range(0,4096);
 REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
@@ -2469,7 +2479,7 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
   auto& backend=EnsureSceneBackendLocked(state);
   auto& recorder=SceneRecorderLocked(state);
   recorder.SetWorldInstancing(draw.world_instancing,REXCVAR_GET(edf_native_world_constant_reuse));
-  recorder.SetTransientBatching(REXCVAR_GET(edf_native_transient_batching));
+  recorder.SetTransientBatching(NativeTransientBatchingEnabled());
   const auto targets=ActiveTargetsLocked(state);
   if(!targets.count) throw std::runtime_error("a recorded draw has no colour target to record into");
   ++state.recorded_draws;
@@ -2616,8 +2626,11 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
 // always ask for the key they asked for last.
 NativeRenderState& RenderStateLocked(Bridge& state,const RenderStateWords& key) {
   auto& memo=state.render_state_memo;
-  if(memo[0].value && memo[0].key==key) return *memo[0].value;
-  if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return *memo[0].value; }
+  // Reuse off (native_reuse.h): the map is searched (the memo still records).
+  if(NativeReuseAllowed()) {
+    if(memo[0].value && memo[0].key==key) return *memo[0].value;
+    if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return *memo[0].value; }
+  }
   auto found=state.render_states.find(key);
   if(found==state.render_states.end())
     found=state.render_states.emplace(key,CreateNativeRenderState(state.device.Get(),key)).first;
@@ -2627,8 +2640,10 @@ NativeRenderState& RenderStateLocked(Bridge& state,const RenderStateWords& key) 
 // samplers[key], created on the scene backend on first use; memoized likewise.
 NativeBackendSampler* SamplerLocked(Bridge& state,const SamplerStateWords& key) {
   auto& memo=state.sampler_memo;
-  if(memo[0].value && memo[0].key==key) return memo[0].value;
-  if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return memo[0].value; }
+  if(NativeReuseAllowed()) {
+    if(memo[0].value && memo[0].key==key) return memo[0].value;
+    if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return memo[0].value; }
+  }
   auto found=state.samplers.find(key);
   if(found==state.samplers.end()) {
     const auto desc=DecodeNativeGuestSampler(key);
@@ -6676,9 +6691,18 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto fetch_geometry=[&](const NativeModelBatchLayout& batch,uint32_t record) {
       return slices([&] { return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,batch,record),batch); });
     };
+    // Reuse off (native_reuse.h): the providers are asked directly, past the
+    // source memo, and the generation is unversioned, so Build re-sources
+    // every draw and keeps no answer; the memo is left as it was and
+    // validates itself at the next reuse-on frame.
+    const bool reuse=NativeReuseAllowed();
     NativeFullFrameModelSources sources{
-      [&](uint32_t record) { return source_memo_.ProgramFor(record,[&] { return fetch_program(record); }); },
+      [&](uint32_t record) {
+        if(!reuse) return fetch_program(record);
+        return source_memo_.ProgramFor(record,[&] { return fetch_program(record); });
+      },
       [&](const NativeModelBatchLayout& batch,uint32_t record) {
+        if(!reuse) return fetch_geometry(batch,record);
         const GeometryInput input{batch,record};
         return source_memo_.GeometryFor(SourceGeometryKey(input),input,[&] { return fetch_geometry(batch,record); });
       },
@@ -6695,6 +6719,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       // just asked for. The providers are called directly here, the locks
       // held once per chunk.
       [&] {
+        if(!reuse) return kNativeFullFrameModelUnversioned;
         return source_memo_.Validate(
           [&] { return SourceHost{state.shader_registry_generation,state.scene_backend.get()}; },
           [&](uint32_t record) { return NativeModelPassProgramLocked(state,window,record,true,report); },
@@ -7103,7 +7128,8 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
           key.pass=NativeSceneMaterialPassState{before,base.samplers}; key.view=formats; key.filtering=filtering;
           key.shaders=state.shader_registry_generation;
           SkyResolve resolve;
-          auto* entry=sky_materials_.Candidate(key);
+          // Reuse off (native_reuse.h): resolved again and stored.
+          auto* entry=NativeReuseAllowed()?sky_materials_.Candidate(key):nullptr;
           NativeSceneView derived;
           if(entry) derived=entry->material.capture.camera;
           if(entry && SkyMaterials::Current(*entry,constants,entry->material.capture.material.get(),derived)) {
@@ -7251,7 +7277,8 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
         // worlds (the same calls, no read of the instance objects); an
         // unchanged group's worlds are last frame's array. (Without geometry or
         // material Render refuses the draw, as before.)
-        if(draw.worlds && draw.geometry && draw.material) {
+        // Reuse off (native_reuse.h): Render over the snapshot instead.
+        if(draw.worlds && draw.geometry && draw.material && NativeReuseAllowed()) {
           drawn+=state.scene_renderer.RenderUniform(*state.scene_backend,*draw.geometry,*draw.material,*draw.worlds,draw.view).draws;
           ++uniform_;
         } else drawn+=state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),draw.view,1).draws;
@@ -7723,6 +7750,32 @@ REX_HOOK_RAW(sub_821A5080) {
       REXLOG_INFO("ab_alternate frame={} native={}",frame,ab_native?1:0);
   }
   const edf::native::NativeAbSideLatch ab_latch(ab_native);
+  // Reuse off (native_reuse.h): the process-wide switch, mirrored for the
+  // other threads' sites, and this frame's side of the reuse alternation,
+  // latched for this helper call like the A/B side and tagged the same way
+  // (reuse_alternate frame=F native=0 for a reuse-off reference frame, 1 for
+  // a reuse-on judged frame; F is the indexed output frame the capture names).
+  edf::native::native_reuse_off_all.store(REXCVAR_GET(edf_native_reuse_off),std::memory_order_relaxed);
+  bool reuse_off=false;
+  if(const auto reuse_period=REXCVAR_GET(edf_native_reuse_off_alternate); reuse_period>0) {
+    if(REXCVAR_GET(edf_native_ab_alternate)>0) {
+      static std::atomic<bool> reported=false;
+      if(!reported.exchange(true)) REXLOG_WARN("edf_native_reuse_off_alternate ignored: edf_native_ab_alternate is on");
+    } else {
+      uint64_t frame=0;
+      {
+        auto& state=edf::native::State();
+        std::lock_guard submission(state.submissions);
+        std::lock_guard lock(state.mutex);
+        frame=state.indexed_output_frames+1;
+      }
+      reuse_off=edf::native::NativeReuseOffSide(frame,REXCVAR_GET(edf_native_output_capture_start_frame),reuse_period);
+      static std::atomic<uint64_t> reuse_logged=0;
+      if(reuse_logged.exchange(frame,std::memory_order_relaxed)!=frame)
+        REXLOG_INFO("reuse_alternate frame={} native={}",frame,reuse_off?0:1);
+    }
+  }
+  const edf::native::NativeReuseOffLatch reuse_latch(reuse_off);
   native_render_frames.fetch_add(1,std::memory_order_relaxed);
   struct RestoreTickFrame {
     bool saved=native_render_tick_frame;
@@ -8313,7 +8366,11 @@ void TickNativeRenderRegistry(uint8_t* base,uint32_t scene,uint64_t tick,bool re
     // follows each such light tick with a full one and logs every entry the
     // full tick changed, which the light tick would have left until the next
     // step.
-    const bool light=render_only && REXCVAR_GET(edf_native_render_registry_idle_skip);
+    // Reuse off (native_reuse.h, edf_native_reuse_off only: the registry ticks
+    // per iteration, not per rendered frame): full ticks, and no frame-pose
+    // memo or unchanged-entry and constant pointer sharing inside Tick.
+    edf::native::native_reuse_off_all.store(REXCVAR_GET(edf_native_reuse_off),std::memory_order_relaxed);
+    const bool light=render_only && REXCVAR_GET(edf_native_render_registry_idle_skip) && edf::native::NativeReuseAllowed();
     auto snapshot=registry.Tick(window,scene,tick,decode,!light);
     if(light && REXCVAR_GET(edf_native_render_registry_idle_audit)) {
       const auto full=registry.Tick(window,scene,tick,decode,true);
@@ -13546,7 +13603,8 @@ uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& rea
   const NativeEffectDraw* activated=nullptr;
   for(const auto& draw:draws) {
     try {
-      if(!activation || !NativeEffectDrawsShareActivation(*activated,draw)) {
+      // Reuse off (native_reuse.h): every draw activates on its own.
+      if(!activation || !NativeReuseAllowed() || !NativeEffectDrawsShareActivation(*activated,draw)) {
         activation.reset();
         activation=ActivateNativeFullFrameEffectLocked(state,reader,window,draw,camera,viewport,formats,report);
         activated=&draw;
@@ -14164,7 +14222,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
               (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),pair.pixel,
               lines?edf::native::NativeBackendTopology::LineList
                    :edf::native::NativeBackendTopology::TriangleList});
-            if(REXCVAR_GET(edf_native_transient_batching))
+            if(NativeTransientBatchingEnabled())
               mesh.DrawTransientExpanded(recorder,vertices,0,uint32_t(indices.size()/2),
                 lines?edf::native::NativeBackendTopology::LineList:edf::native::NativeBackendTopology::TriangleList);
             else if(lines) mesh.DrawLinesTransient(recorder,vertices,0,uint32_t(indices.size()/2));

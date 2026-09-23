@@ -1612,6 +1612,71 @@ void ModelFrames(std::shared_ptr<NativeRenderBackend> backend) {
       <<" rows="<<double(totals.rows)/frames<<" camera_rows="<<double(totals.camera_rows)/frames<<"\n";
   }
 }
+// edf_native_reuse_off (native_reuse.h) across gameplay-like frames with pose
+// interpolation: one instance with reuse on, one with every frame's reuse off
+// and one alternating (off on even frames, as edf_native_reuse_off_alternate=1
+// runs it) build the same inputs; every frame of all three is the same frame.
+// Reuse-off frames carry, reuse and memoize nothing (no carried object, cache
+// hit, side-table hit or pose-blend reuse), and an alternating instance's
+// reuse-on frames, built on state its reuse-off frames rebuilt, still match.
+void ReuseOffFrames(std::shared_ptr<NativeRenderBackend> backend) {
+  ModelsScene scene(backend);
+  const auto sources=scene.Sources();
+  auto pass=scene.Pass();
+  NativeFullFrameModels on,off,alternating;
+  // Each pose object's motion, made when it is first seen: the object's last
+  // pose and the tick that published it, so it blends over its tick's frames.
+  std::map<const void*,std::pair<NativeRenderPose,NativeRenderPoseMotion>> motions;  // Holds the pose: no address reuse.
+  std::map<uint32_t,NativeRenderPose> last;
+  uint64_t off_reused=0,alternating_reuses=0;
+  for(uint32_t frame=0;frame<24;++frame) {
+    scene.Step();
+    const uint64_t tick=scene.frame/2;
+    NativeRenderRegistrySnapshot snapshot;
+    snapshot.generation=scene.generation;
+    for(const auto& entry:scene.entries) {
+      auto moving=std::make_shared<NativeRenderEntry>(*entry);
+      if(entry->pose) {
+        auto [found,inserted]=motions.try_emplace(entry->pose.get());
+        if(inserted) {
+          const auto previous=last.find(entry->object);
+          found->second={entry->pose,{previous!=last.end() && previous->second->size()==entry->pose->size()?previous->second:nullptr,tick,false}};
+        }
+        moving->motion=found->second.second;
+        last[entry->object]=entry->pose;
+      }
+      snapshot.entries.push_back(std::move(moving));
+    }
+    pass.motion={tick,frame%2?.6f:.2f,1,true,true};
+    const auto reused=on.Build(snapshot,scene.camera,pass,sources);
+    NativeFullFrameModelFrame fresh;
+    {
+      const NativeReuseOffLatch latch(true);
+      Require(!NativeReuseAllowed(),"the latch turns reuse off");
+      fresh=off.Build(snapshot,scene.camera,pass,sources);
+    }
+    Require(NativeReuseAllowed(),"the latch restores reuse");
+    NativeFullFrameModelFrame mixed;
+    {
+      const NativeReuseOffLatch latch(frame%2==0);
+      mixed=alternating.Build(snapshot,scene.camera,pass,sources);
+    }
+    const auto& s=fresh.stats;
+    Require(s.failed==0 && s.draws>100 && (frame<2 || s.blended>0),"the reuse-off scene draws and blends");
+    Require(s.reused==0 && s.derived==s.draws,"a reuse-off frame carries no object");
+    Require(s.cache_hits==0 && s.camera_rows==0,"a reuse-off frame reuses no material row or resolve");
+    Require(s.source_hits==0 && s.sourced==s.items,"a reuse-off frame sources every item from the providers");
+    off_reused+=off.poses().stats().reused;
+    if(frame%2) alternating_reuses+=mixed.stats.reused;
+    for(const auto* built:{&fresh,&mixed}) {
+      const auto reason=SameModelFrame(reused,*built);
+      if(!reason.empty())
+        throw std::runtime_error("a reuse-off models frame differs from the reuse-on frame: "+reason+" (frame "+std::to_string(frame)+")");
+    }
+  }
+  Require(off_reused==0,"a reuse-off frame never reuses a pose blend");
+  Require(alternating_reuses>0 && on.poses().stats().reused>0,"the reuse-on frames did reuse");
+}
 }
 // clSky's registry row says another pass draws it (the sky pass): an entry of
 // such a class is never planned, even visible, posed and in either route.
@@ -1643,6 +1708,7 @@ int main(int argc,char** argv) {
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
       PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ObjectConstantBuild(device); ModelFrames(device);
+      ReuseOffFrames(device);
     }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
