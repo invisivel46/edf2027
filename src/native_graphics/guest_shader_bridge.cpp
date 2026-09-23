@@ -2418,14 +2418,17 @@ void ObserveActivation(const GuestReader& backing, uint32_t instance, uint32_t d
   if(state.activations%250000==0)
     REXLOG_INFO("Native activation repeats: activations={}, repeats_of_previous={} ({:.1f}% identical instance and shader pair as the immediately preceding activation)",
       state.activations,state.repeat_activations,100.0*double(state.repeat_activations)/double(state.activations));
-  const bool found = state.shaders.contains(vertex) && state.shaders.contains(pixel);
+  // One lookup per shader, kept: nothing below inserts into or erases from the
+  // shader registry, so both entries stay where they were found.
+  const auto vertex_entry=state.shaders.find(vertex),pixel_entry=state.shaders.find(pixel);
+  const bool found = vertex_entry!=state.shaders.end() && pixel_entry!=state.shaders.end();
   state.active_vertex = 0;
   state.active_vertex_parameters.reset();
   if (!found) ++state.misses;
   if (found) {
     try {
-      auto& vertex_shader=state.shaders.at(vertex);
-      auto& pixel_shader=state.shaders.at(pixel);
+      auto& vertex_shader=vertex_entry->second;
+      auto& pixel_shader=pixel_entry->second;
       const auto material=state.material_parameters.Get(instance);
       auto& vs = *vertex_shader.bindings;
       auto& reversed = *vertex_shader.reversed_bindings;
@@ -2576,14 +2579,19 @@ std::array<float,4> ResolveBlendFactorForDraw(uint32_t device,
           std::bit_cast<float>(words[2]),std::bit_cast<float>(words[3])};
 }
 }
-void PublishNativeRenderState(uint8_t* base,uint32_t device,uint32_t producer) {
+// make_reader supplies what the words are read through, inside the lock and
+// the try, as the plain overload always built its GuestReader: a caller that
+// already holds a validated window over the device (the material activation,
+// once per state override) reads them through it instead.
+template<class MakeReader>
+void PublishNativeRenderStateWith(uint32_t device,uint32_t producer,MakeReader&& make_reader) {
   if((!REXCVAR_GET(edf_native_render_state_audit) && !REXCVAR_GET(edf_native_owned_render_state)) ||
       !EDF_NATIVE_FLAG(shader_bridge)) return;
   auto& state=State();
   std::lock_guard lock(state.mutex);
   try {
     const auto fields=NativeRenderStateProducerFields(producer);
-    const GuestReader reader(base);
+    decltype(auto) reader=make_reader();
     constexpr std::array<uint32_t,6> offsets{10424,10420,10440,10428,10332,11584};
     NativeRenderStateSnapshots::Words words{};
     for(size_t field=0;field<words.size();++field) if(fields&(1u<<field)) {
@@ -2597,6 +2605,9 @@ void PublishNativeRenderState(uint8_t* base,uint32_t device,uint32_t producer) {
     state.render_state_snapshots.Retire(device);
     REXLOG_ERROR("Native render-state publication failed: device={:#x}, producer={:#x}, error={}",device,producer,error.what());
   }
+}
+void PublishNativeRenderState(uint8_t* base,uint32_t device,uint32_t producer) {
+  PublishNativeRenderStateWith(device,producer,[&] { return GuestReader(base); });
 }
 // Draw consumers already hold the bridge state lock. This diagnostic never
 // repairs ownership; opt-in native consumption additionally rejects mismatches.
@@ -7702,21 +7713,50 @@ REX_EXTERN(sub_82149248);
 REX_EXTERN(sub_82149358);
 REX_EXTERN(sub_8213BA98);
 namespace {
-void BindNativeShaderResource(PPCContext&,uint8_t*,bool);
+template<class Reader> void BindNativeShaderResource(PPCContext&,uint8_t*,bool,const Reader&);
+template<class Reader> void BindNativeTextureResource(PPCContext&,uint8_t*,const Reader&);
+bool NativeTextureBindingOwned();
 void PublishNativeShaderBinding(uint32_t,uint32_t,bool);
+// The guest device block the activation reads and writes: sampler records at
+// +1024, constant registers from +1792, render-state mirrors to +12188, the
+// texture and shader bindings at +12272..+12423; the extent the static world
+// handoff's device overlay covers (NativeStaticWorldDeviceOverlay::kBytes).
+constexpr uint32_t kNativeActivationDeviceBytes=13520;
 // states=false runs the activation without its state operations (the static
 // world handoff writes those combined): shader binds with defaults, constant
 // uploads and texture binds with their retirements and sampler words.
+//
+// Its guest accesses go through two windows proven once per activation - the
+// device block (read and written: dirty halves, constant registers, sampler
+// and state mirrors, bindings) and the material's 112-byte header - rather
+// than a separately validated access each: a HUD Utility activation made a
+// few hundred of those (each state override alone re-read the render pass,
+// twenty-odd words, and published its fields through a fresh reader), and the
+// HUD phase loop activates ~130 times a frame. The windows are live, so every
+// value is the one the per-access reads saw; payloads, records and the stack
+// keep their own validated accesses, and so does everything when the device
+// window cannot be proven. The operation lists go into one program per thread
+// (a nested activation, should a guest call ever make one, uses its own).
 void ActivateNativeMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint32_t device,bool states=true) {
-  const edf::native::GuestReader reader(base);
-  const auto program=edf::native::ReadNativeMaterialCpuProgram(reader,instance,device);
+  const edf::native::GuestReader backing(base);
+  const edf::native::GuestWritableWindow reader(backing,device,kNativeActivationDeviceBytes);
+  static thread_local edf::native::NativeMaterialCpuProgram reused;
+  static thread_local bool reused_busy=false;
+  std::optional<edf::native::NativeMaterialCpuProgram> nested;
+  auto& program=reused_busy?nested.emplace():reused;
+  struct Busy {
+    bool& flag; bool owner;
+    explicit Busy(bool& flag):flag(flag),owner(!flag) { flag=true; }
+    ~Busy() { if(owner) flag=false; }
+  } busy(reused_busy);
+  edf::native::ReadNativeMaterialCpuProgram(edf::native::GuestReadWindow(reader,instance,112),instance,device,program);
   auto work=ctx;
   if(work.r1.u32<144) throw std::runtime_error("native activation stack");
   work.r1.u64-=144;
   reader.StoreWord(work.r1.u32,ctx.r1.u32);
   edf::native::ExecuteNativeMaterialCpuProgram(program,[&](uint32_t shader,bool pixel) {
     work.r3.u64=device; work.r4.u64=shader; work.lr=pixel?0x821B8E84:0x821B8E70;
-    BindNativeShaderResource(work,base,pixel);
+    BindNativeShaderResource(work,base,pixel,reader);
     PublishNativeShaderBinding(device,shader,pixel);
   },[&](const auto& operation) {
     const auto first=operation.first/4,last=(operation.first+operation.count-1)/4;
@@ -7733,12 +7773,21 @@ void ActivateNativeMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint
       reader.StoreWord(work.r1.u32-32,device);
       reader.StoreWord(reader.Add(work.r1.u32,48),uint32_t(mask>>32));
       reader.StoreWord(reader.Add(work.r1.u32,52),uint32_t(mask));
-      auto* target=const_cast<uint8_t*>(reader.WritableBytes(destination,bytes,4));
-      const auto dirty_address=reader.Add(device,operation.pixel?8:0);
-      const uint64_t dirty=(uint64_t(reader.Word(dirty_address))<<32)|reader.Word(reader.Add(dirty_address,4));
+      // The destination and the incoming dirty mask are only the audit
+      // oracle's: the upload validates the destination and reads the mask
+      // itself, so an unaudited activation does not read them twice.
+      const bool audit=REXCVAR_GET(edf_native_scene_material_audit);
+      uint8_t* target=nullptr;
+      uint32_t dirty_address=0;
+      uint64_t dirty=0;
+      if(audit) {
+        target=const_cast<uint8_t*>(reader.WritableBytes(destination,bytes,4));
+        dirty_address=reader.Add(device,operation.pixel?8:0);
+        dirty=(uint64_t(reader.Word(dirty_address))<<32)|reader.Word(reader.Add(dirty_address,4));
+      }
       if(!edf::native::UploadNativeMaterialConstant(reader,device,operation,mask))
         throw std::runtime_error("native constant eligibility changed during activation");
-      if(REXCVAR_GET(edf_native_scene_material_audit)) {
+      if(audit) {
         static std::mutex audit_mutex;
         static std::set<std::tuple<bool,uint32_t,uint32_t,uint32_t>> shapes;
         bool sample=false;
@@ -7769,7 +7818,11 @@ void ActivateNativeMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint
   },[&](const auto& operation) {
     const uint64_t mask=uint64_t(1)<<(43-operation.slot);
     work.r3.u64=device; work.r4.u64=operation.slot; work.r5.u64=operation.handle;
-    work.r6.u64=mask; work.lr=0x821B9090; sub_8213BA98(work,base);
+    work.r6.u64=mask; work.lr=0x821B9090;
+    // 8213BA98's hook, through the device window when its native branch owns
+    // the bind; the hook itself (and so the guest setter) otherwise.
+    if(NativeTextureBindingOwned()) BindNativeTextureResource(work,base,reader);
+    else sub_8213BA98(work,base);
     const auto inherited=edf::native::ReadNativeMaterialSamplerPass(reader,device,operation.slot);
     const auto resolved=edf::native::ApplyNativeMaterialSampler(inherited,operation.sampler);
     reader.StoreWord(reader.Add(device,1036+operation.slot*24),resolved.words[1]);
@@ -7818,7 +7871,7 @@ void ActivateNativeMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance,uint
       state.render_state_snapshots.PublishBlend(device,
         edf::native::ReadGuestWords<4>(reader,reader.Add(device,10336)),operation.setter);
     } else if(operation.offset!=0x64) {
-      edf::native::PublishNativeRenderState(base,device,operation.setter);
+      edf::native::PublishNativeRenderStateWith(device,operation.setter,[&]() -> const auto& { return reader; });
     }
   });
   static std::atomic<uint64_t> activations=0;
@@ -7846,9 +7899,12 @@ void RestoreNativeStaticMaterial(PPCContext& ctx,uint8_t* base,uint32_t instance
 }
 REX_HOOK_RAW(sub_821B8E48) {
   const auto instance = ctx.r3.u32, device = ctx.r4.u32;
-  std::map<uint32_t,edf::native::NativeMaterialSamplerPass> expected_samplers;
-  std::optional<edf::native::NativeMaterialRenderPass> expected_state;
+  // Audit state only when audited: the library's std::map allocates its head
+  // node when constructed, and this hook runs for every activation.
   const bool sampler_audit=REXCVAR_GET(edf_native_material_sampler_audit);
+  std::optional<std::map<uint32_t,edf::native::NativeMaterialSamplerPass>> audited_samplers;
+  if(sampler_audit) audited_samplers.emplace();
+  std::optional<edf::native::NativeMaterialRenderPass> expected_state;
   if(REXCVAR_GET(edf_native_material_state_audit)) {
     const edf::native::GuestReader reader(base);
     expected_state=edf::native::ReadNativeMaterialRenderPass(reader,device);
@@ -7875,8 +7931,8 @@ REX_HOOK_RAW(sub_821B8E48) {
     const auto schema=state.material_parameters.Get(instance);
     const auto operations=edf::native::ReadNativeMaterialSamplerOperations(reader,*schema);
     for(const auto& operation:operations) {
-      auto found=expected_samplers.find(operation.slot);
-      if(found==expected_samplers.end()) found=expected_samplers.emplace(operation.slot,
+      auto found=audited_samplers->find(operation.slot);
+      if(found==audited_samplers->end()) found=audited_samplers->emplace(operation.slot,
         edf::native::ReadNativeMaterialSamplerPass(reader,device,operation.slot)).first;
       found->second=edf::native::ApplyNativeMaterialSampler(found->second,operation);
     }
@@ -7906,7 +7962,7 @@ REX_HOOK_RAW(sub_821B8E48) {
   if(sampler_audit) {
     const edf::native::GuestReader reader(base);
     static std::atomic<uint64_t> checked=0;
-    for(const auto& [slot,expected]:expected_samplers) {
+    for(const auto& [slot,expected]:*audited_samplers) {
       const auto actual=edf::native::ReadSamplerWords(reader,device,slot);
       if(edf::native::SamplerStateKey(actual)!=edf::native::SamplerStateKey(expected.words) ||
          (actual[2]&3)!=(expected.words[2]&3)) {
@@ -11048,9 +11104,11 @@ REX_HOOK_RAW(sub_821375C0) {
 }
 
 namespace {
-void BindNativeShaderResource(PPCContext& ctx,uint8_t* base,bool pixel) {
+// reader is what the device, shader and stack words go through: the material
+// activation passes its device window, the setter hooks a fresh reader.
+template<class Reader>
+void BindNativeShaderResource(PPCContext& ctx,uint8_t* base,bool pixel,const Reader& reader) {
   const auto device=ctx.r3.u32,shader=ctx.r4.u32;
-  const edf::native::GuestReader reader(base);
   edf::native::SetNativeShaderResource(reader,device,shader,pixel,[&] {
     auto work=ctx;
     if(work.r1.u32<128) throw std::runtime_error("invalid native shader setter stack");
@@ -11062,6 +11120,29 @@ void BindNativeShaderResource(PPCContext& ctx,uint8_t* base,bool pixel) {
   },[&] {
     if(ctx.r1.u32<48) throw std::runtime_error("invalid native shader retirement tag");
     return reader.Word(ctx.r1.u32-48);
+  });
+}
+void BindNativeShaderResource(PPCContext& ctx,uint8_t* base,bool pixel) {
+  BindNativeShaderResource(ctx,base,pixel,edf::native::GuestReader(base));
+}
+// 8213BA98's native branch: SetTexture's CPU words and retirement. Owned
+// under the same flags as the shader setters; otherwise the guest setter runs.
+bool NativeTextureBindingOwned() {
+  return EDF_NATIVE_FLAG(shader_bridge) && EDF_NATIVE_FLAG(material_activation) &&
+    !(edf::native::native_queued_scene_group && edf::native::native_queued_scene_group->material_compatibility_only);
+}
+template<class Reader>
+void BindNativeTextureResource(PPCContext& ctx,uint8_t* base,const Reader& reader) {
+  const auto device=ctx.r3.u32;
+  edf::native::SetNativeTextureResource(reader,device,ctx.r4.u32,ctx.r5.u32,ctx.r6.u64,[&] {
+    auto work=ctx;
+    if(work.r1.u32<160) throw std::runtime_error("invalid native texture setter stack");
+    work.r1.u64=work.r1.u32-160; work.r3.u64=device; work.lr=0x8213BBE0;
+    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::RetirementAllocation);
+    sub_82141440(work,base); return work.r3.u32;
+  },[&] {
+    if(ctx.r1.u32<80) throw std::runtime_error("invalid native texture retirement tag");
+    return reader.Word(ctx.r1.u32-80);
   });
 }
 void PublishNativeShaderBinding(uint32_t device,uint32_t shader,bool pixel) {
@@ -11147,23 +11228,11 @@ REX_HOOK_RAW(sub_82147BA0) {
 REX_EXTERN(__imp__sub_821498C8);
 REX_EXTERN(__imp__sub_8213BA98);
 REX_HOOK_RAW(sub_8213BA98) {
-  if(!EDF_NATIVE_FLAG(shader_bridge) || !EDF_NATIVE_FLAG(material_activation) ||
-     (edf::native::native_queued_scene_group && edf::native::native_queued_scene_group->material_compatibility_only)) {
+  if(!NativeTextureBindingOwned()) {
     edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::TextureBinding);
     __imp__sub_8213BA98(ctx,base); return;
   }
-  const auto device=ctx.r3.u32;
-  const edf::native::GuestReader reader(base);
-  edf::native::SetNativeTextureResource(reader,device,ctx.r4.u32,ctx.r5.u32,ctx.r6.u64,[&] {
-    auto work=ctx;
-    if(work.r1.u32<160) throw std::runtime_error("invalid native texture setter stack");
-    work.r1.u64=work.r1.u32-160; work.r3.u64=device; work.lr=0x8213BBE0;
-    edf::native::EnterNativeSceneBoundary(edf::native::NativeSceneBoundary::RetirementAllocation);
-    sub_82141440(work,base); return work.r3.u32;
-  },[&] {
-    if(ctx.r1.u32<80) throw std::runtime_error("invalid native texture retirement tag");
-    return reader.Word(ctx.r1.u32-80);
-  });
+  BindNativeTextureResource(ctx,base,edf::native::GuestReader(base));
 }
 REX_HOOK_RAW(sub_821498C8) {
   const auto device=ctx.r3.u32,shader=ctx.r4.u32;
