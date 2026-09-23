@@ -22,6 +22,7 @@
 #include <rex/ui/window_listener.h>
 
 #include "native_kbm.h"
+#include "pause_menu.h"
 
 class NativeKbmDriver final : public rex::input::InputDriver,
                               public rex::ui::WindowInputListener,
@@ -45,7 +46,8 @@ class NativeKbmDriver final : public rex::input::InputDriver,
   rex::X_RESULT GetDeviceState(rex::input::DeviceId id, rex::input::X_INPUT_STATE* out) override {
     if (!edf::kbm::Enabled() || id != kDevice) return kNotConnected;
     // The per-poll call from the guest thread, so it also drives ownership and capture.
-    const bool game_owns_input = is_active() && has_focus_.load(std::memory_order_relaxed);
+    const bool game_owns_input =
+        is_active() && has_focus_.load(std::memory_order_relaxed) && !edf::menu::MenuOpen();
     edf::kbm::SetGameOwnsInput(game_owns_input);
     QueueMouseCaptureUpdate(game_owns_input && edf::kbm::MouseLookWanted());
     if (out) *out = {};
@@ -61,12 +63,25 @@ class NativeKbmDriver final : public rex::input::InputDriver,
     return kEmpty;
   }
 
+  // UI thread: the F1 menu opened. The capture is normally withdrawn by the next guest
+  // poll, but the menu pauses the game and the polls stop with it, so drop it here: free
+  // the cursor and forget whatever was held. The first poll after the menu closes asks
+  // for the capture again.
+  static void ReleaseForMenu() {
+    NativeKbmDriver* driver = instance_;
+    if (!driver || !driver->attached_window_) return;
+    driver->mouse_capture_requested_.store(false, std::memory_order_relaxed);
+    driver->ReleaseMouseCaptureFromUIThread(driver->attached_window_);
+    edf::kbm::SetGameOwnsInput(false);
+  }
+
   void OnWindowAvailable(rex::ui::Window* window) override {
     if (!window) return;
     {
       std::lock_guard lock(mutex_);
       attached_window_ = window;
     }
+    instance_ = this;
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
   }
@@ -186,6 +201,7 @@ class NativeKbmDriver final : public rex::input::InputDriver,
         std::lock_guard lock(mutex_);
         attached_window_ = nullptr;
       }
+      if (instance_ == this) instance_ = nullptr;
       if (mouse_capture_update_queued_.load(std::memory_order_relaxed))
         window->app_context().ExecutePendingFunctionsFromUIThread();
       ReleaseMouseCaptureFromUIThread(window);
@@ -194,6 +210,8 @@ class NativeKbmDriver final : public rex::input::InputDriver,
     });
   }
 
+  // The driver attached to the window, for ReleaseForMenu. UI thread only.
+  static inline NativeKbmDriver* instance_ = nullptr;
   // Only the UI thread writes it, so only guest-thread access needs the lock.
   rex::ui::Window* attached_window_ = nullptr;
   std::mutex mutex_;

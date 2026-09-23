@@ -16,6 +16,7 @@
 #include "core_logic.h"
 #include "native_graphics/native_renderer_preset.h"
 #include "scripted_input_logic.h"
+#include "pause_menu.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -30,10 +31,24 @@ using rex::be;
 REXCVAR_DECLARE(bool, edf_trace_input);
 REXCVAR_DECLARE(bool, edf_rumble);
 REXCVAR_DECLARE(int32_t, edf_frame_pacer_spin_us);
+REXCVAR_DECLARE(std::string, edf_menu_pad_chord);
 
 namespace {
 uint32_t g_calls = 0, g_last_rc = 0xFFFFFFFF;
 uint16_t g_last_btn = 0xFFFF;
+
+// F1 menu (pause_menu.h): the pad chord that opens it, and while it is open - and until
+// the pad has been let go after it closes - the game sees an untouched pad.
+void RoutePadForMenu(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
+  const edf::menu::PadSnapshot snapshot{pad.buttons, pad.left_trigger, pad.right_trigger,
+                                        pad.thumb_lx, pad.thumb_ly, pad.thumb_rx, pad.thumb_ry};
+  const auto routed = edf::menu::RouteGuestPad(snapshot, REXCVAR_GET(edf_menu_pad_chord), user == 0);
+  if (routed.blank) {
+    pad = rex::input::X_INPUT_GAMEPAD{};
+    return;
+  }
+  pad.buttons = routed.buttons;
+}
 }  // namespace
 
 REX_EXTERN(__imp__sub_8212EA20);
@@ -57,6 +72,7 @@ REX_HOOK_RAW(sub_8212EA20) {
                 (uint32_t)st->packet_number, g_calls);
     g_last_rc = rc; g_last_btn = btn;
   }
+  RoutePadForMenu(user, st->gamepad);
 }
 
 // Gate the game's XInputSetState wrapper so the option applies equally to the
@@ -135,6 +151,7 @@ REXCVAR_DECLARE(int32_t, edf_fps_cap);
 REXCVAR_DECLARE(bool, edf_frametime_log);
 REXCVAR_DECLARE(bool, edf_native_memory_log);
 REXCVAR_DECLARE(bool, edf_frame_pacer_before_present);
+REXCVAR_DECLARE(bool, edf_show_fps);
 #ifdef _WIN32
 REXCVAR_DECLARE(bool, edf_native_vsync);
 namespace edf::native { bool NativeFramerateUnlockActive(); }
@@ -219,6 +236,23 @@ void LogProcessMemory(double t_s) {
 namespace edf {
 FrameStats& CurrentFrameStats() { static FrameStats s; return s; }
 }
+namespace {
+// One frame into the overlay's ring (frame_stats.h). CPU time is the interval minus the
+// heartbeat's wait for the next simulation tick and the render cap's wait: the engine
+// thread's busy time, including the present's own work.
+void RecordOverlayFrame(std::chrono::steady_clock::duration interval, std::chrono::steady_clock::duration cap_wait) {
+  auto& st = edf::CurrentFrameStats();
+  const double ms = std::chrono::duration<double, std::milli>(interval).count();
+  const uint32_t index = st.frame_count.load(std::memory_order_relaxed);
+  st.frame_ms[index % edf::FrameStats::kHistory].store(float(ms), std::memory_order_relaxed);
+  st.frame_count.store(index + 1, std::memory_order_release);
+  const double engine_wait_ms = double(st.engine_wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6;
+  const double cap_wait_ms = std::chrono::duration<double, std::milli>(cap_wait).count();
+  const double cpu = std::clamp(ms - engine_wait_ms - cap_wait_ms, 0.0, ms);
+  const float previous = st.cpu_ms.load(std::memory_order_relaxed);
+  st.cpu_ms.store(previous > 0 ? float(previous * 0.9 + cpu * 0.1) : float(cpu), std::memory_order_relaxed);
+}
+}  // namespace
 REX_EXTERN(__imp__sub_82151460);
 REX_EXTERN(__imp__edf_native_present_cpu_tail);
 REXCVAR_DECLARE(bool, edf_native_host);
@@ -242,12 +276,23 @@ REX_HOOK_RAW(sub_82151460) {
   const bool before_present = PaceBeforePresent(cap);
   if (before_present != previous_before_present) pacer.schedule.Reset();
   previous_before_present = before_present;
-  if (before_present) pacer.Pace(cap);
+  // Performance overlay: time spent in the render cap's wait, so the frame's CPU time
+  // can leave it out. Two clock reads, only while the overlay is shown.
+  const bool overlay = REXCVAR_GET(edf_show_fps);
+  clock::duration cap_wait{};
+  const auto pace = [&] {
+    if (!overlay) { pacer.Pace(cap); return; }
+    const auto begin = clock::now();
+    pacer.Pace(cap);
+    cap_wait += clock::now() - begin;
+  };
+  if (before_present) pace();
   if(EDF_NATIVE_FLAG(host)) __imp__edf_native_present_cpu_tail(ctx, base);
   else __imp__sub_82151460(ctx, base);
-  if (!before_present) pacer.Pace(cap);  // cap 0: releases at once and resets the grid
+  if (!before_present) pace();  // cap 0: releases at once and resets the grid
   auto now = clock::now();
   if (total != 0) frame_ms.push_back(std::chrono::duration<double, std::milli>(now - last_frame).count());
+  if (overlay && total != 0) RecordOverlayFrame(now - last_frame, cap_wait);
   last_frame = now; ++frames; ++total;
   double dt = std::chrono::duration<double>(now - last_report).count();
   if (dt >= 5.0) {

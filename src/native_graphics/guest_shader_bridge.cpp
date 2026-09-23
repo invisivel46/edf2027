@@ -4,6 +4,8 @@
 #include "guest_shader_bridge.h"
 #include "native_renderer_preset.h"
 #include "../scripted_input_logic.h"
+#include "../frame_stats.h"
+#include "../pause_menu.h"
 #include "native_backend_frame.h"
 #include "native_backend_frame_queue.h"
 #include "native_frame_flight.h"
@@ -7685,9 +7687,15 @@ void GpuPassFrameBegin() {
     if(!timings.TakeReport(window)) return;
     REXLOG_INFO("Native GPU timing window: frames={} skipped={} dropped_spans={} invalid_spans={} ticks_per_s={} (GPU timestamps; frame is the helper's first to last marker, interval one frame's begin to the next)",
       window.frames,window.skipped,window.dropped_spans,window.invalid_spans,timings.frequency());
-    for(const auto& pass:window.passes)
+    for(const auto& pass:window.passes) {
       REXLOG_INFO("Native GPU timing: pass={} frames={} total_ms={:.3f} avg_ms={:.3f} max_ms={:.3f}",
         pass.name,pass.frames,pass.total_ms,pass.average_ms(),pass.max_ms);
+      // The performance overlay's GPU number (frame_stats.h).
+      if(pass.name=="frame") {
+        edf::CurrentFrameStats().gpu_ms.store(float(pass.average_ms()),std::memory_order_relaxed);
+        edf::CurrentFrameStats().gpu_windows.fetch_add(1,std::memory_order_relaxed);
+      }
+    }
   });
 }
 int GpuPassSpanBegin(std::string_view name) {
@@ -11203,8 +11211,45 @@ REX_HOOK_RAW(sub_821BEBF0) {
 
 REX_EXTERN(__imp__sub_821BEAB0);
 REX_EXTERN(sub_821FAC28);
+namespace {
+// F1 pause menu (pause_menu.h). The engine thread stops here, at the top of a main-loop
+// iteration, while the menu asks for a pause: no simulation step is dispatched and no
+// guest frame is rendered, and the host keeps presenting the last scene image with the
+// menu over it (its UI ticker paints at 60 Hz without guest frames). This is where the
+// retail loop already blocks for the next tick, and the previous frame's render helper
+// has been joined (821A4DE8 runs just before this call). The engine pacing clock is the
+// only clock that has to be told about the gap: on resume it restarts at the tick and
+// sub-tick fraction it had when the hold began, so the game clock (0x8257C300) does not
+// advance across the pause, no catch-up steps are dispatched, and the camera and pose
+// interpolation histories see consecutive ticks (no cut, nothing to reset). Guest
+// threads other than the engine (streaming, audio) keep running and wait on it as they
+// would across one long frame.
+void HoldEngineForMenu() {
+  auto& pacing=edf::native::PacingState();
+  uint64_t tick=0;
+  float fraction=0;
+  {
+    std::lock_guard lock(pacing.mutex);
+    const auto now=edf::native::NativePacingClock::Clock::now();
+    tick=pacing.clock.Sample(now);
+    fraction=pacing.clock.Fraction(now);
+  }
+  const auto began=std::chrono::steady_clock::now();
+  if(!edf::menu::HoldWhilePaused()) return;
+  std::lock_guard lock(pacing.mutex);
+  const auto now=edf::native::NativePacingClock::Clock::now();
+  pacing.clock.Reset(now-std::chrono::nanoseconds(int64_t(double(fraction)*1e9/60.0)),tick);
+  REXLOG_INFO("Native engine pacing: paused by the settings menu for {} ms; resumed at tick {} (clock rebased, no catch-up)",
+    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-began).count(),tick);
+}
+}
 REX_HOOK_RAW(sub_821BEAB0) {
   if(!EDF_NATIVE_FLAG(host)) { __imp__sub_821BEAB0(ctx,base); return; }
+  // The main loop's heartbeat only (the call site the frame-rate unlock also keys on),
+  // and not during movie playback, whose own clocks are not paused.
+  if(ctx.lr==0x821A6894 && edf::menu::Engine().requested.load(std::memory_order_acquire) &&
+     !edf::native::State().movie_pacing_active.load(std::memory_order_relaxed))
+    HoldEngineForMenu();
   NativeLoopTrace loop_trace("heartbeat",ctx.r3.u32,ctx.lr);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::EngineWait);
   const edf::native::GuestReader reader(base);
@@ -11221,6 +11266,7 @@ REX_HOOK_RAW(sub_821BEAB0) {
   auto steps=edf::native::NativePacingSteps(current,previous,divisor);
   edf::native::NativeFrameWaitTrace waiting(edf::native::FrameWaitKind::Engine,
     !unlocked && edf::native::NativePacingPending(steps));
+  const auto wait_began=sampled_at;
   while(!unlocked && edf::native::NativePacingPending(steps)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     sampled_at=edf::native::NativePacingClock::Clock::now();
@@ -11228,6 +11274,10 @@ REX_HOOK_RAW(sub_821BEAB0) {
     steps=edf::native::NativePacingSteps(current,previous,divisor);
   }
   waiting.Finish();
+  // Performance overlay CPU time (frame_stats.h): the time spent waiting for the tick.
+  if(sampled_at!=wait_began)
+    edf::CurrentFrameStats().engine_wait_ns.fetch_add(uint64_t(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(sampled_at-wait_began).count()),std::memory_order_relaxed);
   reader.StoreDoubleWord(0x8257C300,current);
   // A render-only iteration must not discard fractional divisor progress.
   if(!unlocked || steps) reader.StoreDoubleWord(0x8257C308,current);

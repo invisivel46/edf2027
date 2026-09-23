@@ -12,6 +12,4 @@ constexpr const char* kCancel = "Cancel";
 constexpr const char* kWrongTitle = "This is not Earth Defense Force 2017 (title id mismatch).";
 constexpr const char* kNoXex = "No default.xex found in that folder.";
 constexpr const char* kStarting = "Starting the game...";
-constexpr const char* kSettingsTitle = "EDF2027 - Settings";
-constexpr const char* kRestartNote = "* takes effect after restarting the game";
 }
