@@ -21,7 +21,7 @@
 #include <windows.h>
 #endif
 
-REXCVAR_DEFINE_BOOL(edf_low_latency, false, "EDF2027",
+REXCVAR_DEFINE_BOOL(edf_low_latency, true, "EDF2027",
                     "Low-latency presentation: the D3D12 presenter waits for the display just in time on its own "
                     "thread and shows the newest frame; with VSync on the renderer stays at most one frame ahead of "
                     "the display, with one frame of GPU work in flight; mouse aim takes the newest motion. Applies live");
