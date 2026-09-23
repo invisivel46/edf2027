@@ -619,7 +619,10 @@ std::vector<NativeGuestMatrix> Guest820EC180Worlds(const Memory& m,uint32_t r30,
 bool SameBits(const NativeGuestMatrix& a,const NativeGuestMatrix& b) {
   return std::bit_cast<std::array<uint32_t,16>>(a)==std::bit_cast<std::array<uint32_t,16>>(b);
 }
-bool SameBits(double a,double b) { return U(a)==U(b); }
+// A NaN result's sign bit is whatever x86 NaN propagation yields for the
+// operation order the optimizer picked (it differs between -O0 and -O2 on
+// either side); only NaN-ness is a guest fact here.
+bool SameBits(double a,double b) { return U(a)==U(b) || (std::isnan(a) && std::isnan(b)); }
 
 void GuestTrigMatchesTheRecompiledBodies() {
   // Reduction boundaries, both signs and zeros, huge and out-of-range values, NaN.
