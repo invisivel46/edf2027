@@ -960,6 +960,41 @@ NativeRenderObjectConstant ObjectConstant(const char* name,std::array<float,4> v
 NativeRenderConstants ObjectConstants(std::vector<NativeRenderObjectConstant> constants) {
   return std::make_shared<const std::vector<NativeRenderObjectConstant>>(std::move(constants));
 }
+// The guest's effect pool as a reference, written from the guest code and not
+// from the native carry: 821A1730 -> 821A16D8 copies one float4 to the named
+// value, which stays until the next store to it; each slot 4 stores, in
+// order, its entry's constants (the LOD model's), then each part's. A draw
+// reads the value at its slot 4's store point: the pool before the call with
+// the item's own stores over it.
+struct GuestPool {
+  std::map<std::string,std::array<uint8_t,16>> values;
+  void Store(const NativeRenderConstants& stores) {
+    if(stores) for(const auto& store:*stores) values[store.name]=store.registers;
+  }
+  // Every call in order: what each entry's items see before their own stores.
+  std::map<const NativeRenderEntry*,std::map<std::string,std::array<uint8_t,16>>> Run(
+      const std::vector<const NativeRenderEntry*>& calls) {
+    std::map<const NativeRenderEntry*,std::map<std::string,std::array<uint8_t,16>>> before;
+    for(const auto* entry:calls) {
+      before[entry]=values;
+      Store(entry->constants);
+      for(const auto& attachment:entry->attachments) Store(attachment.constants);
+    }
+    return before;
+  }
+};
+// The pass constants with what the pool holds for a draw bound over the
+// globals of those names (the first register), as the guest activation reads them.
+std::vector<NativeSceneMaterialInputs::Constant> GuestBound(std::vector<NativeSceneMaterialInputs::Constant> constants,
+    std::map<std::string,std::array<uint8_t,16>> pool,const NativeRenderConstants& own) {
+  if(own) for(const auto& store:*own) pool[store.name]=store.registers;
+  for(auto& constant:constants) {
+    if(!constant.global || constant.registers.size()<16) continue;
+    const auto found=pool.find(constant.name);
+    if(found!=pool.end()) std::copy(found->second.begin(),found->second.end(),constant.registers.begin());
+  }
+  return constants;
+}
 // 821A16D8 stores one float4 over the pool value: every global of the name
 // (either stage) takes the object's 16 bytes over its first register and
 // keeps the rest; locals and other names are untouched.
@@ -991,13 +1026,17 @@ void ObjectConstantOverrides() {
   Require(plan.opaque.size()==2 && NativeFullFrameModelItemConstants(plan.opaque[0])==entry->constants &&
     NativeFullFrameModelItemConstants(plan.opaque[1])==entry->attachments[0].constants,"an item's constants");
 }
-// Build with per-object constants against full captures: a rigid draw
-// captures the row's constants with its object's bound against the row's
-// pipeline half (a draw without any shares the row's material); a skinned
-// draw rebinds them with its palette. Unchanged values carry the objects, a
-// new pointer to equal values too; a moved value remakes that item's only.
-void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
-  using Constant=NativeSceneMaterialInputs::Constant;
+// A rigid program reading g_Highlight and g_Time (both globals, one float4
+// each) over one quad, its published material and a one-bone layout.
+struct ObjectFixture {
+  std::shared_ptr<NativeSceneMaterialProgram> program;
+  std::unique_ptr<NativeIndexedMesh> mesh;
+  std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
+  std::shared_ptr<NativeSceneGroupMaterial> published;
+  std::shared_ptr<const NativeModelLayout> layout;
+};
+ObjectFixture MakeObjectFixture(std::shared_ptr<NativeRenderBackend> backend) {
+  ObjectFixture fixture;
   auto program=std::make_shared<NativeSceneMaterialProgram>();
   {
     Effect effect;
@@ -1027,8 +1066,8 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
   SkinnedFixture::Word(declaration,4,0x2a23b9);
   const float points[]{-.125f,-.25f,.5f, -.125f,.25f,.5f, .125f,.25f,.5f, .125f,-.25f,.5f};
   for(size_t i=0;i<12;++i) SkinnedFixture::Word(vertices,i*4,std::bit_cast<uint32_t>(points[i]));
-  NativeIndexedMesh mesh(*backend,program->vertex,declaration,12,vertices,indices,2);
-  const auto geometry=std::make_shared<const NativeIndexedMesh::RetainedDraw>(mesh.RetainDraw(backend,0,6));
+  fixture.mesh=std::make_unique<NativeIndexedMesh>(*backend,program->vertex,declaration,12,vertices,indices,2);
+  const auto geometry=std::make_shared<const NativeIndexedMesh::RetainedDraw>(fixture.mesh->RetainDraw(backend,0,6));
   auto published=std::make_shared<NativeSceneGroupMaterial>();
   published->program=program;
   published->constants={{false,"g_mWorld",SkinnedFixture::Floats({1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1}),true},
@@ -1036,6 +1075,20 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
     {false,"g_Highlight",SkinnedFixture::Floats({.1f,.1f,.1f,0}),true},{false,"g_Time",SkinnedFixture::Floats({9,0,0,1}),true},
     {true,"tint",SkinnedFixture::Floats({1,1,1,1}),false}};
   const auto layout=Layout(0x1000,false,1,{Mesh(0,false,true,{Batch(0x2000,{0x3000})})});
+  fixture.program=program; fixture.geometry=geometry; fixture.published=published; fixture.layout=layout;
+  return fixture;
+}
+// Build with per-object constants against full captures: a rigid draw
+// captures the row's constants with the pool's values at its slot 4 bound
+// (GuestPool: the stores earlier in call order, this frame's and the previous
+// frame's, its own over them) against the row's pipeline half; a draw no
+// store reaches shares the row's material; a skinned draw rebinds them with
+// its palette. Unchanged values carry the objects, a new pointer to equal
+// values too; a moved value remakes the draws that see it only.
+void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
+  auto fixture=MakeObjectFixture(backend);
+  const auto& program=fixture.program; const auto& geometry=fixture.geometry;
+  const auto& published=fixture.published; const auto& layout=fixture.layout;
   NativeRenderRegistrySnapshot snapshot;
   std::vector<std::shared_ptr<NativeRenderEntry>> entries;
   for(uint32_t i=0;i<3;++i) { entries.push_back(Entry(i+1,{float(i),0,100},1,layout)); snapshot.entries.push_back(entries.back()); }
@@ -1050,10 +1103,14 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
   sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { return geometry; };
   sources.generation=[] { return uint64_t(1); };
   NativeFullFrameModels models;
-  const auto check=[&](const char* name,uint64_t derived,uint64_t reused,uint64_t object_constants) {
+  GuestPool guest;
+  const auto check=[&](const char* name,uint64_t derived,uint64_t reused,uint64_t object_constants,uint64_t carried) {
     const auto frame=models.Build(snapshot,camera,pass,sources);
     Require(frame.stats.drawn==3 && frame.stats.draws==3 && frame.stats.failed==0 && frame.stats.derived==derived &&
-      frame.stats.reused==reused && frame.stats.object_constants==object_constants,name);
+      frame.stats.reused==reused && frame.stats.object_constants==object_constants && frame.stats.carried==carried,name);
+    Require(frame.plan.calls.size()==3 && frame.plan.calls[0]==entries[0].get() && frame.plan.calls[2]==entries[2].get(),
+      "every entry's slot 4 is called, in gather (here snapshot) order");
+    const auto before=guest.Run(frame.plan.calls);
     auto constants=published->constants;
     for(auto& constant:constants) camera.pass.Apply(constant);
     std::vector<const NativeSceneInstance*> drawn;
@@ -1062,10 +1119,7 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
     Require(drawn.size()==refs.size() && drawn.size()==3,name);
     for(size_t d=0;d<refs.size();++d) {
       const auto& item=frame.plan.opaque[refs[d].item];
-      auto bound=constants;
-      if(const auto& objects=item.entry->constants)
-        for(const auto& replaced:NativeFullFrameModelObjectConstants(constants,*objects))
-          for(auto& constant:bound) if(constant.name==replaced.name && constant.pixel==replaced.pixel) constant=replaced;
+      const auto bound=GuestBound(constants,before.at(item.entry),item.entry->constants);
       const auto& material=*drawn[d]->object.material;
       NativeBackendSampler* sampler=material.samplers().at(0).second;
       const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
@@ -1073,28 +1127,23 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
       const auto values=NativeFullFrameModelConstantsFor(*layout,*item.entry->pose,pass.palette_limit);
       ApplyNativeScenePublishedWorld(full,values.worlds[refs[d].draw.mesh]);
       Require(material.Equivalent(*full.material) && !std::memcmp(drawn[d]->object.world.data(),full.world.data(),sizeof(full.world)),
-        "a rigid draw's material is the full capture of its object's constants");
+        "a rigid draw's material is the full capture of the pool its slot 4 sees");
     }
-    // Entry 1 never has constants: its material is the row's, which every
-    // draw without constants shares; a draw with them has its own image.
-    const auto* plain=drawn[1]->object.material.get();
-    for(size_t d=0;d<refs.size();++d) {
-      const auto* material=drawn[d]->object.material.get();
-      if(frame.plan.opaque[refs[d].item].entry->constants) Require(material!=plain && !material->Equivalent(*plain),
-        "per-object constants reach the image");
-      else Require(material==plain,"a draw without object constants shares the row's material");
-    }
-    if(entries[0]->constants && entries[2]->constants)
-      Require(!drawn[2]->object.material->Equivalent(*drawn[0]->object.material),"each object its own values");
   };
-  check("rigid draws with and without object constants",3,0,2);
-  check("an unchanged frame carries them",0,3,0);
+  // Frame 1 starts from nothing stored: entry 0 its own g_Highlight, entry 1
+  // (no stores) entry 0's, entry 2 its own pair.
+  check("rigid draws with their own and a carried constant",3,0,3,1);
+  // Frame 2 starts from what frame 1 left (entry 2's g_Time too): entries 0
+  // and 1 now bind it as well; entry 2 sees only its own.
+  check("the previous frame's stores reach the next frame's first draws",2,1,2,2);
+  check("an unchanged frame carries them",0,3,0,0);
   entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{1,0,0,1})});
-  check("a new set of equal values carries its object",0,3,0);
+  check("a new set of equal values carries its object",0,3,0,0);
   entries[0]->constants=ObjectConstants({ObjectConstant("g_Highlight",{.5f,0,0,1})});
-  check("a moved value remakes only its item's object",1,2,1);
+  check("a moved value remakes the draws that see it",2,1,2,2);
   entries[2]->constants.reset();
-  check("constants gone: the row's material",1,2,0);
+  check("constants gone: the draw sees the carried pool",1,2,1,1);
+  check("and keeps it while nothing moves",0,3,0,0);
   // Skinned: the palette and the object constant rebind together.
   const auto skinned_layout=Layout(0x5000,true,3,{Mesh(0,true,false,{Batch(0x6000,{0x7000})})});
   auto character=Entry(9,{0,0,100},1,skinned_layout);
@@ -1110,7 +1159,11 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
   skinned_sources.generation=[] { return uint64_t(1); };
   NativeFullFrameModels skinned_models;
   const auto frame=skinned_models.Build(characters,camera,pass,skinned_sources);
-  Require(frame.stats.drawn==2 && frame.stats.palettes==2 && frame.stats.object_constants==1,"skinned draws with a constant");
+  // The plain character draws after the one that stores: it sees its value.
+  Require(frame.stats.drawn==2 && frame.stats.palettes==2 && frame.stats.object_constants==2 && frame.stats.carried==1,
+    "skinned draws with a constant");
+  GuestPool skinned_guest;
+  const auto before=skinned_guest.Run(frame.plan.calls);
   auto constants=skinned.constants;
   for(auto& constant:constants) camera.pass.Apply(constant);
   std::vector<const NativeSceneInstance*> drawn;
@@ -1119,10 +1172,7 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
   Require(drawn.size()==2 && refs.size()==2,"two skinned draws");
   for(size_t d=0;d<2;++d) {
     const auto& item=frame.plan.opaque[refs[d].item];
-    auto bound=constants;
-    if(item.entry->constants)
-      for(const auto& replaced:NativeFullFrameModelObjectConstants(constants,*item.entry->constants))
-        for(auto& constant:bound) if(constant.name==replaced.name && constant.pixel==replaced.pixel) constant=replaced;
+    const auto bound=GuestBound(constants,before.at(item.entry),item.entry->constants);
     const auto values=NativeFullFrameModelConstantsFor(*skinned_layout,*item.entry->pose,pass.palette_limit);
     const auto& material=*drawn[d]->object.material;
     NativeBackendSampler* sampler=material.samplers().at(0).second;
@@ -1130,6 +1180,215 @@ void ObjectConstantBuild(std::shared_ptr<NativeRenderBackend> backend) {
     const auto full=skinned.Full(*material.pipeline(),bound,values.palette,samplers,material.blend_factor());
     Require(material.Equivalent(*full.material),"a skinned draw binds its palette and its object's constants");
   }
+}
+// 821A5080's slot-4 call order: the mode-0 entries as the walks gather them
+// (820B4038 -> 821C0C00 calls slot 4 at once), then the filed ones in
+// 821A3BA0's order (key descending, ties in filing = gather order); a hidden,
+// culled or bucket-0 entry is never called, an unposed one is. Unlisted
+// entries (the octree's) are gathered at the gather's `unlisted` position.
+void PoolCallOrder() {
+  const auto camera=MakeCamera();
+  NativeRenderRegistrySnapshot snapshot;
+  const auto add=[&](uint32_t object,float z,int32_t mode) {
+    auto entry=Entry(object,{0,0,z}); entry->mode=mode; entry->sort_bias=1; entry->cull_distance=1e6f;
+    snapshot.entries.push_back(entry);
+    return entry;
+  };
+  const auto a=add(10,100,0);
+  const auto b=add(20,1000,1);
+  const auto c=add(30,1000,1);               // b's key: the gather order decides.
+  const auto d=add(40,100,0); d->hidden=true;
+  const auto e=add(50,100,1);                // Key 100: bucket 0, never called.
+  const auto f=add(60,100,0); f->pose.reset();  // Called, not drawn.
+  const auto g=add(70,-50,0);                // Culled.
+  const auto h=add(80,100,0);                // Unlisted.
+  NativeFullFrameModelGather gather;
+  gather.objects={60,30,10,20,40,50,70};
+  gather.unlisted=1;
+  const auto plan=PlanNativeFullFrameModels(snapshot,camera,gather);
+  const std::vector<const NativeRenderEntry*> calls{f.get(),h.get(),a.get(),c.get(),b.get()};
+  Require(plan.calls==calls && plan.stats.calls==5,"slot-4 calls: mode 0 in gather order, then the filed ones by key and gather order");
+  Require(plan.stats.unlisted==1,"entries outside the gather are counted");
+  Require(plan.opaque.size()==2 && plan.opaque[0].entry==h.get() && plan.opaque[1].entry==a.get(),"opaque items in gather order");
+  Require(plan.transparent.size()==2 && plan.transparent[0].entry==c.get() && plan.transparent[1].entry==b.get(),
+    "equal keys draw in gather order");
+  // Without a gather order: snapshot order.
+  const auto plain=PlanNativeFullFrameModels(snapshot,camera);
+  const std::vector<const NativeRenderEntry*> unordered{a.get(),f.get(),h.get(),b.get(),c.get()};
+  Require(plain.calls==unordered && plain.stats.unlisted==8,"no gather order: snapshot order");
+  // Unlisted past the end (no map manager): after every listed object.
+  gather.unlisted=UINT32_MAX;
+  const auto last=PlanNativeFullFrameModels(snapshot,camera,gather);
+  Require(last.calls[0]==f.get() && last.calls[1]==a.get() && last.calls[2]==h.get(),"unlisted entries after the listed ones");
+}
+// The carry against GuestPool: each call sees the pool its predecessors
+// left; an entry's stores, then its parts' (attachment constants, cumulative
+// as the registry publishes them), in order; a call with no stores shares
+// the state object; the end is what the last store left.
+void PoolCarry() {
+  const auto store=[](std::vector<NativeRenderObjectConstant> values) { return ObjectConstants(std::move(values)); };
+  auto e1=Entry(1,{0,0,100}),e2=Entry(2,{0,0,100}),e3=Entry(3,{0,0,100}),e4=Entry(4,{0,0,100});
+  e1->constants=store({ObjectConstant("g_Highlight",{1,0,0,1})});
+  // Two parts: 820F01E8 stores its own pair before each part's draw.
+  e1->attachments.push_back({{0x1100,nullptr},0x1144,Pose(1)});
+  e1->attachments.back().constants=store({ObjectConstant("g_Highlight",{1,0,0,1}),ObjectConstant("g_Time",{2,0,0,1})});
+  e1->attachments.push_back({{0x1200,nullptr},0x1244,Pose(1)});
+  e1->attachments.back().constants=store({ObjectConstant("g_Highlight",{1,0,0,1}),ObjectConstant("g_Time",{3,0,0,1})});
+  e3->constants=store({ObjectConstant("g_Highlight",{4,0,0,1})});
+  // C_Tank: the LOD model and weapons store nothing, each tread its g_Scroll.
+  e4->attachments.push_back({{0x2100,nullptr},0x2144,Pose(1)});
+  e4->attachments.push_back({{0x2200,nullptr},0x2244,Pose(1)});
+  e4->attachments.back().constants=store({ObjectConstant("g_Scroll",{-5,0,0,1})});
+  NativeFullFrameModelPlan plan;
+  plan.calls={e1.get(),e2.get(),e3.get(),e4.get()};
+  const std::vector<NativeRenderObjectConstant> start{ObjectConstant("g_Scroll",{9,0,0,1})};
+  const auto carry=CarryNativeFullFrameModelPool(plan,start);
+  GuestPool guest;
+  for(const auto& value:start) guest.values[value.name]=value.registers;
+  const auto before=guest.Run(plan.calls);
+  for(const auto* entry:plan.calls) {
+    const auto& state=carry.before.at(entry);
+    Require(state!=nullptr,"a started pool is never empty");
+    std::map<std::string,std::array<uint8_t,16>> values;
+    for(const auto& value:*state) values[value.name]=value.registers;
+    Require(values==before.at(entry),"each call sees the pool its predecessors left");
+  }
+  Require(carry.before.at(e2.get())==carry.before.at(e3.get()),"a call without stores shares the state");
+  Require(carry.before.at(e1.get())!=carry.before.at(e2.get()),"stores make a new state");
+  std::map<std::string,std::array<uint8_t,16>> end;
+  for(const auto& value:carry.end) end[value.name]=value.registers;
+  Require(end==guest.values && carry.end.size()==3 && carry.end[0].name=="g_Scroll" && carry.end[1].name=="g_Highlight" &&
+    carry.end[2].name=="g_Time","the end is the last stores, names in first-store order");
+  // What an item draws with: the pool before its entry with its own stores over it.
+  const auto effective=NativeFullFrameModelEffectiveConstants(carry.before.at(e4.get()),e4->attachments[1].constants);
+  Require(effective.size()==3 && effective[0].name=="g_Scroll" && effective[0].registers==ObjectConstant("g_Scroll",{-5,0,0,1}).registers &&
+    effective[1].registers==ObjectConstant("g_Highlight",{4,0,0,1}).registers,"a tread's scroll over the carried pool");
+  const auto body=NativeFullFrameModelEffectiveConstants(carry.before.at(e4.get()),e4->constants);
+  Require(body.size()==3 && body[0].registers==start[0].registers,"the tank body sees the carried scroll");
+  // Nothing stored and nothing started: no state.
+  NativeFullFrameModelPlan quiet; quiet.calls={e2.get()};
+  const auto empty=CarryNativeFullFrameModelPool(quiet,{});
+  Require(!empty.before.at(e2.get()) && empty.end.empty() && NativeFullFrameModelEffectiveConstants(nullptr,nullptr).empty(),
+    "an empty pool binds nothing");
+}
+// ReadNativeFullFrameModelGather over a synthetic owner: the owner+44 list's
+// managers in order; 820D4850 managers' +48 lists, the map manager's +372
+// list then the octree's position; other managers nothing; a second visit
+// is skipped (the obj+48 stamp); a list that never ends throws.
+struct GatherMemory {
+  std::map<uint32_t,uint32_t> words;
+  uint32_t Word(uint32_t address) const {
+    const auto found=words.find(address);
+    if(found==words.end()) throw std::runtime_error("unmapped gather word");
+    return found->second;
+  }
+  // A list at `list` holding `objects`: nodes from `nodes` 16 bytes apart, the end marker `end`.
+  void List(uint32_t list,uint32_t nodes,uint32_t end,std::vector<uint32_t> objects) {
+    words[list]=objects.empty()?end:nodes; words[list+12]=end;
+    for(size_t i=0;i<objects.size();++i) {
+      const auto node=nodes+uint32_t(i)*16;
+      words[node]=i+1<objects.size()?node+16:end; words[node+8]=objects[i];
+    }
+  }
+  void Manager(uint32_t manager,uint32_t vtable,uint32_t slot2) { words[manager]=vtable; words[vtable+8]=slot2; }
+};
+void GatherWalk() {
+  GatherMemory memory;
+  const uint32_t owner=0x1000;
+  memory.List(owner+kNativeGatherWorldList,0x2000,0x2F00,{0x3000,0x3100,0x3200,0x3300});
+  memory.Manager(0x3000,0x5000,kNativeGatherObjectSlot2);   // Game objects.
+  memory.Manager(0x3100,0x5100,kNativeGatherMapSlot2);      // Map objects.
+  memory.Manager(0x3200,0x5200,0x820B3610u);                // Map effects: gathers nothing here.
+  memory.Manager(0x3300,0x5300,kNativeGatherObjectSlot2);   // Boss objects.
+  memory.List(0x3000+kNativeGatherObjectList,0x4000,0x4F00,{101,102});
+  memory.List(0x3100+kNativeGatherMapList,0x4100,0x4FF0,{201,101});
+  memory.List(0x3300+kNativeGatherObjectList,0x4200,0x4FE0,{});
+  const auto gather=ReadNativeFullFrameModelGather(memory,owner);
+  Require(gather.objects==std::vector<uint32_t>{101,102,201} && gather.unlisted==3,
+    "managers in world-list order, lists in order, first visits only, the octree after the map list");
+  memory.words[0x4000]=0x4000;  // A node linking to itself.
+  bool threw=false;
+  try { ReadNativeFullFrameModelGather(memory,owner); } catch(const std::exception&) { threw=true; }
+  Require(threw,"a list that does not end throws");
+}
+// The carry across frames, views and guest renders, through Build: a reader
+// R (no stores) gathered before a writer W (g_Highlight = its tick's value).
+// Each advancing frame R sees W's previous tick; a render-only frame of the
+// same tick sees what that tick's frame saw (never its own W); a second view
+// sees the first view's W; after guest renders the carry takes the guest
+// pool's value; a view before any store and without a pool keeps the
+// published value.
+void PoolCarryFrames(std::shared_ptr<NativeRenderBackend> backend) {
+  const auto fixture=MakeObjectFixture(backend);
+  auto reader=Entry(1,{0,0,100},1,fixture.layout),writer=Entry(2,{1,0,100},1,fixture.layout);
+  NativeRenderRegistrySnapshot snapshot;
+  snapshot.entries={reader,writer};
+  const auto camera=MakeCamera();
+  SkinnedFixture skinned(backend);
+  auto pass=skinned.Pass();
+  pass.gather.objects={1,2};
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t) { return std::shared_ptr<const NativeSceneGroupMaterial>(fixture.published); };
+  sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { return fixture.geometry; };
+  sources.generation=[] { return uint64_t(1); };
+  std::optional<std::array<uint8_t,16>> guest_pool;
+  pass.pool=[&](const std::string& name) -> std::optional<std::array<uint8_t,16>> {
+    return name=="g_Highlight"?guest_pool:std::nullopt;
+  };
+  NativeFullFrameModels models;
+  auto published=fixture.published->constants;
+  for(auto& constant:published) camera.pass.Apply(constant);
+  // Whether R's draw is the full capture of the published constants with g_Highlight = value (none: unbound).
+  const auto reader_sees=[&](const NativeFullFrameModelFrame& frame,std::optional<std::array<float,4>> value) {
+    const auto refs=OrderNativeFullFrameModelDraws(frame.plan.opaque,true);
+    std::vector<const NativeSceneInstance*> drawn;
+    for(const auto& batch:frame.batches) for(const auto& object:batch.snapshot.instances) drawn.push_back(object.get());
+    Require(drawn.size()==2 && refs.size()==2 && frame.stats.drawn==2,"both draw");
+    for(size_t d=0;d<2;++d) {
+      if(frame.plan.opaque[refs[d].item].entry!=reader.get()) continue;
+      auto constants=published;
+      if(value) for(auto& constant:constants)
+        if(constant.name=="g_Highlight") std::copy_n(ObjectConstant("g_Highlight",*value).registers.begin(),16,constant.registers.begin());
+      const auto& material=*drawn[d]->object.material;
+      NativeBackendSampler* sampler=material.samplers().at(0).second;
+      const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
+      const auto full=fixture.program->Capture(*material.pipeline(),false,constants,samplers,material.blend_factor(),false);
+      return material.Equivalent(*full.material);
+    }
+    return false;
+  };
+  const auto tick=[&](float value,bool advancing,uint32_t view=0) {
+    writer->constants=ObjectConstants({ObjectConstant("g_Highlight",{value,0,0,1})});
+    pass.tick_frame=advancing; pass.view=view;
+    return models.Build(snapshot,camera,pass,sources);
+  };
+  auto frame=tick(1,true);
+  Require(reader_sees(frame,std::nullopt) && frame.stats.carried==0,"the first frame: nothing stored before R");
+  frame=tick(2,true);
+  Require(reader_sees(frame,std::array<float,4>{1,0,0,1}) && frame.stats.carried==1,"R sees the previous tick's W");
+  frame=tick(2,false);
+  Require(reader_sees(frame,std::array<float,4>{1,0,0,1}),"a render-only frame sees what its tick's frame saw");
+  frame=tick(2,false);
+  Require(reader_sees(frame,std::array<float,4>{1,0,0,1}) && frame.stats.derived==0,"and keeps nothing it drew");
+  frame=tick(2,false,1);
+  Require(reader_sees(frame,std::array<float,4>{2,0,0,1}),"a second view sees the first view's stores");
+  frame=tick(3,true);
+  Require(reader_sees(frame,std::array<float,4>{2,0,0,1}),"the next tick sees the last advancing frame's W");
+  // Guest renders ran (A/B): their stores are in the guest pool.
+  guest_pool=ObjectConstant("g_Highlight",{7,0,0,1}).registers;
+  pass.guest_frames=1;
+  frame=tick(4,true);
+  Require(reader_sees(frame,std::array<float,4>{7,0,0,1}) && frame.stats.reseeds==1,"after guest renders the guest pool's value");
+  frame=tick(5,true);
+  Require(reader_sees(frame,std::array<float,4>{4,0,0,1}) && frame.stats.reseeds==0,"then the carry again");
+  // A pool that cannot be read keeps the carried value.
+  guest_pool.reset(); pass.guest_frames=2;
+  frame=tick(6,true);
+  Require(reader_sees(frame,std::array<float,4>{5,0,0,1}) && frame.stats.reseeds==0,"an unreadable guest pool keeps the carry");
+  // A writer gathered first: R sees this frame's store.
+  pass.gather.objects={2,1};
+  frame=tick(8,true);
+  Require(reader_sees(frame,std::array<float,4>{8,0,0,1}),"gathered after W, R sees W's store of this frame");
 }
 std::string SameModelFrame(const NativeFullFrameModelFrame& a,const NativeFullFrameModelFrame& b);
 // The draw states' carry rules, draw by draw: an unchanged frame and a moved
@@ -1636,13 +1895,13 @@ int main(int argc,char** argv) {
     }
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
     SourceTable(); SourceMemo(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
-    AttachmentsFollowTheModel(); PoseSource(); ObjectConstantOverrides();
+    AttachmentsFollowTheModel(); PoseSource(); ObjectConstantOverrides(); PoolCallOrder(); PoolCarry(); GatherWalk();
     // The skinned material path against full captures, on both backends (WARP).
     for(int backend=0;backend<2;++backend) {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ObjectConstantBuild(device); ModelFrames(device);
+      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ObjectConstantBuild(device); PoolCarryFrames(device); ModelFrames(device);
     }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";

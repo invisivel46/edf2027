@@ -377,6 +377,12 @@ void ClassConstantsAndParts() {
   size_t with=0;
   for(const auto& type:NativeRenderClasses()) with+=NativeRenderClassHasConstants(type);
   Require(with==16,"sixteen classes store per-object constants");
+  // clMapArtifact_Base (82002158) is abstract: its constructor 820B33B0 is
+  // called only by the eight subclass constructors, each storing its own
+  // vtable right after (clBuilding 820B8198, clFieldParts 820BAD20, ...),
+  // and those share slot 4 820B2670 with the static world pass's scene
+  // sources. No row, so an object with that vtable is never drawn twice.
+  Require(!FindNativeRenderClass(0x82002158u),"clMapArtifact_Base has no row");
 }
 // A shared effect pool node (the 821A20C0 map): key std::string at +12, value
 // at +40 (data +0, count +8). A key of capacity 16 or more lives out of line.

@@ -14,6 +14,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace edf::native {
@@ -41,8 +42,10 @@ namespace edf::native {
 //                                 renderer draws them instanced
 //   821A1730 before a draw  -> the item's per-object constants (g_Highlight,
 //                                 g_Time, g_Scroll; NativeRenderEntry::constants)
-//                                 bound over the pass constants' globals of
-//                                 those names (NativeFullFrameModelObjectConstants)
+//                                 over the pool state the guest's earlier slot
+//                                 4s left (NativeFullFrameModelPoolCarry), bound
+//                                 over the pass constants' globals of those
+//                                 names (NativeFullFrameModelObjectConstants)
 // No guest function is called, no device state is read or handed off and no
 // guest-mirror eligibility is assessed. Each draw's render state is the pass
 // base state plus its own material's state operations (see
@@ -142,13 +145,69 @@ inline const NativeRenderConstants& NativeFullFrameModelItemConstants(const Nati
   if(item.attachment>=0) return item.entry->attachments[size_t(item.attachment)].constants;
   return item.entry->constants;
 }
+// The guest's gather order for one view: the objects 820B4038 visits, first
+// visit only (its obj+48 stamp skips a second), in the order 821A5080 calls
+// each world-list manager's slot 2 (owner+44 list):
+//  - 820D4850 (clGameObject_Manager, clGameBossObject_Manager,
+//    clEffectObjectManager): 820B4038 over the list at manager+48;
+//  - 820B4310 (clMapObjectManager): 820B4038 over the list at manager+372,
+//    then the octree walk 821C61D8 -> 821C5FC8 / 821C56C0, which gathers the
+//    cells' lists (node+120) depth first. The octree is not walked here (tens
+//    of thousands of static map objects); its objects are `unlisted`;
+//  - any other slot 2 gathers nothing the registry draws.
+// Objects are gathered in list order, 820B4038 calling 821C0C00 per object as
+// it goes. An object in no walked list (the octree's) is gathered at position
+// `unlisted` (before objects[unlisted]; the octree walk comes after the list
+// at manager+372), several of them in snapshot order. Empty: no guest order
+// known (every entry unlisted, i.e. snapshot order).
+struct NativeFullFrameModelGather {
+  std::vector<uint32_t> objects;
+  uint32_t unlisted=UINT32_MAX;  // UINT32_MAX: after every listed object.
+};
+inline constexpr uint32_t kNativeGatherWorldList=44,kNativeGatherObjectList=48,kNativeGatherMapList=372,
+  kNativeGatherObjectSlot2=0x820D4850u,kNativeGatherMapSlot2=0x820B4310u;
+// The walk 821A5080 makes of owner+44 (nodes {+0 next, +8 manager}, end at
+// list+12) and each manager's gather list (WalkNativeRenderList's layout), as
+// NativeFullFrameModelGather describes. Throws on a list that does not end.
+template<class Reader,class Visit>
+void WalkNativeFullFrameGatherList(const Reader& reader,uint32_t list,Visit&& visit,uint32_t limit) {
+  const auto end=reader.Word(list+12);
+  uint32_t count=0;
+  for(uint32_t node=reader.Word(list);node!=end;node=reader.Word(node)) {
+    if(!node || ++count>limit) throw std::runtime_error("native full-frame gather list does not reach its end");
+    visit(reader.Word(node+8));
+  }
+}
+template<class Reader>
+NativeFullFrameModelGather ReadNativeFullFrameModelGather(const Reader& reader,uint32_t owner) {
+  NativeFullFrameModelGather gather;
+  std::unordered_set<uint32_t> seen;
+  const auto visit=[&](uint32_t object) { if(object && seen.insert(object).second) gather.objects.push_back(object); };
+  WalkNativeFullFrameGatherList(reader,owner+kNativeGatherWorldList,[&](uint32_t manager) {
+    if(!manager) return;
+    const auto slot2=reader.Word(reader.Word(manager)+8);
+    if(slot2==kNativeGatherObjectSlot2) WalkNativeFullFrameGatherList(reader,manager+kNativeGatherObjectList,visit,1u<<17);
+    else if(slot2==kNativeGatherMapSlot2) {
+      WalkNativeFullFrameGatherList(reader,manager+kNativeGatherMapList,visit,1u<<17);
+      if(gather.unlisted==UINT32_MAX) gather.unlisted=uint32_t(gather.objects.size());
+    }
+  },256);
+  return gather;
+}
 struct NativeFullFrameModelPlan {
   struct Stats {
     uint64_t entries=0,hidden=0,mode=0,distance=0,frustum=0,box=0,no_model=0,no_pose=0,bucket_zero=0,opaque=0,transparent=0,
-      instances=0,no_instanced=0,other_pass=0,attachments=0,no_attachment=0;
+      instances=0,no_instanced=0,other_pass=0,attachments=0,no_attachment=0,
+      calls=0,unlisted=0;  // Slot-4 calls (`calls`); entries the gather order does not list.
   };
-  std::vector<NativeFullFrameModelItem> opaque;       // Snapshot order.
-  std::vector<NativeFullFrameModelItem> transparent;  // Draw order: key descending, ties in snapshot order.
+  std::vector<NativeFullFrameModelItem> opaque;       // Gather order.
+  std::vector<NativeFullFrameModelItem> transparent;  // Draw order: key descending, ties in gather order.
+  // Every entry whose slot 4 the guest calls this view, in call order: mode 0
+  // as it is gathered (821C0C00 calls it at once), then the filed ones in
+  // 821A3BA0's drain order (key descending, ties in gather order), drawn by
+  // the native pass or not (no model, pose or layout yet). What the slot-4
+  // bodies store into the effect pool follows this order.
+  std::vector<const NativeRenderEntry*> calls;
   Stats stats;
 };
 // clBrokenObject (vtable 820077D8): slot 4 8211FAA8 copies obj+708 into
@@ -178,8 +237,40 @@ std::vector<const NativeRenderEntry*> NativeFullFrameBrokenObjects(const NativeR
 // buckets by high key byte 255 down to 1, each by low byte descending, equal
 // keys in gather order. High bucket 0 (key < 256) is never traversed there,
 // so those entries are dropped (stats.bucket_zero). The registry snapshot is
-// unordered, so snapshot order stands in for the guest's gather order.
-NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera);
+// ordered by object; entries are taken in `gather` order (unlisted ones at
+// its `unlisted` position, among themselves in snapshot order).
+NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySnapshot& snapshot,const NativeFullFrameModelCamera& camera,
+  const NativeFullFrameModelGather& gather={});
+
+// The shared effect pool as the model slot 4s leave it (821A1730 ->
+// 821A16D8: one float4 over a named pool value, sticky until the next store).
+// In the guest a draw reads the value the last store before it left, in slot-4
+// call order, whichever object made it: a class that stores nothing draws
+// with the previous writer's (C_PowerLoader's powerloader.Dxm is c_Mech01,
+// which reads g_Highlight and g_Time; UFO, alien-tank and mothership classes
+// write them), and a frame starts with what the previous one left.
+//  state: name -> the value the pool holds, in first-store order; a name the
+//    carry never saw is not in it (such a draw keeps the published value, the
+//    live guest pool's).
+// Apply merges one store set (NativeRenderConstants: a name's value replaced
+// in place, a new name appended), as ReadNativeRenderConstant does.
+void ApplyNativeFullFrameModelPool(std::vector<NativeRenderObjectConstant>& state,const NativeRenderConstants& stores);
+// What each call of `plan.calls` finds in the pool (before its own stores),
+// and what the view leaves: every entry's stores, then each attachment's (the
+// parts' stores, after the entry's, in slot-4 order), applied in call order
+// from `start`. before[entry] is shared while unchanged (pointer equality is
+// value equality); null while the state is empty.
+struct NativeFullFrameModelPoolCarry {
+  std::unordered_map<const NativeRenderEntry*,NativeRenderConstants> before;
+  std::vector<NativeRenderObjectConstant> end;
+};
+NativeFullFrameModelPoolCarry CarryNativeFullFrameModelPool(const NativeFullFrameModelPlan& plan,
+  std::span<const NativeRenderObjectConstant> start);
+// The constants in effect at an item's draw: the pool before its entry's slot
+// 4 (`before`) with the item's own stores (NativeFullFrameModelItemConstants)
+// applied over it.
+std::vector<NativeRenderObjectConstant> NativeFullFrameModelEffectiveConstants(const NativeRenderConstants& before,
+  const NativeRenderConstants& own);
 
 // The per-object constants 821C9C20 uploads, from the snapshot pose.
 //  worlds[mesh]: the g_mWorld registers each record draws with
@@ -189,14 +280,14 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
 //    uploaded bone or, before any, the identity (the guest would see the
 //    previous object's world; nothing native can reproduce that).
 //  palette: skinned only, PackNativeBonePalette(pose,limit): bones*12 floats.
-//  objects: the item's per-object pool constants (NativeFullFrameModelItemConstants),
-//    which 821A1730 stored before the draw: part of the item's constants key.
+// The pool constants in effect (NativeFullFrameModelEffectiveConstants) are
+// not among them: they are bound per draw, and only where the draw's material
+// reads one (NativeFullFrameModelDrawState::bound).
 struct NativeFullFrameModelConstants {
   std::vector<std::array<uint8_t,64>> worlds;
   std::vector<float> palette;
   uint32_t bones=0;
   bool skinned=false;
-  std::vector<NativeRenderObjectConstant> objects;
 };
 // The pass constants an item's per-object constants replace, in pass order:
 // each global whose name is one of theirs, with its first register (16
@@ -205,6 +296,11 @@ struct NativeFullFrameModelConstants {
 // Empty when the material reads none of them (a draw of another shader).
 std::vector<NativeSceneMaterialInputs::Constant> NativeFullFrameModelObjectConstants(
   std::span<const NativeSceneMaterialInputs::Constant> pass,std::span<const NativeRenderObjectConstant> objects);
+// The same over the pass constants at `slots` only (indexes of the globals
+// whose names the pool carry knows, NativeFullFrameModelRowState::object_slots).
+std::vector<NativeSceneMaterialInputs::Constant> NativeFullFrameModelObjectConstants(
+  std::span<const NativeSceneMaterialInputs::Constant> pass,std::span<const uint32_t> slots,
+  std::span<const NativeRenderObjectConstant> objects);
 NativeFullFrameModelConstants NativeFullFrameModelConstantsFor(const NativeModelLayout& layout,
   std::span<const NativePoseMatrix> pose,uint32_t palette_limit);
 // 821C9DA8's constants: every record uploads the one world (records with
@@ -247,6 +343,26 @@ struct NativeFullFrameModelPass {
   // The frame's motion budget (NativeFrameInputs::motion): poses blend at its
   // fraction when it interpolates (NativeRenderPoseBlender).
   NativeFrameMotion motion;
+  // The guest's gather order this view (ReadNativeFullFrameModelGather):
+  // the slot-4 call order and the filing order of equal keys.
+  NativeFullFrameModelGather gather;
+  // The pool carry (NativeFullFrameModelPoolCarry) across views and frames:
+  //  tick_frame: NativeFrameInputs::tick_frame. A frame that is not (an
+  //    unlocked render-only frame) starts from the pool its tick's advancing
+  //    frame started from and keeps nothing, so the pool advances once per
+  //    tick, as the guest's one render per tick advances it;
+  //  view: the view's index in the frame (a later view starts from the
+  //    previous view's end);
+  //  guest_frames: renders whose slot 4s were the guest's (the guest helper
+  //    or frame dispatch: A/B alternate frames). When it moved, the guest
+  //    pool holds what those stores left, and every name the carry knows is
+  //    taken again from `pool`;
+  //  pool: the guest pool's float4 of a name (the first register, as guest
+  //    bytes), or nullopt when the name is not registered or unreadable.
+  bool tick_frame=true;
+  uint32_t view=0;
+  uint64_t guest_frames=0;
+  std::function<std::optional<std::array<uint8_t,16>>(const std::string&)> pool;
 };
 // The explicit base state every model draw starts from, opaque and transparent
 // alike: the shared full-frame base state (NativeFullFrameBaseState, the same
@@ -345,7 +461,9 @@ struct NativeFullFrameModelFrame {
       scissor=0,palette=0,failed=0,cache_hits=0,captures=0,palettes=0,source_hits=0,source_fetches=0,
       programs=0,geometries=0,reused=0,derived=0,sourced=0,rows=0,camera_rows=0,
       blended=0,  // Drawn items whose pose or world is blended this frame (NativeRenderPoseBlender).
-      object_constants=0;  // Draw objects made this frame with per-object constants bound (a capture each).
+      object_constants=0,  // Draw objects made this frame with per-object constants bound (a capture each).
+      carried=0,           // Of those, draws binding a value another slot 4 stored (the pool carry).
+      reseeds=0;           // Pool names taken again from the guest pool (guest_frames moved).
   };
   NativeFullFrameModelPlan plan;
   std::vector<NativeFullFrameModelBatch> batches;  // Opaque, then transparent.
@@ -367,6 +485,11 @@ struct NativeFullFrameModelDrawState {
   // or a rigid row's interned material. Held, so its address is never reused.
   std::shared_ptr<const void> made_from;
   std::shared_ptr<const NativeSceneInstance> object;
+  // The pool constants the object was made with bound (the row's globals the
+  // carry knows, NativeFullFrameModelObjectConstants over the item's
+  // effective constants); empty when its material reads none. Another set
+  // makes the object again.
+  std::vector<NativeSceneMaterialInputs::Constant> bound;
 };
 struct NativeFullFrameModelItemState {
   std::shared_ptr<const NativeModelLayout> layout;
@@ -374,7 +497,6 @@ struct NativeFullFrameModelItemState {
   // The blend the constants were made with (NativeRenderBlendOf): the previous
   // pose and fraction, or no previous pose when they are the pose's own.
   NativeRenderBlend blend;
-  NativeRenderConstants constants;  // The per-object constants the values were made with.
   uint32_t world=0,palette_limit=0;
   uint64_t generation=kNativeFullFrameModelUnversioned;  // Source generation of the draws' sources.
   bool sourced=false,valued=false;
@@ -409,6 +531,10 @@ struct NativeFullFrameModelRowState {
   std::optional<std::array<float,4>> blend_factor;
   NativeSceneView view;
   bool scissor=false;
+  // Indexes into constants of the globals whose names the pool carry knows
+  // (at names version object_names), which a draw's pool constants bind.
+  std::vector<uint32_t> object_slots;
+  uint64_t object_names=0;
 };
 // Cross-frame state: object ids, the program/geometry side table, the
 // material cache, the material rows and the draw states. Materials are
@@ -438,8 +564,9 @@ struct NativeFullFrameModelRowState {
 //   per pass record, and per pass record and batch value, per generation);
 //   their constants only when the pose (or world) pointer or palette limit
 //   moved; a draw's scene object is made again only when those constants
-//   moved by value, its sources changed or its row's result is another
-//   object (a recapture, a new resolve). Every other draw carries last
+//   moved by value, its sources changed, its row's result is another object
+//   (a recapture, a new resolve) or the pool constants it binds moved (only a
+//   draw whose material reads one binds any). Every other draw carries last
 //   frame's object, whose material, geometry and world are what a fresh
 //   build makes; only the batch views (the row cameras) are per frame.
 // The output is a fresh instance's for the same inputs, except that carried
@@ -488,6 +615,14 @@ class NativeFullFrameModels {
   std::unordered_map<uint32_t,std::shared_ptr<const NativeSceneGroupMaterial>> provided_programs_;
   std::map<std::pair<uint32_t,uint32_t>,std::vector<std::pair<NativeModelBatchLayout,
     std::shared_ptr<const NativeIndexedMesh::RetainedDraw>>>> provided_geometry_;
+  // The pool carry (NativeFullFrameModelPass::tick_frame, view, guest_frames):
+  // committed, what the last advancing frame's last view left; tick_start,
+  // what that frame started from; view_end, what the last view left. names,
+  // every name the carry has seen, in first-store order (names_version_
+  // counts its growth, for the rows' object_slots).
+  std::vector<NativeRenderObjectConstant> pool_committed_,pool_tick_start_,pool_view_end_;
+  std::vector<std::string> pool_names_;
+  uint64_t pool_names_version_=1,pool_guest_frames_=UINT64_MAX;
 };
 // Build then Record. Returns the frame, which the caller keeps until submission.
 NativeFullFrameModelFrame RecordNativeModels(NativeFullFrameModels& models,const NativeRenderRegistrySnapshot& snapshot,

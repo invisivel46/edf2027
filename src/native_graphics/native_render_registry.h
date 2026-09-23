@@ -30,7 +30,25 @@
 // models pass binds them over the material's globals of those names. Their
 // objects are re-read every tick like the instanced ones. Across objects the
 // pool is sticky in the guest (a draw that stores nothing sees the previous
-// object's value); natively such a draw sees the pool as last published.
+// object's value, and a frame starts with what the last one left): the models
+// pass carries it in the guest's slot-4 call order
+// (NativeFullFrameModelPoolCarry). The one class that draws a material
+// reading them without storing is C_PowerLoader (powerloader.Dxm is
+// c_Mech01: g_Highlight, g_Time); g_Scroll is read only by the treads'
+// c_tDPNC_Scroll (Caterpillar-l/-r), c_Shield01 only by the 4-leg tank's
+// shields, all of which store it themselves.
+//
+// The values are simulation state, never computed in slot 4 (but g_Scroll's
+// negation, which NativeRenderConstantSource::scroll replicates): slot 3
+// (the tick) writes a source block and slot 2 (the scene+100 walk, 821A4DE8)
+// copies its two float4s to the block slot 4 reads, e.g. clUfoSmall01
+// 820E7C48 +2304 -> +2336, clAlienTank01 820EC7A0 +5040 -> +5072 and its
+// turrets 820F0188 +1136 -> +1168, the 4-leg tank parts 820FC400 +1232 ->
+// +1264; the C_Tank treads' +60 is advanced by slot 3 itself (821E61F0 ->
+// 821E7B70: +60 += speed*0.9, wrapped to [0,2]). So a tick's value is final
+// at the tick's 821A4DE8 exit; like the guest's one render per tick, the
+// models pass holds it for every render of the tick (it is never blended:
+// g_Time and g_Scroll wrap).
 //
 // Pose motion (NativeRenderPoseMotion, native_render_motion.h): every pose a
 // re-read publishes (the model's, each attachment's and each instanced set's
@@ -389,8 +407,8 @@ class NativeRenderRegistry {
         // Re-read every tick: inputs that advance outside scene+100 (instanced
         // worlds in slot 3, a frame-posed root, per-object constants).
         // Per-object constants too: the float4s slot 4 stores (g_Highlight,
-        // g_Time, g_Scroll) are object fields whose writers are not traced to
-        // scene+100 (vector stores through computed addresses), so every tick.
+        // g_Time) are copied by slot 2 in the scene+100 walk, but the C_Tank
+        // treads' g_Scroll source (+60) advances in slot 3, so every tick.
         if(record.type && ((record.type->attachments&kNativeRenderMotherSpheres) || record.type->frame_root ||
            NativeRenderClassHasConstants(*record.type))) animated_.insert(object);
         else animated_.erase(object);
