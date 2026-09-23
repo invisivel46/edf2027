@@ -5225,10 +5225,12 @@ void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing)
 }
 void PublishStaticScenePartsLocked(Bridge& state,const GuestReader& reader,uint32_t owner) {
   if(!state.scene_sources.HasOwner(owner)) return; // Nested initial model load precedes completed construction.
-  const auto parts=ReadNativeStaticSceneParts(reader,owner);
+  // LOD owners (clMapArtifact_Base) or a fixed-record owner (clRock).
+  const bool fixed=state.scene_sources.Fixed(owner);
+  const auto parts=ReadNativeSceneOwnerParts(reader,owner,fixed);
   state.scene_sources.Observe(owner,parts);
   state.scene_sources.PublishWorld(owner,ReadNativeStaticWorld(reader,owner));
-  state.scene_sources.PublishVisibility(owner,ReadNativeSceneVisibility(reader,owner,true));
+  state.scene_sources.PublishVisibility(owner,ReadNativeSceneOwnerVisibility(reader,owner,fixed));
   // A model replacement can remove parts/LODs as well as replace their assets.
   // Previously selected snapshots retain old native objects through submission.
   state.scene_adapter.Retire(owner);
@@ -5278,6 +5280,55 @@ REX_HOOK_RAW(sub_820B2870) {
   }
   __imp__sub_820B2870(ctx,base);
 }
+// clRock (NativeSceneFixedRecord): the scene source of its one +396 record,
+// born after its constructor 820BAF98 returns (the record is loaded, its bound
+// at +288 and world registers written; nothing changes them later: its slot 2
+// is empty) and retired by its slot-1 destructor 820BB208, as 820B33B0/820B2870
+// do for the map artifacts. The full frame's static world draws it
+// (NativeFullFrameStaticRoute::fixed).
+REX_EXTERN(__imp__sub_820BAF98);
+REX_HOOK_RAW(sub_820BAF98) {
+  const auto object=ctx.r3.u32;
+  const bool scene=REXCVAR_GET(edf_native_scene_adapter_audit) || EDF_NATIVE_FLAG(scene_queued);
+  if(scene) {
+    auto& state=edf::native::State();
+    bool stale;
+    { std::lock_guard lock(state.mutex);
+      stale=state.scene_sources.HasOwner(object) || state.scene_adapter.HasOwner(object); }
+    if(stale) {
+      std::lock_guard submission(state.submissions);
+      std::lock_guard lock(state.mutex);
+      state.scene_adapter.Retire(object);
+      state.scene_sources.Retire(object);
+    }
+  }
+  __imp__sub_820BAF98(ctx,base);
+  if(scene) {
+    auto& state=edf::native::State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    edf::native::SceneSourceOwners().Add(object);
+    state.scene_sources.Born(object,true);
+    try { edf::native::PublishStaticScenePartsLocked(state,edf::native::GuestReader(base),object); }
+    catch(const std::exception& error) {
+      // An unreadable record leaves the rock unpublished (the static world counts it).
+      state.scene_sources.Retire(object);
+      static std::atomic<uint32_t> failures{0};
+      if(failures.fetch_add(1,std::memory_order_relaxed)<8) REXLOG_INFO("Native scene source: clRock {:#x} not published: {}",object,error.what());
+    }
+  }
+}
+REX_EXTERN(__imp__sub_820BB208);
+REX_HOOK_RAW(sub_820BB208) {
+  if(REXCVAR_GET(edf_native_scene_adapter_audit) || EDF_NATIVE_FLAG(scene_queued)) {
+    auto& state=edf::native::State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    state.scene_adapter.Retire(ctx.r3.u32);
+    state.scene_sources.Retire(ctx.r3.u32);
+  }
+  __imp__sub_820BB208(ctx,base);
+}
 REX_EXTERN(__imp__sub_820B2AC0);
 REX_HOOK_RAW(sub_820B2AC0) {
   const auto owner=ctx.r3.u32;
@@ -5306,7 +5357,8 @@ REX_HOOK_RAW(sub_820B2DF8) {
     if(const auto generation=state.scene_sources.Generation(owner)) {
       const auto world=edf::native::ReadNativeStaticWorld(edf::native::GuestReader(base),owner);
       state.scene_sources.PublishWorld(owner,world);
-      state.scene_sources.PublishVisibility(owner,edf::native::ReadNativeSceneVisibility(edf::native::GuestReader(base),owner,true));
+      state.scene_sources.PublishVisibility(owner,edf::native::ReadNativeSceneOwnerVisibility(edf::native::GuestReader(base),owner,
+        state.scene_sources.Fixed(owner)));
       state.scene_adapter.UpdateWorld(owner,generation,world);
       ++state.scene_world_publications;
     }
@@ -5385,7 +5437,7 @@ REX_HOOK_RAW(sub_821C0B88) {
     auto& state=edf::native::State();
     std::lock_guard lock(state.mutex);
     if(state.scene_sources.HasOwner(owner)) state.scene_sources.PublishVisibility(owner,
-      edf::native::ReadNativeSceneVisibility(edf::native::GuestReader(base),owner,true));
+      edf::native::ReadNativeSceneOwnerVisibility(edf::native::GuestReader(base),owner,state.scene_sources.Fixed(owner)));
   }
 }
 REX_EXTERN(__imp__sub_821BEF10);
@@ -5397,7 +5449,7 @@ REX_HOOK_RAW(sub_821BEF10) {
     std::lock_guard lock(state.mutex);
     const auto owner=destination-288;
     if(state.scene_sources.HasOwner(owner)) state.scene_sources.PublishVisibility(owner,
-      edf::native::ReadNativeSceneVisibility(edf::native::GuestReader(base),owner,true));
+      edf::native::ReadNativeSceneOwnerVisibility(edf::native::GuestReader(base),owner,state.scene_sources.Fixed(owner)));
   }
 }
 REX_EXTERN(__imp__sub_820B4038);
@@ -6073,14 +6125,7 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
     using namespace edf::native;
     shared_->effects.clear();
     if(!context.renderer || !context.owner || !context.guest_context || !native_scene_pass_camera) return;
-    uint32_t manager=0;
-    const auto end=reader_.Word(reader_.Add(context.owner,56));
-    uint32_t guard=0;
-    for(auto node=reader_.Word(reader_.Add(context.owner,44));node!=end;node=reader_.Word(node)) {
-      if(++guard>4096) throw std::runtime_error("native full frame world list does not terminate");
-      const auto object=reader_.Word(reader_.Add(node,8));
-      if(object && reader_.Word(object)==NativeEffectList::manager_vtable) { manager=object; break; }
-    }
+    const auto manager=FindNativeWorldListObject(reader_,context.owner,NativeEffectList::manager_vtable);
     if(!manager) { ++absent_; return; }
     uint32_t order=shared_->model_order;
     NativeEffectCollection collection;
@@ -6181,6 +6226,14 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
 // shared base state, the sky's own pass states chained within the object as
 // the guest chains them, and the pass camera, then recorded on the open scene.
 // A palette-skinned sky declines (none is known).
+//
+// The pass is the guest's map-effect walk (820B35A0 over clMapEffectManager's
+// +48 list, native_map_effects.h), in list order: the sky where the list holds
+// it, clElectricWire's mode-0 strips (BuildNativeElectricWireDraws) drawn
+// immediately as 821C0C00 runs its slot 4 inside the walk. clGrassMap (mode 2,
+// not ported: see NativeGrassMapSupport), a filed wire and any other class are
+// declared unsupported, once each, and not drawn. Without a manager on the
+// world list the sky is drawn alone, as before.
 class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
  public:
   explicit NativeFullFrameSkyPass(uint8_t* base):reader_(base) {}
@@ -6188,6 +6241,66 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
   void Record(edf::native::NativeFrameContext& context) override {
     using namespace edf::native;
     const auto sky=NativeSkyObjects().Current();
+    if(!context.renderer || !native_scene_pass_camera) return;
+    std::vector<NativeMapEffectMember> members;
+    uint32_t manager=0;
+    try {
+      if(context.owner) manager=FindNativeWorldListObject(reader_,context.owner,kNativeMapEffectManagerVtable);
+      if(manager) members=CollectNativeMapEffectMembers(reader_,manager);
+    } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); manager=0; members.clear(); }
+    if(!manager) { if(sky) RecordSky(context,sky); return; }
+    // Mode-0 wire draws since the last sky, recorded in list order around it.
+    std::vector<NativeEffectDraw> pending;
+    std::optional<NativeEffectInputs> inputs;
+    NativeElectricWireStats wires;
+    for(const auto& member:members) {
+      if(member.kind==NativeMapEffectKind::Sky) {
+        // The sky pass reads its own hidden word (RecordNativeSky).
+        if(member.object!=sky) continue;
+        RecordMapEffectDraws(context,pending); pending.clear();
+        RecordSky(context,sky);
+        continue;
+      }
+      if(member.hidden) continue;  // 821C0C00: lhz 64 nonzero returns.
+      if(member.kind==NativeMapEffectKind::ElectricWire && member.mode==0) {
+        try {
+          if(!inputs) inputs=ReadNativeEffectInputs(reader_);
+          for(auto& draw:BuildNativeElectricWireDraws(reader_,member.object,context.view.scene,*inputs,&wires)) pending.push_back(std::move(draw));
+        } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); }
+        continue;
+      }
+      if(unsupported_.insert({member.vtable,member.mode}).second) {
+        const auto* name=NativeMapEffectClassName(member.vtable);
+        REXLOG_INFO("Native full frame map effects: unsupported {} {:#x} mode {} (slot 4 {:#x}){}; not drawn",
+          name?name:"class",member.vtable,member.mode,member.render,
+          member.kind==NativeMapEffectKind::GrassMap?" - clGrassMap is not ported (native_map_effects.h)":"");
+      }
+    }
+    RecordMapEffectDraws(context,pending);
+    if(++walks_<=4 || walks_%1000==0)
+      REXLOG_INFO("Native full frame map effects: walks={} manager={:#x} members={} wire_records={} disabled={} distant={} culled={} strips={} recorded={}",
+        walks_,manager,members.size(),wires.records,wires.disabled,wires.distant,wires.culled,wires.drawn,map_effect_draws_);
+  }
+ private:
+  // Immediate map-effect draws (the wires' strips), on the open scene.
+  void RecordMapEffectDraws(edf::native::NativeFrameContext& context,const std::vector<edf::native::NativeEffectDraw>& draws) {
+    using namespace edf::native;
+    if(draws.empty()) return;
+    auto& state=State();
+    std::lock_guard submission(state.submissions);
+    std::lock_guard lock(state.mutex);
+    NativeFullFramePassTargets formats; NativeBackendViewport backend_viewport; NativeBackendScissor scissor; NativeViewportState viewport;
+    const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
+    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) return;
+    const NativeSceneCpuWindow window(reader_);
+    const auto report=[](const std::string& reason) { NativeFullFrameDeclined("map effects",reason); };
+    for(const auto& draw:draws) {
+      try { RecordNativeFullFrameEffectLocked(state,reader_,window,draw,*native_scene_pass_camera,viewport,formats,report); ++map_effect_draws_; }
+      catch(const std::exception& error) { report(error.what()); }
+    }
+  }
+  void RecordSky(edf::native::NativeFrameContext& context,uint32_t sky) {
+    using namespace edf::native;
     if(!sky || !context.renderer || !native_scene_pass_camera) return;
     NativeSkyFrameInputs inputs;
     inputs.camera_world=ReadNativeVisibilityFloats<16>(reader_,reader_.Add(context.view.scene,NativeSkyScene::world));
@@ -6271,10 +6384,10 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
       REXLOG_INFO("Native full frame sky: frames={} sky={:#x} draws={} declined={} hierarchy_builds={} layout_decodes={}",
         frames_,sky,resolved.size(),declined_,sky_.hierarchy.builds(),sky_.decodes);
   }
- private:
   const edf::native::GuestReader reader_;
   edf::native::NativeSkyPassState sky_;  // Cached hierarchy and layout.
-  uint64_t frames_=0,declined_=0,ids_=0;
+  std::set<std::pair<uint32_t,int32_t>> unsupported_;  // (vtable, mode) reported.
+  uint64_t frames_=0,declined_=0,ids_=0,walks_=0,map_effect_draws_=0;
 };
 // The full frame's StaticWorld pass: SelectNativeFullFrameStaticWorld +
 // NativeFullFrameStaticWorld::Build over the frame's publication and the view's
@@ -12199,15 +12312,20 @@ void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,c
   const auto render=draw.state_before_activation()?program.ResolveRenderState(draw_state(base.render)):
                                                    draw_state(program.ResolveRenderState(base.render));
   DecodeNativeRenderState(render.words);
-  // The immediate path's accepted layouts (see the 821FD8F8 hook's checks).
+  // The immediate path's accepted layouts (see the 821FD8F8 hook's checks):
+  // Vs_Particle, VS_3DTex and, for 821A7B58's strips, VS_3D (position and a
+  // D3DCOLOR at +12, the "solid" Utility 3D layout).
   const bool particle=draw.kind==NativeEffectDraw::Kind::Particles;
+  const bool solid=draw.kind==NativeEffectDraw::Kind::ColourStrip;
   static const auto particle_declaration=NativeDeclaration::Create(NativeFullFrameDeclarationBytes<12>({
     0,0x2a23b9,0, 12,0x2c23a5,0x50000, 20,0x2c23a5,0x50100, 28,0x1a23a6,0xa0000}));
   static const auto ribbon_declaration=NativeDeclaration::Create(NativeFullFrameDeclarationBytes<9>({
     0,0x2a23b9,0, 12,0x2c23a5,0x50000, 20,0x1a23a6,0xa0000}));
-  const auto& declaration=particle?particle_declaration:ribbon_declaration;
+  static const auto solid_declaration=NativeDeclaration::Create(NativeFullFrameDeclarationBytes<6>({
+    0,0x2a23b9,0, 12,0x182886,0xa0000}));
+  const auto& declaration=particle?particle_declaration:solid?solid_declaration:ribbon_declaration;
   // Synthetic declaration identities: only the immediate mesh cache keys on them.
-  const uint32_t declaration_id=particle?0xFFFFFF01u:0xFFFFFF02u;
+  const uint32_t declaration_id=particle?0xFFFFFF01u:solid?0xFFFFFF03u:0xFFFFFF02u;
   const auto device=reader.Word(reader.Add(reader.Word(0x8257bfb4),8));
   for(const auto& [first,count]:NativeEffectDrawCalls(draw)) {
     const auto bytes=EncodeNativeEffectVertices(draw,first,count);

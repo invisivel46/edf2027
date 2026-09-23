@@ -282,7 +282,7 @@ class NativeRenderRegistry {
         if(record.type && (record.type->attachments&kNativeRenderMotherSpheres)) animated_.insert(object); else animated_.erase(object);
       }
       if(record.scene!=scene) ++stats_.foreign;
-      else if(record.type && !record.type->scene_source && !record.type->effect) { Build(reader,object,record,decode,complete); built=true; }
+      else if(record.type && !record.type->scene_source && !record.type->effect && !record.type->other_pass) { Build(reader,object,record,decode,complete); built=true; }
     } catch(const std::exception&) { ++stats_.read_failures; built=false; complete=false; }
     if(complete) { record.retries=0; retry_.erase(object); }
     else retry_[object]=tick+(uint64_t(1)<<std::min<uint32_t>(record.retries++,10));

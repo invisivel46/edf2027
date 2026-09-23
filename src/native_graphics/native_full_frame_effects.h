@@ -100,7 +100,12 @@ struct NativeRibbonVertex {
   std::array<float,2> uv{};
   NativeFxVec4 colour{};
 };
-static_assert(sizeof(NativeParticleVertex)==44 && sizeof(NativeRibbonVertex)==36);
+// VS_3D/PS_Main vertex of 821A7B58, 16 bytes: position and a D3DCOLOR word.
+struct NativeColourVertex {
+  NativeFxVec3 position{};
+  uint32_t colour=0;
+};
+static_assert(sizeof(NativeParticleVertex)==44 && sizeof(NativeRibbonVertex)==36 && sizeof(NativeColourVertex)==16);
 inline constexpr uint32_t kNativeParticleRecordBytes=48,kNativeParticleRecordsPerCall=1000;
 inline constexpr uint32_t kNativeRibbonPointBytes=32,kNativeRibbonPointLimit=100;
 template<class Reader>
@@ -130,13 +135,23 @@ std::vector<NativeRibbonVertex> BuildNativeRibbonSegments(std::span<const Native
 // side taken from the averaged neighbouring directions; primitive 6.
 std::vector<NativeRibbonVertex> BuildNativeRibbonStrip(std::span<const NativeRibbonPoint> points,
   const NativeFxVec4& colour,float width,const NativeFxVec3& eye,const NativeEffectConstants& k);
+// sub_821A7E08: the same strip through up to 100 points of 16-byte stride
+// (+0..+8 position; +12 unread), with no UV and one D3DCOLOR word (r7) on every
+// vertex, drawn through 821A7B58 as primitive 6 (r6 = 2*count-2 primitives).
+// Its side math is 821A8090's statement for statement (D = P1-P0 first, the
+// last point reusing P[n-2]..P[n-1], e = A - eye, the same fmsubs pairing and
+// 821B0320), so the positions are BuildNativeRibbonStrip's. None below 2.
+std::vector<NativeColourVertex> BuildNativeColourStrip(std::span<const NativeFxVec3> points,uint32_t colour,float width,
+  const NativeFxVec3& eye,const NativeEffectConstants& k);
 
 // Technique objects in the effect-shader object: 821A7640 r8==0 -> +244 with
 // its texture into the sampler list at +272 (Ps_Particle), r8!=0 -> +288/+316
-// (Ps_ZParticle); 821A7C70 -> +188/+216 (VS_3DTex/PS_Tex).
-enum class NativeEffectTechnique : uint8_t { Particle, ZParticle, Ribbon };
+// (Ps_ZParticle); 821A7C70 -> +188/+216 (VS_3DTex/PS_Tex); 821A7B58 -> +160
+// (VS_3D/PS_Main, lwz r3,176(r27)), untextured: it never calls 821BC4C8.
+enum class NativeEffectTechnique : uint8_t { Particle, ZParticle, Ribbon, Solid };
 inline constexpr uint32_t NativeEffectTechniqueOffset(NativeEffectTechnique t) {
-  return t==NativeEffectTechnique::Particle?244:t==NativeEffectTechnique::ZParticle?288:188;
+  return t==NativeEffectTechnique::Particle?244:t==NativeEffectTechnique::ZParticle?288:
+         t==NativeEffectTechnique::Solid?160:188;
 }
 inline constexpr uint32_t NativeEffectSamplerListOffset(NativeEffectTechnique t) {
   return t==NativeEffectTechnique::Particle?272:t==NativeEffectTechnique::ZParticle?316:216;
@@ -159,6 +174,7 @@ uint32_t NativeEffectTechniqueMaterial(const Reader& r,uint32_t effect,NativeEff
 inline constexpr uint32_t kNativeEffectSamplerListLimit=64;
 template<class Reader>
 void BindNativeEffectTexture(const Reader& r,uint32_t effect,NativeEffectTechnique t,uint32_t texture) {
+  if(t==NativeEffectTechnique::Solid) return;  // 821A7B58 binds no texture.
   const auto list=r.Add(effect,NativeEffectSamplerListOffset(t));
   const auto begin=r.Word(r.Add(list,4)),count=r.Word(r.Add(list,12));
   if(count>kNativeEffectSamplerListLimit) throw std::runtime_error("native effect sampler list is too long");
@@ -169,7 +185,7 @@ void BindNativeEffectTexture(const Reader& r,uint32_t effect,NativeEffectTechniq
 // values are the li r4 to 82135078 (state 0x48) and 82135108 (0x4c).
 enum : int32_t { kNativeEffectBlendAlpha=0,kNativeEffectBlendAdditive=1 };
 struct NativeEffectDraw {
-  enum class Kind : uint8_t { Particles,RibbonQuads,RibbonStrip };
+  enum class Kind : uint8_t { Particles,RibbonQuads,RibbonStrip,ColourStrip };
   Kind kind=Kind::Particles;
   NativeEffectTechnique technique=NativeEffectTechnique::Particle;
   uint32_t effect=0,texture=0;
@@ -180,14 +196,19 @@ struct NativeEffectDraw {
   std::vector<NativeParticleRecord> records;
   std::vector<NativeParticleVertex> particle_vertices;
   std::vector<NativeRibbonVertex> ribbon_vertices;
-  uint32_t primitive() const { return kind==Kind::RibbonStrip?6:13; }
-  // 821A7C70 sets blend and depth write (82135078/82135108/82135578) before
-  // its 821B94E8, so the technique's own state operations win over them;
-  // 821A7640 sets its blend after the activation, so the draw's blend wins.
-  bool state_before_activation() const { return technique==NativeEffectTechnique::Ribbon; }
-  uint32_t stride() const { return kind==Kind::Particles?44:36; }
+  std::vector<NativeColourVertex> colour_vertices;
+  uint32_t primitive() const { return kind==Kind::RibbonStrip || kind==Kind::ColourStrip?6:13; }
+  // 821A7C70 and 821A7B58 set blend and depth write (82135078/82135108/
+  // 82135578) before their 821B94E8, so the technique's own state operations
+  // win over them; 821A7640 sets its blend after the activation, so the
+  // draw's blend wins.
+  bool state_before_activation() const {
+    return technique==NativeEffectTechnique::Ribbon || technique==NativeEffectTechnique::Solid;
+  }
+  uint32_t stride() const { return kind==Kind::Particles?44:kind==Kind::ColourStrip?16:36; }
   uint32_t vertex_count() const {
-    return uint32_t(kind==Kind::Particles?particle_vertices.size():ribbon_vertices.size());
+    return uint32_t(kind==Kind::Particles?particle_vertices.size():
+                    kind==Kind::ColourStrip?colour_vertices.size():ribbon_vertices.size());
   }
   bool empty() const { return vertex_count()==0; }
 };
@@ -217,6 +238,16 @@ inline NativeEffectDraw MakeNativeRibbonDraw(uint32_t effect,NativeEffectDraw::K
   draw.effect=effect; draw.texture=texture; draw.blend=blend;
   draw.sets_depth_write=true; draw.depth_write=depth_flag==1;
   draw.ribbon_vertices=std::move(vertices);
+  return draw;
+}
+// 821A7B58 r7 blend, r8 depth-write flag (no texture).
+inline NativeEffectDraw MakeNativeColourStripDraw(uint32_t effect,std::vector<NativeColourVertex> vertices,
+    int32_t blend,uint32_t depth_flag) {
+  NativeEffectDraw draw;
+  draw.kind=NativeEffectDraw::Kind::ColourStrip; draw.technique=NativeEffectTechnique::Solid;
+  draw.effect=effect; draw.blend=blend;
+  draw.sets_depth_write=true; draw.depth_write=depth_flag==1;
+  draw.colour_vertices=std::move(vertices);
   return draw;
 }
 // 821A7640 compares its count signed against 0 and 1000; a negative count
