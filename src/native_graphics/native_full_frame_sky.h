@@ -123,6 +123,11 @@ inline NativeSkyDepth NativeSkyDepthOf(const NativeMaterialRenderPass& pass) {
   const auto word=pass.words[1];
   return {(word&2u)!=0,(word&4u)!=0,(word>>4)&7u};
 }
+// The full frame's sky resolve appends z write off (op 0x30, value 0) after
+// each pass's own state operations: the dome is drawn first, so it must never
+// write depth (a written dome depth failed every world pixel beyond its
+// radius). A pass-owned operation, the same for every sky draw.
+inline constexpr std::array<std::array<uint32_t,2>,1> kNativeSkyNoDepthWrite{{{0x30,0}}};
 // Which sky the frame draws. The constructor hook records the object before
 // its body runs (only its address is kept); the destructor clears it when it
 // is still the current one.

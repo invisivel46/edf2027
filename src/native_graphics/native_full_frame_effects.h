@@ -233,6 +233,16 @@ struct NativeEffectDraw {
   }
   bool empty() const { return vertex_count()==0; }
 };
+// Whether two draws activate identically: the host activation of an effect draw
+// (the texture word 821BC4C8 stores, the technique's material and program, its
+// constants and samplers, the blend and depth-write states around it and the
+// immediate declaration) reads exactly these fields and never the vertices.
+// Adjacent draws for which this holds are activated once (clElectricWire's
+// strips: one per record, all alike).
+inline bool NativeEffectDrawsShareActivation(const NativeEffectDraw& a,const NativeEffectDraw& b) {
+  return a.kind==b.kind && a.technique==b.technique && a.effect==b.effect && a.texture==b.texture &&
+    a.blend==b.blend && a.sets_depth_write==b.sets_depth_write && a.depth_write==b.depth_write;
+}
 // Vertex ranges of the guest's DrawPrimitiveUP calls for this draw: 821A7640
 // issues one per 1000 records, the ribbons one each. (first, count) pairs.
 std::vector<std::pair<uint32_t,uint32_t>> NativeEffectDrawCalls(const NativeEffectDraw& draw);

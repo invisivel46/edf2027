@@ -6032,10 +6032,16 @@ std::shared_ptr<const NativeSceneGroupMaterial> NativeModelPassProgramLocked(Bri
 NativeSceneGeometrySource NativeModelGeometrySource(const GuestReader& reader,const NativeModelBatchLayout& batch,uint32_t pass);
 std::shared_ptr<const NativeIndexedMesh::RetainedDraw> NativeModelGeometryLocked(Bridge& state,const GuestReader& reader,
   const NativeSceneGeometrySource& source,const NativeModelBatchLayout& batch);
-// One full-frame effect draw through the immediate path (defined after RecordNativeSceneImmediate).
-void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
-  const NativeEffectDraw& draw,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
-  const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report);
+// Full-frame effect draws through the immediate path (defined after
+// RecordNativeSceneImmediate), recorded back to back in order, with the
+// activation (program, bindings, render state) done once per run of adjacent
+// draws that share it (NativeEffectDrawsShareActivation). Returns the draws
+// recorded; each failure goes to failed (the draw's error) and the next draw
+// activates again.
+uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
+  std::span<const NativeEffectDraw> draws,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
+  const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report,
+  const std::function<void(const std::exception&)>& failed);
 }
 namespace {
 // The open scene's targets and the view's viewport, as every full-frame scene
@@ -6263,10 +6269,9 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
       if(state.active_scene==context.renderer && targets.count && targets.depth && state.scene_backend) {
         const NativeSceneCpuWindow window(reader_);
         const auto report=[](const std::string& reason) { NativeFullFrameDeclined("effects",reason); };
-        for(const auto& item:collection.immediate) for(const auto& draw:item.draws) {
-          try { RecordNativeFullFrameEffectLocked(state,reader_,window,draw,*native_scene_pass_camera,viewport,formats,report); ++drawn; }
-          catch(const std::exception& error) { report(error.what()); }
-        }
+        for(const auto& item:collection.immediate)
+          drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,*native_scene_pass_camera,viewport,formats,report,
+            [&](const std::exception& error) { report(error.what()); });
       }
     }
     if(++frames_<=4 || frames_%1000==0)
@@ -6318,10 +6323,9 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     // Per effect draw: recorded, or declined (reported once per reason).
     uint64_t effect_draws=0,effect_declined=0;
     auto effect_items=NativeEffectTransparentItems(std::move(effects),[&](NativeBackendRecorder&,const NativeEffectItem& item) {
-      for(const auto& draw:item.draws) {
-        try { RecordNativeFullFrameEffectLocked(state,reader_,window,draw,camera,viewport,formats,report); ++effect_draws; }
-        catch(const std::exception& error) { report(error.what()); ++effect_declined; }
-      }
+      // One item's draws in a row; a model batch may run between items.
+      effect_draws+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,camera,viewport,formats,report,
+        [&](const std::exception& error) { report(error.what()); ++effect_declined; });
     });
     std::vector<std::vector<NativeTransparentItem>> sources;
     sources.push_back(std::move(models)); sources.push_back(std::move(effect_items));
@@ -6359,11 +6363,14 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     using namespace edf::native;
     const auto sky=NativeSkyObjects().Current();
     if(!context.renderer || !native_scene_pass_camera) return;
+    // The walk's reads (world list, members, wire records and constants) go
+    // through one page window: no guest code runs during the pass.
+    const NativeSceneCpuWindow walk(reader_);
     std::vector<NativeMapEffectMember> members;
     uint32_t manager=0;
     try {
-      if(context.owner) manager=FindNativeWorldListObject(reader_,context.owner,kNativeMapEffectManagerVtable);
-      if(manager) members=CollectNativeMapEffectMembers(reader_,manager);
+      if(context.owner) manager=FindNativeWorldListObject(walk,context.owner,kNativeMapEffectManagerVtable);
+      if(manager) members=CollectNativeMapEffectMembers(walk,manager);
     } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); manager=0; members.clear(); }
     if(!manager) { if(sky) RecordSky(context,sky); return; }
     // Mode-0 wire draws since the last sky, recorded in list order around it.
@@ -6381,8 +6388,8 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
       if(member.hidden) continue;  // 821C0C00: lhz 64 nonzero returns.
       if(member.kind==NativeMapEffectKind::ElectricWire && member.mode==0) {
         try {
-          if(!inputs) inputs=ReadNativeEffectInputs(reader_);
-          for(auto& draw:BuildNativeElectricWireDraws(reader_,member.object,context.view.scene,*inputs,&wires)) pending.push_back(std::move(draw));
+          if(!inputs) inputs=ReadNativeEffectInputs(walk);
+          for(auto& draw:BuildNativeElectricWireDraws(walk,member.object,context.view.scene,*inputs,&wires)) pending.push_back(std::move(draw));
         } catch(const std::exception& error) { NativeFullFrameDeclined("map effects",error.what()); }
         continue;
       }
@@ -6411,16 +6418,18 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) return;
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("map effects",reason); };
-    for(const auto& draw:draws) {
-      try { RecordNativeFullFrameEffectLocked(state,reader_,window,draw,*native_scene_pass_camera,viewport,formats,report); ++map_effect_draws_; }
-      catch(const std::exception& error) { report(error.what()); }
-    }
+    // The wires' strips all activate alike: one activation for the run.
+    map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,*native_scene_pass_camera,viewport,formats,report,
+      [&](const std::exception& error) { report(error.what()); });
   }
   void RecordSky(edf::native::NativeFrameContext& context,uint32_t sky) {
     using namespace edf::native;
     if(!sky || !context.renderer || !native_scene_pass_camera) return;
+    // Every guest read of the pass (camera, pose walk, pass records) through
+    // one page window: no guest code runs during it.
+    const NativeSceneCpuWindow window(reader_);
     NativeSkyFrameInputs inputs;
-    inputs.camera_world=ReadNativeVisibilityFloats<16>(reader_,reader_.Add(context.view.scene,NativeSkyScene::world));
+    inputs.camera_world=ReadNativeVisibilityFloats<16>(window,window.Add(context.view.scene,NativeSkyScene::world));
     inputs.palette_limit=NativeFullFramePaletteLimit(reader_);
     auto& state=State();
     // The bridge locks in short holds (NativeLockSlices): the targets, each
@@ -6438,7 +6447,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     const auto base=NativeFullFrameBaseState(formats);
     inputs.start=base.render;
     std::vector<NativeSkyDraw> draws;
-    const auto record=RecordNativeSky(reader_,sky_,inputs,sky,
+    const auto record=RecordNativeSky(window,sky_,inputs,sky,
       [&](uint32_t owner,NativeModelBuffers::Kind kind)->uint64_t {
         return slices([&]()->uint64_t {
           const auto* found=state.model_buffers.Find(owner,kind);
@@ -6448,8 +6457,8 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     const auto decline=[&](const std::string& reason) { ++declined_; NativeFullFrameDeclined("sky",reason); };
     if(record.status!=NativeSkyStatus::Recorded) { if(record.status==NativeSkyStatus::Declined) decline(record.reason); return; }
     if(!record.palette.empty()) return decline("palette-skinned sky");
-    const NativeSceneCpuWindow window(reader_);
     std::vector<std::pair<std::shared_ptr<const NativeSceneInstance>,NativeSceneView>> resolved;
+    uint64_t hits=0;
     const bool recorded=slices([&] {
       const auto refuse=[&](const std::string& reason) { decline(reason); return false; };
       // Resolved and recorded in one hold, onto the targets checked at the start
@@ -6457,41 +6466,71 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
       if(state.active_scene!=context.renderer || state.scene_backend!=backend || !(ActiveTargetsLocked(state)==targets))
         return refuse("scene targets changed during the pose walk");
       auto before=base.render;
-      for(const auto& draw:draws) {
+      const int filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
+      for(size_t index=0;index<draws.size();++index) {
+        const auto& draw=draws[index];
         const auto material=NativeModelPassProgramLocked(state,window,draw.pass,false,decline);
         if(!material || !material->program) return refuse("sky pass has no program");
         const auto& program=*material->program;
         if(!program.CanDeferCpuActivation()) return refuse("sky pass needs a scissor rectangle");
-        const auto geometry=NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,*draw.geometry,draw.pass),*draw.geometry);
+        const auto source=NativeModelGeometrySource(reader_,*draw.geometry,draw.pass);
+        const auto geometry=NativeModelGeometryLocked(state,reader_,source,*draw.geometry);
         if(!geometry || geometry->backend()!=state.scene_backend.get()) return refuse("sky geometry not retained");
         auto constants=material->constants;
         for(auto& constant:constants) native_scene_pass_camera->Apply(constant);
         std::array<uint8_t,64> world{};
         for(size_t i=0;i<16;++i) for(size_t byte=0;byte<4;++byte) world[i*4+byte]=uint8_t(draw.world[i]>>(24-byte*8));
         try {
-          NativeBackendPipelineDesc desc;
-          desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(formats.reverse_depth);
-          desc.pixel_id=program.inputs.pixel;
-          desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
-          desc.render_targets=formats.count; desc.rtv_format=formats.rtv_format;
-          desc.dsv_format=formats.dsv_format; desc.sample_count=formats.samples;
-          // The dome is drawn first, so it must never write depth: a written
-          // dome depth failed every world pixel beyond its radius (buildings cut
-          // along the dome, the road ending past the footbridge). Z write off is
-          // appended after the material's own state operations.
-          static constexpr std::array<std::array<uint32_t,2>,1> kNoDepthWrite{{{0x30,0}}};
-          auto result=program.Resolve(desc,formats.reverse_depth,constants,before,base.samplers,
-            REXCVAR_GET(edf_native_anisotropic_filtering),false,kNoDepthWrite);
-          result.capture.material=state.scene_adapter.InternMaterial(std::move(result.capture.material));
-          ApplyNativeScenePublishedWorld(result.capture,world);
+          // The resolve's every input but the constants (SkyMaterials): the
+          // program (its shaders, state and sampler operations), the geometry's
+          // input layout, the chained state and base samplers, the targets,
+          // filtering and the backend's caches. A hit is the resolve of these
+          // constants: all equal but the camera, derived from them bit for bit,
+          // and g_mWorld's matrix, which the capture zeroes (the world is each
+          // draw's own, below). The stored material is interned, and kept alive
+          // here, so it is what InternMaterial returns for an equal resolve.
+          SkyMaterials::Key key;
+          key.group=uint32_t(index); key.vertex=program.inputs.vertex; key.pixel=program.inputs.pixel;
+          key.program=material->program; key.setup=source; key.geometry=geometry; key.backend=state.scene_backend;
+          key.pass=NativeSceneMaterialPassState{before,base.samplers}; key.view=formats; key.filtering=filtering;
+          key.shaders=state.shader_registry_generation;
+          SkyResolve resolve;
+          auto* entry=sky_materials_.Candidate(key);
+          NativeSceneView derived;
+          if(entry) derived=entry->material.capture.camera;
+          if(entry && SkyMaterials::Current(*entry,constants,entry->material.capture.material.get(),derived)) {
+            resolve=entry->material;
+            resolve.capture.camera.view=derived.view; resolve.capture.camera.projection=derived.projection;
+            resolve.capture.camera.view_projection=derived.view_projection;
+            ++sky_materials_.hits; ++hits;
+          } else {
+            NativeBackendPipelineDesc desc;
+            desc.vertex_id=(uint64_t(program.inputs.vertex)<<1)|uint64_t(formats.reverse_depth);
+            desc.pixel_id=program.inputs.pixel;
+            desc.input_layout=geometry->input_layout().elements(); desc.input_layout_id=geometry->input_layout().fingerprint();
+            desc.render_targets=formats.count; desc.rtv_format=formats.rtv_format;
+            desc.dsv_format=formats.dsv_format; desc.sample_count=formats.samples;
+            // The dome is drawn first, so it must never write depth: a written
+            // dome depth failed every world pixel beyond its radius (buildings cut
+            // along the dome, the road ending past the footbridge). Z write off is
+            // appended after the material's own state operations (kNativeSkyNoDepthWrite).
+            auto result=program.Resolve(desc,formats.reverse_depth,constants,before,base.samplers,
+              filtering,false,kNativeSkyNoDepthWrite);
+            result.capture.material=state.scene_adapter.InternMaterial(std::move(result.capture.material));
+            resolve={result.capture,result.render.words[5]!=0};
+            ++sky_materials_.misses;
+            sky_materials_.Store(std::move(key),std::move(constants),{},{},{},resolve,resolve.capture.material.get(),resolve.capture.camera);
+          }
+          ApplyNativeScenePublishedWorld(resolve.capture,world);
           auto object=std::make_shared<NativeSceneInstance>();
           object->id=(uint64_t(7)<<60)+ ++ids_; object->changed_tick=UINT64_MAX;
-          object->object.geometry=geometry; object->object.material=result.capture.material;
-          object->object.world=result.capture.world; object->previous=result.capture.world;
-          resolved.emplace_back(std::move(object),NativeStaticInstanceView(result.capture.camera,viewport,result.render.words[5]!=0));
+          object->object.geometry=geometry; object->object.material=resolve.capture.material;
+          object->object.world=resolve.capture.world; object->previous=resolve.capture.world;
+          resolved.emplace_back(std::move(object),NativeStaticInstanceView(resolve.capture.camera,viewport,resolve.scissor));
         } catch(const std::exception& error) { return refuse(error.what()); }
         before=draw.render;  // The next pass chains from this one's state, as RecordNativeSky computed it.
       }
+      sky_materials_.EndPass();
       SceneRecorderLocked(state).SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
       for(auto& [object,view]:resolved) {
         state.scene_recorded_snapshots.push_back(NativeSceneSnapshot{0,NativeSceneInstances(std::vector{std::move(object)})});
@@ -6503,11 +6542,21 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     });
     if(!recorded) return;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame sky: frames={} sky={:#x} draws={} declined={} hierarchy_builds={} layout_decodes={}",
-        frames_,sky,resolved.size(),declined_,sky_.hierarchy.builds(),sky_.decodes);
+      REXLOG_INFO("Native full frame sky: frames={} sky={:#x} draws={} declined={} hierarchy_builds={} layout_decodes={} material_hits={} (total {}) misses={}",
+        frames_,sky,resolved.size(),declined_,sky_.hierarchy.builds(),sky_.decodes,hits,sky_materials_.hits,sky_materials_.misses);
   }
+  // The resolved half of one sky draw: the interned capture and whether its
+  // state enables scissor.
+  struct SkyResolve {
+    edf::native::NativeSceneMaterialCapture capture;
+    bool scissor=false;
+  };
+  // Per draw of the sky's plan (group = the draw's index), as the static world
+  // caches a group's resolve: reused while the key and Current hold.
+  using SkyMaterials=edf::native::NativeStaticWorldGroupCache<edf::native::NativeFullFramePassTargets,SkyResolve>;
   const edf::native::GuestReader reader_;
   edf::native::NativeSkyPassState sky_;  // Cached hierarchy and layout.
+  SkyMaterials sky_materials_;
   std::set<std::pair<uint32_t,int32_t>> unsupported_;  // (vtable, mode) reported.
   uint64_t frames_=0,declined_=0,ids_=0,walks_=0,map_effect_draws_=0;
 };
@@ -12410,9 +12459,26 @@ std::array<uint8_t,N*4> NativeFullFrameDeclarationBytes(const std::array<uint32_
 // RecordNativeSceneImmediate per guest DrawPrimitiveUP, under the Vs_Particle
 // (44-byte) or VS_3DTex (36-byte) declaration the immediate path accepts.
 // Throws when any of it is missing.
-void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
-    const NativeEffectDraw& draw,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
-    const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report) {
+//
+// Split in two: the activation (everything up to the render state, done once
+// for a run of draws that share it, see RecordNativeFullFrameEffectsLocked)
+// and the draw's DrawPrimitiveUP calls under it. The activation leaves the
+// bound shader pair (the registered shaders' own bindings, holding what
+// ApplyBindings set until another activation), the resolved render state and
+// the immediate declaration.
+struct NativeFullFrameEffectActivation {
+  ShaderBindings* vertex=nullptr;
+  ShaderBindings* pixel=nullptr;
+  std::shared_ptr<const NativeSceneGroupMaterial> material;
+  RenderStateWords render{};
+  GuestShaderPair shaders{};
+  const std::shared_ptr<const NativeDeclaration>* declaration=nullptr;
+  uint32_t declaration_id=0,device=0;
+};
+NativeFullFrameEffectActivation ActivateNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,
+    const NativeSceneCpuWindow<GuestReader>& window,const NativeEffectDraw& draw,const NativeScenePassCamera& camera,
+    const NativeViewportState& viewport,const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report) {
+  NativeFullFrameEffectActivation result;
   if(draw.texture) {
     const auto texture=state.textures.find(draw.texture);
     if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
@@ -12421,7 +12487,8 @@ void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,c
   BindNativeEffectTexture(window,draw.effect,draw.technique,draw.texture);
   const auto pass=NativeEffectTechniqueMaterial(window,draw.effect,draw.technique);
   if(!pass) throw std::runtime_error("native effect technique has no material");
-  const auto material=NativeModelPassProgramLocked(state,window,pass,false,report);
+  result.material=NativeModelPassProgramLocked(state,window,pass,false,report);
+  const auto& material=result.material;
   if(!material || !material->program) throw std::runtime_error("native effect technique has no program");
   const auto& program=*material->program;
   if(draw.texture && std::none_of(program.inputs.textures.begin(),program.inputs.textures.end(),
@@ -12474,16 +12541,50 @@ void RecordNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,c
     0,0x2a23b9,0, 12,0x2c23a5,0x50000, 20,0x1a23a6,0xa0000}));
   static const auto solid_declaration=NativeDeclaration::Create(NativeFullFrameDeclarationBytes<6>({
     0,0x2a23b9,0, 12,0x182886,0xa0000}));
-  const auto& declaration=particle?particle_declaration:solid?solid_declaration:ribbon_declaration;
+  result.declaration=particle?&particle_declaration:solid?&solid_declaration:&ribbon_declaration;
   // Synthetic declaration identities: only the immediate mesh cache keys on them.
-  const uint32_t declaration_id=particle?0xFFFFFF01u:solid?0xFFFFFF03u:0xFFFFFF02u;
-  const auto device=reader.Word(reader.Add(reader.Word(0x8257bfb4),8));
+  result.declaration_id=particle?0xFFFFFF01u:solid?0xFFFFFF03u:0xFFFFFF02u;
+  result.device=reader.Word(reader.Add(reader.Word(0x8257bfb4),8));
+  result.vertex=&vs; result.pixel=&ps;
+  result.render=render.words;
+  result.shaders=GuestShaderPair{.pixel=program.inputs.pixel,.vertex=program.inputs.vertex};
+  return result;
+}
+// The draw's DrawPrimitiveUP calls under its activation.
+void RecordNativeFullFrameEffectCallsLocked(Bridge& state,const GuestReader& reader,
+    const NativeFullFrameEffectActivation& activation,const NativeEffectDraw& draw,const NativeViewportState& viewport) {
+  const auto& declaration=*activation.declaration;
   for(const auto& [first,count]:NativeEffectDrawCalls(draw)) {
     const auto bytes=EncodeNativeEffectVertices(draw,first,count);
-    RecordNativeSceneImmediate(state,reader,device,{vs,ps,viewport,render.words,
-      GuestShaderPair{.pixel=program.inputs.pixel,.vertex=program.inputs.vertex},declaration_id,declaration->count(),declaration,
-      draw.primitive(),draw.stride()},bytes);
+    RecordNativeSceneImmediate(state,reader,activation.device,{*activation.vertex,*activation.pixel,viewport,activation.render,
+      activation.shaders,activation.declaration_id,declaration->count(),declaration,draw.primitive(),draw.stride()},bytes);
   }
+}
+// A run of adjacent draws that NativeEffectDrawsShareActivation is activated
+// once: the activation reads only the fields that predicate compares (never
+// the vertices), so the next draw's would bind the same texture word, program,
+// constants, samplers and render state onto the same bindings, which only an
+// activation changes (the immediate recording reads them). A failed draw
+// drops the activation; the next draw activates again, as it would alone.
+uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
+    std::span<const NativeEffectDraw> draws,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
+    const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report,
+    const std::function<void(const std::exception&)>& failed) {
+  uint64_t recorded=0;
+  std::optional<NativeFullFrameEffectActivation> activation;
+  const NativeEffectDraw* activated=nullptr;
+  for(const auto& draw:draws) {
+    try {
+      if(!activation || !NativeEffectDrawsShareActivation(*activated,draw)) {
+        activation.reset();
+        activation=ActivateNativeFullFrameEffectLocked(state,reader,window,draw,camera,viewport,formats,report);
+        activated=&draw;
+      }
+      RecordNativeFullFrameEffectCallsLocked(state,reader,*activation,draw,viewport);
+      ++recorded;
+    } catch(const std::exception& error) { activation.reset(); failed(error); }
+  }
+  return recorded;
 }
 }
 REX_EXTERN(__imp__sub_821FD8F8);

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -527,6 +528,106 @@ void TestElectricWire() {
   try { BuildNativeElectricWireDraws(m,wire,scene,ReadNativeEffectInputs(m)); } catch(const std::exception&) { refused=true; }
   Require(refused,"torn wire vector accepted");
 }
+// NativeElectricWirePoints as first written: the sag and swing sines taken at
+// every point, as 820B8D28 does. The builder now takes the sag from one table
+// and the swing once per record; the points must be the same bits.
+std::array<NativeFxVec3,NativeElectricWire::points> ReferenceWirePoints(const NativeFxVec3& a,const NativeFxVec3& b,
+    float phase,float offset,const NativeEffectConstants& k,const NativeElectricWireConstants& w) {
+  const float sx=NativeFxMul(NativeFxSub(b[0],a[0]),w.ninth);
+  const float sy=NativeFxMul(NativeFxSub(b[1],a[1]),w.ninth);
+  const float sz=NativeFxMul(NativeFxSub(b[2],a[2]),w.ninth);
+  float px=a[0],py=a[1],pz=a[2],angle=k.zero;
+  std::array<NativeFxVec3,NativeElectricWire::points> out{};
+  for(auto& point:out) {
+    point={px,py,pz};
+    const float s=float(NativeGuestSin(double(angle)));
+    float t=float(NativeGuestSin(double(NativeFxAdd(phase,offset))));
+    px=NativeFxAdd(sx,px);
+    point[1]=NativeFxSub(point[1],s);
+    py=NativeFxAdd(py,sy); pz=NativeFxAdd(pz,sz);
+    angle=NativeFxAdd(angle,w.angle_step);
+    t=NativeFxMul(t,k.half); t=NativeFxMul(t,s);
+    point[0]=NativeFxAdd(point[0],t);
+    point[2]=NativeFxAdd(t,point[2]);
+  }
+  return out;
+}
+// Bit for bit, except that a NaN matches any NaN: NativeGuestSin of a NaN (a
+// NaN wire phase, or a NaN angle step) returns a NaN whose sign bit the host's
+// fma leaves unfixed - the per-point form itself gives either sign depending on
+// the calls before it. A NaN vertex is dropped by the rasterizer whatever its
+// sign, and every non-NaN result must be the same bits.
+bool SameWirePoints(const std::array<NativeFxVec3,NativeElectricWire::points>& a,
+    const std::array<NativeFxVec3,NativeElectricWire::points>& b) {
+  for(size_t i=0;i<a.size();++i) for(size_t c=0;c<3;++c) {
+    if(std::isnan(a[i][c]) || std::isnan(b[i][c])) { if(!std::isnan(a[i][c]) || !std::isnan(b[i][c])) return false; }
+    else if(std::bit_cast<uint32_t>(a[i][c])!=std::bit_cast<uint32_t>(b[i][c])) return false;
+  }
+  return true;
+}
+void TestElectricWirePointsEquivalence() {
+  uint32_t specials_seen=0;
+  std::mt19937 random(0x820B8D28u);
+  std::uniform_real_distribution<float> coordinate(-2000.f,2000.f),angle(-1e6f,1e6f),small(-4.f,4.f);
+  const NativeEffectConstants k{};
+  NativeElectricWireConstants w;
+  // The image constants as guest_image.bin holds them, and odd ones.
+  const std::array<float,5> steps{std::bit_cast<float>(0x3eb2b8c3u),0.f,-0.349066f,3.5f,std::bit_cast<float>(0x7fc00000u)};
+  const std::array<float,6> specials{0.f,-0.f,std::bit_cast<float>(0x7f800000u),std::bit_cast<float>(0xff800000u),
+    std::bit_cast<float>(0x7fc00000u),std::bit_cast<float>(0x00000001u)};
+  for(uint32_t round=0;round<20000;++round) {
+    w.angle_step=steps[round%steps.size()];
+    w.ninth=round%7?std::bit_cast<float>(0x3de38e39u):small(random);
+    NativeFxVec3 a{coordinate(random),coordinate(random),coordinate(random)},b{coordinate(random),coordinate(random),coordinate(random)};
+    float phase=round%3?small(random):angle(random),offset=small(random);
+    if(round%97==0) phase=specials[(round/97)%specials.size()];
+    if(round%89==0) a[round%3]=specials[(round/89)%specials.size()];
+    const auto expected=ReferenceWirePoints(a,b,phase,offset,k,w);
+    const auto sines=NativeElectricWireSag(k,w);
+    const auto actual=NativeElectricWirePoints(a,b,phase,offset,k,w,sines);
+    Require(SameWirePoints(expected,actual),"wire points differ from the per-point sines");
+    Require(SameWirePoints(expected,NativeElectricWirePoints(a,b,phase,offset,k,w)),"wire points without a sag table differ");
+    if(round%97==0) ++specials_seen;
+  }
+  Require(specials_seen>=specials.size(),"wire point specials not exercised");
+}
+// Many records through the builder (block-read records, one sag table per
+// wire) against the guest transcription: every record's decision and every
+// strip's bytes, across phases and random records around the camera.
+void TestElectricWireRandomized() {
+  ImageMemory m;
+  constexpr uint32_t context=0x1000,scene=0x1400,wire=0x2000,effect=0x4000,camera=0x4800,records=0x5000,stack=0xC000,inner=0xD000;
+  constexpr uint32_t count=150;
+  static_assert(records+count*96<=stack);
+  BuildWireWorld(m,context,scene,effect,camera);
+  m.StoreWord(wire,NativeElectricWire::vtable);
+  std::mt19937 random(0x821A7E08u);
+  std::uniform_real_distribution<float> spread(-80.f,80.f),height(-6.f,12.f),radius(0.5f,40.f),offset(-3.f,3.f),phase(-50.f,50.f);
+  uint64_t drawn=0,distant=0,culled=0,disabled=0;
+  for(uint32_t round=0;round<12;++round) {
+    m.StoreFloat(wire+400,phase(random));
+    for(uint32_t i=0;i<count;++i) {
+      const std::array<float,3> a{spread(random)*(i%5?1.f:6.f),height(random),spread(random)*(i%5?1.f:6.f)};
+      const std::array<float,3> b{a[0]+spread(random)*0.5f,height(random),a[2]+spread(random)*0.5f};
+      const std::array<float,3> centre{(a[0]+b[0])*0.5f,(a[1]+b[1])*0.5f,(a[2]+b[2])*0.5f};
+      WireRecord(m,records+i*96,random()%8!=0,a,b,centre,radius(random),offset(random));
+    }
+    m.StoreWord(wire+388,records); m.StoreWord(wire+392,records+count*96);
+    const auto guest=Guest820B8D28(m,wire,context,stack,inner);
+    NativeElectricWireStats stats;
+    const auto draws=BuildNativeElectricWireDraws(m,wire,scene,ReadNativeEffectInputs(m),&stats);
+    Require(draws.size()==guest.size() && stats.drawn==draws.size() && stats.records==count &&
+      stats.disabled+stats.distant+stats.culled+stats.drawn==count,"randomized wire draw count");
+    for(size_t d=0;d<draws.size();++d)
+      Require(EncodeNativeEffectVertices(draws[d],0,draws[d].vertex_count())==guest[d].vertices,"randomized wire vertices differ from the guest's");
+    drawn+=stats.drawn; distant+=stats.distant; culled+=stats.culled; disabled+=stats.disabled;
+  }
+  Require(drawn && distant && culled && disabled,"randomized wires did not reach every decision");
+  // An empty record vector draws nothing and reads no record.
+  m.StoreWord(wire+392,records);
+  NativeElectricWireStats none;
+  Require(BuildNativeElectricWireDraws(m,wire,scene,ReadNativeEffectInputs(m),&none).empty() && !none.records,"empty wire drew");
+}
 // The walk's inputs: the manager on the helper's world list, then its members
 // in list order with their route words; nothing written.
 void TestMapEffectMembers() {
@@ -570,7 +671,8 @@ void TestMapEffectMembers() {
 }
 int main() {
   try {
-    TestOrder(); TestMutation(); TestCensus(); TestElectricWire(); TestMapEffectMembers();
+    TestOrder(); TestMutation(); TestCensus(); TestElectricWire(); TestElectricWirePointsEquivalence(); TestElectricWireRandomized();
+    TestMapEffectMembers();
   } catch(const std::exception& error) {
     std::cerr<<"native map effect tests failed: "<<error.what()<<"\n";
     return 1;
