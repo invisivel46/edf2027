@@ -32,6 +32,10 @@
 #include <mutex>
 #include <span>
 #include <iostream>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <set>
 
 using namespace edf::native;
 namespace {
@@ -1419,29 +1423,190 @@ void FullFrameStaticWorld() {
 // materials read it, and now and then an owner is born, retired or re-observed
 // and a group material is republished. Each frame of one persistent pass
 // equals a from-scratch build of the same inputs (groups, order, instances,
-// worlds, views), while the caches keep what did not move. With
-// --static-world-bench (static_world_bench) it runs 600 frames, checks every
-// 50th and prints the persistent pass's mean select and build times.
+// worlds, views), while the caches keep what did not move. Every frame is
+// checked against a fresh build. rotating: the camera also turns (yaw and a
+// little pitch) every frame and translates along a path through the grid, as
+// a player's camera does, instead of sliding along its axes. With
+// --static-world-bench (static_world_bench) each mode runs 600 frames and
+// prints the persistent pass's mean select and build times (the fresh
+// builds are outside the timed spans).
 bool static_world_bench=false;
-void FullFrameStaticWorldFrames() {
+// The selection as 821C61D8/820B4038/821C3BB8 make it, straight from the
+// published image and records, with no cache, cluster, flattened tree or slot
+// table: WalkNativeSceneTree over the image, each list's members in order with
+// the +48 marker first, SelectNativeVisibility, the route, the parts pushed at
+// their group's first order position. Every cached selection is checked
+// against it (SelectNativeFullFrameStaticWorld with or without a cache runs
+// the same incremental code, so a fresh build alone would not catch a wrong
+// cluster cull or flattened walk).
+NativeFullFrameStaticSelection ReferenceStaticSelection(const NativeScenePublication& publication,
+    const NativeFullFrameStaticCamera& camera,const NativeFullFrameStaticRouteRead& route) {
+  NativeFullFrameStaticSelection result;
+  std::set<uint32_t> seen;
+  const auto& view=camera.visibility;
+  for(const auto& [owner,image]:publication.trees) {
+    if(!image) continue;
+    const auto* slot=publication.group_order.Find(owner);
+    const auto order=slot?*slot:nullptr;
+    const NativeSceneTreeImageReader tree(*image);
+    std::vector<uint32_t> lists;
+    WalkNativeSceneTree(tree,owner,[&](uint32_t node) { return ClassifyNativeSceneTreeNode(tree,node,view).result; },
+      [&](uint32_t list) { lists.push_back(list); });
+    lists.push_back(owner+372);
+    std::map<uint32_t,std::vector<uint32_t>> queues;  // First order position -> instances, in push order.
+    for(const auto list:lists) {
+      const auto* members=publication.membership?publication.membership->lists.Find(list):nullptr;
+      if(!members || !*members) continue;
+      for(const auto& member:(*members)->members) {
+        if(!seen.insert(member.owner).second) continue;
+        const auto candidate=publication.sources->FindCandidateView(member.owner);
+        if(!candidate.visibility || !candidate.visibility->lod_count) continue;
+        const auto& object=*candidate.visibility;
+        const auto selection=SelectNativeVisibility(view,object,NativeVisibilityCenter(view,object));
+        if(!selection.visible()) continue;
+        const auto words=route(member.owner);
+        if(!words || ClassifyNativeStaticWalk(words->hidden,words->mode,words->direct || words->fixed)!=NativeStaticWalkRoute::Direct ||
+           words->fixed!=candidate.fixed) continue;
+        const auto lod=words->fixed?0u:selection.lod;
+        const auto parts=candidate.Lod(lod);
+        if(!parts || std::ranges::any_of(*parts,[](const auto& part) { return !part.group; })) continue;
+        for(const auto& part:*parts) {
+          if(!order) continue;
+          const auto at=std::ranges::find(*order,part.group);
+          if(at!=order->end()) queues[uint32_t(at-order->begin())].push_back(part.instance);
+        }
+        result.objects.push_back({member.owner,lod});
+      }
+    }
+    NativeFullFrameStaticOwner drawn{owner,{}};
+    for(const auto& [position,instances]:queues)
+      drawn.groups.push_back({(*order)[position],std::vector<uint32_t>(instances.rbegin(),instances.rend())});
+    if(!drawn.groups.empty()) result.owners.push_back(std::move(drawn));
+  }
+  return result;
+}
+bool SameStaticSelection(const NativeFullFrameStaticSelection& a,const NativeFullFrameStaticSelection& b) {
+  return a.objects==b.objects && std::ranges::equal(a.owners,b.owners,[](const auto& p,const auto& q) {
+    return p.owner==q.owner && std::ranges::equal(p.groups,q.groups,[](const auto& u,const auto& v) {
+      return u.group==v.group && u.instances==v.instances;
+    });
+  });
+}
+// NativeFullFrameStaticCull is conservative: whenever it calls a bound culled,
+// SelectNativeVisibility culls every member inside it. Random views (turned,
+// pitched, translated, varied near/far and depth scale) against clusters of
+// objects scattered around the frustum, with members placed on the draw
+// distance and on the planes to within a few ulps, a non-unit w, and views
+// with a non-finite value (never culled).
+void FullFrameStaticCull() {
+  uint32_t seed=99;
+  const auto next=[&] { seed=seed*1664525u+1013904223u; return seed>>8; };
+  const auto unit=[&] { return float(next()%20001)/10000.f-1.f; };
+  uint64_t culled=0,bounds=0;
+  for(uint32_t trial=0;trial<4000;++trial) {
+    NativeSceneVisibilityView view;
+    const double yaw=unit()*3.1416,pitch=unit()*.6;
+    const std::array<double,3> forward{std::sin(yaw)*std::cos(pitch),std::sin(pitch),std::cos(yaw)*std::cos(pitch)};
+    const std::array<double,3> right{std::cos(yaw),0,-std::sin(yaw)};
+    const std::array<double,3> up{forward[1]*right[2]-forward[2]*right[1],forward[2]*right[0]-forward[0]*right[2],
+      forward[0]*right[1]-forward[1]*right[0]};
+    const std::array<double,3> position{unit()*200.,unit()*20.,unit()*200.};
+    const std::array<const std::array<double,3>*,3> bases{&right,&up,&forward};
+    view.matrix=kNativeSceneIdentity;
+    for(int axis=0;axis<3;++axis) {
+      for(int i=0;i<3;++i) view.matrix[i*4+axis]=float((*bases[axis])[i]);
+      view.matrix[12+axis]=float(-((*bases[axis])[0]*position[0]+(*bases[axis])[1]*position[1]+(*bases[axis])[2]*position[2]));
+    }
+    auto& f=view.frustum;
+    const float wide=1+unit()*.5f,tall=.6f+unit()*.3f;
+    f[8]=1; f[10]=-wide; f[12]=-1; f[14]=-wide; f[17]=1; f[18]=-tall; f[21]=-1; f[22]=-tall;
+    f[24]=.5f+unit()*.4f; f[25]=600+unit()*300; view.depth_scale=-(1+unit()*.2f);
+    if(trial%97==0) view.matrix[trial%16]=std::numeric_limits<float>::quiet_NaN();
+    const NativeFullFrameStaticCull cull(view);
+    // A cluster around a random point, members within a random spread.
+    const std::array<float,3> center{unit()*400,unit()*60,unit()*400};
+    const float spread=std::abs(unit())*40;
+    const uint32_t count=1+next()%8;
+    std::vector<NativeSceneVisibility> members;
+    NativeFullFrameStaticBound bound;
+    for(uint32_t i=0;i<count;++i) {
+      NativeSceneVisibility object;
+      object.box={center[0]+unit()*spread,center[1]+unit()*spread,center[2]+unit()*spread,trial%13==0?1+unit()*.5f:1,
+        1,0,0,0, 0,1,0,0, 0,0,1,0};
+      object.radius=std::abs(unit())*6; object.distance=20+std::abs(unit())*400; object.lod_count=1;
+      const auto depth=-float(NativeVisibilityCenter(view,object)[2]*view.depth_scale);
+      // On the draw distance itself, to within ulps either side.
+      if(i==0 && trial%3==0 && std::isfinite(depth))
+        object.distance=std::nextafter(depth,trial%2?INFINITY:-INFINITY);
+      if(i==1 && trial%5==0) object.radius=0;
+      members.push_back(object);
+      if(!i) { for(size_t c=0;c<4;++c) bound.lo[c]=bound.hi[c]=object.box[c]; bound.radius=object.radius; bound.distance=object.distance; }
+      for(size_t c=0;c<4;++c) { bound.lo[c]=(std::min)(bound.lo[c],object.box[c]); bound.hi[c]=(std::max)(bound.hi[c],object.box[c]); }
+      bound.radius=(std::max)(bound.radius,object.radius); bound.distance=(std::max)(bound.distance,object.distance);
+    }
+    ++bounds;
+    if(!cull.Culled(bound)) continue;
+    ++culled;
+    Require(cull.valid(),"a view with a non-finite value culled a bound");
+    for(const auto& object:members)
+      Require(!SelectNativeVisibility(view,object,NativeVisibilityCenter(view,object)).visible(),
+        "the conservative cluster test culled a visible object");
+  }
+  // The test must decide both ways, and mostly by distance or planes it can prove.
+  Require(culled>bounds/10 && culled<bounds,"cluster cull fixture never or always culled");
+  // A cluster straddling the near plane, or reaching into the view past its
+  // draw distance, is never culled whole.
+  NativeSceneVisibilityView view;
+  view.matrix=kNativeSceneIdentity; view.depth_scale=-1;
+  auto& f=view.frustum;
+  f[8]=1; f[10]=-1; f[12]=-1; f[14]=-1; f[17]=1; f[18]=-1; f[21]=-1; f[22]=-1; f[24]=1; f[25]=1000;
+  const NativeFullFrameStaticCull cull(view);
+  NativeFullFrameStaticBound inside{{-1,-1,50,1},{1,1,60,1},1,55};
+  Require(!cull.Culled(inside),"a bound reaching into range was culled");
+  inside.distance=49.9f;
+  Require(cull.Culled(inside),"a bound past every member's distance was kept");
+  const NativeFullFrameStaticBound straddle{{-1,-1,-5,1},{1,1,5,1},0,1000};
+  Require(!cull.Culled(straddle),"a bound across the near plane was culled");
+  const NativeFullFrameStaticBound behind{{-1,-1,-50,1},{1,1,-10,1},1,1000};
+  Require(cull.Culled(behind),"a bound behind the near plane was kept");
+  const NativeFullFrameStaticBound beside{{200,-1,50,1},{210,1,60,1},2,1000};
+  Require(cull.Culled(beside),"a bound past a side plane was kept");
+}
+void FullFrameStaticWorldFrames(bool rotating) {
   std::vector<uint8_t> memory(0x40000);
   const GeometryRetryReader r{memory};
   const auto store=[&](uint32_t at,std::initializer_list<float> values) {
     for(const auto value:values) { r.StoreWord(at,std::bit_cast<uint32_t>(value)); at+=4; }
   };
-  // 160 inside-or-culled leaf roots on a 16x10 grid, each with its own list.
-  constexpr uint32_t world=0x1000,levels=0x2000,roots=0x10000,kColumns=16,kRows=10,kLeaves=kColumns*kRows;
+  // 160 leaves on a 16x10 grid, each with its own list, under 40 roots of 2x2
+  // leaves (children in slots 0, 2, 5 and 7; the other four are unoccupied
+  // nodes), so the walk classifies roots and then leaves, accepts whole roots
+  // and skips unoccupied children as 821C61D8 does on a retail octree.
+  constexpr uint32_t world=0x1000,levels=0x2000,leaves=0x10000,roots=0x18000,empties=0x20000;
+  constexpr uint32_t kColumns=16,kRows=10,kLeaves=kColumns*kRows,kRoots=kLeaves/4;
   r.StoreWord(world+52,levels); r.StoreWord(world+56,levels+32);
-  r.StoreWord(levels+20,roots); r.StoreWord(levels+24,roots+kLeaves*144);
+  r.StoreWord(levels+20,roots); r.StoreWord(levels+24,roots+kRoots*144);
   const auto leaf_center=[](uint32_t leaf) {
     return std::array<float,3>{float(int(leaf%kColumns)*40-300),0.f,float(int(leaf/kColumns)*40+20)};
   };
   for(uint32_t leaf=0;leaf<kLeaves;++leaf) {
-    const auto at=roots+leaf*144; const auto c=leaf_center(leaf);
+    const auto at=leaves+leaf*144; const auto c=leaf_center(leaf);
     r.StoreWord(at+116,1); store(at+32,{c[0],c[1],c[2],1,20,20,20,0,35});
   }
+  for(uint32_t root=0;root<kRoots;++root) {
+    const auto at=roots+root*144;
+    const uint32_t column=root%(kColumns/2)*2,row=root/(kColumns/2)*2;
+    const auto c=leaf_center(row*kColumns+column);
+    r.StoreWord(at+116,1); store(at+32,{c[0]+20,c[1],c[2]+20,1,40,20,40,0,62});
+    constexpr std::array<uint32_t,4> kSlots{0,2,5,7};
+    for(uint32_t slot=0,quadrant=0;slot<8;++slot) {
+      uint32_t child=empties+(root*4+slot-quadrant)*144;
+      if(quadrant<4 && kSlots[quadrant]==slot) { child=leaves+((row+quadrant/2)*kColumns+column+quadrant%2)*144; ++quadrant; }
+      r.StoreWord(at+84+slot*4,child);
+    }
+  }
   const std::shared_ptr<const NativeSceneTreeImage> image=CaptureNativeSceneTree(r,world);
-  constexpr uint32_t kOwners=8000,kGroups=300,kOwnerBase=0x01000000,kGroupBase=0x02000000;
+  constexpr uint32_t kOwners=16000,kGroups=300,kOwnerBase=0x01000000,kGroupBase=0x02000000;
   const auto owner_of=[](uint32_t i) { return kOwnerBase+i*0x200; };
   const auto group_of=[](uint32_t i) { return kGroupBase+(i%kGroups)*16; };
   uint32_t seed=12345;
@@ -1463,6 +1628,11 @@ void FullFrameStaticWorldFrames() {
       NativeSceneSources::Part part{0x20000000+i*64+p*28,0,p,owner_of(i)+0x80,group_of(i+p*7+variant)};
       part.world_first=0; parts.push_back(part);
     }
+    // Every fourth owner has a second LOD (its own group) past depth 90.
+    if(i%4==0) {
+      NativeSceneSources::Part part{0x20000000+i*64+56,1,0,owner_of(i)+0xac,group_of(i+3+variant)};
+      part.world_first=0; parts.push_back(part);
+    }
     return parts;
   };
   const auto spawn=[&](uint32_t i,uint32_t variant) {
@@ -1472,8 +1642,11 @@ void FullFrameStaticWorldFrames() {
     const auto& c=centers[i];
     NativeSceneVisibility visibility;
     visibility.box={c[0],c[1],c[2],1, 1,0,0,0, 0,1,0,0, 0,0,1,0};
-    visibility.radius=1.7f; visibility.distance=float(150+i%7*60); visibility.lod_count=1;
-    sources.PublishVisibility(owner,visibility);
+    // Draw distances short against the grid (most visited objects are culled
+    // by distance, as in gameplay), and every ninth owner unpublished.
+    visibility.radius=1.7f; visibility.distance=float(60+i%7*30);
+    visibility.lod_count=1+(i%4==0); visibility.lod_thresholds={90,0};
+    if(i%9!=8) sources.PublishVisibility(owner,visibility);
     sources.PublishWorld(owner,registers_of(c[0],c[1],c[2]));
   };
   auto lists=std::make_shared<NativeSceneMembership::Publication>();
@@ -1484,8 +1657,10 @@ void FullFrameStaticWorldFrames() {
     centers[i]={c[0]+unit()*18,c[1]+unit()*18,c[2]+unit()*18};
     spawn(i,0);
     members[leaf].push_back(owner_of(i));
+    // Every 40th object straddles two leaves: the +48 marker keeps its first.
+    if(i%40==0 && leaf+1<kLeaves) members[leaf+1].push_back(owner_of(i));
   }
-  const auto list_address=[&](uint32_t leaf) { return leaf<kLeaves?roots+leaf*144+120:world+372; };
+  const auto list_address=[&](uint32_t leaf) { return leaf<kLeaves?leaves+leaf*144+120:world+372; };
   const auto publish_list=[&](uint32_t leaf) {
     auto snapshot=std::make_shared<NativeSceneMembership::Snapshot>(); snapshot->end=list_address(leaf)+8;
     for(const auto owner:members[leaf]) snapshot->members.push_back({owner+0x10,owner});
@@ -1552,6 +1727,13 @@ void FullFrameStaticWorldFrames() {
   NativeFullFrameStaticWorld cached;
   const auto same_frame=[](const NativeFullFrameStaticFrame& a,const NativeFullFrameStaticFrame& b) {
     if(a.selection.objects!=b.selection.objects || a.draws.size()!=b.draws.size()) return false;
+    // The selection itself: owners, their groups in order and each group's
+    // instances in draw order.
+    if(!std::ranges::equal(a.selection.owners,b.selection.owners,[](const auto& p,const auto& q) {
+      return p.owner==q.owner && std::ranges::equal(p.groups,q.groups,[](const auto& u,const auto& v) {
+        return u.group==v.group && u.instances==v.instances;
+      });
+    })) return false;
     const auto& x=a.stats; const auto& y=b.stats;
     if(x.groups!=y.groups || x.draws!=y.draws || x.instances!=y.instances || x.world_declines!=y.world_declines ||
        x.missing_group!=y.missing_group || x.missing_material!=y.missing_material || x.declined!=y.declined) return false;
@@ -1570,13 +1752,37 @@ void FullFrameStaticWorldFrames() {
     return true;
   };
   NativeFullFrameStaticFrame::Stats totals{};
+  NativeFullFrameStaticSelection::Stats selected{};
   uint64_t cached_resolves=0;
   const bool bench=static_world_bench;
   const uint32_t frames=bench?600:48;
   double select_ms=0,build_ms=0;
+  uint64_t uniform=0;
+  // A player's camera: yaw sweeping +-34 degrees (up to 0.6 a frame), a little
+  // pitch, and a path along the grid's near side looking across it (view = the
+  // camera basis transposed, translated).
+  const auto look=[&](uint32_t frame) {
+    const double t=frame,yaw=.6*std::sin(t*.0175),pitch=.05*std::sin(t*.02);
+    const std::array<double,3> position{80*std::sin(t*.007),6+2*std::sin(t*.05),50+40*std::cos(t*.009)};
+    const std::array<double,3> forward{std::sin(yaw)*std::cos(pitch),std::sin(pitch),std::cos(yaw)*std::cos(pitch)};
+    const std::array<double,3> right{std::cos(yaw),0,-std::sin(yaw)};
+    std::array<double,3> up{forward[1]*right[2]-forward[2]*right[1],forward[2]*right[0]-forward[0]*right[2],
+      forward[0]*right[1]-forward[1]*right[0]};
+    const double length=std::sqrt(up[0]*up[0]+up[1]*up[1]+up[2]*up[2]);
+    for(auto& value:up) value/=length;
+    auto& m=camera.visibility.matrix;
+    m=kNativeSceneIdentity;
+    const std::array<const std::array<double,3>*,3> bases{&right,&up,&forward};
+    for(int axis=0;axis<3;++axis) {
+      const auto& basis=*bases[axis];
+      for(int i=0;i<3;++i) m[i*4+axis]=float(basis[i]);
+      m[12+axis]=float(-(basis[0]*position[0]+basis[1]*position[1]+basis[2]*position[2]));
+    }
+  };
   for(uint32_t frame=0;frame<frames;++frame) {
     // Camera and pass camera move every frame; the animation advances.
-    camera.visibility.matrix[12]=float(frame%40)*1.5f-30; camera.visibility.matrix[14]=float(frame%13);
+    if(rotating) look(frame);
+    else { camera.visibility.matrix[12]=float(frame%40)*1.5f-30; camera.visibility.matrix[14]=float(frame%13); }
     camera.pass.view[12]=0x3f800000u+frame; camera.pass.view_projection[3]=frame;
     camera.animation=NativeScenePassAnimation{frame,frame/8};
     // A few objects move every frame: a new sources generation.
@@ -1607,23 +1813,41 @@ void FullFrameStaticWorldFrames() {
       build_ms+=std::chrono::duration<double,std::milli>(t2-t1).count();
     }
     const auto& s=built.stats;
+    const auto& v=built.selection.stats;
+    selected.selected+=v.selected; selected.members+=v.members; selected.nodes_classified+=v.nodes_classified;
+    selected.culled_distance+=v.culled_distance; selected.culled_frustum+=v.culled_frustum;
     totals.reused_draws+=s.reused_draws; totals.camera_only+=s.camera_only; totals.draws+=s.draws;
     totals.cache_hits+=s.cache_hits; totals.instances+=s.instances; totals.reused_instances+=s.reused_instances;
     totals.reused_moved+=s.reused_moved;
     // Every frame is a new sources generation and a new animation: the
     // groups not reading the animation keep Current's acceptance (another
     // group's resolve does not take it), and the instances whose reads did
-    // not move are carried across the generation.
-    if(frame>=2) Require(s.camera_only>=s.cache_hits*9/10 && s.reused_instances>=s.instances*8/10 && s.reused_moved &&
-      s.moved_owners>=12,"a moved generation, camera or animation rebuilt unchanged groups");
-    if(bench && frame%50) continue;
+    // not move are carried across the generation. The sliding camera jumps
+    // back when its x (every 40th frame) or z (every 13th) wraps: most of
+    // that frame's view is new.
+    const bool jump=!rotating && (frame%40==0 || frame%13==0);
+    if(frame>=2) Require(s.camera_only>=s.cache_hits*9/10 && (jump || s.reused_instances>=s.instances*8/10) &&
+      s.reused_moved && s.moved_owners>=12,"a moved generation, camera or animation rebuilt unchanged groups");
+    // The selection is the guest's (the reference walk over the image and
+    // records), and each uniform draw's kept worlds are its instances'.
+    Require(SameStaticSelection(built.selection,ReferenceStaticSelection(publication,camera,routes)),
+      "the incremental full-frame selection differs from the reference walk");
+    for(const auto& draw:built.draws) {
+      if(!draw.worlds) continue;
+      ++uniform;
+      Require(draw.worlds->size()==draw.instances.size(),"uniform draw worlds lost an instance");
+      size_t i=0;
+      for(const auto& instance:draw.instances) Require((*draw.worlds)[i++]==instance->object.world,"uniform draw world is stale");
+    }
     NativeFullFrameStaticWorld fresh;
     Require(same_frame(built,fresh.Build(publication,camera,routes,pass,resolve)),
       "a cached full-frame static world frame differs from a fresh build");
   }
-  Require(totals.draws>frames*100 && totals.instances>frames*1000,"full-frame frames fixture drew too little");
+  Require(totals.draws>frames*100 && totals.instances>frames*1000 && uniform>=totals.draws*9/10,"full-frame frames fixture drew too little");
   if(bench)
-    std::cout<<"static world frames: select_ms="<<select_ms/(frames-2)<<" build_ms="<<build_ms/(frames-2)
+    std::cout<<"static world frames ("<<(rotating?"rotating":"sliding")<<"): select_ms="<<select_ms/(frames-2)
+      <<" build_ms="<<build_ms/(frames-2)<<" members="<<selected.members/frames<<" nodes="<<selected.nodes_classified/frames
+      <<" selected="<<selected.selected/frames<<" culled="<<selected.culled_distance/frames<<"/"<<selected.culled_frustum/frames
       <<" draws="<<totals.draws/frames<<" instances="<<totals.instances/frames<<" reused_draws="<<totals.reused_draws/frames
       <<" reused_instances="<<totals.reused_instances/frames<<" camera_only="<<totals.camera_only/frames<<" resolves="<<double(cached_resolves)/frames<<"\n";
 }
@@ -2981,6 +3205,23 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
     const auto camera=NativeStaticCaptureCamera(*moved.capture.material,camera_constants,&derived);
     Require(camera && NativeSceneCameraIdentical(*camera,moved.capture.camera),"derived camera differs from the resolved capture");
     Require(derived==std::vector<uint8_t>{0,1,1,0},"derived camera marked the wrong constants");
+    // The plan made for this material and shape derives the same camera from
+    // any constants of that shape (moved camera bytes, a conflicting pair, a
+    // NaN), and a shape without the camera constants never derives.
+    const auto plan=NativeStaticCameraPlan::Make(*moved.capture.material,camera_constants);
+    for(uint32_t variant=0;variant<6;++variant) {
+      auto varied=camera_constants;
+      for(size_t i=0;i<16;++i) Word(varied[1].registers,i*4,std::bit_cast<uint32_t>(float(i*variant)-7.f));
+      if(variant==3) Word(varied[2].registers,8,0x7fc00000);
+      if(variant==4) varied[2].registers=varied[1].registers;
+      const auto expected=NativeStaticCaptureCamera(*moved.capture.material,varied);
+      const auto planned=plan.Derive(varied);
+      Require(expected.has_value()==planned.has_value() && (!expected || NativeSceneCameraIdentical(*expected,*planned)),
+        "a camera plan derived other than NativeStaticCaptureCamera");
+    }
+    auto unnamed=camera_constants; unnamed[1].name="g_mOther";
+    Require(!NativeStaticCaptureCamera(*moved.capture.material,unnamed) &&
+      NativeStaticCameraPlan::Make(*moved.capture.material,unnamed).never,"a camera plan without its constant derived");
     using Cache=NativeStaticWorldGroupCache<int,int>;
     Cache cache;
     Cache::Key key; key.group=1;
@@ -3144,6 +3385,30 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   auto many=scene.Publish(11); stats=render(*many);
   Require(stats.visible==257 && stats.draws==2 && stats.instanced_draws==1 && pixel(32,0)==255,
     "native scene lost instances across batch capacity");
+  {
+    // RenderUniform records a uniform snapshot (one geometry and material,
+    // visible, unbounded, not interpolated) from its worlds alone: the same
+    // statistics and pixels as Render, across the 256-instance batch split.
+    scene.Clear(); auto plain=object; plain.bounds.reset();
+    for(size_t i=0;i<300;++i) { plain.world[12]=float(i%3)*.5f-.5f; scene.Create(plain); }
+    scene.Publish(12);
+    const auto uniform=scene.Publish(13);
+    const auto reference=render(*uniform);
+    const auto reference_pixels=pixels;
+    std::vector<NativeSceneMatrix> worlds;
+    for(const auto& instance:uniform->instances) {
+      Require(instance->changed_tick!=uniform->tick && !instance->object.bounds,"uniform fixture is not uniform");
+      worlds.push_back(instance->object.world);
+    }
+    backend->BeginFrame(); auto& recorder=backend->Recorder();
+    NativeBackendRenderTarget* targets[]{target.get()}; recorder.SetRenderTargets(targets,nullptr);
+    recorder.ClearColor(*target,{0,0,0,1});
+    const auto direct=renderer.RenderUniform(*backend,*plain.geometry,*plain.material,worlds,view);
+    backend->Submit(); pixels=backend->ReadRenderTarget(*target);
+    Require(direct.visible==reference.visible && direct.draws==reference.draws && direct.draws==2 &&
+      direct.instanced_draws==reference.instanced_draws && pixels==reference_pixels && pixel(16,0)==255 && pixel(48,0)==255,
+      "RenderUniform recorded differently from Render");
+  }
   NativeSceneAdapter adapter;
   Require(!adapter.PreviousGroupMaterial(500),"empty material history returned an asset");
   {
@@ -3486,7 +3751,7 @@ int main(int argc,char** argv) {
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
     AddressFilter(); FullFrameLiveRoutes(); FullFrameFixedRecord();
-    WorldPublicationMirror(); GroupOrder(); FullFrameStaticWorld(); FullFrameStaticWorldFrames(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
+    WorldPublicationMirror(); GroupOrder(); FullFrameStaticWorld(); FullFrameStaticCull(); FullFrameStaticWorldFrames(false); FullFrameStaticWorldFrames(true); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

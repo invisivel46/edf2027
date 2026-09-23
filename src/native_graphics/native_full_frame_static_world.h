@@ -169,56 +169,230 @@ struct NativeFullFrameStaticOwner {
 };
 struct NativeFullFrameStaticSelection {
   struct Object { uint32_t owner=0,lod=0; bool operator==(const Object&) const=default; };
+  // members counts every member of every gathered list; culled_bulk the ones
+  // a conservative cluster test proved culled without testing them one by
+  // one (NativeFullFrameStaticCull), culled_distance/culled_frustum the ones
+  // the exact per-object test culled, duplicates the visible ones an earlier
+  // list already visited (the only ones the +48 marker can change: see
+  // SelectNativeFullFrameStaticWorld). tree_reads: node records the walk
+  // visited (occupied or not). clusters: cluster tests made.
   struct Stats {
     uint64_t worlds=0,missing_orders=0,nodes_classified=0,tree_reads=0,lists=0,missing_lists=0,members=0,duplicates=0;
     uint64_t route_reads=0,unrouted=0,not_direct=0,unpublished=0,culled_distance=0,culled_frustum=0,visible=0,missing_lod=0,undrawable=0;
     uint64_t selected=0,parts=0,unordered_groups=0,unordered_parts=0;
     uint64_t fixed=0,route_mismatch=0;  // Fixed-record objects selected; route kind unlike the source's.
+    uint64_t culled_bulk=0,clusters=0,flat_walks=0;
   };
   std::vector<NativeFullFrameStaticOwner> owners;
   // Every object selected natively, in walk order, with the LOD it chose.
   std::vector<Object> objects;
   Stats stats;
 };
+// A conservative "every one of these objects is culled" test, exact against
+// SelectNativeVisibility's float arithmetic: Culled(bound) is true only when
+// every object whose record lies inside bound is one SelectNativeVisibility
+// culls (not visible()) under the view the test was made for. It decides
+// nothing else - visibility, LOD and everything a survivor needs come from
+// SelectNativeVisibility itself - so it can only spare the per-object test of
+// objects that test would cull.
+//
+// SelectNativeVisibility culls an object when depth=-fl(Z*s) > distance (s
+// the depth scale), or when NativeVisibilitySphere returns 0, which it does
+// as soon as one of Z < fl(f24-r), Z > fl(f25+r) or D_k > r holds, D_k =
+// fma(a_k,A_k,fl(b_k*Z)) the side-plane value (k<4; A_k is X for the first
+// two sides, Y for the others; with r>=0 each implies the enclosing compare
+// the test makes first). X, Y, Z are the center NativeVisibilityTransform
+// computes from box[0..3]: four float roundings of a linear form of the
+// center, so |X-X*| <= 4*2^-24*sum|m_i*c_i|; a plane value adds two roundings
+// and the depth one. The bound interval-evaluates each linear form over the
+// centers' box (exactly, in double) and widens it by kSlack (1e-5, forty
+// times the worst rounding) of the magnitudes involved; a test whose
+// magnitudes could overflow a float is skipped. A bound holds its members'
+// centers (all four components) as a box, their largest radius and their
+// largest distance; a member with a non-finite center, radius or distance, or
+// a negative radius, is never bounded (Boundable). A view with a non-finite
+// value the tests read makes every test false.
+struct NativeFullFrameStaticBound {
+  std::array<float,4> lo{},hi{};
+  float radius=0,distance=0;
+};
+class NativeFullFrameStaticCull {
+ public:
+  explicit NativeFullFrameStaticCull(const NativeSceneVisibilityView& view);
+  bool valid() const { return valid_; }
+  bool Culled(const NativeFullFrameStaticBound& bound) const;
+  static bool Boundable(const NativeSceneVisibility& object);
+  static constexpr double kSlack=1e-5,kLimit=1e30;
+ private:
+  using Form=std::array<double,4>;
+  // The view-space x, y and z of a center, and each side plane's a*A+b*Z.
+  Form x_{},y_{},z_{};
+  std::array<Form,4> sides_{};
+  std::array<double,4> a_{},b_{};
+  double near_=0,far_=0,scale_=0;
+  bool valid_=false;
+};
+// A tree image flattened for the walk: per occupied node the words
+// WalkNativeSceneTree and ClassifyNativeSceneTreeNode read (center +32,
+// half extents +48, radius +64, whether +84 holds a first child, and the
+// children), decoded once per image. Build reads what the walk reads, in its
+// order, but for every node (the walk reads a node's bounds only when it
+// classifies it): any read or check that fails leaves it invalid, and the
+// selection then walks the image itself, which fails, or not, as before. An
+// image is immutable, so the walk's iterator re-checks of the root extent
+// always pass and are not kept. Classify returns ClassifyNativeSceneTreeNode's
+// result from the same floats and the same arithmetic.
+struct NativeFullFrameStaticTree {
+  struct Node {
+    std::array<float,4> center{},extent{};
+    float radius=0;
+    uint32_t list=0;  // node+120, for a leaf.
+    bool leaf=false;
+    // Each child's node, or -1 when unoccupied (the walk returns at its +116).
+    std::array<int32_t,8> children{};
+  };
+  std::vector<Node> nodes;
+  std::vector<int32_t> roots;  // In root order; -1 when unoccupied.
+  bool valid=false;
+  template<class Reader> bool Build(const Reader& reader,uint32_t manager) {
+    nodes.clear(); roots.clear(); valid=false;
+    try {
+      const auto levels=reader.Word(reader.Add(manager,52));
+      const auto level_end=reader.Word(reader.Add(manager,56));
+      if(!levels || level_end<levels || level_end-levels<32) return false;
+      const auto extent=reader.Add(levels,16);
+      auto root=reader.Word(reader.Add(extent,4));
+      const auto end=reader.Word(reader.Add(extent,8));
+      if(root>end || (end-root)%144) return false;
+      const auto flatten=[&](auto&& self,uint32_t node,uint32_t depth)->int32_t {
+        if(depth>128 || nodes.size()>=(1u<<20)) throw std::runtime_error("native full-frame tree exceeds its limits");
+        if(!reader.Word(reader.Add(node,116))) return -1;
+        Node value;
+        value.center=ReadNativeVisibilityFloats<4>(reader,reader.Add(node,32));
+        value.radius=std::bit_cast<float>(reader.Word(reader.Add(node,64)));
+        value.extent=ReadNativeVisibilityFloats<4>(reader,reader.Add(node,48));
+        const auto children=reader.Add(node,84);
+        value.leaf=!reader.Word(children);
+        value.list=reader.Add(node,120);
+        value.children.fill(-1);
+        const auto index=int32_t(nodes.size());
+        nodes.push_back(value);
+        if(!value.leaf) for(uint32_t child=0;child<8;++child)
+          nodes[index].children[child]=self(self,reader.Word(reader.Add(children,child*4)),depth+1);
+        return index;
+      };
+      for(;root!=end;root=reader.Add(root,144)) roots.push_back(flatten(flatten,root,0));
+      valid=true;
+    } catch(const std::exception&) { nodes.clear(); roots.clear(); }
+    return valid;
+  }
+  static uint32_t Classify(const Node& node,const NativeSceneVisibilityView& view) {
+    const auto sphere=NativeVisibilitySphere(view,NativeVisibilityTransform(node.center,view.matrix),node.radius);
+    return sphere==2?NativeVisibilityAabb(view,node.center,node.extent):sphere;
+  }
+};
 // Cross-frame scratch of SelectNativeFullFrameStaticWorld; it never changes
 // a selection, only what one costs:
+//  - each world's tree image flattened (NativeFullFrameStaticTree), rebuilt
+//    when the image's regions move (a restamp shares them); the walk
+//    classifies from it with no image lookups;
 //  - each membership list's members pre-looked-up (visibility record, LOD
-//    parts), rebuilt only when the list's published snapshot or the
-//    candidates (NativeSceneSources::SameCandidates) move. The views point
-//    into sources, which it retains, so they stay valid while the publication
-//    moves on. Route words are never cached: they are read live, each frame,
-//    for culling's survivors;
+//    parts), in list order, and a hierarchy of conservative cluster bounds
+//    over its boundable published members (NativeFullFrameStaticCull): a
+//    frame tests the clusters coarse to fine, drops each one the test proves
+//    culled whole, and runs SelectNativeVisibility only on the members of
+//    the others (and the unbounded ones), in list order. Clusters split on the
+//    widest of x, y, z and the draw distance, so objects of one draw distance
+//    share clusters and a cluster past it is culled whole. A list is rebuilt
+//    when its published snapshot moves. The views point into sources, which
+//    it retains, so they stay valid while the publication moves on; when the
+//    candidates move (NativeSceneSources::SameCandidates) only the members
+//    whose owner entry moved (NativeSceneSources::OwnerDifferences, over the
+//    chunks written between the two generations) are looked up again and
+//    their lists' clusters rebuilt - an unmoved owner's entry holds the same
+//    parts and record objects in both generations, so its views stay valid
+//    under the new one. Route words are never cached: they are read live,
+//    each frame, for culling's survivors;
 //  - the +48 visit marker as an epoch-stamped open-addressing set (no clear,
 //    no allocation per frame);
 //  - each world's group queues as flat arrays indexed by the group's first
-//    position in the published order (rebuilt when the order moves), and its
-//    tree image's regions as a flat index (rebuilt when they move);
-//  - each member's visibility record copied into its list's candidates.
+//    position in the published order (rebuilt when the order moves).
 // Not synchronized.
 struct NativeFullFrameStaticSelectCache {
   struct Candidate {
     uint32_t owner=0;
     bool published=false;  // A visibility record with at least one LOD.
     std::array<bool,3> drawable{};  // Every part of the LOD has a group.
-    // The record itself when published: every candidate the walk tests is
-    // read in list order from one array, not through a pointer per object.
+    // The record itself when published: the survivors a frame tests are read
+    // from one array, not through a pointer per object.
     NativeSceneVisibility visibility;
     NativeSceneSources::CandidateView view;
+  };
+  // One cluster: its bound and its members' positions in List::clustered,
+  // [begin,end); children (both or neither) are later clusters.
+  struct Cluster {
+    NativeFullFrameStaticBound bound;
+    uint32_t begin=0,end=0,left=0,right=0;
   };
   struct List {
     std::shared_ptr<const NativeSceneMembership::Snapshot> members;
     std::vector<Candidate> candidates;
+    // The members' owners, sorted and unique, for OwnerDifferences' patches.
+    std::vector<uint32_t> owners;
+    // The cluster hierarchy (clusters[0] the root, when any) over the
+    // boundable published candidates (their indices, grouped by cluster), and
+    // the published ones outside it, ascending.
+    std::vector<Cluster> clusters;
+    std::vector<uint32_t> clustered,loose;
+    uint32_t unpublished=0;
     uint64_t used=0;
+    // Recomputes owners, clusters, clustered, loose and unpublished from candidates.
+    void Index();
+  };
+  // Group -> its first position in the published order, as an open-addressed
+  // table (the lookup every selected part makes); kNone when absent.
+  class Slots {
+   public:
+    static constexpr uint32_t kNone=UINT32_MAX;
+    template<class Order> void Build(const Order& order) {
+      size_t size=16;
+      while(size<order.size()*2) size*=2;
+      keys_.assign(size,0); values_.assign(size,kNone); zero_=kNone;
+      for(uint32_t i=0;i<order.size();++i) {
+        const uint32_t group=order[i];
+        if(!group) { if(zero_==kNone) zero_=i; continue; }
+        for(size_t at=Hash(group)&(size-1);;at=(at+1)&(size-1)) {
+          if(!keys_[at]) { keys_[at]=group; values_[at]=i; break; }
+          if(keys_[at]==group) break;
+        }
+      }
+    }
+    void clear() { keys_.clear(); values_.clear(); zero_=kNone; }
+    uint32_t Find(uint32_t group) const {
+      if(!group) return zero_;
+      if(keys_.empty()) return kNone;
+      const auto mask=keys_.size()-1;
+      for(size_t at=Hash(group)&mask;;at=(at+1)&mask) {
+        if(keys_[at]==group) return values_[at];
+        if(!keys_[at]) return kNone;
+      }
+    }
+   private:
+    static size_t Hash(uint32_t key) { return size_t((uint64_t(key)*0x9E3779B97F4A7C15ull)>>32); }
+    std::vector<uint32_t> keys_,values_;
+    uint32_t zero_=kNone;
   };
   struct Queues {
     std::shared_ptr<const NativeSceneGroupOrder> order;
-    std::unordered_map<uint32_t,uint32_t> slots;  // Group -> first position in order.
+    Slots slots;                                  // Group -> first position in order.
     std::vector<std::vector<uint32_t>> queues;    // Per position, in push order.
     std::vector<uint32_t> touched;                // Positions with a queue this frame.
     std::map<uint32_t,size_t> unordered;          // Groups outside the order -> parts.
-    // The tree image's regions as a flat index (NativeSceneTreeImageReader),
-    // rebuilt when the image's regions move (a restamp shares them).
+    // The tree image's regions, the flattened tree built from them and, when
+    // it could not be flattened, their flat index for the image walk
+    // (NativeSceneTreeImageReader).
     std::shared_ptr<const NativeSceneTreeImage::Regions> regions;
+    NativeFullFrameStaticTree tree;
     NativeSceneTreeImageReader::Index index;
     uint64_t used=0;
   };
@@ -253,13 +427,19 @@ struct NativeFullFrameStaticSelectCache {
     uint32_t epoch_=0;
     size_t count_=0;
   };
-  struct Stats { uint64_t list_hits=0,list_builds=0,invalidations=0; };
+  // invalidations: the lists dropped whole (no sources to compare with);
+  // patches/patched: lists and members looked up again after moved candidates.
+  struct Stats { uint64_t list_hits=0,list_builds=0,invalidations=0,patches=0,patched=0,tree_builds=0; };
   std::shared_ptr<const NativeSceneSources> sources;  // The generation every List points into.
   std::unordered_map<uint32_t,List> lists;
   std::unordered_map<uint32_t,Queues> worlds;
   Seen seen;
   Stats stats;
   uint64_t pass=0;
+  // Per-frame scratch: gathered lists, a list's members to test, the cluster
+  // stack and the moved owners.
+  std::vector<uint32_t> gathered,pending,stack,moved;
+  size_t objects=0;  // The last selection's object count, reserved up front.
 };
 // 821C61D8 + 820B4038 + 821C3BB8's group order over published data. Per world
 // owner with a tree image: walk the tree with frustum classification from the
@@ -275,6 +455,11 @@ struct NativeFullFrameStaticSelectCache {
 // undrawable here, as it sends the object back to the guest in the hook.
 // Selections of a group outside the owner's published order are counted and
 // dropped: 821C3BB8 never reaches them.
+// The marker is applied to the objects culling keeps only: whether an object
+// is culled, and its LOD, depend on its record and the camera alone, so an
+// object culled at its first list is culled at every later one, and the
+// marker only ever stops a visible object's second selection - which it
+// still does. Culling first lets whole clusters be dropped unvisited.
 // cache, when given, is kept across frames (a call without one builds and
 // drops its own); the selection is the same either way.
 NativeFullFrameStaticSelection SelectNativeFullFrameStaticWorld(const NativeScenePublication& publication,
@@ -357,13 +542,32 @@ struct NativeFullFrameStaticDraw {
   NativeSceneView view;
   // Shared storage: a snapshot, or the next frame's unchanged draw, copies it in O(1).
   NativeSceneInstances instances;
+  // The instances' worlds, in order, when every instance draws this draw's
+  // geometry and material, is visible, unbounded and not interpolated in
+  // Snapshot (changed_tick is not its tick 0): what
+  // NativeSceneRenderer::RenderUniform records Snapshot from without reading
+  // the instances. Null otherwise. Kept with the instances while they do not
+  // move, so an unchanged group's recording reads one array.
+  std::shared_ptr<const std::vector<NativeSceneMatrix>> worlds;
   NativeSceneSnapshot Snapshot() const { return {0,instances}; }
+  // Draw's worlds when every instance has that shape (see worlds).
+  static std::shared_ptr<const std::vector<NativeSceneMatrix>> UniformWorlds(const NativeFullFrameStaticDraw& draw) {
+    auto worlds=std::make_shared<std::vector<NativeSceneMatrix>>();
+    worlds->reserve(draw.instances.size());
+    for(const auto& instance:draw.instances) {
+      const auto& object=instance->object;
+      if(object.geometry!=draw.geometry || object.material!=draw.material || !object.visible || object.bounds ||
+         instance->changed_tick==0) return nullptr;
+      worlds->push_back(object.world);
+    }
+    return worlds;
+  }
 };
 struct NativeFullFrameStaticFrame {
   struct Stats {
     uint64_t groups=0,draws=0,instances=0,resolves=0,cache_hits=0,missing_group=0,missing_material=0,
       missing_geometry=0,scissor=0,declined=0,world_declines=0,retained_objects=0,fresh_objects=0,
-      camera_only=0,reused_draws=0,reused_frame=0,reused_moved=0,moved_owners=0,moved_instances=0,reused_instances=0;
+      camera_only=0,reused_draws=0,reused_frame=0,reused_moved=0,moved_owners=0,moved_instances=0,reused_instances=0,keyed=0;
     // reused_moved: reused_draws across a new generation; moved_*: that
     // generation's moved keys; reused_instances: selected instances whose
     // outcome was carried rather than resolved (whole draws included).
@@ -382,7 +586,14 @@ struct NativeFullFrameStaticFrame {
 // What a frame costs follows what moved since the last one (every result is
 // the one a build from scratch returns, but for the ids of frame-local objects):
 //  - Select always selects (the route words are read live, so no selection
-//    outlives its frame), through selection_cache.
+//    outlives its frame), through selection_cache: the flattened tree, and
+//    per list the cluster bounds that drop whole the objects the exact test
+//    would cull, so the per-object work is the objects in or near the view.
+//  - Per group, the last build's lookups (sources group, published material
+//    and geometry) answer while the three maps share storage with the last
+//    build's, and then with the same pass its cache key is the same: the
+//    entry it found (memo.keyed, while the cache erased nothing) is reused
+//    without building or comparing the key.
 //  - BuildSelected returns the previous frame whole when the selection's
 //    groups and instances equal the ones it was built from and its own inputs
 //    (sources, group materials and geometry, by_source, pass camera,
@@ -408,10 +619,15 @@ struct NativeFullFrameStaticFrame {
 //    NativeSharedMap::Difference), computed once per build from the chunks
 //    written between them; gameplay publishes a new generation whenever any
 //    object moves, so the comparison of whole generations alone never
-//    reuses. When the group's selection moved (an object entered or left
+//    reuses. Only a group some moved owner files a part in (Moved::groups)
+//    scans its instances against the moved keys; the others are unmoved at
+//    once. When the group's selection moved (an object entered or left
 //    the view), each instance the last build also selected, with nothing it
 //    read moved, keeps its outcome (declined, or the same object) and only
 //    the others are resolved. A frame-local object keeps its id across frames.
+//  - Per group, the instances' worlds are kept with them when the draw is
+//    uniform (NativeFullFrameStaticDraw::worlds): recording an unchanged
+//    group reads that one array, not the instance objects.
 // resolve is taken to be the same function on every call.
 class NativeFullFrameStaticWorld {
  public:
@@ -460,6 +676,7 @@ class NativeFullFrameStaticWorld {
     const Cache::Entry* entry=nullptr;
     uint64_t stores=0;
     bool accepted=false,camera_only=false;
+    NativeStaticCameraPlan plan;  // Made at acceptance (Current).
     // The last instance build and what it depended on; outcomes[i] is
     // selected[i]'s.
     std::vector<uint32_t> selected;
@@ -471,7 +688,21 @@ class NativeFullFrameStaticWorld {
     uint32_t first=0;
     bool column_major=false,built=false;
     NativeSceneInstances instances;
+    std::shared_ptr<const std::vector<NativeSceneMatrix>> worlds;  // NativeFullFrameStaticDraw::worlds.
     uint64_t retained=0,fresh=0,declined=0,used=0;
+    // The last build's lookups of this group (at build looked): its sources
+    // group, published material and geometry, each null when absent or of
+    // another revision. Pointers into chunks of that build's maps, valid and
+    // the same answers while this build's maps share them (BuildSelected's lookups).
+    uint64_t looked=0;
+    const NativeSceneSources::Group* membership=nullptr;
+    const std::shared_ptr<const NativeSceneGroupMaterial>* found_material=nullptr;
+    const std::shared_ptr<const NativeSceneGroupGeometry>* found_geometry=nullptr;
+    // The cache entry the last build's key found or stored (at build keyed,
+    // with the cache's erasures then): the entry Candidate returns for the
+    // same key while no entry was erased since.
+    Cache::Entry* keyed=nullptr;
+    uint64_t keyed_pass=0,keyed_erasures=0;
   };
   // NativeFullFrameStaticConstants(published,camera), kept in memo.
   static const Constants& PassConstants(Memo& memo,const std::shared_ptr<const NativeSceneGroupMaterial>& published,
@@ -522,7 +753,8 @@ class NativeFullFrameStaticWorld {
       // Current's result for these constants: the entry's camera is already
       // the one they derive when it is underived or derived at this camera.
       if(!entry.derived || memo.derived==camera.pass) { ++stats.camera_only; return true; }
-      if(material.material) if(const auto view=NativeStaticCaptureCamera(*material.material,memo.constants)) {
+      // The plan made at acceptance: this material and these constants' shape.
+      if(material.material) if(const auto view=memo.plan.Derive(memo.constants)) {
         material.camera.view=view->view; material.camera.projection=view->projection;
         material.camera.view_projection=view->view_projection; memo.derived=camera.pass;
         ++stats.camera_only; return true;
@@ -532,10 +764,16 @@ class NativeFullFrameStaticWorld {
     if(!Cache::Current(entry,memo.constants,material.material.get(),material.camera)) return false;
     memo.accepted=true; memo.entry=&entry; memo.stores=entry.stored; memo.derived=camera.pass;
     memo.camera_only=std::ranges::all_of(memo.cameras,[&](uint32_t i) { return entry.derived && entry.camera[i]; });
+    // The camera-only path's derivation (NativeStaticCaptureCamera's result for
+    // this material and any constants of this shape): valid while the
+    // acceptance is, as the published constants object and the entry's store
+    // stamp fix both.
+    memo.plan=entry.derived && material.material?NativeStaticCameraPlan::Make(*material.material,memo.constants):NativeStaticCameraPlan{};
     return true;
   }
   struct BuildInputs {
     std::shared_ptr<const NativeSceneSources> sources;
+    NativeSceneSources::GroupMap groups;  // sources' groups (shared, O(1)).
     decltype(NativeScenePublication::group_materials) materials;
     decltype(NativeScenePublication::group_geometry) geometry;
     BySource by_source;
@@ -546,14 +784,16 @@ class NativeFullFrameStaticWorld {
     bool valid=false;
   };
   // The keys whose answers moved from built_'s sources and by_source to this
-  // build's (sorted, unique); all when the two cannot be compared.
+  // build's (sorted, unique); all when the two cannot be compared. groups:
+  // every group one of built_'s parts of a moved owner, or of a moved
+  // instance's owner, files its part in (sorted, unique).
   struct Moved {
     bool computed=false,all=false;
-    std::vector<uint32_t> owners,instances;
+    std::vector<uint32_t> owners,instances,groups;
   };
   void ComputeMoved(const NativeScenePublication& publication) {
     auto& moved=moved_;
-    moved.computed=true; moved.all=false; moved.owners.clear(); moved.instances.clear();
+    moved.computed=true; moved.all=false; moved.owners.clear(); moved.instances.clear(); moved.groups.clear();
     const auto& before=built_;
     if(before.sources!=publication.sources) {
       if(!before.sources || !publication.sources) { moved.all=true; return; }
@@ -565,11 +805,26 @@ class NativeFullFrameStaticWorld {
     for(auto* keys:{&moved.owners,&moved.instances}) {
       std::ranges::sort(*keys); keys->erase(std::unique(keys->begin(),keys->end()),keys->end());
     }
+    if(!before.sources) { moved.all=true; return; }
+    const auto file=[&](uint32_t owner) {
+      const auto view=before.sources->FindCandidateView(owner);
+      for(const auto& parts:view.lods) for(const auto& part:parts) moved.groups.push_back(part.group);
+    };
+    for(const auto owner:moved.owners) file(owner);
+    for(const auto instance:moved.instances) if(const auto* source=before.sources->Find(instance)) file(source->owner);
+    std::ranges::sort(moved.groups); moved.groups.erase(std::unique(moved.groups.begin(),moved.groups.end()),moved.groups.end());
   }
-  // Whether anything memo's last instance build read moved since built_.
-  bool Moves(const Memo& memo) const {
+  // Whether anything memo's last instance build (of group, from built_'s
+  // generation) read moved since built_: one of its instances, or the source
+  // owner one resolved through. Each such instance is a part of that owner
+  // filed in group in built_'s sources (the selection queued it from the
+  // owner's parts in that generation, and Find(instance) is that owner), and a
+  // moved instance's own entry moves only with its owner's; so a group no
+  // moved owner files a part in has nothing moved, and only the groups one
+  // does (moved_.groups) scan their instances.
+  bool Moves(uint32_t group,const Memo& memo) const {
     if(moved_.all) return true;
-    if(moved_.owners.empty() && moved_.instances.empty()) return false;
+    if(!std::ranges::binary_search(moved_.groups,group)) return false;
     for(size_t i=0;i<memo.selected.size();++i)
       if(std::ranges::binary_search(moved_.instances,memo.selected[i]) ||
          (memo.outcomes[i].owner && std::ranges::binary_search(moved_.owners,memo.outcomes[i].owner))) return true;
@@ -613,15 +868,34 @@ const NativeFullFrameStaticFrame& NativeFullFrameStaticWorld::BuildSelected(cons
     ++stats.declined;
     (void)reason;
   };
+  // The last build's per-group lookups answer for this one while its maps
+  // share storage with the last build's (equal copies were never written
+  // apart). The same material and geometry objects and the same pass then
+  // make the same cache key (every component is the program's, the
+  // geometry's or the pass's).
+  const bool lookups=baseline && sources && in.sources && in.groups.Shares(sources->Groups()) &&
+    in.materials.Shares(publication.group_materials) && in.geometry.Shares(publication.group_geometry);
+  const bool same_pass=baseline && in.pass==pass;
   for(const auto& owner:frame_.selection.owners) for(const auto& selected:owner.groups) {
     ++stats.groups;
-    const auto* membership=sources?sources->FindGroup(selected.group):nullptr;
-    if(!membership) { ++stats.missing_group; continue; }
-    // Both are kept sorted and unique by group (NativeSceneAdapter publishes them so).
-    const auto* material=publication.group_materials.Find(selected.group,NativeSceneGroupKey{});
-    if(material && (*material)->revision!=membership->revision) material=nullptr;
-    const auto* geometry=publication.group_geometry.Find(selected.group,NativeSceneGroupKey{});
-    if(geometry && (*geometry)->revision!=membership->revision) geometry=nullptr;
+    auto& memo=memos_[selected.group];
+    memo.used=pass_;
+    const bool looked=lookups && memo.looked==pass_-1;
+    if(!looked) {
+      const auto* membership=sources?sources->FindGroup(selected.group):nullptr;
+      memo.membership=membership; memo.found_material=nullptr; memo.found_geometry=nullptr;
+      if(membership) {
+        // Both are kept sorted and unique by group (NativeSceneAdapter publishes them so).
+        const auto* material=publication.group_materials.Find(selected.group,NativeSceneGroupKey{});
+        if(material && (*material)->revision==membership->revision) memo.found_material=material;
+        const auto* geometry=publication.group_geometry.Find(selected.group,NativeSceneGroupKey{});
+        if(geometry && (*geometry)->revision==membership->revision) memo.found_geometry=geometry;
+      }
+    }
+    memo.looked=pass_;
+    const auto* material=memo.found_material;
+    const auto* geometry=memo.found_geometry;
+    if(!memo.membership) { ++stats.missing_group; continue; }
     if(!material || !(*material)->program) { ++stats.missing_material; continue; }
     if(!geometry) { ++stats.missing_geometry; continue; }
     const auto& group=**material;
@@ -630,15 +904,22 @@ const NativeFullFrameStaticFrame& NativeFullFrameStaticWorld::BuildSelected(cons
     if(!program.CanDeferCpuActivation()) { ++stats.scissor; continue; }
     const auto first=program.inputs.WorldRegisterFirst();
     if(!first) { report("world register"); continue; }
-    auto& memo=memos_[selected.group];
-    memo.used=pass_;
-    Cache::Key key{.group=selected.group,.vertex=program.inputs.vertex,.pixel=program.inputs.pixel,
-      .program=group.program,.setup=(*geometry)->setup.value_or(NativeSceneGeometrySource{}),
-      .geometry=(*geometry)->geometry,.backend=program.backend,.pass=base,.view=pass.targets,.filtering=pass.filtering};
+    const auto make_key=[&] {
+      return Cache::Key{.group=selected.group,.vertex=program.inputs.vertex,.pixel=program.inputs.pixel,
+        .program=group.program,.setup=(*geometry)->setup.value_or(NativeSceneGeometrySource{}),
+        .geometry=(*geometry)->geometry,.backend=program.backend,.pass=base,.view=pass.targets,.filtering=pass.filtering};
+    };
     const NativeFullFrameStaticMaterial* resolved=nullptr;
+    // The last build keyed this group to memo.keyed with the same objects
+    // and pass: Candidate would return that entry again (or null had it been
+    // erased, which erasures rules out).
+    auto* const last_entry=looked && same_pass && memo.keyed_pass==pass_-1 && memo.keyed_erasures==cache.erasures?memo.keyed:nullptr;
+    memo.keyed=nullptr;
     try {
       const auto& constants=PassConstants(memo,*material,camera);
-      auto* entry=cache.Candidate(key);
+      Cache::Entry* entry=nullptr;
+      if(last_entry) { entry=last_entry; cache.Touch(*entry); ++stats.keyed; }
+      else entry=cache.Candidate(make_key());
       if(entry && Current(memo,*entry,camera,stats)) {
         resolved=&entry->material; ++stats.cache_hits; ++cache.hits;
       } else {
@@ -648,10 +929,11 @@ const NativeFullFrameStaticFrame& NativeFullFrameStaticWorld::BuildSelected(cons
         const auto view=fresh.camera;
         // No guest eligibility here: empty reads and witness. The published
         // group material is recorded as an observation only.
-        auto& stored=cache.Store(std::move(key),constants,NativeRecordedReads{},NativeStaticEligibilityWitness{},
+        entry=&cache.Store(make_key(),constants,NativeRecordedReads{},NativeStaticEligibilityWitness{},
           base.After(program),std::move(fresh),captured.get(),view,Cache::Observed{0,*material});
-        resolved=&stored.material;
+        resolved=&entry->material;
       }
+      memo.keyed=entry; memo.keyed_pass=pass_; memo.keyed_erasures=cache.erasures;
     } catch(const std::exception& error) { report(error.what()); continue; }
     NativeFullFrameStaticDraw draw;
     draw.owner=owner.owner; draw.group=selected.group; draw.geometry=(*geometry)->geometry; draw.material=resolved->material;
@@ -669,9 +951,9 @@ const NativeFullFrameStaticFrame& NativeFullFrameStaticWorld::BuildSelected(cons
       ComputeMoved(publication);
       stats.moved_owners=moved_.owners.size(); stats.moved_instances=moved_.instances.size();
     }
-    if((same_generation || last_generation) && memo.selected==selected.instances && (same_generation || !Moves(memo))) {
+    if((same_generation || last_generation) && memo.selected==selected.instances && (same_generation || !Moves(selected.group,memo))) {
       if(last_generation) { memo.sources=publication.sources; memo.by_source=publication.by_source; ++stats.reused_moved; }
-      draw.instances=memo.instances; ++stats.reused_draws;
+      draw.instances=memo.instances; draw.worlds=memo.worlds; ++stats.reused_draws;
       stats.reused_instances+=memo.selected.size();
     } else {
       // Per instance: one the last build also selected, with nothing it read
@@ -732,6 +1014,7 @@ const NativeFullFrameStaticFrame& NativeFullFrameStaticWorld::BuildSelected(cons
       memo.selected=selected.instances; memo.sources=publication.sources; memo.by_source=publication.by_source;
       memo.geometry=draw.geometry; memo.material=draw.material; memo.column_major=resolved->world_column_major;
       memo.first=*first; memo.instances=draw.instances; memo.built=true;
+      memo.worlds=draw.worlds=NativeFullFrameStaticDraw::UniformWorlds(draw);
     }
     stats.world_declines+=memo.declined; stats.retained_objects+=memo.retained; stats.fresh_objects+=memo.fresh;
     if(draw.instances.empty()) continue;
@@ -740,8 +1023,8 @@ const NativeFullFrameStaticFrame& NativeFullFrameStaticWorld::BuildSelected(cons
   }
   cache.EndPass(); reuse.EndPass();
   if(!(pass_%kMemoAge)) std::erase_if(memos_,[&](const auto& item) { return pass_-item.second.used>kMemoAge; });
-  in={publication.sources,publication.group_materials,publication.group_geometry,publication.by_source,
-    camera.pass,camera.animation,pass,cache.stores,true};
+  in={publication.sources,sources?sources->Groups():NativeSceneSources::GroupMap{},publication.group_materials,
+    publication.group_geometry,publication.by_source,camera.pass,camera.animation,pass,cache.stores,true};
   return frame_;
 }
 }

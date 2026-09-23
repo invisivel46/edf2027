@@ -7180,7 +7180,14 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
       for(const auto& draw:frame.draws) {
         // Kept until the recording is submitted, as the renderer requires.
         state.scene_recorded_snapshots.push_back(draw.Snapshot());
-        drawn+=state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),draw.view,1).draws;
+        // A draw whose instances have the uniform shape records from its kept
+        // worlds (the same calls, no read of the instance objects); an
+        // unchanged group's worlds are last frame's array. (Without geometry or
+        // material Render refuses the draw, as before.)
+        if(draw.worlds && draw.geometry && draw.material) {
+          drawn+=state.scene_renderer.RenderUniform(*state.scene_backend,*draw.geometry,*draw.material,*draw.worlds,draw.view).draws;
+          ++uniform_;
+        } else drawn+=state.scene_renderer.Render(*state.scene_backend,state.scene_recorded_snapshots.back(),draw.view,1).draws;
       }
       // The batch bound its own targets and pipelines.
       ++state.bind_generation;
@@ -7193,17 +7200,17 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     const auto& built=frame.stats;
     const auto& cached=world_.selection_cache.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame static world: frames={} skipped={} stale={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={} camera_only={} reused_draws={} reused_moved={} reused_instances={} moved={}/{} reused_frame={} list_hits={} list_builds={} list_invalidations={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
-        frames_,skipped_,stale_,routes.reads,routes.slot_reads,routes.failures,selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,
+      REXLOG_INFO("Native full frame static world: frames={} skipped={} stale={} route_reads={} slot_reads={} route_failures={} worlds={} selected={} culled={}/{}/{} clusters={} flat_walks={} unrouted={} not_direct={} unpublished={} undrawable={} groups={} draws={} instances={} renderer_draws={} resolves={} cache_hits={} declined={} missing={}/{}/{} world_declines={} camera_only={} reused_draws={} reused_moved={} reused_instances={} moved={}/{} reused_frame={} list_hits={} list_builds={} list_invalidations={} list_patches={}/{} keyed={} uniform_draws={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f}",
+        frames_,skipped_,stale_,routes.reads,routes.slot_reads,routes.failures,selected.worlds,selected.selected,selected.culled_distance,selected.culled_frustum,selected.culled_bulk,selected.clusters,selected.flat_walks,
         selected.unrouted,selected.not_direct,selected.unpublished,selected.undrawable,built.groups,built.draws,built.instances,drawn,
         built.resolves,built.cache_hits,built.declined,built.missing_group,built.missing_material,built.missing_geometry,built.world_declines,
-        built.camera_only,built.reused_draws,built.reused_moved,built.reused_instances,built.moved_owners,built.moved_instances,built.reused_frame,cached.list_hits,cached.list_builds,cached.invalidations,
+        built.camera_only,built.reused_draws,built.reused_moved,built.reused_instances,built.moved_owners,built.moved_instances,built.reused_frame,cached.list_hits,cached.list_builds,cached.invalidations,cached.patches,cached.patched,built.keyed,uniform_,
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()));
   }
  private:
   const edf::native::GuestReader reader_;
   edf::native::NativeFullFrameStaticWorld world_;  // Cross-frame material cache and instance reuse.
-  uint64_t frames_=0,skipped_=0,stale_=0;
+  uint64_t frames_=0,skipped_=0,stale_=0,uniform_=0;
 };
 // NativeFullFrame's view of the bridge for one render helper call. Native
 // work reads guest memory and writes only owner+136 and the guest frame
