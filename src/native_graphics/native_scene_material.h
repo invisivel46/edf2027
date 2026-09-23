@@ -161,6 +161,30 @@ std::optional<std::vector<NativeSceneMaterialInputs::Constant>> RefreshNativeSce
   }
   return result;
 }
+// The guest half of a published program's per-tick check, in the order the
+// preload's serial path runs it: the recorded program bytes (`program`, a
+// NativeRecordedReads) and, only when they hold, the constant refresh. Reads
+// nothing but guest memory and the caller's inputs and writes nothing, so the
+// preload's parallel prechecks run it off the engine thread; the host
+// identities are checked first, by the caller.
+// constants_read false: the refresh threw (the preload then reloads).
+struct NativeSceneMaterialGuestProbe {
+  bool program_unchanged=false,constants_read=false;
+  std::optional<std::vector<NativeSceneMaterialInputs::Constant>> constants;
+};
+template<class Reader,class Reads>
+NativeSceneMaterialGuestProbe ProbeNativeSceneMaterialGuestInputs(const Reader& reader,const Reads& program,
+    const NativeMaterialParameters::Groups& schema,const NativeSceneMaterialConstantLayout& layout,
+    const std::vector<NativeSceneMaterialInputs::Constant>& published) {
+  NativeSceneMaterialGuestProbe result;
+  result.program_unchanged=program.Unchanged(reader);
+  if(!result.program_unchanged) return result;
+  try {
+    result.constants=RefreshNativeSceneMaterialConstants(reader,schema,layout,published);
+    result.constants_read=true;
+  } catch(const std::exception&) { result.constants.reset(); }
+  return result;
+}
 // Everything except constant values: the stable part of an owned program.
 template<class Reader,class UsesTexture>
 NativeSceneMaterialDefinition ReadNativeSceneMaterialDefinition(const Reader& reader,uint32_t material,
