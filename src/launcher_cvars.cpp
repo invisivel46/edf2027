@@ -9,8 +9,17 @@ REXCVAR_DEFINE_INT32(edf_fps_cap, 0, "EDF2027", "Frame rate cap (0 = off)").rang
 REXCVAR_DEFINE_BOOL(edf_show_settings, false, "EDF2027", "Open the settings screen at startup");
 REXCVAR_DEFINE_BOOL(settings, false, "EDF2027", "Alias of edf_show_settings (--settings)");
 REXCVAR_DEFINE_BOOL(edf_setup_done, false, "EDF2027", "First-run setup completed");
-REXCVAR_DEFINE_STRING(edf_aspect, "native", "EDF2027", "Aspect handling: native, Hor+ ultrawide, 16:9 letterbox, or 16:9 stretch")
+REXCVAR_DEFINE_STRING(edf_aspect, "native", "EDF2027",
+                      "Aspect handling (native_display_layout.h): native fills the window (Hor+ when wider than 16:9, Vert+ when narrower), "
+                      "ultrawide fills it with pure Hor+ (narrower windows lose the sides), letterbox renders 16:9 with bars, "
+                      "stretch renders 16:9 stretched to the window. The render size follows at startup")
     .allowed({"native", "ultrawide", "letterbox", "stretch"});
+REXCVAR_DEFINE_STRING(edf_hud_safe_area, "16:9", "EDF2027",
+                      "HUD, menus and text when the frame is not 16:9: 16:9 keeps them in the centred 16:9 area at their "
+                      "own shape (pillarbox/letterbox; flat-colour fades still cover the frame); full spreads the 1280x720 "
+                      "canvas over the whole frame, stretched, which keeps 2D markers placed from 3D positions on target. "
+                      "Identical on a 16:9 frame. Applies live")
+    .allowed({"16:9", "full"});
 REXCVAR_DEFINE_BOOL(edf_show_fps, false, "EDF2027", "Show the frame-rate overlay");
 REXCVAR_DEFINE_BOOL(edf_frametime_log, false, "EDF2027", "Log frame-time statistics (min/avg/max/1% low) every 5 s");
 REXCVAR_DEFINE_BOOL(edf_native_memory_log, false, "EDF2027",

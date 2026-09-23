@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "native_graphics/native_display_layout.h"
 
 namespace edf {
 
@@ -65,18 +66,25 @@ inline std::string FilterPersistentConfig(std::string_view config) {
 }
 
 struct VideoMode { int width; int height; };
+// edf_native_render_width/height as a pair: (0,0) original 720 lines, (0,h) h lines
+// in the window's shape, (0,-1) the window's size, (w,h) exactly w x h
+// (native_display_layout.h ResolveNativeRenderSize).
 inline bool ValidNativeRenderMode(int width,int height) {
-  return (width==0 && height==0) ||
-    (width>=640 && width<=4095 && height>=480 && height<=4095);
+  return native::ValidNativeRenderRequest(width,height);
 }
 
 inline bool ForcesConsoleAspect(std::string_view aspect) {
   return aspect == "letterbox" || aspect == "stretch";
 }
 
+// The video mode the guest is told about. Always 16:9: the engine reads only its
+// widescreen flag from it (8219E3B8 picks 1280x720 or 1280x960 and the 2D canvas
+// callbacks 820A4DD0/8216E630 shrink to 3/4 when the flag is clear), and the
+// render size the window's shape needs is applied separately by the 82139A40
+// hook. A 4:3 or 16:10 video mode would take the engine down its SD paths.
 inline VideoMode GuestVideoMode(int width, int height, std::string_view aspect) {
-  if (ForcesConsoleAspect(aspect) &&
-      static_cast<int64_t>(width) * 9 != static_cast<int64_t>(height) * 16) {
+  (void)aspect;
+  if (static_cast<int64_t>(width) * 9 != static_cast<int64_t>(height) * 16) {
     width = height * 16 / 9;
     if (width < 1280) return {1280, 720};
   }

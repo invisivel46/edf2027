@@ -70,7 +70,7 @@ struct NativeFrameView {
   uint32_t scene=0,index=0;
   uint32_t serial=0;  // owner+136 before this view's increment.
 };
-// Guest viewport 821BE8D0 would set from scene+480, and the native one bound.
+// Guest viewport 821BE8D0 would set from scene+488..+500 (x, y, width, height), and the native one bound.
 struct NativeFrameViewport {
   uint32_t x=0,y=0,width=0,height=0;
   float min_depth=0,max_depth=1;

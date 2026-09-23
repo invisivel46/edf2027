@@ -1,5 +1,8 @@
 #pragma once
+#include <array>
+#include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include "d3d11_frame_handoff.h"
 #include "native_render_backend.h"
@@ -13,6 +16,11 @@ void LogNativeCoverageCensusFinal();
 // Transitional reference-run bridge: constructs native resources from the
 // live guest shader loader while the existing renderer remains the oracle.
 void InitializeGuestShaderBridge(const std::filesystem::path& game_root);
+// The window's client size, asked once when the engine initializes its
+// renderer (82139A40): the render size follows the window's shape
+// (native_display_layout.h). Without a provider, or when it answers 0x0
+// (minimized), window_width/window_height are used.
+void SetNativeDisplaySizeProvider(std::function<std::array<int32_t,2>()> provider);
 // Serialized, pipeline-isolated access to the latest published native image.
 // No callbacks occur until publication is enabled and an image is available.
 // The backend named by --edf_native_backend, built on first use and kept for

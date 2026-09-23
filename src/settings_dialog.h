@@ -193,9 +193,12 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       {"2560 x 1440 (16:9)", 2560, 1440}, {"3440 x 1440 (21:9)", 3440, 1440},
       {"3840 x 1600 (24:10)", 3840, 1600}, {"3840 x 2160 (16:9)", 3840, 2160},
       {"5120 x 1440 (32:9)", 5120, 1440}, {"Custom", 0, 0}}};
-  static constexpr std::array<Preset, 7> kRenderPresets{{
-      {"Original game size", 0, 0}, {"1280 x 720", 1280, 720}, {"1600 x 900", 1600, 900},
-      {"1920 x 1080", 1920, 1080}, {"2560 x 1440", 2560, 1440}, {"3840 x 2160", 3840, 2160}, {"Custom", 0, 0}}};
+  // Render resolution: a line count in the window's shape (width 0), the window's own
+  // size (0, -1), or a fixed size (Custom). native_display_layout.h resolves them.
+  static constexpr std::array<Preset, 8> kRenderPresets{{
+      {"Original (720 lines)", 0, 0}, {"900 lines", 0, 900}, {"1080 lines", 0, 1080},
+      {"1440 lines", 0, 1440}, {"1800 lines", 0, 1800}, {"2160 lines", 0, 2160},
+      {"Match window", 0, -1}, {"Custom (fixed size)", 0, 0}}};
 
   // ---- cvar access --------------------------------------------------------------------
   static std::string Get(std::string_view name) { return rex::cvar::GetFlagByName(name); }
@@ -451,8 +454,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       if (index + 1 < int(kWindowPresets.size())) SetWindowSize(kWindowPresets[size_t(index)].w, kWindowPresets[size_t(index)].h);
       else { custom_w_ = w; custom_h_ = h; custom_window_ = true; }
     }
-    EndRow("The game's output resolution. In windowed mode the window resizes now; the game renders at the new "
-           "size after a restart.");
+    EndRow("The window's size. In windowed mode the window resizes now and the picture is fitted into it; the game "
+           "renders in the new shape after a restart.");
     if (index == int(kWindowPresets.size()) - 1 || custom_window_) {
       BeginRow("Custom size");
       const float field = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3) * 0.36f;
@@ -473,13 +476,35 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
 
     BeginRow("Aspect ratio", "edf_aspect");
     int aspect = AspectIndex(Pending("edf_aspect"));
-    if (Combo("##aspect", &aspect, {"Native (fills window)", "Ultrawide Hor+ (21:9 / 32:9)", "16:9 letterbox",
+    if (Combo("##aspect", &aspect, {"Fill window (Hor+ / Vert+)", "Fill window (Hor+ only)", "16:9 letterbox",
                                     "16:9 stretched"})) {
       const auto value = std::string(AspectValue(aspect));
       Apply("edf_aspect", {{"edf_aspect", value}, {"present_letterbox", PresentLetterbox(value) ? "true" : "false"}});
     }
-    EndRow("Native and Ultrawide give the game the window's full width, so wide screens see more to the sides "
-           "without stretching. The 16:9 modes keep the console's shape, with black bars or stretched.");
+    EndRow("Fill window renders in the window's shape: wider screens (21:9, 32:9) see more at the sides, narrower "
+           "ones (16:10, 4:3) see more above and below, so nothing of the 16:9 view is lost. Hor+ only keeps the "
+           "vertical view everywhere, so narrower screens lose the sides. The 16:9 modes keep the console's shape, "
+           "with black bars or stretched.");
+
+    if (Exists("edf_hud_safe_area")) {
+      BeginRow("HUD and menus");
+      int hud = Get("edf_hud_safe_area") == "full" ? 1 : 0;
+      if (Combo("##hud", &hud, {"16:9 area", "Full frame (stretched)"}))
+        rex::cvar::SetFlagByName("edf_hud_safe_area", hud == 1 ? "full" : "16:9");
+      EndRow("On a screen that is not 16:9: the 16:9 area keeps the HUD, menus, text and videos at their own shape "
+             "in the middle of the screen; full frame spreads them over the whole screen, stretched. Identical on a "
+             "16:9 screen. Applies immediately.");
+    }
+
+    if (Exists("edf_present_filter")) {
+      BeginRow("Scaling filter");
+      int filter = Get("edf_present_filter") == "bilinear" ? 1 : 0;
+      if (Combo("##scaling", &filter, {"Sharp (automatic)", "Bilinear"}))
+        rex::cvar::SetFlagByName("edf_present_filter", filter == 1 ? "bilinear" : "auto");
+      EndRow("How the picture is fitted to the window when the render resolution differs from it. Sharp keeps "
+             "whole-number enlargements pixel-exact and averages a larger render down cleanly (supersampling). "
+             "Applies immediately.");
+    }
 
     BeginRow("Menu size");
     float scale = float(GetDouble(Get("edf_menu_scale"), 1.0)) * 100.0f;
@@ -546,6 +571,14 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     int render = int(kRenderPresets.size()) - 1;
     for (size_t i = 0; i + 1 < kRenderPresets.size(); ++i)
       if (kRenderPresets[i].w == rw && kRenderPresets[i].h == rh) render = int(i);
+    const auto [window_w, window_h] = CurrentWindowSize();
+    const auto resolved = native::ResolveNativeRenderSize(rw, rh, window_w, window_h,
+                                                          native::ParseNativeAspectMode(Pending("edf_aspect")));
+    const std::string render_note = "Renders at " + std::to_string(resolved.width) + " x " +
+                                    std::to_string(resolved.height) + " in a " + std::to_string(window_w) + " x " +
+                                    std::to_string(window_h) + " window" +
+                                    (resolved.clamped ? " (reduced to the largest size the game's memory allows)" : "") +
+                                    ". ";
     std::vector<const char*> render_names;
     for (const auto& p : kRenderPresets) render_names.push_back(p.name);
     if (Combo("##render", &render, render_names)) {
@@ -554,8 +587,11 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       else
         custom_render_ = true;
     }
-    EndRow("The resolution the 3D scene is drawn at, independent of the window size. Higher looks sharper and "
-           "costs GPU time. Experimental.");
+    const std::string render_help = render_note +
+        "The resolution the game is drawn at, in the window's shape unless a fixed size is chosen; the picture is "
+        "then scaled to the window. Above the window's size it is supersampled, which looks smoother and costs GPU "
+        "time and memory. Experimental.";
+    EndRow(render_help.c_str());
     if (render == int(kRenderPresets.size()) - 1 || custom_render_) {
       BeginRow("Custom render size");
       const float field = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3) * 0.36f;
@@ -567,11 +603,13 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       ImGui::SetNextItemWidth(field);
       ImGui::InputInt("##rh", &render_custom_h_, 0, 0);
       ImGui::SameLine();
-      const bool valid = ValidNativeRenderMode(render_custom_w_, render_custom_h_);
+      const bool valid = render_custom_w_ > 0 && render_custom_h_ > 0 &&
+                         ValidNativeRenderMode(render_custom_w_, render_custom_h_);
       ImGui::BeginDisabled(!valid);
       if (ImGui::Button("Apply", ImVec2(-FLT_MIN, 0))) SetRenderSize(render_custom_w_, render_custom_h_);
       ImGui::EndDisabled();
-      EndRow(valid ? "640 to 4095 wide, 480 to 4095 high." : "Out of range: 640 to 4095 wide, 480 to 4095 high.");
+      EndRow(valid ? "640 to 8192 wide, 480 to 8192 high, up to 16.7 million pixels (5120 x 2880)."
+                   : "Out of range: 640 to 8192 wide, 480 to 8192 high, up to 16.7 million pixels (5120 x 2880).");
     }
 
     if (fsr) DrawUpscalingRows();
@@ -944,6 +982,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
                               {"video_mode_height", Default("video_mode_height")}});
         Apply("edf_aspect", {{"edf_aspect", Default("edf_aspect")},
                              {"present_letterbox", PresentLetterbox(Default("edf_aspect")) ? "true" : "false"}});
+        ResetOne("edf_hud_safe_area");
+        ResetOne("edf_present_filter");
         ResetOne("edf_menu_scale");
         break;
       }

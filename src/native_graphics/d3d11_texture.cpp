@@ -15,6 +15,11 @@
 
 namespace edf::native {
 namespace {
+// Diagnostic readbacks and BMP captures accept any D3D texture extent: render
+// sizes above 4096 (5120x1440, 5K) and window captures of wide monitors are
+// real configurations (native_display_layout.h), and a refused host capture
+// throws inside the presenter's paint.
+constexpr uint32_t kNativeDiagnosticMaxExtent=16384;
 void ValidateSamples(NativeRenderBackend& backend,DXGI_FORMAT format,uint32_t samples) {
   if(samples!=1 && samples!=2 && samples!=4)
     throw std::runtime_error("unsupported native sample count");
@@ -397,7 +402,7 @@ NativeHdrRange InspectNativeHdrColor(ID3D11DeviceContext& context,ID3D11Texture2
   D3D11_TEXTURE2D_DESC desc{}; surface.GetDesc(&desc);
   if ((desc.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM) ||
       desc.SampleDesc.Count!=1 || desc.ArraySize!=1 || desc.MipLevels!=1 ||
-      !desc.Width || !desc.Height || desc.Width>4096 || desc.Height>4096)
+      !desc.Width || !desc.Height || desc.Width>kNativeDiagnosticMaxExtent || desc.Height>kNativeDiagnosticMaxExtent)
     throw std::runtime_error("unsupported diagnostic HDR range resource");
   desc.Usage=D3D11_USAGE_STAGING; desc.BindFlags=desc.MiscFlags=0; desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
   Microsoft::WRL::ComPtr<ID3D11Device> device; context.GetDevice(&device);
@@ -509,7 +514,7 @@ bool FindNativeInvalidColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& s
   D3D11_TEXTURE2D_DESC desc{}; surface.GetDesc(&desc);
   if((desc.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM) ||
      desc.SampleDesc.Count!=1 || desc.ArraySize!=1 || desc.MipLevels!=1 ||
-     !width || !height || width>4096 || height>4096 || x>=desc.Width || y>=desc.Height ||
+     !width || !height || width>kNativeDiagnosticMaxExtent || height>kNativeDiagnosticMaxExtent || x>=desc.Width || y>=desc.Height ||
      width>desc.Width-x || height>desc.Height-y)
     throw std::runtime_error("unsupported diagnostic color region");
   if(desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM) return false;
@@ -553,7 +558,7 @@ bool FindNativeInvalidColorPixel(ID3D11DeviceContext& context,ID3D11Texture2D& s
 std::vector<uint8_t> EncodeNativeBmp(std::span<const uint8_t> pixels,uint32_t width,uint32_t height,
                                      uint32_t format) {
   if((format!=DXGI_FORMAT_R16G16B16A16_FLOAT && format!=DXGI_FORMAT_R8G8B8A8_UNORM) ||
-     !width || !height || width>4096 || height>4096)
+     !width || !height || width>kNativeDiagnosticMaxExtent || height>kNativeDiagnosticMaxExtent)
     throw std::runtime_error("unsupported native diagnostic format");
   const size_t source_pitch=size_t(width)*(format==DXGI_FORMAT_R8G8B8A8_UNORM?4:8);
   if(pixels.size()<source_pitch*height) throw std::runtime_error("short native diagnostic readback");
@@ -605,7 +610,7 @@ std::vector<uint8_t> CaptureNativeHdrBmp(ID3D11DeviceContext& context,ID3D11Text
   D3D11_TEXTURE2D_DESC desc{}; surface.GetDesc(&desc);
   if ((desc.Format!=DXGI_FORMAT_R16G16B16A16_FLOAT && desc.Format!=DXGI_FORMAT_R8G8B8A8_UNORM) || desc.SampleDesc.Count!=1 ||
       desc.ArraySize!=1 || desc.MipLevels!=1 || !desc.Width || !desc.Height ||
-      desc.Width>4096 || desc.Height>4096) throw std::runtime_error("unsupported native diagnostic surface");
+      desc.Width>kNativeDiagnosticMaxExtent || desc.Height>kNativeDiagnosticMaxExtent) throw std::runtime_error("unsupported native diagnostic surface");
   // Read here, encoded by the shared encoder: the fetch is what differs
   // between the two captures, not the picture.
   const size_t row_bytes=size_t(desc.Width)*(desc.Format==DXGI_FORMAT_R8G8B8A8_UNORM?4:8);
@@ -627,7 +632,7 @@ NativeDepthCoverage InspectNativeDepth(ID3D11DeviceContext& context,ID3D11Textur
   D3D11_TEXTURE2D_DESC desc{}; surface.GetDesc(&desc);
   if ((desc.Format!=DXGI_FORMAT_D32_FLOAT && desc.Format!=DXGI_FORMAT_D32_FLOAT_S8X24_UINT) ||
       desc.SampleDesc.Count!=1 || desc.ArraySize!=1 || desc.MipLevels!=1 ||
-      !desc.Width || !desc.Height || desc.Width>4096 || desc.Height>4096 || !std::isfinite(clear_depth))
+      !desc.Width || !desc.Height || desc.Width>kNativeDiagnosticMaxExtent || desc.Height>kNativeDiagnosticMaxExtent || !std::isfinite(clear_depth))
     throw std::runtime_error("unsupported native depth diagnostic surface");
   const size_t pixel_bytes=desc.Format==DXGI_FORMAT_D32_FLOAT?4:8;
   desc.Usage=D3D11_USAGE_STAGING; desc.BindFlags=desc.MiscFlags=0; desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;

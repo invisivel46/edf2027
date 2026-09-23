@@ -119,7 +119,11 @@ class Edf2017App : public rex::ReXApp {
     paths.config_path = paths.user_data_root / "edf2027.toml";
     if (!rex::cvar::HasNonDefaultValue("fullscreen")) rex::cvar::SetFlagByName("fullscreen", "false");
     rex::cvar::SetFlagByName("present_letterbox", REXCVAR_GET(edf_aspect) == "stretch" ? "false" : "true");
-    if (edf::ForcesConsoleAspect(REXCVAR_GET(edf_aspect)) && REXCVAR_GET(window_width) > 0)
+    // The guest is always told a 16:9 video mode (core_logic.h GuestVideoMode); a
+    // config saved by an older build may still hold the window's own shape.
+    if (REXCVAR_GET(window_width) > 0 &&
+        (edf::ForcesConsoleAspect(REXCVAR_GET(edf_aspect)) ||
+         !edf::native::IsConsoleAspect(REXCVAR_GET(window_width), REXCVAR_GET(window_height))))
       edf::SettingsDialog::ApplyVideoMode(REXCVAR_GET(window_width), REXCVAR_GET(window_height));
     edf::ApplyControllerDbDefault();  // before the input backend loads gamecontrollerdb.txt
   }
@@ -150,6 +154,15 @@ class Edf2017App : public rex::ReXApp {
   std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
 #if defined(_WIN32)
     if(EDF_NATIVE_FLAG(host)) {
+      // The render size follows the window's shape (native_display_layout.h); it is
+      // resolved when the engine initializes its renderer, after the display mode
+      // (windowed or borderless) has sized the window.
+      edf::native::SetNativeDisplaySizeProvider(
+          [window=static_cast<HWND>(window()->GetNativeWindowHandle())]() -> std::array<int32_t, 2> {
+            RECT rect{};
+            if (!IsWindow(window) || IsIconic(window) || !GetClientRect(window, &rect)) return {0, 0};
+            return {int32_t(rect.right - rect.left), int32_t(rect.bottom - rect.top)};
+          });
       edf::native::InitializeGuestShaderBridge({});
       if(REXCVAR_GET(edf_native_scene_backend).starts_with("d3d12")) {
         edf::native::RegisterNativeD3D12Backend();

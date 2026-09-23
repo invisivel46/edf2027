@@ -17,13 +17,15 @@ class NativeFontBindings {
     for(const auto& binding:pixel_) if(binding.bytes()!=16) throw std::runtime_error("invalid native font pixel layout");
   }
   void SetConstants(ShaderBindings& vertex,ShaderBindings& pixel,
-                    std::span<const uint8_t> vs,std::span<const uint8_t> ps,float canvas_x=1,float canvas_y=1) const {
+                    std::span<const uint8_t> vs,std::span<const uint8_t> ps,float canvas_x=1,float canvas_y=1,
+                    const NativeClipAffine& layout={}) const {
     if(vs.size()!=64 || ps.size()!=32) throw std::runtime_error("invalid native font register block");
     // Reject either stale generation before modifying either destination.
     for(const auto& binding:vertex_) if(!vertex.Owns(binding)) throw std::runtime_error("stale native font vertex bindings");
     for(const auto& binding:pixel_) if(!pixel.Owns(binding)) throw std::runtime_error("stale native font pixel bindings");
-    const auto offset=ScaleNativeCanvasXY(vs.subspan(32,16),canvas_x,canvas_y);
-    const auto scale=ScaleNativeCanvasXY(vs.subspan(48,16),canvas_x,canvas_y);
+    // clip = position*Scale + Offset: the layout scales both, offsets the Offset.
+    const auto offset=MapNativeCanvasXY(vs.subspan(32,16),canvas_x,canvas_y,layout,true);
+    const auto scale=MapNativeCanvasXY(vs.subspan(48,16),canvas_x,canvas_y,layout,false);
     for(size_t i=0;i<vertex_.size();++i)
       vertex.SetGuestFloatRegisters(vertex_[i],i==2?std::span<const uint8_t>(offset):
         i==3?std::span<const uint8_t>(scale):vs.subspan(i*16,16));

@@ -75,6 +75,7 @@
 #include "native_material_parameters.h"
 #include "native_font_bindings.h"
 #include "native_xui_bindings.h"
+#include "native_display_layout.h"
 #include "native_movie_bindings.h"
 #include "native_generated_indices.h"
 #include "native_physical_write_notify.h"
@@ -199,7 +200,7 @@ REXCVAR_DEFINE_BOOL(edf_native_owned_render_state,true,"EDF2027",
 REXCVAR_DEFINE_INT32(edf_native_anisotropic_filtering, -1, "EDF2027",
                     "Native material filtering: -1 game default, 0 off, 1..5 for 1x..16x; preserves point/base-only sampling");
 REXCVAR_DEFINE_INT32(edf_native_render_width, 0, "EDF2027",
-                    "Native render width at startup; 0 preserves the original scene size (restart required)");
+                    "Native render width at startup; 0 takes the width from the window's shape (native_display_layout.h), a positive width with a positive height renders exactly that size (restart required)");
 REXCVAR_DEFINE_INT32(edf_native_msaa, 0, "EDF2027",
                     "Native scene samples: 0 game default, 1 off, 2 or 4 MSAA (restart required)");
 REXCVAR_DEFINE_BOOL(edf_native_scene_depth_srv, false, "EDF2027",
@@ -217,7 +218,13 @@ REXCVAR_DEFINE_BOOL(edf_native_motion_vectors, false, "EDF2027",
 REXCVAR_DEFINE_INT32(edf_native_motion_vectors_debug, 0, "EDF2027",
                     "Motion vector debug view over the output before the HUD: 0 off, 1 motion as colour, 2 history-valid mask").range(0,2);
 REXCVAR_DEFINE_INT32(edf_native_render_height, 0, "EDF2027",
-                    "Native render height at startup; paired with render width (restart required)");
+                    "Native render height at startup: 0 is 720 lines (with width 0, exactly 1280x720 on a 16:9 window), -1 the window's size, otherwise the line count; paired with render width (restart required)");
+// Launcher cvars (launcher_cvars.cpp) and the SDK's window size, for the
+// render size and the 2D canvas layout (native_display_layout.h).
+REXCVAR_DECLARE(std::string, edf_aspect);
+REXCVAR_DECLARE(std::string, edf_hud_safe_area);
+REXCVAR_DECLARE(int32_t, window_width);
+REXCVAR_DECLARE(int32_t, window_height);
 REXCVAR_DEFINE_STRING(edf_native_scene_capture, "", "EDF2027",
                      "Optional prefix for partial scene, font/movie and output-frame BMP diagnostics (not presentation)");
 REXCVAR_DEFINE_INT32(edf_native_output_capture_interval,0,"EDF2027",
@@ -412,12 +419,53 @@ NativeAddressFilter& SceneSourceOwners() { static auto* value=new NativeAddressF
 // (native_world_publication_mirror.h): the 820B4250 post-hook's lock-free
 // proof that its publication is a no-op. Leaked like the filters above.
 NativeWorldPublicationMirror& WorldPublications() { static auto* value=new NativeWorldPublicationMirror; return *value; }
-// Capture at renderer initialization. Saving a new F1 choice must not change
-// live UI scaling while the current render targets still have the old size.
+std::function<std::array<int32_t,2>()>& NativeDisplaySizeProvider() {
+  static std::function<std::array<int32_t,2>()> provider;
+  return provider;
+}
+void SetNativeDisplaySizeProvider(std::function<std::array<int32_t,2>()> provider) {
+  NativeDisplaySizeProvider()=std::move(provider);
+}
+std::array<int32_t,2> NativeDisplaySize() {
+  if(const auto& provider=NativeDisplaySizeProvider()) try {
+    const auto size=provider();
+    if(size[0]>0 && size[1]>0) return size;
+  } catch(const std::exception& error) { REXLOG_WARN("Native display size provider: {}",error.what()); }
+  return {REXCVAR_GET(window_width),REXCVAR_GET(window_height)};
+}
+// Resolved once, at renderer initialization (native_display_layout.h): the
+// engine allocates its targets, post pyramid, 2D canvas and camera viewports
+// from this size and none of them follows a later change, so saving a new F1
+// choice or resizing the window must not change live canvas scaling while
+// those still have the old size. {0,0} is the engine's own 1280x720: no
+// override and no canvas mapping, byte for byte the unmodified path.
 const std::array<int32_t,2>& NativeRenderDimensions() {
-  static const std::array<int32_t,2> dimensions{
-    REXCVAR_GET(edf_native_render_width),REXCVAR_GET(edf_native_render_height)};
+  static const std::array<int32_t,2> dimensions=[] {
+    const auto display=NativeDisplaySize();
+    const auto size=ResolveNativeRenderSize(REXCVAR_GET(edf_native_render_width),
+      REXCVAR_GET(edf_native_render_height),display[0],display[1],ParseNativeAspectMode(REXCVAR_GET(edf_aspect)));
+    REXLOG_INFO("Native render size: {}x{}{} (request {}x{}, display {}x{}, aspect {}){}",size.width,size.height,
+      size.original?" (engine original)":"",REXCVAR_GET(edf_native_render_width),REXCVAR_GET(edf_native_render_height),
+      display[0],display[1],std::string(REXCVAR_GET(edf_aspect)),size.clamped?"; scaled to fit the render size limits":"");
+    return size.original?std::array<int32_t,2>{0,0}:std::array<int32_t,2>{size.width,size.height};
+  }();
   return dimensions;
+}
+// The 2D canvas layout for a target. edf_hud_safe_area is read per draw: it
+// is a constant mapping, not an allocation, so it applies live.
+NativeClipAffine NativeHudLayout(uint32_t width,uint32_t height) {
+  if(!NativeRenderDimensions()[0]) return {};
+  return NativeHudClipAffine(width,height,ParseNativeHudSafeArea(REXCVAR_GET(edf_hud_safe_area)));
+}
+// A scissor already in legacy canvas form (ScaleNativeCanvasScissor), mapped
+// through a layout affine; identity leaves it untouched.
+NativeViewportState MapNativeCanvasViewportScissor(NativeViewportState state,const NativeClipAffine& affine,
+                                                   uint32_t width,uint32_t height) {
+  if(affine.identity()) return state;
+  const auto mapped=MapNativeCanvasPixelRect({int32_t(state.scissor.left),int32_t(state.scissor.top),
+    int32_t(state.scissor.right),int32_t(state.scissor.bottom)},affine,width,height);
+  state.scissor={LONG(mapped[0]),LONG(mapped[1]),LONG(mapped[2]),LONG(mapped[3])};
+  return state;
 }
 namespace {
 // Opt-in CPU wall-clock diagnostics, not GPU timestamps. Include lock waits and
@@ -1100,6 +1148,12 @@ struct RegisteredShader {
   // the normal one, so its bytes can be mirrored from it at draw time instead
   // of every material and instance being uploaded into both.
   bool reversed_mirrors=false;
+  // The last raw _g_DX2DScale/_g_DX2DOffset this Utility shader uploaded
+  // (guest bytes, before any canvas mapping): a Utility draw on a target that
+  // is not 16:9 re-maps them through its own canvas layout
+  // (native_display_layout.h). Bit 0 scale, bit 1 offset.
+  std::array<uint8_t,16> canvas_scale{},canvas_offset{};
+  uint8_t canvas_uploaded=0;
   struct ParameterBinding {
     ShaderBindings::FloatRegisterBinding binding;
     bool canvas_xy=false;
@@ -2236,6 +2290,10 @@ void UploadParameters(const Reader& reader, const std::shared_ptr<const NativeMa
       }
       std::array<uint8_t,16> canvas_data{};
       if(canvas_xy && NativeRenderDimensions()[0]>0 && maximum==16) {
+        // Kept raw for the Utility draw's per-target canvas layout.
+        const bool offset=parameter.name=="_g_DX2DOffset";
+        std::memcpy(offset?shader.canvas_offset.data():shader.canvas_scale.data(),data,16);
+        shader.canvas_uploaded|=offset?2:1;
         canvas_data=ScaleNativeCanvasXY({data,16},float(NativeRenderDimensions()[0])/1280.0f,
           float(NativeRenderDimensions()[1])/720.0f);
         data=canvas_data.data();
@@ -8338,7 +8396,7 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
   }
   // (b) The native half of 821BE8D0 (clSgsCoreRender +4) on the scene 8219C7A8
   // opened: pass camera (published, else read as the 821BE8D0 hook does),
-  // viewport from scene+480 with the retail depth range words 820008CC and
+  // viewport from scene+488..+500 with the retail depth range words 820008CC and
   // 820009A4 (reversed), and the depth/stencil clear it issues for every view
   // but the first (8219C7A8 already cleared color and depth). The guest
   // view/projection globals 821BE8D0 ends with (821A17F8/821A19F0 on the effect
@@ -8398,7 +8456,12 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     context.owner=owner_; context.guest_context=context_;
     ++views_begun_;
     const auto width=reader_.Word(reader_.Add(renderer,84)),height=reader_.Word(reader_.Add(renderer,88));
-    const auto rect=edf::native::ReadGuestWords<4>(reader_,reader_.Add(scene,480));
+    // 821BE8D0 copies six words from scene+480 and converts the last four,
+    // +488/+492/+496/+500, to the viewport x/y/width/height (fctidz); +480 is
+    // the vertical field of view 821CDDF8 consumes and +484 its companion.
+    // Reading the rectangle at +480 took the angle for x and x for width, so
+    // every view fell back to the whole surface (split views included).
+    const auto rect=edf::native::ReadGuestWords<4>(reader_,reader_.Add(scene,488));
     const auto extent=[](uint32_t word,uint32_t limit) {
       const float value=std::bit_cast<float>(word);  // fctidz truncates; clamp to the surface.
       return value>0?uint32_t((std::min)(double(value),double(limit))):0u;
@@ -9355,14 +9418,44 @@ REX_EXTERN(__imp__sub_821CDDF8);
 REX_HOOK_RAW(sub_821CDDF8) {
   static thread_local std::unordered_map<uint32_t,edf::native::NativeCameraHistory> histories;
   const auto scene=ctx.r3.u32;
+  const edf::native::GuestReader reader(base);
+  // Vert+ (native_display_layout.h): 821CDDF8 derives the projection
+  // (821C82C0) and the frustum (821C26C0) from the vertical angle at +480 and
+  // the viewport +496/+500, so a render narrower than 16:9 would crop the
+  // sides. For the main view (the viewport the renderer size gave it,
+  // clSgsCoreRender::slot7) the angle it consumes is widened for the duration
+  // of the call, so projection, frustum and every copy agree; +480 is restored
+  // after, and the camera state the game reads keeps its own angle.
+  const float fov_scale=[&] {
+    static const auto mode=edf::native::ParseNativeAspectMode(REXCVAR_GET(edf_aspect));
+    const auto& dimensions=edf::native::NativeRenderDimensions();
+    if(!dimensions[0]) return 1.0f;
+    const auto size=edf::native::ReadGuestWords<2>(reader,reader.Add(scene,496));
+    const float width=std::bit_cast<float>(size[0]),height=std::bit_cast<float>(size[1]);
+    if(width!=float(dimensions[0]) || height!=float(dimensions[1])) return 1.0f;
+    return edf::native::NativeVerticalFovScale(width,height,mode);
+  }();
+  const auto derive=[&](float fov) {
+    if(fov_scale==1.0f) { __imp__sub_821CDDF8(ctx,base); return; }
+    auto* destination=const_cast<uint8_t*>(reader.WritableBytes(reader.Add(scene,480),4,4));
+    struct Restore {
+      uint8_t* destination;
+      std::array<uint8_t,4> bytes;
+      ~Restore() { std::memcpy(destination,bytes.data(),bytes.size()); }
+    } restore{destination,{}};
+    std::memcpy(restore.bytes.data(),destination,restore.bytes.size());
+    const std::array<uint32_t,1> word{std::bit_cast<uint32_t>(edf::native::NativeAdjustedVerticalFov(fov,fov_scale))};
+    edf::native::StoreGuestCpuWords(std::span<uint8_t>{destination,4},word);
+    __imp__sub_821CDDF8(ctx,base);
+  };
+  const auto current_fov=[&] { return std::bit_cast<float>(reader.Word(reader.Add(scene,480))); };
   // Publication follows the render-helper join. Constructors and other callers
   // must initialize their real matrices and invalidate any reused address.
   if(ctx.lr!=0x821A4EB0 || !native_loop_budget.unlocked || native_loop_budget.divisor!=1 ||
      !REXCVAR_GET(edf_native_camera_interpolation)) {
     histories.erase(scene);
-    __imp__sub_821CDDF8(ctx,base); return;
+    derive(current_fov()); return;
   }
-  const edf::native::GuestReader reader(base);
   const auto source=reader.Add(scene,416);
   const auto words=edf::native::ReadGuestWords<17>(reader,source);
   edf::native::NativeCameraPose pose;
@@ -9373,7 +9466,7 @@ REX_HOOK_RAW(sub_821CDDF8) {
   auto& history=histories[scene];
   if(native_loop_budget.steps>1) history.Reset();
   const auto rendered=history.Sample(pose,native_loop_budget.tick,native_loop_budget.fraction);
-  if(rendered==pose) { __imp__sub_821CDDF8(ctx,base); return; }
+  if(rendered==pose) { derive(pose.fov); return; }
   // Rebuild every derived camera matrix and its frustum from the same pose.
   // Restore authoritative simulation inputs even if the guest call throws.
   auto* destination=const_cast<uint8_t*>(reader.WritableBytes(source,68,4));
@@ -9385,7 +9478,7 @@ REX_HOOK_RAW(sub_821CDDF8) {
   std::memcpy(restore.bytes.data(),destination,restore.bytes.size());
   std::array<uint32_t,17> interpolated;
   for(size_t i=0;i<16;++i) interpolated[i]=std::bit_cast<uint32_t>(rendered.world[i]);
-  interpolated[16]=std::bit_cast<uint32_t>(rendered.fov);
+  interpolated[16]=std::bit_cast<uint32_t>(edf::native::NativeAdjustedVerticalFov(rendered.fov,fov_scale));
   edf::native::StoreGuestCpuWords(std::span<uint8_t>{destination,68},interpolated);
   __imp__sub_821CDDF8(ctx,base);
 }
@@ -12808,8 +12901,10 @@ REX_HOOK_RAW(sub_82139A40) {
     const auto width=edf::native::NativeRenderDimensions()[0];
     const auto height=edf::native::NativeRenderDimensions()[1];
     if(width || height) {
-      if(width<640 || width>4095 || height<480 || height>4095)
-        throw std::runtime_error("native render dimensions require width 640..4095 and height 480..4095");
+      // ResolveNativeRenderSize already applied the limits; this only refuses
+      // a size that could not have come from it.
+      if(!edf::native::ValidNativeRenderRequest(width,height))
+        throw std::runtime_error("native render dimensions outside the render size limits");
       const edf::native::GuestReader reader(base);
       if(ctx.r8.u32<8 || reader.Word(ctx.r7.u32)!=1280 || reader.Word(reader.Add(ctx.r8.u32,76))!=1280)
         throw std::runtime_error("native resolution initialization contract changed");
@@ -14893,7 +14988,15 @@ REX_HOOK_RAW(sub_821FD8F8) {
         // device+(112+register)*16 / device+(368+register)*16 respectively.
         auto registers=[&](uint32_t offset,size_t bytes) {return std::span<const uint8_t>{reader.Bytes(reader.Add(ctx.r3.u32,offset),bytes),bytes};};
         const auto& movie_plan=*state.movie_bindings[movie_sd?1:0];
-        movie_plan.SetConstants(*state.movie_vertex,movie_pixel,registers(1792,160),registers(5888,16));
+        // On an output that is not 16:9 a full-screen (or canvas-placed) movie
+        // is fitted into the centred 16:9 rectangle (native_canvas_constants.h).
+        const auto movie_layout=edf::native::MapNativeMovieRegisters(registers(1792,160),
+          {reader.Bytes(ctx.r6.u32,64),64},scene.output.sampled.width,scene.output.sampled.height);
+        if(movie_layout.framing!=edf::native::NativeMovieFraming::Unchanged && state.movie_draws<3)
+          REXLOG_INFO("Native movie framing: {} into the 16:9 area of {}x{}",
+            movie_layout.framing==edf::native::NativeMovieFraming::FullTarget?"full-target quad":"canvas quad",
+            scene.output.sampled.width,scene.output.sampled.height);
+        movie_plan.SetConstants(*state.movie_vertex,movie_pixel,movie_layout.registers,registers(5888,16));
         movie_pixel.ClearTextures(); movie_pixel.ClearSamplers();
         for(uint32_t i=0;i<3;++i) {
           // 8213BA98 stores the raw SetTexture handle at (3068+slot)*4.
@@ -15060,9 +15163,24 @@ REX_HOOK_RAW(sub_821FD8F8) {
         }
         const auto& vertex_plan=viewport.reverse_depth?*state.xui_reversed_vertex_bindings:*state.xui_vertex_bindings;
         const bool native_canvas=edf::native::NativeRenderDimensions()[0]>0;
-        vertex_plan.SetConstants(vertex,vertex_registers,registers(5872,16),
-          native_canvas?float(target.sampled.width)/1280.0f:1.0f,
-          native_canvas?float(target.sampled.height)/720.0f:1.0f);
+        const float canvas_x=native_canvas?float(target.sampled.width)/1280.0f:1.0f;
+        const float canvas_y=native_canvas?float(target.sampled.height)/720.0f:1.0f;
+        // 2D canvas layout on an output that is not 16:9 (edf_hud_safe_area,
+        // native_display_layout.h), per draw so a solid fade still covers the
+        // frame; its scissor follows. XUI drawn into the HDR scene keeps the
+        // legacy full-target mapping.
+        edf::native::NativeClipAffine xui_layout;
+        if(native_canvas && !scene_draw) {
+          xui_layout=edf::native::NativeHudLayout(target.sampled.width,target.sampled.height);
+          if(!xui_layout.identity()) {
+            const size_t count=size_t(ctx.r5.u32)*8;
+            xui_layout=edf::native::NativeCanvasDrawAffine(xui_layout,edf::native::NativeXuiClipBounds(vertex_registers,
+              registers(5872,16),edf::native::NativeXuiCanvasProjection(vertex_registers.subspan(64,64),canvas_x,canvas_y),
+              {reader.Bytes(ctx.r6.u32,count),count}),solid);
+            viewport=edf::native::MapNativeCanvasViewportScissor(viewport,xui_layout,target.sampled.width,target.sampled.height);
+          }
+        }
+        vertex_plan.SetConstants(vertex,vertex_registers,registers(5872,16),canvas_x,canvas_y,xui_layout);
         const auto& pixel_plan=*state.xui_pixel_bindings[solid?1:mask?2:0];
         pixel_plan.SetConstants(pixel,registers(5904,16),solid?registers(5888,16):std::span<const uint8_t>{});
         if(!solid) {
@@ -15205,6 +15323,9 @@ REX_HOOK_RAW(sub_821FD8F8) {
         if(edf::native::NativeRenderDimensions()[0]>0)
           viewport=edf::native::ScaleNativeCanvasScissor(viewport,float(scene.output.sampled.width)/1280,
             float(scene.output.sampled.height)/720,true);
+        const auto font_layout=edf::native::NativeHudLayout(scene.output.sampled.width,scene.output.sampled.height);
+        viewport=edf::native::MapNativeCanvasViewportScissor(viewport,font_layout,
+          scene.output.sampled.width,scene.output.sampled.height);
         const auto key=snapshot.render;
         if(viewport.reverse_depth || (key[1]&3))
           throw std::runtime_error("unimplemented font depth contract");
@@ -15240,9 +15361,11 @@ REX_HOOK_RAW(sub_821FD8F8) {
             std::bit_cast<float>(reader.Word(device+1840)),std::bit_cast<float>(reader.Word(device+1844)),
             std::bit_cast<float>(reader.Word(device+1856)),std::bit_cast<float>(reader.Word(device+1860)));
         }
+        // Text follows the 2D canvas layout (native_display_layout.h); its
+        // scissor was mapped with it above.
         state.font_bindings->SetConstants(*state.font_vertex,*state.font_pixel,vs,ps,
           font_canvas?float(scene.output.sampled.width)/1280.0f:1.0f,
-          font_canvas?float(scene.output.sampled.height)/720.0f:1.0f);
+          font_canvas?float(scene.output.sampled.height)/720.0f:1.0f,font_layout);
         state.font_bindings->SetTexture(*state.font_pixel,texture->second.backend);
         state.font_bindings->SetSampler(*state.font_pixel,edf::native::SamplerLocked(state,
           edf::native::SamplerStateKey(edf::native::ReadSamplerWords(reader,device,0))));
@@ -15408,6 +15531,24 @@ REX_HOOK_RAW(sub_821FD8F8) {
           const auto indices=owned_indices->bytes();
           const size_t bytes=size_t(ctx.r5.u32)*stride;
           const std::span<const uint8_t> vertices{reader.Bytes(ctx.r6.u32,bytes),bytes};
+          // 2D canvas layout on an output that is not 16:9 (edf_hud_safe_area,
+          // native_display_layout.h). The activation uploaded the legacy
+          // full-target canvas; this draw re-maps the raw constants through
+          // its own layout (a fade keeps covering the frame) and its scissor
+          // with them. Draws into the HDR scene belong to the 3D view and
+          // keep the legacy mapping.
+          if(const auto& dims=edf::native::NativeRenderDimensions();dims[0]>0 && !scene_draw) {
+            const auto layout=edf::native::NativeHudLayout(target.sampled.width,target.sampled.height);
+            if(!layout.identity() && (vertex->canvas_uploaded&3)==3) {
+              const float kx=float(dims[0])/1280.0f,ky=float(dims[1])/720.0f;
+              const auto affine=edf::native::NativeCanvasDrawAffine(layout,edf::native::NativeCanvasVertexBounds(vertices,stride,
+                edf::native::ScaleNativeCanvasXY(vertex->canvas_scale,kx,ky),
+                edf::native::ScaleNativeCanvasXY(vertex->canvas_offset,kx,ky)),!textured);
+              bindings.SetGuestFloatRegisters("_g_DX2DScale",edf::native::MapNativeCanvasXY(vertex->canvas_scale,kx,ky,affine,false));
+              bindings.SetGuestFloatRegisters("_g_DX2DOffset",edf::native::MapNativeCanvasXY(vertex->canvas_offset,kx,ky,affine,true));
+              viewport=edf::native::MapNativeCanvasViewportScissor(viewport,affine,target.sampled.width,target.sampled.height);
+            }
+          }
           auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
             edf::native::ImmediateStreamKey(vertices.size(),declaration_handle,pair.vertex,ctx.r4.u32,viewport.reverse_depth),
             native_declaration->bytes(),stride,
