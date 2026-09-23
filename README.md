@@ -108,29 +108,32 @@ or `sha1sum <file>.iso` elsewhere.
 
 ## Settings
 
-* **F1** in game — EDF2027 settings: display mode, window size, aspect handling,
-  native VSync, experimental frame-rate unlock, FPS cap, audio, controls, and diagnostics.
-  **Save** writes them to the config file; items marked `*` need a restart.
-  The native renderer currently uses the game's render size. Render-resolution
-  scaling and legacy anisotropic-filtering, MSAA, FXAA, background-compilation,
-  CAS and FSR controls are disabled. The simulation clock remains 60 Hz.
-  Some SDK builds require `amd_fidelityfx_dx12.dll` for loading `rexruntime.dll`;
-  its presence does not enable native FidelityFX upscaling.
-* **Unlock frame rate (experimental)** — Direct3D 12 can render above 60 FPS
-  while simulation stays at 60 Hz. Enable it in F1, then choose a 120 FPS cap
-  or Off; VSync also limits presentation to the display refresh. Camera and
-  model interpolation add up to one simulation tick of latency. This is opt-in,
-  and achievable frame rates depend on scene cost. The Direct3D 11 fallback
-  remains limited by its host ticker. See [validation notes](docs/framerate-unlock.md).
-* **F2** — toggle the compact FPS overlay.
+* **F1** in game (or **Back + Start** on a controller, configurable) — the settings
+  menu, which pauses the game while it is open: the simulation, the game clock and
+  (by default) the sound stop, the mouse is freed and neither keyboard, mouse nor pad
+  reach the game until you resume (Resume, Esc, F1, B or Start). Sections: Display,
+  Graphics, Performance, Controls (with the key-binding table), Audio and Advanced.
+  Most settings apply immediately; the ones the game reads at startup carry a
+  **RESTART** badge and the bottom bar offers *Restart now*. Display-mode and window-size
+  changes revert after 10 seconds unless you keep them. Graphics has Performance /
+  Balanced / Quality / Ultra presets, and every section can be reset to its defaults.
+  Settings are saved when you resume. With a controller: LB/RB switch sections, A
+  selects, B goes back.
+* **Frame rate** (Performance) — 60 (locked, the original), 120, 144, 165, 240 or
+  Uncapped. Above 60, Direct3D 12 renders extra frames while the simulation stays at
+  60 Hz; camera and model interpolation add up to one simulation tick of latency. VSync
+  also limits presentation to the display refresh. Experimental; see
+  [validation notes](docs/framerate-unlock.md).
+* **F2** — toggle the performance overlay (frame rate, frame-time graph, CPU and GPU
+  time; level of detail in F1 > Performance).
 * **F4** — advanced ReXGlue settings (every runtime option).
 * **F3** — debug overlay, **`** — console.
 * `edf2027.exe --settings` opens the settings screen before the game boots.
 
 <img src="docs/media/settings.png" alt="EDF2027 settings screen" width="520">
 
-*Historical F1 screenshot from the GPU-plugin build. The native build disables
-the legacy quality/upscaling controls described above.*
+*Historical F1 screenshot from the GPU-plugin build; the menu has since been
+redesigned.*
 
 Config file: `%APPDATA%\edf2027\edf2027.toml` (Windows),
 `~/.local/share/edf2027/edf2027.toml` (Linux), `~/Library/Application Support/edf2027/` (macOS).

@@ -55,6 +55,15 @@ if(WIN32)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_d3d12_preview.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_host_surface.cpp src/native_graphics/native_backend_host.cpp)
+    # Fonts for the F1 menu and the performance overlay, built into the executable.
+    set(_edf_menu_fonts ${CMAKE_CURRENT_BINARY_DIR}/edf_menu_fonts.cpp)
+    add_custom_command(OUTPUT ${_edf_menu_fonts}
+        COMMAND ${CMAKE_COMMAND} -DOUTPUT=${_edf_menu_fonts} -DFONT_DIR=${CMAKE_SOURCE_DIR}/third_party/fonts
+            -DHEADER=${CMAKE_SOURCE_DIR}/src/menu_fonts.h -P ${CMAKE_SOURCE_DIR}/tools/embed-fonts.cmake
+        DEPENDS third_party/fonts/Inter-Regular.ttf third_party/fonts/Inter-SemiBold.ttf
+            third_party/fonts/fa-solid-900.ttf tools/embed-fonts.cmake
+        COMMENT "Embedding menu fonts" VERBATIM)
+    target_sources(edf2027 PRIVATE ${_edf_menu_fonts})
     target_link_libraries(edf2027 PRIVATE comctl32)
     target_link_libraries(edf2027 PRIVATE gdi32)
     target_link_libraries(edf2027 PRIVATE edf_native_d3d11)

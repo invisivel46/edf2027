@@ -2,12 +2,15 @@
 #include "scripted_input_logic.h"
 #include "keybind_logic.h"
 #include "native_kbm_logic.h"
+#include "pause_menu.h"
+#include "settings_logic.h"
 #include "xdvdfs.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -450,6 +453,317 @@ void TestNativeKbm() {
     router.OnAim(dx, dy);
     CHECK(dx == 0.0f && dy == 0.0f); }
 }
+
+// ---- F1 menu (settings_logic.h, pause_menu.h) -----------------------------------------
+void TestFrameRateMapping() {
+  using namespace edf::settings;
+  // Every choice maps to its cvar pair and back to itself.
+  for (int i = 0; i < int(kFrameRateChoices.size()); ++i) {
+    const auto choice = FrameRateAt(i);
+    CHECK(FrameRateIndex(choice.unlock, choice.cap) == i);
+  }
+  CHECK(!FrameRateAt(0).unlock && FrameRateAt(0).cap == 0);    // 60 (locked): original presentation
+  CHECK(FrameRateAt(1).unlock && FrameRateAt(1).cap == 120);
+  CHECK(FrameRateAt(4).unlock && FrameRateAt(4).cap == 240);
+  CHECK(FrameRateAt(5).unlock && FrameRateAt(5).cap == 0);     // uncapped
+  CHECK(!FrameRateAt(-1).unlock && FrameRateAt(99).cap == 0);  // out of range reads as locked
+  // Locked with a cap at or above 60 still presents at 60; below it is kept as custom.
+  CHECK(FrameRateIndex(false, 60) == 0);
+  CHECK(FrameRateIndex(false, 120) == 0);
+  CHECK(FrameRateIndex(false, 30) == -1);
+  // Unlocked with a cap that is not a choice is custom, not silently rounded.
+  CHECK(FrameRateIndex(true, 100) == -1);
+  CHECK(FrameRateIndex(true, -5) == 5);  // negative cap is "off"
+}
+
+void TestRendererAndUpscalerMapping() {
+  using namespace edf::settings;
+  CHECK(RendererIndex("native") == 0);
+  CHECK(RendererIndex("off") == 1);
+  CHECK(RendererIndex("") == 1);
+  CHECK(RendererIndex("world") == -1 && RendererIndex("full") == -1);
+  CHECK(RendererValue(0) == "native" && RendererValue(1) == "off");
+  for (int i = 0; i < int(kNativeFsrValues.size()); ++i) CHECK(NativeFsrIndex(kNativeFsrValues[size_t(i)]) == i);
+  CHECK(NativeFsrIndex("bogus") == 0);
+  CHECK(kNativeFsrValues[5] == "ultra_performance");
+}
+
+void TestGraphicsPresets() {
+  using namespace edf::settings;
+  for (bool fsr : {false, true}) {
+    for (int i = 0; i < 4; ++i) {
+      const auto preset = GraphicsPreset(i);
+      const auto values = PresetValues(preset, fsr);
+      GraphicsState state{values.anisotropic, values.msaa, std::string(values.fsr), values.sharpness};
+      CHECK(MatchPreset(state, fsr) == preset);  // every preset recognizes itself
+      CHECK(values.anisotropic >= 0 && values.anisotropic <= 5);
+      CHECK(values.msaa == 0 || values.msaa == 1 || values.msaa == 2 || values.msaa == 4);
+    }
+    // Presets are a ladder: filtering never gets worse going up.
+    for (int i = 1; i < 4; ++i)
+      CHECK(PresetValues(GraphicsPreset(i), fsr).anisotropic >= PresetValues(GraphicsPreset(i - 1), fsr).anisotropic);
+  }
+  // With the upscaler, it does the anti-aliasing: MSAA off everywhere.
+  for (int i = 0; i < 4; ++i) CHECK(PresetValues(GraphicsPreset(i), true).msaa == 1);
+  CHECK(PresetValues(GraphicsPreset::kPerformance, true).fsr == "performance");
+  CHECK(PresetValues(GraphicsPreset::kUltra, true).fsr == "native_aa");
+  // Without it, the fsr fields are ignored when matching.
+  GraphicsState plain{PresetValues(GraphicsPreset::kUltra, false).anisotropic, 4, "quality", 0.9};
+  CHECK(MatchPreset(plain, false) == GraphicsPreset::kUltra);
+  CHECK(MatchPreset(plain, true) == GraphicsPreset::kCustom);
+  GraphicsState custom{-1, 0, "off", 0.0};  // game-default filtering matches no preset
+  CHECK(MatchPreset(custom, false) == GraphicsPreset::kCustom);
+  CHECK(std::string(kGraphicsPresetLabels[size_t(GraphicsPreset::kCustom)]) == "Custom");
+}
+
+void TestRestartClassification() {
+  using namespace edf::settings;
+  for (const char* cvar : {"edf_native_renderer", "edf_native_scene_backend", "edf_native_render_width",
+                           "edf_native_msaa", "edf_aspect", "window_width", "video_mode_height", "edf_kbm",
+                           "edf_native_thread_qos", "present_effect", "present_fsr_sharpness_reduction",
+                           "swap_post_effect"})
+    CHECK(NeedsRestart(cvar));
+  for (const char* cvar : {"edf_native_anisotropic_filtering", "edf_native_vsync", "edf_native_unlock_framerate",
+                           "edf_fps_cap", "edf_frame_pacer_before_present", "audio_mute", "edf_rumble",
+                           "edf_kbm_sensitivity", "edf_display_mode", "fullscreen", "edf_show_fps"})
+    CHECK(!NeedsRestart(cvar));
+  // Unknown (renderer-owned) cvars follow their own description.
+  CHECK(NeedsRestart("edf_native_fsr", "Upscaler quality mode (restart required)"));
+  CHECK(NeedsRestart("edf_native_fsr", "Read AT STARTUP"));
+  CHECK(!NeedsRestart("edf_native_fsr", "Upscaler quality mode; applies live"));
+  CHECK(!NeedsRestart("edf_native_fsr_sharpness"));
+
+  std::map<std::string, std::string> running{{"edf_native_msaa", "0"}, {"window_width", "1280"},
+                                             {"window_height", "720"}, {"edf_aspect", "native"}};
+  const RestartTracker::Getter get = [&](std::string_view name) {
+    const auto found = running.find(std::string(name));
+    return found == running.end() ? std::string() : found->second;
+  };
+  RestartTracker tracker;
+  CHECK(tracker.empty() && tracker.Count(get) == 0);
+  tracker.Stage("edf_native_msaa", {{"edf_native_msaa", "4"}});
+  tracker.Stage("window_size", {{"window_width", "1920"}, {"window_height", "1080"}});
+  CHECK(tracker.Count(get) == 2);  // two settings, three cvars: counted by setting
+  CHECK(tracker.Pending("edf_native_msaa", get) == "4");
+  CHECK(tracker.Pending("edf_aspect", get) == "native");  // not staged: the running value
+  CHECK(tracker.Differs("window_size", get) && !tracker.Differs("edf_aspect", get));
+  CHECK(tracker.Values("window_size").size() == 2 && tracker.Values("nothing").empty());
+  // Staged back to what is running: no longer a pending change.
+  tracker.Stage("edf_native_msaa", {{"edf_native_msaa", "0"}});
+  CHECK(tracker.Count(get) == 1);
+  CHECK(tracker.Overrides().size() == 3);
+  tracker.Unstage("window_size");
+  CHECK(tracker.Count(get) == 0);
+  // After the restart the running value is the staged one: nothing pending.
+  tracker.Stage("edf_native_msaa", {{"edf_native_msaa", "4"}});
+  running["edf_native_msaa"] = "4";
+  CHECK(tracker.Count(get) == 0);
+  tracker.Clear();
+  CHECK(tracker.empty());
+}
+
+void TestConfigOverrides() {
+  using edf::settings::ConfigOverride;
+  const std::string config = "# header\r\nedf_native_msaa = 2\nwindow_width = 1920\nedf_aspect = \"native\"\n";
+  const std::vector<ConfigOverride> overrides{{"edf_native_msaa", "4", false},
+                                              {"edf_aspect", "\"ultrawide\"", false},
+                                              {"window_width", "0", true},
+                                              {"edf_kbm", "false", false}};
+  const std::string out = edf::settings::ApplyConfigOverrides(config, overrides);
+  CHECK(out == "# header\nedf_native_msaa = 4\nedf_aspect = \"ultrawide\"\nedf_kbm = false\n");
+  // Keys are matched whole: a longer name that starts the same survives.
+  const std::vector<ConfigOverride> one{{"window_width", "800", false}};
+  CHECK(edf::settings::ApplyConfigOverrides("window_width_extra = 1\n", one) ==
+        "window_width_extra = 1\nwindow_width = 800\n");
+  CHECK(edf::settings::ApplyConfigOverrides("a = 1\n", {}) == "a = 1\n");
+}
+
+void TestRevertCountdown() {
+  edf::settings::RevertCountdown countdown;
+  CHECK(!countdown.active() && !countdown.Expire(100.0) && countdown.SecondsLeft(0) == 0);
+  countdown.Start(50.0);
+  CHECK(countdown.active());
+  CHECK(countdown.SecondsLeft(50.0) == 10);
+  CHECK(countdown.SecondsLeft(50.2) == 10);  // rounded up: never shows 0 while waiting
+  CHECK(countdown.SecondsLeft(59.5) == 1);
+  CHECK(!countdown.Expire(59.99));
+  CHECK(countdown.Expire(60.0));   // fires once...
+  CHECK(!countdown.Expire(61.0));  // ...and only once
+  CHECK(!countdown.active() && countdown.SecondsLeft(61.0) == 0);
+  countdown.Start(0.0, 3.0);
+  countdown.Keep();
+  CHECK(!countdown.active() && !countdown.Expire(10.0));  // kept: never reverts
+  countdown.Start(0.0);
+  countdown.Start(5.0);  // a second change restarts the wait
+  CHECK(!countdown.Expire(12.0) && countdown.Expire(15.0));
+}
+
+void TestMenuScaling() {
+  using namespace edf::settings;
+  CHECK(MenuScale(1080.0f) == 1.0f);
+  CHECK(MenuScale(2160.0f) == 2.0f);
+  CHECK(std::fabs(MenuScale(1440.0f) - 1.3333f) < 1e-3f);
+  CHECK(MenuScale(480.0f) == 0.75f);     // never unreadably small
+  CHECK(MenuScale(0.0f) == 1.0f);        // unknown height: design size
+  CHECK(MenuScale(1080.0f, 1.5f) == 1.5f);
+  CHECK(MenuScale(1080.0f, 9.0f) == 2.0f);  // user scale clamped
+  const float sizes[] = {14.0f, 18.0f, 24.0f, 36.0f};
+  CHECK(PickBakedSize(sizes, 18.0f) == 1);  // exact
+  CHECK(PickBakedSize(sizes, 20.0f) == 2);  // never scaled up...
+  CHECK(PickBakedSize(sizes, 17.6f) == 1);  // ...beyond a hair
+  CHECK(PickBakedSize(sizes, 10.0f) == 0);
+  CHECK(PickBakedSize(sizes, 72.0f) == 3);  // largest when nothing is big enough
+}
+
+void TestPauseController() {
+  edf::menu::PauseController pause;
+  // Pause and mute on: the engine holds and audio is forced off.
+  auto open = pause.Open(true, true, true, false);
+  CHECK(open.hold_engine && open.set_mute && *open.set_mute);
+  CHECK(pause.open() && pause.holding() && pause.forcing_mute());
+  CHECK(pause.PersistentMute(true) == false);  // the saved value is the player's, not the forced one
+  // Opening again while open changes nothing.
+  auto again = pause.Open(false, false, true, true);
+  CHECK(again.hold_engine && !again.set_mute);
+  auto close = pause.Close();
+  CHECK(!close.hold_engine && close.set_mute && !*close.set_mute);  // sound back as it was
+  CHECK(!pause.open() && !pause.holding());
+  CHECK(!pause.Close().set_mute);  // closing twice is harmless
+  // Player already muted: nothing to force, nothing to give back.
+  open = pause.Open(true, true, true, true);
+  CHECK(open.hold_engine && !open.set_mute);
+  close = pause.Close();
+  CHECK(close.set_mute && *close.set_mute);
+  // Mute toggled inside the menu is what comes back.
+  pause.Open(true, true, true, false);
+  pause.SetUserMute(true);
+  CHECK(pause.PersistentMute(true) == true);
+  close = pause.Close();
+  CHECK(close.set_mute && *close.set_mute);
+  // Pause switched off, or nothing running yet (--settings before boot).
+  open = pause.Open(false, true, true, false);
+  CHECK(!open.hold_engine && open.set_mute);
+  pause.Close();
+  open = pause.Open(true, true, false, false);
+  CHECK(!open.hold_engine && !open.set_mute && !pause.forcing_mute());
+  pause.Close();
+}
+
+void TestMenuInputGate() {
+  using Gate = edf::menu::MenuInputGate;
+  Gate gate;
+  // Closed menu: everything reaches the game.
+  CHECK(!gate.Block(Gate::kPad, false, 0) && !gate.Block(Gate::kKeyboardMouse, false, 0));
+  gate.Open();
+  CHECK(gate.menu_open());
+  CHECK(gate.Block(Gate::kPad, true, 10) && gate.Block(Gate::kKeyboardMouse, true, 10));  // even idle input
+  gate.Close(1000);
+  CHECK(gate.state() == Gate::State::kDraining);
+  // The button that closed the menu is still down: withheld, per source.
+  CHECK(gate.Block(Gate::kPad, false, 1010));
+  CHECK(!gate.Block(Gate::kKeyboardMouse, true, 1010));  // keyboard idle: passes at once
+  CHECK(gate.Block(Gate::kPad, false, 1500));
+  CHECK(!gate.Block(Gate::kPad, true, 1600));            // released: passes...
+  CHECK(!gate.Block(Gate::kPad, false, 1700));           // ...and a new press is a real one
+  CHECK(gate.state() == Gate::State::kGame);
+  // Held past the timeout: let through rather than lock the player out.
+  gate.Open();
+  gate.Close(0);
+  CHECK(gate.Block(Gate::kKeyboardMouse, false, 1499));
+  CHECK(!gate.Block(Gate::kKeyboardMouse, false, Gate::kDrainTimeoutMs));
+  CHECK(gate.state() == Gate::State::kGame);
+  // A source that never polls (keyboard with native K/M off) cannot keep the drain open.
+  gate.Open();
+  gate.Close(0);
+  CHECK(!gate.Block(Gate::kPad, true, 5));
+  CHECK(gate.state() == Gate::State::kDraining);
+  CHECK(!gate.Block(Gate::kPad, false, 2000) && gate.state() == Gate::State::kGame);
+  // Close without open is a no-op.
+  gate.Close(0);
+  CHECK(gate.state() == Gate::State::kGame);
+}
+
+void TestPadChord() {
+  using namespace edf::menu;
+  CHECK(ParsePadChord("back+start") == (kPadBack | kPadStart));
+  CHECK(ParsePadChord("LS+RS") == (kPadLeftThumb | kPadRightThumb));
+  CHECK(ParsePadChord("back+rb+y") == (kPadBack | kPadRightShoulder | kPadY));
+  CHECK(ParsePadChord("off") == 0);
+  CHECK(ParsePadChord("start") == 0);        // one button is not a chord
+  CHECK(ParsePadChord("back+select") == 0);  // unknown name: off, not a partial chord
+  CHECK(ParsePadChord("") == 0 && ParsePadChord("back+") == 0);
+  for (const auto& option : kChordOptions)
+    CHECK((ParsePadChord(option.value) != 0) == (std::string_view(option.value) != "off"));
+
+  PadChord chord;
+  const uint16_t mask = kPadBack | kPadStart;
+  auto r = chord.Filter(mask, kPadA);
+  CHECK(!r.fired && r.game_buttons == kPadA);
+  r = chord.Filter(mask, kPadBack);  // first chord button: an ordinary press so far
+  CHECK(!r.fired && r.game_buttons == kPadBack);
+  r = chord.Filter(mask, kPadBack | kPadStart | kPadA);
+  CHECK(r.fired && r.game_buttons == kPadA);  // the game never sees Start (its own pause menu)
+  r = chord.Filter(mask, kPadBack | kPadStart);
+  CHECK(!r.fired && r.game_buttons == 0);  // held: fires once
+  r = chord.Filter(mask, kPadStart);
+  CHECK(!r.fired && r.game_buttons == kPadStart);
+  r = chord.Filter(mask, 0);
+  r = chord.Filter(mask, kPadBack | kPadStart);
+  CHECK(r.fired);  // released and pressed again: fires again
+  r = chord.Filter(0, kPadBack | kPadStart);
+  CHECK(!r.fired && r.game_buttons == (kPadBack | kPadStart));  // chord off: untouched
+
+  PadSnapshot pad;
+  CHECK(PadIdle(pad));
+  pad.lx = 5000;
+  CHECK(PadIdle(pad));  // inside the dead zone
+  pad.ly = -20000;
+  CHECK(!PadIdle(pad));
+  pad = {};
+  pad.right_trigger = 200;
+  CHECK(!PadIdle(pad));
+  pad = {};
+  pad.buttons = kPadB;
+  CHECK(!PadIdle(pad));
+}
+
+void TestGuestPadRouting() {
+  using namespace edf::menu;
+  // The process-wide route: chord fires the open request, the gate blanks the pad.
+  int requests = 0;
+  SetOpenRequestHandler([&] { ++requests; });
+  PadSnapshot pad;
+  pad.buttons = kPadBack;
+  auto routed = RouteGuestPad(pad, "back+start", true);
+  CHECK(!routed.blank && routed.buttons == kPadBack && requests == 0);
+  pad.buttons = kPadBack | kPadStart;
+  routed = RouteGuestPad(pad, "back+start", true);
+  CHECK(requests == 1 && !routed.blank && routed.buttons == 0);
+  OpenGate();
+  CHECK(MenuOpen());
+  routed = RouteGuestPad(pad, "back+start", true);
+  CHECK(routed.blank && requests == 1);
+  pad.buttons = kPadB;
+  CHECK(RouteGuestPad(pad, "back+start", false).blank);  // other players too
+  CloseGate();
+  CHECK(!MenuOpen());
+  CHECK(RouteGuestPad(pad, "back+start", true).blank);   // B that closed it: withheld
+  CHECK(RouteGuestPad(pad, "back+start", false).blank);  // other players wait for player 0
+  pad.buttons = 0;
+  CHECK(!RouteGuestPad(pad, "back+start", true).blank);  // released
+  CHECK(!BlockGameInput(MenuInputGate::kKeyboardMouse, true));
+  SetOpenRequestHandler({});
+  // Engine hold: nothing to wait for when no pause is requested.
+  CHECK(!HoldWhilePaused());
+  Engine().requested = true;
+  std::thread release([] {
+    while (!Engine().holding.load()) std::this_thread::yield();
+    Engine().requested = false;
+  });
+  CHECK(HoldWhilePaused());
+  release.join();
+  CHECK(!Engine().holding.load() && Engine().holds.load() == 1);
+}
 }  // namespace
 
 int main() {
@@ -461,6 +775,17 @@ int main() {
   TestXdvdfs();
   TestKeybinds();
   TestNativeKbm();
+  TestFrameRateMapping();
+  TestRendererAndUpscalerMapping();
+  TestGraphicsPresets();
+  TestRestartClassification();
+  TestConfigOverrides();
+  TestRevertCountdown();
+  TestMenuScaling();
+  TestPauseController();
+  TestMenuInputGate();
+  TestPadChord();
+  TestGuestPadRouting();
   if (failures) std::cerr << failures << " test assertion(s) failed\n";
   else std::cout << "All unit tests passed\n";
   return failures ? 1 : 0;

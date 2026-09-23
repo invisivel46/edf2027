@@ -19,6 +19,17 @@ REXCVAR_DEFINE_BOOL(edf_trace_input, false, "EDF2027", "Log verbose guest input 
 REXCVAR_DEFINE_BOOL(edf_rumble, true, "EDF2027", "Enable controller vibration");
 REXCVAR_DEFINE_INT32(edf_frame_pacer_spin_us, 250, "EDF2027",
                      "Minimum busy-wait margin of the frame limiter in microseconds; the margin adapts above it to the timer's observed oversleep").range(0, 2000);
+// F1 menu (settings_dialog.h, pause_menu.h).
+REXCVAR_DEFINE_BOOL(edf_menu_pause, true, "EDF2027", "Pause the game while the F1 settings menu is open");
+REXCVAR_DEFINE_BOOL(edf_menu_mute_audio, true, "EDF2027", "Silence the game while the F1 settings menu is open");
+REXCVAR_DEFINE_BOOL(edf_menu_pause_audio_engine, false, "EDF2027",
+                    "Also suspend the audio engine while the F1 menu pauses the game, so music resumes where it stopped (experimental)");
+REXCVAR_DEFINE_STRING(edf_menu_pad_chord, "back+start", "EDF2027",
+                      "Controller buttons that open the settings menu, joined by '+' (a b x y start back lb rb ls rs up down left right), or off");
+REXCVAR_DEFINE_DOUBLE(edf_menu_scale, 1.0, "EDF2027", "Size of the settings menu and overlay relative to the window height")
+    .range(0.5, 2.0);
+REXCVAR_DEFINE_INT32(edf_perf_overlay_detail, 1, "EDF2027",
+                     "Performance overlay (F2): 0 frame rate, 1 adds a frame-time graph, 2 adds CPU and GPU time").range(0, 2);
 REXCVAR_DEFINE_BOOL(edf_frame_pacer_before_present, true, "EDF2027",
                     "With the frame-rate unlock active and VSync off, pace capped frames before the guest present (steady present cadence) rather than after it (up to one period less latency, present times follow each frame's work)");
 

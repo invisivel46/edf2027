@@ -6,9 +6,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <span>
 #include <string>
 #include <vector>
 #include "core_logic.h"
+#include "settings_logic.h"
 
 REXCVAR_DECLARE(std::string, edf_game_path);      // extracted disc folder (contains default.xex)
 REXCVAR_DECLARE(std::string, edf_display_mode);   // "windowed" | "borderless"
@@ -54,18 +56,19 @@ inline uint32_t ReadXexTitleId(const std::filesystem::path& xex) {
 
 inline std::string DisplayMode() { return REXCVAR_GET(edf_display_mode); }
 
-// Saves the cvar config, then strips per-launch options that must not persist
-// (log file from the command line, one-shot flags, explicit --game_data_root).
-inline void SaveUserConfig(const std::filesystem::path& path) {
+// Saves the cvar config, stripped of per-launch options that must not persist (log file
+// from the command line, one-shot flags, explicit --game_data_root). `overrides` are
+// values for the file that are not set on the running game: restart-only settings the
+// F1 menu staged (settings_logic.h RestartTracker).
+inline void SaveUserConfig(const std::filesystem::path& path,
+                           std::span<const settings::ConfigOverride> overrides = {}) {
   std::error_code ec;
   std::filesystem::create_directories(path.parent_path(), ec);
-  rex::cvar::SaveConfig(path);
-  std::ifstream in(path, std::ios::binary);
-  if (!in) return;
-  std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  std::string out = FilterPersistentConfig(contents);
-  in.close();
-  std::ofstream(path, std::ios::trunc) << out;
+  std::string out = "# Auto-generated cvar configuration\n" + rex::cvar::SerializeToTOML();
+  out = FilterPersistentConfig(out);
+  if (!overrides.empty()) out = settings::ApplyConfigOverrides(out, overrides);
+  std::ofstream file(path, std::ios::binary | std::ios::trunc);
+  file << out;
 }
 
 // Per-user data folder (Windows: %APPDATA%\edf2027, Linux: ~/.local/share/edf2027,

@@ -5,13 +5,19 @@
 #pragma once
 
 #include <rex/rex_app.h>
+#include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <mutex>
+#include <thread>
 #include "launcher.h"
-#include "fps_overlay.h"
+#include "pause_menu.h"
+#include "perf_overlay.h"
 #include "scripted_input.h"
 #include "settings_dialog.h"
 #include "setup_dialog.h"
@@ -35,6 +41,62 @@ REXCVAR_DECLARE(bool, edf_native_host);
 REXCVAR_DECLARE(std::string, edf_native_scene_backend);
 REXCVAR_DECLARE(bool, edf_native_untiled_scene);
 REXCVAR_DECLARE(bool, edf_native_mesh_watch_audit);
+REXCVAR_DECLARE(bool, audio_mute);
+REXCVAR_DECLARE(bool, edf_menu_pause);
+REXCVAR_DECLARE(bool, edf_menu_mute_audio);
+REXCVAR_DECLARE(bool, edf_menu_pause_audio_engine);
+
+namespace edf {
+// Suspends and resumes the SDK audio engine (AudioSystem::Pause/Resume) for the F1
+// pause, on a thread of its own: Pause waits for the audio worker to acknowledge, and
+// the UI thread must never wait on anything the game owns. Requests run in order, so a
+// resume always follows the pause it undoes. Only used with edf_menu_pause_audio_engine.
+class AudioSuspender {
+ public:
+  ~AudioSuspender() {
+    {
+      std::lock_guard lock(mutex_);
+      stopping_ = true;
+    }
+    wake_.notify_all();
+    // A Pause that never returns must not hang the exit.
+    if (worker_.joinable()) worker_.detach();
+  }
+  void Request(rex::audio::AudioSystem* audio, bool suspend) {
+    if (!audio) return;
+    {
+      std::lock_guard lock(mutex_);
+      if (suspend == suspended_) return;
+      suspended_ = suspend;
+      queue_.push_back({audio, suspend});
+      if (!worker_.joinable()) worker_ = std::thread([this] { Run(); });
+    }
+    wake_.notify_all();
+  }
+  bool suspended() const { std::lock_guard lock(mutex_); return suspended_; }
+
+ private:
+  struct Job { rex::audio::AudioSystem* audio; bool suspend; };
+  void Run() {
+    std::unique_lock lock(mutex_);
+    while (true) {
+      wake_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
+      if (queue_.empty()) return;
+      const Job job = queue_.front();
+      queue_.pop_front();
+      lock.unlock();
+      if (job.suspend) job.audio->Pause();
+      else job.audio->Resume();
+      lock.lock();
+    }
+  }
+  mutable std::mutex mutex_;
+  std::condition_variable wake_;
+  std::deque<Job> queue_;
+  std::thread worker_;
+  bool suspended_ = false, stopping_ = false;
+};
+}  // namespace edf
 
 class Edf2017App : public rex::ReXApp {
  public:
@@ -81,6 +143,9 @@ class Edf2017App : public rex::ReXApp {
     config.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
     config.input_factory = REX_INPUT_BACKEND(CreateEdfInputSystem);  // SDL + NOP + optional scripted pad (EDF_INPUT_SCRIPT)
   }
+
+  // The F1 menu's fonts (menu_ui.h), baked next to the SDK's default font.
+  void OnConfigureFonts(ImFontAtlas* atlas) override { edf::ui::LoadMenuFonts(atlas); }
 
   std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
 #if defined(_WIN32)
@@ -142,14 +207,16 @@ class Edf2017App : public rex::ReXApp {
 #endif
     // ReXApp's default mouse-look gate only knows about its built-in dialogs.
     // EDF's setup and F1 settings are custom dialogs, so use ImGui's capture
-    // state directly. This releases relative mouse mode and restores the OS
-    // cursor whenever an interactive dialog needs it. The FPS overlay uses
+    // state directly, and the F1 menu's own state: while it is open the SDK's
+    // drivers report an untouched pad and the native K/M driver lets go of the
+    // mouse (pause_menu.h has the whole routing). The performance overlay uses
     // NoInputs, so it does not interrupt mouse-look.
     auto* input_system = static_cast<rex::input::InputSystem*>(runtime()->input_system());
     if (input_system && imgui_drawer()) {
       input_system->SetActiveCallback(
-          [this]() { return !imgui_drawer()->GetIO().WantCaptureMouse; });
+          [this]() { return !edf::menu::MenuOpen() && !imgui_drawer()->GetIO().WantCaptureMouse; });
     }
+    booted_ = true;
   }
 
   // Runs after config load and window creation, before the runtime boots.
@@ -201,11 +268,16 @@ class Edf2017App : public rex::ReXApp {
   }
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
-    auto* overlay = new edf::FpsOverlay(drawer);
-    edf::FpsOverlay::Current() = overlay;
+    auto* overlay = new edf::PerfOverlay(drawer, [this] { return PhysicalHeight(); });
+    edf::PerfOverlay::Current() = overlay;
     rex::ui::RegisterBind("bind_edf_settings", "F1", "EDF2027 settings", [this]() { ToggleSettings(); });
-    rex::ui::RegisterBind("bind_edf_fps", "F2", "Toggle FPS overlay", []() {
+    rex::ui::RegisterBind("bind_edf_fps", "F2", "Toggle performance overlay", []() {
       rex::cvar::SetFlagByName("edf_show_fps", REXCVAR_GET(edf_show_fps) ? "false" : "true");
+    });
+    // The pad chord (edf_menu_pad_chord) is seen on the guest's pad poll; open the menu
+    // from the UI thread.
+    edf::menu::SetOpenRequestHandler([context = &app_context(), this] {
+      context->CallInUIThreadDeferred([this] { OpenSettings(true); });
     });
   }
 
@@ -222,6 +294,12 @@ class Edf2017App : public rex::ReXApp {
     }
     if (event.virtual_key() == rex::ui::VirtualKey::kEscape) {
       event.set_handled(true);
+      // With the menu open, Escape resumes (unless ImGui has a popup or an edit to
+      // cancel first); otherwise it quits, as before.
+      if (auto* settings = edf::SettingsDialog::Current()) {
+        if (settings->WantsEscapeToClose()) settings->Dismiss();
+        return;
+      }
       window()->RequestClose();
       return;
     }
@@ -229,6 +307,7 @@ class Edf2017App : public rex::ReXApp {
   }
 
   void OnShutdown() override {
+    ReleasePause();
 #if defined(_WIN32)
     edf::native::LogNativeCoverageCensusFinal();
     edf::native::SetNativeMeshWatchAudit({});
@@ -241,6 +320,8 @@ class Edf2017App : public rex::ReXApp {
 #endif
   }
   bool OnWindowCloseRequested() override {
+    // The engine thread must not stay held in the heartbeat while the runtime stops.
+    ReleasePause();
 #if defined(_WIN32)
     edf::native::LogNativeCoverageCensusFinal();
     if(native_backend_host_) native_backend_host_->Stop();
@@ -272,19 +353,87 @@ class Edf2017App : public rex::ReXApp {
     }
     OpenSettings();
   }
-  void OpenSettings() {
+  void OpenSettings(bool by_pad = false) {
     if (edf::SettingsDialog::Current() || !imgui_drawer()) return;
-    auto* dlg = new edf::SettingsDialog(imgui_drawer(), config_path_, "SDL3 gamepad (auto-detected; XInput via --input_backend xinput)",
-                                        [this]() {
-                                          if (pending_resume_) {
-                                            auto r = std::move(pending_resume_);
-                                            pending_resume_ = nullptr;
-                                            r();
-                                          }
-                                        },
-                                        [this]() { return RestartApplication(); });
+    BeginPause();
+    edf::SettingsDialog::Hooks hooks;
+    hooks.on_close = [this]() {
+      EndPause();
+      if (pending_resume_) {
+        auto r = std::move(pending_resume_);
+        pending_resume_ = nullptr;
+        r();
+      }
+    };
+    hooks.on_restart = [this]() { return RestartApplication(); };
+    hooks.physical_height = [this]() { return PhysicalHeight(); };
+    hooks.resize_window = [this](int width, int height) { ResizeWindow(width, height); };
+    hooks.game_running = [this]() { return booted_; };
+    hooks.user_mute = [this]() { return pause_.PersistentMute(REXCVAR_GET(audio_mute)); };
+    hooks.set_user_mute = [this](bool mute) {
+      // While the menu forces silence, this is the setting to give back on close.
+      if (pause_.forcing_mute()) pause_.SetUserMute(mute);
+      else rex::cvar::SetFlagByName("audio_mute", mute ? "true" : "false");
+    };
+    hooks.paused = [this]() { return pause_.holding() && edf::menu::Engine().holding.load(); };
+    auto* dlg = new edf::SettingsDialog(imgui_drawer(), config_path_,
+                                        "SDL3 gamepad (auto-detected; XInput via --input_backend xinput)",
+                                        std::move(hooks), by_pad);
     edf::SettingsDialog::Current() = dlg;
     imgui_drawer()->AddDialog(dlg);
+  }
+
+  // ---- F1 pause (pause_menu.h) -------------------------------------------------------
+  // Opening: input goes to the menu only (gate closed, mouse capture dropped, cursor
+  // shown), then the engine heartbeat is asked to hold and the game is silenced.
+  void BeginPause() {
+    edf::menu::OpenGate();
+    NativeKbmDriver::ReleaseForMenu();
+    if (window()) {
+      cursor_before_menu_ = window()->GetCursorVisibility();
+      window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+    }
+    const auto effects = pause_.Open(REXCVAR_GET(edf_menu_pause), REXCVAR_GET(edf_menu_mute_audio), booted_,
+                                     REXCVAR_GET(audio_mute));
+    if (effects.set_mute) rex::cvar::SetFlagByName("audio_mute", *effects.set_mute ? "true" : "false");
+    edf::menu::Engine().requested.store(effects.hold_engine, std::memory_order_release);
+    if (effects.hold_engine && REXCVAR_GET(edf_menu_pause_audio_engine)) audio_suspender_.Request(AudioEngine(), true);
+  }
+  // Closing: the engine resumes (its clock rebased, no catch-up), sound comes back as the
+  // player had it, and input drains back to the game (pause_menu.h MenuInputGate). The
+  // mouse is captured again by the first guest poll.
+  void EndPause() {
+    const auto effects = pause_.Close();
+    edf::menu::Engine().requested.store(false, std::memory_order_release);
+    if (audio_suspender_.suspended()) audio_suspender_.Request(AudioEngine(), false);
+    if (effects.set_mute) rex::cvar::SetFlagByName("audio_mute", *effects.set_mute ? "true" : "false");
+    edf::menu::CloseGate();
+    if (window()) window()->SetCursorVisibility(cursor_before_menu_);
+  }
+  void ReleasePause() {
+    edf::menu::SetOpenRequestHandler({});
+    edf::menu::Engine().requested.store(false, std::memory_order_release);
+    if (audio_suspender_.suspended()) audio_suspender_.Request(AudioEngine(), false);
+  }
+  rex::audio::AudioSystem* AudioEngine() {
+    return runtime() ? dynamic_cast<rex::audio::AudioSystem*>(runtime()->audio_system()) : nullptr;
+  }
+  float PhysicalHeight() { return window() ? float(window()->GetActualPhysicalHeight()) : 0.0f; }
+  // Settings > Display > Window size, windowed mode: resize the client area now. The
+  // game's render size follows only after a restart.
+  void ResizeWindow(int width, int height) {
+#if defined(_WIN32)
+    if (!window() || width <= 0 || height <= 0) return;
+    auto hwnd = static_cast<HWND>(window()->GetNativeWindowHandle());
+    if (!hwnd || IsZoomed(hwnd) || IsIconic(hwnd)) return;
+    RECT rect{0, 0, width, height};
+    const DWORD style = DWORD(GetWindowLongPtrW(hwnd, GWL_STYLE)), ex_style = DWORD(GetWindowLongPtrW(hwnd, GWL_EXSTYLE));
+    AdjustWindowRectEx(&rect, style, FALSE, ex_style);
+    SetWindowPos(hwnd, nullptr, 0, 0, rect.right - rect.left, rect.bottom - rect.top,
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+#else
+    (void)width; (void)height;
+#endif
   }
 
   bool RestartApplication() {
@@ -315,4 +464,8 @@ class Edf2017App : public rex::ReXApp {
 
   std::filesystem::path config_path_;
   std::function<void()> pending_resume_;
+  bool booted_ = false;  // the runtime is up (OnPostSetup); before it, --settings has nothing to pause
+  edf::menu::PauseController pause_;
+  edf::AudioSuspender audio_suspender_;
+  rex::ui::Window::CursorVisibility cursor_before_menu_ = rex::ui::Window::CursorVisibility::kVisible;
 };

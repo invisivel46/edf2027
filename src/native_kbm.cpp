@@ -28,6 +28,7 @@
 
 #include "native_kbm.h"
 #include "native_kbm_logic.h"
+#include "pause_menu.h"
 
 REXCVAR_DEFINE_BOOL(edf_kbm, true, "EDF2027", "Native keyboard and mouse input (not pad emulation)");
 REXCVAR_DEFINE_BOOL(edf_kbm_mouse_look, true, "EDF2027", "Aim with the mouse");
@@ -195,6 +196,15 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
   GuestSide& guest = Guest();
   std::lock_guard lock(guest.mutex);
   if (!game_owns_input) {
+    guest.router.Reset();
+    return;
+  }
+  // F1 menu (pause_menu.h): nothing reaches the game while it is open, nor after it
+  // closes until every key and button then held has been let go - the key or click
+  // that closed it must not land in the game. Motion in that window is dropped.
+  const bool idle = std::none_of(keys.begin(), keys.end(), [](bool down) { return down; }) &&
+                    std::none_of(mouse_buttons.begin(), mouse_buttons.end(), [](bool down) { return down; });
+  if (edf::menu::BlockGameInput(edf::menu::MenuInputGate::kKeyboardMouse, idle)) {
     guest.router.Reset();
     return;
   }
