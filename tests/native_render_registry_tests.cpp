@@ -728,6 +728,90 @@ void MotherSpheresArePublishedEveryTick() {
   registry.Died(kMother); Unlink(memory,kMother+108);
   Require(registry.Tick(memory,kScene,4,decode)->entries.empty(),"death removes the mothership");
 }
+// Pose motion (NativeModelPoseHistory's rules over published poses): a pose
+// read on consecutive ticks carries the previous tick's pose; unchanged
+// re-reads keep the entry pointer; a change within one tick is
+// render-dependent until a reset; an unread tick, a bone count change and a
+// new generation reset.
+void PoseMotion() {
+  std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kTree=0x2000;
+  BuildTree(memory,kTree,true);
+  registry.Born(kTree);
+  const auto tick=[&](uint64_t at) { return EntryOf(*registry.Tick(memory,kScene,at,decode),kTree); };
+  const auto move=[&](float seed,uint32_t bones=2) { BuildPose(memory,kTree+400,kTree+0x600,bones,seed); };
+  auto first=tick(1);
+  Require(first && !first->motion.previous && first->motion.tick==1 && !first->motion.render_dependent,"a first read does not blend");
+  move(2);
+  auto second=tick(2);
+  Require(second->motion.previous==first->pose && second->motion.tick==2 && !second->motion.render_dependent,
+    "a pose read on consecutive ticks keeps the previous tick's");
+  Require(tick(2)==second,"an unchanged re-read within the tick keeps the entry");
+  Require(tick(3)==second,"an unchanged pose on the next tick keeps the entry (stationary since its tick)");
+  move(3);
+  auto fourth=tick(4);
+  Require(fourth->motion.previous==second->pose && fourth->motion.tick==4,"a pose moving after a stationary tick blends from it");
+  move(4);
+  auto dependent=tick(4);
+  Require(!dependent->motion.previous && dependent->motion.render_dependent && dependent->motion.tick==4,
+    "a pose changing between two reads of one tick is render-dependent");
+  move(5);
+  auto sticky=tick(5);
+  Require(!sticky->motion.previous && sticky->motion.render_dependent,"render dependence is sticky until a reset");
+  move(6);
+  auto skipped=tick(7);
+  Require(!skipped->motion.previous && !skipped->motion.render_dependent && skipped->motion.tick==7,"an unread tick resets");
+  move(7);
+  auto resumed=tick(8);
+  Require(resumed->motion.previous==skipped->pose && resumed->motion.tick==8,"blending resumes after a reset");
+  move(8,3);
+  auto resized=tick(9);
+  Require(resized->pose->size()==3 && resized->models[0].layout!=resumed->models[0].layout && !resized->motion.previous,
+    "a bone count change resets");
+  move(9,3);
+  Require(tick(10)->motion.previous==resized->pose,"blending resumes after a resize");
+  registry.Died(kTree); registry.Born(kTree);
+  move(10,3);
+  auto reborn=tick(11);
+  Require(reborn->generation!=resized->generation && !reborn->motion.previous,"a new generation resets");
+  // Unchanged after a reset: nothing to republish.
+  Require(tick(12)==reborn,"a reset, unchanged pose keeps the entry");
+}
+// Attachments and instanced worlds carry their own motion, keyed as their
+// poses are shared (pose vector; set instance).
+void AttachmentAndInstancedMotion() {
+  std::vector<uint8_t> bytes(0x20000); const Memory memory{bytes}; BuildScene(memory);
+  NativeRenderRegistry registry(0);
+  const auto decode=Decoder(memory);
+  constexpr uint32_t kSoldier=0x4000,kWeapons=0x10000;
+  BuildObject(memory,kSoldier,kSoldierVtable,true);
+  BuildInstance(memory,kSoldier+1168); BuildPose(memory,kSoldier+1088,0x9000,3,1.0f);
+  memory.StoreByte(kSoldier+kNativeRenderFaceFlag,1);
+  BuildInstance(memory,kSoldier+kNativeRenderFaceInstance); BuildPose(memory,kSoldier+kNativeRenderFacePose,0x9400,1,7.0f);
+  memory.StoreWord(kSoldier+kNativeRenderWeaponArray,kWeapons); memory.StoreWord(kSoldier+kNativeRenderWeaponCount,1);
+  memory.StoreByte(kWeapons+1404,1); memory.StoreByte(kWeapons+1405,1); memory.StoreWord(kWeapons+108,0x1234);
+  BuildInstance(memory,kWeapons+100); BuildPose(memory,kWeapons+144,0x9800,1,2.0f);
+  registry.Born(kSoldier);
+  const auto first=EntryOf(*registry.Tick(memory,kScene,1,decode),kSoldier);
+  Require(first->attachments.size()==2 && !first->attachments[0].motion.previous && !first->attachments[1].motion.previous,
+    "attachments start without a previous pose");
+  BuildPose(memory,kSoldier+kNativeRenderFacePose,0x9400,1,8.0f);
+  const auto second=EntryOf(*registry.Tick(memory,kScene,2,decode),kSoldier);
+  Require(second->attachments[0].motion.previous==first->attachments[0].pose && second->attachments[0].motion.tick==2 &&
+    second->attachments[1].motion==first->attachments[1].motion && second->attachments[1].pose==first->attachments[1].pose &&
+    second->motion==first->motion,"only the moved face carries its previous pose");
+  constexpr uint32_t kMother=0x6000,kRecords=0xB000;
+  BuildMother(memory,kMother,kRecords,6,5.0f);
+  registry.Born(kMother);
+  const auto mother=EntryOf(*registry.Tick(memory,kScene,3,decode),kMother);
+  Require(mother->instanced.size()==1 && !mother->instanced[0].motion.previous,"a first read of the worlds does not blend");
+  memory.StoreFloat(kMother+NativeMotherSpheres::phase,5.01f);
+  const auto moved=EntryOf(*registry.Tick(memory,kScene,4,decode),kMother);
+  Require(moved->instanced[0].motion.previous==mother->instanced[0].worlds && moved->instanced[0].motion.tick==4,
+    "moved worlds carry the previous tick's");
+}
 }
 
 // A render-only iteration (refresh false): the published snapshot is returned
@@ -803,6 +887,8 @@ int main() {
     MotherSphereWorldsMatchTheGuest();
     SingleWorldLayoutFollows821C9DA8();
     MotherSpheresArePublishedEveryTick();
+    PoseMotion();
+    AttachmentAndInstancedMotion();
   } catch(const std::exception& error) {
     std::cerr<<"native render registry test failed: "<<error.what()<<"\n";
     return 1;

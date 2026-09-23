@@ -9,6 +9,7 @@
 #include <string>
 #include <string_view>
 #include <cmath>
+#include <functional>
 #include <algorithm>
 #include <iostream>
 #include <map>
@@ -270,6 +271,103 @@ void InstancedWorlds() {
   Require(partial.stats.no_pose==1 && partial.stats.no_instanced==1 && partial.opaque.size()==4 &&
     partial.opaque[0].instanced==0 && partial.opaque[3].entry==undecoded.get() && partial.opaque[3].instanced==-1,
     "instances survive a missing pose");
+}
+// 820DEA08: 8210AE48's LOD model, then the face (820DB268), then each weapon
+// (820DE790 -> 820E1A80), all inside the one slot-4 call: attachment items
+// follow their entry's model in published order, share its route and key,
+// and draw with their own layout and pose; an attachment whose model has not
+// decoded for its pose is skipped alone.
+void AttachmentsFollowTheModel() {
+  const auto face=Layout(0x4000,false,1,{Mesh(0,false,true,{Batch(0x4100,{0x4200})})});
+  const auto weapon=Layout(0x5000,true,2,{Mesh(0,true,false,{Batch(0x5100,{0x5200})})});
+  const auto soldier=[&](uint32_t object,float z,int32_t mode) {
+    auto entry=Entry(object,{0,0,z}); entry->mode=mode; entry->sort_bias=1; entry->cull_distance=1e6f;
+    entry->attachments.push_back({{0x1588,face},0x1636,Pose(1)});
+    entry->attachments.push_back({{0x1100,nullptr},0x1144,Pose(2)});   // Not decoded yet.
+    entry->attachments.push_back({{0x2100,weapon},0x2144,Pose(2)});
+    entry->attachments.push_back({{0x3100,weapon},0x3144,Pose(3)});    // Pose not the layout's size.
+    return entry;
+  };
+  NativeRenderRegistrySnapshot snapshot;
+  const auto opaque=soldier(1,100,0);
+  const auto filed=soldier(2,1000,1);
+  const auto unposed=soldier(3,100,0); unposed->pose.reset();
+  const auto after=Entry(4,{0,0,100});
+  for(const auto& entry:{opaque,filed,unposed,after}) snapshot.entries.push_back(entry);
+  const auto plan=PlanNativeFullFrameModels(snapshot,MakeCamera());
+  Require(plan.stats.attachments==6 && plan.stats.no_attachment==6 && plan.stats.no_pose==1,"attachments counted");
+  Require(plan.opaque.size()==6,"model, face and weapon; face and weapon without the model; the next entry");
+  Require(plan.opaque[0].entry==opaque.get() && plan.opaque[0].attachment==-1 &&
+    plan.opaque[1].entry==opaque.get() && plan.opaque[1].attachment==0 &&
+    plan.opaque[2].entry==opaque.get() && plan.opaque[2].attachment==2 &&
+    plan.opaque[3].entry==unposed.get() && plan.opaque[3].attachment==0 && plan.opaque[4].attachment==2 &&
+    plan.opaque[5].entry==after.get() && plan.opaque[5].attachment==-1,"attachments follow their model in guest order");
+  Require(&NativeFullFrameModelItemLayout(plan.opaque[1])==face.get() && &NativeFullFrameModelItemLayout(plan.opaque[2])==weapon.get() &&
+    NativeFullFrameModelItemLayoutObject(plan.opaque[2])==weapon,"an attachment item draws its own layout");
+  Require(NativeFullFrameModelItemPose(plan.opaque[2]).first==&opaque->attachments[2].pose &&
+    NativeFullFrameModelItemPose(plan.opaque[2]).second==&opaque->attachments[2].motion &&
+    NativeFullFrameModelItemPose(plan.opaque[0]).first==&opaque->pose,"an attachment item draws its own pose");
+  Require(plan.transparent.size()==3 && plan.transparent[0].attachment==-1 && plan.transparent[1].attachment==0 &&
+    plan.transparent[2].attachment==2 && plan.transparent[1].key==plan.transparent[0].key && plan.transparent[2].key==1000,
+    "a filed entry's attachments share its key and stay in order");
+  const auto draws=OrderNativeFullFrameModelDraws(plan.transparent,false);
+  Require(draws.size()==3 && draws[0].item==0 && draws[1].item==1 && draws[2].item==2 && draws[2].draw.pass==0x5200,
+    "transparent attachment draws follow the model's");
+}
+// A valid bone: rows scaled (sx, sy, sz) of a rotation about z, and a translation.
+NativePoseMatrix Bone(float angle,std::array<float,3> scale,std::array<float,3> at) {
+  const float c=std::cos(angle),s=std::sin(angle);
+  return {c*scale[0],s*scale[0],0,0, -s*scale[1],c*scale[1],0,0, 0,0,scale[2],0, at[0],at[1],at[2],1};
+}
+// The pose source: the published pose unless the frame interpolates a pose of
+// its tick with a previous one; blended bones are BlendNativePosePrepared's.
+void PoseSource() {
+  auto previous=std::make_shared<std::vector<NativePoseMatrix>>();
+  auto current=std::make_shared<std::vector<NativePoseMatrix>>();
+  previous->push_back(Bone(.1f,{1,2,1},{0,0,0}));     current->push_back(Bone(.5f,{2,2,1},{10,4,-2}));  // Moving.
+  previous->push_back(Bone(1,{1,1,1},{5,5,5}));       current->push_back((*previous)[1]);               // Stationary.
+  previous->push_back(Bone(.2f,{1,1,1},{0,0,0}));     current->push_back(Bone(.3f,{1,1,1},{1,0,0}));
+  (*current)[2][1]+=.5f;                                                                             // Sheared.
+  previous->push_back(Bone(.2f,{1,1,1},{0,0,0}));     current->push_back(Bone(.3f,{1,1,1},{900,0,0}));  // Cut.
+  const NativeRenderPose pose=current;
+  const NativeRenderPoseMotion motion{previous,7,false};
+  const NativeFrameMotion frame{7,.5f,1,true};
+  NativeRenderPoseBlender blender;
+  // Off: the published pose itself.
+  auto off=frame; off.interpolate=false;
+  Require(blender.Pose(pose,motion,off).data()==current->data(),"interpolation off draws the published pose");
+  auto other=frame; other.tick=8;
+  Require(blender.Pose(pose,motion,other).data()==current->data(),"a pose of an earlier tick is stationary since");
+  auto end=frame; end.fraction=1;
+  Require(blender.Pose(pose,motion,end).data()==current->data(),"alpha 1 draws the published pose");
+  Require(blender.Pose(pose,{previous,7,true},frame).data()==current->data(),"a render-dependent pose is not blended again");
+  Require(blender.Pose(pose,{nullptr,7,false},frame).data()==current->data(),"no previous pose, no blend");
+  Require(blender.stats().blended==0,"nothing blended yet");
+  const auto same=[](const NativePoseMatrix& a,const NativePoseMatrix& b) { return !std::memcmp(a.data(),b.data(),sizeof(a)); };
+  auto start=frame; start.fraction=0;
+  const auto first=blender.Pose(pose,motion,start);
+  const std::vector<NativePoseMatrix> at_start(first.begin(),first.end());
+  Require(same(at_start[0],(*previous)[0]),"alpha 0 draws the previous pose's bits");
+  Require(same(at_start[1],(*current)[1]) && same(at_start[2],(*current)[2]) && same(at_start[3],(*current)[3]),
+    "alpha 0: stationary, sheared and cut bones keep the current bits");
+  const auto second=blender.Pose(pose,motion,frame);
+  const std::vector<NativePoseMatrix> half(second.begin(),second.end());
+  Require(same(half[0],BlendNativePoseMatrix((*previous)[0],(*current)[0],.5f)) && !same(half[0],(*current)[0]),
+    "a moving bone is BlendNativePoseMatrix's");
+  Require(same(half[1],(*current)[1]),"a stationary bone keeps the current bits");
+  Require(same(half[2],(*current)[2]),"a sheared bone passes through");
+  Require(same(half[3],(*current)[3]),"a cut bone is not swept");
+  Require(blender.stats().blended==2 && blender.stats().prepared==1 && blender.stats().reused==1,"the pair is prepared once and reused");
+  // One matrix of a pose (an instanced world), and a pose of another size.
+  Require(same(blender.Matrix(pose,motion,0,frame),half[0]) && same(blender.Matrix(pose,motion,0,off),(*current)[0]),
+    "an instanced world blends as a bone");
+  auto shorter=std::make_shared<std::vector<NativePoseMatrix>>(previous->begin(),previous->begin()+2);
+  Require(blender.Pose(pose,{shorter,7,false},frame).data()==current->data(),"a previous pose of another size is not blended");
+  // Rows unused for two frames are released.
+  blender.EndFrame();
+  Require(blender.size()==1,"a row used this frame is kept");
+  blender.EndFrame();
+  Require(blender.size()==0,"a row unused since the last frame is dropped");
 }
 void BaseState() {
   NativeFullFrameModelTargets targets; targets.dsv_format=1;
@@ -709,7 +807,12 @@ void SkinnedBuild(std::shared_ptr<NativeRenderBackend> backend) {
     for(size_t i=0;i<16;++i) camera.pass.view_projection[i]=std::bit_cast<uint32_t>(i%5?0.f:scale);
   };
   vp(1.5f);
-  const auto pass=fixture.Pass();
+  auto pass=fixture.Pass();
+  // The pose each item should have drawn, and how many items blend.
+  std::function<std::vector<NativePoseMatrix>(const NativeFullFrameModelItem&)> expected=[](const NativeFullFrameModelItem& item) {
+    return *item.entry->pose;
+  };
+  uint64_t blended=0;
   uint64_t generation=1;
   auto published=std::make_shared<NativeSceneGroupMaterial>();
   published->program=fixture.program; published->constants=fixture.constants;
@@ -722,7 +825,7 @@ void SkinnedBuild(std::shared_ptr<NativeRenderBackend> backend) {
     const auto frame=models.Build(snapshot,camera,pass,sources);
     const auto& stats=frame.stats;
     Require(stats.drawn==3 && stats.draws==6 && stats.palettes==6 && stats.palette==0 && stats.failed==0,frame_name);
-    Require(stats.resolves==resolves && stats.captures==captures && stats.cache_hits==hits,frame_name);
+    Require(stats.resolves==resolves && stats.captures==captures && stats.cache_hits==hits && stats.blended==blended,frame_name);
     auto constants=published->constants;
     for(auto& constant:constants) camera.pass.Apply(constant);
     std::vector<std::pair<const NativeSceneInstance*,const NativeSceneView*>> drawn;
@@ -732,7 +835,7 @@ void SkinnedBuild(std::shared_ptr<NativeRenderBackend> backend) {
     std::vector<const NativeSceneMaterial*> materials;
     for(size_t d=0;d<refs.size();++d) {
       const auto& item=frame.plan.opaque[refs[d].item];
-      const auto values=NativeFullFrameModelConstantsFor(*layout,*item.entry->pose,pass.palette_limit);
+      const auto values=NativeFullFrameModelConstantsFor(*layout,expected(item),pass.palette_limit);
       const auto& material=*drawn[d].first->object.material;
       NativeBackendSampler* sampler=material.samplers().at(0).second;
       const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
@@ -762,6 +865,89 @@ void SkinnedBuild(std::shared_ptr<NativeRenderBackend> backend) {
   republished->constants[3].registers[7]^=0x10;
   published=republished; ++generation;
   check("a moved published constant recaptures the row",0,1,0);
+  // Pose motion: every entry moved from its previous tick's pose (one bone
+  // stationary). Interpolation off draws the published poses; on, each drawn
+  // pose is the stateless blend at the frame's fraction, and at fraction 0 the
+  // previous pose.
+  for(size_t e=0;e<entries.size();++e) {
+    auto from=std::make_shared<std::vector<NativePoseMatrix>>(),to=std::make_shared<std::vector<NativePoseMatrix>>();
+    for(size_t b=0;b<3;++b) {
+      from->push_back(Bone(.1f*float(b),{1,1,1},{float(e),0,0}));
+      to->push_back(Bone(.1f*float(b)+.3f,{1.5f,1,1},{float(e)+2,1,0}));
+    }
+    (*to)[1]=(*from)[1];
+    entries[e]->pose=to; entries[e]->motion={from,9,false};
+  }
+  pass.motion={9,.25f,1,false};
+  check("interpolation off draws the published poses",0,0,1);
+  pass.motion.interpolate=true; blended=3;
+  expected=[](const NativeFullFrameModelItem& item) {
+    std::vector<NativePoseMatrix> pose;
+    for(size_t b=0;b<item.entry->pose->size();++b)
+      pose.push_back(BlendNativePoseMatrix((*item.entry->motion.previous)[b],(*item.entry->pose)[b],.25f));
+    return pose;
+  };
+  check("interpolated poses are the stateless blend",0,0,1);
+  pass.motion.fraction=0;
+  expected=[](const NativeFullFrameModelItem& item) { return *item.entry->motion.previous; };
+  check("alpha 0 draws the previous poses",0,0,1);
+  pass.motion.fraction=1; blended=0;
+  expected=[](const NativeFullFrameModelItem& item) { return *item.entry->pose; };
+  check("alpha 1 draws the published poses",0,0,1);
+  // The next tick's render with the same poses: stationary since, so every
+  // object made at alpha 1 is carried.
+  pass.motion={10,.5f,0,true};
+  const auto carried=models.Build(snapshot,camera,pass,sources);
+  Require(carried.stats.reused==6 && carried.stats.derived==0 && carried.stats.blended==0,
+    "a pose of an earlier tick keeps carrying its objects");
+}
+// Attachments through Build: the face draws after the model with its own
+// layout, pose and constants, in its own draw state; moving only the face
+// remakes only its object.
+void AttachmentBuild(std::shared_ptr<NativeRenderBackend> backend) {
+  SkinnedFixture fixture(backend);
+  const auto layout=Layout(0x1000,true,3,{Mesh(0,true,false,{Batch(0x2000,{0x3000})})});
+  const auto face=Layout(0x1800,true,2,{Mesh(0,true,false,{Batch(0x2800,{0x3000})})});
+  auto entry=Entry(1,{0,0,100},1,layout);
+  entry->attachments.push_back({{face->instance,face},0x1636,Pose(2)});
+  NativeRenderRegistrySnapshot snapshot;
+  snapshot.entries.push_back(entry);
+  const auto camera=MakeCamera();
+  const auto pass=fixture.Pass();
+  auto published=std::make_shared<NativeSceneGroupMaterial>();
+  published->program=fixture.program; published->constants=fixture.constants;
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t) { return std::shared_ptr<const NativeSceneGroupMaterial>(published); };
+  sources.geometry=[&](const NativeModelBatchLayout&,uint32_t) { return fixture.geometry; };
+  sources.generation=[] { return uint64_t(1); };
+  NativeFullFrameModels models;
+  const auto check=[&](const char* name,uint64_t derived,uint64_t reused) {
+    const auto frame=models.Build(snapshot,camera,pass,sources);
+    Require(frame.plan.opaque.size()==2 && frame.plan.opaque[1].attachment==0 && frame.stats.drawn==2 && frame.stats.draws==2 &&
+      frame.stats.derived==derived && frame.stats.reused==reused && models.item_states()==2,name);
+    auto constants=published->constants;
+    for(auto& constant:constants) camera.pass.Apply(constant);
+    std::vector<const NativeSceneInstance*> drawn;
+    for(const auto& batch:frame.batches) for(const auto& object:batch.snapshot.instances) drawn.push_back(object.get());
+    const auto refs=OrderNativeFullFrameModelDraws(frame.plan.opaque,true);
+    Require(drawn.size()==refs.size(),name);
+    for(size_t d=0;d<refs.size();++d) {
+      const auto& item=frame.plan.opaque[refs[d].item];
+      const auto values=NativeFullFrameModelConstantsFor(NativeFullFrameModelItemLayout(item),**NativeFullFrameModelItemPose(item).first,
+        pass.palette_limit);
+      const auto& material=*drawn[d]->object.material;
+      NativeBackendSampler* sampler=material.samplers().at(0).second;
+      const std::array<NativeBackendSampler*,2> samplers{sampler,sampler};
+      const auto full=fixture.Full(*material.pipeline(),constants,values.palette,samplers,material.blend_factor());
+      Require(material.Equivalent(*full.material),"each draw binds its own item's palette (model or face)");
+    }
+  };
+  check("the model and its face draw",2,0);
+  check("an unchanged frame carries both",0,2);
+  auto moved=std::make_shared<std::vector<NativePoseMatrix>>(*entry->attachments[0].pose);
+  (*moved)[0][0]+=1;
+  entry->attachments[0].pose=moved;
+  check("a moved face remakes only its own object",1,1);
 }
 std::string SameModelFrame(const NativeFullFrameModelFrame& a,const NativeFullFrameModelFrame& b);
 // The draw states' carry rules, draw by draw: an unchanged frame and a moved
@@ -1268,12 +1454,13 @@ int main(int argc,char** argv) {
     }
     Visibility(); Lod(); Constants(); SortKeys(); Instancing(); InstancedWorlds(); BaseState();
     SourceTable(); SourceMemo(); MaterialCache(); RigidInstancing(); InstancedCache(); BrokenObjects(); OtherPassClasses();
+    AttachmentsFollowTheModel(); PoseSource();
     // The skinned material path against full captures, on both backends (WARP).
     for(int backend=0;backend<2;++backend) {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ModelFrames(device);
+      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ModelFrames(device);
     }
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";

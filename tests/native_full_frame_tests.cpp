@@ -106,6 +106,34 @@ int main() {
     check(host.trace[6]=="1:static_world" && host.trace[7]=="stub:replaced","replaced view pass keeps its position");
     check(host.trace[host.trace.size()-3]=="stub:replaced" && !host.output_ready,"replaced post runs in the frame");
   }
+  // The motion budget: AcquireInputs' budget reaches every pass and the frame
+  // context unchanged; poses interpolate only unlocked, at divisor 1, with the
+  // model interpolation setting (the guest 821C9C20 hook's condition).
+  {
+    class MotionHost final : public NativeFrameHost {
+     public:
+      NativeFrameMotion acquired;
+      std::vector<NativeFrameMotion> seen;
+      NativeFrameInputs AcquireInputs() override { NativeFrameInputs inputs; inputs.motion=acquired; return inputs; }
+      std::vector<uint32_t> Views() override { return {1,2}; }
+      uint32_t AdvanceSerial(uint32_t) override { return 0; }
+      bool BeginView(NativeFrameContext&) override { return true; }
+      void RunPass(size_t,NativeFramePass&,NativeFrameContext& context) override { seen.push_back(context.inputs.motion); }
+      void SideEffects(const NativeFrameInputs& inputs) override { seen.push_back(inputs.motion); }
+      void EndScene(const NativeFrameInputs& inputs,bool) override { seen.push_back(inputs.motion); }
+    } host;
+    host.acquired=MakeNativeFrameMotion(true,1,1234,.375f,2,true);
+    check(host.acquired.tick==1234 && host.acquired.fraction==.375f && host.acquired.steps==2 && host.acquired.interpolate,
+      "the frame motion carries the budget");
+    NativeFullFrame frame;
+    frame.Run(host);
+    check(host.seen.size()==2*kNativeFrameViewPassCount+3,"every pass saw the inputs");
+    for(const auto& motion:host.seen) check(motion==host.acquired,"a pass saw another motion budget than AcquireInputs'");
+    check(!MakeNativeFrameMotion(false,1,5,.5f,1,true).interpolate,"locked frames do not interpolate models");
+    check(!MakeNativeFrameMotion(true,2,5,.5f,1,true).interpolate,"divisor 2 does not interpolate models");
+    check(!MakeNativeFrameMotion(true,1,5,.5f,1,false).interpolate,"edf_native_model_interpolation=false does not interpolate");
+    check(!NativeFrameInputs{}.motion.interpolate,"default inputs do not interpolate");
+  }
   // Routing: full frame only on the native side with bridge and host; guest
   // side frames take today's path for frame-by-frame A/B comparison.
   {

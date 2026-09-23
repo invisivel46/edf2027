@@ -6190,6 +6190,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     NativeFullFrameModelPass pass;
     pass.palette_limit=NativeFullFramePaletteLimit(reader_);
     pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
+    pass.motion=context.inputs.motion;
     auto& state=State();
     // The bridge locks in short holds (NativeLockSlices): the targets, each use
     // of the model pass caches (program, geometry) and each resolve with its
@@ -6305,10 +6306,11 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto& built=frame->stats;
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} items={} drawn={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
+      REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} attachments={} no_attachment={} items={} drawn={} blended={} interpolate={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
         "source_generation={} source_memo={} source_validated={} source_advances={}/{}/{}/{} source_reuses={} source_audits={}/{}",
         frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
-        built.items,built.drawn,built.draws,statistics.draws,built.resolves,built.captures,built.palettes,built.cache_hits,built.memo_hits,
+        planned.attachments,planned.no_attachment,
+        built.items,built.drawn,built.blended,pass.motion.interpolate,built.draws,statistics.draws,built.resolves,built.captures,built.palettes,built.cache_hits,built.memo_hits,
         built.reused,built.derived,built.sourced,built.programs,built.geometries,built.camera_rows,built.rows,
         built.source_hits,built.source_fetches,models_.material_cache().size(),models_.source_table().size(),
         models_.item_states(),models_.row_states(),built.missing_program,built.missing_geometry,built.failed,broken_,
@@ -6865,8 +6867,13 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     // The renderable registry's latest tick (edf_native_render_registry, and
     // always with the full frame); null before its first tick.
     registry=edf::native::RenderRegistry().AcquireSnapshot();
+    // The render budget the hook took from the 821A4DE8 publication, as the
+    // camera's 821CDDF8 interpolation sampled it: the models pass blends the
+    // registry's poses with it under the guest 821C9C20 hook's condition.
+    const auto motion=edf::native::MakeNativeFrameMotion(native_render_budget.unlocked,native_render_budget.divisor,
+      native_render_budget.tick,native_render_budget.fraction,native_render_budget.steps,REXCVAR_GET(edf_native_model_interpolation));
     return {edf::native::native_scene_publication,edf::native::native_scene_pass_cameras,
-      edf::native::native_scene_pass_animations,native_render_publication,std::move(registry)};
+      edf::native::native_scene_pass_animations,native_render_publication,std::move(registry),motion};
   }
   // The helper's view loop condition and list (owner+0..owner+12, view at
   // node+8), and the frame context it initializes before the loop.

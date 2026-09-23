@@ -69,7 +69,15 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
     };
     size_t instances=0;
     for(const auto& set:entry.instanced) { if(drawable(set)) instances+=set.worlds->size(); else ++stats.no_instanced; }
-    if(!posed && !instances) continue;
+    // An attachment (820DB268 face, 820E1A80 weapon) draws once its model
+    // decoded for its own pose vector and the pose is that size.
+    const auto attached=[](const NativeRenderAttachment& attachment) {
+      return attachment.model.instance && attachment.model.layout && !attachment.model.layout->single_world &&
+        attachment.pose && attachment.pose->size()==attachment.model.layout->bones;
+    };
+    size_t attachments=0;
+    for(const auto& attachment:entry.attachments) { if(attached(attachment)) ++attachments; else ++stats.no_attachment; }
+    if(!posed && !instances && !attachments) continue;
     NativeFullFrameModelItem item{&entry,model.value_or(0),visibility.depth,visibility.centre[2],0,entry.mode!=0};
     if(item.transparent) {
       item.key=NativeFullFrameModelKey(entry.mode,item.view_z,entry.sort_bias,camera.key_scale,camera.key_offset);
@@ -77,6 +85,12 @@ NativeFullFrameModelPlan PlanNativeFullFrameModels(const NativeRenderRegistrySna
     }
     auto& list=item.transparent?plan.transparent:plan.opaque;
     if(posed) list.push_back(item);
+    // 820DEA08: 8210AE48's model, the face (820DB268), then the weapons (820DE790).
+    for(size_t index=0;index<entry.attachments.size();++index) {
+      if(!attached(entry.attachments[index])) continue;
+      auto attachment=item; attachment.attachment=int32_t(index);
+      list.push_back(attachment); ++stats.attachments;
+    }
     for(size_t set=0;set<entry.instanced.size();++set) {
       if(!drawable(entry.instanced[set])) continue;
       for(uint32_t world=0;world<entry.instanced[set].worlds->size();++world) {
@@ -184,9 +198,6 @@ bool SameView(const NativeSceneView& a,const NativeSceneView& b) {
   return a.view==b.view && a.projection==b.projection && a.view_projection==b.view_projection &&
     a.scissor_enabled==b.scissor_enabled;
 }
-const std::shared_ptr<const NativeModelLayout>& ItemLayoutObject(const NativeFullFrameModelItem& item) {
-  return item.instanced<0?item.entry->models[item.model].layout:item.entry->instanced[size_t(item.instanced)].model.layout;
-}
 // The sampler objects program.Resolve bound, in program texture order, from
 // its resolved sampler pass (the backend's sampler cache returns the same
 // object for the same description).
@@ -267,11 +278,13 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
     for(size_t index=0;index<lists[list].size();++index) {
       const auto& item=lists[list][index];
       ++stats.items;
-      // The item's layout object: the posed LOD model's, or its instanced set's.
-      const auto& layout_object=ItemLayoutObject(item);
+      // The item's layout object: the posed LOD model's, its attachment's, or
+      // its instanced set's.
+      const auto& layout_object=NativeFullFrameModelItemLayoutObject(item);
       const auto& layout=*layout_object;
-      auto* state=&items_[ItemKey{item.entry->object,item.entry->generation,item.instanced,
-        item.instanced<0?item.model:item.world}];
+      auto* state=&items_[item.attachment>=0?
+        ItemKey{item.entry->object,item.entry->generation,-2,item.entry->attachments[size_t(item.attachment)].pose_vector}:
+        ItemKey{item.entry->object,item.entry->generation,item.instanced,item.instanced<0?item.model:item.world}];
       if(state->used==frame_) state=duplicates.emplace_back(std::make_unique<ItemState>()).get();
       state->used=frame_;
       try {
@@ -454,16 +467,21 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
       const auto& item=items[index];
       const auto& layout=*state->layout;
       try {
-        // The item's constants (worlds, palette) when their inputs moved; if
-        // they moved by value, every object made from them goes.
-        const auto& pose=item.instanced<0?item.entry->pose:item.entry->instanced[size_t(item.instanced)].worlds;
+        // The item's constants (worlds, palette) when their inputs moved (the
+        // pose, and in unlocked mode the blend: previous pose and fraction);
+        // if they moved by value, every object made from them goes.
+        const auto [pose_of,motion_of]=NativeFullFrameModelItemPose(item);
+        const auto& pose=*pose_of;
         const uint32_t world=item.instanced<0?0:item.world;
-        if(!state->valued || state->pose!=pose || state->world!=world || state->palette_limit!=pass.palette_limit) {
-          auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,*pose,pass.palette_limit):
-            NativeFullFrameModelInstancedConstants(layout,pose->at(world));
+        const auto blend=NativeRenderBlendOf(pose,*motion_of,pass.motion);
+        if(blend.previous) ++stats.blended;
+        if(!state->valued || state->pose!=pose || state->blend!=blend || state->world!=world || state->palette_limit!=pass.palette_limit) {
+          // Pose source: the published pose, or blended from the previous tick's.
+          auto values=item.instanced<0?NativeFullFrameModelConstantsFor(layout,poses_.Pose(pose,*motion_of,pass.motion),pass.palette_limit):
+            NativeFullFrameModelInstancedConstants(layout,poses_.Matrix(pose,*motion_of,world,pass.motion));
           if(!state->valued || !SameConstants(values,state->values))
             for(auto& draw:state->draws) { draw.object.reset(); draw.made_from.reset(); }
-          state->values=std::move(values); state->pose=pose; state->world=world; state->palette_limit=pass.palette_limit;
+          state->values=std::move(values); state->pose=pose; state->blend=blend; state->world=world; state->palette_limit=pass.palette_limit;
           state->valued=true;
         }
         const auto& values=state->values;
@@ -541,7 +559,7 @@ NativeFullFrameModelFrame NativeFullFrameModels::Build(const NativeRenderRegistr
   };
   emit(frame.plan.opaque,states[0],false);
   emit(frame.plan.transparent,states[1],true);
-  sources_.EndFrame(); materials_.EndFrame();
+  sources_.EndFrame(); materials_.EndFrame(); poses_.EndFrame();
   // Draw states and rows of objects, layouts, programs or geometry no longer
   // drawn release what they hold.
   if(items_.size()>kItemLimit) items_.clear();

@@ -15,6 +15,7 @@ struct NativeCameraPose {
 
 class NativeCameraHistory {
  public:
+  using Quaternion=std::array<float,4>;
   static bool CanInterpolate(const NativeCameraPose& a,const NativeCameraPose& b) {
     return Valid(a) && Valid(b) && !Cut(a,b);
   }
@@ -31,31 +32,79 @@ class NativeCameraHistory {
     const float alpha=std::clamp(fraction,0.f,1.f);
     if(alpha==0) return previous_;
     if(alpha==1 || previous_==current_) return current_;
-    auto a=Rotation(previous_.world),b=Rotation(current_.world);
-    float dot=Dot(a,b);
-    if(dot<0) { for(auto& v:b) v=-v; dot=-dot; }
-    float left=1-alpha,right=alpha;
+    return Interpolate(previous_,current_,PrepareBlend(previous_,current_),alpha);
+  }
+  // The pieces of CanInterpolate for a caller that keeps each pose's rotation
+  // (RotationOf): CanInterpolate(a,b) is ValidPose(a) && ValidPose(b) &&
+  // !CutWith(a,b,RotationOf(a.world),RotationOf(b.world)).
+  static Quaternion RotationOf(const std::array<float,16>& world) { return Rotation(world); }
+  static bool ValidPose(const NativeCameraPose& pose) { return Valid(pose); }
+  static bool CutWith(const NativeCameraPose& a,const NativeCameraPose& b,const Quaternion& qa,const Quaternion& qb) {
+    float distance=0;
+    for(size_t i=12;i<15;++i) { const auto d=a.world[i]-b.world[i]; distance+=d*d; }
+    // Discontinuous jumps must not sweep through geometry. Ordinary movement
+    // and zoom blend; camera replacement also resets at the integration layer.
+    return distance>50.f*50.f || std::abs(a.fov-b.fov)>0.25f || std::abs(Dot(qa,qb))<0.70710678f;
+  }
+  // The alpha-independent half of Interpolate (the rotations and the arc),
+  // so a caller blending one pair at many alphas computes it once.
+  struct Blend {
+    Quaternion a{},b{};
+    float angle=0,divisor=0;
+    bool slerp=false,same=false;
+  };
+  static Blend PrepareBlend(const NativeCameraPose& previous,const NativeCameraPose& current) {
+    if(previous==current) { Blend blend; blend.same=true; return blend; }
+    return PrepareBlend(previous,current,Rotation(previous.world),Rotation(current.world));
+  }
+  // The same with the poses' rotations (RotationOf).
+  static Blend PrepareBlend(const NativeCameraPose& previous,const NativeCameraPose& current,const Quaternion& qa,const Quaternion& qb) {
+    Blend blend;
+    blend.same=previous==current;
+    if(blend.same) return blend;
+    blend.a=qa; blend.b=qb;
+    float dot=Dot(blend.a,blend.b);
+    if(dot<0) { for(auto& v:blend.b) v=-v; dot=-dot; }
     if(dot<0.9995f) {
-      const float angle=std::acos(std::clamp(dot,-1.f,1.f));
-      const float divisor=std::sin(angle);
-      left=std::sin((1-alpha)*angle)/divisor;
-      right=std::sin(alpha*angle)/divisor;
+      blend.slerp=true;
+      blend.angle=std::acos(std::clamp(dot,-1.f,1.f));
+      blend.divisor=std::sin(blend.angle);
     }
-    for(size_t i=0;i<4;++i) a[i]=a[i]*left+b[i]*right;
-    Normalize(a);
-    const auto [x,y,z,w]=a;
-    auto result=current_;
-    result.world={1-2*(y*y+z*z),2*(x*y+z*w),2*(x*z-y*w),0,
-                  2*(x*y-z*w),1-2*(x*x+z*z),2*(y*z+x*w),0,
-                  2*(x*z+y*w),2*(y*z-x*w),1-2*(x*x+y*y),0,
-                  0,0,0,1};
-    for(size_t i=12;i<15;++i)
-      result.world[i]=previous_.world[i]+alpha*(current_.world[i]-previous_.world[i]);
-    result.fov=previous_.fov+alpha*(current_.fov-previous_.fov);
+    return blend;
+  }
+  // Stateless: the pose Sample returns between previous and current at alpha
+  // in [0,1] (translation and FOV linear, rotation along the shortest arc).
+  static NativeCameraPose Interpolate(const NativeCameraPose& previous,const NativeCameraPose& current,const Blend& blend,float alpha) {
+    if(alpha==0) return previous;
+    if(alpha==1 || blend.same) return current;
+    auto result=current;
+    result.world=InterpolateWorld(blend,{previous.world[12],previous.world[13],previous.world[14]},
+      {current.world[12],current.world[13],current.world[14]},alpha);
+    result.fov=previous.fov+alpha*(current.fov-previous.fov);
     return result;
   }
+  // Interpolate's world for alpha in (0,1) and a pair that is not the same:
+  // the rotation from the prepared arc, the translations (world[12..14])
+  // linear.
+  static std::array<float,16> InterpolateWorld(const Blend& blend,const std::array<float,3>& previous,
+      const std::array<float,3>& current,float alpha) {
+    float left=1-alpha,right=alpha;
+    if(blend.slerp) {
+      left=std::sin((1-alpha)*blend.angle)/blend.divisor;
+      right=std::sin(alpha*blend.angle)/blend.divisor;
+    }
+    auto a=blend.a;
+    for(size_t i=0;i<4;++i) a[i]=a[i]*left+blend.b[i]*right;
+    Normalize(a);
+    const auto [x,y,z,w]=a;
+    std::array<float,16> world{1-2*(y*y+z*z),2*(x*y+z*w),2*(x*z-y*w),0,
+                               2*(x*y-z*w),1-2*(x*x+z*z),2*(y*z+x*w),0,
+                               2*(x*z+y*w),2*(y*z-x*w),1-2*(x*x+y*y),0,
+                               0,0,0,1};
+    for(size_t i=0;i<3;++i) world[12+i]=previous[i]+alpha*(current[i]-previous[i]);
+    return world;
+  }
  private:
-  using Quaternion=std::array<float,4>;
   static float Dot(const Quaternion& a,const Quaternion& b) {
     return a[0]*b[0]+a[1]*b[1]+a[2]*b[2]+a[3]*b[3];
   }
@@ -96,12 +145,7 @@ class NativeCameraHistory {
     return determinant>0.998f;
   }
   static bool Cut(const NativeCameraPose& a,const NativeCameraPose& b) {
-    float distance=0;
-    for(size_t i=12;i<15;++i) { const auto d=a.world[i]-b.world[i]; distance+=d*d; }
-    // Discontinuous jumps must not sweep through geometry. Ordinary movement
-    // and zoom blend; camera replacement also resets at the integration layer.
-    return distance>50.f*50.f || std::abs(a.fov-b.fov)>0.25f ||
-      std::abs(Dot(Rotation(a.world),Rotation(b.world)))<0.70710678f;
+    return CutWith(a,b,Rotation(a.world),Rotation(b.world));
   }
   NativeCameraPose previous_{},current_{};
   uint64_t tick_=0;
