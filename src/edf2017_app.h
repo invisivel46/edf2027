@@ -32,15 +32,13 @@
 #include "native_graphics/native_backend_host.h"
 #include "native_graphics/d3d12_backend.h"
 #endif
+// edf_native_preview_window, edf_native_scene_backend, edf_native_untiled_scene, edf_native_mesh_watch_audit.
+#include "native_graphics/bridge/native_cvars.h"
 
 REXCVAR_DECLARE(std::string, game_data_root);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
-REXCVAR_DECLARE(bool, edf_native_preview_window);
 REXCVAR_DECLARE(bool, edf_native_host);
-REXCVAR_DECLARE(std::string, edf_native_scene_backend);
-REXCVAR_DECLARE(bool, edf_native_untiled_scene);
-REXCVAR_DECLARE(bool, edf_native_mesh_watch_audit);
 REXCVAR_DECLARE(bool, audio_mute);
 REXCVAR_DECLARE(bool, edf_menu_pause);
 REXCVAR_DECLARE(bool, edf_menu_mute_audio);

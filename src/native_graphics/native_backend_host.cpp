@@ -1,12 +1,12 @@
 #include "native_backend_host.h"
 #include "d3d11_texture.h"
+#include "bridge/native_cvars.h"  // edf_native_unlock_framerate
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <fstream>
 #include <stdexcept>
 
 REXCVAR_DECLARE(bool,edf_native_vsync);
-REXCVAR_DECLARE(bool,edf_native_unlock_framerate);
 REXCVAR_DECLARE(bool,edf_native_host_timings);
 REXCVAR_DECLARE(std::string,edf_native_host_capture);
 REXCVAR_DECLARE(int32_t,edf_native_host_capture_after_ms);

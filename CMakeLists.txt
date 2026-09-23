@@ -51,6 +51,10 @@ if(WIN32)
     target_link_libraries(edf_native_sdk_ui PUBLIC edf_native_d3d11 rex::runtime)
     add_executable(edf2027 WIN32 ${EDF2027_SOURCES})
     target_sources(edf2027 PRIVATE src/native_graphics/guest_shader_bridge.cpp)
+    # Split out of the bridge (same target, so the same host optimization flags): its cvars,
+    # hook timing and bridge locks, and the shared bridge state (State()).
+    target_sources(edf2027 PRIVATE src/native_graphics/bridge/native_cvars.cpp
+        src/native_graphics/bridge/hook_timing.cpp src/native_graphics/bridge/bridge_state.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_full_frame_sky.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)

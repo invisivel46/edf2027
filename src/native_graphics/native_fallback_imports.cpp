@@ -1,10 +1,10 @@
 #include <Windows.h>
 #include <delayimp.h>
+#include "bridge/native_cvars.h"  // edf_native_scene_backend
 #include <rex/cvar.h>
 #include <cstring>
 #include <stdexcept>
 
-REXCVAR_DECLARE(std::string,edf_native_scene_backend);
 namespace {
 FARPROC WINAPI CheckFallbackImport(unsigned notification,PDelayLoadInfo import) {
   if(notification==dliNotePreGetProcAddress && !_stricmp(import->szDll,"d3d11.dll") &&

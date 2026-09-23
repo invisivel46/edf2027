@@ -127,6 +127,8 @@
 #include "native_reuse.h"
 #include "native_immediate_classify.h"
 #include "font_effect.h"
+#include "bridge/native_cvars.h"
+#include "bridge/bridge_state.h"
 #include <rex/cvar.h>
 #include <rex/chrono/clock.h>
 #include <rex/ppc/func.h>
@@ -150,272 +152,23 @@
 #include <thread>
 #include <optional>
 
-REXCVAR_DEFINE_BOOL(edf_native_shader_bridge, false, "EDF2027",
-                   "Validate native shader resources against live guest loads (development)");
-REXCVAR_DEFINE_BOOL(edf_native_render_state_audit,false,"EDF2027",
-                   "Compare setter-owned render-state snapshots with live draw state (diagnostic; does not bypass reads)");
-REXCVAR_DEFINE_BOOL(edf_native_material_sampler_audit,false,"EDF2027",
-                   "Compare explicit native material sampler programs with original activation (diagnostic)");
-REXCVAR_DEFINE_BOOL(edf_native_material_state_audit,false,"EDF2027",
-                   "Compare explicit native material render-state programs with original activation (diagnostic)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_material_audit,false,"EDF2027",
-                   "Compare published programs with explicit pass-time constants and visible group setup (diagnostic)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_material_owned,false,"EDF2027",
-                   "Construct queued rigid scene materials from published programs and native pass inputs");
-REXCVAR_DEFINE_BOOL(edf_native_scene_activation_owned,false,"EDF2027",
-                   "Activate queued scene shader bindings from published material inputs");
-REXCVAR_DEFINE_BOOL(edf_native_scene_geometry_owned,false,"EDF2027",
-                   "Use published geometry for the first native group draw, retaining the indexed CPU tail");
-REXCVAR_DEFINE_BOOL(edf_native_scene_instance_owned,false,"EDF2027",
-                   "Use lifecycle-owned world-only instance register metadata");
-REXCVAR_DEFINE_BOOL(edf_native_scene_pass_owned,false,"EDF2027",
-                   "Carry explicit render and sampler pass state between native groups");
-REXCVAR_DEFINE_BOOL(edf_native_scene_geometry_deferred,false,"EDF2027",
-                   "Submit eligible native groups before installing compatibility geometry bindings");
-REXCVAR_DEFINE_BOOL(edf_native_scene_material_deferred,false,"EDF2027",
-                   "Submit eligible native groups before CPU material activation and restore state at handoff");
-REXCVAR_DEFINE_BOOL(edf_native_scene_reject_compatibility,false,"EDF2027",
-                   "Diagnostic: reject counted static-group compatibility boundaries before calling them");
-REXCVAR_DEFINE_BOOL(edf_native_scene_view_owned,false,"EDF2027",
-                   "Carry viewport, scissor and native target selection across native material groups");
-REXCVAR_DEFINE_BOOL(edf_native_scene_camera_owned,false,"EDF2027",
-                   "Consume immutable producer camera matrices at native render entry");
-REXCVAR_DEFINE_BOOL(edf_native_scene_sources_owned,false,"EDF2027",
-                   "Select native static sources, LOD, visibility and world from one scene publication");
-REXCVAR_DEFINE_BOOL(edf_native_scene_selection_owned,false,"EDF2027",
-                   "Resolve published static instances without mutating the current scene database");
-REXCVAR_DEFINE_BOOL(edf_native_scene_membership_owned,false,"EDF2027",
-                   "Select spatial lists and hierarchy from the same publication as native scene sources and assets");
-REXCVAR_DEFINE_BOOL(edf_native_worker_callback_audit,false,"EDF2027",
-                   "Log up to 256 render-worker callback registrations for writer provenance (diagnostic)");
-REXCVAR_DEFINE_BOOL(edf_native_retirement_audit,false,"EDF2027",
-                   "Sample completed native setter retirement branches and descriptor identity (diagnostic)");
-REXCVAR_DEFINE_INT32(edf_native_geometry_verify_interval,256,"EDF2027",
-                    "Sample the guest geometry byte comparison once per N snapshot observations of an owner once its revision proves the retained candidate; 0 compares every draw. A detected miss permanently restores full comparison");
-REXCVAR_DEFINE_INT32(edf_native_geometry_verify_initial,8,"EDF2027",
-                    "Snapshot observations of each subscription lifetime that always compare guest geometry bytes before the sampled schedule applies (0..65536)");
-REXCVAR_DEFINE_INT32(edf_native_wait_stall_ms,5000,"EDF2027",
-                    "Native wait no-progress deadline in host milliseconds (1..600000); failure does not fake GPU completion");
-REXCVAR_DEFINE_BOOL(edf_native_owned_render_state,true,"EDF2027",
-                   "Use native setter-owned render words, scissor enable and blend factors; false enables diagnostic legacy reads");
-REXCVAR_DEFINE_INT32(edf_native_anisotropic_filtering, -1, "EDF2027",
-                    "Native material filtering: -1 game default, 0 off, 1..5 for 1x..16x; preserves point/base-only sampling");
-REXCVAR_DEFINE_INT32(edf_native_render_width, 0, "EDF2027",
-                    "Native render width at startup; 0 takes the width from the window's shape (native_display_layout.h), a positive width with a positive height renders exactly that size (restart required)");
-REXCVAR_DEFINE_INT32(edf_native_msaa, 0, "EDF2027",
-                    "Native scene samples: 0 game default, 1 off, 2 or 4 MSAA (restart required)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_depth_srv, false, "EDF2027",
-                   "Create a single-sampled native scene depth shader-readable (typeless, with a depth SRV) for FSR; ignored with MSAA (restart required)");
-REXCVAR_DEFINE_STRING(edf_native_fsr, "off", "EDF2027",
-                     "FSR 3.1 on the native full-frame scene (native_fsr.h): off, or native_aa (1.0x temporal anti-aliasing); quality, balanced, performance and ultra_performance are accepted and run as native_aa until render scaling exists. On at startup it forces 1x scene MSAA and the sampled scene depth (edf_native_msaa, edf_native_scene_depth_srv; restart-time), so turning it on later needs a restart unless those already hold. Off while edf_native_ab_alternate, edf_native_reuse_off_alternate or edf_native_shadow_render is set");
-REXCVAR_DEFINE_DOUBLE(edf_native_fsr_sharpness, 0.2, "EDF2027",
-                     "FSR sharpening (RCAS) strength, 0 (off) to 1").range(0.0,1.0);
-// Defined further down; FSR reads them to stand aside for the validation runs.
-REXCVAR_DECLARE(int32_t, edf_native_ab_alternate);
-REXCVAR_DECLARE(int32_t, edf_native_reuse_off_alternate);
-REXCVAR_DECLARE(int32_t, edf_native_shadow_render);
-REXCVAR_DEFINE_BOOL(edf_native_motion_vectors, false, "EDF2027",
-                   "FSR motion vectors: camera reprojection from the scene depth plus a velocity re-render of moving models, per view before post; forces a single-sampled, shader-readable scene depth (restart required)");
-REXCVAR_DEFINE_INT32(edf_native_motion_vectors_debug, 0, "EDF2027",
-                    "Motion vector debug view over the output before the HUD: 0 off, 1 motion as colour, 2 history-valid mask").range(0,2);
-REXCVAR_DEFINE_INT32(edf_native_render_height, 0, "EDF2027",
-                    "Native render height at startup: 0 is 720 lines (with width 0, exactly 1280x720 on a 16:9 window), -1 the window's size, otherwise the line count; paired with render width (restart required)");
 // Launcher cvars (launcher_cvars.cpp) and the SDK's window size, for the
 // render size and the 2D canvas layout (native_display_layout.h).
 REXCVAR_DECLARE(std::string, edf_aspect);
 REXCVAR_DECLARE(std::string, edf_hud_safe_area);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
-REXCVAR_DEFINE_STRING(edf_native_scene_capture, "", "EDF2027",
-                     "Optional prefix for partial scene, font/movie and output-frame BMP diagnostics (not presentation)");
-REXCVAR_DEFINE_INT32(edf_native_output_capture_interval,0,"EDF2027",
-                    "Additional output capture interval in indexed frames; 0 disables periodic captures (development)");
-REXCVAR_DEFINE_INT32(edf_native_output_capture_limit,32,"EDF2027",
-                    "Maximum diagnostic output BMPs per run, clamped to 0..128; requires scene capture prefix (development)");
-REXCVAR_DEFINE_INT32(edf_native_output_capture_start_frame,0,"EDF2027",
-                    "Positive indexed frame starts interval captures and disables startup milestones; 0 preserves defaults (development)");
-REXCVAR_DEFINE_BOOL(edf_native_output_capture_scene_color,false,"EDF2027",
-                   "Also capture scene color at each selected output frame to diagnose post-processing differences (development)");
-REXCVAR_DEFINE_INT32(edf_native_shadow_render,0,"EDF2027",
-                    "Shadow render: every Nth indexed output frame, after the native full frame, also render the guest helper path for the same state into offscreen targets and write both pre-HUD images and draw lists (tools/shadow-diff.py); 0 off (development)").range(0,100000);
-REXCVAR_DEFINE_INT32(edf_native_shadow_render_start_frame,0,"EDF2027",
-                    "First indexed output frame a shadow render may take; shadow frames are start, start+N, ... (development)").range(0,100000000);
-REXCVAR_DEFINE_INT32(edf_native_shadow_render_limit,16,"EDF2027",
-                    "Maximum shadow frames written per run (development)").range(0,4096);
-REXCVAR_DEFINE_STRING(edf_native_shadow_render_prefix,"native-shadow/shadow","EDF2027",
-                     "Path prefix of shadow render output: <prefix>.<frame>.native.bmp/.guest.bmp, .native.draws.jsonl/.guest.draws.jsonl and .shadow.json; its directory is created (development)");
-REXCVAR_DEFINE_BOOL(edf_native_shadow_render_constants,false,"EDF2027",
-                   "Shadow render: also write every draw's constant bytes and its transient vertex uploads of up to 4 KB into the draw lists, so tools/shadow-diff.py can say which registers and vertices differ (large; development)");
-REXCVAR_DEFINE_BOOL(edf_native_pixel_centers,true,"EDF2027",
-                   "Apply the guest PA_SU_VTX_CNTL half-pixel offset to the audited retail post passes; false restores the unshifted viewport for regression diagnosis");
-REXCVAR_DEFINE_INT32(edf_native_loop_trace,0,"EDF2027",
-                    "Trace the first N engine heartbeat/update/helper calls with thread and timing for frame-rate decoupling; 0 disables (development)").range(0,10000);
-REXCVAR_DEFINE_INT32(edf_native_motion_trace,0,"EDF2027",
-                    "Trace the first N scene camera submissions and matrix fingerprints; 0 disables (development)").range(0,10000);
-REXCVAR_DEFINE_INT32(edf_native_instance_motion_trace,0,"EDF2027",
-                    "Observe transforms for N scene frames, up to 256 instance and 64 palette sources; 0 disables (development)").range(0,10000);
-REXCVAR_DEFINE_BOOL(edf_native_scene_adapter_audit,false,"EDF2027",
-                   "Log bounded world-object dispatch samples for native scene lifetime integration (development)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_queued,false,"EDF2027",
-                   "Render supported queued static-world groups from retained native scene objects (development)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_preload,false,"EDF2027",
-                   "Publish static-group geometry and owned material inputs without draw callbacks (development)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_transform_audit,false,"EDF2027",
-                   "Compare event-published native static transforms with every queued guest matrix (development)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_visibility,false,"EDF2027",
-                   "Use native visibility and static LOD selection within the opt-in native scene path (development)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_visibility_audit,false,"EDF2027",
-                   "Compare native visibility against original culling routines and live bounds (development)");
-REXCVAR_DEFINE_BOOL(edf_native_bucket_dispatch_audit,false,"EDF2027",
-                   "Compare the native sort-mode 1/2 bucket key and insert with sub_821C0C00 (development)");
-REXCVAR_DEFINE_BOOL(edf_native_bucket_dispatch,false,"EDF2027",
-                   "Insert sort-mode 1/2 objects into the guest depth buckets natively instead of sub_821C0C00 (development)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_static_walk,false,"EDF2027",
-                   "Publish a per-world static walk plan at the simulation step and drive the native visibility walk from it: planned membership, vtable slot and source candidates; mode, hidden flag and vtable stay live (development)");
-REXCVAR_DEFINE_BOOL(edf_native_scene_static_walk_audit,false,"EDF2027",
-                   "Publish the static walk plan and compare its classification with the live walk reads, counting mismatches; the walk itself stays live (development)");
-REXCVAR_DEFINE_BOOL(edf_native_unlock_framerate,false,"EDF2027",
-                   "Experimental independent render loop with 60 Hz step dispatch; motion interpolation and timing validation are in progress");
-REXCVAR_DEFINE_BOOL(edf_native_camera_interpolation,true,"EDF2027",
-                   "Interpolate published camera poses in experimental unlocked mode; false permits diagnostic comparison");
-REXCVAR_DEFINE_BOOL(edf_native_model_interpolation,true,"EDF2027",
-                   "Interpolate model pose uploads in experimental unlocked mode; false permits diagnostic comparison");
-REXCVAR_DEFINE_BOOL(edf_native_model_publication,false,"EDF2027",
-                   "Capture model draw layouts at first sight and publish per-tick pose snapshots; draws are unchanged (development)");
-REXCVAR_DEFINE_BOOL(edf_native_model_publication_audit,false,"EDF2027",
-                   "Compare published model layouts and poses with live memory at model draw entry (development)");
-REXCVAR_DEFINE_BOOL(edf_native_render_registry,false,"EDF2027",
-                   "Track render objects from the base constructor/destructor and update subscription, and publish a per-tick renderable snapshot at the end of 821A4DE8 for the full-frame renderer; draws are unchanged (development)");
-REXCVAR_DEFINE_BOOL(edf_native_render_registry_audit,false,"EDF2027",
-                   "Walk scene+84 and scene+100 each tick and count mismatches against the render registry's records and subscriptions; requires edf_native_render_registry (development)");
-REXCVAR_DEFINE_BOOL(edf_native_model_source_audit,false,"EDF2027",
-                   "Full-frame Models pass: fetch the program and geometry of every draw kept at the current source generation afresh from the providers and log each one that differs (a provider input the source generation missed) (development)");
-REXCVAR_DEFINE_BOOL(edf_native_render_registry_idle_skip,true,"EDF2027",
-                   "On an unlocked render-only iteration (no simulation step) the render registry applies its events and reads only new, resubscribed and retrying objects plus a round-robin probe of the update members (and those a probe found changing on such iterations), not every scene+100 member, animated object and round-robin refresh; false re-reads them every iteration");
-REXCVAR_DEFINE_BOOL(edf_native_render_registry_idle_audit,false,"EDF2027",
-                   "Follow each render-only light registry tick with a compare-only read of every update member and log the entries a full tick would change (what the light tick left unread); publishes nothing (development)");
-REXCVAR_DEFINE_BOOL(edf_native_model_pass,false,"EDF2027",
-                   "Draw rigid published models natively at 821C9C20; any unsupported object runs the original draw. Requires edf_native_model_publication and the static world pass scene flags (development)");
-REXCVAR_DEFINE_BOOL(edf_native_model_pass_skinned,false,"EDF2027",
-                   "Also draw palette-skinned models (instance+12 set) in the native model pass, binding the packed bone palette as g_mWorldArray; requires edf_native_model_pass (development)");
-REXCVAR_DEFINE_BOOL(edf_native_capture_indexed_state,false,"EDF2027",
-                   "Trace up to 256 indexed draw states per selected capture frame; requires scene capture prefix (development)");
-REXCVAR_DEFINE_INT32(edf_native_probe_x, -1, "EDF2027", "Optional native scene invalid-RGB probe pixel X");
-REXCVAR_DEFINE_INT32(edf_native_probe_y, -1, "EDF2027", "Optional native scene invalid-RGB probe pixel Y");
-REXCVAR_DEFINE_INT32(edf_native_probe_frame, 0, "EDF2027",
-                    "First indexed output candidate to probe; 0 retains first-scene diagnostics");
-REXCVAR_DEFINE_INT32(edf_native_probe_width, 1, "EDF2027", "Invalid-RGB diagnostic region width");
-REXCVAR_DEFINE_INT32(edf_native_probe_height, 1, "EDF2027", "Invalid-RGB diagnostic region height");
-REXCVAR_DEFINE_INT32(edf_native_probe_draw_limit, 4096, "EDF2027", "Maximum invalid-RGB diagnostic draws, capped at 65536");
-REXCVAR_DEFINE_BOOL(edf_native_probe_negative, false, "EDF2027",
-                   "Also stop the invalid-RGB probe on a scene channel at or below -1; the tone curve maps a large negative to white");
-REXCVAR_DEFINE_STRING(edf_native_backend, "d3d12", "EDF2027",
-                     "Backend used by everything that draws through the renderer's backend interface: d3d12 (default), d3d12-warp, d3d11, d3d11-warp, or empty for none. Built on first use, so selecting one costs nothing until something draws through it. An unknown name is refused rather than silently falling back");
-REXCVAR_DEFINE_STRING(edf_native_scene_backend, "d3d12", "EDF2027",
-                     "Scene rendering backend: d3d12 (default) or d3d11 for comparison. D3D12 publishes a fenced GPU snapshot through the host compositor, preserving display gamma and overlays. D3D11 is an explicit fallback; backend initialization failures do not silently change this setting");
-REXCVAR_DEFINE_STRING(edf_native_cache_dir, "", "EDF2027",
-                     "Directory for the renderer's persistent caches: compiled shader bytecode (shaders/<sha256>.dxbc) and the scene backend's D3D12 pipeline manifest (d3d12_pipelines.bin), which the next run prebuilds in the background. Empty (default) uses native_cache beside the executable; off disables both, leaving only this run's in-memory caches. Entries are keyed by SHA-256 of everything their output depends on, so a stale file is a miss, never a wrong shader or pipeline");
-REXCVAR_DEFINE_INT32(edf_native_upload_megabytes, 256, "EDF2027",
-                    "Upload-ring megabytes for a D3D12 backend. Every recorded draw stages its constants here and the ring is retired by fence, so it has to hold every frame still in flight. A frame that does not fit is refused with the high water it reached, which is what to set this from");
-REXCVAR_DEFINE_INT32(edf_native_geometry_workers, 4, "EDF2027",
-    "D3D12 geometry recording workers (0 direct, 1 serial packets, 2..32 parallel); restart required");
-REXCVAR_DEFINE_INT32(edf_native_frame_operations, 8192, "EDF2027",
-                    "Recorded operations after which the scene's frame is submitted and a new one opened, rather than waiting for the guest's swap. The guest swaps once a frame but begins render targets far more often than that - measured at 1,000 begins across 8 swaps - so a frame tied only to the swap accumulates without bound during loading, which is one command list, one ring's worth of uploads, and eventually a GPU with more work in one submission than it will accept");
-REXCVAR_DEFINE_BOOL(edf_native_d3d12_debug_layer, false, "EDF2027",
-                   "Turn the D3D12 debug layer, and GPU-based validation with it, on for every backend this process builds - including the hardware one. Very slow. Worth it when something removes the device: the plain layer names an invalid call, and GPU-based validation names what a shader did with a valid one, which is the half that presents as a hang with nothing in the log");
-REXCVAR_DEFINE_BOOL(edf_native_seam_draws, true, "EDF2027",
-                   "Record the scene's draws through the backend interface instead of calling the D3D11 context directly. True by default, and required by --edf_native_scene_backend=d3d12: a draw issued straight to the D3D11 context cannot bind a resource that lives on another device. False keeps the old direct path, which only works with the d3d11 scene backend and exists as the A/B control - with both on d3d11 the two draw the same thing on the same device, so a difference is a wiring mistake rather than a backend one");
-REXCVAR_DEFINE_BOOL(edf_native_backend_present, true, "EDF2027",
-                   "Use a separate presenting backend for the D3D11 fallback. D3D12 always uses its native host and presenter");
-REXCVAR_DEFINE_BOOL(edf_native_reuse_material, true, "EDF2027",
-                   "Skip re-binding the shader pair, textures and samplers when the previous indexed draw already bound the same ones and nothing has bound since. Set false if repeated objects ever show another material's textures; that is what a wrong guard here looks like");
-REXCVAR_DEFINE_INT32(edf_native_shader_workers, -1, "EDF2027",
-                    "Threads used to compile a shader registration's entries: -1 picks one per core up to eight, 0 compiles inline on the calling thread. Compilation is the load cost worth threading - the entries are a real batch and each takes milliseconds, unlike the per-draw work, which has neither property");
-REXCVAR_DEFINE_INT32(edf_native_preload_workers, -1, "EDF2027",
-                    "Threads that help the engine thread check the static preloads' groups each step (821A4DE8, between frames): -1 picks 3 on 8+ cores, 1 on 4+, else 0; 0 checks every group on the engine thread. Read once, at the first preload").range(-1,16);
-REXCVAR_DEFINE_BOOL(edf_native_registry_overlap, true, "EDF2027",
-                   "Run the render registry's per-step tick on its own thread beside the step's scene publication and preloads (joined before 821A4DE8 returns); false runs it after them on the engine thread");
-REXCVAR_DEFINE_BOOL(edf_native_backend_preview, false, "EDF2027",
-                   "Open a second window drawn and presented entirely by the selected backend. Needs --edf_native_backend and --edf_native_publish_frames. The renderer's own window is untouched");
-REXCVAR_DEFINE_BOOL(edf_native_batch_audit, false, "EDF2027",
-                   "Measure runs of consecutive indexed draws that differ only in per-instance constants; the mean run length is the draw-call reduction instancing would give");
-REXCVAR_DEFINE_INT32(edf_native_contract_limit, 4096, "EDF2027",
-                    "Distinct draw contracts the coverage ledger retains (1..1048576); reaching it is counted, never silently dropped");
-REXCVAR_DEFINE_STRING(edf_native_contract_export, "", "EDF2027",
-                     "Write the captured draw-contract catalog to this path; the offline geometry check replays it");
-REXCVAR_DEFINE_BOOL(edf_native_contract_coverage, false, "EDF2027",
-                   "Also record every submitted draw contract, so a run can enumerate what the content exercises; costs a set lookup per draw");
-REXCVAR_DEFINE_INT32(edf_native_shared_constant_audit, 0, "EDF2027",
-                    "Audit Common.fx globals a stage's native shader consumes but the material never lists for that stage, for this many activations; 0 disables (development)");
-REXCVAR_DEFINE_INT32(edf_native_frame_latency,2,"EDF2027",
-  "D3D12 frame credits: 1 drains each frame, 2 overlaps next-frame preparation; restart required.");
-REXCVAR_DEFINE_STRING(edf_native_frame_trace, "", "EDF2027",
-  "Optional CSV of swap-boundary wall times; restart to change the output path.");
-REXCVAR_DEFINE_BOOL(edf_native_owned_mesh_hit,true,"EDF2027",
-                   "Reuse consecutive mesh hits with identical owned geometry snapshots");
-REXCVAR_DEFINE_BOOL(edf_native_world_instancing,true,"EDF2027",
-                   "Combine compatible queued world-matrix draws into GPU instances");
-REXCVAR_DEFINE_BOOL(edf_native_world_constant_reuse,true,"EDF2027",
-                   "Retain shared vertex constants when only an instance world matrix changes");
-REXCVAR_DEFINE_BOOL(edf_native_transient_batching,true,"EDF2027",
-                   "Record a UI/immediate list draw (XUI brush, font run, Utility 2D quad or line) as the continuation of the draw before it when the two differ only in their vertices; the Utility 2D path then records its quads non-indexed. Set false to record every draw as its own");
-REXCVAR_DEFINE_BOOL(edf_native_reuse_off,false,"EDF2027",
-                   "Correctness diagnostics: disable every cross-frame reuse of the full-frame renderer (native_reuse.h): the models' draw states, carried objects, material rows and caches, source memo and pose-blend cache; the static world's frame, group memos, material cache, instance reuse, selection cache, flattened tree, cluster cull and uniform recording; the sky's material, layout and hierarchy caches; the registry's render-only light ticks, frame-pose memo and unchanged-entry/constant pointer sharing; shared effect activation, transient batching (implies edf_native_transient_batching off) and the UI lookup memos. Output should be identical, only slower (development)");
-REXCVAR_DEFINE_INT32(edf_native_reuse_off_alternate,0,"EDF2027",
-  "Correctness diagnostics: render with reuse off (edf_native_reuse_off) in runs of N indexed output frames from the capture start frame, the edf_native_ab_alternate rule: even runs (the reference, logged reuse_alternate frame=F native=0) reuse off, odd runs (judged, native=1) reuse on; 0 off, ignored while edf_native_ab_alternate is on (development)").range(0,1000);
-REXCVAR_DEFINE_BOOL(edf_native_prepared_geometry,true,"EDF2027",
-                   "Reuse prepared queued geometry after guarded snapshot validation");
 // Transient batching (edf_native_transient_batching), off whenever reuse is
 // (native_reuse.h): a batched run is recorded as its separate draws.
 static bool NativeTransientBatchingEnabled() {
   return REXCVAR_GET(edf_native_transient_batching) && edf::native::NativeReuseAllowed();
 }
-REXCVAR_DEFINE_INT32(edf_native_hook_sample_period,0,"EDF2027",
-  "Sample one in N bridge timing scopes (0 disables); independent of full hook/load instrumentation").range(0,4096);
-REXCVAR_DEFINE_BOOL(edf_native_hook_timings, false, "EDF2027",
-                   "Log inclusive CPU wall times for native/original graphics hook phases (development)");
-REXCVAR_DEFINE_BOOL(edf_native_gpu_timings, false, "EDF2027",
-                   "Log GPU time per full-frame pass (sky, models, static_world, effects, transparent, post, view overlays, HUD phases) and per frame from scene-backend timestamps, read back frames later without stalling (development)");
-REXCVAR_DEFINE_BOOL(edf_native_coverage_census, false, "EDF2027",
-                   "Full-frame coverage census: count, per class and reason, what the native passes draw and every object, pass or view they skip that the guest render helper would have drawn; logs 'Native coverage' summaries every edf_native_coverage_census_interval seconds and at exit (tools/coverage-report.py; development)");
-REXCVAR_DEFINE_INT32(edf_native_coverage_census_interval,30,"EDF2027",
-  "Seconds between edf_native_coverage_census summaries").range(1,3600);
-REXCVAR_DEFINE_BOOL(edf_native_frame_times, false, "EDF2027",
-                   "Log present-to-present frame-time percentiles and one line per spike frame (over 25 ms or twice the rolling median) with its pipeline, shader, geometry and texture creations, declined passes and largest hook phases (development)");
-REXCVAR_DEFINE_INT32(edf_native_thread_qos,2,"EDF2027",
-  "Engine and render helper thread QoS: 0 OS default (a hidden or occluded window gets low QoS, which on hybrid CPUs "
-  "prefers efficiency cores), 1 opt out of execution-speed throttling (HighQoS), 2 also prefer performance-core CPU sets").range(0,2);
-REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
-                   "Sample end-frame publication eligibility and cumulative UI draws; does not capture pixels (development)");
-REXCVAR_DEFINE_BOOL(edf_native_load_timings, false, "EDF2027",
-                   "Log each texture/shader load phase CPU duration, including nested work (development)");
-REXCVAR_DEFINE_BOOL(edf_native_load_trace, false, "EDF2027",
-                   "Loading-screen trace: log the load's phase transitions (mission begin, BeginLoading/EndLoading requests, "
-                   "the engine's resource transition, LoadMap, the loading presenter's start and exit) and, per phase and "
-                   "every 250 ms while loading, the time per category (file reads and bytes, texture snapshot/guest/create, "
-                   "shaders, model construction/publication/retirement, preloads, guest and bridge-mutex waits) split "
-                   "engine thread / other threads, plus the engine thread's CPU time; aggregated, no per-call lines (development)");
-REXCVAR_DEFINE_BOOL(edf_native_mesh_watch_audit,false,"EDF2027",
-                   "Audit physical mesh write versions against exact bytes; never skips validation (development)");
-REXCVAR_DEFINE_BOOL(edf_native_untiled_scene, true, "EDF2027",
-                   "Deprecated compatibility setting; native untiled scene lifecycle is always used");
-REXCVAR_DEFINE_BOOL(edf_native_guest_heap_reads, true, "EDF2027",
-                   "Validate committed readable SDK regions; Windows validation remains fallback (false forces OS checks)");
-REXCVAR_DEFINE_BOOL(edf_native_fence_probe, false, "EDF2027",
-                   "Observe native event-query completion at guest fence boundaries; never writes guest counters");
-REXCVAR_DEFINE_BOOL(edf_native_validate_wait, false, "EDF2027",
-                   "Development: await native completion after original guest waits; requires native bridge and fence probe");
-REXCVAR_DEFINE_BOOL(edf_native_publish_frames, false, "EDF2027",
-                   "Publish native movie/partial scene GPU snapshots for host presentation; requires native bridge");
-REXCVAR_DEFINE_BOOL(edf_native_preview_window, false, "EDF2027",
-                   "Show native frames in a separate development window; requires frame publication");
 REXCVAR_DECLARE(bool, edf_native_host);
 REX_EXTERN(__imp__KeSetEvent);
 
 // edf_native_load_trace (native_load_trace.h): phase events and 250 ms ticks.
 // Everything here runs only with the cvar on; off, each hook pays one cvar read.
 namespace {
-bool LoadTraceOn() { return REXCVAR_GET(edf_native_load_trace); }
 struct NativeLoadTraceState {
   using Clock=std::chrono::steady_clock;
   std::mutex mutex;
@@ -620,451 +373,6 @@ NativeViewportState MapNativeCanvasViewportScissor(NativeViewportState state,con
   return state;
 }
 namespace {
-// Opt-in CPU wall-clock diagnostics, not GPU timestamps. Include lock waits and
-// any nested work; phases from different hooks must not be added as exclusive
-// frame costs. Per-thread buckets avoid adding contention to the draw path.
-enum class HookPhase { ActivationGuest, ActivationNative, InstanceGuest, InstanceNative,
-                       IndexedNative, IndexedGuest, ImmediateNative, ImmediateGuest,
-                       SwapGpuWait, SwapRefreshWait, EngineWait, CompletionPoll,
-                       SceneSetup, WorkerService, TilingBegin, TilingEnd,
-                       FenceWait, SubmissionFlush, DescriptorSubmit,
-                       SceneSetupGuest, SceneSetupNative, SceneSetupLock, SceneClear,
-                       ColorTarget, DepthTarget, ViewportHook, ViewportLock,
-                       ViewportRead, ViewportWrite, ViewportGuest,
-                       IndexedMesh, IndexedBindings, MeshRanges, MeshAcquire, MeshDrawRange,
-                       MeshObserve, MeshLookup, MeshCommit,
-                       IndexedSubmissionWait, IndexedContextWait, ImmediateSubmissionWait,
-                       ImmediateContextWait, PresentationContextWait,
-                       ActivationLock, ActivationResolve, ActivationVertexParams, ActivationPixelParams,
-                       ActivationTextures, ActivationBind,
-                       XuiNative, XuiDecode, XuiBind, XuiDraw,
-                       IndexedSetup, IndexedRecord, IndexedDraw, IndexedTail, IndexedCoverage,
-                       ImmediateClassify, ImmediateUtility3D, ImmediateAcquire, ImmediateRecord, ImmediateTail,
-                       ActivationSamplerWords, InstanceRead, InstancePatch,
-                       SimulationDispatch, RenderHelper, FrameTransition,
-                       RenderGather, RenderBuckets, RenderModel, RenderMesh, RenderOverlay,
-                       RenderSceneEnd, RenderFinish, RenderPose,
-                       RenderList, RenderSceneBegin, RenderChildren, RenderWorld,
-                       RenderListener, RenderUiListener,
-                       RenderQueued, RenderMaterialGroup,
-                       RenderGatherClassify, RenderGatherVisibility, RenderGatherLod, RenderGatherPush, RenderGatherGuest,
-                       QueuedEligibility, QueuedResolve, QueuedInstances, QueuedRecord,
-                       QueuedHandoff, QueuedHandoffBinds, QueuedHandoffReplays,
-                       FrameNative, FrameNativeBegin, FrameNativeSky, FrameNativeModels,
-                       FrameNativeStaticWorld, FrameNativeEffects, FrameNativeTransparent, FrameNativePost,
-                       FrameNativeEnd, FrameNativeOverlays, FrameNativePhases,
-                       FrameNativeModelsVisibility, FrameNativeModelsPrograms, FrameNativeModelsResolve, FrameNativeModelsRecord,
-                       FrameNativeStaticWorldSelect, FrameNativeStaticWorldBuild, FrameNativeStaticWorldRecord,
-                       SimRegistry, SimStaticWalk, SimPreloadGeometry, SimPreloadMaterial,
-                       SimTrees, SimMembership, SimPublish, SimPoses, SimLockWait, SimPreloadPrecheck, SimWorldUpdate,
-                       BridgeMutexWait, BridgeGateWait, GuestWait,
-                       TextureSnapshot, TextureOriginal, TextureLock, TextureCreate,
-                       ShaderRegistration, ShaderLock, ShaderEntry,
-                       TextureAllocate, TextureUpload2D, TextureUploadVolume, TexturePrepare,
-                       ResourceOneShot, ResourceCoordinator, ResourceHelper, ResourceTransition, Count };
-constexpr const char* kHookPhaseNames[]{"activation.original","activation.native",
-  "instance.original","instance.native","indexed.native","indexed.original",
-  "immediate.native","immediate.original","swap.gpu_wait","swap.refresh_wait",
-  "engine.wait","completion.poll","scene.setup","worker.service","tiling.begin","tiling.end",
-  "fence.wait","submission.flush","descriptor.submit","scene.setup.original","scene.setup.native",
-  "scene.setup.lock","scene.clear","target.color","target.depth","viewport.hook",
-  "viewport.lock","viewport.read","viewport.write","viewport.original",
-  "indexed.mesh","indexed.bindings","mesh.ranges","mesh.acquire","mesh.draw_range",
-  "mesh.observe","mesh.lookup","mesh.commit",
-  "indexed.submission_wait","indexed.context_wait","immediate.submission_wait",
-  "immediate.context_wait","presentation.context_wait",
-  "activation.lock","activation.resolve","activation.params_vs","activation.params_ps",
-  "activation.textures","activation.bind",
-  "xui.native","xui.decode","xui.bind","xui.draw",
-  "indexed.setup","indexed.record","indexed.draw","indexed.tail","indexed.coverage",
-  "immediate.classify","immediate.utility3d","immediate.acquire","immediate.record","immediate.tail",
-  "activation.sampler_words","instance.read","instance.patch",
-  "engine.simulation_dispatch","engine.render_helper","engine.frame_transition",
-  "render.gather","render.buckets","render.model","render.mesh","render.overlay",
-  "render.scene_end","render.finish","render.pose",
-  "render.list","render.scene_begin","render.children","render.world",
-  "render.listener","render.ui_listener",
-  "render.queued","render.material_group",
-  "render.gather.classify","render.gather.visibility","render.gather.lod","render.gather.push","render.gather.guest_dispatch",
-  "render.queued.eligibility","render.queued.resolve","render.queued.instances","render.queued.record",
-  "render.queued.handoff","render.queued.handoff_binds","render.queued.handoff_replays",
-  "frame.native","frame.native.begin","frame.native.sky","frame.native.models",
-  "frame.native.static_world","frame.native.effects","frame.native.transparent","frame.native.post",
-  "frame.native.end","frame.native.view_overlays","frame.native.phases",
-  "frame.native.models.visibility","frame.native.models.programs","frame.native.models.resolve","frame.native.models.record",
-  "frame.native.static_world.select","frame.native.static_world.build","frame.native.static_world.record",
-  "sim.registry","sim.static_walk","sim.preload_geometry","sim.preload_material",
-  "sim.trees","sim.membership","sim.publish","sim.poses","sim.lock_wait","sim.preload_precheck","sim.world_update",
-  "bridge.mutex_wait","bridge.gate_wait","guest.wait",
-  "load.texture.snapshot","load.texture.original","load.texture.lock","load.texture.create",
-  "load.shader.registration","load.shader.lock","load.shader.entry",
-  "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
-  "load.resource.oneshot","load.resource.coordinator","load.resource.helper","load.resource.transition"};
-static_assert(std::size(kHookPhaseNames)==static_cast<size_t>(HookPhase::Count));
-thread_local uint32_t texture_loader_depth=0;
-// This frame's inclusive totals per phase, for the edf_native_frame_times
-// spike lines: every thread adds, the swap takes and clears them. Only full
-// (not sampled) timings add, so they exist only with the hook or load timings
-// on. Names are published by the first Finish of each phase.
-struct FrameHookPhases {
-  std::array<std::atomic<uint64_t>,static_cast<size_t>(HookPhase::Count)> nanos{};
-  std::array<std::atomic<const char*>,static_cast<size_t>(HookPhase::Count)> names{};
-};
-FrameHookPhases& FrameHookPhaseTotals() {
-  static FrameHookPhases totals;
-  return totals;
-}
-// Engine-thread region probe (edf_native_hook_timings only; nothing runs when
-// off). The step dispatch 821A4BA0 and the frame transition 821A4DE8 run guest
-// code on the engine thread, and their inclusive timings say how long they
-// take, not why. This splits a region's wall time into: time off the CPU
-// (thread cycle time against the TSC: blocked in a wait, or preempted), the
-// processor class it ran on (efficiency-class samples at entry, exit and at
-// every timed hook inside it), whether the render helper ran beside it, the
-// bridge-lock and guest waits inside it (bridge.*_wait, guest.wait), and every
-// timed hook phase nested in it. A fixed calibration kernel run beside the
-// region measures how fast the engine thread itself executes there,
-// independent of guest content: a slower region with an unchanged kernel is
-// more guest work; a slower kernel is a slower thread (core class, clock, SMT
-// sibling, cache). Scheduling, locks and guest state are unchanged.
-enum class EngineRegion : uint8_t { Dispatch, Transition, Count };
-struct EngineRegionTotals {
-  uint64_t calls=0,steps=0;
-  double wall_ms=0,oncpu_ms=0;
-  // Processor samples: [0] the highest efficiency class (performance cores;
-  // every core on a non-hybrid part), [1] a lower class, [2] unknown.
-  std::array<uint64_t,3> cores{};
-  uint64_t migrations=0,helper_entry=0,helper_exit=0,mxcsr_stale=0;
-  std::array<double,size_t(HookPhase::Count)> phase_ms{};
-  std::array<uint64_t,size_t(HookPhase::Count)> phase_calls{};
-  // Guest wait wrappers timed inside the region, by function.
-  struct Wait { uint32_t function=0; uint64_t calls=0; double ms=0; };
-  std::array<Wait,6> waits{};
-  uint64_t other_waits=0; double other_wait_ms=0;
-  // Calibration kernels (microseconds) and the class they ran on.
-  uint64_t calibrations=0; double alu_us=0,memory_us=0;
-  std::array<uint64_t,3> calibration_cores{};
-  std::chrono::steady_clock::time_point reported{};
-};
-// The region this thread is in; null outside one (and always when timings are off).
-thread_local EngineRegionTotals* native_engine_region=nullptr;
-// The guest wait wrapper being timed on this thread, for the per-function split.
-thread_local uint32_t native_guest_wait_function=0;
-// Render helper calls (821A5080) in flight, sampled at region entry and exit.
-std::atomic<int> native_render_helper_active{0};
-// Logical processor -> efficiency class (GetSystemCpuSetInformation), and the
-// CPU set IDs of the highest class. Read once; the topology does not change.
-struct NativeCpuTopology {
-  struct Processor { BYTE efficiency=0; bool known=false; };
-  std::vector<Processor> processors;  // index: group*64+number
-  std::vector<ULONG> performance_sets;
-  BYTE highest=0,lowest=0;
-  size_t performance_logical=0,other_logical=0;
-  static const NativeCpuTopology& Get() { static const NativeCpuTopology value=Build(); return value; }
-  bool hybrid() const { return highest!=lowest; }
-  // 0: highest class, 1: lower class, 2: unknown.
-  size_t Classify(const PROCESSOR_NUMBER& number) const {
-    const size_t index=size_t(number.Group)*64+number.Number;
-    if(index>=processors.size() || !processors[index].known) return 2;
-    return processors[index].efficiency==highest?0:1;
-  }
-  size_t Current() const { PROCESSOR_NUMBER number{}; GetCurrentProcessorNumberEx(&number); return Classify(number); }
- private:
-  static NativeCpuTopology Build() {
-    NativeCpuTopology result;
-    ULONG length=0;
-    GetSystemCpuSetInformation(nullptr,0,&length,GetCurrentProcess(),0);
-    if(!length) return result;
-    std::vector<uint8_t> buffer(length);
-    if(!GetSystemCpuSetInformation(reinterpret_cast<SYSTEM_CPU_SET_INFORMATION*>(buffer.data()),length,&length,
-         GetCurrentProcess(),0)) return result;
-    struct Entry { size_t index; BYTE efficiency; ULONG id; };
-    std::vector<Entry> entries;
-    for(size_t offset=0;offset+offsetof(SYSTEM_CPU_SET_INFORMATION,CpuSet)<=length;) {
-      const auto* entry=reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data()+offset);
-      if(!entry->Size || offset+entry->Size>length) break;
-      if(entry->Type==CpuSetInformation)
-        entries.push_back({size_t(entry->CpuSet.Group)*64+entry->CpuSet.LogicalProcessorIndex,
-          entry->CpuSet.EfficiencyClass,entry->CpuSet.Id});
-      offset+=entry->Size;
-    }
-    if(entries.empty()) return result;
-    result.highest=result.lowest=entries.front().efficiency;
-    for(const auto& entry:entries) {
-      result.highest=(std::max)(result.highest,entry.efficiency);
-      result.lowest=(std::min)(result.lowest,entry.efficiency);
-      if(entry.index>=result.processors.size()) result.processors.resize(entry.index+1);
-      result.processors[entry.index]={entry.efficiency,true};
-    }
-    for(const auto& entry:entries) {
-      if(entry.efficiency==result.highest) { result.performance_sets.push_back(entry.id); ++result.performance_logical; }
-      else ++result.other_logical;
-    }
-    return result;
-  }
-};
-thread_local std::array<EngineRegionTotals,size_t(EngineRegion::Count)> native_engine_regions;
-void ReportEngineRegion(EngineRegion region,EngineRegionTotals& totals) {
-  static constexpr const char* kRegionNames[]{"dispatch","transition"};
-  const double calls=double(totals.calls);
-  // The eight costliest phases nested in the region, per region call.
-  std::array<size_t,8> top{};
-  size_t count=0;
-  for(size_t index=0;index<totals.phase_ms.size();++index) {
-    if(!totals.phase_calls[index]) continue;
-    size_t at=count;
-    while(at>0 && totals.phase_ms[top[at-1]]<totals.phase_ms[index]) {
-      if(at<top.size()) top[at]=top[at-1];
-      --at;
-    }
-    if(at<top.size()) { top[at]=index; count=(std::min)(count+1,top.size()); }
-  }
-  std::string phases,waits;
-  char text[192];
-  for(size_t rank=0;rank<count;++rank) {
-    const auto index=top[rank];
-    std::snprintf(text,sizeof(text),"%s=%.3fms(%.1fx%.2fus) ",kHookPhaseNames[index],totals.phase_ms[index]/calls,
-      double(totals.phase_calls[index])/calls,1000.0*totals.phase_ms[index]/double(totals.phase_calls[index]));
-    phases+=text;
-  }
-  for(const auto& wait:totals.waits) {
-    if(!wait.calls) continue;
-    std::snprintf(text,sizeof(text),"%08X=%.3fms(%.2fx) ",wait.function,wait.ms/calls,double(wait.calls)/calls);
-    waits+=text;
-  }
-  if(totals.other_waits) {
-    std::snprintf(text,sizeof(text),"other=%.3fms(%.2fx) ",totals.other_wait_ms/calls,double(totals.other_waits)/calls);
-    waits+=text;
-  }
-  const double calibrations=double((std::max)(totals.calibrations,uint64_t(1)));
-  REXLOG_INFO("Native engine region probe: region={} calls={} steps={} wall_ms/call={:.3f} wall_ms/step={:.3f} "
-    "oncpu={:.1f}% offcpu_ms/call={:.3f} cores[performance/lower/unknown]={}/{}/{} migrations={} "
-    "helper_running[entry/exit]={}/{} mxcsr_stale={} calibration[n={} alu_us={:.1f} memory_us={:.1f} "
-    "cores={}/{}/{}] phases/call: {}waits/call: {}",
-    kRegionNames[size_t(region)],totals.calls,totals.steps,totals.wall_ms/calls,
-    totals.steps?totals.wall_ms/double(totals.steps):0.0,
-    totals.wall_ms>0?100.0*totals.oncpu_ms/totals.wall_ms:0.0,(totals.wall_ms-totals.oncpu_ms)/calls,
-    totals.cores[0],totals.cores[1],totals.cores[2],totals.migrations,totals.helper_entry,totals.helper_exit,
-    totals.mxcsr_stale,totals.calibrations,totals.alu_us/calibrations,totals.memory_us/calibrations,
-    totals.calibration_cores[0],totals.calibration_cores[1],totals.calibration_cores[2],phases,waits);
-}
-// One engine-thread region (see EngineRegionTotals). Construct it inside the
-// region's own inclusive HookTimings so they are not attributed to it.
-class EngineRegionScope {
- public:
-  using Clock=std::chrono::steady_clock;
-  EngineRegionScope(EngineRegion region,uint32_t steps,uint32_t guest_csr)
-      :region_(region),steps_(steps) {
-    if(!REXCVAR_GET(edf_native_hook_timings)) return;
-    auto& totals=native_engine_regions[size_t(region)];
-    previous_=std::exchange(native_engine_region,&totals);
-    totals_=&totals;
-    // The guest's cached flush mode against the live MXCSR: a stale cache
-    // runs VMX code without flush-to-zero (slow denormals) until the next
-    // FPU instruction rewrites it.
-    if(((_mm_getcsr()^guest_csr)&0x8040u)!=0) ++totals.mxcsr_stale;
-    if(native_render_helper_active.load(std::memory_order_relaxed)>0) ++totals.helper_entry;
-    GetCurrentProcessorNumberEx(&processor_);
-    ++totals.cores[NativeCpuTopology::Get().Classify(processor_)];
-    QueryThreadCycleTime(GetCurrentThread(),&cycles_);
-    tsc_=__rdtsc();
-    start_=Clock::now();
-  }
-  ~EngineRegionScope() { Finish(); }
-  EngineRegionScope(const EngineRegionScope&)=delete;
-  EngineRegionScope& operator=(const EngineRegionScope&)=delete;
-  void Finish() {
-    if(!totals_) return;
-    auto& totals=*std::exchange(totals_,nullptr);
-    const auto now=Clock::now();
-    const auto tsc=__rdtsc();
-    ULONG64 cycles=0;
-    QueryThreadCycleTime(GetCurrentThread(),&cycles);
-    native_engine_region=previous_;
-    const double wall=std::chrono::duration<double,std::milli>(now-start_).count();
-    const double share=tsc>tsc_?(std::min)(1.0,double(cycles-cycles_)/double(tsc-tsc_)):1.0;
-    PROCESSOR_NUMBER processor{};
-    GetCurrentProcessorNumberEx(&processor);
-    ++totals.cores[NativeCpuTopology::Get().Classify(processor)];
-    if(processor.Group!=processor_.Group || processor.Number!=processor_.Number) ++totals.migrations;
-    if(native_render_helper_active.load(std::memory_order_relaxed)>0) ++totals.helper_exit;
-    ++totals.calls; totals.steps+=steps_;
-    totals.wall_ms+=wall; totals.oncpu_ms+=wall*share;
-    if(totals.calls>=256 && (totals.reported==Clock::time_point{} || now-totals.reported>=std::chrono::seconds(5))) {
-      ReportEngineRegion(region_,totals);
-      totals={};
-      totals.reported=now;
-    }
-  }
- private:
-  EngineRegion region_;
-  uint32_t steps_;
-  EngineRegionTotals* totals_=nullptr;
-  EngineRegionTotals* previous_=nullptr;
-  PROCESSOR_NUMBER processor_{};
-  ULONG64 cycles_=0;
-  uint64_t tsc_=0;
-  Clock::time_point start_{};
-};
-// Fixed work on the engine thread, every 32nd region call with hook timings
-// on, outside every region timing: a dependent multiply-add chain (latency
-// bound: the core's class and clock) and a pointer chase through 16 MiB
-// (last-level cache and memory contention). About 25 us and 50-200 us.
-void RunEngineCalibration(EngineRegion region) {
-  if(!REXCVAR_GET(edf_native_hook_timings)) return;
-  static thread_local std::array<uint64_t,size_t(EngineRegion::Count)> calls{};
-  if(calls[size_t(region)]++%32) return;
-  static thread_local std::vector<uint32_t> chase;
-  static constexpr size_t kLines=(16u<<20)/64,kStride=16;
-  if(chase.empty()) {
-    // One random cycle through every line: no stride a prefetcher can follow.
-    std::vector<uint32_t> order(kLines);
-    for(size_t index=0;index<kLines;++index) order[index]=uint32_t(index);
-    uint64_t state=0x9E3779B97F4A7C15ull;
-    for(size_t index=kLines-1;index>0;--index) {
-      state=state*6364136223846793005ull+1442695040888963407ull;
-      std::swap(order[index],order[size_t(state>>33)%(index+1)]);
-    }
-    chase.assign(kLines*kStride,0);
-    for(size_t index=0;index<kLines;++index)
-      chase[size_t(order[index])*kStride]=uint32_t(order[(index+1)%kLines]*kStride);
-  }
-  using Clock=std::chrono::steady_clock;
-  const auto core=NativeCpuTopology::Get().Current();
-  const auto start=Clock::now();
-  uint64_t value=calls[size_t(region)];
-  for(uint32_t index=0;index<(1u<<15);++index) value=value*0x5851F42D4C957F2Dull+0x14057B7EF767814Full;
-  const auto alu=Clock::now();
-  uint32_t cursor=uint32_t((value>>40)%kLines)*kStride;
-  for(uint32_t hop=0;hop<2048;++hop) cursor=chase[cursor];
-  const auto end=Clock::now();
-  static volatile uint64_t sink=0;
-  sink=value+cursor;
-  auto& totals=native_engine_regions[size_t(region)];
-  ++totals.calibrations; ++totals.calibration_cores[core];
-  totals.alu_us+=std::chrono::duration<double,std::micro>(alu-start).count();
-  totals.memory_us+=std::chrono::duration<double,std::micro>(end-alu).count();
-}
-// Quality of service for the two threads that bound a frame: the engine thread
-// (step dispatch and transition) and the render helper (edf_native_thread_qos).
-// Windows derives a thread's QoS from its window: a hidden or occluded one
-// (automated runs launch hidden) gets low QoS, which on a hybrid CPU steers it
-// towards efficiency cores and lower clocks. 1 opts these two threads (only;
-// workers keep the OS default) out of execution-speed throttling (HighQoS);
-// 2 also restricts them to the highest efficiency class's CPU sets
-// (performance cores; a no-op on a non-hybrid part). Applied once per thread, at its first hook
-// call; guest state, locks and ordering are untouched.
-enum class NativeThreadRole : uint8_t { Engine, RenderHelper };
-void ApplyNativeThreadQos(NativeThreadRole role) {
-  static thread_local bool applied=false;
-  if(applied) return;
-  applied=true;
-  const auto mode=REXCVAR_GET(edf_native_thread_qos);
-  const auto& topology=NativeCpuTopology::Get();
-  static std::once_flag topology_once;
-  std::call_once(topology_once,[&] {
-    REXLOG_INFO("Native thread QoS: mode={} hybrid={} performance_logical={} other_logical={}",
-      mode,topology.hybrid(),topology.performance_logical,topology.other_logical);
-  });
-  if(mode<=0) return;
-  THREAD_POWER_THROTTLING_STATE state{};
-  state.Version=THREAD_POWER_THROTTLING_CURRENT_VERSION;
-  state.ControlMask=THREAD_POWER_THROTTLING_EXECUTION_SPEED;
-  state.StateMask=0;
-  const bool high=SetThreadInformation(GetCurrentThread(),ThreadPowerThrottling,&state,sizeof(state))!=0;
-  bool performance=false;
-  if(mode>=2 && topology.hybrid() && !topology.performance_sets.empty())
-    performance=SetThreadSelectedCpuSets(GetCurrentThread(),topology.performance_sets.data(),
-      ULONG(topology.performance_sets.size()))!=0;
-  REXLOG_INFO("Native thread QoS: role={} thread={} high_qos={} performance_cpu_sets={}",
-    role==NativeThreadRole::Engine?"engine":"render_helper",GetCurrentThreadId(),high,performance);
-}
-class HookTiming {
- public:
-  explicit HookTiming(HookPhase phase,bool active=true) : phase_(phase), enabled_(active && (phase>=HookPhase::TextureSnapshot ?
-      REXCVAR_GET(edf_native_load_timings) : REXCVAR_GET(edf_native_hook_timings))) {
-    if(active && !enabled_ && phase<HookPhase::TextureSnapshot) {
-      const auto period=uint32_t(REXCVAR_GET(edf_native_hook_sample_period));
-      if(period) {
-        static thread_local std::array<uint64_t,static_cast<size_t>(HookPhase::Count)> calls{};
-        const auto index=size_t(phase);
-        // Offset phases so nested scopes do not all pay for timing on the
-        // same draw. Samples remain deterministic for reproducible diagnosis.
-        enabled_=(calls[index]++ + index*17)%period==0;
-        sample_period_=period;
-      }
-    }
-    if(enabled_) start_=Clock::now();
-  }
-  ~HookTiming() { Finish(); }
-  void Finish() {
-    if(!enabled_) return;
-    enabled_=false;
-    const auto now=Clock::now();
-    const double ms=std::chrono::duration<double,std::milli>(now-start_).count();
-    struct Bucket { uint64_t count=0; double total=0,maximum=0; Clock::time_point reported{}; };
-    static thread_local std::array<Bucket,static_cast<size_t>(HookPhase::Count)> buckets{};
-    const auto& names=kHookPhaseNames;
-    const auto index=static_cast<size_t>(phase_);
-    if(!sample_period_ && REXCVAR_GET(edf_native_frame_times)) {
-      auto& totals=FrameHookPhaseTotals();
-      totals.names[index].store(names[index],std::memory_order_relaxed);
-      totals.nanos[index].fetch_add(uint64_t(ms*1e6),std::memory_order_relaxed);
-    }
-    auto& bucket=buckets[index];
-    ++bucket.count; bucket.total+=ms; bucket.maximum=(std::max)(bucket.maximum,ms);
-    if(auto* region=native_engine_region) {
-      region->phase_ms[index]+=ms; ++region->phase_calls[index];
-      ++region->cores[NativeCpuTopology::Get().Current()];
-      if(phase_==HookPhase::GuestWait) {
-        auto slot=std::find_if(region->waits.begin(),region->waits.end(),[](const EngineRegionTotals::Wait& wait) {
-          return wait.function==native_guest_wait_function || !wait.function; });
-        if(slot==region->waits.end()) { ++region->other_waits; region->other_wait_ms+=ms; }
-        else { slot->function=native_guest_wait_function; ++slot->calls; slot->ms+=ms; }
-      }
-    }
-    if(phase_>=HookPhase::TextureSnapshot ||
-       ((sample_period_ || bucket.count>=256) && (bucket.reported==Clock::time_point{} || now-bucket.reported>=std::chrono::seconds(5)))) {
-      if(sample_period_) {
-        REXLOG_INFO("Native sampled hook timing: phase={} samples={} period={} total_ms={} max_ms={} (sampled inclusive CPU wall time)",
-          names[index],bucket.count,sample_period_,bucket.total,bucket.maximum);
-      } else {
-        REXLOG_INFO("Native hook timing: phase={} calls={} total_ms={} max_ms={} (inclusive CPU wall time)",
-          names[index],bucket.count,bucket.total,bucket.maximum);
-      }
-      bucket={};
-      bucket.reported=now;
-    }
-  }
- private:
-  using Clock=std::chrono::steady_clock;
-  HookPhase phase_;
-  uint32_t sample_period_=0;
-  bool enabled_;
-  Clock::time_point start_{};
-};
-// A bridge lock whose contended acquisitions are timed (bridge.mutex_wait,
-// bridge.gate_wait; inside an engine region they are also attributed to it).
-// try_lock first, so an uncontended acquisition is one atomic operation as
-// before, and nothing is timed unless hook timings are on and the lock was
-// actually held by another thread. Lockable, so lock_guard, unique_lock,
-// scoped_lock and NativeLockSlices take it unchanged.
-template<class Mutex,HookPhase Phase>
-class NativeTimedMutex {
- public:
-  void lock() {
-    if(mutex_.try_lock()) return;
-    HookTiming timing(Phase);
-    LoadTraceScope trace(::LoadTraceOn(),LoadTraceKind::BridgeMutexWait);
-    mutex_.lock();
-  }
-  bool try_lock() { return mutex_.try_lock(); }
-  void unlock() { mutex_.unlock(); }
- private:
-  Mutex mutex_;
-};
-using BridgeMutex=NativeTimedMutex<std::mutex,HookPhase::BridgeMutexWait>;
-using BridgeGate=NativeTimedMutex<std::recursive_mutex,HookPhase::BridgeGateWait>;
 // Coarse wait totals are sampled once per swap. They include all participating
 // threads, so they locate waits but must not be summed as a CPU-time partition.
 enum class FrameWaitKind { Engine,GuestFence,SharedSlot };
@@ -1285,632 +593,6 @@ std::array<float,4> GuestBlendFactorForDraw(const Reader& reader,uint32_t device
   if(audit) live=ReadGuestWords<4>(reader,reader.Add(device,10336));
   return ResolveBlendFactorForDraw(device,audit?&live:nullptr);
 }
-struct VertexParameterRange {
-  std::string name;
-  uint32_t first,count;
-  ShaderBindings::FloatRegisterBinding normal,reversed;
-};
-struct RegisteredShader {
-  uint32_t owner;
-  std::unique_ptr<ShaderBindings> bindings;
-  std::unique_ptr<QuadStream> quads;
-  std::unique_ptr<ShaderBindings> reversed_bindings;
-  std::unique_ptr<QuadStream> reversed_quads;
-  uint64_t source_fingerprint=0;
-  // Whether the reversed-depth variant reflects the same constant buffers as
-  // the normal one, so its bytes can be mirrored from it at draw time instead
-  // of every material and instance being uploaded into both.
-  bool reversed_mirrors=false;
-  // The last raw _g_DX2DScale/_g_DX2DOffset this Utility shader uploaded
-  // (guest bytes, before any canvas mapping): a Utility draw on a target that
-  // is not 16:9 re-maps them through its own canvas layout
-  // (native_display_layout.h). Bit 0 scale, bit 1 offset.
-  std::array<uint8_t,16> canvas_scale{},canvas_offset{};
-  uint8_t canvas_uploaded=0;
-  struct ParameterBinding {
-    ShaderBindings::FloatRegisterBinding binding;
-    bool canvas_xy=false;
-  };
-  struct ParameterUpload {
-    size_t index=0;
-    std::array<const ShaderBindings::FloatRegisterBinding*,2> targets{};
-    std::array<size_t,2> sizes{};
-    size_t maximum=0;
-    bool canvas_xy=false;
-  };
-  struct UploadPlan {
-    std::vector<ParameterUpload> parameters;
-    uint64_t optimized_out=0;
-    bool ready=false;
-  };
-  struct ParameterPlan {
-    std::array<std::vector<ParameterBinding>,4> groups;
-    std::array<bool,4> ready{};
-    std::array<std::vector<ShaderBindings::ResourceBinding>,2> textures;
-    std::array<bool,2> textures_ready{};
-    std::shared_ptr<const std::vector<VertexParameterRange>> vertex_ranges;
-    // Normal-only and normal+reversed uploads use different active sets.
-    std::array<std::array<UploadPlan,4>,2> uploads;
-  };
-  using ParameterOwner=std::weak_ptr<const NativeMaterialParameters::Groups>;
-  std::array<std::map<ParameterOwner,ParameterPlan,std::owner_less<ParameterOwner>>,2> parameter_plans;
-  std::array<ParameterOwner,2> last_plan_owner;
-  std::array<ParameterPlan*,2> last_plan{};
-  using PublishedProgramOwner=std::weak_ptr<const NativeSceneMaterialProgram>;
-  std::map<PublishedProgramOwner,std::shared_ptr<const std::vector<VertexParameterRange>>,
-    std::owner_less<PublishedProgramOwner>> published_vertex_ranges;
-  std::shared_ptr<const std::vector<VertexParameterRange>> ResolvePublishedVertexRanges(
-      const std::shared_ptr<const NativeSceneMaterialProgram>& program) {
-    const auto found=published_vertex_ranges.find(PublishedProgramOwner(program));
-    if(found!=published_vertex_ranges.end()) return found->second;
-    if(!reversed_bindings) throw std::runtime_error("published vertex parameters have no reversed shader");
-    auto ranges=std::make_shared<std::vector<VertexParameterRange>>();
-    for(const auto& range:program->inputs.vertex_registers) {
-      if(range.first>256 || range.count>256-range.first)
-        throw std::runtime_error("invalid published activation register range");
-      ranges->push_back({range.name,range.first,range.count,
-        bindings->ResolveFloatRegisters(range.name),reversed_bindings->ResolveFloatRegisters(range.name)});
-    }
-    std::erase_if(published_vertex_ranges,[](const auto& entry) { return entry.first.expired(); });
-    published_vertex_ranges.emplace(PublishedProgramOwner(program),ranges);
-    return ranges;
-  }
-  ParameterPlan& MaterialPlan(const std::shared_ptr<const NativeMaterialParameters::Groups>& material,bool reverse) {
-    const size_t slot=reverse?1:0;
-    auto& previous=last_plan_owner[slot];
-    if(last_plan[slot] && !previous.owner_before(material) && !material.owner_before(previous))
-      return *last_plan[slot];
-    auto& cache=parameter_plans[slot];
-    auto found=cache.find(ParameterOwner(material));
-    if(found==cache.end()) {
-      std::erase_if(cache,[](const auto& entry){return entry.first.expired();});
-      found=cache.try_emplace(ParameterOwner(material)).first;
-    }
-    previous=material; last_plan[slot]=&found->second;
-    return found->second;
-  }
-  const std::vector<ShaderBindings::ResourceBinding>& ResolveTextures(
-      const std::shared_ptr<const NativeMaterialParameters::Groups>& material,size_t group) {
-    auto& plan=MaterialPlan(material,false);
-    if(!plan.textures_ready[group]) {
-      std::vector<ShaderBindings::ResourceBinding> fresh;
-      fresh.reserve(material->textures[group].size());
-      for(const auto& texture:material->textures[group]) fresh.push_back(bindings->ResolveResource(texture.name));
-      plan.textures[group]=std::move(fresh); plan.textures_ready[group]=true;
-    }
-    return plan.textures[group];
-  }
-  const std::vector<ParameterBinding>& ResolveParameters(
-      const std::shared_ptr<const NativeMaterialParameters::Groups>& material,size_t group,bool reverse) {
-    auto& plan=MaterialPlan(material,reverse);
-    if(!plan.ready[group]) {
-      std::vector<ParameterBinding> fresh;
-      fresh.reserve((*material)[group].size());
-      const auto& destination=reverse?*reversed_bindings:*bindings;
-      for(const auto& parameter:(*material)[group])
-        fresh.push_back({destination.ResolveFloatRegisters(parameter.name),
-          IsNativeCanvasXY(destination.shader().source_fingerprint,destination.shader().entry.name,parameter.name,group)});
-      plan.groups[group]=std::move(fresh); plan.ready[group]=true;
-    }
-    return plan.groups[group];
-  }
-  const UploadPlan& ResolveUploads(
-      const std::shared_ptr<const NativeMaterialParameters::Groups>& material,size_t group,bool alternate) {
-    auto& plan=MaterialPlan(material,false).uploads[alternate?1:0][group];
-    if(!plan.ready) {
-      // Resolved vectors are immutable after publication; their binding tokens
-      // stay owned by this shader's material plans for the upload plan's life.
-      const auto& normal=ResolveParameters(material,group,false);
-      const auto* reversed=alternate?&ResolveParameters(material,group,true):nullptr;
-      UploadPlan fresh;
-      fresh.parameters.reserve((*material)[group].size());
-      for(size_t index=0;index<(*material)[group].size();++index) {
-        ParameterUpload upload;
-        upload.index=index; upload.canvas_xy=normal[index].canvas_xy;
-        upload.targets={&normal[index].binding,reversed?&(*reversed)[index].binding:nullptr};
-        for(size_t target=0;target<upload.targets.size();++target) {
-          if(!upload.targets[target]) continue;
-          const auto required=upload.targets[target]->bytes();
-          if(!required) { ++fresh.optimized_out; upload.targets[target]=nullptr; continue; }
-          upload.sizes[target]=(group&1)?required:size_t((*material)[group][index].registers)*16;
-          upload.maximum=std::max(upload.maximum,upload.sizes[target]);
-        }
-        if(upload.targets[0] || upload.targets[1]) fresh.parameters.push_back(upload);
-      }
-      fresh.ready=true; plan=std::move(fresh);
-    }
-    return plan;
-  }
-  std::shared_ptr<const std::vector<VertexParameterRange>> ResolveVertexRanges(
-      const std::shared_ptr<const NativeMaterialParameters::Groups>& material) {
-    auto& plan=MaterialPlan(material,false);
-    if(!plan.vertex_ranges) {
-      if(!reversed_bindings) throw std::runtime_error("vertex parameter has no reversed binding plan");
-      auto fresh=std::make_shared<std::vector<VertexParameterRange>>();
-      for(size_t group=0;group<2;++group) {
-        const auto& normal=ResolveParameters(material,group,false);
-        const auto& reversed=ResolveParameters(material,group,true);
-        size_t index=0;
-        for(const auto& parameter:(*material)[group]) {
-          if(parameter.registers) {
-            if(parameter.first>256 || parameter.registers>256-parameter.first)
-              throw std::runtime_error("invalid vertex parameter register range");
-            fresh->push_back({parameter.name,parameter.first,parameter.registers,normal[index].binding,reversed[index].binding});
-          }
-          ++index;
-        }
-      }
-      // Publish only a complete plan. The active shared owner survives material
-      // retirement; binding tokens still reject a replaced shader generation.
-      plan.vertex_ranges=std::move(fresh);
-    }
-    return plan.vertex_ranges;
-  }
-};
-// The vertex bindings a draw with this depth convention uses, with the
-// reversed variant brought up to date from the normal one where it mirrors it.
-// Every draw path that picks a variant goes through here, so a variant can
-// never be drawn with the constants of the activation before last.
-ShaderBindings& VertexBindingsForDraw(RegisteredShader& shader,bool reverse_depth) {
-  if(!reverse_depth) return *shader.bindings;
-  if(shader.reversed_mirrors) shader.reversed_bindings->MirrorConstantsFrom(*shader.bindings);
-  return *shader.reversed_bindings;
-}
-struct TextureCreation {
-  uint32_t width, height, depth, levels, usage, format, pool, type, caller;
-};
-struct RegisteredTarget {
-  uint32_t texture_handle, surface_handle;
-  NativeRenderTarget native;
-};
-NativeBufferWrites& BufferWrites() {
-  static NativeBufferWrites writes;
-  return writes;
-}
-struct GuestStream {
-  uint32_t resource, offset, stride;
-};
-struct NativeScene {
-  NativeRenderTarget color;
-  NativeDepthTarget depth;
-  NativeRenderTarget output;
-  uint32_t output_surface=0;
-  uint32_t color_surface=0;
-  uint32_t samples=1;
-  bool frame_complete=false;
-  std::unordered_map<uint32_t,NativeRenderTarget> direct_outputs;
-};
-struct SurfaceCreation { uint32_t width,height,format,msaa; };
-struct EmbeddedShader { uint32_t source; bool pixel; };
-struct MoviePlaneLock { uint32_t texture,pitch,pixels; };
-struct MovieDecodeLocks { std::vector<MoviePlaneLock> planes; bool failed=false; };
-thread_local MovieDecodeLocks* active_movie_decode=nullptr;
-struct DrawVisibility {
-  Microsoft::WRL::ComPtr<ID3D11Query> query;
-  std::array<uint32_t,4> key; // VS, PS, raster state, depth state.
-};
-struct NativePacingState {
-  // Separate from the rendering mutex: sleeping must not block host UI paints.
-  std::mutex mutex;
-  NativePacingClock clock;
-  uint64_t calls=0;
-};
-NativePacingState& PacingState() {
-  static NativePacingState state;
-  return state;
-}
-// FSR native AA (native_fsr.h, edf_native_fsr), under the bridge locks.
-// `frame` arms one helper call: its scene passes draw jittered and the
-// scene's resolve to owner+104 (ResolveScene: the native post's, or the
-// 8219C930 hook's mode 1) dispatches FSR and maps owner+104 to the output.
-// Armed by the first accepted view's BeginView (ArmNativeFsrFrameLocked);
-// cleared by the dispatch, or unconsumed at EndScene / the next frame
-// (counted as dropped: a direct-frame publication, or a post that failed
-// before resolving).
-struct NativeFsrBridgeState {
-  NativeFsrUpscaler upscaler;
-  NativeFsrResetTracker resets;
-  bool frame=false,opaque=false;
-  uint32_t owner=0;
-  uint64_t helper_frame=0;
-  int32_t index=0;
-  NativeFsrMode mode=NativeFsrMode::Off;
-  NativeFsrJitter jitter;
-  NativeFsrCameraParams camera;       // from the unjittered pass camera
-  NativeMotionVectorOutput motion;    // workstream B's, for the last view
-  std::chrono::steady_clock::time_point last_dispatch{};
-  uint64_t armed=0,dispatched=0,dropped=0,failures=0,history_resets=0;
-};
-struct Bridge {
-  // Game command ordering is separate from immediate-context access. A swap
-  // may hold this gate while releasing mutex between polls so the host can paint.
-  //
-  // Full frame vs simulation (the render helper's thread and the main loop):
-  // - The simulation's per-step work takes the mutex alone, not the gate: the
-  //   step's publication (membership, preloads, adapter Publish), cameras,
-  //   world updates (820B2DF8), walk plans (PublishStaticWalkPlans), registry
-  //   layout decodes and the list-link touches. (Object birth/retirement, 820B33B0/820B2870/
-  //   820B2AC0, still takes both; it is not per step.) The gate is held by the
-  //   swap across its GPU and pacing wait, so a step that took it waited out
-  //   the render thread's pacing. What it hands the frame is swapped in as immutable
-  //   generations (publication, cameras, world animations, registry snapshot,
-  //   trees), which AcquireInputs takes once per frame. The static world's
-  //   route words are read live from guest memory at selection
-  //   (NativeFullFrameLiveRoutes), which needs no bridge lock.
-  // - The full frame's passes plan off both locks over those generations and
-  //   take gate and mutex together only in short slices (NativeLockSlices)
-  //   around what they share with the simulation and other hooks: the model
-  //   pass caches (model_pass_loads, model_geometry_loads, over model_buffers,
-  //   shaders and declarations), the backend's pipeline/sampler caches and
-  //   mesh cache (program Resolve, geometry retention), the adapter's material
-  //   intern table, and the scene recorder/targets. Nothing a slice returns
-  //   points into locked state except through a shared_ptr, and the recording
-  //   slice re-validates the active scene, backend and targets it planned for.
-  // - Recorder state (scene recorder, active targets, bind_generation,
-  //   recorded, scene_recorded_*) is written only by the render thread, under
-  //   both locks; the simulation never records.
-  BridgeGate submissions;
-  BridgeMutex mutex;
-  std::filesystem::path root;
-  bool initialized=false;
-  std::string scene_backend_name;
-  Microsoft::WRL::ComPtr<ID3D11Device> device;
-  Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
-  // Created when --edf_native_backend names one. The renderer still draws
-  // through its direct D3D11 path; this exists so the backend can be created
-  // and reported inside the real process, which is where device creation
-  // actually fails, and so paths can be moved onto it one at a time.
-  std::unique_ptr<edf::native::NativeRenderBackend> backend;
-  // The scene's resources, separate from the selection above because the two
-  // answer different questions while the port is under way: --edf_native_backend
-  // is what the player picked, --edf_native_scene_backend is what the half-ported
-  // scene can actually share targets with. See the cvar.
-  std::shared_ptr<edf::native::NativeRenderBackend> scene_backend;
-  NativeSceneAdapter scene_adapter;
-  // Advanced whenever state.shaders gains, replaces or releases an entry, so
-  // anything derived from a registered shader's bindings can tell it is stale.
-  uint64_t shader_registry_generation=0;
-  uint64_t scene_publication_tick=0,scene_published_selections=0,scene_current_selections=0;
-  NativeSceneRenderer scene_renderer;
-  NativeFsrBridgeState fsr;
-  std::vector<NativeSceneSnapshot> scene_recorded_snapshots;
-  // Full-frame pass frames (models, sky) whose snapshots a recording uses;
-  // released with scene_recorded_snapshots at submission.
-  std::vector<std::shared_ptr<const void>> scene_recorded_frames;
-  uint64_t scene_native_objects=0,scene_native_draws=0,scene_native_fallbacks=0;
-  uint64_t scene_native_direct_instances=0,scene_native_direct_retries=0;
-  uint64_t scene_native_direct_worlds=0;
-  std::set<std::string> scene_native_reasons;
-  std::unique_ptr<NativeFrameHandoff> presentation_frames;
-  std::weak_ptr<GuestMeshWatchAudit> mesh_watch_audit;
-  std::optional<NativeDisplayGamma> display_gamma;
-  uint32_t display_gamma_device=0;
-  std::map<uint32_t,uint32_t> native_published_completions;
-  NativeSubmissionCursors submission_cursors;
-  struct SwapClock { NativePacingClock clock; uint64_t sampled=0;
-    std::unique_ptr<NativeFrameFlight> flight; };
-  std::map<uint32_t,SwapClock> swap_clocks;
-  std::unordered_map<uint32_t, RegisteredShader> shaders;
-  std::shared_ptr<const std::vector<VertexParameterRange>> active_vertex_parameters;
-  uint64_t instance_parameter_updates=0, instance_parameter_errors=0;
-  NativeSceneSources scene_sources;
-  NativeSceneMembership scene_membership;
-  NativeStaticWalkPlans static_walk_plans;
-  NativeStaticWalkAudit static_walk_audit;
-  uint64_t static_walk_lists=0,static_walk_misses=0,static_walk_stale=0,static_walk_members=0;
-  uint64_t static_walk_direct_reuses=0,static_walk_source_reuses=0,static_walk_abandoned=0,static_walk_bucket_native=0;
-  uint64_t scene_membership_events=0,scene_membership_lists=0,scene_membership_nodes=0;
-  uint64_t scene_membership_checks=0,scene_membership_mismatches=0;
-  uint64_t scene_source_draws=0,scene_source_misses=0;
-  uint64_t scene_source_publications=0;
-  uint64_t scene_world_publications=0,scene_world_reused=0,scene_world_reads=0,scene_world_checks=0,scene_world_mismatches=0;
-  uint64_t scene_queue_instances=0,scene_queue_groups=0,scene_queue_fallbacks=0;
-  uint64_t scene_group_material_captures=0,scene_group_material_reused=0;
-  uint64_t scene_asset_examined=0,scene_asset_created=0,scene_asset_rejected=0;
-  struct SceneGeometryLoad {
-    NativeSceneGeometrySource source;
-    uint64_t revision=0,vertex_generation=0,index_generation=0;
-    std::array<NativeBufferWrites::ObservedVersion,2> versions{};
-    std::shared_ptr<const NativeDeclaration> declaration;
-    Microsoft::WRL::ComPtr<ID3DBlob> shader;
-    NativeRecordedReads reads; // Descriptor bytes behind `source`.
-  };
-  std::map<uint32_t,SceneGeometryLoad> scene_geometry_loads;
-  struct SceneMaterialLoad {
-    uint64_t revision=0;
-    uint32_t material=0;
-    std::shared_ptr<const NativeMaterialParameters::Groups> schema;
-    std::shared_ptr<const NativeSceneGroupMaterial> published;
-    // Program bytes only: pass, shader, texture, sampler and state inputs.
-    // Constant values change per frame and are refreshed through `constants`.
-    NativeRecordedReads reads;
-    NativeSceneMaterialConstantLayout constants;
-  };
-  std::map<uint32_t,SceneMaterialLoad> scene_material_loads;
-  // Model pass (821C9C20): material programs keyed by pass record address and
-  // retained geometry keyed by (batch descriptor, vertex shader). Validated at
-  // each use; never trusted across a changed input.
-  struct ModelPassLoad {
-    std::shared_ptr<const NativeMaterialParameters::Groups> schema;
-    std::shared_ptr<const NativeSceneGroupMaterial> published;
-    NativeRecordedReads reads; // Program bytes only; constant values are re-read at each use.
-    NativeSceneMaterialConstantLayout layout;
-    uint64_t failed_tick=UINT64_MAX;
-  };
-  std::unordered_map<uint32_t,ModelPassLoad> model_pass_loads;
-  struct ModelGeometryLoad {
-    NativeSceneGeometrySource source;
-    uint64_t vertex_generation=0,index_generation=0;
-    std::array<NativeBufferWrites::ObservedVersion,2> versions{};
-    std::shared_ptr<const NativeDeclaration> declaration;
-    Microsoft::WRL::ComPtr<ID3DBlob> shader;
-    std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
-  };
-  std::map<std::pair<uint32_t,uint32_t>,ModelGeometryLoad> model_geometry_loads;
-  uint64_t model_pass_loaded=0,model_pass_reused=0,model_pass_constants=0,model_geometry_loaded=0;
-  uint64_t scene_preload_group_revision=UINT64_MAX;
-  uint64_t scene_geometry_loaded=0,scene_geometry_reused=0,scene_geometry_deferred=0;
-  uint64_t scene_geometry_unchanged=0,scene_geometry_verified=0,scene_material_unchanged=0;
-  uint64_t scene_material_constants=0;
-  std::set<std::string> scene_geometry_reasons;
-  uint64_t scene_material_loaded=0,scene_material_reused=0,scene_material_deferred=0;
-  uint64_t scene_material_constructed=0,scene_material_rejected=0;
-  uint64_t scene_material_binding_bypasses=0;
-  uint64_t scene_geometry_draw_bypasses=0,scene_geometry_draw_verified=0;
-  std::set<std::string> scene_material_reasons;
-  uint64_t scene_visibility_candidates=0,scene_visibility_retained=0,scene_visibility_selected=0;
-  uint64_t scene_visibility_checks=0,scene_visibility_mismatches=0;
-  std::unordered_map<uint32_t, EmbeddedShader> embedded_shaders;
-  // Advanced whenever embedded_shaders gains, replaces or loses an entry, for
-  // the same purpose as shader_registry_generation.
-  uint64_t embedded_shader_generation=0;
-  // The DrawPrimitiveUP hook's per-pair classification (native_immediate_classify.h)
-  // and the registry entries it was read from, which stay valid while both
-  // generations do: state.shaders only erases or replaces under a generation bump.
-  struct ImmediatePairShaders { RegisteredShader* vertex=nullptr; RegisteredShader* pixel=nullptr; };
-  NativeImmediatePairMemo<ImmediatePairShaders> immediate_pairs;
-  std::unordered_map<uint32_t, NativeTexture> textures;
-  std::unordered_map<uint32_t, TextureCreation> texture_creations;
-  std::unordered_map<uint32_t, RegisteredTarget> render_targets;
-  std::unordered_map<uint32_t, NativeDepthTarget> depth_targets;
-  std::unordered_map<uint32_t, SurfaceCreation> surface_creations;
-  std::unordered_map<uint32_t, NativeScene> scenes;
-  uint32_t active_scene = 0;
-  std::set<uint32_t> untiled_devices;
-  std::unique_ptr<NativeGpuTimer> scene_gpu_timer;
-  uint32_t scene_gpu_timer_owner=0;
-  bool scene_gpu_timer_resolved=false;
-  uint32_t active_output = 0, output_captures = 0;
-  uint64_t loading_trace_frames=0;
-  std::array<uint64_t,4> loading_trace_routes{};
-  std::chrono::steady_clock::time_point loading_trace_reported{};
-  std::chrono::steady_clock::time_point bloom_parameters_reported{};
-  uint64_t output_draws=0;
-  uint64_t output_unhandled=0;
-  // Sentinel distinguishes "not observed" from a real zero register word.
-  uint64_t vertex_center_word=UINT64_MAX;
-  uint64_t shared_constant_activations=0,shared_constant_unsupplied=0,shared_constant_split_storage=0;
-  uint64_t shared_constant_both_supplied=0;
-  uint32_t last_activation_instance=0,last_activation_vertex=0,last_activation_pixel=0;
-  uint64_t repeat_activations=0;
-  // Whether the scene backend has a frame open. Opened lazily by the first
-  // thing that records into it and closed at the guest's swap barrier, which
-  // is the only point in the frame where the renderer already knows the frame
-  // is over. A backend that records has to be told where a frame ends: D3D11
-  // did not, which is why nothing needed this until now.
-  bool scene_frame_open=false;
-  uint64_t scene_frames=0;
-  // Recorded operations in the open frame. A backend frame has to be bounded
-  // by something: the guest's swap alone is not, because the renderer records
-  // far more between two swaps than one command list should carry.
-  uint64_t scene_frame_operations=0;
-  uint64_t scene_frame_splits=0;
-  // The scene's finished frame, in a surface the window's backend can open.
-  //
-  // This is how a scene drawn on one backend reaches a window presented by
-  // another. The D3D11 path hands the compositor an ID3D11ShaderResourceView
-  // instead, which is exactly what a D3D12 scene cannot produce.
-  std::shared_ptr<edf::native::NativeBackendSharedSurface> scene_shared;
-  std::array<std::shared_ptr<NativeBackendSharedSurface>,NativeBackendFrameQueue::kSlots> scene_shared_slots;
-  std::array<uint64_t,NativeBackendFrameQueue::kSlots> scene_shared_slot_generations{};
-  std::optional<size_t> scene_shared_slot;
-  uint64_t scene_shared_next_generation=0;
-  NativeBackendFrameQueue scene_frame_queue;
-  uint32_t scene_shared_width=0,scene_shared_height=0;
-  // Set when a copy into it has been recorded and not yet signalled. The
-  // signal is a queue signal on the backends that have a queue, so it has to
-  // happen after the frame is submitted, not while it is still open.
-  bool scene_shared_pending=false;
-  uint64_t scene_shared_sequence=0,scene_shared_generation=0;
-  std::optional<NativeDisplayGamma> scene_shared_gamma;
-  NativeFrameKind scene_shared_kind=NativeFrameKind::PartialScene;
-  bool scene_shared_refused=false;
-  // What the last recorded draw left the recorder holding.
-  //
-  // The same reasoning the direct path already uses: 77.4% of this game's
-  // draws repeat the one before them in everything but the constants an
-  // activation patched between them, so re-sending the pipeline, the targets,
-  // the viewport and the material is the same calls with the same arguments.
-  // The direct path skips those and this has to as well, or recording is
-  // slower than the thing it replaces for no reason anyone would accept.
-  struct RecordedBindings {
-    bool valid=false;
-    // Bumped by anything that binds the context directly. On the adopted D3D11
-    // backend the recorder and the direct paths share one context, so a direct
-    // bind invalidates what the recorder believes is still set.
-    uint64_t bind_generation=0;
-    uint64_t frame=0;
-    edf::native::NativeBackendPipeline* pipeline=nullptr;
-    // What that pipeline was built from. Compared here so a repeat draw does
-    // not go through the backend's cache at all: that lookup builds a string
-    // key per call, which is a heap allocation on a path that runs a million
-    // times a minute.
-    uint64_t vertex_id=0,pixel_id=0,layout_id=0;
-    edf::native::RenderStateWords state{};
-    edf::native::NativeBackendTopology topology=edf::native::NativeBackendTopology::TriangleList;
-    uint32_t render_targets=0,sample_count=0,dsv_format=0;
-    std::array<uint32_t,8> rtv_format{};
-    std::array<edf::native::NativeBackendRenderTarget*,8> colors{};
-    uint32_t color_count=0;
-    edf::native::NativeBackendRenderTarget* depth=nullptr;
-    D3D11_VIEWPORT viewport{};
-    D3D11_RECT scissor{};
-    bool scissor_enabled=false;
-    const edf::native::ShaderBindings* pixel=nullptr;
-    uint64_t pixel_resources=0;
-    bool blend_factor_needed=false;
-    std::array<float,4> blend_factor{};
-    // The bytes last staged for each constant buffer, so an unchanged buffer
-    // is not copied into the upload ring again.
-    edf::native::NativeConstantCache vertex_constants,pixel_constants;
-  } recorded;
-  uint64_t recorded_draws=0,recorded_pipeline_skips=0,recorded_material_skips=0;
-  uint64_t recorded_constant_skips=0;
-  // Declared after the backend so it is destroyed before it: the preview
-  // thread uses the backend on every tick and must be stopped first.
-  std::unique_ptr<edf::native::NativeD3D12Preview> backend_preview;
-  // Run-length accounting for the XUI path, the same question the indexed
-  // audit answered: how many consecutive draws differ only in things a batch
-  // would carry per-item, and how many change state that a batch cannot.
-  // Bumped by every path that binds a target or render state, so the indexed
-  // path can tell whether anything has bound since it last did. Without this a
-  // skip would compare against its own cache and miss that another path had
-  // replaced the state underneath it.
-  uint64_t bind_generation=0,indexed_bind_generation=0;
-  edf::native::RenderStateWords indexed_bind_key{};
-  uint32_t indexed_bind_target=0,indexed_bind_scene=0,indexed_bind_output=0;
-  uint32_t indexed_bind_vertex=0,indexed_bind_pixel=0;
-  bool indexed_bind_reversed=false;
-  uint64_t indexed_materials_reused=0;
-  bool indexed_bind_valid=false;
-  uint64_t indexed_binds_skipped=0,indexed_binds_bound=0;
-  uint64_t xui_batch_draws=0,xui_batch_runs=0,xui_batch_run=0,xui_batch_longest=0;
-  uint64_t xui_batch_collapsible=0,xui_last_state=0,xui_last_constants=0;
-  uint64_t xui_constants_differ=0;
-  // Per-part breakdown of the XUI audit: the parts of the draw before, and
-  // how often each part differed from it.
-  std::array<uint64_t,9> xui_audit_parts{},xui_audit_breaks{};
-  uint64_t xui_audit_identical=0,xui_audit_constants_only=0;
-  std::array<uint32_t,12> last_batch_key{};
-  uint64_t batch_draws=0,batch_runs=0,batch_run=0,batch_run_total=0,batch_longest=0,batch_collapsible=0;
-  uint64_t instance_shape=0,last_instance_shape=0,batch_shape_breaks=0;
-
-  std::set<std::array<uint32_t,2>> shared_constant_pairs;
-  std::set<std::array<uint32_t,3>> shared_constant_storage_reported;
-  std::set<std::array<uint32_t,3>> shared_constant_reported;
-  uint64_t movie_uploads=0, movie_upload_errors=0;
-  uint64_t movie_draws=0, movie_draw_errors=0;
-  // Movie drawing can run on a helper between main-thread UI swaps. Keep both
-  // clocks paced until a completed 3D scene takes over or movie_pacing sees
-  // NativeMoviePacing::kIdleSwaps swaps in a row without a new movie draw,
-  // rather than clearing on the first UI-only swap that did not draw the movie.
-  std::atomic<bool> movie_pacing_active{false};
-  NativeMoviePacing movie_pacing;
-  std::unique_ptr<ShaderBindings> movie_vertex,movie_pixel,movie_pixel_sd;
-  std::array<std::optional<NativeMovieBindings>,2> movie_bindings;
-  std::unique_ptr<QuadStream> movie_vertices;
-  std::unique_ptr<ShaderBindings> xui_vertex,xui_pixel;
-  std::unique_ptr<ShaderBindings> xui_reversed_vertex;
-  std::optional<NativeXuiVertexBindings> xui_vertex_bindings,xui_reversed_vertex_bindings;
-  std::array<std::optional<NativeXuiPixelBindings>,3> xui_pixel_bindings;
-  std::unique_ptr<ShaderBindings> xui_solid_pixel,xui_mask_pixel;
-  std::unique_ptr<PositionTriangleStream> xui_vertices;
-  uint64_t xui_draws=0,xui_errors=0;
-  std::unique_ptr<ShaderBindings> font_vertex,font_pixel;
-  std::optional<NativeFontBindings> font_bindings;
-  std::unique_ptr<QuadStream> font_vertices;
-  uint64_t font_draws=0,font_errors=0;
-  uint64_t utility_draws=0,utility_errors=0;
-  uint64_t utility_3d_draws=0,utility_3d_errors=0;
-  std::array<bool,6> scene_immediate_variants_reported{};
-  std::array<bool,4> utility_variants_reported{};
-  std::set<std::array<uint32_t,4>> unsupported_output_pairs;
-  uint64_t immediate_requests=0,immediate_empty=0,immediate_submitted=0,immediate_unsubmitted=0;
-  std::set<std::array<uint32_t,5>> immediate_unsubmitted_paths;
-  std::chrono::steady_clock::time_point immediate_coverage_reported{};
-  uint64_t scene_begins = 0, scene_ends = 0;
-  uint64_t scene_resolves = 0,scene_resolve_errors = 0;
-  uint64_t scene_indexed_start = 0;
-  // A full native frame recorded on the current scene (reset at scene begin);
-  // it counts as the scene's indexed draws (NativeSceneDrew).
-  bool scene_full_frame = false;
-  uint32_t scene_captures = 0;
-  uint64_t indexed_output_frames = 0;
-  uint64_t indexed_trace_frame = 0;
-  uint64_t post_input_capture_frame = 0;
-  uint32_t post_input_capture_pass = 0;
-  uint32_t indexed_trace_draws = 0;
-  std::vector<DrawVisibility> visibility;
-  std::set<std::array<uint32_t,4>> clip_probes;
-  uint32_t color_probe_draws=0;
-  bool color_probe_done=false;
-  uint64_t depth_clears = 0, depth_clear_skips = 0, depth_errors = 0;
-  // Backend samplers, keyed by the guest words they were decoded from. The
-  // backend owns the sampler objects and caches them by combination too; this
-  // map only saves decoding the same words again.
-  std::map<SamplerStateWords, edf::native::NativeBackendSampler*> samplers;
-  std::map<RenderStateWords,NativeRenderState> render_states;
-  // The two most recent keys each UI draw path looked up in the maps above
-  // (RenderStateLocked, SamplerLocked). Neither map ever erases, so an entry
-  // stays valid for the bridge's life.
-  struct RenderStateMemo { RenderStateWords key{}; NativeRenderState* value=nullptr; };
-  struct SamplerMemo { SamplerStateWords key{}; edf::native::NativeBackendSampler* value=nullptr; };
-  std::array<RenderStateMemo,2> render_state_memo{};
-  std::array<SamplerMemo,2> sampler_memo{};
-  std::map<std::pair<uint32_t,uint32_t>,GuestStream> streams;
-  std::map<uint32_t,uint32_t> index_bindings;
-  std::map<uint32_t,uint32_t> declaration_bindings;
-  NativeShaderState shader_bindings;
-  NativeRenderStateSnapshots render_state_snapshots;
-  NativeDeclarations declarations;
-  NativeMaterialParameters material_parameters;
-  NativeGeneratedIndexCache generated_indices;
-  NativeModelBuffers model_buffers{&BufferWrites()};
-  uint64_t buffer_update_notifications=0;
-  uint64_t buffer_write_batches=0;
-  uint64_t buffer_write_all_batches=0;
-  uint64_t reported_mesh_mismatches=0;
-  NativeMeshCache meshes;
-  // Immediate guest buffers may be reused or mutated every draw. This cache
-  // compares all bytes and stays separate from long-lived scene geometry.
-  NativeMeshCache immediate_meshes{4*1024*1024,256,true};
-  std::map<uint32_t,std::unique_ptr<NativeCompletionQueue>> completion_queues;
-  std::map<uint32_t,std::unique_ptr<NativePresentProfiler>> present_profilers;
-  std::set<uint32_t> completion_faults;
-  uint64_t completion_submits=0;
-  std::unordered_map<uint32_t,std::unique_ptr<NativeSignalQueue>> signal_queues;
-  // Registry/context -> delivery, or SDK global -> delivery. Never delivery ->
-  // registry/context/global. CPU delivery must not depend on renderer progress.
-  std::mutex signal_delivery_mutex;
-  std::unordered_map<uint32_t,NativeSignalDelivery> signal_deliveries;
-  uint64_t completion_waits=0,completion_waits_native_pending=0;
-  uint64_t completion_validated_waits=0;
-  uint64_t indexed_draws = 0, indexed_uploads = 0, indexed_errors = 0, indexed_submitted = 0;
-  std::array<uint64_t,4> indexed_ownership{}; // Bit0: registered VB; bit1: registered IB.
-  uint64_t indexed_ownership_attempts=0,indexed_physical_pairs=0;
-  uint64_t indexed_empty_requests=0,indexed_nonempty_submitted=0,indexed_unsubmitted_requests=0;
-  std::set<std::array<uint32_t,5>> indexed_unsubmitted_paths;
-  // Identity is the contract, not the caller: see native_contract_ledger.h.
-  edf::native::NativeContractLedger contracts;
-  std::chrono::steady_clock::time_point indexed_coverage_reported{};
-  uint64_t indexed_outside_scene = 0;
-  uint64_t sampler_bindings = 0;
-  std::vector<std::pair<uint32_t,uint32_t>> target_stack;
-  uint32_t active_target = 0;
-  uint64_t target_begins = 0, target_resolves = 0, target_unwritten = 0;
-  uint64_t immediate_draws = 0;
-  uint64_t native_quad_draws = 0, native_quad_errors = 0;
-  uint64_t color_clears = 0, color_clear_skips = 0;
-  uint32_t active_vertex = 0, linked_vertex = 0, linked_pixel = 0;
-  // Shader pairs whose varyings have been checked against each other. The
-  // check reflects both signatures, and the pair changes hundreds of times a
-  // frame; a pair only needs it once per registration of its shaders.
-  std::set<std::pair<uint32_t,uint32_t>> validated_links;
-  uint64_t texture_loads = 0, texture_errors = 0;
-  uint64_t texture_bindings = 0, texture_missing = 0, texture_binding_errors = 0;
-  uint64_t activations = 0, misses = 0, parameter_uploads = 0, optimized_out = 0, parameter_errors = 0;
-};
-Bridge& State() { static Bridge state; return state; }
 // State().mutex for one visibility walk; see native_scene_walk_lock.h.
 using BridgeWalkLock=NativeWalkLockScope<BridgeMutex>;
 using BridgeGuestCall=NativeWalkGuestCall<BridgeMutex>;
@@ -4450,10 +3132,6 @@ REX_HOOK_RAW(sub_821C9478) {
 //   native: the chain's control flow, targets, sizes, offsets, blur kernel and
 //   quads (the plan), the preflight against the native target registry, and
 //   the bloom quad 821A8F20 would build.
-REXCVAR_DEFINE_BOOL(edf_native_post_finish,false,"EDF2027",
-  "Replace the post chain 820B09B0 (and the bloom quad of 821A8F20) of the finish stage 820B0B80 with a native loop issuing the planned passes; with edf_native_post_finish_audit on, only after a clean audited guest frame. Any preflight failure, missing target or exception runs the original for that frame");
-REXCVAR_DEFINE_BOOL(edf_native_post_finish_audit,false,"EDF2027",
-  "Compare the native finish plan with the setters, targets and quads 820B0B80 actually issues, and log mismatches (development). With edf_native_post_finish on, audited guest frames and native frames alternate");
 REX_EXTERN(sub_821B8828);
 REX_EXTERN(sub_821B88B0);
 REX_EXTERN(sub_821BCD58);
@@ -5241,16 +3919,6 @@ EDF_POST_FINISH_OBSERVER(821A79B8,
     recorder->seen.Quad(quad);
   })
 #undef EDF_POST_FINISH_OBSERVER
-REXCVAR_DEFINE_BOOL(edf_native_scene_tree,false,"EDF2027",
-  "Use native spatial tree traversal and culling; leaf callbacks remain explicit.");
-REXCVAR_DEFINE_BOOL(edf_native_scene_tree_published,false,"EDF2027",
-  "Read immutable spatial hierarchy published by the world producer.");
-REXCVAR_DEFINE_BOOL(edf_native_scene_group_order,false,"EDF2027",
-  "Publish each world owner's static group walk order (owner+240) at simulation step.");
-REXCVAR_DEFINE_BOOL(edf_native_scene_group_order_audit,false,"EDF2027",
-  "Compare the published static group order with a live walk at world-pass entry (development).");
-REXCVAR_DEFINE_BOOL(edf_native_full_frame,false,"EDF2027",
-  "Full-frame native renderer: the render helper 821A5080 runs a native frame (scene begin, native static world, native post, then the guest HUD phase loop on the output) instead of the guest helper. Needs edf_native_host and edf_native_shader_bridge; edf_native_ab_alternate guest-side frames keep the guest helper (development)");
 namespace edf::native {
 void RetireGroupOrder(uint32_t owner) {
   // Destructor path of every world: stay off the bridge lock unless orders exist.
@@ -5597,10 +4265,6 @@ REX_HOOK_RAW(sub_821C3BB8) {
   });
 }
 #undef EDF_RENDER_PHASE
-REXCVAR_DEFINE_BOOL(edf_native_map_effect_census,false,"EDF2027",
-  "Tally map-effect objects by (vtable, mode, slot-4 method) before each map-effect walk; log the top classes every 600 frames.");
-REXCVAR_DEFINE_BOOL(edf_native_map_effect_list,false,"EDF2027",
-  "Walk the map-effect list (sub_820B35A0) natively; each object still goes through the hooked sub_821C0C00.");
 namespace {
 // Render helper entries (sub_821A5080), one per frame; census periods count these.
 std::atomic<uint64_t> native_render_frames{0};
@@ -7117,8 +5781,6 @@ REX_HOOK_RAW(sub_821C0C00) {
   }
   DispatchNativeBucketObject(ctx,base);
 }
-REXCVAR_DEFINE_BOOL(edf_native_frame_dispatch,false,"EDF2027",
-  "Own outer render phase dispatch in native code; remaining phase callbacks are retained.");
 namespace edf::native {
 // The model pass caches (defined with RenderNativeModelPass), shared with the
 // full frame's Models and Sky passes.
@@ -9180,8 +7842,6 @@ bool GuestRenderTickFrame() {
     native_render_budget.tick,native_render_budget.fraction,native_render_budget.steps,false));
 }
 }
-REXCVAR_DEFINE_INT32(edf_native_ab_alternate,0,"EDF2027",
-  "A/B diagnostics: alternate guest and native passes in runs of N indexed output frames from the capture start frame; odd runs are native, 0 off (development)").range(0,1000);
 REX_HOOK_RAW(sub_821A5080) {
   edf::native::ApplyNativeThreadQos(edf::native::NativeThreadRole::RenderHelper);
   // Sampled by the engine region probe: is the helper running beside the step?
@@ -10193,8 +8853,6 @@ REX_HOOK_RAW(sub_821B6880) {
   }
 }
 REX_EXTERN(__imp__sub_821B8E48);
-REXCVAR_DEFINE_BOOL(edf_native_material_activation,false,"EDF2027",
-  "Run material activation from a native operation list with native sampler resolution");
 REX_EXTERN(sub_821498C8);
 REX_EXTERN(sub_82149608);
 REX_EXTERN(sub_82149248);
@@ -12630,7 +11288,7 @@ void PublishNativeModelBuffer(uint8_t* base,uint32_t owner,edf::native::NativeMo
       if(contents && version) state.model_buffers.RetainIndexContents(owner,generation,contents,*version);
       // GPU construction is outside the queue lock and reads the owned copy for
       // physical buffers. Later writes can still reject registry attachment.
-      auto index_storage=std::make_shared<const edf::native::NativeIndexBuffer>(EnsureSceneBackendLocked(state),
+      auto index_storage=std::make_shared<const edf::native::NativeIndexBuffer>(edf::native::EnsureSceneBackendLocked(state),
         contents?std::span<const uint8_t>(*contents):source,stride,contents);
       if(version) state.model_buffers.CommitObservedIndex(owner,generation,*version,std::move(index_storage));
       else state.model_buffers.RetainIndexStorage(owner,generation,std::move(index_storage));
@@ -13063,7 +11721,7 @@ REX_HOOK_RAW(sub_8213B850) {
         if (msaa) {
           REXLOG_INFO("Native depth allocation: {}x{}, MSAA={} not supported",width,height,msaa);
         } else {
-          auto target=edf::native::CreateNativeDepthTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
+          auto target=edf::native::CreateNativeDepthTarget(edf::native::EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT);
           state.depth_targets.insert_or_assign(ctx.r3.u32,std::move(target));
           REXLOG_INFO("Native depth allocation: handle={:#x}, {}x{}, host=D32S8 (development)",ctx.r3.u32,width,height);
         }
@@ -13343,16 +12001,16 @@ REX_HOOK_RAW(sub_8219C7A8) {
         static const bool depth_srv=REXCVAR_GET(edf_native_scene_depth_srv) || motion_vectors || fsr_scene;
         // FidelityFX availability, once, on the scene device (FSR runs there).
         static const bool ffx_logged=[&] {
-          auto* raw=EnsureSceneBackendLocked(state).D3D12Raw();
+          auto* raw=edf::native::EnsureSceneBackendLocked(state).D3D12Raw();
           REXLOG_INFO("{} (scene backend {}{}; edf_native_fsr={})",edf::native::NativeFsrLibrary().Describe(raw?raw->Device():nullptr),
-            std::string(EnsureSceneBackendLocked(state).name()),raw?"":", no D3D12 raw access: FSR unavailable",
+            std::string(edf::native::EnsureSceneBackendLocked(state).name()),raw?"":", no D3D12 raw access: FSR unavailable",
             std::string(REXCVAR_GET(edf_native_fsr)));
           return true;
         }();
         (void)ffx_logged;
         edf::native::NativeScene scene{
-          edf::native::CreateNativeRenderTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,samples),
-          edf::native::CreateNativeDepthTarget(EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples,
+          edf::native::CreateNativeRenderTarget(edf::native::EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_R16G16B16A16_FLOAT,samples),
+          edf::native::CreateNativeDepthTarget(edf::native::EnsureSceneBackendLocked(state),width,height,DXGI_FORMAT_D32_FLOAT_S8X24_UINT,samples,
             0.0f,depth_srv)};
         scene.samples=samples;
         found=state.scenes.insert_or_assign(owner,std::move(scene)).first;
@@ -13471,7 +12129,7 @@ REX_HOOK_RAW(sub_8219C930) {
           (creation.format!=0x1a220186 && creation.format!=0x18280186))
         throw std::runtime_error("unsupported ordinary output surface contract");
       if (scene.output_surface!=surface || !scene.output.backend_surface) {
-        scene.output=edf::native::CreateNativeRenderTarget(EnsureSceneBackendLocked(state),creation.width,creation.height,DXGI_FORMAT_R8G8B8A8_UNORM);
+        scene.output=edf::native::CreateNativeRenderTarget(edf::native::EnsureSceneBackendLocked(state),creation.width,creation.height,DXGI_FORMAT_R8G8B8A8_UNORM);
         scene.output_surface=surface;
       }
       scene.output.content_valid=false;
@@ -13541,7 +12199,7 @@ REX_HOOK_RAW(sub_8219C840) {
           ++state.output_captures;
           const auto path=std::filesystem::path(prefix+".output."+std::to_string(state.indexed_output_frames)+".bmp");
           if (std::filesystem::exists(path)) throw std::runtime_error("native output capture already exists");
-          const auto bmp=CaptureOutputBmp(state,scene);
+          const auto bmp=edf::native::CaptureOutputBmp(state,scene);
           std::ofstream output(path,std::ios::binary);
           output.write(reinterpret_cast<const char*>(bmp.data()),bmp.size()); output.close();
           if (!output) throw std::runtime_error("native output capture write failed");
@@ -13551,7 +12209,7 @@ REX_HOOK_RAW(sub_8219C840) {
               throw std::runtime_error("paired scene-color capture has no valid scene surface");
             const auto scene_path=std::filesystem::path(prefix+".scene-color."+std::to_string(state.indexed_output_frames)+".bmp");
             if(std::filesystem::exists(scene_path)) throw std::runtime_error("paired scene-color capture already exists");
-            const auto scene_bmp=edf::native::CaptureNativeBmp(EnsureSceneBackendLocked(state),*scene.color.backend_surface,scene.color.format);
+            const auto scene_bmp=edf::native::CaptureNativeBmp(edf::native::EnsureSceneBackendLocked(state),*scene.color.backend_surface,scene.color.format);
             std::ofstream scene_file(scene_path,std::ios::binary);
             scene_file.write(reinterpret_cast<const char*>(scene_bmp.data()),scene_bmp.size()); scene_file.close();
             if(!scene_file) throw std::runtime_error("paired scene-color capture write failed");
@@ -13561,7 +12219,7 @@ REX_HOOK_RAW(sub_8219C840) {
           for (const auto& [owner,target]:state.render_targets) {
             const auto& sample=target.native.sampled;
             if (!sample.content_valid || sample.width>40 || sample.height>22) continue;
-            const auto value=edf::native::ReadNativeColorPixel(EnsureSceneBackendLocked(state),*sample.backend,sample.format,sample.width/2,sample.height/2);
+            const auto value=edf::native::ReadNativeColorPixel(edf::native::EnsureSceneBackendLocked(state),*sample.backend,sample.format,sample.width/2,sample.height/2);
             REXLOG_INFO("Native post pixel: texture={:#x}, {}x{}, center={},{},{},{}",target.texture_handle,sample.width,sample.height,value[0],value[1],value[2],value[3]);
           }
         } catch (const std::exception& error) { REXLOG_ERROR("Native output capture: {}",error.what()); }
@@ -13588,7 +12246,7 @@ REX_HOOK_RAW(sub_8219C840) {
         // scene's own backend has no D3D11 surface, and this would build a new
         // one every frame and hand the old one to the collector mid-flight.
         if(!direct.backend_surface)
-          direct=edf::native::CreateNativeOpaqueFrameTarget(EnsureSceneBackendLocked(state),creation.width,creation.height);
+          direct=edf::native::CreateNativeOpaqueFrameTarget(edf::native::EnsureSceneBackendLocked(state),creation.width,creation.height);
         edf::native::ResolveNativeRgba8Frame(edf::native::SceneRecorderLocked(state),scene.color,direct);
         state.textures.insert_or_assign(handle,direct.sampled);
         if(REXCVAR_GET(edf_native_publish_frames)) {
@@ -14116,7 +12774,7 @@ REX_HOOK_RAW(sub_821FE358) {
             if(versions) {
               vertices_bytes=std::span<const uint8_t>(*vertex_contents).subspan(stream.offset);
               indices_bytes=*index_contents;
-              preacquired_mesh=state.meshes.TryAcquireOwned(EnsureSceneBackendLocked(state),bindings.shader(),
+              preacquired_mesh=state.meshes.TryAcquireOwned(edf::native::EnsureSceneBackendLocked(state),bindings.shader(),
                 {stream.resource,ib,decl,state.active_vertex,uint32_t(viewport.reverse_depth)},
                 *native_declaration,stream.stride,vertices_bytes,indices_bytes,index_width);
               if(preacquired_mesh) prepared_draw=preacquired_mesh->FindPreparedDraw(ctx.r6.u32,ctx.r7.u32,ctx.r5.s32);
@@ -14218,7 +12876,7 @@ REX_HOOK_RAW(sub_821FE358) {
         observe_timing.Finish();
         edf::native::HookTiming lookup_timing(edf::native::HookPhase::MeshLookup);
         state.meshes.SetTimingsEnabled(REXCVAR_GET(edf_native_hook_timings));
-        auto& mesh_backend=EnsureSceneBackendLocked(state);
+        auto& mesh_backend=edf::native::EnsureSceneBackendLocked(state);
         const edf::native::NativeMeshCache::Key mesh_key{
           stream.resource,ib,decl,state.active_vertex,uint32_t(viewport.reverse_depth)};
         auto* owned_mesh=preacquired_mesh?preacquired_mesh:REXCVAR_GET(edf_native_owned_mesh_hit)?state.meshes.TryAcquireOwned(
@@ -14679,7 +13337,7 @@ REX_HOOK_RAW(sub_821FE358) {
                      std::memcmp(&group->view.scissor,&view.scissor,sizeof(view.scissor)) ||
                      group->targets.count!=targets.count || group->targets.colors!=targets.colors || group->targets.depth!=targets.depth))
                     edf::native::FlushNativeQueuedSceneLocked(state,*group);
-                  group->view=view; group->targets=targets; group->objects.push_back(SelectNativeSceneInstanceLocked(state,object));
+                  group->view=view; group->targets=targets; group->objects.push_back(edf::native::SelectNativeSceneInstanceLocked(state,object));
                   group->geometry=group->objects.back()->object.geometry;
                   group->material=group->objects.back()->object.material;
                   group->reverse_depth=viewport.reverse_depth;
@@ -15407,7 +14065,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           auto cached=state.samplers.find(key);
           if(cached==state.samplers.end()) {
             const auto desc=edf::native::DecodeNativeGuestSampler(key);
-            cached=state.samplers.emplace(key,&EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
+            cached=state.samplers.emplace(key,&edf::native::EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
           }
           movie_plan.SetSampler(movie_pixel,i,cached->second);
         }
@@ -15452,7 +14110,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           if(!prefix.empty() && scene.output.content_valid) {
             const auto path=std::filesystem::path(prefix+".movie."+std::to_string(state.movie_draws)+".bmp");
             if(std::filesystem::exists(path)) throw std::runtime_error("native movie capture path already exists");
-            const auto bytes=CaptureOutputBmp(state,scene);
+            const auto bytes=edf::native::CaptureOutputBmp(state,scene);
             std::ofstream output(path,std::ios::binary);
             output.write(reinterpret_cast<const char*>(bytes.data()),std::streamsize(bytes.size()));
             output.close();
@@ -15793,7 +14451,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
            (state.font_draws==1 || state.font_draws==100 || state.font_draws==1000)) {
           const auto path=std::filesystem::path(prefix+".font."+std::to_string(state.font_draws)+".bmp");
           if(std::filesystem::exists(path)) throw std::runtime_error("native font capture path already exists");
-          const auto bytes=CaptureOutputBmp(state,scene);
+          const auto bytes=edf::native::CaptureOutputBmp(state,scene);
           std::ofstream output(path,std::ios::binary);
           output.write(reinterpret_cast<const char*>(bytes.data()),std::streamsize(bytes.size()));
           output.close();
@@ -15944,7 +14602,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
               viewport=edf::native::MapNativeCanvasViewportScissor(viewport,affine,target.sampled.width,target.sampled.height);
             }
           }
-          auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),bindings.shader(),
+          auto& mesh=state.immediate_meshes.Acquire(edf::native::EnsureSceneBackendLocked(state),bindings.shader(),
             edf::native::ImmediateStreamKey(vertices.size(),declaration_handle,pair.vertex,ctx.r4.u32,viewport.reverse_depth),
             native_declaration->bytes(),stride,
             vertices,indices,2,native_declaration,owned_indices,{},{},{},{},0,{},
@@ -16510,8 +15168,6 @@ REX_HOOK_RAW(sub_8213DDA0) {
     REXLOG_INFO("Native fetch ownership: omitted Xbox descriptor packet encoding, dirty={:#x}",ctx.r4.u64);
 }
 
-REXCVAR_DEFINE_BOOL(edf_native_static_world_pass,false,"EDF2027",
-  "Draw the static opaque world pass natively in published group order; unsupported groups run their guest group callback (development)");
 namespace edf::native {
 namespace {
 // The scene publication, queue, ownership and preload flags a native pass
@@ -16558,8 +15214,6 @@ bool NativeModelPassEnabled() {
   return true;
 }
 }
-REXCVAR_DEFINE_STRING(edf_native_renderer,"native","EDF2027",
-  "Native renderer preset (default native; off restores the guest renderer): off, world (static world pass and every scene flag it requires), full (world plus model publication, the rigid model pass and the native post finish) or native (full plus the full-frame renderer, edf_native_full_frame). Adds to the individual edf_native_* cvars and never turns one off; read once at startup");
 namespace edf::native {
 void ResolveNativeRendererPreset() {
   const auto& name=REXCVAR_GET(edf_native_renderer);
