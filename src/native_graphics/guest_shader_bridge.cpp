@@ -7033,11 +7033,12 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
   void RecordSky(edf::native::NativeFrameContext& context,uint32_t sky) {
     using namespace edf::native;
     if(!sky || !context.renderer || !native_scene_pass_camera) return;
-    // Every guest read of the pass (camera, pose walk, pass records) through
-    // one page window: no guest code runs during it.
-    const NativeSceneCpuWindow window(reader_);
+    // The camera and pose walk run between lock slices, so they read through
+    // the validating reader: a page window must not outlive a release of the
+    // bridge locks (another thread may free or decommit an admitted page).
+    // The final slice reads the pass records through its own window.
     NativeSkyFrameInputs inputs;
-    inputs.camera_world=ReadNativeVisibilityFloats<16>(window,window.Add(context.view.scene,NativeSkyScene::world));
+    inputs.camera_world=ReadNativeVisibilityFloats<16>(reader_,reader_.Add(context.view.scene,NativeSkyScene::world));
     inputs.palette_limit=NativeFullFramePaletteLimit(reader_);
     auto& state=State();
     // The bridge locks in short holds (NativeLockSlices): the targets, each
@@ -7055,7 +7056,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     const auto base=NativeFullFrameBaseState(formats);
     inputs.start=base.render;
     std::vector<NativeSkyDraw> draws;
-    const auto record=RecordNativeSky(window,sky_,inputs,sky,
+    const auto record=RecordNativeSky(reader_,sky_,inputs,sky,
       [&](uint32_t owner,NativeModelBuffers::Kind kind)->uint64_t {
         return slices([&]()->uint64_t {
           const auto* found=state.model_buffers.Find(owner,kind);
@@ -7075,6 +7076,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
         return refuse("scene targets changed during the pose walk");
       auto before=base.render;
       const int filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
+      const NativeSceneCpuWindow window(reader_);  // Valid for this hold only.
       for(size_t index=0;index<draws.size();++index) {
         const auto& draw=draws[index];
         const auto material=NativeModelPassProgramLocked(state,window,draw.pass,false,decline);
