@@ -26,6 +26,7 @@
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
 
+#include "manual_reload.h"
 #include "native_kbm.h"
 #include "native_kbm_logic.h"
 #include "pause_menu.h"
@@ -197,6 +198,7 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
   std::lock_guard lock(guest.mutex);
   if (!game_owns_input) {
     guest.router.Reset();
+    edf::reload::ResetKeyboard();
     return;
   }
   // F1 menu (pause_menu.h): nothing reaches the game while it is open, nor after it
@@ -206,9 +208,13 @@ void MergeIntoDevice(uint8_t* base, uint32_t device) {
                     std::none_of(mouse_buttons.begin(), mouse_buttons.end(), [](bool down) { return down; });
   if (edf::menu::BlockGameInput(edf::menu::MenuInputGate::kKeyboardMouse, idle)) {
     guest.router.Reset();
+    edf::reload::ResetKeyboard();
     return;
   }
   ActionState actions = ReadActions(guest, keys, mouse_buttons);
+  // Manual reload (optional): a request on the press edge and nothing written to the pad
+  // channels, so an action sharing the key keeps it. A no-op with edf_manual_reload off.
+  edf::reload::OnKeyboardAction(actions[static_cast<size_t>(Action::kReload)]);
   if (test_forward) actions[static_cast<size_t>(Action::kMoveForward)] = true;
   const ChannelFrame frame = BuildChannelFrame(actions, ReadBindings(base));
 

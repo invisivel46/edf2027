@@ -99,6 +99,7 @@ enum class Action : uint8_t {
   kVehicle, kPadX, kCancel, kLeftStickPress, kRightStickPress,
   kMenuUp, kMenuDown, kMenuLeft, kMenuRight,
   kStart, kBack,
+  kReload,  // synthetic: presses no pad control; manual_reload.h, only with edf_manual_reload on
   kCount
 };
 inline constexpr size_t kActionCount = static_cast<size_t>(Action::kCount);

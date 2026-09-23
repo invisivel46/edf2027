@@ -2,6 +2,7 @@
 #include "core_logic.h"
 #include "scripted_input_logic.h"
 #include "keybind_logic.h"
+#include "manual_reload_logic.h"
 #include "native_kbm_logic.h"
 #include "pause_menu.h"
 #include "settings_logic.h"
@@ -980,6 +981,379 @@ void TestDeadzones() {
   r = ProcessPad(pad, Deadzones::FromPercent(20, 0, 0), nullptr);
   CHECK(r.game.lx == 0 && r.game.rx == 32767 && r.game.left_trigger == 120 && r.synthetic == 0);
 }
+// ---- manual reload (manual_reload_logic.h) --------------------------------------------
+namespace reload_test {
+using namespace edf::reload;
+
+// A player soldier and an ordinary rifle (AF14: 120 rounds, 90-tick reload), part-used.
+SoldierState Player() {
+  SoldierState s;
+  s.vtable = kPlayerObjectVtable;
+  s.player = 0;
+  s.fire_ready = true;
+  s.weapons = 0x4000;
+  s.weapon_count = 3;
+  s.weapon_index = 1;
+  return s;
+}
+WeaponState Rifle() {
+  WeaponState w;
+  w.constructed = w.selected = true;
+  w.ammo = 57;
+  w.capacity = 120;
+  w.reload_time = w.reload_timer = 90;
+  return w;
+}
+
+void TestDecision() {
+  CHECK(Decide(Player(), Rifle(), 0) == Decision::kStart);
+  // Only the local player's own soldier.
+  { auto s = Player(); s.vtable = 0x82004000u; CHECK(Decide(s, Rifle(), 0) == Decision::kNotLocalPlayer); }
+  { auto s = Player(); s.player = -1; CHECK(Decide(s, Rifle(), 0) == Decision::kNotLocalPlayer); }
+  { auto s = Player(); s.player = 1; CHECK(Decide(s, Rifle(), 0) == Decision::kNotLocalPlayer);
+    CHECK(Decide(s, Rifle(), 1) == Decision::kStart); }
+  CHECK(Decide(Player(), Rifle(), -1) == Decision::kNotLocalPlayer);
+  // Cutscenes, vehicles, a soldier that cannot act, no weapon.
+  { auto s = Player(); s.input_disabled = true; CHECK(Decide(s, Rifle(), 0) == Decision::kInputDisabled); }
+  { auto s = Player(); s.vehicle = 0x40001000u; CHECK(Decide(s, Rifle(), 0) == Decision::kInVehicle); }
+  { auto s = Player(); s.status = 2; CHECK(Decide(s, Rifle(), 0) == Decision::kCannotAct); }
+  { auto s = Player(); s.weapon_index = 3; CHECK(Decide(s, Rifle(), 0) == Decision::kNoWeapon); }
+  { auto s = Player(); s.weapons = 0; CHECK(Decide(s, Rifle(), 0) == Decision::kNoWeapon); }
+  { auto w = Rifle(); w.selected = false; CHECK(Decide(Player(), w, 0) == Decision::kWeaponInactive); }
+  { auto w = Rifle(); w.constructed = false; CHECK(Decide(Player(), w, 0) == Decision::kWeaponInactive); }
+  // Mid switch or already in the reload animation: the game would not accept a trigger pull.
+  { auto s = Player(); s.fire_ready = false; CHECK(Decide(s, Rifle(), 0) == Decision::kNotReady); }
+  // Weapons without an ordinary reload.
+  { auto w = Rifle(); w.reload_time = w.reload_timer = -1; CHECK(Decide(Player(), w, 0) == Decision::kNoReload); }
+  { auto w = Rifle(); w.reload_time = w.reload_timer = 0; CHECK(Decide(Player(), w, 0) == Decision::kNoReload); }
+  { auto w = Rifle(); w.secondary_type = kSecondaryDeployed; w.deployed = 2;
+    CHECK(Decide(Player(), w, 0) == Decision::kWaitingDeployed);
+    w.deployed = 0; CHECK(Decide(Player(), w, 0) == Decision::kStart); }
+  { auto w = Rifle(); w.secondary_type = 1; w.deployed = 2; CHECK(Decide(Player(), w, 0) == Decision::kStart); }
+  // Magazine state.
+  { auto w = Rifle(); w.ammo = 120; CHECK(Decide(Player(), w, 0) == Decision::kFull); }
+  { auto w = Rifle(); w.ammo = 0; w.reload_timer = 40; CHECK(Decide(Player(), w, 0) == Decision::kAlreadyEmpty); }
+  { auto w = Rifle(); w.ammo = 1; CHECK(Decide(Player(), w, 0) == Decision::kStart); }
+  { auto w = Rifle(); w.burst_left = 2; CHECK(Decide(Player(), w, 0) == Decision::kFiring); }
+  { auto w = Rifle(); w.reload_timer = 12; CHECK(Decide(Player(), w, 0) == Decision::kTimerBusy); }
+  // The game's own predicate (sub_820E1688).
+  { auto w = Rifle(); CHECK(!GameIsReloading(w)); w.ammo = 0; CHECK(GameIsReloading(w));
+    w.secondary_type = kSecondaryDeployed; w.deployed = 1; CHECK(!GameIsReloading(w));
+    w.deployed = 0; w.reload_time = 0; CHECK(!GameIsReloading(w)); }
+  for (int d = 0; d <= int(Decision::kTimerBusy); ++d) CHECK(std::string_view(DecisionName(Decision(d))) != "?");
+}
+
+void TestRequests() {
+  // Off: a press does nothing, and nothing is left behind for later.
+  {
+    Requests r;
+    r.Request(0, 1000, false);
+    CHECK(!r.Pending(0));
+    CHECK(!r.Consume(0, 1001, true));
+  }
+  // On: one press, one reload, consumed once.
+  {
+    Requests r;
+    r.Request(0, 1000, true);
+    CHECK(r.Pending(0));
+    CHECK(r.Consume(0, 1016, true));
+    CHECK(!r.Consume(0, 1033, true));
+    CHECK(!r.Pending(0));
+    // Players are independent.
+    r.Request(1, 2000, true);
+    CHECK(!r.Consume(0, 2001, true));
+    CHECK(r.Consume(1, 2001, true));
+    CHECK(!r.Consume(4, 2001, true));
+    r.Request(7, 2000, true);  // out of range: ignored
+  }
+  // Two presses before a tick: still one reload.
+  {
+    Requests r;
+    r.Request(0, 1000, true);
+    r.Request(0, 1005, true);
+    CHECK(r.Consume(0, 1010, true));
+    CHECK(!r.Consume(0, 1026, true));
+  }
+  // A request nobody took in time (a menu, the game's pause) expires instead of firing late.
+  {
+    Requests r;
+    r.Request(0, 1000, true);
+    CHECK(!r.Consume(0, 1000 + Requests::kLifetimeMs + 1, true));
+    CHECK(!r.Pending(0));
+    r.Request(0, 5000, true);
+    CHECK(r.Consume(0, 5000 + Requests::kLifetimeMs, true));
+  }
+  // Toggled off mid-game with a request pending: dropped, and turning it back on does not
+  // bring it back.
+  {
+    Requests r;
+    r.Request(0, 1000, true);
+    CHECK(!r.Consume(0, 1010, false));
+    CHECK(!r.Consume(0, 1020, true));
+    r.Request(0, 1030, false);  // pressed while off
+    CHECK(!r.Consume(0, 1040, true));
+    r.Request(0, 1050, true);   // back on
+    CHECK(r.Consume(0, 1060, true));
+    r.Request(0, 1070, true);
+    r.Clear();
+    CHECK(!r.Consume(0, 1071, true));
+  }
+  // Once per tick.
+  {
+    TickGate gate;
+    CHECK(gate.Take(10));
+    CHECK(!gate.Take(10));
+    CHECK(gate.Take(11));
+  }
+  // Keyboard: press edge only.
+  {
+    KeyEdge edge;
+    CHECK(!edge.Update(false));
+    CHECK(edge.Update(true));
+    CHECK(!edge.Update(true));
+    CHECK(!edge.Update(false));
+    CHECK(edge.Update(true));
+  }
+}
+
+void TestPad() {
+  using namespace edf::menu;
+  CHECK(ParsePadBinding("rs") == kPadRightThumb);
+  CHECK(ParsePadBinding("RS") == kPadRightThumb);
+  CHECK(ParsePadBinding("lb+rb") == (kPadLeftShoulder | kPadRightShoulder));
+  CHECK(ParsePadBinding("off") == 0);
+  CHECK(ParsePadBinding("") == 0);
+  CHECK(ParsePadBinding("rs+nope") == 0);
+  for (const auto& option : kPadOptions)
+    CHECK(std::string_view(option.value) == "off" || ParsePadBinding(option.value) != 0);
+
+  // No chord shared: fires on the press.
+  {
+    PadTrigger t;
+    const uint16_t chord = ParsePadChord("back+start");
+    CHECK(!t.Update(0, 0, kPadRightThumb, chord));
+    CHECK(t.Update(kPadRightThumb, kPadRightThumb, kPadRightThumb, chord));
+    CHECK(!t.Update(kPadRightThumb, kPadRightThumb, kPadRightThumb, chord));
+    CHECK(!t.Update(0, 0, kPadRightThumb, chord));
+    CHECK(t.Update(kPadRightThumb | kPadA, kPadRightThumb | kPadA, kPadRightThumb, chord));
+    CHECK(!t.Update(kPadRightThumb, kPadRightThumb, 0, chord));  // binding off
+  }
+  // Shared with the "click both sticks" chord: a tap fires on release; L3 + R3 does not.
+  {
+    PadTrigger t;
+    const uint16_t chord = ParsePadChord("ls+rs");
+    CHECK(!t.Update(kPadRightThumb, kPadRightThumb, kPadRightThumb, chord));
+    CHECK(t.Update(0, 0, kPadRightThumb, chord));
+    // R3, then L3: the chord takes both from the game; no reload, then or on release.
+    CHECK(!t.Update(kPadRightThumb, kPadRightThumb, kPadRightThumb, chord));
+    CHECK(!t.Update(0, kPadRightThumb | kPadLeftThumb, kPadRightThumb, chord));
+    CHECK(!t.Update(0, 0, kPadRightThumb, chord));
+    // L3 first, then R3 while L3 is held.
+    CHECK(!t.Update(kPadLeftThumb, kPadLeftThumb, kPadRightThumb, chord));
+    CHECK(!t.Update(0, kPadRightThumb | kPadLeftThumb, kPadRightThumb, chord));
+    CHECK(!t.Update(0, 0, kPadRightThumb, chord));
+    // A spoiled press does not poison the next tap.
+    CHECK(!t.Update(kPadRightThumb, kPadRightThumb, kPadRightThumb, chord));
+    CHECK(t.Update(0, 0, kPadRightThumb, chord));
+  }
+  // The remap's Reload action wins over the fallback while it is bound.
+  {
+    PadReload p;
+    PadPoll poll;
+    poll.game = poll.raw = kPadRightThumb;
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kFallback);
+    poll.game = poll.raw = 0;
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kNone);
+    poll.reload_mapped = true;
+    poll.game = poll.raw = kPadRightThumb;  // R3 no longer reloads
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kNone);
+    poll.reload_held = true;  // the mapped button (taken from the game)
+    poll.game = 0;
+    poll.raw = kPadX;
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kMapped);
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kNone);
+    poll.reload_held = false;
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kNone);
+    poll.reload_held = true;
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kMapped);
+    // The F1 menu withholds the pad: nothing, and no stale edge afterwards.
+    poll.blank = true;
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kNone);
+    poll.blank = false;
+    CHECK(p.Update(poll, kPadRightThumb, 0) == PadPress::kMapped);
+  }
+  // The player's in-game controller settings: Technical (type 1) and Normal (type 0)
+  // defaults as sub_820A0028 writes them; neither names RightThumb (9).
+  {
+    const std::array<uint32_t, 14> technical{1, 0, 0, 7, 4, 6, 5, 2, 3, 8, 0, 1, 4, 5};
+    std::array<uint32_t, 14> normal = technical;
+    normal[0] = 0;
+    CHECK(!ProfileUsesBinding(technical, kPadRightThumb));
+    CHECK(!ProfileUsesBinding(normal, kPadRightThumb));
+    CHECK(!ProfileUsesBinding(technical, kPadLeftThumb));  // Technical's words +12..+24 only
+    CHECK(ProfileUsesBinding(normal, kPadLeftThumb));      // Normal zooms on L3
+    std::array<uint32_t, 14> moved = technical;
+    moved[4] = 9;  // zoom moved to R3 in the game's settings
+    CHECK(ProfileUsesBinding(moved, kPadRightThumb));
+    CHECK(!ProfileUsesBinding(technical, kPadBack));  // not a profile-nameable button
+  }
+  // Off, a button mapped to Reload goes back to its own game control.
+  {
+    namespace pad = edf::pad;
+    const int reload = pad::TargetOf(pad::SyntheticAction::kReload);
+    const pad::PadRemap mapped = pad::AssignSource(pad::PadRemap::Default(), reload, pad::kX);
+    CHECK(mapped.source[size_t(pad::kX)] == pad::kNoSource);
+    const pad::PadRemap off = WithoutReload(mapped);
+    CHECK(off.IsDefault());
+    CHECK(WithoutReload(pad::PadRemap::Default()).IsDefault());
+    // If the button was since given to another control too, leave that as the player set it.
+    pad::PadRemap moved = pad::AssignSource(mapped, pad::kY, pad::kX);
+    moved.source[size_t(reload)] = int8_t(pad::kX);
+    const pad::PadRemap moved_off = WithoutReload(moved);
+    CHECK(moved_off.source[size_t(reload)] == pad::kNoSource);
+    CHECK(moved_off.source[size_t(pad::kY)] == pad::kX);
+  }
+}
+
+// ---- synthetic guest memory ----
+// The game's side, transcribed instruction by instruction, so the injection can be run
+// against it.
+constexpr uint32_t kSoldier = 0x1000, kWeapons = 0x4000, kWeaponCount = 3, kSelected = 1;
+constexpr uint32_t kWeapon = kWeapons + kSelected * kWeaponStride;
+
+void Put32(std::vector<uint8_t>& m, uint32_t a, uint32_t v) { Store32(m.data(), a, v); }
+int32_t Get32(const std::vector<uint8_t>& m, uint32_t a) { return int32_t(Load32(m.data(), a)); }
+
+std::vector<uint8_t> GuestWorld(int32_t ammo) {
+  std::vector<uint8_t> m(0x10000, 0);
+  Put32(m, kSoldier, kPlayerObjectVtable);
+  Put32(m, kSoldier + kSoldierPlayer, 0);
+  Put32(m, kSoldier + kSoldierWeapons, kWeapons);
+  Put32(m, kSoldier + kSoldierWeaponCount, kWeaponCount);
+  Put32(m, kSoldier + kSoldierWeaponIndex, kSelected);
+  m[kSoldier + kSoldierFireReady] = 1;
+  for (uint32_t i = 0; i < kWeaponCount; ++i) {
+    const uint32_t w = kWeapons + i * kWeaponStride;
+    m[w + kWeaponConstructed] = 1;
+    m[w + kWeaponSelected] = i == kSelected;
+    Put32(m, w + kWeaponReloadTime, 90);
+    Put32(m, w + kWeaponReloadTimer, 90);
+    Put32(m, w + kWeaponCapacity, 120);
+    Put32(m, w + kWeaponAmmo, 120);
+    Put32(m, w + 440, 7);   // fire cooldown
+    Put32(m, w + 788, 3);   // FireLoadSe countdown
+  }
+  Put32(m, kWeapon + kWeaponAmmo, uint32_t(ammo));
+  return m;
+}
+
+// sub_820E28B8 0x820E28D0..0x820E2900: fire one shot.
+void GameFireOneShot(std::vector<uint8_t>& m, uint32_t w) {
+  const int32_t ammo = Get32(m, w + 804);        // lwz r11,804(r31)
+  if (ammo <= 0) return;                         // cmpwi; bgt
+  Put32(m, w + 804, uint32_t(ammo - 1));         // addi r11,r11,-1; stw r11,804(r31)
+}
+
+// sub_820E2C38 0x820E2EC4..0x820E2F3C (reload arm) and sub_820E1620 (refill), with
+// r4 = soldier+1460 != 2.
+void GameReloadArm(std::vector<uint8_t>& m, uint32_t w, bool r4) {
+  if (Get32(m, w + 804) > 0) return;
+  bool r11 = true;
+  if (Get32(m, w + 412) == 2 && Get32(m, w + 1368) != 0) r11 = false;
+  if (!r4) return;
+  if (Get32(m, w + 384) < 0) return;
+  if (!r11) return;
+  const int32_t timer = Get32(m, w + 388);
+  Put32(m, w + 72, 0x3F800000u);                 // stfs f30(=1.0),72(r31)
+  m[w + 68] = 0;                                 // stb r27(=0),68(r31)
+  Put32(m, w + 388, uint32_t(timer - 1));        // stw r10,388(r31)
+  if (timer > 0) return;
+  // sub_820E1620
+  const int32_t reload_time = Get32(m, w + 384);
+  Put32(m, w + 388, uint32_t(reload_time));
+  Put32(m, w + 804, uint32_t(Get32(m, w + 800)));
+  if (reload_time != 0) Put32(m, w + 440, 0);
+  Put32(m, w + 788, 0);
+}
+
+void TestGuestMemory() {
+  // The injection writes one word: the selected weapon's magazine count.
+  {
+    auto m = GuestWorld(57);
+    const auto before = m;
+    CHECK(TryManualReload(m.data(), kSoldier, 0) == Decision::kStart);
+    size_t changed = 0, first = 0;
+    for (size_t i = 0; i < m.size(); ++i)
+      if (m[i] != before[i]) { if (!changed) first = i; ++changed; }
+    CHECK(changed <= 4 && first >= kWeapon + kWeaponAmmo && first < kWeapon + kWeaponAmmo + 4);
+    CHECK(Get32(m, kWeapon + kWeaponAmmo) == 0);
+    // Nothing else is touched: not the other weapons, not the timer.
+    CHECK(Get32(m, kWeapons + kWeaponAmmo) == 120 && Get32(m, kWeapon + kWeaponReloadTimer) == 90);
+    // A second request finds the reload running and writes nothing.
+    const auto after = m;
+    CHECK(TryManualReload(m.data(), kSoldier, 0) == Decision::kAlreadyEmpty);
+    CHECK(m == after);
+  }
+  // Refusals write nothing.
+  for (const int32_t ammo : {120, 0}) {
+    auto m = GuestWorld(ammo);
+    const auto before = m;
+    CHECK(TryManualReload(m.data(), kSoldier, 0) != Decision::kStart);
+    CHECK(m == before);
+  }
+  {
+    auto m = GuestWorld(57);
+    Put32(m, kSoldier + kSoldierVehicle, 0x40002000u);
+    const auto before = m;
+    CHECK(TryManualReload(m.data(), kSoldier, 0) == Decision::kInVehicle);
+    CHECK(m == before);
+  }
+  // Same state as the game's own path: a magazine emptied by manual reload and one emptied
+  // by firing its last round are byte-identical, and so is every tick of the reload after.
+  {
+    auto manual = GuestWorld(57);
+    auto game = GuestWorld(1);
+    CHECK(TryManualReload(manual.data(), kSoldier, 0) == Decision::kStart);
+    GameFireOneShot(game, kWeapon);
+    CHECK(manual == game);
+    int ticks = 0;
+    while (GameIsReloading(ReadWeapon(manual.data(), kWeapon)) && ticks < 1000) {
+      GameReloadArm(manual, kWeapon, true);
+      GameReloadArm(game, kWeapon, true);
+      CHECK(manual == game);
+      ++ticks;
+    }
+    // ReloadTime 90: the arm reads 90..0 and refills on the 91st tick, cooldown cleared.
+    CHECK(ticks == 91);
+    CHECK(Get32(manual, kWeapon + kWeaponAmmo) == 120);
+    CHECK(Get32(manual, kWeapon + kWeaponReloadTimer) == 90);
+    CHECK(Get32(manual, kWeapon + 440) == 0 && Get32(manual, kWeapon + 788) == 0);
+    // Fire paths are dead while empty: a shot during the reload changes nothing.
+    auto again = GuestWorld(57);
+    TryManualReload(again.data(), kSoldier, 0);
+    const auto empty = again;
+    GameFireOneShot(again, kWeapon);
+    CHECK(again == empty);
+  }
+}
+}  // namespace reload_test
+
+void TestManualReload() {
+  reload_test::TestDecision();
+  reload_test::TestRequests();
+  reload_test::TestPad();
+  reload_test::TestGuestMemory();
+  // Key table: an optional action, off the shared defaults, and a mouse target of its own.
+  CHECK(std::string_view(edf::kKeyActions[static_cast<size_t>(edf::kbm::Action::kReload)].cvar) == "kbm_reload");
+  CHECK(edf::IsOptionalAction("kbm_reload") && !edf::IsOptionalAction("kbm_fire"));
+  CHECK(edf::MouseTargetAt(edf::MouseTargetIndex("reload")).action == static_cast<int>(edf::kbm::Action::kReload));
+  // A reload press presses no pad control.
+  edf::kbm::ActionState actions{};
+  actions[static_cast<size_t>(edf::kbm::Action::kReload)] = true;
+  const auto frame = edf::kbm::BuildChannelFrame(actions, edf::kbm::TechnicalBindings{});
+  CHECK(std::none_of(frame.pad.begin(), frame.pad.end(), [](bool b) { return b; }));
+  CHECK(frame.move_x == 0 && frame.move_y == 0 && frame.menu_x == 0 && frame.menu_y == 0 && !frame.start && !frame.back);
+}
 }  // namespace
 
 int main() {
@@ -1005,6 +1379,7 @@ int main() {
   TestControllerRemap();
   TestControllerRemapPersistence();
   TestDeadzones();
+  TestManualReload();
   if (failures) std::cerr << failures << " test assertion(s) failed\n";
   else std::cout << "All unit tests passed\n";
   return failures ? 1 : 0;

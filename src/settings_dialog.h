@@ -35,6 +35,7 @@
 #include "controller_logic.h"
 #include "keybind_logic.h"
 #include "launcher.h"
+#include "manual_reload_logic.h"
 #include "menu_gamepad.h"
 #include "menu_ui.h"
 #include "pause_menu.h"
@@ -814,6 +815,35 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
                      "range.");
     DrawControllerRemap();
 
+    ui::SectionHeading("Gameplay additions", metrics_);
+    CheckboxRow("Manual reload (not in original game)", "edf_manual_reload",
+                "EDF 2017 only reloads when a magazine runs dry. This adds a Reload key (default G, under Key "
+                "bindings) and a controller button (below) that start the current weapon's reload early, exactly as "
+                "an empty magazine would: the full reload time, the reload gauge, then a full magazine. Rounds left "
+                "in the magazine are replaced, not added. Does nothing with a full magazine, during a reload or a "
+                "burst, in vehicles, or for weapons that never reload or refill at once (grenades), nor while "
+                "C-bombs or sentry guns are still deployed. Off, the Reload key and button do nothing and the game "
+                "gets every button as before. Applies immediately.");
+    const bool manual_reload = GetBool(Get("edf_manual_reload"));
+    ImGui::BeginDisabled(!manual_reload);
+    BeginRow("Reload on the controller");
+    const std::string reload_pad = Get("edf_manual_reload_pad");
+    int reload_pad_index = -1;
+    std::vector<const char*> reload_pad_labels;
+    for (size_t i = 0; i < reload::kPadOptions.size(); ++i) {
+      reload_pad_labels.push_back(reload::kPadOptions[i].label);
+      if (reload_pad == reload::kPadOptions[i].value) reload_pad_index = int(i);
+    }
+    const std::string reload_pad_custom = "Custom (" + reload_pad + ")";
+    if (Combo("##reload_pad", &reload_pad_index, reload_pad_labels, {},
+              reload_pad_index < 0 ? reload_pad_custom.c_str() : nullptr))
+      rex::cvar::SetFlagByName("edf_manual_reload_pad", reload::kPadOptions[size_t(reload_pad_index)].value);
+    EndRow("Used while Controller mapping > Extra actions > Reload is unbound; mapping a button there replaces it. "
+           "Clicking the right stick does nothing else in the game, so it stays with the game as well. If the F1 "
+           "menu opens with both sticks, a reload needs a short tap of the right stick on its own. A button the "
+           "game's own controller settings give to an action is left to that action.");
+    ImGui::EndDisabled();
+
     ui::SectionHeading("Keyboard and mouse", metrics_);
     CheckboxRow("Keyboard and mouse", "edf_kbm",
                 "Play with keyboard and mouse. The controller keeps working alongside. Uses the game's Technical "
@@ -932,7 +962,14 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
           ImGui::TableSetColumnIndex(0);
           ImGui::TextColored(ui::color::kGreen, "Extra actions");
         }
+        // The Reload row only means something while manual reload is on.
+        const bool inactive = target == pad::TargetOf(pad::SyntheticAction::kReload) &&
+                              !GetBool(Get("edf_manual_reload"));
+        ImGui::BeginDisabled(inactive);
         DrawRemapRow(remap, target);
+        ImGui::EndDisabled();
+        if (inactive && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Turn on Manual reload under Gameplay additions to use this.");
       }
       ImGui::EndTable();
     }
@@ -1064,9 +1101,13 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     constexpr ImGuiTableFlags kFlags = ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_RowBg |
                                        ImGuiTableFlags_BordersInnerH | ImGuiTableFlags_PadOuterX;
     // Snapshot every binding once per frame so each row can spot a key it shares.
+    // The optional Reload row is greyed out, and shares nothing, while manual reload is off.
+    const bool manual_reload = GetBool(Get("edf_manual_reload"));
     std::vector<std::pair<std::string, std::string>> bindings;
     bindings.reserve(std::size(kKeyActions));
-    for (const auto& action : kKeyActions) bindings.emplace_back(action.cvar, rex::cvar::GetFlagByName(action.cvar));
+    for (const auto& action : kKeyActions)
+      if (manual_reload || !IsOptionalAction(action.cvar))
+        bindings.emplace_back(action.cvar, rex::cvar::GetFlagByName(action.cvar));
     const char* group = nullptr;
     if (ImGui::BeginTable("keybinds", 3, kFlags)) {
       ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.38f);
@@ -1079,7 +1120,13 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
           ImGui::TableSetColumnIndex(0);
           ImGui::TextColored(ui::color::kGreen, "%s", group);
         }
-        DrawBindRow(action, bindings);
+        const bool inactive = IsOptionalAction(action.cvar) && !manual_reload;
+        static const std::vector<std::pair<std::string, std::string>> kNoBindings;
+        ImGui::BeginDisabled(inactive);
+        DrawBindRow(action, inactive ? kNoBindings : bindings);
+        ImGui::EndDisabled();
+        if (inactive && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+          ImGui::SetTooltip("Turn on Manual reload under Gameplay additions to use this key.");
       }
       ImGui::TableNextRow();
       ImGui::TableSetColumnIndex(0);
@@ -1169,8 +1216,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
       case 3:
         for (const char* cvar : {"input_backend", "edf_menu_pad_chord", "edf_rumble", "edf_pad_left_deadzone",
                                  "edf_pad_right_deadzone", "edf_pad_trigger_threshold", "edf_pad_remap_p1",
-                                 "edf_pad_remap_p2", "edf_kbm", "edf_kbm_mouse_look", "edf_kbm_invert_y",
-                                 "edf_kbm_sensitivity"})
+                                 "edf_pad_remap_p2", "edf_manual_reload", "edf_manual_reload_pad", "edf_kbm",
+                                 "edf_kbm_mouse_look", "edf_kbm_invert_y", "edf_kbm_sensitivity"})
           ResetOne(cvar);
         capture_cvar_.clear();
         pad_capture_target_ = -1;

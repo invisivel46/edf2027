@@ -51,12 +51,18 @@ struct KeyAction {
   X(kbm_menu_left, "Menu left", "Menus", "Left") \
   X(kbm_menu_right, "Menu right", "Menus", "Right") \
   X(kbm_start, "Start (title screen, pause)", "System", "Return") \
-  X(kbm_back, "Back (retire)", "System", "Tab")
+  X(kbm_back, "Back (retire)", "System", "Tab") \
+  X(kbm_reload, "Reload (manual reload, not in original game)", "Optional", "G")
 
 // The keyboard bindings this port exposes, in display order, which is also the order of
 // edf::kbm::Action in native_kbm_logic.h. Fire, zoom, jump and next weapon follow whatever pad
 // control the in-game controller settings give them; the rest are fixed controls, named
 // by what is known of them.
+//
+// Reload is a synthetic action: it presses no pad control, it asks manual_reload.h for a
+// reload, and it does nothing unless edf_manual_reload is on. Its default is G, not the
+// usual R: R has always been Pad X here, and a default shared by two actions would press
+// both (the defaults test below the table forbids it). Rebinding it to R is one Set away.
 #define EDF_KEY_ACTION_ROW(cvar, label, group, default_value) {#cvar, label, group, default_value},
 inline constexpr KeyAction kKeyActions[] = {EDF_KEY_ACTIONS(EDF_KEY_ACTION_ROW)};
 #undef EDF_KEY_ACTION_ROW
@@ -89,7 +95,13 @@ inline constexpr MouseTarget kMouseTargets[] = {
     {"rstick_press", "Right stick press", 12},
     {"start", "Start (title screen, pause)", 17},
     {"back", "Back (retire)", 18},
+    {"reload", "Reload (manual reload, not in original game)", 19},
 };
+
+// The Reload row and its mouse target only mean something while edf_manual_reload is on;
+// the settings screen greys the row out and leaves it out of conflict checks otherwise.
+inline constexpr std::string_view kReloadActionCvar = "kbm_reload";
+inline bool IsOptionalAction(std::string_view cvar) { return cvar == kReloadActionCvar; }
 
 inline constexpr int kMouseTargetCount = static_cast<int>(std::size(kMouseTargets));
 

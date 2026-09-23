@@ -43,6 +43,7 @@ set(EDF2027_SOURCES
     src/input_hooks.cpp
     src/launcher_cvars.cpp
     src/native_kbm.cpp
+    src/manual_reload.cpp
 )
 
 if(WIN32)

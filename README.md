@@ -200,6 +200,20 @@ Right: binding a key that another action already uses flags both rows, since
 only one of them would respond in game.*
 
 Controller vibration can be enabled or disabled in the F1 settings.
+
+**Manual reload (optional, not in the original game).** EDF 2017 only reloads
+when a magazine runs dry. *Controls > Gameplay additions > Manual reload*
+(`edf_manual_reload`, off by default, applies at once) adds a Reload key
+(**G**, rebindable under Key bindings) and a controller button: whatever you map
+under *Controller mapping > Extra actions > Reload*, or else a click of the
+right stick (`edf_manual_reload_pad`), which the game itself leaves unused. A
+press starts the current weapon's reload exactly as an empty magazine would -
+the full reload time and gauge, then a full magazine; the rounds left are
+replaced. It does nothing with a full magazine, mid-reload or mid-burst, in a
+vehicle, for weapons that never reload or refill at once (grenades), or while
+C-bombs and sentry guns are deployed. Turned off, the key and button do nothing
+and every button reaches the game as before.
+
 Press **Escape** at any time to quit the game; it cannot be rebound.
 
 ## Command line (optional)

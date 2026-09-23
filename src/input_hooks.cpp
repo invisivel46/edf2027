@@ -23,6 +23,7 @@
 #include "scripted_input_logic.h"
 #include "pause_menu.h"
 #include "controller_logic.h"
+#include "manual_reload.h"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -59,8 +60,9 @@ struct RemapTables {
 RemapTables& Remaps() { static RemapTables tables; return tables; }
 
 // Dead zones, then the remap table of guest user `user`; users past the tables get the
-// dead zones only. Returns the synthetic actions held.
-uint32_t RemapPad(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
+// dead zones only. Returns the synthetic actions held; `reload_mapped` says whether the
+// table binds a button to the Reload action at all (manual_reload.h).
+uint32_t RemapPad(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad, bool* reload_mapped) {
   const auto zones = edf::pad::Deadzones::FromPercent(
       REXCVAR_GET(edf_pad_left_deadzone), REXCVAR_GET(edf_pad_right_deadzone), REXCVAR_GET(edf_pad_trigger_threshold));
   edf::pad::PadRemap table;
@@ -76,6 +78,10 @@ uint32_t RemapPad(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
     }
     table = remaps.table[user];
   }
+  // Manual reload off: a button mapped to Reload goes back to the game (manual_reload_logic.h).
+  if (has_table && !edf::reload::Enabled()) table = edf::reload::WithoutReload(table);
+  *reload_mapped = has_table && table.source[size_t(edf::pad::TargetOf(edf::pad::SyntheticAction::kReload))] !=
+                                    edf::pad::kNoSource;
   const edf::menu::PadSnapshot raw{pad.buttons, pad.left_trigger, pad.right_trigger,
                                    pad.thumb_lx, pad.thumb_ly, pad.thumb_rx, pad.thumb_ry};
   const auto result = edf::pad::ProcessPad(raw, zones, has_table ? &table : nullptr);
@@ -92,18 +98,27 @@ uint32_t RemapPad(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
 // F1 menu (pause_menu.h): the pad chord that opens it, and while it is open - and until
 // the pad has been let go after it closes - the game sees an untouched pad. The chord and
 // the drain look at the RAW pad, before dead zones and remapping, so no remap can make the
-// menu unreachable. Then the player's dead zones and remap table.
-void RoutePad(uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
+// menu unreachable. Then the player's dead zones and remap table. Last, manual reload
+// (optional, off by default) is shown the poll; it never changes what the game is given.
+void RoutePad(const uint8_t* base, uint32_t user, rex::input::X_INPUT_GAMEPAD& pad) {
   const edf::menu::PadSnapshot snapshot{pad.buttons, pad.left_trigger, pad.right_trigger,
                                         pad.thumb_lx, pad.thumb_ly, pad.thumb_rx, pad.thumb_ry};
   const auto routed = edf::menu::RouteGuestPad(snapshot, REXCVAR_GET(edf_menu_pad_chord), user == 0);
+  edf::reload::PadPoll poll;
+  poll.raw = snapshot.buttons;
   if (routed.blank) {
     pad = rex::input::X_INPUT_GAMEPAD{};
     edf::pad::PublishSynthetic(int(user), 0);
+    poll.blank = true;
+    edf::reload::OnGuestPad(base, user, poll);
     return;
   }
   pad.buttons = routed.buttons;  // the chord's buttons taken out, as raw buttons
-  edf::pad::PublishSynthetic(int(user), RemapPad(user, pad));
+  const uint32_t synthetic = RemapPad(user, pad, &poll.reload_mapped);
+  edf::pad::PublishSynthetic(int(user), synthetic);
+  poll.game = pad.buttons;
+  poll.reload_held = (synthetic >> unsigned(edf::pad::SyntheticAction::kReload)) & 1u;
+  edf::reload::OnGuestPad(base, user, poll);
 }
 }  // namespace
 
@@ -129,7 +144,7 @@ REX_HOOK_RAW(sub_8212EA20) {
                 (uint32_t)st->packet_number, g_calls);
     g_last_rc = rc; g_last_btn = btn;
   }
-  RoutePad(user, st->gamepad);
+  RoutePad(base, user, st->gamepad);
 }
 
 // Gate the game's XInputSetState wrapper so the option applies equally to the
