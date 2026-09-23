@@ -1,6 +1,8 @@
 #include "native_graphics/native_pacing.h"
 #include "native_graphics/native_camera_history.h"
 #include "native_graphics/native_model_pose_history.h"
+#include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 
@@ -34,6 +36,50 @@ int main() {
     check(poses.render_dependent() && output==view_dependent,"render-dependent pose was interpolated twice");
     view_dependent[0][12]=2; poses.Sample(view_dependent,201,.2f,output);
     check(output==view_dependent,"render-dependent pose resumed stale fixed-step blending");
+  }
+  // The stateless per-bone blend the full-frame models pass uses is what
+  // Sample outputs, bit for bit: over consecutive ticks, several renders per
+  // tick, for a scaled rotating bone, a stationary bone, a sheared bone, a cut
+  // (a teleport) and a bone that becomes degenerate.
+  {
+    const auto bone=[](float angle,float scale,float x) {
+      const float c=std::cos(angle),s=std::sin(angle);
+      return NativePoseMatrix{c*scale,s*scale,0,0, -s*scale*1.5f,c*scale*1.5f,0,0, 0,0,scale*.75f,0, x,2*x,-x,1};
+    };
+    const auto frame=[&](uint64_t tick) {
+      const float t=float(tick);
+      std::vector<NativePoseMatrix> pose{bone(.3f*t,1+.1f*t,t),bone(1,2,3),bone(.2f*t,1,t),bone(.7f*t,.5f,tick>=13?500.f+t:t),
+        bone(.1f*t,tick==12?0.f:1.f,t)};
+      pose[2][1]+=.5f;  // Sheared: never blended.
+      return pose;
+    };
+    NativeModelPoseHistory history;
+    std::vector<NativePoseMatrix> output,previous=frame(10);
+    history.Sample(previous,10,.5f,output);
+    bool identical=true,blended=false,stationary=true,sheared=true;
+    for(uint64_t tick=11;tick<16;++tick) {
+      const auto current=frame(tick);
+      for(const float fraction:{0.f,.125f,.5f,.8f,1.f}) {
+        history.Sample(current,tick,fraction,output);
+        for(size_t index=0;index<current.size();++index) {
+          const auto expected=BlendNativePoseMatrix(previous[index],current[index],fraction);
+          identical&=std::memcmp(expected.data(),output[index].data(),sizeof(expected))==0;
+          blended|=fraction>0 && fraction<1 && expected!=current[index];
+        }
+        stationary&=output[1]==current[1];
+        sheared&=output[2]==current[2];
+      }
+      previous=current;
+    }
+    check(identical,"the stateless pose blend differs from NativeModelPoseHistory::Sample");
+    check(blended && stationary && sheared,"the blend comparison exercised no blend, or blended a stationary or sheared bone");
+    const auto a=bone(.1f,1,0),b=bone(.4f,2,10);
+    check(BlendNativePoseMatrix(a,b,0)==a && BlendNativePoseMatrix(a,b,-1)==a,"alpha 0 is not the previous matrix");
+    check(BlendNativePoseMatrix(a,b,1)==b && BlendNativePoseMatrix(a,b,std::numeric_limits<float>::quiet_NaN())==b,
+      "alpha 1 or NaN is not the current matrix");
+    check(BlendNativePoseMatrix(b,b,.5f)==b,"a stationary bone is not the current matrix");
+    const auto half=BlendNativePoseMatrix(a,b,.5f);
+    check(std::abs(half[12]-5)<1e-5f && std::abs(half[13]-10)<1e-5f,"blended bone translation is not the midpoint");
   }
   {
     NativeCameraHistory history;

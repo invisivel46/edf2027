@@ -21,6 +21,12 @@
 // (native_model_hierarchy.h), so their layout is captured with the tree's
 // bone count and never waits for the guest pose vector to be sized.
 //
+// Pose motion (NativeRenderPoseMotion, native_render_motion.h): every pose a
+// re-read publishes (the model's, each attachment's and each instanced set's
+// worlds) carries the previous tick's pose while the object was read on
+// consecutive ticks, for the models pass to interpolate in unlocked mode; an
+// unchanged pose keeps its motion, so unchanged entries stay shared.
+//
 // Cost per tick is O(re-read objects + changes), never O(entries): a re-read
 // builds into a reused scratch entry and compares it with the published one
 // (the pose against the guest bytes, without decoding), so only an entry that
@@ -35,6 +41,7 @@
 #include "native_model_publication.h"
 #include "native_render_entry.h"
 #include "native_render_instances.h"
+#include "native_render_motion.h"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -89,7 +96,8 @@ template<class Reader> float NativeRenderFloat(const Reader& reader,uint32_t add
   return std::bit_cast<float>(reader.Word(address));
 }
 // Bitwise equality; the pose, layout and entry pointers compare by identity
-// because the registry shares them whenever their content is unchanged.
+// because the registry shares them whenever their content is unchanged (pose
+// motions too: previous by identity, tick and render_dependent by value).
 inline bool SameNativeRenderEntry(const NativeRenderEntry& a,const NativeRenderEntry& b) {
   const auto bits=[](float value) { return std::bit_cast<uint32_t>(value); };
   const auto same_models=[](const NativeRenderModel& x,const NativeRenderModel& y) {
@@ -97,17 +105,18 @@ inline bool SameNativeRenderEntry(const NativeRenderEntry& a,const NativeRenderE
   };
   if(a.object!=b.object || a.generation!=b.generation || a.type!=b.type || a.mode!=b.mode || a.hidden!=b.hidden ||
      bits(a.radius)!=bits(b.radius) || bits(a.cull_distance)!=bits(b.cull_distance) || bits(a.sort_bias)!=bits(b.sort_bias) ||
-     a.pose!=b.pose || a.pose_vector!=b.pose_vector || a.lod_thresholds.size()!=b.lod_thresholds.size() ||
+     a.pose!=b.pose || a.motion!=b.motion || a.pose_vector!=b.pose_vector || a.lod_thresholds.size()!=b.lod_thresholds.size() ||
      a.models.size()!=b.models.size() || a.attachments.size()!=b.attachments.size() || a.instanced.size()!=b.instanced.size()) return false;
   for(size_t i=0;i<4;++i) if(bits(a.centre[i])!=bits(b.centre[i])) return false;
   for(size_t i=0;i<a.lod_thresholds.size();++i) if(bits(a.lod_thresholds[i])!=bits(b.lod_thresholds[i])) return false;
   for(size_t i=0;i<a.models.size();++i) if(!same_models(a.models[i],b.models[i])) return false;
   for(size_t i=0;i<a.attachments.size();++i) {
     const auto& x=a.attachments[i],&y=b.attachments[i];
-    if(!same_models(x.model,y.model) || x.pose_vector!=y.pose_vector || x.pose!=y.pose) return false;
+    if(!same_models(x.model,y.model) || x.pose_vector!=y.pose_vector || x.pose!=y.pose || x.motion!=y.motion) return false;
   }
   for(size_t i=0;i<a.instanced.size();++i)
-    if(!same_models(a.instanced[i].model,b.instanced[i].model) || a.instanced[i].worlds!=b.instanced[i].worlds) return false;
+    if(!same_models(a.instanced[i].model,b.instanced[i].model) || a.instanced[i].worlds!=b.instanced[i].worlds ||
+       a.instanced[i].motion!=b.instanced[i].motion) return false;
   return true;
 }
 
@@ -233,6 +242,9 @@ class NativeRenderRegistry {
     NativeRenderPose frame_pose;
     std::array<uint32_t,16> frame_root{};
     uint64_t frame_builds=0;
+    // The tick of the last read that published the entry (pose motion).
+    uint64_t read_tick=0;
+    bool read=false;
   };
   void Push(uint32_t object,Event event) {
     { std::lock_guard lock(events_mutex_); events_.push_back({object,event}); }
@@ -300,8 +312,9 @@ class NativeRenderRegistry {
         else animated_.erase(object);
       }
       if(record.scene!=scene) ++stats_.foreign;
-      else if(record.type && !record.type->scene_source && !record.type->effect && !record.type->other_pass) { Build(reader,object,record,decode,complete); built=true; }
+      else if(record.type && !record.type->scene_source && !record.type->effect && !record.type->other_pass) { Build(reader,tick,object,record,decode,complete); built=true; }
     } catch(const std::exception&) { ++stats_.read_failures; built=false; complete=false; }
+    record.read=built; record.read_tick=tick;
     if(complete) { record.retries=0; retry_.erase(object); }
     else retry_[object]=tick+(uint64_t(1)<<std::min<uint32_t>(record.retries++,10));
     const auto* previous=objects_.Find(object);
@@ -314,13 +327,20 @@ class NativeRenderRegistry {
   // Fills scratch_ (vectors keep their capacity across builds); poses equal
   // to the published entry's are that entry's shared pointers.
   template<class Reader,class Decode>
-  void Build(const Reader& reader,uint32_t object,Record& record,const Decode& decode,bool& complete) {
+  void Build(const Reader& reader,uint64_t tick,uint32_t object,Record& record,const Decode& decode,bool& complete) {
     const auto& type=*record.type;
     const auto* previous=objects_.Find(object);
     const NativeRenderEntry* old=previous?previous->get():nullptr;
     auto* entry=&scratch_;
+    // Pose motion against the published entry (native_render_motion.h).
+    const bool same_generation=old && old->generation==record.generation;
+    const std::optional<uint64_t> read=record.read?std::optional<uint64_t>(record.read_tick):std::nullopt;
+    const auto motion=[&](const NativeRenderPose& pose,const NativeRenderPose* published,const NativeRenderPoseMotion* published_motion,
+        bool same_layout) {
+      return AdvanceNativeRenderPoseMotion(pose,published,published_motion,same_generation && same_layout,read,tick);
+    };
     entry->lod_thresholds.clear(); entry->models.clear(); entry->attachments.clear(); entry->instanced.clear();
-    entry->pose.reset(); entry->pose_vector=0; entry->axes={};
+    entry->pose.reset(); entry->pose_vector=0; entry->axes={}; entry->motion={};
     entry->object=object; entry->generation=record.generation; entry->type=&type;
     for(uint32_t i=0;i<4;++i) entry->centre[i]=NativeRenderFloat(reader,object+kNativeRenderObjectCentre+i*4);
     // The oriented half axes of the 821B2B00 bound (obj+304/+320/+336): the
@@ -356,13 +376,20 @@ class NativeRenderRegistry {
         entry->models.push_back(Model(reader,record,at+4,entry->pose_vector,decode,complete));
       }
     }
+    // Every LOD model draws the one pose: any model or layout change resets it.
+    bool same_models=old && old->models.size()==entry->models.size();
+    for(size_t i=0;same_models && i<entry->models.size();++i)
+      same_models=old->models[i].instance==entry->models[i].instance && old->models[i].layout==entry->models[i].layout;
+    entry->motion=motion(entry->pose,old?&old->pose:nullptr,old?&old->motion:nullptr,same_models);
     const auto attach=[&](uint32_t instance,uint32_t vector) {
       NativeRenderAttachment attachment;
       attachment.pose_vector=vector;
       attachment.model=Model(reader,record,instance,vector,decode,complete);
-      NativeRenderPose shared;
-      if(old) for(const auto& earlier:old->attachments) if(earlier.pose_vector==vector) { shared=earlier.pose; break; }
-      attachment.pose=ReadPose(reader,vector,shared);
+      const NativeRenderAttachment* earlier=nullptr;
+      if(old) for(const auto& candidate:old->attachments) if(candidate.pose_vector==vector) { earlier=&candidate; break; }
+      attachment.pose=ReadPose(reader,vector,earlier?earlier->pose:nullptr);
+      attachment.motion=motion(attachment.pose,earlier?&earlier->pose:nullptr,earlier?&earlier->motion:nullptr,
+        earlier && earlier->model.instance==attachment.model.instance && earlier->model.layout==attachment.model.layout);
       entry->attachments.push_back(std::move(attachment));
     };
     if((type.attachments&kNativeRenderFace) && reader.Bytes(object+kNativeRenderFaceFlag,1)[0])
@@ -385,9 +412,12 @@ class NativeRenderRegistry {
       set.model=Model(reader,record,object+NativeMotherSpheres::instance,0,decode,complete);
       ReadNativeMotherSphereWorlds(reader,object,worlds_);
       stats_.instanced_worlds+=worlds_.size();
-      if(old) for(const auto& earlier:old->instanced)
-        if(earlier.model.instance==set.model.instance && earlier.worlds && SameNativeModelPose(*earlier.worlds,worlds_)) { set.worlds=earlier.worlds; break; }
+      const NativeRenderInstanced* earlier=nullptr;
+      if(old) for(const auto& candidate:old->instanced) if(candidate.model.instance==set.model.instance) { earlier=&candidate; break; }
+      if(earlier && earlier->worlds && SameNativeModelPose(*earlier->worlds,worlds_)) set.worlds=earlier->worlds;
       if(!set.worlds) set.worlds=std::make_shared<const std::vector<NativePoseMatrix>>(worlds_);
+      set.motion=motion(set.worlds,earlier?&earlier->worlds:nullptr,earlier?&earlier->motion:nullptr,
+        earlier && earlier->model.layout==set.model.layout);
       entry->instanced.push_back(std::move(set));
     }
   }

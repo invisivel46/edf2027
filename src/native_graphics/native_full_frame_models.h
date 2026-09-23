@@ -4,6 +4,7 @@
 #include "native_full_frame_model_cache.h"
 #include "native_model_pass.h"
 #include "native_render_entry.h"
+#include "native_render_motion.h"
 #include "native_scene_adapter.h"
 #include "native_scene_visibility.h"
 #include <functional>
@@ -26,7 +27,12 @@ namespace edf::native {
 //   8210AE48 / 820B2670 LOD    -> SelectNativeFullFrameModelLod
 //   821C9C20 model draw        -> the layout's records/batches/passes with the
 //                                 snapshot pose (821A17D8 rigid world,
-//                                 821A1738 bone palette)
+//                                 821A1738 bone palette), blended from the
+//                                 previous tick's in unlocked mode
+//                                 (NativeFullFrameModelPass::motion)
+//   820DB268 face / 820DE790   -> one item per published attachment
+//     weapons                     (NativeRenderEntry::attachments) after the
+//                                 LOD model, with its own layout and pose
 //   821C9DA8 world draw        -> one item per published instanced world
 //                                 (NativeRenderEntry::instanced), every drawn
 //                                 record with that world; identical draws of
@@ -89,11 +95,12 @@ inline uint16_t NativeFullFrameModelKey(int32_t mode,float view_z,float sort_bia
   return uint16_t(uint64_t(NativeFctidz(depth)));
 }
 
-// One model the frame draws: the LOD model chosen, or with instanced >= 0 the
+// One model the frame draws: the LOD model chosen, with attachment >= 0
+// entry->attachments[attachment] (face, weapon), or with instanced >= 0 the
 // world `world` of entry->instanced[instanced], and the entry's sort data
-// (instances share their object's visibility, key and route, as 820EC180
-// draws them inside the one slot-4 call). entry points into the snapshot,
-// which must outlive the plan.
+// (attachments and instances share their object's visibility, key and route,
+// as 820DEA08 and 820EC180 draw them inside the one slot-4 call). entry points
+// into the snapshot, which must outlive the plan.
 struct NativeFullFrameModelItem {
   const NativeRenderEntry* entry=nullptr;
   uint32_t model=0;
@@ -102,14 +109,33 @@ struct NativeFullFrameModelItem {
   bool transparent=false;
   int32_t instanced=-1;
   uint32_t world=0;
+  int32_t attachment=-1;
 };
+inline const std::shared_ptr<const NativeModelLayout>& NativeFullFrameModelItemLayoutObject(const NativeFullFrameModelItem& item) {
+  if(item.instanced>=0) return item.entry->instanced[size_t(item.instanced)].model.layout;
+  if(item.attachment>=0) return item.entry->attachments[size_t(item.attachment)].model.layout;
+  return item.entry->models[item.model].layout;
+}
 inline const NativeModelLayout& NativeFullFrameModelItemLayout(const NativeFullFrameModelItem& item) {
-  return item.instanced<0?*item.entry->models[item.model].layout:*item.entry->instanced[size_t(item.instanced)].model.layout;
+  return *NativeFullFrameModelItemLayoutObject(item);
+}
+// The pose vector an item draws from and its motion: the entry's pose, its
+// attachment's, or its instanced set's worlds (of which it draws one).
+inline std::pair<const NativeRenderPose*,const NativeRenderPoseMotion*> NativeFullFrameModelItemPose(const NativeFullFrameModelItem& item) {
+  if(item.instanced>=0) {
+    const auto& set=item.entry->instanced[size_t(item.instanced)];
+    return {&set.worlds,&set.motion};
+  }
+  if(item.attachment>=0) {
+    const auto& attachment=item.entry->attachments[size_t(item.attachment)];
+    return {&attachment.pose,&attachment.motion};
+  }
+  return {&item.entry->pose,&item.entry->motion};
 }
 struct NativeFullFrameModelPlan {
   struct Stats {
     uint64_t entries=0,hidden=0,mode=0,distance=0,frustum=0,box=0,no_model=0,no_pose=0,bucket_zero=0,opaque=0,transparent=0,
-      instances=0,no_instanced=0,other_pass=0;
+      instances=0,no_instanced=0,other_pass=0,attachments=0,no_attachment=0;
   };
   std::vector<NativeFullFrameModelItem> opaque;       // Snapshot order.
   std::vector<NativeFullFrameModelItem> transparent;  // Draw order: key descending, ties in snapshot order.
@@ -137,6 +163,7 @@ inline bool NativeFullFrameModelDispatched(const NativeFullFrameModelVisibility&
 std::vector<const NativeRenderEntry*> NativeFullFrameBrokenObjects(const NativeRenderRegistrySnapshot& snapshot,
   const NativeFullFrameModelCamera& camera);
 // Visibility, LOD and routing for every entry: its posed LOD model, then each
+// posed attachment in guest order (the face, then the weapons), then each
 // instanced world in record order. Transparents follow 821A3BA0:
 // buckets by high key byte 255 down to 1, each by low byte descending, equal
 // keys in gather order. High bucket 0 (key < 256) is never traversed there,
@@ -197,6 +224,9 @@ struct NativeFullFrameModelPass {
   // Word(descriptor+16) of the 821A1738 descriptor *(*(8257C02C)+36): the
   // runtime palette clamp, read once per frame by the host.
   uint32_t palette_limit=kNativeBonePaletteShaderBones;
+  // The frame's motion budget (NativeFrameInputs::motion): poses blend at its
+  // fraction when it interpolates (NativeRenderPoseBlender).
+  NativeFrameMotion motion;
 };
 // The explicit base state every model draw starts from, opaque and transparent
 // alike: the shared full-frame base state (NativeFullFrameBaseState, the same
@@ -287,7 +317,8 @@ struct NativeFullFrameModelFrame {
     // place (the published constants and animation they read unchanged).
     uint64_t items=0,drawn=0,draws=0,resolves=0,memo_hits=0,missing_program=0,missing_geometry=0,
       scissor=0,palette=0,failed=0,cache_hits=0,captures=0,palettes=0,source_hits=0,source_fetches=0,
-      programs=0,geometries=0,reused=0,derived=0,sourced=0,rows=0,camera_rows=0;
+      programs=0,geometries=0,reused=0,derived=0,sourced=0,rows=0,camera_rows=0,
+      blended=0;  // Drawn items whose pose or world is blended this frame (NativeRenderPoseBlender).
   };
   NativeFullFrameModelPlan plan;
   std::vector<NativeFullFrameModelBatch> batches;  // Opaque, then transparent.
@@ -312,7 +343,10 @@ struct NativeFullFrameModelDrawState {
 };
 struct NativeFullFrameModelItemState {
   std::shared_ptr<const NativeModelLayout> layout;
-  NativeRenderPose pose;  // The entry's pose, or the instanced set's worlds.
+  NativeRenderPose pose;  // The entry's pose, its attachment's, or the instanced set's worlds.
+  // The blend the constants were made with (NativeRenderBlendOf): the previous
+  // pose and fraction, or no previous pose when they are the pose's own.
+  NativeRenderBlend blend;
   uint32_t world=0,palette_limit=0;
   uint64_t generation=kNativeFullFrameModelUnversioned;  // Source generation of the draws' sources.
   bool sourced=false,valued=false;
@@ -355,6 +389,12 @@ struct NativeFullFrameModelRowState {
 // only its palette's registers rebound (NativeScenePaletteCapture), which is
 // what a full capture of the palette-bound constants makes.
 //
+// In unlocked mode an item's pose blends from its previous tick's
+// (NativeFullFrameModelPass::motion, NativeRenderPoseBlender): its constants
+// are then keyed by the blend inputs too (previous pose, fraction), so a
+// moving item's are made again each frame, while a stationary item, a pose of
+// an earlier tick, alpha 1 or interpolation off keep the pose's own.
+//
 // Per frame, Build touches:
 // - visibility, LOD and routing of every entry (PlanNativeFullFrameModels);
 // - each material row once: its pass constants take the camera in place
@@ -385,8 +425,11 @@ class NativeFullFrameModels {
   const NativeFullFrameModelSourceTable<NativeFullFrameModelSourcePair>& source_table() const { return sources_; }
   const NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve>& material_cache() const { return materials_; }
   size_t item_states() const { return items_.size(); }
+  // The pose source of every drawn item (Build's hook point for pose blending).
+  const NativeRenderPoseBlender& poses() const { return poses_; }
   size_t row_states() const { return rows_.size(); }
-  // (object, registry generation, instanced set or -1, LOD model or world).
+  // (object, registry generation, instanced set or -1, LOD model or world);
+  // an attachment's is (object, generation, -2, its pose vector address).
   using ItemKey=std::tuple<uint32_t,uint64_t,int32_t,uint32_t>;
   using RowKey=std::tuple<uint32_t,const void*,const void*,bool>;  // (pass record, program, geometry, skinned)
  private:
@@ -404,6 +447,7 @@ class NativeFullFrameModels {
   NativeFullFrameModelSourceTable<NativeFullFrameModelSourcePair> sources_;
   NativeFullFrameModelMaterialCache<NativeFullFrameModelResolve> materials_;
   std::unordered_map<ItemKey,NativeFullFrameModelItemState,ItemKeyHash> items_;
+  NativeRenderPoseBlender poses_;
   std::map<RowKey,NativeFullFrameModelRowState> rows_;
   // The providers' answers at one source generation: a program per pass
   // record, a geometry per pass record and batch value. Found ones only.

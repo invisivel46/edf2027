@@ -1,4 +1,5 @@
 #pragma once
+#include "native_frame_motion.h"
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -48,6 +49,9 @@ struct NativeFrameInputs {
   uint64_t motion_publication=0;  // Model motion generation (native_render_publication).
   // The render registry's latest tick snapshot (native_render_entry.h); null before its first tick.
   std::shared_ptr<const NativeRenderRegistrySnapshot> registry;
+  // The motion budget of this render (tick, fraction, steps, whether model
+  // poses interpolate): the one the camera's 821CDDF8 interpolation used.
+  NativeFrameMotion motion;
 };
 struct NativeFrameView {
   uint32_t scene=0,index=0;

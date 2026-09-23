@@ -53,11 +53,26 @@ struct NativeRenderModel {
   std::shared_ptr<const NativeModelLayout> layout; // null until the pose is sized and the model decodes
 };
 using NativeRenderPose=std::shared_ptr<const std::vector<std::array<float,16>>>;
+// Where a published pose came from, for interpolation in unlocked mode
+// (native_render_motion.h, AdvanceNativeRenderPoseMotion): previous is the
+// same matrices at the tick before `tick`, when the registry read them then
+// and nothing reset in between; null when the pose must not blend (first
+// read, a skipped tick or step jump, a new generation, a bone count or layout
+// change, or a render-dependent pose). tick: the tick this pose was first
+// read at. render_dependent: the pose changed between two reads of one tick
+// (as NativeModelPoseHistory), sticky until a reset.
+struct NativeRenderPoseMotion {
+  NativeRenderPose previous;
+  uint64_t tick=0;
+  bool render_dependent=false;
+  bool operator==(const NativeRenderPoseMotion&) const=default;
+};
 // A model drawn with its own pose vector (face, weapons), in guest draw order.
 struct NativeRenderAttachment {
   NativeRenderModel model;
   uint32_t pose_vector=0;       // guest address of the attachment's pose vector
   NativeRenderPose pose;
+  NativeRenderPoseMotion motion;
 };
 // A model drawn once per world through 821C9DA8, in guest draw order: the
 // layout is decoded without a pose vector (NativeModelLayout::single_world)
@@ -66,6 +81,7 @@ struct NativeRenderAttachment {
 struct NativeRenderInstanced {
   NativeRenderModel model;
   NativeRenderPose worlds;
+  NativeRenderPoseMotion motion; // Of `worlds`, as a pose.
 };
 // Immutable per-tick copy of what the frame needs from one render object.
 struct NativeRenderEntry {
@@ -90,6 +106,10 @@ struct NativeRenderEntry {
   // Pose vector snapshot: 64-byte row-major matrices as the guest stores them.
   std::shared_ptr<const std::vector<std::array<float,16>>> pose;
   uint32_t pose_vector=0;       // guest address of the pose vector (obj+type->pose)
+  NativeRenderPoseMotion motion;
+  // Face and weapons (NativeRenderAttachmentBit), drawn after the LOD model in
+  // this order, as 820DEA08 does: 820DB268 (8210AE48, then the face), then
+  // 820DE790 unless 820DBBD0.
   std::vector<NativeRenderAttachment> attachments;
   std::vector<NativeRenderInstanced> instanced;  // Drawn after the model, as slot 4 does.
 };
