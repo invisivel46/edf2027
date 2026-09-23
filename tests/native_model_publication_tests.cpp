@@ -243,7 +243,7 @@ void ModelPassGateDeclines() {
   const auto newer=models.Register(Decode(memory,&buffers),kPose);
   Require(reason(GateNativeModelPass(newer,true,0,poses.get(),10,false))==D::Pose,"pose of an older layout generation accepted");
   const auto seeded=models.PublishPoses(memory,11,{});
-  Require(GateNativeModelPass(newer,true,0,seeded.get(),11,false),"seeded pose of the new generation declined");
+  Require(reason(GateNativeModelPass(newer,true,0,seeded.get(),11,false))==D::Count,"seeded pose of the new generation declined");
   // The render-dependence latch follows the layout generation.
   models.MarkRenderDependent(kInstance,layout.generation);
   Require(!models.RenderDependent(kInstance,newer.generation),"latch applied to a stale generation");
@@ -293,7 +293,7 @@ void SkinnedModelPassGate() {
   Require(models.RenderDependent(kInstance,layout.generation),"skinned render-dependence latch");
   // A palette record names no bone; an uploading record's bone must be in range.
   auto palette_bone=*layout.layout; palette_bone.meshes[1].bone=99;
-  Require(GateNativeModelPass({layout.generation,std::make_shared<const NativeModelLayout>(palette_bone)},true,1,poses.get(),10,false,true),
+  Require(reason(GateNativeModelPass({layout.generation,std::make_shared<const NativeModelLayout>(palette_bone)},true,1,poses.get(),10,false,true))==D::Count,
     "palette record's bone field was range-checked");
   auto upload_bone=*layout.layout; upload_bone.meshes[0].bone=8;
   Require(reason(GateNativeModelPass({layout.generation,std::make_shared<const NativeModelLayout>(upload_bone)},true,1,poses.get(),10,false,true))==D::Bone,
