@@ -349,6 +349,110 @@ class GateLogTests(unittest.TestCase):
         self.assertEqual(report['phases_fps']['entry']['baseline'],
                          dict(fps_median=60.0, fps_min=60.0, fps_samples=1))
 
+    # Missions other than Mission 1. The seeded scenarios (tools/run-renderer-scenario.ps1)
+    # load M301/M212/M211 through a pre-mission scene like M202; M204 or M307 have none.
+
+    def no_intro(self, entry=60, game=40.0, end=200, mission='M204'):
+        """Menus, the mission load (lookup and loading screen) before entry, then
+        gameplay from the first scene draw with no loading screen after it."""
+        cam = MISSION_CAM.replace('M202', mission)
+        out = [tline(0, 't3', 'boot'), tline(entry - 30, 't3', cam, 'warning'),
+               tline(entry - 29.5, 't9', PRESENTER)]
+        out += [tfps(s, 57.0, 't9') for s in range(entry - 25, entry, 5)]
+        out += [tline(entry, 't1', ENTRY)]
+        out += [tfps(s, game) for s in range(entry + 5, end + 1, 5)]
+        return out
+
+    def test_mission_without_pre_mission_scene_enters_gameplay_at_entry(self):
+        lines = self.no_intro()
+        self.assertTrue(gate.entry_is_gameplay(lines))
+        self.assertEqual(gate.markers(lines), dict(entry=60.0, load=None, gameplay=60.0, loading_screens=0))
+        phases = gate.phase_fps(lines, 10, 100)
+        self.assertEqual(phases['intro']['windows_s'], [])
+        self.assertEqual(phases['gameplay']['windows_s'], [[70.0, 160.0]])
+        self.assertEqual(phases['gameplay']['fps_samples'], 18)   # 75..160
+        # Mission 1 (lookup after entry) and a run stuck before any mission keep the old reading.
+        mission1 = phased(entry=30, load=80, resume=150, intro=50.0, loading=57.0, game=27.0, end=250)
+        self.assertFalse(gate.entry_is_gameplay(mission1))
+        self.assertFalse(gate.entry_is_gameplay([tline(0, 't3', 'boot'), tline(10, 't1', ENTRY)]))
+
+    def test_gameplay_mode_is_default_when_neither_log_has_a_pre_mission_scene(self):
+        base = self.write('base.log', self.no_intro(entry=60, game=40.0))
+        cand = self.write('cand.log', self.no_intro(entry=75, game=39.0, end=230))
+        code, report = self.run_main(cand, base, '--expect-mission', 'm204')
+        self.assertEqual(report['phase_mode'], 'gameplay')
+        self.assertIn('entry is gameplay', report['phase_mode_reason'])
+        self.assertEqual(code, 0, report['failures'])
+        self.assertEqual(report['candidate']['missions'], ['M204'])
+        self.assertIs(report['candidate']['pre_mission_scene'], False)
+        self.assertEqual(report['phases_fps']['gameplay']['candidate']['fps_median'], 39.0)
+        mixed = self.write('mixed.log', phased(entry=30, load=80, resume=150, intro=50.0, loading=57.0,
+                                               game=27.0, end=250))
+        code, report = self.run_main(mixed, base)
+        self.assertEqual(report['phase_mode'], 'entry')
+
+    def test_expect_mission_fails_a_run_that_loaded_another_mission(self):
+        seeded = self.write('seeded.log', phased(entry=30, load=80, resume=150, intro=50.0, loading=57.0,
+                                                 game=27.0, end=250))
+        text = seeded.read_text().replace('M202', 'M301')
+        seeded.write_text(text)
+        fallback = self.write('fallback.log', phased(entry=30, load=80, resume=150, intro=50.0, loading=57.0,
+                                                     game=27.0, end=250))
+        code, report = self.run_main(seeded, seeded, '--expect-mission', 'M301')
+        self.assertEqual(code, 0, report['failures'])
+        self.assertIs(report['candidate']['pre_mission_scene'], True)
+        code, report = self.run_main(fallback, seeded, '--expect-mission', 'M301')
+        self.assertEqual(code, 1)
+        self.assertEqual(report['failures'], ['candidate did not load mission M301 (loaded: M202)'])
+
+    def pad(self, seconds, ms, analog=False):
+        text = (f'Scripted pad: analog LT=0 RT=255 LX=0 LY=0 RX=0 RY=0 at {ms} ms' if analog else
+                f'Scripted pad: state buttons=0x1000 at {ms} ms (calls 9)')
+        return tline(seconds, 't3', text)
+
+    def memory(self, seconds, ticks):
+        return tline(seconds, 't3', f'Native memory: private_mb=2048.5 working_set_mb=1500.0 '
+                                    f'peak_working_set_mb=1600.0 pagefile_mb=2048.5 handles=900 '
+                                    f'sim_ticks={ticks} t={int(seconds)} s')
+
+    def test_script_clock_from_simulation_ticks(self):
+        # The pad's first poll is at 10 s with 600 ticks already counted; the game
+        # then runs at half speed (30 ticks/s) through a slow stretch after 40 s.
+        lines = [tline(0, 't3', 'boot'), self.pad(10, 0)]
+        ticks = lambda t: 600 + (t - 10) * 60 if t <= 40 else 600 + 1800 + (t - 40) * 30
+        lines += [self.memory(t, ticks(t)) for t in range(15, 121, 5)]
+        lines.insert(8, self.pad(40, 30000))
+        clock, source = gate.script_clock(lines)
+        self.assertEqual(source, 'sim_ticks')
+        self.assertAlmostEqual(clock(40), 30000)
+        self.assertAlmostEqual(clock(100), 60000)           # 1800 + 60*30 ticks after the base
+        lines.append(tline(100, 't1', ENTRY))
+        marks = gate.markers(lines)
+        script_ms, source = gate.script_markers(lines, marks)
+        self.assertEqual(script_ms, dict(entry=60000, load=None, gameplay=None))
+
+    def test_script_clock_from_pad_lines_alone(self):
+        lines = [tline(0, 't3', 'boot'), self.pad(10, 0), self.pad(10, 0), self.pad(30, 20000),
+                 self.pad(80, 45000, analog=True)]
+        clock, source = gate.script_clock(lines)
+        self.assertEqual(source, 'pad_lines')
+        self.assertAlmostEqual(clock(20), 10000)
+        self.assertAlmostEqual(clock(55), 32500)
+        self.assertAlmostEqual(clock(100), 55000)          # the last segment's speed, 500 ms/s
+        self.assertEqual(gate.script_clock([tline(0, 't3', 'boot')]), (None, None))
+        one, _ = gate.script_clock([self.pad(10, 5000)])
+        self.assertAlmostEqual(one(2), 7000)                # offsets count from its own stamp
+
+    def test_summary_reports_script_markers(self):
+        lines = phased(entry=30, load=80, resume=150, intro=50.0, loading=57.0, game=27.0, end=250)
+        lines.insert(1, self.pad(5, 0))
+        lines.append(self.pad(250, 245000))
+        lines.sort(key=lambda text: text[:25])
+        summary = gate.summarize(self.write('game.log', lines), 10, 150)
+        self.assertEqual(summary['script_clock'], 'pad_lines')
+        self.assertEqual(summary['markers_script_ms'], dict(entry=25000, load=75000, gameplay=145000))
+        self.assertEqual(summary['missions'], ['M202'])
+
     def test_bad_max_phase_argument_is_rejected(self):
         with self.assertRaises(Exception):
             gate.phase_limit('render.model')

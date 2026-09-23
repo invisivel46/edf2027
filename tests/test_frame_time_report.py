@@ -151,6 +151,16 @@ class FrameTimeReportTests(unittest.TestCase):
         self.assertEqual(list(phases), ['unphased', 'all'])
         self.assertEqual(phases['unphased']['p99'], 10.1)
 
+    def test_mission_without_pre_mission_scene_has_no_intro(self):
+        # M204-like: the mission load comes before the first scene, which is gameplay.
+        lines = [tline(0, 't3', 'boot'), tline(10, 't3', MISSION_CAM.replace('M202', 'M204'), 'warning'),
+                 tline(20, 't1', ENTRY),
+                 window(26, 600, 5000.0, '8.25:600', 8.4, 8.3),
+                 window(31, 600, 5000.0, '8.25:600', 8.4, 8.3)]
+        phases = report.report(lines)['phases']
+        self.assertNotIn('intro', phases)
+        self.assertEqual(phases['gameplay']['frames'], 1200)
+
     def test_main_prints_table_and_json(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'game.log'

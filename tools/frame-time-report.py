@@ -133,7 +133,8 @@ def collect(lines, start=0.0, end=1e9):
     """Per-phase accumulators for every report line in the log."""
     segs = gate.segments(lines)
     entry = segs[0][1] if segs else None
-    windows = gate.phase_windows(segs, start, end)
+    # A mission without a pre-mission scene enters gameplay directly: no intro.
+    windows = gate.phase_windows(segs, start, end, not gate.entry_is_gameplay(lines, segs))
     phases = defaultdict(new_phase)
     for t, line in gate.stamped(lines):
         m = FRAME_TIMES.search(line)

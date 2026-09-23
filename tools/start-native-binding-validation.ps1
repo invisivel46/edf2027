@@ -22,6 +22,10 @@ param(
   # --edf_native_output_capture_start_frame/interval/limit in -ExtraArgs;
   # without them the capture limit stays 0 and nothing is written.
   [switch]$SceneCapture,
+  # A user-data tree to copy into this run's fresh user directory before launch,
+  # such as a save from tools/make-edf-save.py that unlocks a later mission.
+  # Without it every run starts from an empty profile (Mission 1 only).
+  [string]$SaveSeed = '',
   # Anything else this run needs, passed through verbatim. The options above
   # are the ones every run chooses between; this is for a flag that exists to
   # answer one question, such as a port's A/B control.
@@ -44,6 +48,13 @@ $stamp = (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + [guid]::NewGuid().ToString
 $runRoot = Join-Path $workspace ('out/native-bridge-run/binding-validation-' + $stamp)
 New-Item -ItemType Directory -Path $runRoot | Out-Null
 $log = Join-Path $runRoot 'game.log'
+if ($SaveSeed) {
+  if (-not [IO.Path]::IsPathRooted($SaveSeed)) { $SaveSeed = Join-Path $workspace $SaveSeed }
+  $seed = (Resolve-Path -LiteralPath $SaveSeed).Path
+  $userRoot = Join-Path $runRoot 'user'
+  New-Item -ItemType Directory -Path $userRoot | Out-Null
+  Copy-Item -Path (Join-Path $seed '*') -Destination $userRoot -Recurse
+}
 # Do not pass an empty --edf_native_scene_capture= : the current command-line
 # parser consumes the following flag as its string value. A fresh user directory
 # has no saved capture override, so omit the option and retain its empty
@@ -106,7 +117,7 @@ try {
   # diagnostics keep their existing hidden launch behavior.
   $windowStyle = if ($ManualInput) { 'Normal' } else { 'Hidden' }
   $game = Start-Process -FilePath $candidate -WorkingDirectory (Split-Path $candidate) -WindowStyle $windowStyle -ArgumentList $arguments -PassThru
-  [pscustomobject]@{ Id=$game.Id; Executable=$candidate; Log=$log; RunDirectory=$runRoot
+  [pscustomobject]@{ Id=$game.Id; Executable=$candidate; Log=$log; RunDirectory=$runRoot; SaveSeed=$SaveSeed
     CapturePrefix=$(if ($SceneCapture) { Join-Path $runRoot 'cap' } else { $null }) }
 } finally {
   $env:EDF_INPUT_SCRIPT = $previousScript

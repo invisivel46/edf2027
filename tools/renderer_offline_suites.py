@@ -11,7 +11,8 @@ edf_native_worker_callback_audit_tests edf_native_model_constructor_tests
 edf_native_bucket_dispatch_tests edf_native_map_effect_tests edf_native_ab_alternate_tests
 edf_native_full_frame_tests
 edf_renderer_runtime_gate_tests edf_renderer_image_compare_tests
-edf_renderer_ab_capture_tests edf_renderer_ab_postprocess_tests""".split()
+edf_renderer_ab_capture_tests edf_renderer_ab_postprocess_tests
+edf_soak_report_tests edf_renderer_scenario_tests""".split()
 RENDER = """edf_native_scene_tests edf_native_backend_completion_tests
 edf_native_backend_ui_tests edf_native_backend_compositor_tests
 edf_native_backend_conformance_tests edf_native_static_pass_replay_tests
@@ -48,6 +49,13 @@ SOURCES = {
     'edf_native_ab_alternate_tests': ['tests/native_ab_alternate_tests.cpp'],
     'edf_native_full_frame_tests': ['tests/native_full_frame_tests.cpp'],
     'edf_renderer_runtime_gate_tests': ['tests/test_renderer_runtime_gate.py', 'tools/renderer-runtime-gate.py'],
+    # soak-report reads the gate's markers and frame-time-report's histograms.
+    'edf_soak_report_tests': ['tests/test_soak_report.py', 'tools/soak-report.py', 'tools/renderer-runtime-gate.py',
+                              'tools/frame-time-report.py'],
+    'edf_renderer_scenario_tests': ['tests/test_renderer_scenarios.py', 'tools/make-edf-save.py',
+                                    'tools/renderer-scenarios.json', 'tools/native-benchmark-input.txt',
+                                    'tools/native-scenario-cave-input.txt', 'tools/native-scenario-ufo-swarm-input.txt',
+                                    'tools/native-scenario-vehicle-input.txt', 'tools/native-scenario-soak-input.txt'],
     'edf_renderer_image_compare_tests': ['tests/test_compare_renderer_images.py', 'tools/compare-renderer-images.py'],
     'edf_renderer_ab_capture_tests': ['tools/test_compare_renderer_ab_captures.py', 'tools/compare-renderer-ab-captures.py'],
     'edf_renderer_ab_postprocess_tests': ['tools/test_renderer_ab_postprocess.py', 'tools/renderer-ab-postprocess.py'],
