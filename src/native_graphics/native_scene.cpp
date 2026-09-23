@@ -225,6 +225,53 @@ std::shared_ptr<const NativeSceneSnapshot> NativeSceneDatabase::Publish(uint64_t
   return snapshot;
 }
 
+template<class Geometry,class Material,class World>
+void NativeSceneRenderer::Record(NativeRenderBackend& backend,size_t count,const Geometry& geometry_of,
+    const Material& material_of,const World& world_of,const NativeSceneView& view,const NativeSceneMatrix& vp,
+    NativeSceneRenderStatistics& statistics) {
+  auto& recorder=backend.Recorder();
+  recorder.SetWorldInstancing(false);
+  recorder.SetViewport(view.viewport); recorder.SetScissor(view.scissor,view.scissor_enabled);
+  for(size_t first=0;first<count;) {
+    const auto* geometry=geometry_of(first);
+    const auto* material_pointer=material_of(first);
+    const auto& material=*material_pointer;
+    size_t end=first+1;
+    if(material.instance_world_) while(end<count && end-first<256 &&
+      geometry_of(end)==geometry && material_of(end)==material_pointer) ++end;
+    const bool instanced=end-first>1;
+    recorder.SetPipeline(instanced?*material.pipeline_->world_instanced:*material.pipeline_);
+    if(material.blend_factor_) recorder.SetBlendFactor(*material.blend_factor_);
+    for(const auto& texture:material.textures_) recorder.SetTexture(NativeBackendStage::Pixel,texture.slot,texture.texture.get());
+    for(const auto& [slot,sampler]:material.samplers_) recorder.SetSampler(NativeBackendStage::Pixel,slot,sampler);
+    for(const auto& constant:material.constants_) {
+      if(constant.matrices.empty()) { recorder.SetConstants(constant.stage,constant.slot,constant.bytes); continue; }
+      constants_scratch_=constant.bytes;
+      for(const auto& matrix:constant.matrices) {
+        auto value=kNativeSceneIdentity;
+        switch(matrix.source) {
+          case NativeSceneMatrixSource::World: value=world_of(first); break;
+          case NativeSceneMatrixSource::View: value=view.view; break;
+          case NativeSceneMatrixSource::Projection: value=view.projection; break;
+          case NativeSceneMatrixSource::ViewProjection: value=vp; break;
+          case NativeSceneMatrixSource::WorldViewProjection: value=Multiply(world_of(first),vp); break;
+          case NativeSceneMatrixSource::ViewTranspose: value=NativeSceneTranspose(view.view); break;
+        }
+        Pack(constants_scratch_.data()+matrix.offset,value,matrix.column_major);
+      }
+      recorder.SetConstants(constant.stage,constant.slot,constants_scratch_);
+    }
+    if(instanced) {
+      instances_scratch_.resize((end-first)*64);
+      for(size_t i=first;i<end;++i)
+        Pack(instances_scratch_.data()+(i-first)*64,world_of(i),material.instance_world_->column_major);
+      recorder.SetTransientVertices(15,instances_scratch_,64);
+      geometry->DrawInstanced(recorder,uint32_t(end-first));
+      ++statistics.instanced_draws;
+    } else geometry->Draw(recorder);
+    ++statistics.draws; first=end;
+  }
+}
 NativeSceneRenderStatistics NativeSceneRenderer::Render(NativeRenderBackend& backend,
     const NativeSceneSnapshot& snapshot,const NativeSceneView& view,float fraction) {
   if(!Finite(view.view) || !Finite(view.projection) || (view.view_projection && !Finite(*view.view_projection)))
@@ -244,48 +291,23 @@ NativeSceneRenderStatistics NativeSceneRenderer::Render(NativeRenderBackend& bac
     visible_.push_back({instance.get(),world});
   }
   statistics.visible=visible_.size();
-  auto& recorder=backend.Recorder();
-  recorder.SetWorldInstancing(false);
-  recorder.SetViewport(view.viewport); recorder.SetScissor(view.scissor,view.scissor_enabled);
-  for(size_t first=0;first<visible_.size();) {
-    const auto& object=visible_[first].instance->object;
-    const auto& material=*object.material;
-    size_t end=first+1;
-    if(material.instance_world_) while(end<visible_.size() && end-first<256 &&
-      visible_[end].instance->object.geometry==object.geometry &&
-      visible_[end].instance->object.material==object.material) ++end;
-    const bool instanced=end-first>1;
-    recorder.SetPipeline(instanced?*material.pipeline_->world_instanced:*material.pipeline_);
-    if(material.blend_factor_) recorder.SetBlendFactor(*material.blend_factor_);
-    for(const auto& texture:material.textures_) recorder.SetTexture(NativeBackendStage::Pixel,texture.slot,texture.texture.get());
-    for(const auto& [slot,sampler]:material.samplers_) recorder.SetSampler(NativeBackendStage::Pixel,slot,sampler);
-    for(const auto& constant:material.constants_) {
-      if(constant.matrices.empty()) { recorder.SetConstants(constant.stage,constant.slot,constant.bytes); continue; }
-      constants_scratch_=constant.bytes;
-      for(const auto& matrix:constant.matrices) {
-        auto value=kNativeSceneIdentity;
-        switch(matrix.source) {
-          case NativeSceneMatrixSource::World: value=visible_[first].world; break;
-          case NativeSceneMatrixSource::View: value=view.view; break;
-          case NativeSceneMatrixSource::Projection: value=view.projection; break;
-          case NativeSceneMatrixSource::ViewProjection: value=vp; break;
-          case NativeSceneMatrixSource::WorldViewProjection: value=Multiply(visible_[first].world,vp); break;
-          case NativeSceneMatrixSource::ViewTranspose: value=NativeSceneTranspose(view.view); break;
-        }
-        Pack(constants_scratch_.data()+matrix.offset,value,matrix.column_major);
-      }
-      recorder.SetConstants(constant.stage,constant.slot,constants_scratch_);
-    }
-    if(instanced) {
-      instances_scratch_.resize((end-first)*64);
-      for(size_t i=first;i<end;++i)
-        Pack(instances_scratch_.data()+(i-first)*64,visible_[i].world,material.instance_world_->column_major);
-      recorder.SetTransientVertices(15,instances_scratch_,64);
-      object.geometry->DrawInstanced(recorder,uint32_t(end-first));
-      ++statistics.instanced_draws;
-    } else object.geometry->Draw(recorder);
-    ++statistics.draws; first=end;
-  }
+  Record(backend,visible_.size(),[&](size_t i) { return visible_[i].instance->object.geometry.get(); },
+    [&](size_t i) { return visible_[i].instance->object.material.get(); },
+    [&](size_t i)->const NativeSceneMatrix& { return visible_[i].world; },view,vp,statistics);
+  return statistics;
+}
+NativeSceneRenderStatistics NativeSceneRenderer::RenderUniform(NativeRenderBackend& backend,
+    const NativeIndexedMesh::RetainedDraw& geometry,const NativeSceneMaterial& material,
+    std::span<const NativeSceneMatrix> worlds,const NativeSceneView& view) {
+  if(!Finite(view.view) || !Finite(view.projection) || (view.view_projection && !Finite(*view.view_projection)))
+    throw std::runtime_error("nonfinite native scene camera");
+  const auto vp=view.view_projection?*view.view_projection:Multiply(view.view,view.projection);
+  NativeSceneRenderStatistics statistics;
+  if(!worlds.empty() && (geometry.backend()!=&backend || material.backend()!=&backend))
+    throw std::runtime_error("scene snapshot belongs to another backend");
+  statistics.visible=worlds.size();
+  Record(backend,worlds.size(),[&](size_t) { return &geometry; },[&](size_t) { return &material; },
+    [&](size_t i)->const NativeSceneMatrix& { return worlds[i]; },view,vp,statistics);
   return statistics;
 }
 }

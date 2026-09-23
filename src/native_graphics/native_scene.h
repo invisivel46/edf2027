@@ -4,6 +4,7 @@
 #include <atomic>
 #include <map>
 #include <set>
+#include <span>
 
 namespace edf::native {
 using NativeSceneMatrix=std::array<float,16>;
@@ -162,11 +163,25 @@ class NativeSceneRenderer {
   // recording is submitted. This function owns all scene shader bindings.
   NativeSceneRenderStatistics Render(NativeRenderBackend& backend,
     const NativeSceneSnapshot& snapshot,const NativeSceneView& view,float fraction);
+  // Render for a snapshot whose instances all draw geometry with material, are
+  // visible, unbounded and not interpolated (changed_tick is not the
+  // snapshot's tick), worlds[i] being instance i's object.world: records the
+  // same calls without reading the instances. The caller proves that shape
+  // (a static world draw keeps the worlds while its instances do not move).
+  NativeSceneRenderStatistics RenderUniform(NativeRenderBackend& backend,
+    const NativeIndexedMesh::RetainedDraw& geometry,const NativeSceneMaterial& material,
+    std::span<const NativeSceneMatrix> worlds,const NativeSceneView& view);
  private:
   struct Visible {
     const NativeSceneInstance* instance;
     NativeSceneMatrix world;
   };
+  // The recording both share: count objects in order, object i drawing
+  // geometry(i) with material(i) at world(i); adjacent objects of one
+  // geometry and material instance when the material binds a world.
+  template<class Geometry,class Material,class World>
+  void Record(NativeRenderBackend& backend,size_t count,const Geometry& geometry,const Material& material,
+    const World& world,const NativeSceneView& view,const NativeSceneMatrix& vp,NativeSceneRenderStatistics& statistics);
   std::vector<Visible> visible_;
   std::vector<uint8_t> constants_scratch_,instances_scratch_;
 };

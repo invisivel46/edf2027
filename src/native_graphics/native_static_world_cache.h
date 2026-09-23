@@ -69,6 +69,62 @@ inline std::optional<NativeSceneView> NativeStaticCaptureCamera(const NativeScen
   if(derived) *derived=std::move(used);
   return result;
 }
+// NativeStaticCaptureCamera for one material and one shape of constants (their
+// count, and each one's stage, name and size), with the constant each
+// recorded camera matrix reads found once: Derive(constants) returns what
+// NativeStaticCaptureCamera(material,constants) returns for any constants of
+// that shape - the same matrices read from the same bytes in the same order,
+// checked the same way - without searching the names per matrix. Any failure
+// there returns nothing, whichever matrix fails first, so a shape that can
+// never derive (a matrix with no constant name, or no such constant of 64
+// bytes) is recorded as never.
+struct NativeStaticCameraPlan {
+  struct Read {
+    uint32_t constant=0;
+    NativeSceneMatrixSource source=NativeSceneMatrixSource::View;
+    bool column_major=false;
+  };
+  std::vector<Read> reads;
+  bool never=false;
+  static NativeStaticCameraPlan Make(const NativeSceneMaterial& material,
+      std::span<const NativeSceneMaterialInputs::Constant> constants) {
+    NativeStaticCameraPlan plan;
+    for(const auto& image:material.constants()) for(const auto& matrix:image.matrices) {
+      if(matrix.source==NativeSceneMatrixSource::World) continue;
+      const auto* name=NativeSceneCameraConstantName(matrix.source);
+      if(!name) { plan.never=true; return plan; }
+      const bool pixel=image.stage==NativeBackendStage::Pixel;
+      size_t found=constants.size();
+      for(size_t i=0;i<constants.size();++i) if(constants[i].pixel==pixel && constants[i].name==name) found=i;
+      if(found==constants.size() || constants[found].registers.size()<64) { plan.never=true; return plan; }
+      plan.reads.push_back({uint32_t(found),matrix.source,matrix.column_major});
+    }
+    return plan;
+  }
+  std::optional<NativeSceneView> Derive(std::span<const NativeSceneMaterialInputs::Constant> constants) const {
+    if(never) return {};
+    std::optional<NativeSceneMatrix> view,projection,view_projection;
+    for(const auto& read:reads) {
+      const auto* bytes=constants[read.constant].registers.data();
+      NativeSceneMatrix value;
+      for(size_t row=0;row<4;++row) for(size_t column=0;column<4;++column) {
+        const auto* word=bytes+(read.column_major?column*16+row*4:row*16+column*4);
+        value[row*4+column]=std::bit_cast<float>(uint32_t(word[0])<<24|uint32_t(word[1])<<16|uint32_t(word[2])<<8|word[3]);
+      }
+      if(read.source==NativeSceneMatrixSource::ViewTranspose) value=NativeSceneTranspose(value);
+      auto& destination=read.source==NativeSceneMatrixSource::Projection?projection:
+        read.source==NativeSceneMatrixSource::ViewProjection?view_projection:view;
+      if(destination && (*destination!=value || std::memcmp(destination->data(),value.data(),sizeof(value)))) return {};
+      destination=value;
+    }
+    if(!view_projection && !(view && projection)) return {};
+    NativeSceneView result;
+    if(view) result.view=*view;
+    if(projection) result.projection=*projection;
+    result.view_projection=view_projection;
+    return result;
+  }
+};
 inline bool NativeSceneCameraIdentical(const NativeSceneView& a,const NativeSceneView& b) {
   const auto same=[](const NativeSceneMatrix& x,const NativeSceneMatrix& y) { return !std::memcmp(x.data(),y.data(),sizeof(x)); };
   return same(a.view,b.view) && same(a.projection,b.projection) &&
@@ -234,10 +290,13 @@ class NativeStaticWorldGroupCache {
   // capture.world - which the resolve replaces with each instance's published
   // world - and its only other use is a self-comparison that fails on NaN
   // (Current rejects a NaN world). Bytes past 64 are still compared.
+  // What Candidate does to the entry it returns, for a caller that proved the
+  // entry is the one Candidate would return (same key, no erasure since).
+  void Touch(Entry& entry) { entry.used=pass_; }
   Entry& Store(Key key,Constants constants,NativeRecordedReads reads,NativeStaticEligibilityWitness eligibility,
       NativeSceneMaterialPassState next,Material material,const NativeSceneMaterial* captured,const NativeSceneView& camera,
       Observed observed={}) {
-    if(entries_.size()>=kLimit && !entries_.contains(key.group)) entries_.clear();
+    if(entries_.size()>=kLimit && !entries_.contains(key.group)) { entries_.clear(); ++erasures; }
     Entry entry{std::move(key),std::move(constants)};
     const auto derived=captured?NativeStaticCaptureCamera(*captured,entry.constants,&entry.camera):std::nullopt;
     entry.derived=derived && NativeSceneCameraIdentical(*derived,camera);
@@ -261,13 +320,13 @@ class NativeStaticWorldGroupCache {
     entry.stored=++stores;
     return entries_.insert_or_assign(group,std::move(entry)).first->second;
   }
-  void Invalidate(uint32_t group) { entries_.erase(group); }
-  void Clear() { entries_.clear(); }
+  void Invalidate(uint32_t group) { if(entries_.erase(group)) ++erasures; }
+  void Clear() { entries_.clear(); ++erasures; }
   // Once per pass: groups unused for kAge passes (unloaded, or no longer
   // drawn natively) release what their entries hold.
   void EndPass() {
     if(++pass_%kAge) return;
-    std::erase_if(entries_,[&](const auto& item) { return pass_-item.second.used>kAge; });
+    if(std::erase_if(entries_,[&](const auto& item) { return pass_-item.second.used>kAge; })) ++erasures;
   }
   size_t size() const { return entries_.size(); }
   // Counts one miss with every reason in mask; returns the miss count.
@@ -284,6 +343,10 @@ class NativeStaticWorldGroupCache {
     return text;
   }
   uint64_t hits=0,misses=0,stores=0,miss_events=0;
+  // Advances whenever an entry may have been erased: an Entry* taken while
+  // it was the same (entries are node-held: a store or rehash never moves
+  // one) still points at a live entry.
+  uint64_t erasures=0;
   std::array<uint64_t,size_t(NativeStaticWorldMiss::Count)> missed{};
  private:
   static constexpr size_t kLimit=16384;

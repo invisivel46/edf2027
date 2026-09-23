@@ -225,6 +225,14 @@ class NativeSceneSources {
     owners_.Difference(before.owners_,owner);
     parts_.Difference(before.parts_,instance);
   }
+  // Differences' owners alone: every owner whose FindCandidate(View) answer
+  // may differ from before's (and those whose world moved). An owner not
+  // visited has the same entry - the same parts and visibility objects - in
+  // both, so a CandidateView taken from before stays valid under this one.
+  template<class OwnerVisit>
+  void OwnerDifferences(const NativeSceneSources& before,OwnerVisit&& owner) const {
+    owners_.Difference(before.owners_,owner);
+  }
  private:
   mutable std::shared_ptr<const NativeSceneSources> snapshot_;
   // Shared by every generation until the owner's membership is replaced.
