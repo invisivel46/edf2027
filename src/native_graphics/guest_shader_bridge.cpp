@@ -111,6 +111,8 @@
 #include "d3d11_render_state.h"
 #include "movie_effect.h"
 #include "xui_effect.h"
+#include "native_transient_batching.h"
+#include "native_immediate_classify.h"
 #include "font_effect.h"
 #include <rex/cvar.h>
 #include <rex/chrono/clock.h>
@@ -310,6 +312,8 @@ REXCVAR_DEFINE_BOOL(edf_native_world_instancing,true,"EDF2027",
                    "Combine compatible queued world-matrix draws into GPU instances");
 REXCVAR_DEFINE_BOOL(edf_native_world_constant_reuse,true,"EDF2027",
                    "Retain shared vertex constants when only an instance world matrix changes");
+REXCVAR_DEFINE_BOOL(edf_native_transient_batching,true,"EDF2027",
+                   "Record a UI/immediate list draw (XUI brush, font run, Utility 2D quad or line) as the continuation of the draw before it when the two differ only in their vertices; the Utility 2D path then records its quads non-indexed. Set false to record every draw as its own");
 REXCVAR_DEFINE_BOOL(edf_native_prepared_geometry,true,"EDF2027",
                    "Reuse prepared queued geometry after guarded snapshot validation");
 REXCVAR_DEFINE_INT32(edf_native_hook_sample_period,0,"EDF2027",
@@ -1068,6 +1072,14 @@ struct Bridge {
   uint64_t scene_visibility_candidates=0,scene_visibility_retained=0,scene_visibility_selected=0;
   uint64_t scene_visibility_checks=0,scene_visibility_mismatches=0;
   std::unordered_map<uint32_t, EmbeddedShader> embedded_shaders;
+  // Advanced whenever embedded_shaders gains, replaces or loses an entry, for
+  // the same purpose as shader_registry_generation.
+  uint64_t embedded_shader_generation=0;
+  // The DrawPrimitiveUP hook's per-pair classification (native_immediate_classify.h)
+  // and the registry entries it was read from, which stay valid while both
+  // generations do: state.shaders only erases or replaces under a generation bump.
+  struct ImmediatePairShaders { RegisteredShader* vertex=nullptr; RegisteredShader* pixel=nullptr; };
+  NativeImmediatePairMemo<ImmediatePairShaders> immediate_pairs;
   std::unordered_map<uint32_t, NativeTexture> textures;
   std::unordered_map<uint32_t, TextureCreation> texture_creations;
   std::unordered_map<uint32_t, RegisteredTarget> render_targets;
@@ -1186,6 +1198,10 @@ struct Bridge {
   uint64_t xui_batch_draws=0,xui_batch_runs=0,xui_batch_run=0,xui_batch_longest=0;
   uint64_t xui_batch_collapsible=0,xui_last_state=0,xui_last_constants=0;
   uint64_t xui_constants_differ=0;
+  // Per-part breakdown of the XUI audit: the parts of the draw before, and
+  // how often each part differed from it.
+  std::array<uint64_t,9> xui_audit_parts{},xui_audit_breaks{};
+  uint64_t xui_audit_identical=0,xui_audit_constants_only=0;
   std::array<uint32_t,12> last_batch_key{};
   uint64_t batch_draws=0,batch_runs=0,batch_run=0,batch_run_total=0,batch_longest=0,batch_collapsible=0;
   uint64_t instance_shape=0,last_instance_shape=0,batch_shape_breaks=0;
@@ -1245,6 +1261,13 @@ struct Bridge {
   // map only saves decoding the same words again.
   std::map<SamplerStateWords, edf::native::NativeBackendSampler*> samplers;
   std::map<RenderStateWords,NativeRenderState> render_states;
+  // The two most recent keys each UI draw path looked up in the maps above
+  // (RenderStateLocked, SamplerLocked). Neither map ever erases, so an entry
+  // stays valid for the bridge's life.
+  struct RenderStateMemo { RenderStateWords key{}; NativeRenderState* value=nullptr; };
+  struct SamplerMemo { SamplerStateWords key{}; edf::native::NativeBackendSampler* value=nullptr; };
+  std::array<RenderStateMemo,2> render_state_memo{};
+  std::array<SamplerMemo,2> sampler_memo{};
   std::map<std::pair<uint32_t,uint32_t>,GuestStream> streams;
   std::map<uint32_t,uint32_t> index_bindings;
   std::map<uint32_t,uint32_t> declaration_bindings;
@@ -1530,6 +1553,7 @@ void RecordEmbeddedShader(const GuestReader& reader,uint32_t output,uint32_t sou
   auto& state=State();
   std::lock_guard lock(state.mutex);
   state.embedded_shaders.insert_or_assign(handle,EmbeddedShader{source,pixel});
+  ++state.embedded_shader_generation;
   REXLOG_INFO("Native middleware shader source: handle={:#x}, source={:#x}, pixel={}, caller={:#x}",handle,source,pixel,caller);
 }
 Effect SnapshotEffect(const GuestReader& reader, uint32_t data) {
@@ -2142,6 +2166,7 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
   auto& backend=EnsureSceneBackendLocked(state);
   auto& recorder=SceneRecorderLocked(state);
   recorder.SetWorldInstancing(draw.world_instancing,REXCVAR_GET(edf_native_world_constant_reuse));
+  recorder.SetTransientBatching(REXCVAR_GET(edf_native_transient_batching));
   const auto targets=ActiveTargetsLocked(state);
   if(!targets.count) throw std::runtime_error("a recorded draw has no colour target to record into");
   ++state.recorded_draws;
@@ -2202,6 +2227,14 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
     desc.dsv_format=targets.dsv_format;
     desc.sample_count=targets.samples;
     auto& pipeline=backend.CreatePipeline(desc);
+    // A property of the two shaders and the layout, which is what the cached
+    // pipeline is keyed on, so it is decided once per pipeline: reflecting
+    // on every pipeline switch would cost more than the switch.
+    if(!pipeline.transient_batchable_known) {
+      pipeline.transient_batchable=NativePipelineTransientBatchable(draw.layout,
+        draw.vertex.shader().reflection.Get(),draw.pixel.shader().reflection.Get());
+      pipeline.transient_batchable_known=true;
+    }
     if(auto* code=draw.vertex.shader().instanced_bytecode.Get(); code && !pipeline.world_instanced &&
        draw.layout.size()<=28 && std::none_of(draw.layout.begin(),draw.layout.end(),
          [](const auto& element) { return element.slot==15 || element.per_instance; })) {
@@ -2274,6 +2307,60 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
   last.frame=state.scene_frames;
   last.bind_generation=state.bind_generation;
   return recorder;
+}
+// render_states[key], created on first use, as the UI draw paths look it up:
+// a std::map search of array keys per draw, where consecutive draws almost
+// always ask for the key they asked for last.
+NativeRenderState& RenderStateLocked(Bridge& state,const RenderStateWords& key) {
+  auto& memo=state.render_state_memo;
+  if(memo[0].value && memo[0].key==key) return *memo[0].value;
+  if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return *memo[0].value; }
+  auto found=state.render_states.find(key);
+  if(found==state.render_states.end())
+    found=state.render_states.emplace(key,CreateNativeRenderState(state.device.Get(),key)).first;
+  memo[1]=memo[0]; memo[0]={key,&found->second};
+  return found->second;
+}
+// samplers[key], created on the scene backend on first use; memoized likewise.
+NativeBackendSampler* SamplerLocked(Bridge& state,const SamplerStateWords& key) {
+  auto& memo=state.sampler_memo;
+  if(memo[0].value && memo[0].key==key) return memo[0].value;
+  if(memo[1].value && memo[1].key==key) { std::swap(memo[0],memo[1]); return memo[0].value; }
+  auto found=state.samplers.find(key);
+  if(found==state.samplers.end()) {
+    const auto desc=DecodeNativeGuestSampler(key);
+    found=state.samplers.emplace(key,&EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
+  }
+  memo[1]=memo[0]; memo[0]={key,found->second};
+  return found->second;
+}
+// The immediate hook's pair classification, memoized (native_immediate_classify.h).
+const NativeImmediatePairMemo<Bridge::ImmediatePairShaders>::Entry&
+ClassifyImmediatePairLocked(Bridge& state,const GuestShaderPair& pair) {
+  return state.immediate_pairs.Get(pair.vertex,pair.pixel,state.shader_registry_generation,
+    state.embedded_shader_generation,[&](NativeImmediatePairClass& kind,Bridge::ImmediatePairShaders& shaders) {
+      const auto vertex_embedded=state.embedded_shaders.find(pair.vertex);
+      const auto pixel_embedded=state.embedded_shaders.find(pair.pixel);
+      const auto vertex=state.shaders.find(pair.vertex),pixel=state.shaders.find(pair.pixel);
+      NativeEmbeddedIdentity vertex_identity,pixel_identity;
+      NativeSourceIdentity vertex_source,pixel_source;
+      const bool embedded=vertex_embedded!=state.embedded_shaders.end() &&
+                          pixel_embedded!=state.embedded_shaders.end();
+      if(embedded) {
+        vertex_identity={vertex_embedded->second.source,vertex_embedded->second.pixel};
+        pixel_identity={pixel_embedded->second.source,pixel_embedded->second.pixel};
+      }
+      const bool registered=vertex!=state.shaders.end() && pixel!=state.shaders.end();
+      if(registered) {
+        const auto& vs=vertex->second.bindings->shader();
+        const auto& ps=pixel->second.bindings->shader();
+        vertex_source={vs.source_fingerprint,vs.entry.name};
+        pixel_source={ps.source_fingerprint,ps.entry.name};
+      }
+      kind=ClassifyNativeImmediatePair(embedded?&vertex_identity:nullptr,embedded?&pixel_identity:nullptr,
+        registered?&vertex_source:nullptr,registered?&pixel_source:nullptr);
+      shaders={registered?&vertex->second:nullptr,registered?&pixel->second:nullptr};
+    });
 }
 void BindActiveTarget(Bridge& state) {
   ++state.bind_generation;
@@ -2917,6 +3004,8 @@ void SubmitSceneFrameLocked(Bridge& state) {
       counts.geometry_serial_draws,counts.geometry_serial_flushes);
     REXLOG_INFO("Native world instancing: groups={}, folded_draws={} (consecutive queued draws with identical non-world state)",
       counts.geometry_instanced_draws,counts.geometry_folded_draws);
+    REXLOG_INFO("Native transient batching: appended_draws={} (UI/immediate list draws recorded as the continuation of the identical-state draw before them)",
+      counts.geometry_transient_appends);
     REXLOG_INFO("Native world constants: reused={}, snapshot_bytes={} (full immutable constant images copied by the producer)",
       counts.geometry_world_constant_reuses,counts.geometry_constant_snapshot_bytes);
     REXLOG_INFO("Native scene backend spend: frames={}, splits={}, operations_last_frame={}, "
@@ -10087,7 +10176,7 @@ REX_HOOK_RAW(sub_82134220) {
     state.declarations.Retire(ctx.r3.u32);
     state.depth_targets.erase(ctx.r3.u32);
     state.surface_creations.erase(ctx.r3.u32);
-    state.embedded_shaders.erase(ctx.r3.u32);
+    if(state.embedded_shaders.erase(ctx.r3.u32)) ++state.embedded_shader_generation;
     for (auto& [owner,scene]:state.scenes) if (scene.output_surface==ctx.r3.u32) {
       scene.output={}; scene.output_surface=0;
       if (state.active_output==owner) state.active_output=0;
@@ -12970,12 +13059,21 @@ REX_HOOK_RAW(sub_821FD8F8) {
         draw_shaders=state.shader_bindings.Pair(ctx.r3.u32);
       return *draw_shaders;
     };
+    // What the pair's identities admit, memoized per pair against the two
+    // registry generations (native_immediate_classify.h): the same answer the
+    // lookups below each path used to make per draw. Throws as bound_shaders
+    // does, inside each path's own handler.
+    const decltype(state.immediate_pairs)::Entry* pair_entry=nullptr;
+    auto pair_class=[&]() -> const decltype(state.immediate_pairs)::Entry& {
+      if(!pair_entry) pair_entry=&edf::native::ClassifyImmediatePairLocked(state,bound_shaders());
+      return *pair_entry;
+    };
+    using PairClass=edf::native::NativeImmediatePairClass;
     if (!state.active_target && state.scenes.contains(state.active_output)) try {
       const auto& pair=bound_shaders();
-      const auto vs=state.embedded_shaders.find(pair.vertex),ps=state.embedded_shaders.find(pair.pixel);
-      movie_draw=vs!=state.embedded_shaders.end() && ps!=state.embedded_shaders.end() &&
-        !vs->second.pixel && vs->second.source==0x82060B70 && ps->second.pixel &&
-        (ps->second.source==0x82064428 || ps->second.source==0x820641F0);
+      const auto movie_kind=pair_class().kind.movie;
+      movie_draw=movie_kind!=PairClass::Movie::None;
+      const bool movie_sd=movie_kind==PairClass::Movie::Sd;
       if (movie_draw) {
         const edf::native::GuestReader backing(base);
         const edf::native::GuestReadWindow reader(backing,backing.Add(ctx.r3.u32,1024),12416-1024);
@@ -13007,11 +13105,11 @@ REX_HOOK_RAW(sub_821FD8F8) {
         }
         // Choose the program actually bound by the game, not a heuristic based
         // on the output resolution (SD movies may fill a 1280x720 target).
-        auto& movie_pixel=ps->second.source==0x820641F0 ? *state.movie_pixel_sd : *state.movie_pixel;
+        auto& movie_pixel=movie_sd ? *state.movie_pixel_sd : *state.movie_pixel;
         // CPU constant setters 82149248/82149358 copy float4 rows to
         // device+(112+register)*16 / device+(368+register)*16 respectively.
         auto registers=[&](uint32_t offset,size_t bytes) {return std::span<const uint8_t>{reader.Bytes(reader.Add(ctx.r3.u32,offset),bytes),bytes};};
-        const auto& movie_plan=*state.movie_bindings[ps->second.source==0x820641F0?1:0];
+        const auto& movie_plan=*state.movie_bindings[movie_sd?1:0];
         movie_plan.SetConstants(*state.movie_vertex,movie_pixel,registers(1792,160),registers(5888,16));
         movie_pixel.ClearTextures(); movie_pixel.ClearSamplers();
         for(uint32_t i=0;i<3;++i) {
@@ -13088,10 +13186,8 @@ REX_HOOK_RAW(sub_821FD8F8) {
     const auto xui_scene_owner=state.active_scene?state.active_scene:state.active_output;
     if(!movie_draw && !state.active_target && state.scenes.contains(xui_scene_owner)) try {
       const auto& pair=bound_shaders();
-      const auto vs=state.embedded_shaders.find(pair.vertex),ps=state.embedded_shaders.find(pair.pixel);
-      xui_draw=vs!=state.embedded_shaders.end() && ps!=state.embedded_shaders.end() &&
-        !vs->second.pixel && vs->second.source==0x820608B0 && ps->second.pixel &&
-        (ps->second.source==0x82060EC8 || ps->second.source==0x82060DB0 || ps->second.source==0x82061848);
+      const auto xui_kind=pair_class().kind.xui;
+      xui_draw=xui_kind!=PairClass::Xui::None;
       if(xui_draw) {
         const edf::native::GuestReader backing(base);
         const auto device=ctx.r3.u32;
@@ -13115,8 +13211,8 @@ REX_HOOK_RAW(sub_821FD8F8) {
         const auto key=snapshot.render;
         if(!scene_draw && (viewport.reverse_depth || (key[1]&3)))
           throw std::runtime_error("unimplemented XUI depth contract");
-        const bool solid=ps->second.source==0x82060DB0;
-        const bool mask=ps->second.source==0x82061848;
+        const bool solid=xui_kind==PairClass::Xui::Solid;
+        const bool mask=xui_kind==PairClass::Xui::Mask;
         const auto texture=state.textures.find(snapshot.texture);
         if(!solid && (texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend))
           throw std::runtime_error("XUI textured brush has no native texture");
@@ -13188,13 +13284,8 @@ REX_HOOK_RAW(sub_821FD8F8) {
         pixel_plan.SetConstants(pixel,registers(5904,16),solid?registers(5888,16):std::span<const uint8_t>{});
         if(!solid) {
         pixel_plan.SetTexture(pixel,texture->second.backend);
-        const auto sampler_key=edf::native::SamplerStateKey(edf::native::ReadSamplerWords(reader,device,0));
-        auto sampler=state.samplers.find(sampler_key);
-        if(sampler==state.samplers.end()) {
-          const auto desc=edf::native::DecodeNativeGuestSampler(sampler_key);
-          sampler=state.samplers.emplace(sampler_key,&EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
-        }
-        pixel_plan.SetSampler(pixel,sampler->second);
+        pixel_plan.SetSampler(pixel,edf::native::SamplerLocked(state,
+          edf::native::SamplerStateKey(edf::native::ReadSamplerWords(reader,device,0))));
         }
         if(REXCVAR_GET(edf_native_batch_audit)) {
           // State a batch must share, and constants it would have to carry per
@@ -13223,23 +13314,59 @@ REX_HOOK_RAW(sub_821FD8F8) {
           }
           state.xui_last_state=shape;
           state.xui_last_constants=constants;
-          if(state.xui_batch_draws%500000==0)
+          // What differs from the draw before, part by part, and how often
+          // only the vertex constants do: the draws transient batching appends
+          // (nothing differs) and the ones only constants carried per vertex
+          // could (only the vertex constants differ). The recorder also needs
+          // equal scissor rectangles and samplers, which the shape above
+          // leaves out, so they are counted here.
+          uint64_t scissor=1469598103934665603ull;
+          for(const auto value:{viewport.scissor.left,viewport.scissor.top,viewport.scissor.right,viewport.scissor.bottom})
+            scissor=mix(scissor,uint64_t(uint32_t(value)));
+          uint64_t pixel_constants=1469598103934665603ull;
+          for(const auto byte:registers(5904,16)) pixel_constants=mix(pixel_constants,byte);
+          if(solid) for(const auto byte:registers(5888,16)) pixel_constants=mix(pixel_constants,byte);
+          uint64_t sampler=0;
+          if(!solid) for(const auto word:edf::native::SamplerStateKey(edf::native::ReadSamplerWords(reader,device,0)))
+            sampler=mix(sampler^1469598103934665603ull,word);
+          uint64_t render_words=1469598103934665603ull;
+          for(const auto word:key) render_words=mix(render_words,word);
+          const std::array<uint64_t,9> parts{render_words,uint64_t(solid?1:mask?2:0),
+            reinterpret_cast<uintptr_t>(texture==state.textures.end()?nullptr:texture->second.backend.get()),
+            uint64_t(viewport.reverse_depth),uint64_t(viewport.viewport.Width)*8191+uint64_t(viewport.viewport.Height),
+            scissor,sampler,pixel_constants,constants};
+          if(state.xui_batch_draws>1) {
+            bool state_differs=false;
+            for(size_t part=0;part<parts.size();++part) if(parts[part]!=state.xui_audit_parts[part]) {
+              ++state.xui_audit_breaks[part];
+              if(part+1<parts.size()) state_differs=true;
+            }
+            if(!state_differs) {
+              if(parts.back()==state.xui_audit_parts.back()) ++state.xui_audit_identical;
+              else ++state.xui_audit_constants_only;
+            }
+          }
+          state.xui_audit_parts=parts;
+          if(state.xui_batch_draws%500000==0) {
             REXLOG_INFO("Native XUI batch audit: draws={}, runs={}, longest_run={}, collapsible={} ({:.1f}% share the state of the draw before), of those {} also change constants ({:.1f}%)",
               state.xui_batch_draws,state.xui_batch_runs,state.xui_batch_longest,
               state.xui_batch_collapsible,
               100.0*double(state.xui_batch_collapsible)/double(state.xui_batch_draws),
               state.xui_constants_differ,
               state.xui_batch_collapsible?100.0*double(state.xui_constants_differ)/double(state.xui_batch_collapsible):0.0);
+            const auto& breaks=state.xui_audit_breaks;
+            REXLOG_INFO("Native XUI batch breaks: draws={}, identical_to_previous={} (appendable), only_vertex_constants_differ={}, differs: render_state={}, pixel_shader={}, texture={}, reverse_depth={}, viewport={}, scissor={}, sampler={}, pixel_constants={}, vertex_constants={}",
+              state.xui_batch_draws,state.xui_audit_identical,state.xui_audit_constants_only,
+              breaks[0],breaks[1],breaks[2],breaks[3],breaks[4],breaks[5],breaks[6],breaks[7],breaks[8]);
+          }
         }
         xui_decode.Finish();
         edf::native::HookTiming xui_bind(edf::native::HookPhase::XuiBind);
-        auto render=state.render_states.find(key);
-        if(render==state.render_states.end())
-          render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(state.device.Get(),key)).first;
+        auto& render=edf::native::RenderStateLocked(state,key);
         const bool xui_seam=EDF_NATIVE_FLAG(seam_draws);
         if(!xui_seam) {
           edf::native::BindActiveTarget(state);
-          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
+          edf::native::BindGuestRenderState(render,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
           vertex.Bind(*state.context.Get()); pixel.Bind(*state.context.Get());
         }
         xui_bind.Finish();
@@ -13334,16 +13461,9 @@ REX_HOOK_RAW(sub_821FD8F8) {
           font_canvas?float(scene.output.sampled.width)/1280.0f:1.0f,
           font_canvas?float(scene.output.sampled.height)/720.0f:1.0f);
         state.font_bindings->SetTexture(*state.font_pixel,texture->second.backend);
-        const auto sampler_key=edf::native::SamplerStateKey(edf::native::ReadSamplerWords(reader,device,0));
-        auto sampler=state.samplers.find(sampler_key);
-        if(sampler==state.samplers.end()) {
-          const auto desc=edf::native::DecodeNativeGuestSampler(sampler_key);
-          sampler=state.samplers.emplace(sampler_key,&EnsureSceneBackendLocked(state).CreateSampler(desc)).first;
-        }
-        state.font_bindings->SetSampler(*state.font_pixel,sampler->second);
-        auto render=state.render_states.find(key);
-        if(render==state.render_states.end())
-          render=state.render_states.emplace(key,edf::native::CreateNativeRenderState(state.device.Get(),key)).first;
+        state.font_bindings->SetSampler(*state.font_pixel,edf::native::SamplerLocked(state,
+          edf::native::SamplerStateKey(edf::native::ReadSamplerWords(reader,device,0))));
+        auto& render=edf::native::RenderStateLocked(state,key);
         const size_t bytes=size_t(ctx.r5.u32)*16;
         if(EDF_NATIVE_FLAG(seam_draws)) {
           auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
@@ -13358,7 +13478,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
                                     {reader.Bytes(ctx.r6.u32,bytes),bytes});
         } else {
           edf::native::BindActiveTarget(state);
-          edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
+          edf::native::BindGuestRenderState(render,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
           state.font_vertex->Bind(*state.context.Get()); state.font_pixel->Bind(*state.context.Get());
           state.font_vertices->Draw(*state.context.Get(),{reader.Bytes(ctx.r6.u32,bytes),bytes});
         }
@@ -13387,20 +13507,15 @@ REX_HOOK_RAW(sub_821FD8F8) {
     bool utility_3d_draw=false;
     if(!movie_draw && !xui_draw && !font_draw && state.active_scene && !state.active_target) try {
       const auto& pair=bound_shaders();
-      auto vertex=state.shaders.find(pair.vertex),pixel=state.shaders.find(pair.pixel);
-      if(vertex!=state.shaders.end() && pixel!=state.shaders.end()) {
-        const auto& vs=vertex->second.bindings->shader();
-        auto& ps=*pixel->second.bindings;
-        const bool solid=vs.source_fingerprint==0xc885203e230fe745ull &&
-          ps.shader().source_fingerprint==0xc885203e230fe745ull &&
-          vs.entry.name=="VS_3D" && ps.shader().entry.name=="PS_Main";
-        const bool textured=vs.source_fingerprint==0xc885203e230fe745ull &&
-          ps.shader().source_fingerprint==0xc885203e230fe745ull &&
-          vs.entry.name=="VS_3DTex" && ps.shader().entry.name=="PS_Tex";
-        const bool particle=vs.source_fingerprint==0x777f4cf51fb1b019ull &&
-          ps.shader().source_fingerprint==0x777f4cf51fb1b019ull &&
-          vs.entry.name=="Vs_Particle" &&
-          (ps.shader().entry.name=="Ps_Particle" || ps.shader().entry.name=="Ps_ZParticle");
+      const auto& classified=pair_class();
+      if(classified.payload.vertex && classified.payload.pixel) {
+        auto* const vertex=classified.payload.vertex;
+        const auto& vs=vertex->bindings->shader();
+        auto& ps=*classified.payload.pixel->bindings;
+        const auto kind=classified.kind.utility3d;
+        const bool solid=kind==PairClass::Utility3D::Solid;
+        const bool textured=kind==PairClass::Utility3D::Textured;
+        const bool particle=kind==PairClass::Utility3D::Particle || kind==PairClass::Utility3D::ZParticle;
         utility_3d_draw=solid || textured || particle;
         if(utility_3d_draw) {
           const edf::native::GuestReader backing(base);
@@ -13429,7 +13544,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
              (particle && (word(24)!=20 || word(28)!=0x2c23a5 || (word(32)&0xffffff00)!=0x50100)))
             throw std::runtime_error("unsupported Utility 3D vertex layout");
           const auto viewport=edf::native::ReadNativeDrawViewport(reader,ctx.r3.u32);
-          auto& bindings=edf::native::VertexBindingsForDraw(vertex->second,viewport.reverse_depth);
+          auto& bindings=edf::native::VertexBindingsForDraw(*vertex,viewport.reverse_depth);
           if(!bindings.HasAllTextureInputs() || !ps.HasAllTextureInputs())
             throw std::runtime_error("Utility 3D missing texture inputs");
           if(edf::native::SamplesTarget(bindings,scene.color) || edf::native::SamplesTarget(ps,scene.color))
@@ -13441,7 +13556,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           edf::native::RecordNativeSceneImmediate(state,reader,ctx.r3.u32,{
             bindings,ps,viewport,key,pair,declaration,element_count,owned_declaration,ctx.r4.u32,stride},vertices);
           native_submitted=true; scene.frame_complete=false;
-          auto& reported=state.scene_immediate_variants_reported[solid?0:textured?(strip?1:2):ps.shader().entry.name=="Ps_ZParticle"?4:3];
+          auto& reported=state.scene_immediate_variants_reported[solid?0:textured?(strip?1:2):kind==PairClass::Utility3D::ZParticle?4:3];
           if(++state.utility_3d_draws<=5 || !reported || state.utility_3d_draws%10000==0)
             REXLOG_INFO("Native scene immediate: submitted={}, vertices={}, reverse_depth={}, scene={:#x}, VS={}, PS={}, stride={}",
               state.utility_3d_draws,ctx.r5.u32,viewport.reverse_depth,state.active_scene,
@@ -13458,13 +13573,12 @@ REX_HOOK_RAW(sub_821FD8F8) {
     const auto utility_scene_owner=state.active_scene?state.active_scene:state.active_output;
     if(!movie_draw && !xui_draw && !font_draw && !state.active_target && state.scenes.contains(utility_scene_owner)) try {
       const auto& pair=bound_shaders();
-      const auto vertex=state.shaders.find(pair.vertex),pixel=state.shaders.find(pair.pixel);
-      if(vertex!=state.shaders.end() && pixel!=state.shaders.end()) {
-        auto& vs=*vertex->second.bindings; auto& ps=*pixel->second.bindings;
-        constexpr uint64_t utility_source=0xc885203e230fe745ull;
-        const bool textured=vs.shader().entry.name=="VS_2DTex" && ps.shader().entry.name=="PS_Tex";
-        utility_draw=vs.shader().source_fingerprint==utility_source && ps.shader().source_fingerprint==utility_source &&
-          (textured || (vs.shader().entry.name=="VS_2D" && ps.shader().entry.name=="PS_Main"));
+      const auto& classified=pair_class();
+      if(classified.payload.vertex && classified.payload.pixel) {
+        auto* const vertex=classified.payload.vertex;
+        auto& vs=*vertex->bindings; auto& ps=*classified.payload.pixel->bindings;
+        const bool textured=classified.kind.utility2d==PairClass::Utility2D::Textured;
+        utility_draw=classified.kind.utility2d!=PairClass::Utility2D::None;
         if(utility_draw) {
           const edf::native::GuestReader backing(base);
           const edf::native::GuestReadWindow reader(backing,backing.Add(ctx.r3.u32,1024),12416-1024);
@@ -13501,7 +13615,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
           // uses the same reversed-clip shader contract as indexed scene draws.
           if(!scene_draw && (viewport.reverse_depth || (snapshot.render[1]&3)))
             throw std::runtime_error("unsupported Utility output depth contract");
-          auto& bindings=edf::native::VertexBindingsForDraw(vertex->second,viewport.reverse_depth);
+          auto& bindings=edf::native::VertexBindingsForDraw(*vertex,viewport.reverse_depth);
           if(!bindings.HasAllTextureInputs()) throw std::runtime_error("Utility vertex shader has missing native texture inputs");
           if(!ps.HasAllTextureInputs()) throw std::runtime_error("Utility has missing native texture inputs");
           if(edf::native::SamplesTarget(ps,target) || edf::native::SamplesTarget(bindings,target))
@@ -13518,9 +13632,7 @@ REX_HOOK_RAW(sub_821FD8F8) {
             // Where this mesh's dynamic vertices are rewritten when the draw
             // is recorded; the immediate context does it otherwise.
             EDF_NATIVE_FLAG(seam_draws)?&edf::native::SceneRecorderLocked(state):nullptr);
-          auto render=state.render_states.find(snapshot.render);
-          if(render==state.render_states.end())
-            render=state.render_states.emplace(snapshot.render,edf::native::CreateNativeRenderState(state.device.Get(),snapshot.render)).first;
+          auto& render=edf::native::RenderStateLocked(state,snapshot.render);
           if(EDF_NATIVE_FLAG(seam_draws)) {
             auto& recorder=edf::native::RecordDrawSetup(state,reader,ctx.r3.u32,{
               bindings,ps,viewport,snapshot.render,
@@ -13530,11 +13642,14 @@ REX_HOOK_RAW(sub_821FD8F8) {
               (uint64_t(pair.vertex)<<1)|uint64_t(viewport.reverse_depth?1:0),pair.pixel,
               lines?edf::native::NativeBackendTopology::LineList
                    :edf::native::NativeBackendTopology::TriangleList});
-            if(lines) mesh.DrawLinesTransient(recorder,vertices,0,uint32_t(indices.size()/2));
+            if(REXCVAR_GET(edf_native_transient_batching))
+              mesh.DrawTransientExpanded(recorder,vertices,0,uint32_t(indices.size()/2),
+                lines?edf::native::NativeBackendTopology::LineList:edf::native::NativeBackendTopology::TriangleList);
+            else if(lines) mesh.DrawLinesTransient(recorder,vertices,0,uint32_t(indices.size()/2));
             else mesh.DrawTransient(recorder,vertices,0,uint32_t(indices.size()/2));
           } else {
             edf::native::BindActiveTarget(state);
-            edf::native::BindGuestRenderState(render->second,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
+            edf::native::BindGuestRenderState(render,*state.context.Get(),reader,ctx.r3.u32,&state.bind_generation); viewport.Bind(*state.context.Get());
             bindings.Bind(*state.context.Get()); ps.Bind(*state.context.Get());
             if(lines) mesh.DrawLines(*state.context.Get(),0,uint32_t(indices.size()/2));
             else mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));

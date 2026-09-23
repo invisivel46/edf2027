@@ -61,6 +61,13 @@ struct NativeParallelRecorder::Impl {
     } world;
   } state;
   bool reuse_world_constants=true;
+  bool transient_batching=false;
+  // The vertex image a transient append created for packets.back() and which
+  // nothing else references, so the next append may grow it in place. Any
+  // other image may also be bound by an earlier packet or by the serial replay
+  // state that skips re-staging an image it has already staged, so appending
+  // to it would change what that other draw reads.
+  const std::vector<uint8_t>* appendable=nullptr;
   struct PacketState : DrawState { const Bindings* bindings=nullptr; };
   std::deque<Bindings> binding_images;
   size_t used_binding_images=0;
@@ -244,12 +251,68 @@ struct NativeParallelRecorder::Impl {
     state.constants[0][w.slot]=&image;
     w.active=false;
   }
+  // Largest vertex image an append may build; a run past it starts a new draw.
+  static constexpr size_t kTransientAppendBytes=size_t(1)<<20;
+  // Appends a transient list draw to the draw recorded just before it when the
+  // two differ in nothing but their vertices: the same bindings snapshot
+  // (pipeline, topology, targets, viewport, scissor, blend factor, textures,
+  // samplers), equal constants in every stage and slot, both non-indexed from
+  // vertex 0 over their whole slot-0 image of whole primitives. A list draw of
+  // A's vertices followed by B's then becomes one draw of A's vertices then
+  // B's: the same primitives, assembled from the same vertices, rasterized and
+  // blended in the same order. Only a pipeline marked transient_batchable is
+  // eligible - one reading slot 0 alone, per vertex, and nothing that numbers
+  // vertices or primitives, which a merged draw would number differently.
+  bool TryAppendTransient(bool indexed,uint32_t count,uint32_t instances,uint32_t first,
+                          uint32_t first_instance,const Bindings* bindings) {
+    if(!transient_batching || indexed || instances!=1 || first || first_instance ||
+       packets.empty() || !queries.empty() || state.world.active) return false;
+    const auto* pipeline=bindings->pipeline;
+    if(!pipeline->transient_batchable || !bindings->topology) return false;
+    uint32_t primitive=0;
+    switch(*bindings->topology) {
+      case NativeBackendTopology::TriangleList: primitive=3; break;
+      case NativeBackendTopology::LineList: primitive=2; break;
+      case NativeBackendTopology::PointList: primitive=1; break;
+      default: return false;
+    }
+    auto& previous=packets.back();
+    if(previous.indexed || previous.worlds || previous.instances!=1 || previous.first ||
+       previous.first_instance || previous.state.bindings!=bindings) return false;
+    const auto& mine=state.vertices[0];
+    const auto& theirs=previous.state.vertices[0];
+    if(!mine.transient || !theirs.transient || mine.buffer || theirs.buffer || !mine.stride ||
+       mine.stride!=theirs.stride || mine.offset || theirs.offset || mine.transient==theirs.transient ||
+       !count || count%primitive || !previous.count || previous.count%primitive ||
+       size_t(count)*mine.stride!=mine.transient->size() ||
+       size_t(previous.count)*theirs.stride!=theirs.transient->size() ||
+       theirs.transient->size()+mine.transient->size()>kTransientAppendBytes) return false;
+    for(size_t stage=0;stage<state.constants.size();++stage)
+      for(size_t slot=0;slot<state.constants[stage].size();++slot) {
+        const auto a=previous.state.constants[stage][slot],b=state.constants[stage][slot];
+        if(a!=b && (!a || !b || *a!=*b)) return false;
+      }
+    if(theirs.transient!=appendable) {
+      if(used_vertex_images==vertex_images.size()) vertex_images.emplace_back();
+      auto& image=vertex_images[used_vertex_images++];
+      image.assign(theirs.transient->begin(),theirs.transient->end());
+      previous.state.vertices[0].transient=&image;
+      appendable=&image;
+    }
+    // Owned by this recorder's deque; const only in the packet's view of it.
+    auto& grown=const_cast<std::vector<uint8_t>&>(*appendable);
+    grown.insert(grown.end(),mine.transient->begin(),mine.transient->end());
+    previous.count+=count;
+    ++stats.transient_appends; ++stats.draws;
+    return true;
+  }
   void Draw(bool indexed,uint32_t count,uint32_t instances,uint32_t first,int32_t base,uint32_t first_instance) {
     if(failure) std::rethrow_exception(failure);
     if(!state.bindings.pipeline) throw std::runtime_error("draw packet has no pipeline");
     if(state.bindings.pipeline->requires_blend_factor() && !state.bindings.blend)
       throw std::runtime_error("draw packet requires a blend factor");
     const auto* bindings=SnapshotBindings();
+    if(TryAppendTransient(indexed,count,instances,first,first_instance,bindings)) return;
     if(queries.empty() && indexed && instances==1 && !first_instance &&
        bindings->world_instancing && bindings->pipeline->world_instanced && !packets.empty() &&
        (markers.empty() || markers.back().before!=packets.size())) {
@@ -310,6 +373,7 @@ struct NativeParallelRecorder::Impl {
   }
   void Flush(bool reopen) {
     if(failure) std::rethrow_exception(failure);
+    appendable=nullptr;
     if(packets.empty()) { if(!reopen) { finish(false); serial_previous.reset(); } return; }
     // Small UI/immediate runs often end at a buffer update. Waking every
     // worker and submitting a GPU frame per such run costs more than recording
@@ -364,6 +428,7 @@ void NativeParallelRecorder::Reset() {
   // for every changed binding. No old packet or saved state survives Reset.
   impl_->used_constant_images=0;
   impl_->used_vertex_images=0;
+  impl_->appendable=nullptr;
   impl_->used_binding_images=0;
 }
 void NativeParallelRecorder::Flush(bool reopen) {
@@ -397,6 +462,7 @@ void NativeParallelRecorder::SetWorldInstancing(bool enabled,bool reuse_constant
   impl_->reuse_world_constants=reuse_constants;
   if(s.bindings.world_instancing!=enabled) { s.bindings.world_instancing=enabled; s.snapshot=nullptr; }
 }
+void NativeParallelRecorder::SetTransientBatching(bool enabled) { impl_->transient_batching=enabled; }
 void NativeParallelRecorder::SetVertexBuffer(uint32_t slot,NativeBackendBuffer& b,uint32_t stride,uint32_t offset) {
   impl_->state.vertices.at(slot)={&b,stride,offset,nullptr};
 }

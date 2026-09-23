@@ -4,6 +4,7 @@
 #include "native_input_layout.h"
 #include "native_declarations.h"
 #include "native_generated_indices.h"
+#include "native_transient_batching.h"
 #include <array>
 #include <algorithm>
 #include <bit>
@@ -446,6 +447,21 @@ void NativeIndexedMesh::DrawLinesTransient(NativeBackendRecorder& recorder,std::
                                            uint32_t first,uint32_t count,int32_t base) const {
   ValidateLineDraw(first,count,base);
   BindTransientAndDraw(recorder,guest_vertices,first,count,base,NativeBackendTopology::LineList);
+}
+void NativeIndexedMesh::DrawTransientExpanded(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                                              uint32_t first,uint32_t count,NativeBackendTopology topology,
+                                              int32_t base) const {
+  if(topology==NativeBackendTopology::TriangleList) ValidateDraw(first,count,base);
+  else if(topology==NativeBackendTopology::LineList) ValidateLineDraw(first,count,base);
+  else throw std::runtime_error("an expanded transient draw is for list topologies");
+  if(!vertex_storage_->dynamic_vertices_)
+    throw std::runtime_error("transient vertices are for a dynamic mesh; an immutable one draws its own buffer");
+  static thread_local std::vector<uint8_t> converted,expanded;
+  vertex_storage_->ConvertVerticesInto(guest_vertices,converted);
+  ExpandIndexedVertices(converted,stride_,index_storage_->values_,first,count,base,expanded);
+  recorder.SetTransientVerticesOwned(0,expanded,stride_);
+  recorder.SetTopology(topology);
+  recorder.Draw(count,0);
 }
 void NativeIndexedMesh::BindTransientAndDraw(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
                                              uint32_t first,uint32_t count,int32_t base,

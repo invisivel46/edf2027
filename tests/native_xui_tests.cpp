@@ -7,6 +7,7 @@
 #include "native_graphics/d3d11_quads.h"
 #include "native_graphics/d3d11_texture.h"
 #include "native_graphics/d3d11_render_state.h"
+#include "native_graphics/native_immediate_classify.h"
 #include <bit>
 #include <cmath>
 #include <iostream>
@@ -18,6 +19,52 @@ template<size_t N> std::span<const uint8_t> Bytes(const std::array<float,N>& dat
 }
 int main() {
   try {
+    {
+      // The DrawPrimitiveUP hook's pair classification: the predicates each
+      // path applied per draw, now computed once per pair and registry state.
+      using Kind=NativeImmediatePairClass;
+      const NativeEmbeddedIdentity xui_vs{0x820608B0,false},movie_vs{0x82060B70,false};
+      const NativeEmbeddedIdentity brush{0x82060EC8,true},solid{0x82060DB0,true},mask{0x82061848,true};
+      const NativeEmbeddedIdentity hd{0x82064428,true},sd{0x820641F0,true},unknown{0x82061000,true};
+      Require(ClassifyNativeImmediatePair(&xui_vs,&brush,nullptr,nullptr).xui==Kind::Xui::Texture,"XUI texture brush");
+      Require(ClassifyNativeImmediatePair(&xui_vs,&solid,nullptr,nullptr).xui==Kind::Xui::Solid,"XUI solid brush");
+      Require(ClassifyNativeImmediatePair(&xui_vs,&mask,nullptr,nullptr).xui==Kind::Xui::Mask,"XUI mask brush");
+      Require(ClassifyNativeImmediatePair(&xui_vs,&unknown,nullptr,nullptr)==Kind{},"unknown XUI pixel shader classified");
+      Require(ClassifyNativeImmediatePair(&movie_vs,&hd,nullptr,nullptr).movie==Kind::Movie::Hd,"HD movie");
+      Require(ClassifyNativeImmediatePair(&movie_vs,&sd,nullptr,nullptr).movie==Kind::Movie::Sd,"SD movie");
+      Require(ClassifyNativeImmediatePair(&movie_vs,&brush,nullptr,nullptr)==Kind{},"movie VS with brush PS classified");
+      const NativeEmbeddedIdentity pixel_as_vertex{0x820608B0,true};
+      Require(ClassifyNativeImmediatePair(&pixel_as_vertex,&brush,nullptr,nullptr)==Kind{},"stage flags ignored");
+      Require(ClassifyNativeImmediatePair(&xui_vs,nullptr,nullptr,nullptr)==Kind{},"half-registered pair classified");
+      const auto utility=kNativeUtilitySourceFingerprint,particle=kNativeParticleSourceFingerprint;
+      auto source=[&](NativeSourceIdentity vs,NativeSourceIdentity ps) { return ClassifyNativeImmediatePair(nullptr,nullptr,&vs,&ps); };
+      Require(source({utility,"VS_2D"},{utility,"PS_Main"}).utility2d==Kind::Utility2D::Solid,"Utility 2D solid");
+      Require(source({utility,"VS_2DTex"},{utility,"PS_Tex"}).utility2d==Kind::Utility2D::Textured,"Utility 2D textured");
+      Require(source({utility,"VS_2DTex"},{utility,"PS_Main"})==Kind{},"mismatched Utility 2D entries classified");
+      Require(source({utility,"VS_2D"},{particle,"PS_Main"})==Kind{},"foreign pixel source classified");
+      Require(source({utility,"VS_3D"},{utility,"PS_Main"}).utility3d==Kind::Utility3D::Solid,"Utility 3D solid");
+      Require(source({utility,"VS_3DTex"},{utility,"PS_Tex"}).utility3d==Kind::Utility3D::Textured,"Utility 3D textured");
+      Require(source({particle,"Vs_Particle"},{particle,"Ps_Particle"}).utility3d==Kind::Utility3D::Particle,"particle");
+      Require(source({particle,"Vs_Particle"},{particle,"Ps_ZParticle"}).utility3d==Kind::Utility3D::ZParticle,"z particle");
+      Require(source({utility,"Vs_Particle"},{utility,"Ps_Particle"})==Kind{},"particle entries of another source classified");
+      // Memoized per pair against both generations; either one moving, or
+      // another pair, recomputes.
+      struct Payload { int value=0; };
+      NativeImmediatePairMemo<Payload,4> memo;
+      int computed=0;
+      auto get=[&](uint32_t vs,uint32_t ps,uint64_t shaders,uint64_t embedded) {
+        return memo.Get(vs,ps,shaders,embedded,[&](Kind& kind,Payload& payload) {
+          ++computed; kind=ClassifyNativeImmediatePair(&xui_vs,&brush,nullptr,nullptr); payload.value=int(vs+ps);
+        }).payload.value;
+      };
+      Require(get(0x100,0x200,1,1)==0x300 && computed==1,"first classification");
+      Require(get(0x100,0x200,1,1)==0x300 && computed==1 && memo.hits()==1,"repeat classification recomputed");
+      get(0x100,0x200,2,1); Require(computed==2,"shader registry change kept a stale classification");
+      get(0x100,0x200,2,2); Require(computed==3,"embedded registry change kept a stale classification");
+      get(0x100,0x204,2,2); Require(computed==4,"another pair reused a classification");
+      Require(get(0x100,0x200,2,2)==0x300 && computed==4,"another pair evicted a live classification");
+      memo.Clear(); get(0x100,0x204,2,2); Require(computed==5,"cleared memo kept an entry");
+    }
     for(size_t group=0;group<4;++group)
       for(const auto entry:{"VS_2D","VS_2DTex","PS_2D","VS_3D"})
         for(const auto parameter:{"_g_DX2DScale","_g_DX2DOffset","_g_Color"}) {
