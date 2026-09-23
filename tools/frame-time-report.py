@@ -265,7 +265,7 @@ def main(argv=None):
     ap.add_argument('--top', type=int, default=5, help='worst spikes listed per phase')
     ap.add_argument('--json', action='store_true', help='print JSON instead of a table')
     args = ap.parse_args(argv)
-    lines = Path(args.log).read_text(encoding='utf-8', errors='replace').splitlines()
+    lines = gate.read_log_lines(args.log)
     result = report(lines, args.start, args.end, args.top)
     if args.json:
         print(json.dumps(result, indent=2))
