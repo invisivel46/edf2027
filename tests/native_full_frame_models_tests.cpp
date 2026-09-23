@@ -14,6 +14,7 @@
 #include <iostream>
 #include <map>
 #include <memory>
+#include <set>
 #include <vector>
 
 using namespace edf::native;
@@ -1652,6 +1653,92 @@ void MemoDrivenBuild(std::shared_ptr<NativeRenderBackend> backend) {
   const auto after=models.Build(snapshot,camera,pass,sources);
   Require(after.stats.sourced==0 && after.stats.reused==6 && audited==24 && !stale,"the new generation holds");
 }
+// A material whose native parameters are unpublished (its model resource was
+// released: the material retired, "unpublished native material parameters")
+// never costs the pass more than the items that draw it. The bridge's program
+// provider returns null for it; a failure seen by the memo's validation (a
+// change probe) is not a decline, one seen fetching a planned item is.
+//  - The scenario runs: an object died and its model was released; the memo
+//    still remembered its pass record, so the next validation probed it and
+//    failed. Every live item still draws, nothing is marked, nothing declined.
+//  - A planned item's record unpublished: that item alone is uncovered
+//    (models_missing_program), the others draw; republished, it draws again.
+void UnpublishedMaterial(std::shared_ptr<NativeRenderBackend> backend) {
+  SkinnedFixture fixture(backend);
+  const uint32_t kLive=0x3000,kReleased=0x3100;
+  const auto live_layout=Layout(0x1000,true,3,{Mesh(0,true,false,{Batch(0x2000,{kLive})})});
+  const auto released_layout=Layout(0x1100,true,3,{Mesh(0,true,false,{Batch(0x2200,{kReleased})})});
+  std::vector<std::shared_ptr<NativeRenderEntry>> entries{Entry(1,{0,0,100},1,live_layout),Entry(2,{1,0,100},1,live_layout),
+    Entry(3,{2,0,100},1,released_layout)};
+  const auto snapshot_of=[&](size_t count) {
+    NativeRenderRegistrySnapshot snapshot;
+    for(size_t i=0;i<count;++i) snapshot.entries.push_back(entries[i]);
+    return snapshot;
+  };
+  auto camera=MakeCamera();
+  for(size_t i=0;i<16;++i) camera.pass.view_projection[i]=std::bit_cast<uint32_t>(i%5?0.f:1.5f);
+  auto pass=fixture.Pass(); pass.census=true;
+  auto published=std::make_shared<NativeSceneGroupMaterial>();
+  published->program=fixture.program; published->constants=fixture.constants;
+  using Program=std::shared_ptr<const NativeSceneGroupMaterial>;
+  using Geometry=std::shared_ptr<const NativeIndexedMesh::RetainedDraw>;
+  using Input=std::pair<NativeModelBatchLayout,uint32_t>;
+  NativeFullFrameModelSourceMemo<int,Program,std::pair<uint32_t,uint32_t>,Input,Geometry> memo;
+  std::set<uint32_t> unpublished;
+  // The bridge's routing: a fetch's failure is reported as a decline, a
+  // validation probe's is only noted.
+  int declined=0,noted=0;
+  const auto provide=[&](uint32_t record,int& failures) {
+    if(unpublished.contains(record)) { ++failures; return Program(); }
+    return Program(published);
+  };
+  NativeFullFrameModelSources sources;
+  sources.program=[&](uint32_t record) { return memo.ProgramFor(record,[&] { return provide(record,declined); }); };
+  sources.geometry=[&](const NativeModelBatchLayout& batch,uint32_t record) {
+    return memo.GeometryFor({record,batch.address},Input{batch,record},[&] { return fixture.geometry; });
+  };
+  sources.generation=[&] {
+    return memo.Validate([] { return 1; },[&](uint32_t record) { return provide(record,noted); },
+      [&](const Input&) { return fixture.geometry; },[](const auto& work) { work(); });
+  };
+  const auto uncovered=[](const NativeFullFrameModelFrame& frame) {
+    return std::count_if(frame.census.begin(),frame.census.end(),[](const NativeCoverageMark& mark) {
+      return mark.status==NativeCoverageStatus::Uncovered;
+    });
+  };
+  NativeFullFrameModels models;
+  const auto all=models.Build(snapshot_of(3),camera,pass,sources);
+  Require(all.stats.drawn==3 && !uncovered(all),"three items, two materials, all drawn");
+  // Object 3 dies and its model resource is released in the same step: the
+  // registry no longer lists it, and its material is retired.
+  unpublished.insert(kReleased);
+  const auto generation=memo.generation();
+  const auto died=models.Build(snapshot_of(2),camera,pass,sources);
+  Require(memo.generation()!=generation && noted==1,"the validation probed the released record and advanced");
+  Require(died.stats.drawn==2 && died.stats.missing_program==0 && !uncovered(died) && declined==0,
+    "a released material no item draws declines nothing and drops nothing");
+  const auto steady=models.Build(snapshot_of(2),camera,pass,sources);
+  Require(steady.stats.drawn==2 && steady.stats.sourced==0 && noted==1,"the released record is forgotten after one probe");
+  // A planned item's material unpublished: it alone is uncovered.
+  NativeFullFrameModels planned;
+  unpublished.clear();
+  Require(planned.Build(snapshot_of(3),camera,pass,sources).stats.drawn==3,"republished: all drawn");
+  unpublished.insert(kReleased);
+  const auto one=planned.Build(snapshot_of(3),camera,pass,sources);
+  Require(one.stats.drawn==2 && one.stats.missing_program==1 && uncovered(one)==1 && !one.batches.empty(),
+    "one unpublished material drops only its item");
+  const auto marked=std::find_if(one.census.begin(),one.census.end(),[](const NativeCoverageMark& mark) {
+    return mark.status==NativeCoverageStatus::Uncovered;
+  });
+  Require(std::string_view(marked->reason)=="models_missing_program" && marked->vtable==kPlain.vtable,
+    "the dropped item is counted by class with its reason");
+  size_t instances=0;
+  for(const auto& batch:one.batches) instances+=batch.snapshot.instances.size();
+  Require(instances==2,"the other items' draws are recorded");
+  unpublished.clear();
+  const auto back=planned.Build(snapshot_of(3),camera,pass,sources);
+  Require(back.stats.drawn==3 && !uncovered(back),"republished, the item draws again the next frame");
+}
 // A gameplay-like registry for the multi-frame checks and --models-bench:
 // 1600 entries on a grid around the camera, of which about 150 pass
 // visibility: skinned characters with three LOD models (a palette record and
@@ -2225,7 +2312,7 @@ int main(int argc,char** argv) {
       NativeD3D12Options options; options.prefer_warp=true;
       const std::shared_ptr<NativeRenderBackend> device=backend?std::shared_ptr<NativeRenderBackend>(CreateNativeD3D12Backend(options)):
         std::shared_ptr<NativeRenderBackend>(CreateNativeD3D11Backend({true,false}));
-      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); ObjectConstantBuild(device); PoolCarryFrames(device); ModelFrames(device); VelocityBuild(device);
+      PaletteCapture(device); SkinnedBuild(device); AttachmentBuild(device); PersistentDraws(device); MemoDrivenBuild(device); UnpublishedMaterial(device); ObjectConstantBuild(device); PoolCarryFrames(device); ModelFrames(device); VelocityBuild(device);
       ReuseOffFrames(device);
     }
   } catch(const std::exception& error) {

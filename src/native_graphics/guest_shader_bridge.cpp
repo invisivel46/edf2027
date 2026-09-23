@@ -7136,8 +7136,7 @@ std::shared_ptr<const NativeIndexedMesh::RetainedDraw> NativeModelGeometryLocked
 // activates again.
 uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
   std::span<const NativeEffectDraw> draws,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
-  const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report,
-  const std::function<void(const std::exception&)>& failed);
+  const NativeFullFramePassTargets& formats,const std::function<void(const std::exception&)>& failed);
 }
 namespace {
 // The open scene's targets and the view's viewport, as every full-frame scene
@@ -7215,6 +7214,17 @@ void CensusNativeWorldList(const Reader& reader,uint32_t owner) {
     CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"world_list","world_list_unreadable",1,error.what());
   }
   CoverageCensus().Add(marks);
+}
+// A provider failure that dropped no draw: a change probe (the models' source
+// memo validation, the source audit's refetch) or a step a retry recovered
+// from. Logged once per reason; it is not a decline and the census does not
+// count it (an item that does lose its draw is counted where it is dropped).
+void NativeFullFrameNoted(const char* pass,const std::string& reason) {
+  static std::mutex mutex;
+  static std::set<std::string> reported;
+  std::lock_guard lock(mutex);
+  if(reported.size()<64 && reported.insert(std::string(pass)+": "+reason).second)
+    REXLOG_INFO("Native full frame {}: {} (not a declined draw)",pass,reason);
 }
 void NativeFullFrameDeclined(const char* pass,const std::string& reason) {
   edf::native::FrameEventCounters().pass_declines.fetch_add(1,std::memory_order_relaxed);
@@ -7345,12 +7355,22 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       return;
     }
     const NativeSceneCpuWindow window(reader_);
+    // A program fetch for a planned item that fails drops that item's draws
+    // (Build marks each such item models_missing_program; the rest of the
+    // pass draws): a decline. The change probes below ask the providers again
+    // for every remembered result, including pass records of items no longer
+    // drawn (an object died and its model resource was released, its
+    // materials retired from material_parameters: "unpublished native
+    // material parameters"); a probe failure only advances the source
+    // generation and drops no draw, so it is noted, not declined.
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("models",reason); };
+    const auto probe=[this](const std::string& reason) { ++source_probe_failures_; NativeFullFrameNoted("models source probe",reason); };
     // The providers, each inside its own slice: the model pass program of a
     // pass record and the retained geometry of a batch under it.
-    const auto fetch_program=[&](uint32_t record) {
-      return slices([&] { return NativeModelPassProgramLocked(state,window,record,true,report); });
+    const auto program_from=[&](uint32_t record,const std::function<void(const std::string&)>& sink) {
+      return slices([&] { return NativeModelPassProgramLocked(state,window,record,true,sink); });
     };
+    const auto fetch_program=[&](uint32_t record) { return program_from(record,report); };
     const auto fetch_geometry=[&](const NativeModelBatchLayout& batch,uint32_t record) {
       return slices([&] { return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,batch,record),batch); });
     };
@@ -7385,7 +7405,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
         if(!reuse) return kNativeFullFrameModelUnversioned;
         return source_memo_.Validate(
           [&] { return SourceHost{state.shader_registry_generation,state.scene_backend.get()}; },
-          [&](uint32_t record) { return NativeModelPassProgramLocked(state,window,record,true,report); },
+          [&](uint32_t record) { return NativeModelPassProgramLocked(state,window,record,true,probe); },
           [&](const GeometryInput& input) {
             return NativeModelGeometryLocked(state,reader_,NativeModelGeometrySource(reader_,input.first,input.second),input.first);
           },
@@ -7400,7 +7420,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
       sources.audit=[&](const NativeModelBatchLayout& batch,uint32_t record,const NativeFullFrameModelSourcePair& kept) {
         const char* mismatch=nullptr;
         try {
-          const auto program=fetch_program(record);
+          const auto program=program_from(record,probe);
           const auto geometry=program && program->program?fetch_geometry(batch,record):nullptr;
           if(!program || !program->program) mismatch="program now missing";
           else if(!kept.first || (program!=kept.first &&
@@ -7463,7 +7483,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     const auto& planned=frame->plan.stats;
     if(++frames_<=4 || frames_%1000==0)
       REXLOG_INFO("Native full frame models: frames={} empty={} stale={} entries={} opaque={} transparent={} culled={}/{}/{} attachments={} no_attachment={} items={} drawn={} blended={} interpolate={} draws={} renderer_draws={} resolves={} captures={} palettes={} cache_hits={} memo_hits={} reused={} derived={} object_constants={} carried={} calls={} unlisted={} gathered={} pool_reseeds={} sourced={} providers={}/{} rows={}/{} sources={}/{} cached={}/{} states={}/{} missing={}/{} failed={} broken_objects={} lock_slices={} lock_ms={:.3f} lock_longest_ms={:.3f} "
-        "source_generation={} source_memo={} source_validated={} source_advances={}/{}/{}/{} source_reuses={} source_audits={}/{}",
+        "source_generation={} source_memo={} source_validated={} source_advances={}/{}/{}/{} source_reuses={} source_audits={}/{} source_probe_failures={}",
         frames_,empty_,stale_,planned.entries,planned.opaque,planned.transparent,planned.distance,planned.frustum,planned.box,
         planned.attachments,planned.no_attachment,
         built.items,built.drawn,built.blended,pass.motion.interpolate,built.draws,statistics.draws,built.resolves,built.captures,built.palettes,built.cache_hits,built.memo_hits,
@@ -7474,7 +7494,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
         slices.slices(),NativeLockSliceMs(slices.held()),NativeLockSliceMs(slices.longest()),
         source_memo_.generation(),source_memo_.size(),source_memo_.stats().validated,source_memo_.stats().advances,
         source_memo_.stats().host_changes,source_memo_.stats().changes,source_memo_.stats().prunes,source_memo_.stats().reuses,
-        source_audits_,source_mismatches_);
+        source_audits_,source_mismatches_,source_probe_failures_);
   }
  private:
   const edf::native::GuestReader reader_;
@@ -7495,7 +7515,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
   }
   edf::native::NativeFullFrameModelSourceMemo<SourceHost,std::shared_ptr<const edf::native::NativeSceneGroupMaterial>,
     GeometryKey,GeometryInput,std::shared_ptr<const edf::native::NativeIndexedMesh::RetainedDraw>> source_memo_;
-  uint64_t source_audits_=0,source_mismatches_=0;
+  uint64_t source_audits_=0,source_mismatches_=0,source_probe_failures_=0;
   uint64_t frames_=0,empty_=0,stale_=0,broken_=0;
 };
 // The full frame's Effects pass: CollectNativeEffectManager over the
@@ -7539,6 +7559,13 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
     }
     shared_->effect_filings=order-first;
     if(NativeCoverageCensusOn()) CensusEffects(collection);
+    // Objects skipped alone (the walk went on): each is one undrawn object,
+    // counted by class in the census (effect_object_failed); logged once per reason.
+    failed_objects_+=collection.failures.size();
+    for(const auto& failure:collection.failures)
+      if(failure_reasons_.size()<32 && failure_reasons_.insert(failure.reason).second)
+        REXLOG_INFO("Native full frame effects: object {:#x} (vtable {:#x}, slot 4 {:#x}) not drawn: {}",
+          failure.object,failure.vtable,failure.slot4,failure.reason);
     for(const auto slot:collection.unsupported_slots)
       if(unsupported_.insert(slot).second) {
         const auto* known=FindNativeEffectUnbuiltSlot(slot);
@@ -7556,15 +7583,16 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
         const NativeSceneCpuWindow window(reader_);
         const auto report=[](const std::string& reason) { NativeFullFrameDeclined("effects",reason); };
         for(const auto& item:collection.immediate)
-          drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,NativeSceneDrawCamera(),viewport,formats,report,
+          drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,NativeSceneDrawCamera(),viewport,formats,
             [&](const std::exception& error) { report(error.what()); });
       } else if(NativeCoverageCensusOn())
         CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:effects","no_targets",collection.immediate.size());
     }
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} absent={} stale_guest_eye={} held_frames={}",
+      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} failed={} (total {}) absent={} stale_guest_eye={} held_frames={}",
         frames_,manager,collection.visited,collection.culled,collection.hidden,collection.immediate.size(),drawn,
-        collection.items.size(),collection.undrawn_keys,collection.unsupported,absent_,stale_eyes_,held_frames_);
+        collection.items.size(),collection.undrawn_keys,collection.unsupported,collection.failures.size(),failed_objects_,
+        absent_,stale_eyes_,held_frames_);
     shared_->effects=std::move(collection.items);
   }
  private:
@@ -7596,10 +7624,15 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
     }
     census.Add(NativeCoverageStatus::Uncovered,0,"effect_object","effect_unknown_mode",collection.unknown_modes);
     census.Add(NativeCoverageStatus::Parity,0,"effect_object","undrawn_key",collection.undrawn_keys);
+    // Objects skipped alone: uncovered by class, the failure as the detail.
+    for(const auto& failure:collection.failures)
+      census.Add(NativeCoverageStatus::Uncovered,failure.vtable,failure.vtable?std::string_view{}:std::string_view("effect_object"),
+        "effect_object_failed",1,failure.reason);
   }
   std::shared_ptr<NativeFullFrameModelsShared> shared_;
   std::set<uint32_t> unsupported_;
-  uint64_t frames_=0,absent_=0,stale_eyes_=0,held_frames_=0;
+  std::set<std::string> failure_reasons_;  // Logged once each.
+  uint64_t frames_=0,absent_=0,stale_eyes_=0,held_frames_=0,failed_objects_=0;
 };
 // The frame's one transparent sequence (sub_821A3BA0): the models' mode-1/2
 // batches and the effects' filed items merged by key descending, filing order
@@ -7654,7 +7687,7 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     const auto record_item=[&](NativeBackendRecorder&,const NativeEffectItem& item) {
       // One item's draws in a row (a run of alike draws activated once); a
       // model batch may run between items.
-      effect_draws+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,camera,viewport,formats,report,
+      effect_draws+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,camera,viewport,formats,
         [&](const std::exception& error) { report(error.what()); ++effect_declined; });
     };
     auto effect_items=NativeEffectTransparentItems(std::move(effects),record_item);
@@ -7770,7 +7803,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     const NativeSceneCpuWindow window(reader_);
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("map effects",reason); };
     // A run of alike draws (the wires' strips) activates once.
-    map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,NativeSceneDrawCamera(),viewport,formats,report,
+    map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,NativeSceneDrawCamera(),viewport,formats,
       [&](const std::exception& error) { report(error.what()); });
   }
   // The coverage census of one map-effect walk, member by member as
@@ -7850,15 +7883,22 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
       auto before=base.render;
       const int filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
       const NativeSceneCpuWindow window(reader_);  // Valid for this hold only.
-      for(size_t index=0;index<draws.size();++index) {
+      // Each draw declines alone (one decline each, with its reason): the
+      // guest activates and draws every sky pass on its own, so one pass
+      // without a program, geometry or resolve leaves the others drawn. The
+      // next pass still chains from this one's state, which RecordNativeSky
+      // computed from the pass records, not from the resolve.
+      const auto resolve_draw=[&](size_t index) -> std::string {
         const auto& draw=draws[index];
-        const auto material=NativeModelPassProgramLocked(state,window,draw.pass,false,decline);
-        if(!material || !material->program) return refuse("sky pass has no program");
+        std::string provider;  // The program provider's reason, if it has none.
+        const auto material=NativeModelPassProgramLocked(state,window,draw.pass,false,
+          [&](const std::string& reason) { provider=reason; });
+        if(!material || !material->program) return provider.empty()?"sky pass has no program":provider;
         const auto& program=*material->program;
-        if(!program.CanDeferCpuActivation()) return refuse("sky pass needs a scissor rectangle");
+        if(!program.CanDeferCpuActivation()) return "sky pass needs a scissor rectangle";
         const auto source=NativeModelGeometrySource(reader_,*draw.geometry,draw.pass);
         const auto geometry=NativeModelGeometryLocked(state,reader_,source,*draw.geometry);
-        if(!geometry || geometry->backend()!=state.scene_backend.get()) return refuse("sky geometry not retained");
+        if(!geometry || geometry->backend()!=state.scene_backend.get()) return "sky geometry not retained";
         auto constants=material->constants;
         for(auto& constant:constants) native_scene_pass_camera->Apply(constant);
         std::array<uint8_t,64> world{};
@@ -7911,8 +7951,12 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
           object->object.geometry=geometry; object->object.material=resolve.capture.material;
           object->object.world=resolve.capture.world; object->previous=resolve.capture.world;
           resolved.emplace_back(std::move(object),NativeStaticInstanceView(resolve.capture.camera,viewport,resolve.scissor));
-        } catch(const std::exception& error) { return refuse(error.what()); }
-        before=draw.render;  // The next pass chains from this one's state, as RecordNativeSky computed it.
+        } catch(const std::exception& error) { return error.what(); }
+        return {};
+      };
+      for(size_t index=0;index<draws.size();++index) {
+        if(const auto error=resolve_draw(index);!error.empty()) decline(error);
+        before=draws[index].render;  // The next pass chains from this one's state, as RecordNativeSky computed it.
       }
       sky_materials_.EndPass();
       SceneRecorderLocked(state).SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
@@ -15065,7 +15109,7 @@ struct NativeFullFrameEffectActivation {
 };
 NativeFullFrameEffectActivation ActivateNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,
     const NativeSceneCpuWindow<GuestReader>& window,const NativeEffectDraw& draw,const NativeScenePassCamera& camera,
-    const NativeViewportState& viewport,const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report) {
+    const NativeViewportState& viewport,const NativeFullFramePassTargets& formats) {
   NativeFullFrameEffectActivation result;
   if(draw.texture) {
     const auto texture=state.textures.find(draw.texture);
@@ -15075,9 +15119,13 @@ NativeFullFrameEffectActivation ActivateNativeFullFrameEffectLocked(Bridge& stat
   BindNativeEffectTexture(window,draw.effect,draw.technique,draw.texture);
   const auto pass=NativeEffectTechniqueMaterial(window,draw.effect,draw.technique);
   if(!pass) throw std::runtime_error("native effect technique has no material");
-  result.material=NativeModelPassProgramLocked(state,window,pass,false,report);
+  // The provider's reason travels with the draw's one failure (the caller's
+  // `failed`), not as a second decline of the same draw.
+  std::string provider;
+  result.material=NativeModelPassProgramLocked(state,window,pass,false,[&](const std::string& reason) { provider=reason; });
   const auto& material=result.material;
-  if(!material || !material->program) throw std::runtime_error("native effect technique has no program");
+  if(!material || !material->program)
+    throw std::runtime_error(provider.empty()?"native effect technique has no program":provider);
   const auto& program=*material->program;
   if(draw.texture && std::none_of(program.inputs.textures.begin(),program.inputs.textures.end(),
        [&](const auto& texture) { return texture.handle==draw.texture; }))
@@ -15153,11 +15201,11 @@ void RecordNativeFullFrameEffectCallsLocked(Bridge& state,const GuestReader& rea
 // the vertices), so the next draw's would bind the same texture word, program,
 // constants, samplers and render state onto the same bindings, which only an
 // activation changes (the immediate recording reads them). A failed draw
-// drops the activation; the next draw activates again, as it would alone.
+// drops the activation and goes to `failed` once, with its reason; the next
+// draw activates again, as it would alone.
 uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
     std::span<const NativeEffectDraw> draws,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
-    const NativeFullFramePassTargets& formats,const std::function<void(const std::string&)>& report,
-    const std::function<void(const std::exception&)>& failed) {
+    const NativeFullFramePassTargets& formats,const std::function<void(const std::exception&)>& failed) {
   uint64_t recorded=0;
   std::optional<NativeFullFrameEffectActivation> activation;
   const NativeEffectDraw* activated=nullptr;
@@ -15166,7 +15214,7 @@ uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& rea
       // Reuse off (native_reuse.h): every draw activates on its own.
       if(!activation || !NativeReuseAllowed() || !NativeEffectDrawsShareActivation(*activated,draw)) {
         activation.reset();
-        activation=ActivateNativeFullFrameEffectLocked(state,reader,window,draw,camera,viewport,formats,report);
+        activation=ActivateNativeFullFrameEffectLocked(state,reader,window,draw,camera,viewport,formats);
         activated=&draw;
       }
       RecordNativeFullFrameEffectCallsLocked(state,reader,*activation,draw,viewport);
@@ -16878,8 +16926,14 @@ std::shared_ptr<const NativeSceneGroupMaterial> NativeModelPassProgramLocked(Bri
   auto& load=state.model_pass_loads[pass];
   if(load.published && NativeSceneMaterialHostCurrent(state,*load.published->program,pass,load.schema) &&
      load.reads.Unchanged(window)) {
+    // A failed refresh rebuilds below: only a rebuild failure, which returns
+    // no program, is the caller's to report (and to count as a decline).
     try { refresh(load); ++state.model_pass_reused; return load.published; }
-    catch(const std::exception& error) { report(error.what()); }
+    catch(const std::exception& error) {
+      static std::set<std::string> noted;  // Under the bridge mutex.
+      if(noted.size()<32 && noted.insert(error.what()).second)
+        REXLOG_INFO("Native model pass program refresh failed, rebuilding: {}",error.what());
+    }
   }
   if(!load.published && load.failed_tick==native_render_budget.tick) return nullptr;
   try {
