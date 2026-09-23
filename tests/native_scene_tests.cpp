@@ -26,6 +26,7 @@
 #include "native_graphics/d3d11_backend.h"
 #include "native_graphics/d3d12_backend.h"
 #include <bit>
+#include <chrono>
 #include <cstring>
 #include <iostream>
 
@@ -109,6 +110,46 @@ void SharedIndex() {
     "shared map erase_if");
   NativeSharedVector<int> list{1,2,3};
   Require(list.size()==3 && list[2]==3 && NativeSharedVector<int>{}.empty(),"shared vector sequence");
+  // Difference: exactly the keys a brute-force comparison of the two copies
+  // finds, in key order, through inserts, splits, erases, overwrites and
+  // equal rewrites (a rewritten chunk with equal elements reports nothing).
+  // Four-element chunks so every step crosses chunk boundaries.
+  NativeSharedMap<uint32_t,uint32_t,4> live;
+  std::map<uint32_t,uint32_t> model;
+  uint32_t seed=7;
+  const auto next=[&] { seed=seed*1664525u+1013904223u; return seed>>8; };
+  std::vector<uint32_t> reported;
+  const auto differs=[&](const auto& before) {
+    reported.clear(); live.Difference(before,[&](uint32_t key) { reported.push_back(key); });
+  };
+  Require((differs(live),reported.empty()),"a map differs from itself");
+  for(uint32_t step=0;step<400;++step) {
+    const auto before=live;
+    const auto previous=model;
+    for(uint32_t edit=next()%12;edit--;) {
+      const auto key=next()%160;
+      switch(next()%4) {
+        case 0: live.Erase(key); model.erase(key); break;
+        case 1: if(model.contains(key)) { live.Set(key,model[key]); break; } [[fallthrough]];  // Equal rewrite.
+        default: { const auto value=next()%3; live.Set(key,value); model[key]=value; }
+      }
+    }
+    std::vector<uint32_t> expected;
+    for(uint32_t key=0;key<160;++key) {
+      const auto a=previous.find(key); const auto b=std::as_const(model).find(key);
+      if((a==previous.end())!=(b==model.end()) || (a!=previous.end() && a->second!=b->second)) expected.push_back(key);
+    }
+    differs(before);
+    Require(reported==expected,"shared map difference is not the brute-force difference");
+    Require(before.size()==previous.size(),"a difference or a write reached the earlier copy");
+  }
+  // Copies that share nothing still compare exactly.
+  NativeSharedMap<uint32_t,uint32_t,4> rebuilt;
+  for(const auto& [key,value]:model) rebuilt.Set(key,value);
+  differs(rebuilt);
+  Require(reported.empty(),"equal unshared maps differ");
+  rebuilt.Set(1000,1); differs(rebuilt);
+  Require(reported==std::vector<uint32_t>{1000},"a key only the earlier copy holds was not reported");
 }
 // Page-backed guest arena: the device, its texture objects and the retail
 // constant tables at 0x82000000 live far apart.
@@ -1192,6 +1233,23 @@ void FullFrameStaticWorld() {
   const NativeSceneTreeImageReader image_reader(*image);
   Reject([&] { image_reader.Word(root1+120); });
   Reject([&] { image_reader.Word(world+100); });
+  // The flat index answers every read as the map does: each captured word of
+  // every node, alternating regions, and a read past a region's end throws.
+  NativeSceneTreeImageReader::Index index;
+  NativeSceneTreeImageReader::Build(*image,index);
+  Require(index.size()==image->regions->size(),"tree image index lost a region");
+  const NativeSceneTreeImageReader indexed(*image,&index);
+  for(const auto at:{root0,root1,root2,child_a,child_b}) for(const auto offset:{116u,32u,84u,64u,48u,88u,36u,116u}) {
+    const auto address=at+offset;
+    bool plain=true,flat=true;
+    uint32_t a=0,b=0;
+    try { a=image_reader.Word(address); } catch(const std::exception&) { plain=false; }
+    try { b=indexed.Word(address); } catch(const std::exception&) { flat=false; }
+    Require(plain==flat && a==b,"indexed tree image read differs from the map's");
+  }
+  Reject([&] { indexed.Word(root1+120); });
+  Reject([&] { indexed.Word(world+100); });
+  Reject([&] { indexed.Word(0x10); });
   using Object=NativeFullFrameStaticSelection::Object;
   const auto selection=SelectNativeFullFrameStaticWorld(publication,camera,routes);
   const auto& s=selection.stats;
@@ -1321,6 +1379,27 @@ void FullFrameStaticWorld() {
   Require(republished.sources!=publication.sources && republished.sources->SameCandidates(*publication.sources) &&
     same_selection(SelectNativeFullFrameStaticWorld(republished,camera,routes,&select_cache),selection) &&
     select_cache.stats.invalidations==1 && select_cache.stats.list_builds==builds,"a world republish invalidated the selection cache");
+  // What moved between the two generations: A's owner entry (its world), no
+  // part. A re-observed owner moves its parts too: the dropped, the added
+  // and the ones whose record changed (0x7c00's LOD).
+  std::vector<uint32_t> moved_owners,moved_parts;
+  const auto diff=[&](const NativeSceneSources& after,const NativeSceneSources& before) {
+    moved_owners.clear(); moved_parts.clear();
+    after.Differences(before,[&](uint32_t owner) { moved_owners.push_back(owner); },
+      [&](uint32_t instance) { moved_parts.push_back(instance); });
+  };
+  diff(*republished.sources,*publication.sources);
+  Require(moved_owners==std::vector<uint32_t>{A} && moved_parts.empty(),"a world republish moved other owners or parts");
+  diff(*publication.sources,*publication.sources);
+  Require(moved_owners.empty() && moved_parts.empty(),"a generation differs from itself");
+  {
+    NativeSceneSources producer=*republished.sources;  // A new lineage: shares its chunks until written.
+    Require(producer.Observe(J,std::vector<NativeSceneSources::Part>{P{0x7c00,1,0,J+0x80,G1,0},P{0x7d00,0,0,J+0x80,G1,0}}),
+      "re-observed fixture parts");
+    diff(*producer.AcquireSnapshot(),*republished.sources);
+    Require(moved_owners==std::vector<uint32_t>{J} && moved_parts==std::vector<uint32_t>{0x7c00,0x7d00},
+      "a re-observed owner's parts did not move");
+  }
   const NativeSceneSources copied=*republished.sources;
   Require(!copied.SameCandidates(*republished.sources),"a copied source producer kept its lineage");
   // Route words are never cached: a live write routes E natively through a warm cache.
@@ -1330,6 +1409,220 @@ void FullFrameStaticWorld() {
     select_cache.stats.list_builds==builds && std::ranges::count(direct.objects,NativeFullFrameStaticSelection::Object{E,0})==1,
     "a cached selection used stale route words");
   live[E].mode=1;
+}
+// NativeFullFrameStaticWorld across a run of gameplay-like frames: the camera
+// moves every frame, some objects publish new worlds every frame (a new
+// sources generation each time), the world animation advances and a few
+// materials read it, and now and then an owner is born, retired or re-observed
+// and a group material is republished. Each frame of one persistent pass
+// equals a from-scratch build of the same inputs (groups, order, instances,
+// worlds, views), while the caches keep what did not move. With
+// --static-world-bench (static_world_bench) it runs 600 frames, checks every
+// 50th and prints the persistent pass's mean select and build times.
+bool static_world_bench=false;
+void FullFrameStaticWorldFrames() {
+  std::vector<uint8_t> memory(0x40000);
+  const GeometryRetryReader r{memory};
+  const auto store=[&](uint32_t at,std::initializer_list<float> values) {
+    for(const auto value:values) { r.StoreWord(at,std::bit_cast<uint32_t>(value)); at+=4; }
+  };
+  // 160 inside-or-culled leaf roots on a 16x10 grid, each with its own list.
+  constexpr uint32_t world=0x1000,levels=0x2000,roots=0x10000,kColumns=16,kRows=10,kLeaves=kColumns*kRows;
+  r.StoreWord(world+52,levels); r.StoreWord(world+56,levels+32);
+  r.StoreWord(levels+20,roots); r.StoreWord(levels+24,roots+kLeaves*144);
+  const auto leaf_center=[](uint32_t leaf) {
+    return std::array<float,3>{float(int(leaf%kColumns)*40-300),0.f,float(int(leaf/kColumns)*40+20)};
+  };
+  for(uint32_t leaf=0;leaf<kLeaves;++leaf) {
+    const auto at=roots+leaf*144; const auto c=leaf_center(leaf);
+    r.StoreWord(at+116,1); store(at+32,{c[0],c[1],c[2],1,20,20,20,0,35});
+  }
+  const std::shared_ptr<const NativeSceneTreeImage> image=CaptureNativeSceneTree(r,world);
+  constexpr uint32_t kOwners=8000,kGroups=300,kOwnerBase=0x01000000,kGroupBase=0x02000000;
+  const auto owner_of=[](uint32_t i) { return kOwnerBase+i*0x200; };
+  const auto group_of=[](uint32_t i) { return kGroupBase+(i%kGroups)*16; };
+  uint32_t seed=12345;
+  const auto next=[&] { seed=seed*1664525u+1013904223u; return seed>>8; };
+  const auto unit=[&] { return float(next()%20001)/10000.f-1.f; };
+  NativeSceneSources sources;
+  const auto registers_of=[](float x,float y,float z) {
+    auto matrix=kNativeSceneIdentity; matrix[12]=x; matrix[13]=y; matrix[14]=z;
+    NativeSceneSources::World registers{};
+    for(size_t i=0;i<16;++i) for(size_t byte=0;byte<4;++byte)
+      registers[i*4+byte]=uint8_t(std::bit_cast<uint32_t>(matrix[i])>>(24-byte*8));
+    return registers;
+  };
+  std::vector<std::array<float,3>> centers(kOwners);
+  const auto parts_of=[&](uint32_t i,uint32_t variant) {
+    std::vector<NativeSceneSources::Part> parts;
+    const uint32_t count=1+(i%3==0);
+    for(uint32_t p=0;p<count;++p) {
+      NativeSceneSources::Part part{0x20000000+i*64+p*28,0,p,owner_of(i)+0x80,group_of(i+p*7+variant)};
+      part.world_first=0; parts.push_back(part);
+    }
+    return parts;
+  };
+  const auto spawn=[&](uint32_t i,uint32_t variant) {
+    const auto owner=owner_of(i);
+    sources.Born(owner);
+    Require(sources.Observe(owner,parts_of(i,variant)),"full-frame frames fixture parts");
+    const auto& c=centers[i];
+    NativeSceneVisibility visibility;
+    visibility.box={c[0],c[1],c[2],1, 1,0,0,0, 0,1,0,0, 0,0,1,0};
+    visibility.radius=1.7f; visibility.distance=float(150+i%7*60); visibility.lod_count=1;
+    sources.PublishVisibility(owner,visibility);
+    sources.PublishWorld(owner,registers_of(c[0],c[1],c[2]));
+  };
+  auto lists=std::make_shared<NativeSceneMembership::Publication>();
+  std::vector<std::vector<uint32_t>> members(kLeaves+1);
+  for(uint32_t i=0;i<kOwners;++i) {
+    const uint32_t leaf=i%(kLeaves+1);  // The last is world+372.
+    const auto c=leaf<kLeaves?leaf_center(leaf):std::array<float,3>{0,0,100};
+    centers[i]={c[0]+unit()*18,c[1]+unit()*18,c[2]+unit()*18};
+    spawn(i,0);
+    members[leaf].push_back(owner_of(i));
+  }
+  const auto list_address=[&](uint32_t leaf) { return leaf<kLeaves?roots+leaf*144+120:world+372; };
+  const auto publish_list=[&](uint32_t leaf) {
+    auto snapshot=std::make_shared<NativeSceneMembership::Snapshot>(); snapshot->end=list_address(leaf)+8;
+    for(const auto owner:members[leaf]) snapshot->members.push_back({owner+0x10,owner});
+    lists->lists.Set(list_address(leaf),std::move(snapshot));
+  };
+  for(uint32_t leaf=0;leaf<=kLeaves;++leaf) publish_list(leaf);
+  NativeScenePublication publication;
+  publication.membership=lists; publication.trees[world]=image;
+  NativeSceneGroupOrder order;
+  for(uint32_t g=0;g<kGroups;++g) order.push_back(kGroupBase+((g*37)%kGroups)*16);
+  publication.group_order.Set(world,std::make_shared<const NativeSceneGroupOrder>(order));
+  auto program=std::make_shared<NativeSceneMaterialProgram>();
+  program->inputs.vertex=0x9100; program->inputs.pixel=0x9200;
+  program->inputs.vertex_registers.push_back({"g_mWorld",0,4});
+  // Constants: plain ones, the object world, and on every 100th group the
+  // world animation's m_WaterTime (a per-frame miss) or g_SignalBrightness.
+  const auto constants_of=[&](uint32_t g,uint8_t salt) {
+    std::vector<NativeSceneMaterialInputs::Constant> result;
+    for(uint32_t c=0;c<12;++c) result.push_back({c%2==1,"c"+std::to_string(c),std::vector<uint8_t>(16,uint8_t(g+c+salt)),false});
+    result.push_back({false,"g_mWorld",std::vector<uint8_t>(64,0),false});
+    if(g%100==0) result.push_back({false,"m_WaterTime",std::vector<uint8_t>(16,0),true});
+    if(g%100==1) result.push_back({true,"g_SignalBrightness",std::vector<uint8_t>(16,0),true});
+    return result;
+  };
+  const auto publish_material=[&](uint32_t g,uint8_t salt) {
+    const auto group=kGroupBase+g*16;
+    const auto* membership=publication.sources->FindGroup(group);
+    auto material=std::make_shared<NativeSceneGroupMaterial>(); material->group=group;
+    material->revision=membership?membership->revision:1; material->program=program; material->constants=constants_of(g,salt);
+    publication.group_materials.Assign(material,NativeSceneGroupKey{});
+    auto geometry=std::make_shared<NativeSceneGroupGeometry>(); geometry->group=group; geometry->revision=material->revision;
+    publication.group_geometry.Assign(geometry,NativeSceneGroupKey{});
+  };
+  const auto republish_all=[&] {
+    publication.sources=sources.AcquireSnapshot();
+    // Revisions follow the sources' groups, as the adapter republishes them.
+    for(uint32_t g=0;g<kGroups;++g) {
+      const auto group=kGroupBase+g*16;
+      const auto* membership=publication.sources->FindGroup(group);
+      const auto* material=publication.group_materials.Find(group,NativeSceneGroupKey{});
+      if(!material || (membership && (*material)->revision!=membership->revision)) publish_material(g,0);
+    }
+  };
+  republish_all();
+  NativeFullFrameStaticPass pass;
+  pass.targets.dsv_format=DXGI_FORMAT_D24_UNORM_S8_UINT; pass.targets.rtv_format[0]=DXGI_FORMAT_R8G8B8A8_UNORM;
+  uint64_t resolves=0;
+  const auto resolve=[&](const NativeSceneGroupMaterial& group,const auto&,const NativeSceneMaterialPassState& state,
+      std::span<const NativeSceneMaterialInputs::Constant> constants) {
+    ++resolves;
+    NativeFullFrameStaticMaterial result; result.render=state.render.words;
+    // A column-major world on odd groups: the decode differs per group.
+    result.world_column_major=(group.group>>4)&1;
+    (void)constants;
+    return result;
+  };
+  const NativeFullFrameStaticRouteRead routes=[&](uint32_t owner)->std::optional<NativeFullFrameStaticRoute> {
+    return NativeFullFrameStaticRoute{true,0,uint16_t((owner>>9)%97==0)};
+  };
+  NativeFullFrameStaticCamera camera;
+  camera.visibility.matrix=kNativeSceneIdentity; camera.visibility.depth_scale=-1;
+  auto& f=camera.visibility.frustum;
+  f[8]=1; f[10]=-1; f[12]=-1; f[14]=-1; f[17]=1; f[18]=-1; f[21]=-1; f[22]=-1; f[24]=1; f[25]=1000;
+  NativeFullFrameStaticWorld cached;
+  const auto same_frame=[](const NativeFullFrameStaticFrame& a,const NativeFullFrameStaticFrame& b) {
+    if(a.selection.objects!=b.selection.objects || a.draws.size()!=b.draws.size()) return false;
+    const auto& x=a.stats; const auto& y=b.stats;
+    if(x.groups!=y.groups || x.draws!=y.draws || x.instances!=y.instances || x.world_declines!=y.world_declines ||
+       x.missing_group!=y.missing_group || x.missing_material!=y.missing_material || x.declined!=y.declined) return false;
+    for(size_t i=0;i<a.draws.size();++i) {
+      const auto& p=a.draws[i]; const auto& q=b.draws[i];
+      if(p.owner!=q.owner || p.group!=q.group || p.geometry!=q.geometry || p.material!=q.material ||
+         p.instances.size()!=q.instances.size() || std::memcmp(&p.view.viewport,&q.view.viewport,sizeof(p.view.viewport)) ||
+         p.view.scissor_enabled!=q.view.scissor_enabled ||
+         std::memcmp(p.view.view.data(),q.view.view.data(),sizeof(p.view.view))) return false;
+      for(size_t j=0;j<p.instances.size();++j) {
+        const auto& u=*p.instances[j]; const auto& v=*q.instances[j];
+        if(u.object.world!=v.object.world || u.previous!=v.previous || u.object.geometry!=v.object.geometry ||
+           u.object.material!=v.object.material) return false;
+      }
+    }
+    return true;
+  };
+  NativeFullFrameStaticFrame::Stats totals{};
+  uint64_t cached_resolves=0;
+  const bool bench=static_world_bench;
+  const uint32_t frames=bench?600:48;
+  double select_ms=0,build_ms=0;
+  for(uint32_t frame=0;frame<frames;++frame) {
+    // Camera and pass camera move every frame; the animation advances.
+    camera.visibility.matrix[12]=float(frame%40)*1.5f-30; camera.visibility.matrix[14]=float(frame%13);
+    camera.pass.view[12]=0x3f800000u+frame; camera.pass.view_projection[3]=frame;
+    camera.animation=NativeScenePassAnimation{frame,frame/8};
+    // A few objects move every frame: a new sources generation.
+    for(uint32_t k=0;k<12;++k) {
+      const auto i=(frame*131+k*577)%kOwners;
+      centers[i][1]+=.25f;
+      sources.PublishWorld(owner_of(i),registers_of(centers[i][0],centers[i][1],centers[i][2]));
+    }
+    // Now and then: a re-observed owner moves between groups, an owner retires
+    // and returns, a group material republishes (equal or changed constants).
+    if(frame%7==3) { const auto i=(frame*97)%kOwners; Require(sources.Observe(owner_of(i),parts_of(i,frame)),"re-observe"); }
+    if(frame%11==5) { const auto i=(frame*53)%kOwners; sources.Retire(owner_of(i)); spawn(i,0); }
+    if(frame%5==2) publish_material((frame*17)%kGroups,uint8_t(frame%3==0?0:frame));
+    if(frame%9==4) {
+      auto& list=members[frame%kLeaves];
+      std::rotate(list.begin(),list.begin()+1,list.end()); publish_list(frame%kLeaves);
+    }
+    republish_all();
+    const auto before=resolves;
+    const auto t0=std::chrono::steady_clock::now();
+    cached.Select(publication,camera,routes);
+    const auto t1=std::chrono::steady_clock::now();
+    const auto& built=cached.BuildSelected(publication,camera,pass,resolve);
+    const auto t2=std::chrono::steady_clock::now();
+    cached_resolves+=resolves-before;
+    if(frame>=2) {
+      select_ms+=std::chrono::duration<double,std::milli>(t1-t0).count();
+      build_ms+=std::chrono::duration<double,std::milli>(t2-t1).count();
+    }
+    const auto& s=built.stats;
+    totals.reused_draws+=s.reused_draws; totals.camera_only+=s.camera_only; totals.draws+=s.draws;
+    totals.cache_hits+=s.cache_hits; totals.instances+=s.instances; totals.reused_instances+=s.reused_instances;
+    totals.reused_moved+=s.reused_moved;
+    // Every frame is a new sources generation and a new animation: the
+    // groups not reading the animation keep Current's acceptance (another
+    // group's resolve does not take it), and the instances whose reads did
+    // not move are carried across the generation.
+    if(frame>=2) Require(s.camera_only>=s.cache_hits*9/10 && s.reused_instances>=s.instances*8/10 && s.reused_moved &&
+      s.moved_owners>=12,"a moved generation, camera or animation rebuilt unchanged groups");
+    if(bench && frame%50) continue;
+    NativeFullFrameStaticWorld fresh;
+    Require(same_frame(built,fresh.Build(publication,camera,routes,pass,resolve)),
+      "a cached full-frame static world frame differs from a fresh build");
+  }
+  Require(totals.draws>frames*100 && totals.instances>frames*1000,"full-frame frames fixture drew too little");
+  if(bench)
+    std::cout<<"static world frames: select_ms="<<select_ms/(frames-2)<<" build_ms="<<build_ms/(frames-2)
+      <<" draws="<<totals.draws/frames<<" instances="<<totals.instances/frames<<" reused_draws="<<totals.reused_draws/frames
+      <<" reused_instances="<<totals.reused_instances/frames<<" camera_only="<<totals.camera_only/frames<<" resolves="<<double(cached_resolves)/frames<<"\n";
 }
 // NativeAddressFilter: every added address answers true; addresses never
 // added are almost all false (two bits of a 4 Mi-bit table).
@@ -1372,6 +1665,19 @@ void FullFrameLiveRoutes() {
   // Through the type-erased reader SelectNativeFullFrameStaticWorld takes.
   const NativeFullFrameStaticRouteRead erased=std::cref(routes);
   Require(erased(B)==NativeFullFrameStaticRoute{false,0,0} && routes.reads==6,"erased route reader");
+  // The last vtable's answer is kept beside the map: alternating vtables and
+  // a bucket or hidden object between them keep each object's own answer.
+  r.StoreWord(C+52,2);
+  const NativeFullFrameLiveRoutes fresh(r);
+  for(uint32_t pass=0;pass<3;++pass)
+    Require(fresh(A)==NativeFullFrameStaticRoute{false,0,0} && fresh(B)==NativeFullFrameStaticRoute{false,0,0} &&
+      fresh(C)==NativeFullFrameStaticRoute{false,2,0} && fresh(D)==NativeFullFrameStaticRoute{false,0,3} &&
+      fresh(B)==NativeFullFrameStaticRoute{false,0,0},"alternating vtables took another object's slot answer");
+  r.StoreWord(direct_table+16,kNativeStaticDirectRender);
+  const NativeFullFrameLiveRoutes restored(r);
+  Require(restored(A)==NativeFullFrameStaticRoute{true,0,0} && restored(B)==NativeFullFrameStaticRoute{false,0,0} &&
+    restored(A)==NativeFullFrameStaticRoute{true,0,0} && restored(A)==NativeFullFrameStaticRoute{true,0,0} &&
+    restored.slot_reads==2,"alternating vtables re-read a slot or lost its answer");
 }
 void GroupOrder() {
   std::vector<uint8_t> memory(0x1000);
@@ -2954,13 +3260,15 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
   for(const auto& message:backend->DrainValidationMessages()) throw std::runtime_error(message);
 }
 }
-int main() {
+int main(int argc,char** argv) {
+  // --static-world-bench: FullFrameStaticWorldFrames runs 600 frames and prints its per-frame timings.
+  static_world_bench=argc>1 && std::string_view(argv[1])=="--static-world-bench";
   try {
     SharedIndex(); PassCamera(); Visibility();
     QueuedGuestState(); PreloadChangeSignals();
     TreePublicationReuse();
     AddressFilter(); FullFrameLiveRoutes();
-    GroupOrder(); FullFrameStaticWorld(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
+    GroupOrder(); FullFrameStaticWorld(); FullFrameStaticWorldFrames(); StaticWorldPass(); StaticWorldComposedBinds(); StaticWorldGroupCache(); StaticWorldGroupResolve(); WalkLock(); StaticWalkPlan();
     NativeSceneSources sources;
     const NativeSceneSources::Part first[]{ {1000,0,0,0,500},{1028,0,1,0,500} };
     Require(!sources.Observe(100,first),"scene inferred lifetime from an observation");

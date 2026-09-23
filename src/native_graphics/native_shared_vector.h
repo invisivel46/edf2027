@@ -97,6 +97,29 @@ class NativeSharedVector {
     if(values.empty()) spine.leaves.erase(spine.leaves.begin()+leaf);
     return true;
   }
+  // Sorted use: visit(before element or null, this element or null) for every
+  // key whose element differs from before's (==) or is in one of the two
+  // only, in key order. A chunk both reach at the same boundary is skipped
+  // unread: storage reachable from two copies is never written, so a shared
+  // chunk holds equal elements. Costs the chunks and the elements of the
+  // chunks written since the copy, not the size.
+  template<class KeyOf,class Visit> void Difference(const NativeSharedVector& before,const KeyOf& key_of,Visit&& visit) const {
+    if(spine_==before.spine_) return;
+    const Spine* a=before.spine_.get(); const Spine* b=spine_.get();
+    const size_t an=a?a->leaves.size():0,bn=b?b->leaves.size():0;
+    size_t al=0,ai=0,bl=0,bi=0;
+    const auto next_a=[&] { if(++ai==a->leaves[al]->size()) { ai=0; ++al; } };
+    const auto next_b=[&] { if(++bi==b->leaves[bl]->size()) { bi=0; ++bl; } };
+    while(al<an && bl<bn) {
+      if(!ai && !bi && a->leaves[al]==b->leaves[bl]) { ++al; ++bl; continue; }
+      const T& x=(*a->leaves[al])[ai]; const T& y=(*b->leaves[bl])[bi];
+      if(key_of(x)<key_of(y)) { visit(&x,static_cast<const T*>(nullptr)); next_a(); }
+      else if(key_of(y)<key_of(x)) { visit(static_cast<const T*>(nullptr),&y); next_b(); }
+      else { if(!(x==y)) visit(&x,&y); next_a(); next_b(); }
+    }
+    for(;al<an;next_a()) visit(&(*a->leaves[al])[ai],static_cast<const T*>(nullptr));
+    for(;bl<bn;next_b()) visit(static_cast<const T*>(nullptr),&(*b->leaves[bl])[bi]);
+  }
   template<class Predicate> size_t EraseIf(Predicate predicate) {
     size_t erased=0;
     for(size_t leaf=0;leaf<Leaves();) {
@@ -165,6 +188,11 @@ class NativeSharedMap {
   bool Erase(const K& key) { return values_.Erase(key,First{}); }
   template<class Predicate> size_t EraseIf(Predicate predicate) { return values_.EraseIf(predicate); }
   bool Shares(const NativeSharedMap& other) const { return values_.Shares(other.values_); }
+  // visit(key) for every key whose value differs from before's or that only
+  // one of the two holds (NativeSharedVector::Difference).
+  template<class Visit> void Difference(const NativeSharedMap& before,Visit&& visit) const {
+    values_.Difference(before.values_,First{},[&](const value_type* a,const value_type* b) { visit(a?a->first:b->first); });
+  }
  private:
   NativeSharedVector<value_type,Chunk> values_;
 };

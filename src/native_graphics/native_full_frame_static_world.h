@@ -72,8 +72,11 @@ class NativeFullFrameLiveRoutes {
       NativeFullFrameStaticRoute route{false,GuestBlockWord(header+52),uint16_t(GuestBlockWord(header+64)>>16)};
       ++reads;
       if(route.hidden || route.mode) return route;
+      // Static objects share a handful of vtables: the last one answers most.
+      if(last_ && vtable==last_vtable_) { route.direct=last_direct_; return route; }
       if(const auto found=direct_.find(vtable);found!=direct_.end()) route.direct=found->second;
       else { route.direct=reader_.Word(reader_.Add(vtable,16))==kNativeStaticDirectRender; direct_.emplace(vtable,route.direct); ++slot_reads; }
+      last_=true; last_vtable_=vtable; last_direct_=route.direct;
       return route;
     } catch(const std::exception&) { ++failures; return std::nullopt; }
   }
@@ -81,27 +84,59 @@ class NativeFullFrameLiveRoutes {
  private:
   const Reader& reader_;
   mutable std::unordered_map<uint32_t,bool> direct_;
+  mutable uint32_t last_vtable_=0;
+  mutable bool last_=false,last_direct_=false;
 };
 // Addresses of the published tree image only: every read is a captured byte,
 // and anything else throws rather than reaching guest memory.
 class NativeSceneTreeImageReader {
  public:
-  explicit NativeSceneTreeImageReader(const NativeSceneTreeImage& image):image_(image) {}
+  // image.Locate's answer for every region, in address order: what index
+  // holds for an image's regions (Build).
+  using Index=std::vector<NativeSceneTreeImage::Region>;
+  // index, when given, is Index(image) and must outlive this.
+  explicit NativeSceneTreeImageReader(const NativeSceneTreeImage& image,const Index* index=nullptr)
+    :image_(image),index_(index) {}
   uint32_t Add(uint32_t address,size_t size) const { return uint32_t(address+size); }
-  // image.Find(address,size): the region last located answers every address
-  // in its [base,limit) exactly as Locate would (a node's center, radius and
-  // extents are one region), so only a read outside it searches the map.
+  // image.Find(address,size): the regions last located answer every address
+  // in their [base,limit) exactly as Locate would. A node's reads alternate
+  // between two regions (center, radius and extents; children and
+  // occupancy), so two are kept; a read outside both searches the index (a
+  // flat array) or the map.
   const uint8_t* Bytes(uint32_t address,size_t size) const {
     ++reads;
-    if(!last_.bytes || address<last_.base || address>=last_.limit) last_=image_.Locate(address);
-    if(const auto* bytes=NativeSceneTreeImage::Within(last_,address,size)) return bytes;
+    if(!Inside(last_[0],address)) {
+      std::swap(last_[0],last_[1]);
+      if(!Inside(last_[0],address)) last_[0]=Locate(address);
+    }
+    if(const auto* bytes=NativeSceneTreeImage::Within(last_[0],address,size)) return bytes;
     throw std::runtime_error("native full-frame tree read outside its published image");
   }
   uint32_t Word(uint32_t address) const { return GuestBlockWord(Bytes(address,4)); }
   mutable uint64_t reads=0;
+  // Index(image): each region with the next one's start as its limit.
+  static void Build(const NativeSceneTreeImage& image,Index& index) {
+    index.clear();
+    if(!image.regions) return;
+    index.reserve(image.regions->size());
+    for(auto at=image.regions->begin();at!=image.regions->end();++at) {
+      const auto next=std::next(at);
+      index.push_back({at->first,next==image.regions->end()?(uint64_t(1)<<32):next->first,&at->second});
+    }
+  }
  private:
+  static bool Inside(const NativeSceneTreeImage::Region& region,uint32_t address) {
+    return region.bytes && address>=region.base && address<region.limit;
+  }
+  NativeSceneTreeImage::Region Locate(uint32_t address) const {
+    if(!index_) return image_.Locate(address);
+    // The last region starting at or below address, as Locate's upper_bound.
+    const auto next=std::ranges::upper_bound(*index_,address,{},&NativeSceneTreeImage::Region::base);
+    return next==index_->begin()?NativeSceneTreeImage::Region{}:*std::prev(next);
+  }
   const NativeSceneTreeImage& image_;
-  mutable NativeSceneTreeImage::Region last_;
+  const Index* index_=nullptr;
+  mutable std::array<NativeSceneTreeImage::Region,2> last_{};
 };
 
 // One world owner's frame selection, in the order 821C3BB8 draws it: groups in
@@ -138,14 +173,19 @@ struct NativeFullFrameStaticSelection {
 //  - the +48 visit marker as an epoch-stamped open-addressing set (no clear,
 //    no allocation per frame);
 //  - each world's group queues as flat arrays indexed by the group's first
-//    position in the published order (rebuilt when the order moves).
+//    position in the published order (rebuilt when the order moves), and its
+//    tree image's regions as a flat index (rebuilt when they move);
+//  - each member's visibility record copied into its list's candidates.
 // Not synchronized.
 struct NativeFullFrameStaticSelectCache {
   struct Candidate {
     uint32_t owner=0;
     bool published=false;  // A visibility record with at least one LOD.
-    NativeSceneSources::CandidateView view;
     std::array<bool,3> drawable{};  // Every part of the LOD has a group.
+    // The record itself when published: every candidate the walk tests is
+    // read in list order from one array, not through a pointer per object.
+    NativeSceneVisibility visibility;
+    NativeSceneSources::CandidateView view;
   };
   struct List {
     std::shared_ptr<const NativeSceneMembership::Snapshot> members;
@@ -158,6 +198,10 @@ struct NativeFullFrameStaticSelectCache {
     std::vector<std::vector<uint32_t>> queues;    // Per position, in push order.
     std::vector<uint32_t> touched;                // Positions with a queue this frame.
     std::map<uint32_t,size_t> unordered;          // Groups outside the order -> parts.
+    // The tree image's regions as a flat index (NativeSceneTreeImageReader),
+    // rebuilt when the image's regions move (a restamp shares them).
+    std::shared_ptr<const NativeSceneTreeImage::Regions> regions;
+    NativeSceneTreeImageReader::Index index;
     uint64_t used=0;
   };
   // The +48 marker: Insert is true once per key per Begin.
@@ -277,6 +321,11 @@ inline bool NativeFullFrameStaticCameraConstant(const NativeSceneMaterialInputs:
   return constant.global && (constant.name=="g_mProjection" || constant.name=="g_mView" ||
     constant.name=="g_mViewTranspose" || constant.name=="g_mViewProjection");
 }
+// Whether NativeScenePassAnimation::Apply rewrites this constant: the only
+// constants whose pass value depends on the animation (never a camera one).
+inline bool NativeFullFrameStaticAnimationConstant(const NativeSceneMaterialInputs::Constant& constant) {
+  return constant.global && (constant.name=="m_WaterTime" || constant.name=="g_SignalBrightness");
+}
 
 // One instanced draw: one group's geometry and material, every selected
 // instance with its published world. instances are scene objects in draw
@@ -295,7 +344,10 @@ struct NativeFullFrameStaticFrame {
   struct Stats {
     uint64_t groups=0,draws=0,instances=0,resolves=0,cache_hits=0,missing_group=0,missing_material=0,
       missing_geometry=0,scissor=0,declined=0,world_declines=0,retained_objects=0,fresh_objects=0,
-      camera_only=0,reused_draws=0,reused_frame=0;
+      camera_only=0,reused_draws=0,reused_frame=0,reused_moved=0,moved_owners=0,moved_instances=0,reused_instances=0;
+    // reused_moved: reused_draws across a new generation; moved_*: that
+    // generation's moved keys; reused_instances: selected instances whose
+    // outcome was carried rather than resolved (whole draws included).
   };
   NativeFullFrameStaticSelection selection;
   std::vector<NativeFullFrameStaticDraw> draws;
@@ -318,14 +370,29 @@ struct NativeFullFrameStaticFrame {
 //    animation, pass) are the same and no group was resolved since
 //    (cache.stores).
 //  - Per group, the pass constants persist (Memo): while the published group
-//    material and the animation are the same objects only the camera
-//    constants are rewritten, in place. Once Current accepted them for an
-//    entry, and every camera constant is one it compares by shape alone (it
-//    reaches the capture only as the derived camera), later frames skip
-//    Current's compare and derive the camera alone.
+//    material is the same object only the camera constants (a moved pass
+//    camera) and the animation constants (a moved animation) are rewritten,
+//    in place. Once Current accepted them for an entry, and every camera
+//    constant is one it compares by shape alone (it reaches the capture only
+//    as the derived camera), later frames skip Current's compare and derive
+//    the camera alone - until that entry is stored again (its own stamp, so
+//    another group's resolve keeps it) or an animation constant's bytes move
+//    (Current compares those whole). The animation advances every gameplay
+//    frame; most materials read none of it and keep their acceptance.
 //  - Per group, the instances are the previous frame's while the selected
-//    instances, sources, by_source, geometry, material and world layout are
-//    the same; a frame-local object then keeps its id across frames.
+//    instances, geometry, material and world layout are the same and either
+//    sources and by_source are too, or the group was built from the last
+//    build's generation and nothing any of its instances reads moved from
+//    that one to this: its parts (Find), its owners (world registers and
+//    generation) and their by_source objects. The moved keys are the two
+//    generations' difference (NativeSceneSources::Differences,
+//    NativeSharedMap::Difference), computed once per build from the chunks
+//    written between them; gameplay publishes a new generation whenever any
+//    object moves, so the comparison of whole generations alone never
+//    reuses. When the group's selection moved (an object entered or left
+//    the view), each instance the last build also selected, with nothing it
+//    read moved, keeps its outcome (declined, or the same object) and only
+//    the others are resolved. A frame-local object keeps its id across frames.
 // resolve is taken to be the same function on every call.
 class NativeFullFrameStaticWorld {
  public:
@@ -353,6 +420,14 @@ class NativeFullFrameStaticWorld {
  private:
   using Constants=std::vector<NativeSceneMaterialInputs::Constant>;
   using BySource=decltype(NativeScenePublication::by_source);
+  // One selected instance's instance build: the source owner it was
+  // resolved through (0: no source) and its object (none when declined).
+  struct Outcome {
+    enum Kind : uint8_t { Declined,Retained,Fresh };
+    uint32_t owner=0;
+    Kind kind=Declined;
+    std::shared_ptr<const NativeSceneInstance> object;
+  };
   struct Memo {
     // constants: published's constants with pass_camera and animation applied;
     // cameras: the indices NativeFullFrameStaticCameraConstant names.
@@ -360,14 +435,16 @@ class NativeFullFrameStaticWorld {
     std::optional<NativeScenePassAnimation> animation;
     NativeScenePassCamera pass_camera,derived;
     Constants constants;
-    std::vector<uint32_t> cameras;
-    // Current accepted constants for entry (at stores); derived is the pass
-    // camera entry's camera was last derived at.
+    std::vector<uint32_t> cameras,animated;
+    // Current accepted constants for entry (at its stored stamp); derived is
+    // the pass camera entry's camera was last derived at.
     const Cache::Entry* entry=nullptr;
     uint64_t stores=0;
     bool accepted=false,camera_only=false;
-    // The last instance build and what it depended on.
+    // The last instance build and what it depended on; outcomes[i] is
+    // selected[i]'s.
     std::vector<uint32_t> selected;
+    std::vector<Outcome> outcomes;
     std::shared_ptr<const NativeSceneSources> sources;
     BySource by_source;
     std::shared_ptr<const NativeIndexedMesh::RetainedDraw> geometry;
@@ -380,19 +457,41 @@ class NativeFullFrameStaticWorld {
   // NativeFullFrameStaticConstants(published,camera), kept in memo.
   static const Constants& PassConstants(Memo& memo,const std::shared_ptr<const NativeSceneGroupMaterial>& published,
       const NativeFullFrameStaticCamera& camera) {
-    if(memo.published!=published || memo.animation!=camera.animation) {
+    if(memo.published!=published) {
       memo.published=nullptr; memo.accepted=false;
       memo.constants=published->constants;  // Assignment keeps each constant's storage.
       ApplyNativeFullFrameStaticConstants(memo.constants,camera);
-      memo.cameras.clear();
-      for(size_t i=0;i<memo.constants.size();++i)
+      memo.cameras.clear(); memo.animated.clear();
+      for(size_t i=0;i<memo.constants.size();++i) {
         if(NativeFullFrameStaticCameraConstant(memo.constants[i])) memo.cameras.push_back(uint32_t(i));
+        else if(NativeFullFrameStaticAnimationConstant(memo.constants[i])) memo.animated.push_back(uint32_t(i));
+      }
       memo.published=published; memo.animation=camera.animation; memo.pass_camera=camera.pass;
-    } else if(!(memo.pass_camera==camera.pass)) {
+      return memo.constants;
+    }
+    // Apply rewrites each constant from itself and the camera or animation
+    // alone, so rewriting only the ones that depend on what moved gives the
+    // bytes applying all of them to the published constants gives.
+    if(!(memo.pass_camera==camera.pass)) {
       // Only the camera constants depend on the pass camera.
       memo.published=nullptr;
       for(const auto i:memo.cameras) camera.pass.Apply(memo.constants[i]);
       memo.published=published; memo.pass_camera=camera.pass;
+    }
+    if(memo.animation!=camera.animation) {
+      // Only the animation constants depend on the animation. Current compares
+      // them whole: its acceptance stands only while their bytes do.
+      memo.published=nullptr;
+      for(const auto i:memo.animated) {
+        auto& constant=memo.constants[i];
+        if(!camera.animation) throw std::runtime_error("native full-frame static material needs the world animation");
+        std::array<uint8_t,16> old{};
+        const bool sized=constant.registers.size()==old.size();
+        if(sized) std::copy(constant.registers.begin(),constant.registers.end(),old.begin());
+        camera.animation->Apply(constant);  // Throws unless 16 bytes.
+        if(!sized || !std::equal(old.begin(),old.end(),constant.registers.begin())) memo.accepted=false;
+      }
+      memo.published=published; memo.animation=camera.animation;
     }
     return memo.constants;
   }
@@ -400,7 +499,7 @@ class NativeFullFrameStaticWorld {
   // only constants it compares by shape moved since it accepted them.
   bool Current(Memo& memo,Cache::Entry& entry,const NativeFullFrameStaticCamera& camera,NativeFullFrameStaticFrame::Stats& stats) {
     auto& material=entry.material;
-    if(memo.accepted && memo.camera_only && memo.entry==&entry && memo.stores==cache.stores) {
+    if(memo.accepted && memo.camera_only && memo.entry==&entry && memo.stores==entry.stored) {
       // Current's result for these constants: the entry's camera is already
       // the one they derive when it is underived or derived at this camera.
       if(!entry.derived || memo.derived==camera.pass) { ++stats.camera_only; return true; }
@@ -412,7 +511,7 @@ class NativeFullFrameStaticWorld {
     }
     memo.accepted=false;
     if(!Cache::Current(entry,memo.constants,material.material.get(),material.camera)) return false;
-    memo.accepted=true; memo.entry=&entry; memo.stores=cache.stores; memo.derived=camera.pass;
+    memo.accepted=true; memo.entry=&entry; memo.stores=entry.stored; memo.derived=camera.pass;
     memo.camera_only=std::ranges::all_of(memo.cameras,[&](uint32_t i) { return entry.derived && entry.camera[i]; });
     return true;
   }
@@ -427,7 +526,42 @@ class NativeFullFrameStaticWorld {
     uint64_t stores=0;
     bool valid=false;
   };
+  // The keys whose answers moved from built_'s sources and by_source to this
+  // build's (sorted, unique); all when the two cannot be compared.
+  struct Moved {
+    bool computed=false,all=false;
+    std::vector<uint32_t> owners,instances;
+  };
+  void ComputeMoved(const NativeScenePublication& publication) {
+    auto& moved=moved_;
+    moved.computed=true; moved.all=false; moved.owners.clear(); moved.instances.clear();
+    const auto& before=built_;
+    if(before.sources!=publication.sources) {
+      if(!before.sources || !publication.sources) { moved.all=true; return; }
+      publication.sources->Differences(*before.sources,[&](uint32_t owner) { moved.owners.push_back(owner); },
+        [&](uint32_t instance) { moved.instances.push_back(instance); });
+    }
+    // Resolve's by_source key is {owner, generation, lod, part}.
+    publication.by_source.Difference(before.by_source,[&](const auto& key) { moved.owners.push_back(uint32_t(key[0])); });
+    for(auto* keys:{&moved.owners,&moved.instances}) {
+      std::ranges::sort(*keys); keys->erase(std::unique(keys->begin(),keys->end()),keys->end());
+    }
+  }
+  // Whether anything memo's last instance build read moved since built_.
+  bool Moves(const Memo& memo) const {
+    if(moved_.all) return true;
+    if(moved_.owners.empty() && moved_.instances.empty()) return false;
+    for(size_t i=0;i<memo.selected.size();++i)
+      if(std::ranges::binary_search(moved_.instances,memo.selected[i]) ||
+         (memo.outcomes[i].owner && std::ranges::binary_search(moved_.owners,memo.outcomes[i].owner))) return true;
+    return false;
+  }
   BuildInputs built_;
+  Moved moved_;
+  // Scratch of one group's instance build: the last build's (instance,
+  // position) sorted, and the new outcomes (swapped into the memo).
+  std::vector<std::pair<uint32_t,uint32_t>> carried_;
+  std::vector<Outcome> outcomes_;
   bool same_selection_=false;  // Select's groups and instances are the ones built_ drew.
   NativeFullFrameStaticFrame frame_;
   std::unordered_map<uint32_t,Memo> memos_;
@@ -446,6 +580,10 @@ const NativeFullFrameStaticFrame& NativeFullFrameStaticWorld::BuildSelected(cons
     frame_.stats.reused_frame=1;
     return frame_;
   }
+  // built_ still holds the last build's inputs until this one ends: the
+  // generation per-group reuse across generations compares against.
+  const bool baseline=in.valid;
+  moved_.computed=false;
   in.valid=false;
   frame_.draws.clear(); frame_.stats={};
   ++pass_;
@@ -500,32 +638,78 @@ const NativeFullFrameStaticFrame& NativeFullFrameStaticWorld::BuildSelected(cons
     draw.owner=owner.owner; draw.group=selected.group; draw.geometry=(*geometry)->geometry; draw.material=resolved->material;
     draw.view=resolved->camera;
     draw.view.viewport=pass.viewport; draw.view.scissor=pass.scissor; draw.view.scissor_enabled=resolved->render[5]!=0;
-    if(memo.built && memo.selected==selected.instances && memo.sources==publication.sources &&
-       memo.by_source.Shares(publication.by_source) && memo.geometry==draw.geometry && memo.material==draw.material &&
-       memo.column_major==resolved->world_column_major && memo.first==*first) {
+    // What memo's last instance build read, for the instances this one also
+    // selects: the same group inputs, and either this very generation or the
+    // last build's, from which this one differs only by moved_.
+    const bool layout=memo.built && memo.geometry==draw.geometry && memo.material==draw.material &&
+      memo.column_major==resolved->world_column_major && memo.first==*first;
+    const bool same_generation=layout && memo.sources==publication.sources && memo.by_source.Shares(publication.by_source);
+    const bool last_generation=layout && !same_generation && baseline && memo.sources==in.sources &&
+      memo.by_source.Shares(in.by_source);
+    if(last_generation && !moved_.computed) {
+      ComputeMoved(publication);
+      stats.moved_owners=moved_.owners.size(); stats.moved_instances=moved_.instances.size();
+    }
+    if((same_generation || last_generation) && memo.selected==selected.instances && (same_generation || !Moves(memo))) {
+      if(last_generation) { memo.sources=publication.sources; memo.by_source=publication.by_source; ++stats.reused_moved; }
       draw.instances=memo.instances; ++stats.reused_draws;
+      stats.reused_instances+=memo.selected.size();
     } else {
+      // Per instance: one the last build also selected, with nothing it read
+      // moved, has the outcome it had (declined, or the same object); only
+      // the rest are resolved. The group's selection moves whenever one of its
+      // objects enters or leaves the view, which the camera does every frame.
+      const bool carry=same_generation || last_generation;
+      if(carry) {
+        carried_.clear(); carried_.reserve(memo.selected.size());
+        for(uint32_t i=0;i<memo.selected.size();++i) carried_.emplace_back(memo.selected[i],i);
+        std::ranges::sort(carried_);
+      }
+      auto& outcomes=outcomes_;
+      outcomes.clear(); outcomes.resize(selected.instances.size());
+      // memo.selected and memo.outcomes stay the last build's until the swap.
       memo.built=false; memo.retained=memo.fresh=memo.declined=0;
-      for(const auto instance:selected.instances) {
+      const auto count=[&](const Outcome& outcome) {
+        (outcome.kind==Outcome::Declined?memo.declined:outcome.kind==Outcome::Retained?memo.retained:memo.fresh)+=1;
+      };
+      for(size_t at=0;at<selected.instances.size();++at) {
+        const auto instance=selected.instances[at];
+        auto& outcome=outcomes[at];
+        if(carry) {
+          const auto found=std::ranges::lower_bound(carried_,std::pair<uint32_t,uint32_t>{instance,0});
+          if(found!=carried_.end() && found->first==instance) {
+            const auto& last=memo.outcomes[found->second];
+            if(same_generation || (!moved_.all && !std::ranges::binary_search(moved_.instances,instance) &&
+               !(last.owner && std::ranges::binary_search(moved_.owners,last.owner)))) {
+              outcome=last; count(outcome); ++stats.reused_instances;
+              if(outcome.object) draw.instances.push_back(outcome.object);
+              continue;
+            }
+          }
+        }
         // The instance's parameters must be its world alone, in the program's
         // g_mWorld registers (recorded at the source's lifetime event).
         const auto* source=sources->Find(instance);
-        if(!source || !source->world_data || !source->world_first || *source->world_first!=*first) { ++memo.declined; continue; }
-        const auto world=sources->WorldRegisters(*source,source->world_data);
-        if(!world) { ++memo.declined; continue; }
+        if(source) outcome.owner=source->owner;
+        const auto world=source && source->world_data && source->world_first && *source->world_first==*first?
+          sources->WorldRegisters(*source,source->world_data):nullptr;
+        if(!world) { outcome.kind=Outcome::Declined; count(outcome); continue; }
         const auto matrix=DecodeNativeQueuedWorld(*world,resolved->world_column_major);
         auto object=publication.Resolve(*source,draw.geometry,draw.material,matrix,&reuse);
-        if(object) ++memo.retained;
-        else {
+        outcome.kind=Outcome::Retained;
+        if(!object) {
           // No retained lifetime yet (never observed): a frame-local object.
           auto fresh=std::make_shared<NativeSceneInstance>();
           fresh->id=++next_id_; fresh->changed_tick=UINT64_MAX;
           fresh->object.geometry=draw.geometry; fresh->object.material=draw.material;
           fresh->object.world=matrix; fresh->previous=matrix;
-          object=std::move(fresh); ++memo.fresh;
+          object=std::move(fresh); outcome.kind=Outcome::Fresh;
         }
+        count(outcome);
+        outcome.object=object;
         draw.instances.push_back(std::move(object));
       }
+      std::swap(memo.outcomes,outcomes);
       memo.selected=selected.instances; memo.sources=publication.sources; memo.by_source=publication.by_source;
       memo.geometry=draw.geometry; memo.material=draw.material; memo.column_major=resolved->world_column_major;
       memo.first=*first; memo.instances=draw.instances; memo.built=true;

@@ -177,6 +177,9 @@ class NativeStaticWorldGroupCache {
     Material material{};
     Observed observed;
     uint64_t used=0;
+    // The cache's stores count after this entry's Store: unique per store, so
+    // an equal stamp on the same entry means it was not stored again since.
+    uint64_t stored=0;
   };
   // The group's entry when every key component matches, else null.
   Entry* Candidate(const Key& inputs) {
@@ -255,7 +258,7 @@ class NativeStaticWorldGroupCache {
     entry.reads=std::move(reads); entry.eligibility=std::move(eligibility); entry.next=std::move(next);
     entry.material=std::move(material); entry.observed=std::move(observed); entry.used=pass_;
     const auto group=entry.key.group;
-    ++stores;
+    entry.stored=++stores;
     return entries_.insert_or_assign(group,std::move(entry)).first->second;
   }
   void Invalidate(uint32_t group) { entries_.erase(group); }

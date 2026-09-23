@@ -201,6 +201,18 @@ class NativeSceneSources {
   }
   size_t owners() const { return owners_.size(); }
   size_t parts() const { return parts_.size(); }
+  // What moved since before, for a consumer that kept before alive: owner(key)
+  // for every owner whose entry differs (generation, membership, world or
+  // visibility object: Generation, LodParts, FindCandidate and WorldRegisters
+  // answer the same for any other owner), instance(key) for every part whose
+  // Find answer differs. Keys may repeat. Costs the chunks written between the
+  // two generations (NativeSharedMap::Difference), not the scene; objects are
+  // compared by identity, so an equal republished object counts as moved.
+  template<class OwnerVisit,class InstanceVisit>
+  void Differences(const NativeSceneSources& before,OwnerVisit&& owner,InstanceVisit&& instance) const {
+    owners_.Difference(before.owners_,owner);
+    parts_.Difference(before.parts_,instance);
+  }
  private:
   mutable std::shared_ptr<const NativeSceneSources> snapshot_;
   // Shared by every generation until the owner's membership is replaced.
@@ -213,6 +225,7 @@ class NativeSceneSources {
     std::shared_ptr<const Parts> parts;
     std::shared_ptr<const World> world;
     std::shared_ptr<const NativeSceneVisibility> visibility;
+    bool operator==(const Owner&) const=default;
   };
   NativeSharedMap<uint32_t,Owner> owners_;
   NativeSharedMap<uint32_t,Source> parts_;
