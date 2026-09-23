@@ -3841,7 +3841,9 @@ thread_local uint64_t native_render_publication=0;
 // (edf::native::NativeTickGate over native_render_budget). True outside a
 // helper and on every locked render, so guest code there is unchanged; false
 // only on an unlocked render that dispatched no simulation step. The
-// clEffectEtc02 slot 4 hook (8217C4A0) keeps +612 on such a render. The full
+// clEffectEtc02 slot 4 hook (8217C4A0) keeps +612 on such a render, and the
+// native post loop of the 820B0B80 hook drops the DownsampleTone pass
+// (PostIssueWithoutPass) so the tone history blends once per tick. The full
 // frame reads NativeFrameInputs::tick_frame instead.
 thread_local bool native_render_tick_frame=true;
 // The shadow render's guest side (edf_native_shadow_render,
@@ -4018,6 +4020,9 @@ struct PostFinishStats {
   // Step 3.
   bool last_audit_clean=false,last_frame_native=false;
   uint64_t native_frames=0,native_bloom=0,ab_guest=0,uninitialized=0,self_audited=0,self_clean=0,self_mismatches=0;
+  // Held renders: DownsampleTone dropped (tone_held), or drawn anyway because
+  // its record had no resolved history yet (tone_unheld).
+  uint64_t tone_held=0,tone_unheld=0;
   std::array<uint64_t,size_t(PostFinishFallback::Count)> fallbacks{};
 };
 PostFinishStats& FinishStats() { static PostFinishStats stats; return stats; }
@@ -4067,6 +4072,12 @@ struct PostFinishNativeRun {
   PostFinishPlan plan;
   std::vector<PostIssueStep> steps;
   bool chain_attempted=false,chain_native=false,bloom_attempted=false,bloom_native=false;
+  // hold_tone: this render holds the tone history (unlocked, no simulation
+  // step: native_render_tick_frame false). tone_held: the loop dropped the
+  // DownsampleTone pass because its record already held a resolve
+  // (PostIssueWithoutPass); the pass is plan index held_pass.
+  bool hold_tone=false,tone_held=false;
+  size_t held_pass=0;
 };
 thread_local PostFinishNativeRun* post_finish_native_run=nullptr;
 struct PostFinishRefusal:std::runtime_error {
@@ -4132,6 +4143,19 @@ void CheckPost2DObject(const GuestReader& reader) {
     throw PostFinishRefusal(PostFinishFallback::Draw2D,std::format("2D object {:#x} declaration record is its list's end",object));
   reader.Word(reader.Add(current,28));
 }
+// The history a held render keeps (both post routes; locks held): the
+// DownsampleTone record `target` still registered with the planned texture
+// and extent, and that texture's last resolve initialized and the one the
+// record's own sampled texture holds (not a stale or replaced one).
+bool NativeToneHistoryResolved(const Bridge& state,uint32_t target,uint32_t texture,int64_t width,int64_t height) {
+  const auto found=state.render_targets.find(target);
+  if(found==state.render_targets.end() || found->second.texture_handle!=texture) return false;
+  const auto& sampled=found->second.native.sampled;
+  if(int64_t(sampled.width)!=width || int64_t(sampled.height)!=height) return false;
+  const auto resolved=state.textures.find(texture);
+  return resolved!=state.textures.end() && resolved->second.content_valid && resolved->second.backend &&
+    resolved->second.backend==sampled.backend && sampled.content_valid;
+}
 // Everything a native frame needs, checked before the first guest call: the
 // plan rebuilt where 820B09B0 itself reads the records (after the resolve),
 // every chain target registered natively at the planned extent and texture,
@@ -4144,20 +4168,24 @@ PostIssueFrame PreparePostIssue(const GuestReader& reader,const PPCContext& ctx,
     run.steps=BuildPostFinishIssue(run.plan);
   } catch(const std::exception& error) { throw PostFinishRefusal(F::Plan,error.what()); }
   PostIssueFrame frame;
-  frame.end=PostIssueChainEnd(run.plan,run.steps);
-  for(size_t i=0;i<frame.end;++i) {
-    const auto& step=run.steps[i];
-    const auto& pass=run.plan.passes[step.pass];
-    if(step.guest) throw PostFinishRefusal(F::Plan,"guest step inside the chain");
-    if(step.kind==PostIssueKind::Setter) {
-      const auto& call=pass.setters[step.setter];
-      if(call.name.empty() || call.name.size()>kPostMaxName ||
-         (call.kind==PostSetterKind::Vectors && (call.values.empty() || call.values.size()%4 || call.values.size()>kPostMaxVectors)) ||
-         (call.kind==PostSetterKind::Sampler && call.values.size()!=1))
-        throw PostFinishRefusal(F::Plan,std::format("{} setter {} does not fit the loop's frame",PostPassName(pass.kind),call.name));
+  const auto chain=[&] {
+    frame.end=PostIssueChainEnd(run.plan,run.steps);
+    frame.links.clear();
+    for(size_t i=0;i<frame.end;++i) {
+      const auto& step=run.steps[i];
+      const auto& pass=run.plan.passes[step.pass];
+      if(step.guest) throw PostFinishRefusal(F::Plan,"guest step inside the chain");
+      if(step.kind==PostIssueKind::Setter) {
+        const auto& call=pass.setters[step.setter];
+        if(call.name.empty() || call.name.size()>kPostMaxName ||
+           (call.kind==PostSetterKind::Vectors && (call.values.empty() || call.values.size()%4 || call.values.size()>kPostMaxVectors)) ||
+           (call.kind==PostSetterKind::Sampler && call.values.size()!=1))
+          throw PostFinishRefusal(F::Plan,std::format("{} setter {} does not fit the loop's frame",PostPassName(pass.kind),call.name));
+      }
+      frame.links.push_back(PostIssueLink(pass.kind,step.kind,step.setter));
     }
-    frame.links.push_back(PostIssueLink(pass.kind,step.kind,step.setter));
-  }
+  };
+  chain();
   CheckPost2DObject(reader);
   // Technique -> pass (+108) -> shader handles, as ObserveActivation reads them.
   std::vector<std::array<uint32_t,3>> programs;
@@ -4187,6 +4215,24 @@ PostIssueFrame PreparePostIssue(const GuestReader& reader,const PPCContext& ctx,
   for(const auto& [technique,vertex,pixel]:programs)
     if(!state.shaders.contains(vertex) || !state.shaders.contains(pixel))
       throw PostFinishRefusal(F::Shaders,std::format("technique {:#x} shaders {:#x}/{:#x} are not registered natively",technique,vertex,pixel));
+  // A held render drops the DownsampleTone pass when its record already
+  // holds a resolve to keep (the full frame's NativePostHistory::Hold, on the
+  // same registry); without one it draws, as the first frame must.
+  run.tone_held=false;
+  if(run.hold_tone) {
+    std::optional<size_t> history;
+    try { history=PostToneHistoryPass(run.plan); }
+    catch(const std::exception& error) { throw PostFinishRefusal(F::Plan,error.what()); }
+    if(history) {
+      const auto& pass=run.plan.passes[*history];
+      if(NativeToneHistoryResolved(state,pass.target,pass.target_texture,pass.target_width,pass.target_height)) {
+        try { run.steps=PostIssueWithoutPass(run.plan,run.steps,*history); }
+        catch(const std::exception& error) { throw PostFinishRefusal(F::Plan,error.what()); }
+        chain();
+        run.tone_held=true; run.held_pass=*history;
+      } else ++FinishStats().tone_unheld;
+    }
+  }
   return frame;
 }
 // The 820A62E8 layout: 16+ byte names point at a copy in the loop's frame.
@@ -4274,9 +4320,11 @@ bool RunNativePostChain(PPCContext& ctx,uint8_t* base,PostFinishNativeRun& run) 
       work.r1.u64=frame.stack; work.r3.u64=open; work.lr=0x820B04ACu; sub_821B88B0(work,base);
     } catch(const std::exception& close) { REXLOG_ERROR("Native post finish: closing target {:#x}: {}",open,close.what()); }
     CountPostFallback(F::Midway,std::format("{} after {} native draw(s)",error.what(),draws));
+    run.tone_held=false;  // the original reruns the whole chain, DownsampleTone included
     return false;
   }
   run.chain_native=true;
+  if(run.tone_held) ++FinishStats().tone_held;
   return true;
 }
 // The bloom quad 821A8F20 would draw, issued from the plan. False before any
@@ -4352,6 +4400,10 @@ REX_HOOK_RAW(sub_820B0B80) {
   if(mode==edf::native::PostFinishMode::Native) {
     edf::native::PostFinishNativeRun run;
     run.self=self; run.plan=*plan;
+    // The guest-helper and frame-dispatch routes' tick gate (the 821A5080
+    // hook; the full frame's host sets it before its fallback call): a held
+    // render keeps the tone history, as the full-frame post does.
+    run.hold_tone=!native_render_tick_frame;
     // Native frames with the audit on are recorded by the same observers:
     // a self-audit that the loop issued the plan, never counted as the guest
     // audit that gates the next native frame.
@@ -4379,12 +4431,15 @@ REX_HOOK_RAW(sub_820B0B80) {
         std::string reasons;
         for(size_t r=0;r<stats.fallbacks.size();++r) if(stats.fallbacks[r])
           reasons+=std::format(" {}={}",edf::native::PostFinishFallbackName(edf::native::PostFinishFallback(r)),stats.fallbacks[r]);
-        REXLOG_INFO("Native post finish: native_frames={}, native_bloom={}, passes={}, uninitialized_targets={}, ab_guest={}, fallbacks=[{} ]",
-          stats.native_frames,stats.native_bloom,run.plan.passes.size(),stats.uninitialized,stats.ab_guest,reasons);
+        REXLOG_INFO("Native post finish: native_frames={}, native_bloom={}, passes={}, uninitialized_targets={}, ab_guest={}, tone_held={}, tone_unheld={}, fallbacks=[{} ]",
+          stats.native_frames,stats.native_bloom,run.plan.passes.size(),stats.uninitialized,stats.ab_guest,
+          stats.tone_held,stats.tone_unheld,reasons);
       }
     }
     if(recorder && run.chain_native) try {
-      const auto result=edf::native::ComparePostFinish(run.plan,recorder->seen);
+      // A held render issued the plan without its DownsampleTone pass.
+      const auto result=edf::native::ComparePostFinish(
+        run.tone_held?edf::native::PostPlanWithoutPass(run.plan,run.held_pass):run.plan,recorder->seen);
       ++stats.self_audited;
       if(result.mismatches.empty() && !recorder->errors) ++stats.self_clean;
       for(const auto& mismatch:result.mismatches)
@@ -4501,13 +4556,7 @@ class BridgePostSink final:public NativePostSink {
   // the one the record's own sampled texture holds (not a stale or replaced one).
   bool HasToneHistory(const NativePostDraw& draw) const override {
     if(draw.output || draw.kind!=PostPassKind::DownsampleTone) return false;
-    const auto target=state_.render_targets.find(draw.target);
-    if(target==state_.render_targets.end() || target->second.texture_handle!=draw.target_texture) return false;
-    const auto& sampled=target->second.native.sampled;
-    if(int64_t(sampled.width)!=draw.width || int64_t(sampled.height)!=draw.height) return false;
-    const auto texture=state_.textures.find(draw.target_texture);
-    return texture!=state_.textures.end() && texture->second.content_valid && texture->second.backend &&
-      texture->second.backend==sampled.backend && sampled.content_valid;
+    return NativeToneHistoryResolved(state_,draw.target,draw.target_texture,draw.width,draw.height);
   }
   void Draw(const NativePostDraw& draw) override {
     auto& state=state_;
@@ -8060,7 +8109,19 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     const auto scene=context.view.scene;
     const auto& cameras=context.inputs.cameras;
     const auto found=cameras?cameras->find(scene):edf::native::NativeScenePassCameras::const_iterator{};
-    if(cameras && found!=cameras->end()) edf::native::native_scene_pass_camera=found->second;
+    if(cameras && found!=cameras->end()) {
+      edf::native::native_scene_pass_camera=found->second;
+      // The native culls (models, static world, effects, wires, grass) read
+      // scene+96/+288 live; they are the pass camera's only while nothing
+      // wrote the scene since the publication (see BuildNativeElectricWireDraws).
+      if(REXCVAR_GET(edf_native_scene_transform_audit) &&
+         found->second!=edf::native::ReadNativeScenePassCamera(reader_,scene)) {
+        static std::atomic<uint64_t> mismatches=0;
+        if(const auto count=++mismatches;count<=4 || !(count&(count-1)))
+          REXLOG_ERROR("Native full frame camera mismatch: scene={:#x} changed after publication; culls and draws disagree (count={})",
+            scene,count);
+      }
+    }
     else edf::native::native_scene_pass_camera=edf::native::ReadNativeScenePassCamera(reader_,scene);
     // 821BE8D0's 821A17F8(pool, scene+32) and 821A19F0(pool, scene+96), from
     // the same camera the native passes draw with.
@@ -8189,6 +8250,9 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
       if(!reported.exchange(true))
         REXLOG_WARN("Native full frame post failed, guest finish stage 820B0B80 used: {} (logged once)",error);
       RemainingGuestCall(2);
+      // The guest stage's native chain holds the tone history by the same
+      // gate (a view-less frame never reached ViewOverlays, which sets it).
+      native_render_tick_frame=context.inputs.tick_frame;
       Virtual(post,12,0,0,0x821A52E8);
     }
     auto& state=edf::native::State();

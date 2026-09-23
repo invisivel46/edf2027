@@ -284,6 +284,85 @@ void TestIssue() {
   for(size_t r=0;r<size_t(PostFinishFallback::Count);++r) CHECK(std::string(PostFinishFallbackName(PostFinishFallback(r)))!="?");
 }
 
+// The guest route's held render (native_render_tick_frame false): the native
+// loop issues the plan without its DownsampleTone pass, whole.
+void TestIssueToneHold() {
+  const auto plan=BuildPostFinishPlan(Input());
+  const auto steps=BuildPostFinishIssue(plan);
+  const auto history=PostToneHistoryPass(plan);
+  CHECK(history && *history==9 && plan.passes[9].kind==PostPassKind::DownsampleTone);
+  CHECK(!PostToneHistoryPass(BuildPostFinishPlan(Input(1))));  // one record: Mono feeds Tone, no history pass
+  const auto held=PostIssueWithoutPass(plan,steps,*history);
+  CHECK(held.size()==steps.size()-(4+plan.passes[9].setters.size()));
+  for(const auto& step:held) CHECK(step.pass!=9);
+  // The rest keeps its order, and the bloom's guest steps stay the kept body's.
+  std::vector<PostIssueStep> expected;
+  for(const auto& step:steps) if(step.pass!=9) expected.push_back(step);
+  CHECK(held.size()==expected.size());
+  for(size_t i=0;i<held.size();++i)
+    CHECK(held[i].kind==expected[i].kind && held[i].pass==expected[i].pass && held[i].setter==expected[i].setter && held[i].guest==expected[i].guest);
+  CHECK(PostIssueChainEnd(plan,held)==held.size()-7);
+  // Balanced targets (Execute checks every begin has its end), no draw into
+  // the history record, and the Tone pass still samples that record.
+  const auto trace=Execute(plan,held);
+  CHECK(std::find(trace.draw_targets.begin(),trace.draw_targets.end(),plan.passes[9].target)==trace.draw_targets.end());
+  CHECK(trace.draw_targets.size()==13);
+  const auto& tone=plan.passes[10];
+  CHECK(tone.kind==PostPassKind::Tone && tone.setters[1].name==kPostTone && tone.setters[1].texture==plan.passes[9].target_texture);
+  // The self-audit compares a held render against the plan without the pass.
+  const auto without=PostPlanWithoutPass(plan,9);
+  CHECK(without.passes.size()==13 && without.passes[9].kind==PostPassKind::Tone);
+  CHECK(ComparePostFinish(without,trace.seen).mismatches.empty());
+  CHECK(!ComparePostFinish(plan,trace.seen).mismatches.empty());
+  // Only a chain pass can be held; a guest step in it is refused.
+  bool threw=false;
+  try { PostIssueWithoutPass(plan,steps,13); } catch(const std::runtime_error&) { threw=true; }
+  CHECK(threw);
+  auto guest=steps;
+  for(auto& step:guest) if(step.pass==9 && step.kind==PostIssueKind::Setter) { step.guest=true; break; }
+  threw=false;
+  try { PostIssueWithoutPass(plan,guest,9); } catch(const std::runtime_error&) { threw=true; }
+  CHECK(threw);
+  auto twice=plan; twice.passes[8].kind=PostPassKind::DownsampleTone;
+  threw=false;
+  try { PostToneHistoryPass(twice); } catch(const std::runtime_error&) { threw=true; }
+  CHECK(threw);
+  // Locked 60 Hz against unlocked at two renders per tick, each render issuing
+  // the steps the bridge would (held once the record holds a resolve): the
+  // history the DownsampleTone draw blends by 0.025 per draw is the same
+  // after every tick, and the Tone pass reads its tick's value every render.
+  struct Guest {
+    float history=0,read=0;
+    bool resolved=false;
+    uint32_t tone_draws=0;
+    void Run(const PostFinishPlan& plan,const std::vector<PostIssueStep>& issue,float scene) {
+      for(const auto& step:issue) {
+        if(step.kind!=PostIssueKind::Draw) continue;
+        const auto kind=plan.passes[step.pass].kind;
+        if(kind==PostPassKind::DownsampleTone) { history=history+(scene-history)*0.025f; resolved=true; ++tone_draws; }
+        if(kind==PostPassKind::Tone) read=history;
+      }
+    }
+  } locked,unlocked;
+  NativeTickGate locked_gate,unlocked_gate;
+  const auto issue=[&](const Guest& guest,bool tick_frame) {
+    return !tick_frame && guest.resolved ? PostIssueWithoutPass(plan,steps,*history) : steps;
+  };
+  for(uint64_t tick=1;tick<=120;++tick) {
+    const float scene=float(tick%7)*0.3f;
+    const bool locked_frame=locked_gate.Advance(MakeNativeFrameMotion(false,1,tick,1,1,true));
+    CHECK(locked_frame);
+    locked.Run(plan,issue(locked,locked_frame),scene);
+    for(uint32_t render=0;render<2;++render) {
+      const bool tick_frame=unlocked_gate.Advance(MakeNativeFrameMotion(true,1,tick,render?.5f:0.f,render?0u:1u,true));
+      unlocked.Run(plan,issue(unlocked,tick_frame),scene);
+      CHECK(std::bit_cast<uint32_t>(unlocked.read)==std::bit_cast<uint32_t>(locked.read));
+    }
+    CHECK(std::bit_cast<uint32_t>(unlocked.history)==std::bit_cast<uint32_t>(locked.history));
+  }
+  CHECK(locked.tone_draws==120 && unlocked.tone_draws==120);
+}
+
 void TestMode() {
   using M=PostFinishMode;
   const auto mode=[](bool native,bool audit,bool side,bool plan,bool clean,bool last_native) {
@@ -622,6 +701,7 @@ int main() {
   TestValidation();
   TestComparison();
   TestIssue();
+  TestIssueToneHold();
   TestMode();
   TestLogPolicy();
   TestFullFrameRecording();

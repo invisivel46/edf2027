@@ -1238,6 +1238,9 @@ void GrassCamera(const ImageMemory& m,std::array<float,3> at,float yaw) {
   // The camera world (scene+416): its translation row is what 82172698 copies.
   const float world[16]{1,0,0,0, 0,1,0,0, 0,0,1,0, at[0],at[1],at[2],1};
   for(uint32_t i=0;i<16;++i) m.StoreFloat(W::scene+416+i*4,world[i]);
+  // 821CDDF8 leaves its copy at +224 (the rendered camera the native build
+  // reads); on a locked frame the two are equal.
+  for(uint32_t i=0;i<16;++i) m.StoreFloat(W::scene+224+i*4,world[i]);
   m.StoreWord(W::context+16,W::scene);
   m.StoreFloat(W::context+8,-1.0f);
 }
@@ -1412,6 +1415,62 @@ void TestGrassMap() {
   Require(calls.size()==2 && calls[0]==std::pair<uint32_t,uint32_t>{0,kNativeGrassMapCallVertices} &&
     calls[1]==std::pair<uint32_t,uint32_t>{kNativeGrassMapCallVertices,8},"grass call split");
 }
+// Unlocked: the 821CDDF8 hook derives +96, +224 and +288 from the
+// interpolated pose and then puts the tick pose back into +416. The native
+// build takes the camera from +224, the one its cull uses. It draws exactly
+// what the guest walk draws when +416 holds that rendered pose (the locked
+// frame of the same camera), whatever the tick pose in +416. The guest's own
+// read of the tick pose would give other cells or other fades.
+void SetGrassTickCamera(const ImageMemory& m,std::array<float,3> at) {
+  for(uint32_t i=0;i<3;++i) m.StoreFloat(GrassWorld::scene+416+48+i*4,at[i]);
+}
+bool SameGrassDraws(const std::vector<NativeEffectDraw>& a,const std::vector<NativeEffectDraw>& b) {
+  if(a.size()!=b.size()) return false;
+  for(size_t i=0;i<a.size();++i)
+    if(a[i].texture!=b[i].texture || a[i].effect!=b[i].effect ||
+       EncodeNativeEffectVertices(a[i],0,a[i].vertex_count())!=EncodeNativeEffectVertices(b[i],0,b[i].vertex_count())) return false;
+  return true;
+}
+void TestGrassMapRenderedCamera() {
+  using W=GrassWorld;
+  static_assert(NativeGrassMap::camera_translation==224+48,"grass camera is the rendered copy's translation row");
+  ImageMemory m;
+  std::mt19937 random(0x821CDDF8u);
+  BuildGrassWorld(m,random);
+  std::set<uint32_t> textures;
+  // Rendered pose (x, y, z, yaw), then the tick pose left in +416: another
+  // cell, the same cell a fraction of a unit away, a height change only, and
+  // a move across both axes.
+  const std::array<std::array<float,7>,4> cases{{
+    {-7.5f,1.25f,0.3f,0.f, -5.2f,1.25f,0.3f},
+    {0.2f,0.75f,-1.7f,-0.6f, 0.6f,0.75f,-1.3f},
+    {3.3f,1.5f,4.4f,-2.2f, 3.3f,3.5f,4.4f},
+    {-13.1f,0.5f,-13.4f,0.8f, -12.2f,0.5f,-14.9f}}};
+  uint32_t drawn=0;
+  for(const auto& c:cases) {
+    GrassCamera(m,{c[0],c[1],c[2]},c[3]);
+    SetGrassTickCamera(m,{c[4],c[5],c[6]});
+    std::vector<std::array<int32_t,2>> cells;
+    NativeGrassMapStats stats;
+    const auto unlocked=BuildNativeGrassMapDraws(m,W::grass,W::context,&stats,&cells);
+    drawn+=stats.drawn;
+    // The guest's read of the tick pose.
+    GuestGrassLog tick;
+    Guest82172698(m,W::grass,W::context,W::stack,W::inner,tick);
+    bool same_as_tick=cells==tick.cells && unlocked.size()==tick.draws.size();
+    for(size_t i=0;same_as_tick && i<unlocked.size();++i)
+      same_as_tick=EncodeNativeEffectVertices(unlocked[i],0,unlocked[i].vertex_count())==tick.draws[i].bytes;
+    Require(!same_as_tick,"grass case does not separate the tick camera from the rendered one");
+    // +416 back at the rendered pose: the native build is unchanged and
+    // matches the guest byte for byte.
+    SetGrassTickCamera(m,{c[0],c[1],c[2]});
+    std::vector<std::array<int32_t,2>> locked_cells;
+    const auto locked=BuildNativeGrassMapDraws(m,W::grass,W::context,nullptr,&locked_cells);
+    Require(locked_cells==cells && SameGrassDraws(locked,unlocked),"native grass followed +416 instead of the rendered camera");
+    CompareGrass(m,textures);
+  }
+  Require(drawn>0,"rendered-camera grass cases drew nothing");
+}
 // The map-effect walk's routes in list order, and where the filed grass map
 // lands among the transparent items.
 void TestMapEffectPlan() {
@@ -1519,7 +1578,7 @@ void TestMapEffectPlan() {
 int main() {
   try {
     TestOrder(); TestMutation(); TestCensus(); TestElectricWire(); TestElectricWirePointsEquivalence(); TestElectricWireRandomized();
-    TestMapEffectMembers(); TestGrassMapRings(); TestGrassMap(); TestMapEffectPlan();
+    TestMapEffectMembers(); TestGrassMapRings(); TestGrassMap(); TestGrassMapRenderedCamera(); TestMapEffectPlan();
   } catch(const std::exception& error) {
     std::cerr<<"native map effect tests failed: "<<error.what()<<"\n";
     return 1;

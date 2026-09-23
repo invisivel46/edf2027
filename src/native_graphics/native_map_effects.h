@@ -277,6 +277,13 @@ inline std::array<NativeFxVec3,NativeElectricWire::points> NativeElectricWirePoi
 struct NativeElectricWireStats { uint32_t records=0,disabled=0,distant=0,culled=0,drawn=0; };
 // Every draw 820B8D28 issues for `wire` in the view whose scene is `scene`
 // (Word(context+16)), in record order. Throws on an implausible vector.
+// scene+96 and +288 are the camera the pass draws with, unlocked included:
+// only 821CDDF8 writes them, and the frustum builder 821C26C0 has no other
+// caller. The hook runs it at 821A4EB0 on the interpolated pose, 821A4DE8
+// then publishes the pass camera by copying +32/+96/+160 (so its view is
+// +96's bytes), and nothing writes them again before the helper that draws
+// this frame is joined. The frustum is in view space (fov +480, aspect
+// +496/+500), so +288 is the one for that camera.
 template<class Reader>
 std::vector<NativeEffectDraw> BuildNativeElectricWireDraws(const Reader& r,uint32_t wire,uint32_t scene,
     const NativeEffectInputs& in,NativeElectricWireStats* stats=nullptr) {
@@ -373,6 +380,22 @@ std::vector<NativeEffectDraw> BuildNativeElectricWireDraws(const Reader& r,uint3
 //  quad). The declaration is 821D34F0's from 825558FC - position FLOAT3 +0,
 //  texcoord FLOAT2 +12, colour FLOAT4 +20 - which is the VS_3DTex layout the
 //  ribbons' immediate path already uses.
+// The camera the native build takes (NativeGrassMap::camera_translation) is
+// not +416 but the scene's +224, the 64-byte copy of +416 that 821CDDF8 makes
+// in the same call that derives the view +96 and the frustum +288 this build
+// culls with (the sky reads the same copy, NativeSkyScene). The two are the
+// same bytes whenever +416 still holds what 821CDDF8 consumed. They differ in
+// two cases. Unlocked, the 821CDDF8 hook derives +96/+224/+288 from the
+// interpolated pose and then puts the tick pose back into +416, so +416
+// would centre the rings and the blades' distance fade on the tick camera
+// while the cull and the draw use the interpolated one. And the helper runs
+// beside the next step (821D58E8 releases it before 821A4BA0; 821D5800 joins
+// it after), whose camera update writes +416, so a live +416 read races with
+// the simulation. That is also true of the guest's own read, which can
+// therefore see the next tick's position. +224 is written only by 821CDDF8
+// (at 821A4EB0, after the join, and by the scene constructor 821CE168), so
+// it is the camera of the frame being drawn.
+//
 // The native build only reads. The guest's own writes are left out: the
 // counters +1168/+1172 (read by nothing but 82172698), +1228 and +1232..
 // +1244, the bound +288..+352, context+32..+44 (821B0198's output; the drain
@@ -389,7 +412,10 @@ struct NativeGrassMap {
   // .data blade sizes (8 bytes per type) and 8218D3F0's per-primitive vertex
   // table (8 bytes per primitive type: per primitive, plus).
   static constexpr uint32_t blade_table=0x82554480,primitive_table=0x82008888;
-  static constexpr uint32_t camera_translation=416+48;       // Word(context+16)+416, row 3
+  // Word(context+16)+224 row 3: the rendered copy of the +416 world whose
+  // row 3 (+464) 82172698 reads (see above).
+  static constexpr uint32_t camera_world=416,rendered_camera_world=224;
+  static constexpr uint32_t camera_translation=rendered_camera_world+48;
   static constexpr uint32_t declarations=60,declaration=64;   // in the Utility object (8218D440's traps)
   // The native pass's own refusals, not the guest's.
   static constexpr int32_t max_rings=256,max_subcells=256;
@@ -489,7 +515,9 @@ std::vector<NativeEffectDraw> BuildNativeGrassMapDraws(const Reader& r,uint32_t 
   if(!r.Bytes(r.Add(grass,G::loaded),1)[0] || !r.Bytes(r.Add(grass,G::enabled),1)[0]) { ++count.skipped; return {}; }
   const auto k=ReadNativeGrassMapConstants(r);
   const auto view=ReadNativeSceneVisibilityView(r,context);     // 82171BD8 through Word(+1228) = context
-  const auto camera=ReadNativeFxVec3(r,r.Add(r.Word(r.Add(context,16)),G::camera_translation));  // +1232/+1236/+1240
+  // +1232/+1236/+1240, from the rendered copy (scene+272, not +464): the
+  // camera the view and frustum above were derived from.
+  const auto camera=ReadNativeFxVec3(r,r.Add(r.Word(r.Add(context,16)),G::camera_translation));
   const float sub_x=single(G::sub_x),sub_z=single(G::sub_z),reach=single(G::reach);
   const float origin_x=single(G::origin_x),origin_z=single(G::origin_z);
   const float inv_z=NativeFxDiv(k.one,sub_z);                   // fdivs f12,f0,f13
