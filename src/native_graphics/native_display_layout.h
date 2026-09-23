@@ -121,6 +121,46 @@ inline NativeRenderSize ResolveNativeRenderSize(int32_t request_width,int32_t re
   return size;
 }
 
+// ---- Guest EDRAM budget for the device's own surfaces ---------------------------
+// 8213B850 (surface creation) fills a descriptor (8213B280) and then places the
+// surface in EDRAM. A caller that passes a placement in r7 (base, hi-z base, ..)
+// gets it as given: every engine target does this (8219C258, 8219E3B8's post
+// surfaces, 821B8AD8), with base 0. With r7 == 0 the tiles come from the EDRAM
+// allocator 82141940, and 8213B914 refuses the surface - frees the descriptor
+// and returns 0 - when base + tiles > 2048: the 10 MiB of Xenos EDRAM in tiles of
+// 5120 bytes. Only the device's presentation setup 82147318 passes r7 == 0 (the
+// back buffer at 82147414 and the optional auto depth at 82147450), from the
+// presentation parameters the 82139A40 hook sets to the render size.
+//
+// So the back buffer of a render larger than one EDRAM (2560x1440 is 2880 tiles)
+// was refused, 82147318/821477A8 failed, the factory 82139A40 destroyed the
+// half-initialized device and returned E_OUTOFMEMORY, 8219E3B8 tore down the
+// renderer globals, and its caller 820B1F60 carried on with a null device: the
+// read of guest 0x18 on the main thread. Native graphics never places anything in
+// EDRAM (no tile packets, no guest resolves), so for such a surface the hook gives
+// the caller placement the engine's own targets use instead of the allocator.
+inline constexpr uint32_t kGuestEdramTiles=2048,kGuestEdramTileBytes=5120;
+// 82139BC0: tiles for width x height of format (low six bits select 4 or 8
+// bytes per sample: 21, 32 and 37 are the 64-bit formats) with msaa 0/1/2 (1
+// doubles the rows, 2 also the columns), in the guest's 32-bit arithmetic.
+inline uint32_t GuestEdramSurfaceTiles(uint32_t width,uint32_t height,uint32_t format,int32_t msaa) {
+  const uint32_t kind=format&63u;
+  const uint32_t bytes=kind==21 || kind==32 || kind==37?8u:4u;
+  const uint32_t rows=msaa>=1?height*2u:height;
+  const uint32_t columns=msaa==2?width*2u:width;
+  const uint32_t pitch=(columns+79u)/80u*80u;
+  const uint32_t aligned_rows=(rows+15u)&~15u;
+  return aligned_rows*pitch*bytes/kGuestEdramTileBytes;
+}
+// 8213B914 with the allocator's first placement (base 0): whether the guest's
+// own allocation path can hold the surface at all.
+inline bool GuestEdramSurfaceFits(uint32_t width,uint32_t height,uint32_t format,int32_t msaa) {
+  return GuestEdramSurfaceTiles(width,height,format,msaa)<=kGuestEdramTiles;
+}
+// The presentation back buffer's format (8219E3B8 stores 0x18280186 at
+// presentation parameters +8).
+inline constexpr uint32_t kGuestBackBufferFormat=0x18280186u;
+
 // ---- Field of view -----------------------------------------------------------
 // The factor to apply to tan(vertical fov / 2) for a view of width x height.
 // Wider than 16:9 the engine is already Hor+ (1). Narrower, native mode keeps

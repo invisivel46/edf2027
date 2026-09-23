@@ -13021,7 +13021,36 @@ REX_HOOK_RAW(sub_82134A78) {
 REX_EXTERN(__imp__sub_8213B850);
 REX_HOOK_RAW(sub_8213B850) {
   const auto width=ctx.r3.u32,height=ctx.r4.u32,format=ctx.r5.u32,msaa=ctx.r6.u32;
-  __imp__sub_8213B850(ctx,base);
+  // The device's own surfaces (82147318's back buffer and auto depth) take
+  // their EDRAM from the allocator, which refuses anything above 2048 tiles
+  // (native_display_layout.h). Larger ones, only possible at an overridden
+  // render size, get the caller placement {0,0,0} the engine's own targets
+  // use, so the descriptor keeps the full extent; the surface is then not
+  // marked as allocator-owned and its release (82134220) frees no tiles.
+  // Surfaces that fit, 1280x720 among them, keep the original path.
+  const auto caller=uint32_t(ctx.lr);
+  if(ctx.r7.u32==0 && (caller==0x82147418u || caller==0x82147454u) &&
+     !edf::native::GuestEdramSurfaceFits(width,height,format,int32_t(msaa))) {
+    const edf::native::GuestReader reader(base);
+    if(ctx.r1.u32<4096) throw std::runtime_error("invalid stack for native device surface placement");
+    auto work=ctx;
+    // A 32-byte frame below the caller's: back chain, then the 12-byte
+    // placement at +16, above the callee's own (negative-offset) saves.
+    work.r1.u64=(ctx.r1.u32-32u)&~15u;
+    reader.StoreWord(work.r1.u32,ctx.r1.u32);
+    reader.StoreCpuWords(work.r1.u32+16u,std::array<uint32_t,3>{0u,0u,0u});
+    work.r7.u64=work.r1.u32+16u;
+    __imp__sub_8213B850(work,base);
+    work.r1.u64=ctx.r1.u64;
+    ctx=work;
+    static std::atomic<uint32_t> reports{0};
+    if(reports.fetch_add(1,std::memory_order_relaxed)<4)
+      REXLOG_INFO("Native device surface beyond guest EDRAM: caller={:#x}, {}x{}, format={:#x}, MSAA={}, tiles={} > {}; caller placement, handle={:#x}",
+        caller,width,height,format,msaa,edf::native::GuestEdramSurfaceTiles(width,height,format,int32_t(msaa)),
+        edf::native::kGuestEdramTiles,ctx.r3.u32);
+  } else {
+    __imp__sub_8213B850(ctx,base);
+  }
   if (EDF_NATIVE_FLAG(shader_bridge) && ctx.r3.u32) {
     auto& state=edf::native::State();
     // Device-only creation/registry replacement; no context submission here.
@@ -13235,6 +13264,9 @@ REX_HOOK_RAW(sub_82140E98) {
 // Audited call: 8219E3B8 -> 82139A40 at LR 8219E4D4; r7 is presentation
 // parameters, r8 is &renderer.device at renderer+8. Later consumers reload
 // renderer+84/+88 rather than retaining the fixed dimensions in registers.
+// The presentation size also sizes the device's back buffer, whose EDRAM
+// allocation refuses more than 2048 tiles; the 8213B850 hook places a larger
+// one itself (GuestEdramSurfaceFits in native_display_layout.h).
 REX_EXTERN(__imp__sub_82139A40);
 REX_HOOK_RAW(sub_82139A40) {
   if (uint32_t(ctx.lr)==0x8219E4D4u) {

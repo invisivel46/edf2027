@@ -381,8 +381,66 @@ void TestPostPyramid() {
 }
 }  // namespace
 
+// ---- Guest EDRAM budget (82139BC0 tiles, 8213B914 limit) ------------------------------
+void TestGuestEdramBudget() {
+  const auto back=kGuestBackBufferFormat;
+  // The limit: 2048 tiles of 5120 bytes, the 10 MiB of EDRAM.
+  CHECK(kGuestEdramTiles==2048 && kGuestEdramTileBytes==5120);
+  CHECK(uint64_t(kGuestEdramTiles)*kGuestEdramTileBytes==10u*1024*1024);
+  // The tile count, 80-sample columns by 16-row groups, 4 bytes per sample.
+  CHECK(GuestEdramSurfaceTiles(1280,720,back,0)==720);
+  CHECK(GuestEdramSurfaceTiles(1920,1080,back,0)==1632);
+  CHECK(GuestEdramSurfaceTiles(1920,1200,back,0)==1800);
+  CHECK(GuestEdramSurfaceTiles(2133,1200,back,0)==2025);
+  CHECK(GuestEdramSurfaceTiles(1365,768,back,0)==864);
+  CHECK(GuestEdramSurfaceTiles(2560,1080,back,0)==2176);
+  CHECK(GuestEdramSurfaceTiles(2560,1440,back,0)==2880);
+  CHECK(GuestEdramSurfaceTiles(3440,1440,back,0)==3870);
+  CHECK(GuestEdramSurfaceTiles(3840,2160,back,0)==6480);
+  CHECK(GuestEdramSurfaceTiles(5120,1440,back,0)==5760);
+  // MSAA 1 doubles the rows (the tiled depth the log reports as 640x736,
+  // MSAA=1), 2 also the columns; 64-bit formats (21, 32, 37) take twice the bytes.
+  CHECK(GuestEdramSurfaceTiles(640,736,0x1a220197u,1)==736);
+  CHECK(GuestEdramSurfaceTiles(1280,720,back,2)==2880);
+  CHECK(GuestEdramSurfaceTiles(1280,720,0x00000020u,0)==1440);
+  CHECK(GuestEdramSurfaceTiles(1280,720,0x00000015u,0)==1440);
+  CHECK(GuestEdramSurfaceTiles(1280,720,0x00000025u,0)==1440);
+  // Exactly at the limit, and one row group past it.
+  CHECK(GuestEdramSurfaceFits(2560,1024,back,0) && GuestEdramSurfaceTiles(2560,1024,back,0)==2048);
+  CHECK(!GuestEdramSurfaceFits(2560,1025,back,0));
+  CHECK(GuestEdramSurfaceFits(2720,960,back,0) && !GuestEdramSurfaceFits(2721,960,back,0));
+  // The matrix: sizes that started fit the allocator; the five that crashed at
+  // startup do not, and they are the ones the 8213B850 hook places itself.
+  const auto native=NativeAspectMode::Native;
+  for(const auto [w,h]:{std::pair{1280,720},{1920,1080},{1920,1200},{2133,1200},{1365,768}}) {
+    const auto size=ResolveNativeRenderSize(w,h,w,h,native);
+    CHECK(Size(size,w,h) && !size.clamped && ValidNativeRenderRequest(w,h));
+    CHECK(GuestEdramSurfaceFits(uint32_t(size.width),uint32_t(size.height),back,0));
+  }
+  for(const auto [w,h]:{std::pair{2560,1440},{3840,2160},{2560,1080},{3440,1440},{5120,1440}}) {
+    const auto size=ResolveNativeRenderSize(w,h,w,h,native);
+    CHECK(Size(size,w,h) && !size.clamped && ValidNativeRenderRequest(w,h));
+    CHECK(!GuestEdramSurfaceFits(uint32_t(size.width),uint32_t(size.height),back,0));
+    // "Match window" and a line count resolve the same sizes on those displays.
+    CHECK(Size(ResolveNativeRenderSize(0,-1,w,h,native),w,h));
+    CHECK(Size(ResolveNativeRenderSize(0,h,w,h,native),w,h));
+  }
+  // The render size ceiling (8192 per axis, 4096*4096 pixels) stays in 32-bit
+  // guest arithmetic and inside the descriptor fields 8213B280 packs: the
+  // sample-aligned width shifted by two in 16 bits, the 80-aligned pitch in 14.
+  for(const auto [w,h]:{std::pair{8192,2048},{2048,8192},{4096,4096},{5460,3072}}) {
+    CHECK(ValidNativeRenderRequest(w,h));
+    const uint32_t tiles=GuestEdramSurfaceTiles(uint32_t(w),uint32_t(h),back,0);
+    CHECK(tiles>kGuestEdramTiles && uint64_t(tiles)*kGuestEdramTileBytes<=0xffffffffu);
+    CHECK(((uint32_t(w)+31u)&~31u)<<2<=0xffffu);
+    CHECK((uint32_t(w)+79u)/80u*80u<=0x3fffu);
+  }
+  CHECK(GuestEdramSurfaceTiles(8192,2048,back,0)==13184);
+}
+
 int main() {
   TestRenderSize();
+  TestGuestEdramBudget();
   TestFieldOfView();
   TestCanvasLayout();
   TestCanvasDrawAndScissor();
