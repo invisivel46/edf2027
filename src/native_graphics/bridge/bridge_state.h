@@ -269,7 +269,7 @@ struct SurfaceCreation { uint32_t width,height,format,msaa; };
 struct EmbeddedShader { uint32_t source; bool pixel; };
 struct MoviePlaneLock { uint32_t texture,pitch,pixels; };
 struct MovieDecodeLocks { std::vector<MoviePlaneLock> planes; bool failed=false; };
-extern thread_local MovieDecodeLocks* active_movie_decode;
+extern thread_local constinit MovieDecodeLocks* active_movie_decode;
 struct DrawVisibility {
   Microsoft::WRL::ComPtr<ID3D11Query> query;
   std::array<uint32_t,4> key; // VS, PS, raster state, depth state.

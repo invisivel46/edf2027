@@ -1188,11 +1188,11 @@ thread_local NativeMaterialPassCursor* native_material_pass_cursor=nullptr;
 thread_local NativeSceneQueues* native_scene_queues=nullptr;
 }  // namespace (shared with the full frame: bridge/bridge_helpers.h)
 thread_local std::shared_ptr<const NativeScenePublication> native_scene_publication;
-thread_local std::optional<NativeScenePassCamera> native_scene_pass_camera;
+thread_local constinit std::optional<NativeScenePassCamera> native_scene_pass_camera;
 thread_local std::shared_ptr<const NativeScenePassCameras> native_scene_pass_cameras;
-thread_local std::optional<NativeScenePassAnimation> native_scene_pass_animation;
+thread_local constinit std::optional<NativeScenePassAnimation> native_scene_pass_animation;
 thread_local std::shared_ptr<const NativeSceneAdapter::WorldAnimations> native_scene_pass_animations;
-thread_local uint32_t native_scene_animation_owner=0;
+thread_local constinit uint32_t native_scene_animation_owner=0;
 // FSR (native_fsr.h): while a full-frame view is jittered, the pass camera
 // with the jitter in its projection and view*projection, for the draws that
 // take their camera constants from a NativeScenePassCamera (the effect and
@@ -1201,8 +1201,8 @@ thread_local uint32_t native_scene_animation_owner=0;
 // the culls, the effects' eye and the guest view globals all read it. The
 // renderer-drawn passes get the same jitter through
 // NativeSceneRenderer::SetClipJitter. Null (no jitter) outside such a view.
-thread_local std::optional<NativeScenePassCamera> native_scene_draw_camera;
-thread_local NativeFsrJitter native_scene_view_jitter;
+thread_local constinit std::optional<NativeScenePassCamera> native_scene_draw_camera;
+thread_local constinit NativeFsrJitter native_scene_view_jitter;
 namespace {
 NativeFsrMode NativeFsrRequestedMode() {
   const std::string text=REXCVAR_GET(edf_native_fsr);
@@ -2787,8 +2787,8 @@ thread_local std::vector<uint32_t>* native_model_dirty_poses=nullptr;
 // they are still current instead of comparing every tree byte a second time.
 thread_local std::vector<uint32_t> native_step_trees;
 }  // namespace (shared with the full frame: bridge/bridge_helpers.h)
-thread_local NativeLoopBudget native_render_budget;
-thread_local uint64_t native_render_publication=0;
+thread_local constinit NativeLoopBudget native_render_budget;
+thread_local constinit uint64_t native_render_publication=0;
 // Whether the guest render helper running on this thread (the 821A5080 hook's
 // guest-helper and frame-dispatch routes) is its tick's advancing render
 // (edf::native::NativeTickGate over native_render_budget). True outside a
@@ -2798,11 +2798,11 @@ thread_local uint64_t native_render_publication=0;
 // native post loop of the 820B0B80 hook drops the DownsampleTone pass
 // (PostIssueWithoutPass) so the tone history blends once per tick. The full
 // frame reads NativeFrameInputs::tick_frame instead.
-thread_local bool native_render_tick_frame=true;
+thread_local constinit bool native_render_tick_frame=true;
 // The shadow render's guest side (edf_native_shadow_render,
 // native_shadow_render.h) on this thread; null outside it, always null with
 // the cvar off. Counts what its guest route held back.
-thread_local NativeShadowGuest* native_shadow_guest=nullptr;
+thread_local constinit NativeShadowGuest* native_shadow_guest=nullptr;
 namespace {
 struct NativeModelRenderContext {
   uint32_t source=0;
