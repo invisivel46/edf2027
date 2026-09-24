@@ -1,7 +1,8 @@
 #pragma once
 // Bridge CPU timing: hook phases and their timing scopes (HookTiming), the engine-thread region probe,
 // the engine/render-helper thread QoS and the timed bridge locks (BridgeMutex, BridgeGate). Moved from
-// guest_shader_bridge.cpp unchanged; its variables and functions are defined in hook_timing.cpp.
+// guest_shader_bridge.cpp unchanged; its variables and functions are defined in hook_timing.cpp, except
+// FrameHookPhaseTotals, inline here (HookTiming::Finish calls it from every translation unit).
 #include "../native_load_trace.h"
 #include "native_cvars.h"
 #include <rex/logging.h>
@@ -102,7 +103,9 @@ inline constexpr const char* kHookPhaseNames[]{"activation.original","activation
   "load.texture.allocate","load.texture.upload2d","load.texture.upload_volume","load.texture.prepare",
   "load.resource.oneshot","load.resource.coordinator","load.resource.helper","load.resource.transition"};
 static_assert(std::size(kHookPhaseNames)==static_cast<size_t>(HookPhase::Count));
-extern thread_local uint32_t texture_loader_depth;
+// The thread-locals declared here are constinit (constant-initialized, trivially destructible): read from any
+// file without the TLS guard check an extern thread_local otherwise costs on every access.
+extern thread_local constinit uint32_t texture_loader_depth;
 // This frame's inclusive totals per phase, for the edf_native_frame_times
 // spike lines: every thread adds, the swap takes and clears them. Only full
 // (not sampled) timings add, so they exist only with the hook or load timings
@@ -111,7 +114,10 @@ struct FrameHookPhases {
   std::array<std::atomic<uint64_t>,static_cast<size_t>(HookPhase::Count)> nanos{};
   std::array<std::atomic<const char*>,static_cast<size_t>(HookPhase::Count)> names{};
 };
-FrameHookPhases& FrameHookPhaseTotals();
+inline FrameHookPhases& FrameHookPhaseTotals() {
+  static FrameHookPhases totals;
+  return totals;
+}
 // Engine-thread region probe (edf_native_hook_timings only; nothing runs when
 // off). The step dispatch 821A4BA0 and the frame transition 821A4DE8 run guest
 // code on the engine thread, and their inclusive timings say how long they
@@ -145,9 +151,9 @@ struct EngineRegionTotals {
   std::chrono::steady_clock::time_point reported{};
 };
 // The region this thread is in; null outside one (and always when timings are off).
-extern thread_local EngineRegionTotals* native_engine_region;
+extern thread_local constinit EngineRegionTotals* native_engine_region;
 // The guest wait wrapper being timed on this thread, for the per-function split.
-extern thread_local uint32_t native_guest_wait_function;
+extern thread_local constinit uint32_t native_guest_wait_function;
 // Render helper calls (821A5080) in flight, sampled at region entry and exit.
 extern std::atomic<int> native_render_helper_active;
 // Logical processor -> efficiency class (GetSystemCpuSetInformation), and the
@@ -201,7 +207,7 @@ struct NativeCpuTopology {
     return result;
   }
 };
-extern thread_local std::array<EngineRegionTotals,size_t(EngineRegion::Count)> native_engine_regions;
+extern thread_local constinit std::array<EngineRegionTotals,size_t(EngineRegion::Count)> native_engine_regions;
 void ReportEngineRegion(EngineRegion region,EngineRegionTotals& totals);
 // One engine-thread region (see EngineRegionTotals). Construct it inside the
 // region's own inclusive HookTimings so they are not attributed to it.

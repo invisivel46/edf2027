@@ -1,8 +1,16 @@
 # Source-level regression gate, not a whole-program reachability proof.
+# SOURCE is guest_shader_bridge.cpp; the hooks split out of it (edf/hooks/*.cpp next to it) are read with it.
 if(NOT DEFINED SOURCE OR NOT EXISTS "${SOURCE}")
   message(FATAL_ERROR "Native hook bridge source is required")
 endif()
 file(READ "${SOURCE}" bridge)
+get_filename_component(bridge_source_directory "${SOURCE}" DIRECTORY)
+file(GLOB hook_sources "${bridge_source_directory}/edf/hooks/*.cpp")
+list(SORT hook_sources)
+foreach(hook_source IN LISTS hook_sources)
+  file(READ "${hook_source}" hook_text)
+  string(APPEND bridge "\n${hook_text}")
+endforeach()
 foreach(address IN ITEMS 821409A0 82140E98 821512D8 8214E640
                          8213BD90 8213C410 8214EE50 8214EFF8)
   string(FIND "${bridge}" "REX_HOOK_RAW(sub_${address})" hook)

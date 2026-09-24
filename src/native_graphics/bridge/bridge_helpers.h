@@ -224,14 +224,16 @@ std::vector<uint8_t> CaptureOutputBmp(Bridge& state,Scene& scene) {
 }
 // The scene pass inputs of this thread's render helper call and its FSR jitter (defined in
 // guest_shader_bridge.cpp), and the camera the effect activations draw with (inline: every pass calls it).
+// constinit (here and on the definitions): a constant-initialized, trivially destructible thread-local is read
+// from another file without the TLS guard check an extern thread_local otherwise costs on every access.
 extern thread_local std::shared_ptr<const NativeScenePublication> native_scene_publication;
-extern thread_local std::optional<NativeScenePassCamera> native_scene_pass_camera;
+extern thread_local constinit std::optional<NativeScenePassCamera> native_scene_pass_camera;
 extern thread_local std::shared_ptr<const NativeScenePassCameras> native_scene_pass_cameras;
-extern thread_local std::optional<NativeScenePassAnimation> native_scene_pass_animation;
+extern thread_local constinit std::optional<NativeScenePassAnimation> native_scene_pass_animation;
 extern thread_local std::shared_ptr<const NativeSceneAdapter::WorldAnimations> native_scene_pass_animations;
-extern thread_local uint32_t native_scene_animation_owner;
-extern thread_local std::optional<NativeScenePassCamera> native_scene_draw_camera;
-extern thread_local NativeFsrJitter native_scene_view_jitter;
+extern thread_local constinit uint32_t native_scene_animation_owner;
+extern thread_local constinit std::optional<NativeScenePassCamera> native_scene_draw_camera;
+extern thread_local constinit NativeFsrJitter native_scene_view_jitter;
 inline const NativeScenePassCamera& NativeSceneDrawCamera() {
   return native_scene_draw_camera?*native_scene_draw_camera:*native_scene_pass_camera;
 }
@@ -272,14 +274,14 @@ struct NativeLoopBudget {
   float fraction=0;
   uint32_t divisor=1;
 };
-extern thread_local NativeLoopBudget native_render_budget;
-extern thread_local uint64_t native_render_publication;
-extern thread_local bool native_render_tick_frame;
+extern thread_local constinit NativeLoopBudget native_render_budget;
+extern thread_local constinit uint64_t native_render_publication;
+extern thread_local constinit bool native_render_tick_frame;
 // The shadow render's guest side (native_shadow_guest, with its definition).
 struct NativeShadowGuest {
   uint64_t tone_holds=0;      // PS_Downsample_Tone draws skipped (the immediate draw hook)
   uint64_t lifetime_holds=0;  // clEffectEtc02 +612 put back (the 8217C4A0 hook)
 };
-extern thread_local NativeShadowGuest* native_shadow_guest;
+extern thread_local constinit NativeShadowGuest* native_shadow_guest;
 extern std::atomic<uint64_t> native_render_frames;
 extern std::atomic<uint64_t> native_guest_slot4_frames;

@@ -73,7 +73,13 @@ foreach(item "42:sub_821FD428" "10:sub_821FD8F8" "12:__savegprlr_22" "17:__saveg
     string(APPEND result "#include \"edf2017_funcs.${shard}.h\"\n${body}\n")
 endforeach()
 # Exercise the actual native import adapter against a controlled SDK provider.
-file(READ "${SOURCE_DIR}/src/native_graphics/guest_shader_bridge.cpp" bridge)
+# The hooks exercised below, from the files they are in: the buffer providers and locks, the declaration and shader
+# binding setters and the physical frees (edf/hooks/buffers.cpp, draw.cpp and models.cpp once split out).
+set(bridge "")
+foreach(hook_file edf/hooks/buffers.cpp edf/hooks/draw.cpp edf/hooks/models.cpp)
+    file(READ "${SOURCE_DIR}/src/native_graphics/${hook_file}" hook_text)
+    string(APPEND bridge "${hook_text}\n")
+endforeach()
 # The fixture sees the individual cvars: undo the renderer preset layer
 # (EDF_NATIVE_FLAG(x) -> REXCVAR_GET(edf_native_x)) before any replacement.
 string(REGEX REPLACE "EDF_NATIVE_FLAG\\(([a-z_0-9]+)\\)" "REXCVAR_GET(edf_native_\\1)" bridge "${bridge}")

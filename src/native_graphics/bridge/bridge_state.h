@@ -1,8 +1,10 @@
 #pragma once
 // The bridge's shared state: the State() singleton (Bridge: locks, registered shaders, targets, scene and
 // submission bookkeeping, caches) and the helper types it holds. Moved from guest_shader_bridge.cpp
-// unchanged; the accessor and the other namespace-scope definitions are in bridge_state.cpp. A file that
-// includes this shares the one Bridge with the bridge; see Bridge for which lock guards what.
+// unchanged. The accessors (State, BufferWrites, PacingState) and VertexBindingsForDraw are inline here, as
+// they were inlined in the bridge's one translation unit before the split: a function-local static in an
+// inline function is one object program-wide. A file that includes this shares the one Bridge with the
+// bridge; see Bridge for which lock guards what. active_movie_decode is defined in bridge_state.cpp.
 #include "hook_timing.h"
 #include "../guest_shader_bridge.h"
 #include "../guest_mesh_watch_audit.h"
@@ -234,7 +236,11 @@ struct RegisteredShader {
 // reversed variant brought up to date from the normal one where it mirrors it.
 // Every draw path that picks a variant goes through here, so a variant can
 // never be drawn with the constants of the activation before last.
-ShaderBindings& VertexBindingsForDraw(RegisteredShader& shader,bool reverse_depth);
+inline ShaderBindings& VertexBindingsForDraw(RegisteredShader& shader,bool reverse_depth) {
+  if(!reverse_depth) return *shader.bindings;
+  if(shader.reversed_mirrors) shader.reversed_bindings->MirrorConstantsFrom(*shader.bindings);
+  return *shader.reversed_bindings;
+}
 struct TextureCreation {
   uint32_t width, height, depth, levels, usage, format, pool, type, caller;
 };
@@ -242,7 +248,10 @@ struct RegisteredTarget {
   uint32_t texture_handle, surface_handle;
   NativeRenderTarget native;
 };
-NativeBufferWrites& BufferWrites();
+inline NativeBufferWrites& BufferWrites() {
+  static NativeBufferWrites writes;
+  return writes;
+}
 struct GuestStream {
   uint32_t resource, offset, stride;
 };
@@ -260,7 +269,7 @@ struct SurfaceCreation { uint32_t width,height,format,msaa; };
 struct EmbeddedShader { uint32_t source; bool pixel; };
 struct MoviePlaneLock { uint32_t texture,pitch,pixels; };
 struct MovieDecodeLocks { std::vector<MoviePlaneLock> planes; bool failed=false; };
-extern thread_local MovieDecodeLocks* active_movie_decode;
+extern thread_local constinit MovieDecodeLocks* active_movie_decode;
 struct DrawVisibility {
   Microsoft::WRL::ComPtr<ID3D11Query> query;
   std::array<uint32_t,4> key; // VS, PS, raster state, depth state.
@@ -271,7 +280,10 @@ struct NativePacingState {
   NativePacingClock clock;
   uint64_t calls=0;
 };
-NativePacingState& PacingState();
+inline NativePacingState& PacingState() {
+  static NativePacingState state;
+  return state;
+}
 // FSR native AA (native_fsr.h, edf_native_fsr), under the bridge locks.
 // `frame` arms one helper call: its scene passes draw jittered and the
 // scene's resolve to owner+104 (ResolveScene: the native post's, or the
@@ -683,5 +695,5 @@ struct Bridge {
   uint64_t texture_bindings = 0, texture_missing = 0, texture_binding_errors = 0;
   uint64_t activations = 0, misses = 0, parameter_uploads = 0, optimized_out = 0, parameter_errors = 0;
 };
-Bridge& State();
+inline Bridge& State() { static Bridge state; return state; }
 }  // namespace edf::native
