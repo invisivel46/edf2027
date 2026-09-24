@@ -68,6 +68,8 @@ struct GuestDirect {
   void StoreU32(uint32_t address,uint32_t value) const { value=_byteswap_ulong(value); std::memcpy(At(address),&value,4); }
   void StoreU64(uint32_t address,uint64_t value) const { value=_byteswap_uint64(value); std::memcpy(At(address),&value,8); }
   const uint8_t* Row(uint32_t address) const { return At(address); }
+  // A 16-byte aligned row never straddles 0xE0000000.
+  void StoreRow(uint32_t address,__m128i bytes) const { _mm_storeu_si128(reinterpret_cast<__m128i*>(At(address)),bytes); }
 };
 
 // The object Animation_Update is running for (mismatch detail only).
@@ -80,6 +82,8 @@ thread_local constinit uint32_t skeletal_passthrough=0;
 struct SkeletalTimes {
   uint64_t update_calls=0,eval_calls=0,eval_records=0,propagate_calls=0,propagate_nodes=0;
   double update_ms=0,eval_ms=0,propagate_ms=0;
+  // Audit mode: the native and the original halves of the same calls.
+  double audit_eval_native_ms=0,audit_eval_guest_ms=0,audit_propagate_native_ms=0,audit_propagate_guest_ms=0;
   Clock::time_point reported{};
 };
 SkeletalTimes& Times() {
@@ -97,9 +101,11 @@ void MaybeReportTimes(SkeletalTimes& t,Clock::time_point now) {
   const double seconds=std::chrono::duration<double>(now-t.reported).count();
   REXLOG_INFO("Native skeletal timing: thread={} mode={} interval_s={:.2f} update calls={} ms={:.3f} "
     "eval calls={} records={} ms={:.3f} us/record={:.4f} propagate calls={} nodes={} ms={:.3f} "
+    "audit[eval native/guest ms={:.3f}/{:.3f} propagate native/guest ms={:.3f}/{:.3f}] "
     "(inclusive CPU wall time; eval and propagate are inside update when called from it)",
     GetCurrentThreadId(),SkeletalMode(),seconds,t.update_calls,t.update_ms,t.eval_calls,t.eval_records,t.eval_ms,
-    t.eval_records?t.eval_ms*1000.0/double(t.eval_records):0.0,t.propagate_calls,t.propagate_nodes,t.propagate_ms);
+    t.eval_records?t.eval_ms*1000.0/double(t.eval_records):0.0,t.propagate_calls,t.propagate_nodes,t.propagate_ms,
+    t.audit_eval_native_ms,t.audit_eval_guest_ms,t.audit_propagate_native_ms,t.audit_propagate_guest_ms);
   const auto reported=now;
   t=SkeletalTimes{};
   t.reported=reported;
@@ -210,11 +216,21 @@ void AuditEvaluate(PPCContext& ctx,uint8_t* base) {
     if(m.U8(bone+S::bone_enabled)) regions.push_back({m.U32(bone+S::bone_local),64,int32_t(i),2});
   }
   Snapshot(m,regions,before);
+  const bool timed=REXCVAR_GET(edf_native_hook_timings);
+  auto t0=timed?Clock::now():Clock::time_point{};
   ctx.fpscr.disableFlushMode();
   NativeSkeletalEvaluate(m,slot);
+  auto t1=timed?Clock::now():Clock::time_point{};
   Snapshot(m,regions,native);
   Restore(m,regions,before);
+  auto t2=timed?Clock::now():Clock::time_point{};
   __imp__sub_821CE848(ctx,base);
+  auto t3=timed?Clock::now():Clock::time_point{};
+  if(timed) {
+    auto& t=Times();
+    t.audit_eval_native_ms+=std::chrono::duration<double,std::milli>(t1-t0).count();
+    t.audit_eval_guest_ms+=std::chrono::duration<double,std::milli>(t3-t2).count();
+  }
   Snapshot(m,regions,guest);
   uint64_t bytes=0;
   for(const auto& region:regions) bytes+=region.size;
@@ -270,13 +286,23 @@ void AuditPropagate(PPCContext& ctx,uint8_t* base) {
     return;
   }
   Snapshot(m,regions,before);
+  const bool timed=REXCVAR_GET(edf_native_hook_timings);
+  auto t0=timed?Clock::now():Clock::time_point{};
   ctx.fpscr.enableFlushMode();
   NativeSkeletalPropagate(m,node,parent);
+  auto t1=timed?Clock::now():Clock::time_point{};
   Snapshot(m,regions,native);
   Restore(m,regions,before);
+  auto t2=timed?Clock::now():Clock::time_point{};
   ++skeletal_passthrough;
   __imp__sub_821D1688(ctx,base);
   --skeletal_passthrough;
+  auto t3=timed?Clock::now():Clock::time_point{};
+  if(timed) {
+    auto& t=Times();
+    t.audit_propagate_native_ms+=std::chrono::duration<double,std::milli>(t1-t0).count();
+    t.audit_propagate_guest_ms+=std::chrono::duration<double,std::milli>(t3-t2).count();
+  }
   Snapshot(m,regions,guest);
   audit.propagate_calls.fetch_add(1,std::memory_order_relaxed);
   NoteAudited(&AuditCounters::roots,node);

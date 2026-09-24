@@ -119,6 +119,81 @@ inline void RotateZ(Rows& m,double angle) {
     m[row]=Fms(x,c,ys);
   }
 }
+// NativeGuestSin/NativeGuestCos for up to four lanes at once (AVX2, FMA): the
+// same double operations per lane, so the same bits. cos lanes (mask set) take
+// the cos reduction (|x|+pi/2, quadrant n-0.5, no sign), sin lanes the sin one.
+// fctid is vroundpd in the current rounding mode (nearbyint); where it would
+// differ (NaN, |x| beyond 2^63) the lane's result is NaN either way, as is its
+// quadrant parity (vcvttpd2dq), which only matters below the 2.2e8 limit.
+inline __m256d NativeGuestSinCos4(__m256d x,__m256d cos_lanes) {
+  using K=NativeGuestTrig;
+  const __m256d sign_bit=_mm256_set1_pd(-0.0);
+  const __m256d a=_mm256_andnot_pd(sign_bit,x);
+  const __m256d argument=_mm256_blendv_pd(a,_mm256_add_pd(_mm256_set1_pd(K::half_pi),a),cos_lanes);
+  const __m256d n=_mm256_round_pd(_mm256_mul_pd(_mm256_set1_pd(K::inv_pi),argument),_MM_FROUND_CUR_DIRECTION);
+  const __m256d q=_mm256_blendv_pd(n,_mm256_sub_pd(n,_mm256_set1_pd(double(K::half))),cos_lanes);
+  const __m128i quadrant=_mm256_cvttpd_epi32(n);
+  const __m256i odd=_mm256_cmpeq_epi64(_mm256_cvtepi32_epi64(_mm_and_si128(quadrant,_mm_set1_epi32(1))),_mm256_set1_epi64x(1));
+  __m256d r=_mm256_xor_pd(sign_bit,_mm256_fmadd_pd(_mm256_set1_pd(K::pi_high),q,_mm256_xor_pd(sign_bit,a)));
+  r=_mm256_xor_pd(sign_bit,_mm256_fmadd_pd(_mm256_set1_pd(K::pi_low),q,_mm256_xor_pd(sign_bit,r)));
+  const __m256d r2=_mm256_mul_pd(r,r);
+  __m256d p=_mm256_fmadd_pd(_mm256_set1_pd(K::poly[7]),r2,_mm256_set1_pd(K::poly[6]));
+  for(size_t i=6;i-->0;) p=_mm256_fmadd_pd(p,r2,_mm256_set1_pd(K::poly[i]));
+  p=_mm256_fmadd_pd(p,r2,_mm256_set1_pd(K::unit));
+  __m256d value=_mm256_mul_pd(p,r);
+  value=_mm256_xor_pd(value,_mm256_and_pd(_mm256_castsi256_pd(odd),sign_bit));
+  // sin: times +-1 by the sign of x (NaN: -1); cos: as is.
+  const __m256d sign=_mm256_blendv_pd(_mm256_set1_pd(double(K::minus_one)),_mm256_set1_pd(double(K::one)),
+    _mm256_cmp_pd(x,_mm256_setzero_pd(),_CMP_GE_OQ));
+  value=_mm256_blendv_pd(_mm256_mul_pd(value,sign),value,cos_lanes);
+  const __m256d beyond=_mm256_cmp_pd(_mm256_sub_pd(argument,_mm256_set1_pd(K::limit)),_mm256_setzero_pd(),_CMP_GE_OQ);
+  value=_mm256_blendv_pd(value,_mm256_set1_pd(K::nan),beyond);
+  // Zero: sin returns x itself (a signed zero), cos 1.0.
+  const __m256d zero=_mm256_cmp_pd(a,_mm256_setzero_pd(),_CMP_EQ_OQ);
+  const __m256d at_zero=_mm256_blendv_pd(x,_mm256_set1_pd(double(K::one)),cos_lanes);
+  return _mm256_blendv_pd(value,at_zero,zero);
+}
+// The six results rotX/rotY/rotZ need, rounded to single as the builders do (frsp):
+// s[k], c[k] = sin, cos of angle k.
+inline void NativeGuestSinCos3(const double* angles,double* s,double* c) {
+  const __m256d cos_lanes=_mm256_castsi256_pd(_mm256_setr_epi64x(0,0,0,-1));
+  const __m256d first=NativeGuestSinCos4(_mm256_setr_pd(angles[0],angles[1],angles[2],angles[0]),cos_lanes);
+  const __m256d second=NativeGuestSinCos4(_mm256_setr_pd(angles[1],angles[2],angles[1],angles[2]),
+    _mm256_castsi256_pd(_mm256_set1_epi64x(-1)));
+  alignas(32) double a[4],b[4];
+  _mm256_store_pd(a,first); _mm256_store_pd(b,second);
+  s[0]=F(a[0]); s[1]=F(a[1]); s[2]=F(a[2]); c[0]=F(a[3]); c[1]=F(b[0]); c[2]=F(b[1]);
+}
+// rotX(angles[0]) then rotY(angles[1]) then rotZ(angles[2]) (821C7B20, 821C7D80,
+// 821C7E30) with the six trig values computed together.
+inline void RotationXYZ(Rows& m,const double* angles,double one,double zero) {
+  double s[3],c[3];
+  NativeGuestSinCos3(angles,s,c);
+  m={one,zero,zero,zero, zero,c[0],s[0],zero, zero,-s[0],c[0],zero};
+  {
+    const double x=m[0],z=m[2];
+    const double xs=F(x*s[1]),zs=F(z*s[1]);
+    m[2]=Fms(z,c[1],xs);
+    m[0]=Fma(x,c[1],zs);
+  }
+  {
+    const double x=m[4],xc=F(x*c[1]),z=m[6],xs=F(x*s[1]);
+    const double nx=Fma(z,s[1],xc);
+    m[6]=Fms(z,c[1],xs);
+    m[4]=nx;
+  }
+  {
+    const double x=m[8],xs=F(x*s[1]),z=m[10],xc=F(x*c[1]);
+    m[10]=Fms(z,c[1],xs);
+    m[8]=Fma(z,s[1],xc);
+  }
+  for(size_t row=0;row<12;row+=4) {
+    const double x=m[row],y=m[row+1];
+    const double xs=F(x*s[2]),ys=F(y*s[2]);
+    m[row+1]=Fma(y,c[2],xs);
+    m[row]=Fms(x,c[2],ys);
+  }
+}
 // 821B0320(v,length): v scaled to length; a zero squared length stores zeros.
 inline void Normalize(double* v,double length,double zero) {
   const double y=v[1];
@@ -214,17 +289,15 @@ NativeSkeletalEvalStats NativeSkeletalEvaluate(const M& m,uint32_t slot) {
       NativeSkeletalKeyLerp(m,angles,key_address(key0),key_address(key1),frac,
         NativeSkeletalLoadFloat(m,channel+S::channel_rotation_divisor),one);
       Rows rows;
-      RotationX(rows,F(angles[0]),one,zero);
-      RotateY(rows,F(angles[1]));
-      RotateZ(rows,F(angles[2]));
+      RotationXYZ(rows,angles,one,zero);
       for(uint32_t k=0;k<12;++k) NativeSkeletalStoreFloat(m,record+S::record_rotation+k*4,rows[k]);
       key0+=2; key1+=2;
     }
     if(m.U32(channel+S::channel_flags)&16u) {
       Rows rows;
-      RotationX(rows,NativeSkeletalLoadFloat(m,channel+S::channel_angles),one,zero);
-      RotateY(rows,NativeSkeletalLoadFloat(m,channel+S::channel_angles+4));
-      RotateZ(rows,NativeSkeletalLoadFloat(m,channel+S::channel_angles+8));
+      const double constant[3]{NativeSkeletalLoadFloat(m,channel+S::channel_angles),
+        NativeSkeletalLoadFloat(m,channel+S::channel_angles+4),NativeSkeletalLoadFloat(m,channel+S::channel_angles+8)};
+      RotationXYZ(rows,constant,one,zero);
       for(uint32_t k=0;k<12;++k) NativeSkeletalStoreFloat(m,record+S::record_rotation+k*4,rows[k]);
     }
     if(m.U32(channel+S::channel_flags)&4u) {
@@ -288,7 +361,8 @@ NativeSkeletalEvalStats NativeSkeletalEvaluate(const M& m,uint32_t slot) {
 // body's own vector operations (the same byte-reversed lanes, unpacks and DPPS),
 // so the guest flush mode must already be on. lvx128 reads the 16-byte aligned
 // rows below each address; stvlx writes 16-(out&15) bytes of each row.
-// M::Row(address) returns the 16 guest bytes at address (aligned).
+// M::Row(address) returns the 16 guest bytes at a 16-byte aligned address and
+// M::StoreRow(address,bytes) stores 16 bytes there (memory order).
 template<class M>
 inline void NativeSkeletalMultiply(const M& m,uint32_t out,uint32_t a,uint32_t b) {
   const __m128i reverse=_mm_setr_epi8(15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0);
@@ -342,6 +416,11 @@ inline void NativeSkeletalMultiply(const M& m,uint32_t out,uint32_t a,uint32_t b
   v13=hi(v11,v10);                  // vmrghw v13,v10,v11
   const __m128i row3=v13;           // stvx v13 -> r1-16
   const __m128i rows[4]{v0,row1,row2,row3};
+  if(!(out&0xFu)) {
+    // Aligned (every node world): all 16 bytes of each row, guest order.
+    for(uint32_t row=0;row<4;++row) m.StoreRow(out+row*16,_mm_shuffle_epi8(rows[row],reverse));
+    return;
+  }
   const uint32_t bytes=16u-(out&0xFu);
   for(uint32_t row=0;row<4;++row) {
     alignas(16) uint8_t lanes[16];

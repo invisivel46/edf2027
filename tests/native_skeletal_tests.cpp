@@ -39,6 +39,7 @@ struct Memory {
   void StoreU32(uint32_t a,uint32_t v) const { auto* p=At(a,4); for(int i=0;i<4;++i) p[i]=uint8_t(v>>(24-8*i)); }
   void StoreU64(uint32_t a,uint64_t v) const { StoreU32(a,uint32_t(v>>32)); StoreU32(a+4,uint32_t(v)); }
   const uint8_t* Row(uint32_t a) const { return At(a,16); }
+  void StoreRow(uint32_t a,__m128i bytes) const { _mm_storeu_si128(reinterpret_cast<__m128i*>(At(a,16)),bytes); }
 };
 
 // ---- Guest register form. ----
@@ -548,11 +549,36 @@ void RotationsMatchRenderHelpers() {
   }
   std::cout<<"rotX/rotY agree with native_render_instances.h\n";
 }
+// The batched sin/cos against NativeGuestSin/NativeGuestCos (the transcriptions
+// the render registry tests check against the recompiled bodies), bit for bit.
+void BatchedTrigMatchesScalar() {
+  Random r(11);
+  uint64_t values=0;
+  const auto check=[&](float angle) {
+    const double x[3]{double(angle),double(-angle),double(angle*0.5f)};
+    double s[3],c[3];
+    skeletal::NativeGuestSinCos3(x,s,c);
+    for(int k=0;k<3;++k) {
+      const uint32_t es=std::bit_cast<uint32_t>(float(NativeGuestSin(x[k]))),ec=std::bit_cast<uint32_t>(float(NativeGuestCos(x[k])));
+      const uint32_t gs=std::bit_cast<uint32_t>(float(s[k])),gc=std::bit_cast<uint32_t>(float(c[k]));
+      if(!(es==gs || (IsNan(es) && IsNan(gs))) || !(ec==gc || (IsNan(ec) && IsNan(gc)))) {
+        std::cerr<<"angle bits "<<std::hex<<std::bit_cast<uint32_t>(float(x[k]))<<" sin "<<es<<"/"<<gs<<" cos "<<ec<<"/"<<gc<<std::dec<<"\n";
+        throw std::runtime_error("batched sin/cos differ");
+      }
+    }
+    values+=3;
+  };
+  for(uint32_t i=0;i<2000000;++i) check(r.Awkward(20));
+  for(uint32_t i=0;i<2000000;++i) check(std::bit_cast<float>(uint32_t(r.engine())));  // every exponent
+  for(float k=-64;k<=64;k+=0.5f) check(k*1.5707963267948966f);
+  std::cout<<"batched sin/cos: "<<values<<" values match\n";
+}
 }  // namespace
 
 int main() {
   try {
     RotationsMatchRenderHelpers();
+    BatchedTrigMatchesScalar();
     EvaluationMatchesGuest();
     PropagationMatchesGuest(false);
     PropagationMatchesGuest(true);
