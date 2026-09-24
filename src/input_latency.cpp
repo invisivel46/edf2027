@@ -24,7 +24,8 @@
 REXCVAR_DEFINE_BOOL(edf_low_latency, true, "EDF2027",
                     "Low-latency presentation: the D3D12 presenter waits for the display just in time on its own "
                     "thread and shows the newest frame; with VSync on the renderer stays at most one frame ahead of "
-                    "the display, with one frame of GPU work in flight; mouse aim takes the newest motion. Applies live");
+                    "the display, with one frame of GPU work in flight (presentation parts only with VSync on); mouse aim "
+                    "takes the newest motion. Applies live");
 REXCVAR_DEFINE_BOOL(edf_native_input_latency_trace, false, "EDF2027",
                     "Trace input-to-photon latency of keyboard and mouse input and log percentiles per stage every "
                     "5 s (\"Input latency:\" lines, tools/latency-report.py). Diagnostic; applies live");
@@ -134,7 +135,10 @@ void WithTrace(F&& f) {
 
 }  // namespace
 
-bool LowLatency() { return REXCVAR_GET(edf_low_latency); }
+// With VSync off nothing queues behind the display, so the presenter wait and the one-frame GPU
+// credit only cost throughput (about 4.5% uncapped); the mouse path keeps the setting alone.
+bool LowLatency() { return REXCVAR_GET(edf_low_latency) && REXCVAR_GET(edf_native_vsync); }
+bool LowLatencySetting() { return REXCVAR_GET(edf_low_latency); }
 bool Enabled() { return REXCVAR_GET(edf_native_input_latency_trace); }
 int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())

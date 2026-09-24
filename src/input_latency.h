@@ -15,8 +15,11 @@ namespace edf::latency {
 // ticker thread before a paint (just in time, and never on the UI thread, which delivers
 // input) and shows the newest scene image; the scene producer keeps at most one image
 // ahead of the presenter with VSync on and one frame of GPU work in flight; the soldier's
-// aim takes the mouse motion that arrived after the step's pad poll too.
+// aim takes the mouse motion that arrived after the step's pad poll too. The presentation
+// parts apply only with VSync on: LowLatency() is the setting and VSync, LowLatencySetting()
+// the setting alone (the mouse path).
 bool LowLatency();
+bool LowLatencySetting();
 // edf_native_input_latency_trace.
 bool Enabled();
 int64_t NowNs();

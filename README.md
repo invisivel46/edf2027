@@ -145,7 +145,9 @@ This is a crop of the top-left corner.*
   frame ahead of the display. Measured with VSync on, uncapped, aiming with the
   mouse: the median input-to-photon time went from 42 ms to 18 ms, and the
   99th percentile went from 52 ms to 29 ms. With VSync on and a frame rate
-  above the display's, it can cost frame rate when the GPU is the limit.
+  above the display's, it can cost frame rate when the GPU is the limit. With
+  VSync off, only the mouse part applies (aim takes the newest motion): the
+  presentation part would cost about 5% of uncapped frame rate for no gain.
 - **Frame pacing** sets how a cap is held with VSync off: *Even* for steady
   frame times, or *Low latency*.
 - **CPU priority** keeps the game's two busiest threads on the performance

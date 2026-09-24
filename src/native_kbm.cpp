@@ -370,7 +370,7 @@ void InjectAim(uint8_t* base, uint32_t unit) {
   {
     GuestSide& guest = Guest();
     std::lock_guard lock(guest.mutex);
-    if (edf::latency::LowLatency() && REXCVAR_GET(edf_kbm_mouse_look)) {
+    if (edf::latency::LowLatencySetting() && REXCVAR_GET(edf_kbm_mouse_look)) {
       // edf_low_latency: the motion that arrived since this step's pad poll too (no smoothing,
       // no acceleration: the counts as they came, turned into an exact angle below).
       guest.router.OnAim(dx, dy, [](float& late_x, float& late_y) {
