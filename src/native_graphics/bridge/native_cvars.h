@@ -70,6 +70,7 @@ EDF_NATIVE_CVAR(int32_t, edf_native_frame_operations, 8192);
 EDF_NATIVE_CVAR(bool, edf_native_d3d12_debug_layer, false);
 EDF_NATIVE_CVAR(bool, edf_native_backend_present, true);
 EDF_NATIVE_CVAR(int32_t, edf_native_shader_workers, -1);
+EDF_NATIVE_CVAR(int32_t, edf_native_shader_precompile, -1);
 EDF_NATIVE_CVAR(bool, edf_native_backend_preview, false);
 EDF_NATIVE_CVAR(int32_t, edf_native_frame_latency, 2);
 

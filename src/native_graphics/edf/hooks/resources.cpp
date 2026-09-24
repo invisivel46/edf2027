@@ -18,6 +18,7 @@
 #include "../../native_declarations.h"
 #include "../../native_font_bindings.h"
 #include "../../native_load_trace.h"
+#include "../../native_shader_precompile.h"
 #include "../../d3d11_texture.h"
 #include "../../bridge/native_cvars.h"
 #include "../../bridge/bridge_state.h"
@@ -196,7 +197,11 @@ void RegisterShaders(const GuestReader& reader, uint32_t owner, const Effect& ef
   auto& workers = ShaderWorkers();
   std::vector<uint64_t> tickets;
   tickets.reserve(count);
-  const auto source_path = state.root / "Shader" / "guest.fx";
+  // The boot precompile (native_shader_precompile.h) compiles the disc's
+  // effects under this same path and in the same variants as the body below
+  // (PrepareGuestShaderEntry), so a registration after it is a cache hit. A
+  // variant added here must be added there, or it compiles here on a cold run.
+  const auto source_path = GuestEffectSourcePath(state.root);
   auto* device = state.device.Get();
   for (uint32_t i = 0; i < count; ++i)
     tickets.push_back(workers.Submit([&, i] {

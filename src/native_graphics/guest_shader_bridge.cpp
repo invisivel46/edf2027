@@ -35,6 +35,8 @@
 #include "native_queued_scene.h"
 #include "native_decode_workers.h"
 #include "native_first_use.h"
+#include "native_shader_precompile.h"
+#include "../version.h"
 #include "native_d3d12_preview.h"
 #include "native_host_surface.h"
 #include "guest_instance_parameters.h"
@@ -919,6 +921,31 @@ void SubmitSceneFrameLocked(Bridge& state) {
   }
 }
 
+namespace {
+// edf_native_shader_precompile (native_shader_precompile.h): from the moment
+// the game folder is known. Once per process; a warm cache makes it a stamp
+// check.
+void StartShaderPrecompile(const std::filesystem::path& game_root) {
+  const auto requested=REXCVAR_GET(edf_native_shader_precompile);
+  if(requested==0 || game_root.empty()) return;
+  edf::native::NativeShaderPrecompileOptions options;
+  options.game_root=game_root;
+  options.cache_directory=edf::native::NativeCacheDirectory();
+  options.build_identity=edf::version::Full();
+  // Half the cores, at most four: the game is loading on the others, and the
+  // precompile only has to finish before the game asks, not as fast as it can.
+  const auto cores=std::thread::hardware_concurrency();
+  options.threads=requested>0?uint32_t(requested):std::clamp(cores/2,1u,4u);
+  options.finished=[](const edf::native::NativeShaderPrecompileStatus& status) {
+    REXLOG_INFO("Native shader precompile: {} in {:.0f} ms; effects={} entries={} done={} failed={} compiles={}{}{}",
+      status.state_name(),status.elapsed_ms,status.effects,status.jobs,status.done,status.failed,status.compiles,
+      status.reason.empty()?"":"; ",status.reason);
+  };
+  REXLOG_INFO("Native shader precompile: starting on {} threads for {}",options.threads,game_root.string());
+  edf::native::StartNativeShaderPrecompile(std::move(options));
+}
+}  // namespace
+
 void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
   // Before anything can compile a shader.
   ApplyNativeCacheDirectory();
@@ -943,6 +970,7 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
   auto& state = State();
   std::lock_guard lock(state.mutex);
   state.root = game_root;
+  StartShaderPrecompile(game_root);
   // Native overlays may initialize the device before a game path/runtime
   // exists. The later OnPostSetup call supplies the root without replacing
   // a device already referenced by the host window and font textures.

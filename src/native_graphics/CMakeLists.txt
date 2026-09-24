@@ -3,7 +3,7 @@ target_include_directories(edf_native_effects PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 target_compile_features(edf_native_effects PUBLIC cxx_std_20)
 
 if(WIN32)
-    add_library(edf_native_d3d11 STATIC d3d11_backend.cpp d3d11_effect.cpp d3d11_bindings.cpp d3d11_texture.cpp d3d11_quads.cpp d3d11_sampler.cpp d3d11_render_state.cpp d3d11_mesh.cpp d3d11_completion.cpp d3d11_presenter.cpp d3d11_frame_compositor.cpp)
+    add_library(edf_native_d3d11 STATIC d3d11_backend.cpp d3d11_effect.cpp native_shader_precompile.cpp d3d11_bindings.cpp d3d11_texture.cpp d3d11_quads.cpp d3d11_sampler.cpp d3d11_render_state.cpp d3d11_mesh.cpp d3d11_completion.cpp d3d11_presenter.cpp d3d11_frame_compositor.cpp)
     target_link_libraries(edf_native_d3d11 PUBLIC edf_native_effects d3d11 d3dcompiler user32 dxgi OneCore)
     target_link_libraries(edf_native_d3d11 PUBLIC edf_native_d3d12)
     target_sources(edf_native_d3d11 PRIVATE d3d11_frame_handoff.cpp)
