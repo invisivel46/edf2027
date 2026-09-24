@@ -65,7 +65,7 @@ if(WIN32)
     target_sources(edf2027 PRIVATE src/native_graphics/edf/hooks/diagnostics.cpp
         src/native_graphics/edf/hooks/loading.cpp src/native_graphics/edf/hooks/resources.cpp
         src/native_graphics/edf/hooks/hud.cpp src/native_graphics/edf/hooks/effects.cpp
-        src/native_graphics/edf/hooks/post.cpp)
+        src/native_graphics/edf/hooks/post.cpp src/native_graphics/edf/hooks/buffers.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_full_frame_sky.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
@@ -389,7 +389,7 @@ if(BUILD_TESTING)
         add_custom_command(OUTPUT ${_native_tail_fixture}
             COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_native_tail_fixture}
                 -P ${CMAKE_SOURCE_DIR}/tools/extract-native-tail-test.cmake
-            DEPENDS ${_native_tail_shards} tools/extract-native-tail-test.cmake src/native_graphics/guest_shader_bridge.cpp VERBATIM)
+            DEPENDS ${_native_tail_shards} tools/extract-native-tail-test.cmake src/native_graphics/edf/hooks/buffers.cpp src/native_graphics/guest_shader_bridge.cpp VERBATIM)
         add_executable(edf_native_immediate_tail_tests tests/native_immediate_tail_tests.cpp ${_native_tail_fixture} ${_native_indexed_tail} ${_native_derived_tail} ${_native_shader_output_tail} ${_native_shader_upload_tail} ${_native_main_state_tail} ${_native_device_reset} ${_native_cache_range} ${_native_ring_submit})
         target_sources(edf_native_immediate_tail_tests PRIVATE ${_native_immediate_tail})
         target_sources(edf_native_immediate_tail_tests PRIVATE ${_native_shader_cache_tail})
