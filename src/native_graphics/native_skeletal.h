@@ -36,6 +36,15 @@
 //   the node+88 children (304 bytes each, from node+80) with node+240 as parent.
 //   821C8198 is VMX (vmsum4fp128 = DPPS 0xFF) with the guest flush mode on: the
 //   caller's hook turns it on before the first multiply, as the original does.
+//
+// Speed without new results: NativeSkeletalEvaluate builds four records'
+// rotations at once, one per AVX2 lane with each lane's operations exactly the
+// scalar ones (NativeSkeletalEvaluateScalar is the one-record reference), blends
+// four records per lane group the same way, memoises the constant rotations by
+// their angles' bits, and reads and writes whole 16-byte rows. The propagation's
+// multiply for an aligned world does DPPS's multiplies and adds with mulps/addps
+// in DPPS's order. Order across objects is untouched: all of it still runs in
+// each object's own update, on the engine thread.
 #include "native_render_instances.h"
 #include <immintrin.h>
 #include <array>
@@ -194,6 +203,83 @@ inline void RotationXYZ(Rows& m,const double* angles,double one,double zero) {
     m[row]=Fms(x,c[2],ys);
   }
 }
+// ---- Four records at once (NativeSkeletalEvaluate's batched rotations). ----
+// Each lane is one record and carries exactly the scalar code's operations in its
+// order: F is the same float round trip (cvtpd2ps/cvtps2pd round and widen as
+// cvtsd2ss/cvtss2sd do, lane by lane, under the same MXCSR), Fma/Fms the same
+// double fma then F. So each lane's bits are the scalar function's.
+namespace lanes {
+inline __m256d F(__m256d x) { return _mm256_cvtps_pd(_mm256_cvtpd_ps(x)); }
+inline __m256d Fma(__m256d a,__m256d c,__m256d b) { return F(_mm256_fmadd_pd(a,c,b)); }  // fmadds
+inline __m256d Fms(__m256d a,__m256d c,__m256d b) { return F(_mm256_fmsub_pd(a,c,b)); }  // fmsubs: a*c-b, one rounding
+inline __m256d Sin(__m256d x) { return NativeGuestSinCos4(x,_mm256_setzero_pd()); }
+inline __m256d Cos(__m256d x) { return NativeGuestSinCos4(x,_mm256_castsi256_pd(_mm256_set1_epi64x(-1))); }
+// RotationXYZ per lane: m[k] holds element k of rows 0-2 for the four records.
+inline void RotationXYZ(__m256d* m,__m256d ax,__m256d ay,__m256d az,__m256d one,__m256d zero) {
+  const __m256d s0=F(Sin(ax)),s1=F(Sin(ay)),s2=F(Sin(az));
+  const __m256d c0=F(Cos(ax)),c1=F(Cos(ay)),c2=F(Cos(az));
+  m[0]=one; m[1]=zero; m[2]=zero; m[3]=zero;
+  m[4]=zero; m[5]=c0; m[6]=s0; m[7]=zero;
+  m[8]=zero; m[9]=_mm256_xor_pd(s0,_mm256_set1_pd(-0.0)); m[10]=c0; m[11]=zero;
+  {
+    const __m256d x=m[0],z=m[2];
+    const __m256d xs=F(_mm256_mul_pd(x,s1)),zs=F(_mm256_mul_pd(z,s1));
+    m[2]=Fms(z,c1,xs);
+    m[0]=Fma(x,c1,zs);
+  }
+  {
+    const __m256d x=m[4],xc=F(_mm256_mul_pd(x,c1)),z=m[6],xs=F(_mm256_mul_pd(x,s1));
+    const __m256d nx=Fma(z,s1,xc);
+    m[6]=Fms(z,c1,xs);
+    m[4]=nx;
+  }
+  {
+    const __m256d x=m[8],xs=F(_mm256_mul_pd(x,s1)),z=m[10],xc=F(_mm256_mul_pd(x,c1));
+    m[10]=Fms(z,c1,xs);
+    m[8]=Fma(z,s1,xc);
+  }
+  for(size_t row=0;row<12;row+=4) {
+    const __m256d x=m[row],y=m[row+1];
+    const __m256d xs=F(_mm256_mul_pd(x,s2)),ys=F(_mm256_mul_pd(y,s2));
+    m[row+1]=Fma(y,c2,xs);
+    m[row]=Fms(x,c2,ys);
+  }
+}
+// 821B0320 per lane (skeletal::Normalize below): a lane whose squared length
+// equals zero stores zeros.
+inline void Normalize(__m256d* v,__m256d length,__m256d zero) {
+  const __m256d y=v[1];
+  __m256d squared=F(_mm256_mul_pd(y,y));
+  const __m256d x=v[0],z=v[2];
+  squared=Fma(x,x,squared);
+  squared=Fma(z,z,squared);
+  const __m256d is_zero=_mm256_cmp_pd(squared,zero,_CMP_EQ_OQ);
+  const __m256d scale=F(_mm256_div_pd(length,F(_mm256_sqrt_pd(squared))));
+  v[0]=_mm256_blendv_pd(F(_mm256_mul_pd(x,scale)),zero,is_zero);
+  v[1]=_mm256_blendv_pd(F(_mm256_mul_pd(y,scale)),zero,is_zero);
+  v[2]=_mm256_blendv_pd(F(_mm256_mul_pd(z,scale)),zero,is_zero);
+}
+// 821C84C8 per lane (skeletal::Orthonormalize below).
+inline void Orthonormalize(__m256d* r0,__m256d* r1,__m256d* r2,__m256d one,__m256d zero) {
+  const auto mul=[](__m256d a,__m256d b) { return F(_mm256_mul_pd(a,b)); };
+  r0[0]=Fms(r2[2],r1[1],mul(r2[1],r1[2]));
+  r0[1]=Fms(r1[2],r2[0],mul(r2[2],r1[0]));
+  r0[2]=Fms(r2[1],r1[0],mul(r1[1],r2[0]));
+  r1[0]=Fms(r2[1],r0[2],mul(r0[1],r2[2]));
+  r1[1]=Fms(r0[0],r2[2],mul(r2[0],r0[2]));
+  r1[2]=Fms(r2[0],r0[1],mul(r2[1],r0[0]));
+  Normalize(r0,one,zero);
+  Normalize(r1,one,zero);
+  Normalize(r2,one,zero);
+}
+// NativeSkeletalKeyLerp's element k per lane: first/second are the int16 keys.
+inline __m256d KeyLerp(__m128i first,__m128i second,__m256d frac,__m256d reciprocal) {
+  const __m256d a=F(_mm256_cvtepi32_pd(first)),b=F(_mm256_cvtepi32_pd(second));
+  const __m256d delta=F(_mm256_sub_pd(b,a));
+  return F(_mm256_mul_pd(Fma(delta,frac,a),reciprocal));
+}
+}  // namespace lanes
+
 // 821B0320(v,length): v scaled to length; a zero squared length stores zeros.
 inline void Normalize(double* v,double length,double zero) {
   const double y=v[1];
@@ -242,9 +328,11 @@ inline void NativeSkeletalKeyLerp(const M& m,double* dest,uint32_t a,uint32_t b,
   }
 }
 
-// sub_821CE848 (edf2017_recomp.74.cpp:8866).
+// sub_821CE848 (edf2017_recomp.74.cpp:8866), one record at a time in the
+// original's statement order: the reference NativeSkeletalEvaluate is checked
+// against (and the edf_native_skeletal_batched=false route).
 template<class M>
-NativeSkeletalEvalStats NativeSkeletalEvaluate(const M& m,uint32_t slot) {
+NativeSkeletalEvalStats NativeSkeletalEvaluateScalar(const M& m,uint32_t slot) {
   using namespace skeletal;
   using S=NativeSkeletal;
   NativeSkeletalEvalStats stats;
@@ -357,6 +445,352 @@ NativeSkeletalEvalStats NativeSkeletalEvaluate(const M& m,uint32_t slot) {
   return stats;
 }
 
+// ---- The batched evaluation. ----
+// A memo of the constant rotations (channel flag 16). RotationXYZ's rows are a
+// pure function of the three angles' single bits, given the image constants one
+// (1.0f) and zero (+0.0f) and the MXCSR rounding and flush bits (round to nearest,
+// FTZ and DAZ off): the evaluation uses the memo only under exactly those, the
+// state every entry was computed in, so a hit stores the bits a computation would.
+// Direct mapped by the source channel's address (the same clip data serves every
+// object of a kind); the channel only picks the slot and the angle bits decide a
+// hit. Entries hold the guest bytes of record+16..+63.
+struct NativeSkeletalRotationCache {
+  struct Entry { uint32_t channel=0,angles[3]{}; alignas(16) uint8_t rows[48]{}; };
+  static constexpr uint32_t bits=10,size=1u<<bits;
+  Entry entries[size];
+  uint64_t hits=0,misses=0;
+  static uint32_t Slot(uint32_t channel) { return (channel*0x9E3779B1u)>>(32-bits); }
+  static bool Usable(uint32_t one_bits,uint32_t zero_bits,uint32_t csr) {
+    return one_bits==0x3F800000u && zero_bits==0 && !(csr&0xE040u);
+  }
+};
+
+// 16 guest bytes in memory order at any address (M::Row/M::StoreRow take any
+// address here); a row straddling 0xE0000000 (the host view jumps there) goes
+// byte by byte.
+template<class M>
+inline __m128i NativeSkeletalLoadBytes(const M& m,uint32_t address) {
+  if(address-0xDFFFFFF1u<15u) {
+    alignas(16) uint8_t bytes[16];
+    for(uint32_t i=0;i<16;++i) bytes[i]=m.U8(address+i);
+    return _mm_load_si128(reinterpret_cast<const __m128i*>(bytes));
+  }
+  return _mm_loadu_si128(reinterpret_cast<const __m128i*>(m.Row(address)));
+}
+template<class M>
+inline void NativeSkeletalStoreBytes(const M& m,uint32_t address,__m128i value) {
+  if(address-0xDFFFFFF1u<15u) {
+    alignas(16) uint8_t bytes[16];
+    _mm_store_si128(reinterpret_cast<__m128i*>(bytes),value);
+    for(uint32_t i=0;i<16;++i) m.StoreU8(address+i,bytes[i]);
+    return;
+  }
+  m.StoreRow(address,value);
+}
+// A guest structure [address, address+size): through one host pointer when M
+// offers it (M::Host: null for a range crossing 0xE0000000), else access by
+// access through M. The same bytes either way.
+template<class M>
+struct NativeSkeletalBytes {
+  const M& m;
+  uint32_t address;
+  uint8_t* host=nullptr;
+  NativeSkeletalBytes(const M& memory,uint32_t at,uint32_t size):m(memory),address(at) {
+    if constexpr(requires { memory.Host(at,size); }) host=memory.Host(at,size);
+  }
+  uint32_t U32(uint32_t offset) const {
+    if(!host) return m.U32(address+offset);
+    uint32_t v; std::memcpy(&v,host+offset,4); return std::byteswap(v);
+  }
+  uint8_t U8(uint32_t offset) const { return host?host[offset]:m.U8(address+offset); }
+  __m128i Load(uint32_t offset) const {
+    return host?_mm_loadu_si128(reinterpret_cast<const __m128i*>(host+offset)):NativeSkeletalLoadBytes(m,address+offset);
+  }
+  void Store(uint32_t offset,__m128i value) const {
+    if(host) _mm_storeu_si128(reinterpret_cast<__m128i*>(host+offset),value);
+    else NativeSkeletalStoreBytes(m,address+offset,value);
+  }
+};
+// A cache hint for the line holding a guest address, when M offers one
+// (M::Prefetch; never faults, no effect on memory).
+template<class M>
+inline void NativeSkeletalPrefetch(const M& m,uint32_t address) {
+  if constexpr(requires { m.Prefetch(address); }) m.Prefetch(address);
+}
+// Big-endian words <-> host floats, four at a time.
+inline __m128i NativeSkeletalSwapWords(__m128i v) {
+  return _mm_shuffle_epi8(v,_mm_setr_epi8(3,2,1,0,7,6,5,4,11,10,9,8,15,14,13,12));
+}
+
+// Up to 64 rotations the record loop queued: keyed (flag 2: the two int16
+// palette triples, the divisor) or constant (flag 16 whose memo missed: the
+// angles), built four records at a time.
+struct NativeSkeletalRotationBatch {
+  static constexpr uint32_t capacity=64;
+  alignas(32) int32_t first[3][capacity],second[3][capacity];
+  alignas(32) double divisor[capacity],constant[3][capacity];
+  alignas(32) int64_t is_constant[capacity];
+  uint32_t record[capacity];
+  uint8_t* record_host[capacity];   // NativeSkeletalBytes::host of the record
+  NativeSkeletalRotationCache::Entry* fill[capacity];
+  uint32_t count=0;
+};
+
+template<class M>
+void NativeSkeletalFlushRotations(const M& m,NativeSkeletalRotationBatch& batch,double frac,double one,double zero) {
+  using S=NativeSkeletal;
+  const uint32_t count=batch.count;
+  if(!count) return;
+  // Lanes past the end: harmless inputs, never stored.
+  for(uint32_t j=count;j<((count+3u)&~3u);++j) {
+    for(uint32_t k=0;k<3;++k) { batch.first[k][j]=batch.second[k][j]=0; batch.constant[k][j]=zero; }
+    batch.divisor[j]=one; batch.is_constant[j]=-1; batch.record[j]=0; batch.record_host[j]=nullptr; batch.fill[j]=nullptr;
+  }
+  const __m256d vfrac=_mm256_set1_pd(frac),vone=_mm256_set1_pd(one),vzero=_mm256_set1_pd(zero);
+  for(uint32_t j=0;j<count;j+=4) {
+    const __m256d reciprocal=skeletal::lanes::F(_mm256_div_pd(vone,_mm256_load_pd(batch.divisor+j)));
+    const __m256d constant=_mm256_castsi256_pd(_mm256_load_si256(reinterpret_cast<const __m256i*>(batch.is_constant+j)));
+    __m256d angle[3];
+    for(uint32_t k=0;k<3;++k) {
+      const __m256d keyed=skeletal::lanes::KeyLerp(_mm_load_si128(reinterpret_cast<const __m128i*>(batch.first[k]+j)),
+        _mm_load_si128(reinterpret_cast<const __m128i*>(batch.second[k]+j)),vfrac,reciprocal);
+      angle[k]=_mm256_blendv_pd(keyed,_mm256_load_pd(batch.constant[k]+j),constant);
+    }
+    __m256d rows[12];
+    skeletal::lanes::RotationXYZ(rows,angle[0],angle[1],angle[2],vone,vzero);
+    // Element-major (4 records per vector) to record-major rows of 4 floats.
+    __m128 r[12];
+    for(uint32_t e=0;e<12;++e) r[e]=_mm256_cvtpd_ps(rows[e]);
+    for(uint32_t row=0;row<3;++row) _MM_TRANSPOSE4_PS(r[row*4],r[row*4+1],r[row*4+2],r[row*4+3]);
+    const uint32_t lanes_used=count-j<4u?count-j:4u;
+    for(uint32_t lane=0;lane<lanes_used;++lane) {
+      const uint32_t record=batch.record[j+lane];
+      uint8_t* const host=batch.record_host[j+lane];
+      NativeSkeletalRotationCache::Entry* fill=batch.fill[j+lane];
+      for(uint32_t row=0;row<3;++row) {
+        const __m128i bytes=NativeSkeletalSwapWords(_mm_castps_si128(r[row*4+lane]));
+        if(host) _mm_storeu_si128(reinterpret_cast<__m128i*>(host+S::record_rotation+row*16),bytes);
+        else NativeSkeletalStoreBytes(m,record+S::record_rotation+row*16,bytes);
+        if(fill) _mm_store_si128(reinterpret_cast<__m128i*>(fill->rows+row*16),bytes);
+      }
+    }
+  }
+  batch.count=0;
+}
+
+// sub_821CE848 (edf2017_recomp.74.cpp:8866), the same results as
+// NativeSkeletalEvaluateScalar with the work reordered where nothing can observe
+// it: each record's rotation is built later than its translation and scale (the
+// three write disjoint parts of the record, and nothing in the loop reads a
+// record), four records' rotations at a time (lanes), a constant rotation comes
+// from the memo when it holds, and a group the original writes twice (flags 1
+// and 8, 2 and 16, 4 and 32) is written once with the second value. Records
+// never overlap the clip data they read (a record is heap, a clip is the
+// model's file image). The blend and the final copy to the node locals run
+// afterwards in record order as before (the copy with 16-byte rows).
+template<class M>
+NativeSkeletalEvalStats NativeSkeletalEvaluate(const M& m,uint32_t slot,NativeSkeletalRotationCache* cache=nullptr) {
+  using namespace skeletal;
+  using S=NativeSkeletal;
+  NativeSkeletalEvalStats stats;
+  const uint32_t palette=m.U32(slot+S::slot_palette);
+  if(!palette) return stats;
+  const uint32_t one_bits=m.U32(S::one_address),zero_bits=m.U32(S::zero_address);
+  const double one=double(std::bit_cast<float>(one_bits)),zero=double(std::bit_cast<float>(zero_bits));
+  if(cache && !NativeSkeletalRotationCache::Usable(one_bits,zero_bits,_mm_getcsr())) cache=nullptr;
+  const double time=NativeSkeletalLoadFloat(m,slot+S::slot_time),end=NativeSkeletalLoadFloat(m,slot+S::slot_end);
+  uint32_t frame;
+  double frac;
+  if(time<end) {
+    frame=Fctiwz(time);
+    frac=F(time-F(double(int64_t(int32_t(frame)))));
+  } else {
+    frame=Fctiwz(time)-1u;
+    frac=one;
+  }
+  const uint32_t next=frame+1u;
+  const uint32_t records=m.U32(slot+S::slot_records);
+  const uint32_t count=m.U32(slot+S::slot_record_count);
+  const uint32_t records_end=records+count*S::record_size;
+  const auto key_address=[&](uint32_t key) { return palette+uint32_t(int32_t(int16_t(m.U16(key))))*6u; };
+  // A translation or scale (3 words) goes into its 16-byte row with the row's
+  // fourth word written back as it is, so the copy's 16-byte loads below read
+  // one 16-byte store (store forwarding). Singles in, singles out, through
+  // double as lfs/stfs are (a signalling NaN comes out quiet, as there).
+  const auto store3=[&](const NativeSkeletalBytes<M>& rec,uint32_t offset,__m128 values) {
+    const __m128i row=rec.Load(offset);
+    const __m128i bytes=NativeSkeletalSwapWords(_mm_castps_si128(_mm256_cvtpd_ps(_mm256_cvtps_pd(values))));
+    rec.Store(offset,_mm_blend_epi32(bytes,row,0x8));
+  };
+  const auto lerp3=[&](const NativeSkeletalBytes<M>& rec,uint32_t offset,uint32_t a,uint32_t b,double divisor) {
+    double v[3];
+    NativeSkeletalKeyLerp(m,v,a,b,frac,divisor,one);
+    store3(rec,offset,_mm_setr_ps(float(v[0]),float(v[1]),float(v[2]),0.0f));
+  };
+  stats.records=count;
+  NativeSkeletalRotationBatch batch;
+  for(uint32_t record=records;record!=records_end;record+=S::record_size) {
+    const NativeSkeletalBytes<M> rec(m,record,S::record_size);
+    // The copy at the end reads each record's bone struct and then its node
+    // local, lines a step old: ask for the bone now and, eight records on (its
+    // line in by then), for the local.
+    NativeSkeletalPrefetch(m,rec.U32(S::record_bone));
+    if(record-records>=8*S::record_size) {
+      const uint32_t earlier_bone=m.U32(record-8*S::record_size+S::record_bone);
+      const uint32_t local=m.U32(earlier_bone+S::bone_local);
+      NativeSkeletalPrefetch(m,local); NativeSkeletalPrefetch(m,local+63);
+    }
+    const uint32_t channel=rec.U32(S::record_channel);
+    // The 64-byte source channel as host words: c0 = +0..+12 (name, flags,
+    // translation and rotation divisors), c1 = +16..+28 (scale divisor, stream,
+    // stride, translation x), c2 = +32..+44, c3 = +48..+60.
+    const NativeSkeletalBytes<M> source(m,channel,64);
+    const __m128i c0=NativeSkeletalSwapWords(source.Load(0));
+    const __m128i c1=NativeSkeletalSwapWords(source.Load(16));
+    const __m128i c2=NativeSkeletalSwapWords(source.Load(32));
+    const __m128i c3=NativeSkeletalSwapWords(source.Load(48));
+    const uint32_t flags=uint32_t(_mm_extract_epi32(c0,1));
+    const uint32_t stream=uint32_t(_mm_extract_epi32(c1,1));
+    const uint32_t stride=uint32_t(_mm_extract_epi32(c1,2));
+    const auto word_float=[](__m128i v,int lane) { return double(std::bit_cast<float>(uint32_t(
+      lane==0?_mm_cvtsi128_si32(v):lane==1?_mm_extract_epi32(v,1):lane==2?_mm_extract_epi32(v,2):_mm_extract_epi32(v,3)))); };
+    uint32_t key0=((stride*frame)<<1)+stream+channel;
+    uint32_t key1=((next*stride)<<1)+stream+channel;
+    if(flags&8u) {
+      store3(rec,S::record_translation,_mm_castsi128_ps(_mm_alignr_epi8(c2,c1,12)));   // +28..+36
+    } else if(flags&1u) {
+      lerp3(rec,S::record_translation,key_address(key0),key_address(key1),word_float(c0,2));
+    }
+    if(flags&1u) { key0+=2; key1+=2; }
+    if(flags&16u) {
+      const __m128i angles=_mm_alignr_epi8(c3,c2,8);   // +40..+48
+      const uint32_t a=uint32_t(_mm_cvtsi128_si32(angles)),b=uint32_t(_mm_extract_epi32(angles,1)),
+        c=uint32_t(_mm_extract_epi32(angles,2));
+      NativeSkeletalRotationCache::Entry* fill=nullptr;
+      if(cache) {
+        auto& entry=cache->entries[NativeSkeletalRotationCache::Slot(channel)];
+        if(entry.channel==channel && entry.angles[0]==a && entry.angles[1]==b && entry.angles[2]==c) {
+          ++cache->hits;
+          for(uint32_t row=0;row<3;++row)
+            rec.Store(S::record_rotation+row*16,_mm_load_si128(reinterpret_cast<const __m128i*>(entry.rows+row*16)));
+        } else {
+          ++cache->misses;
+          // Untagged until the rows are in (the batch is built right below).
+          entry.channel=0; entry.angles[0]=a; entry.angles[1]=b; entry.angles[2]=c;
+          fill=&entry;
+        }
+      }
+      if(!cache || fill) {
+        const uint32_t j=batch.count++;
+        batch.record[j]=record; batch.record_host[j]=rec.host; batch.fill[j]=fill; batch.is_constant[j]=-1;
+        batch.constant[0][j]=double(std::bit_cast<float>(a));
+        batch.constant[1][j]=double(std::bit_cast<float>(b));
+        batch.constant[2][j]=double(std::bit_cast<float>(c));
+        batch.divisor[j]=one;
+        for(uint32_t k=0;k<3;++k) batch.first[k][j]=batch.second[k][j]=0;
+        if(fill) { NativeSkeletalFlushRotations(m,batch,frac,one,zero); fill->channel=channel; }
+      }
+    } else if(flags&2u) {
+      const uint32_t j=batch.count++;
+      batch.record[j]=record; batch.record_host[j]=rec.host; batch.fill[j]=nullptr; batch.is_constant[j]=0;
+      const uint32_t a=key_address(key0),b=key_address(key1);
+      for(uint32_t k=0;k<3;++k) {
+        batch.first[k][j]=int16_t(m.U16(a+k*2));
+        batch.second[k][j]=int16_t(m.U16(b+k*2));
+      }
+      batch.divisor[j]=word_float(c0,3);
+      for(uint32_t k=0;k<3;++k) batch.constant[k][j]=zero;
+    }
+    if(flags&2u) { key0+=2; key1+=2; }
+    if(flags&32u) {
+      store3(rec,S::record_scale,_mm_castsi128_ps(_mm_srli_si128(c3,4)));   // +52..+60
+    } else if(flags&4u) {
+      lerp3(rec,S::record_scale,key_address(key0),key_address(key1),word_float(c1,0));
+    }
+    if(batch.count==NativeSkeletalRotationBatch::capacity) NativeSkeletalFlushRotations(m,batch,frac,one,zero);
+  }
+  NativeSkeletalFlushRotations(m,batch,frac,one,zero);
+  if(m.U8(slot+S::slot_blending)) {
+    stats.blended=true;
+    double w=F(NativeSkeletalLoadFloat(m,slot+S::slot_blend_clock)/NativeSkeletalLoadFloat(m,slot+S::slot_blend_length));
+    if(!(w<one)) { w=one; m.StoreU8(slot+S::slot_blending,0); }
+    const double keep=F(one-w);
+    // Four records at a time, one per lane, each with the scalar blend's
+    // operations (the records are disjoint and the snapshots only read). Rows
+    // are loaded and stored whole: the words the blend does not write (each
+    // row's fourth) go back as they were.
+    using namespace skeletal::lanes;
+    const __m256d vkeep=_mm256_set1_pd(keep),vone=_mm256_set1_pd(one),vzero=_mm256_set1_pd(zero);
+    const auto wide=[](__m128 v) { return _mm256_cvtps_pd(v); };
+    for(uint32_t first=records;first!=records_end;) {
+      uint32_t record[4],bone[4],n=0;
+      for(;n<4 && first!=records_end;++n,first+=S::record_size) { record[n]=first; bone[n]=m.U32(first+S::record_bone); }
+      for(uint32_t lane=n;lane<4;++lane) { record[lane]=record[0]; bone[lane]=bone[0]; }
+      // Element-major: v[k] holds element k of the four records' rows.
+      const auto load=[&](const uint32_t* base,uint32_t offset,__m128* v) {
+        for(uint32_t lane=0;lane<4;++lane)
+          v[lane]=_mm_castsi128_ps(NativeSkeletalSwapWords(NativeSkeletalLoadBytes(m,base[lane]+offset)));
+        _MM_TRANSPOSE4_PS(v[0],v[1],v[2],v[3]);
+      };
+      const auto store=[&](uint32_t offset,__m128* v) {
+        _MM_TRANSPOSE4_PS(v[0],v[1],v[2],v[3]);
+        for(uint32_t lane=0;lane<n;++lane)
+          NativeSkeletalStoreBytes(m,record[lane]+offset,NativeSkeletalSwapWords(_mm_castps_si128(v[lane])));
+      };
+      __m128 t[4],snap_t[4];
+      load(record,S::record_translation,t); load(bone,S::bone_translation,snap_t);
+      for(uint32_t k=0;k<3;++k) {
+        const __m256d current=wide(t[k]),snapshot=wide(snap_t[k]);
+        t[k]=_mm256_cvtpd_ps(F(_mm256_add_pd(F(_mm256_mul_pd(F(_mm256_sub_pd(snapshot,current)),vkeep)),current)));
+      }
+      // 821C8480(rec+16, B+16, 1-w), then 821C84C8(rec+16).
+      __m128 r[3][4],snap_r[3][4];
+      __m256d rows[3][3];
+      for(uint32_t row=0;row<3;++row) {
+        load(record,S::record_rotation+row*16,r[row]); load(bone,S::bone_rotation+row*16,snap_r[row]);
+        for(uint32_t c=0;c<3;++c) {
+          const __m256d a=wide(r[row][c]),b=wide(snap_r[row][c]);
+          rows[row][c]=Fma(F(_mm256_sub_pd(b,a)),vkeep,a);
+        }
+      }
+      Orthonormalize(rows[0],rows[1],rows[2],vone,vzero);
+      for(uint32_t row=0;row<3;++row) for(uint32_t c=0;c<3;++c) r[row][c]=_mm256_cvtpd_ps(rows[row][c]);
+      __m128 s[4],snap_s[4];
+      load(record,S::record_scale,s); load(bone,S::bone_scale,snap_s);
+      for(uint32_t k=0;k<3;++k) {
+        const __m256d current=wide(s[k]),snapshot=wide(snap_s[k]);
+        s[k]=_mm256_cvtpd_ps(F(_mm256_add_pd(current,F(_mm256_mul_pd(F(_mm256_sub_pd(snapshot,current)),vkeep)))));
+      }
+      store(S::record_translation,t);
+      for(uint32_t row=0;row<3;++row) store(S::record_rotation+row*16,r[row]);
+      store(S::record_scale,s);
+    }
+  }
+  // The copy: rows 0-2 of the rotation times the scale (elements 0-2; a float
+  // multiply is the rounding of the exact product, as F(x*s) of two singles),
+  // their w words and row 3 (translation, +76) as they are.
+  uint32_t copies=0;
+  for(uint32_t record=records;record!=records_end;record+=S::record_size) {
+    const NativeSkeletalBytes<M> rec(m,record,S::record_size);
+    const NativeSkeletalBytes<M> bone(m,rec.U32(S::record_bone),8);
+    if(!bone.U8(S::bone_enabled)) continue;
+    ++copies;
+    const NativeSkeletalBytes<M> local(m,bone.U32(S::bone_local),64);
+    const __m128 scale=_mm_castsi128_ps(NativeSkeletalSwapWords(rec.Load(S::record_scale)));
+    const __m128i row3=rec.Load(S::record_translation);
+    __m128i out[3];
+    for(uint32_t row=0;row<3;++row) {
+      const __m128 v=_mm_castsi128_ps(NativeSkeletalSwapWords(rec.Load(S::record_rotation+row*16)));
+      const __m128 s=row==0?_mm_shuffle_ps(scale,scale,0x00):row==1?_mm_shuffle_ps(scale,scale,0x55):_mm_shuffle_ps(scale,scale,0xAA);
+      out[row]=NativeSkeletalSwapWords(_mm_castps_si128(_mm_blend_ps(_mm_mul_ps(v,s),v,0x8)));
+    }
+    for(uint32_t row=0;row<3;++row) local.Store(row*16,out[row]);
+    local.Store(48,row3);
+  }
+  stats.copies=copies;
+  return stats;
+}
+
 // sub_821C8198 (edf2017_recomp.79.cpp:8666): out = a x b with the recompiled
 // body's own vector operations (the same byte-reversed lanes, unpacks and DPPS),
 // so the guest flush mode must already be on. lvx128 reads the 16-byte aligned
@@ -457,12 +891,35 @@ inline void NativeSkeletalMultiply(const M& m,uint32_t out,uint32_t a,uint32_t b
   }
 }
 
+// NativeSkeletalMultiply without the stack writes, for a 16-byte aligned out:
+// each output element is the DPPS 0xFF sum over its row of a and column of b,
+// ((l0+l1)+(l2+l3)) with lane l the guest element 3-l, so
+// (a3*b3c + a2*b2c) + (a1*b1c + a0*b0c): the same single-precision multiplies
+// and adds in the same order under the same MXCSR, done for the four columns at
+// once with mulps/addps instead of sixteen DPPS and their unpacks.
+template<class M>
+inline void NativeSkeletalMultiplyRows(const M& m,uint32_t out,uint32_t a,uint32_t b) {
+  const auto load=[&](uint32_t address) {   // lvx128: the aligned row, as host floats in guest order
+    return _mm_castsi128_ps(NativeSkeletalSwapWords(_mm_loadu_si128(reinterpret_cast<const __m128i*>(m.Row(address&~0xFu)))));
+  };
+  const __m128 b0=load(b),b1=load(b+16),b2=load(b+32),b3=load(b+48);
+  __m128 rows[4];
+  for(uint32_t row=0;row<4;++row) {
+    const __m128 x=load(a+row*16);
+    const __m128 t0=_mm_mul_ps(_mm_shuffle_ps(x,x,0x00),b0),t1=_mm_mul_ps(_mm_shuffle_ps(x,x,0x55),b1);
+    const __m128 t2=_mm_mul_ps(_mm_shuffle_ps(x,x,0xAA),b2),t3=_mm_mul_ps(_mm_shuffle_ps(x,x,0xFF),b3);
+    rows[row]=_mm_add_ps(_mm_add_ps(t3,t2),_mm_add_ps(t1,t0));
+  }
+  for(uint32_t row=0;row<4;++row) m.StoreRow(out+row*16,NativeSkeletalSwapWords(_mm_castps_si128(rows[row])));
+}
+
 // sub_821D1688 (edf2017_recomp.52.cpp:8930): the node's world, then its children's.
 // Returns the nodes written.
 template<class M>
 uint32_t NativeSkeletalPropagate(const M& m,uint32_t node,uint32_t parent) {
   using S=NativeSkeletal;
-  NativeSkeletalMultiply(m,node+S::node_world,node+S::node_local,parent);
+  if(!((node+S::node_world)&0xFu)) NativeSkeletalMultiplyRows(m,node+S::node_world,node+S::node_local,parent);
+  else NativeSkeletalMultiply(m,node+S::node_world,node+S::node_local,parent);
   uint32_t nodes=1;
   const uint32_t count=m.U32(node+S::node_child_count);
   for(uint32_t i=0,offset=0;i<count;++i,offset+=S::node_size)

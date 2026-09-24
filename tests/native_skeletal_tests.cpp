@@ -4,6 +4,10 @@
 // form, over synthetic big-endian guest memory. The transcriptions write the
 // guest stack scratch the originals write (in a stack area the comparison
 // skips); everything else must match bit for bit, a NaN matching any NaN.
+// 821CE848 is checked three ways: one record at a time
+// (NativeSkeletalEvaluateScalar), batched (NativeSkeletalEvaluate, four records'
+// rotations per AVX2 lane group) and batched with the constant-rotation memo,
+// filled and then hit.
 #include "native_graphics/native_skeletal.h"
 #include <immintrin.h>
 #include <array>
@@ -40,6 +44,21 @@ struct Memory {
   void StoreU64(uint32_t a,uint64_t v) const { StoreU32(a,uint32_t(v>>32)); StoreU32(a+4,uint32_t(v)); }
   const uint8_t* Row(uint32_t a) const { return At(a,16); }
   void StoreRow(uint32_t a,__m128i bytes) const { _mm_storeu_si128(reinterpret_cast<__m128i*>(At(a,16)),bytes); }
+  // A structure's bytes through one pointer (NativeSkeletalBytes).
+  uint8_t* Host(uint32_t a,uint32_t size) const { return At(a,size); }
+};
+// The same memory without Host: NativeSkeletalBytes goes access by access.
+struct PlainMemory {
+  const Memory& m;
+  uint8_t U8(uint32_t a) const { return m.U8(a); }
+  uint16_t U16(uint32_t a) const { return m.U16(a); }
+  uint32_t U32(uint32_t a) const { return m.U32(a); }
+  uint64_t U64(uint32_t a) const { return m.U64(a); }
+  void StoreU8(uint32_t a,uint8_t v) const { m.StoreU8(a,v); }
+  void StoreU32(uint32_t a,uint32_t v) const { m.StoreU32(a,v); }
+  void StoreU64(uint32_t a,uint64_t v) const { m.StoreU64(a,v); }
+  const uint8_t* Row(uint32_t a) const { return m.Row(a); }
+  void StoreRow(uint32_t a,__m128i bytes) const { m.StoreRow(a,bytes); }
 };
 
 // ---- Guest register form. ----
@@ -391,10 +410,10 @@ void RequireSame(const std::vector<uint8_t>& a,const std::vector<uint8_t>& b,uin
     }
   }
 }
-std::vector<uint8_t> Image() {
+std::vector<uint8_t> Image(float one=1.0f,float zero=0.0f) {
   std::vector<uint8_t> image(0x1000,0);
   const auto put=[&](uint32_t a,float v) { const uint32_t b=std::bit_cast<uint32_t>(v); for(int i=0;i<4;++i) image[a-kImage+i]=uint8_t(b>>(24-8*i)); };
-  put(0x820008CC,1.0f); put(0x820009A4,0.0f);
+  put(0x820008CC,one); put(0x820009A4,zero);
   return image;
 }
 struct Random {
@@ -420,7 +439,7 @@ struct Random {
   }
 };
 
-constexpr uint32_t kHeap=0xB0000,kTreeHeap=0x40000;
+constexpr uint32_t kHeap=0xD0000,kTreeHeap=0x40000;
 constexpr uint32_t kSlot=0x1000,kStackTop=0x3000,kStackBottom=0x2000,kPalette=0x10000,kChannels=0x20000,
   kRecords=0x40000,kBones=0x60000,kLocals=0x80000,kStreams=0xA0000;
 
@@ -488,21 +507,157 @@ bool FrameInStreams(const Memory& m) {
 
 void EvaluationMatchesGuest() {
   Random r(1234);
-  uint64_t cases=0,records_total=0,blends=0,skipped=0;
+  uint64_t cases=0,records_total=0,blends=0,skipped=0,big=0,odd_constants=0;
+  // One memo for the whole run: the channels sit at the same addresses in every
+  // slot with new angles each time, so its entries are met again with other
+  // angles (a stale entry must miss) as well as with the same ones.
+  static NativeSkeletalRotationCache cache;
   for(uint32_t iteration=0;iteration<30000;++iteration) {
-    std::vector<uint8_t> heap(kHeap,0),image=Image();
+    // Sometimes other image constants (the memo must stand aside then).
+    float one=1.0f,zero=0.0f;
+    if(r.U(25)==0) { one=r.U(2)?2.0f:-1.0f; ++odd_constants; }
+    if(r.U(25)==0) { zero=r.U(2)?-0.0f:0.5f; ++odd_constants; }
+    std::vector<uint8_t> heap(kHeap,0),image=Image(one,zero);
     const Memory m{heap,image};
-    const uint32_t records=r.U(12);
+    // Now and then more records than one rotation batch holds (64).
+    const uint32_t records=r.U(40)==0?60+r.U(90):r.U(12);
+    big+=records>64;
     BuildSlot(m,r,records,r.U(6)==0);
     if(!FrameInStreams(m) && m.U32(kSlot+24) && records) { ++skipped; continue; }  // would read off the synthetic streams
+    const std::vector<uint8_t> initial=heap;
     std::vector<uint8_t> heap_guest=heap,image_guest=image;
     const Memory g{heap_guest,image_guest};
-    NativeSkeletalEvaluate(m,kSlot);
     Guest821CE848(g,kSlot,kStackTop-208);
-    RequireSame(heap,heap_guest,kStackBottom,kStackTop,"821CE848");
+    NativeSkeletalEvaluateScalar(m,kSlot);
+    RequireSame(heap,heap_guest,kStackBottom,kStackTop,"821CE848 (scalar)");
+    heap=initial;
+    NativeSkeletalEvaluate(m,kSlot);
+    RequireSame(heap,heap_guest,kStackBottom,kStackTop,"821CE848 (batched)");
+    heap=initial;
+    NativeSkeletalEvaluate(PlainMemory{m},kSlot);
+    RequireSame(heap,heap_guest,kStackBottom,kStackTop,"821CE848 (batched, access by access)");
+    for(int pass=0;pass<2;++pass) {  // fills the memo, then hits it
+      heap=initial;
+      NativeSkeletalEvaluate(m,kSlot,&cache);
+      RequireSame(heap,heap_guest,kStackBottom,kStackTop,pass?"821CE848 (memo hit)":"821CE848 (memo fill)");
+    }
     ++cases; records_total+=records; blends+=m.U8(kSlot+56)||g.U8(kSlot+56)?1:0;
   }
-  std::cout<<"821CE848: "<<cases<<" slots, "<<records_total<<" records match ("<<skipped<<" skipped)\n";
+  Require(cache.hits>10000 && cache.misses>10000,"the memo was not exercised");
+  std::cout<<"821CE848: "<<cases<<" slots, "<<records_total<<" records match, scalar, batched and memoised ("
+    <<big<<" slots over one batch, "<<odd_constants<<" odd image constants, memo "<<cache.hits<<" hits "
+    <<cache.misses<<" misses; "<<skipped<<" skipped)\n";
+}
+
+// The memo answers only for the same three angle bits under the state its
+// entries were filled in: after a fill, the same slot is evaluated again with
+// one constant rotation's angle changed (each of the three in turn), with other
+// image constants, and under round-up; each must match the guest (no stale hit).
+void MemoStandsAside() {
+  Random r(4321);
+  NativeSkeletalRotationCache cache;
+  const uint32_t csr=_mm_getcsr();
+  uint32_t checked[6]{};
+  for(uint32_t iteration=0;iteration<6000;++iteration) {
+    std::vector<uint8_t> heap(kHeap,0),image=Image();
+    const Memory m{heap,image};
+    const uint32_t records=1+r.U(12);
+    BuildSlot(m,r,records,false);
+    if(!FrameInStreams(m) || !m.U32(kSlot+24)) continue;
+    // Constant rotations only, so the memo decides every record's rows.
+    for(uint32_t i=0;i<records;++i) m.StoreU32(kChannels+i*64+4,r.U(2)?56u:16u);
+    const std::vector<uint8_t> initial=heap;
+    NativeSkeletalEvaluate(m,kSlot,&cache);   // fill
+    const uint32_t variant=iteration%6;
+    heap=initial;
+    std::vector<uint8_t> image_now=image;
+    const Memory now{heap,image_now};
+    if(variant<3) {
+      // One angle of one channel, one ulp or a sign away.
+      const uint32_t at=kChannels+r.U(records)*64+40+variant*4;
+      const uint32_t bits=m.U32(at);
+      now.StoreU32(at,r.U(2)?bits^0x80000000u:bits+1u);
+    } else if(variant==3) {
+      image_now=Image(2.0f,0.0f);
+    } else if(variant==4) {
+      image_now=Image(1.0f,-0.0f);
+    }
+    std::vector<uint8_t> heap_guest=heap,image_guest=image_now;
+    const Memory g{heap_guest,image_guest};
+    if(variant==5) _mm_setcsr((csr&~0x6000u)|0x4000u);
+    Guest821CE848(g,kSlot,kStackTop-208);
+    NativeSkeletalEvaluate(now,kSlot,&cache);
+    _mm_setcsr(csr);
+    static const char* what[6]{"821CE848 (memo, angle x changed)","821CE848 (memo, angle y changed)",
+      "821CE848 (memo, angle z changed)","821CE848 (memo, one=2)","821CE848 (memo, zero=-0)","821CE848 (memo, round up)"};
+    RequireSame(heap,heap_guest,kStackBottom,kStackTop,what[variant]);
+    ++checked[variant];
+  }
+  std::cout<<"memo stands aside: "<<checked[0]<<"/"<<checked[1]<<"/"<<checked[2]<<" slots with an angle changed, "
+    <<checked[3]<<"/"<<checked[4]<<" with other constants, "<<checked[5]<<" under round-up match\n";
+}
+
+// The four-lane rotation build against the one-record build, lane by lane.
+void LaneRotationsMatchScalar() {
+  Random r(17);
+  uint64_t rotations=0;
+  for(uint32_t i=0;i<400000;++i) {
+    alignas(32) double angle[3][4];
+    for(auto& axis:angle) for(double& a:axis) a=double(r.U(4)?r.Awkward(8):std::bit_cast<float>(uint32_t(r.engine())));
+    const double one=r.U(50)?1.0:double(r.Awkward(2)),zero=r.U(50)?0.0:double(r.Awkward(2));
+    __m256d rows[12];
+    skeletal::lanes::RotationXYZ(rows,_mm256_load_pd(angle[0]),_mm256_load_pd(angle[1]),_mm256_load_pd(angle[2]),
+      _mm256_set1_pd(one),_mm256_set1_pd(zero));
+    alignas(32) double out[12][4];
+    for(int k=0;k<12;++k) _mm256_store_pd(out[k],rows[k]);
+    for(int lane=0;lane<4;++lane) {
+      const double angles[3]{angle[0][lane],angle[1][lane],angle[2][lane]};
+      skeletal::Rows expected;
+      skeletal::RotationXYZ(expected,angles,one,zero);
+      for(int k=0;k<12;++k) {
+        const uint64_t a=std::bit_cast<uint64_t>(expected[k]),b=std::bit_cast<uint64_t>(out[k][lane]);
+        Require(a==b || (std::isnan(expected[k]) && std::isnan(out[k][lane])),"lane rotation differs");
+      }
+      ++rotations;
+    }
+  }
+  std::cout<<"lane rotations: "<<rotations<<" match\n";
+}
+
+// Rows the batched evaluation loads and stores whole: one crossing 0xE0000000
+// (where the game's host view of guest memory jumps) goes byte by byte.
+struct SplitMemory {
+  std::vector<uint8_t>& bytes;   // [0xDFFFFF00, +0x200)
+  static constexpr uint32_t base=0xDFFFFF00u;
+  uint8_t* At(uint32_t a,uint32_t size) const {
+    if(a<base || a-base+uint64_t(size)>bytes.size()) throw std::runtime_error("split address out of range");
+    return bytes.data()+(a-base);
+  }
+  uint8_t U8(uint32_t a) const { return *At(a,1); }
+  void StoreU8(uint32_t a,uint8_t v) const { *At(a,1)=v; }
+  const uint8_t* Row(uint32_t a) const {
+    if(a<0xE0000000u && a+16u>0xE0000000u) throw std::runtime_error("a whole row across 0xE0000000");
+    return At(a,16);
+  }
+  void StoreRow(uint32_t a,__m128i v) const {
+    if(a<0xE0000000u && a+16u>0xE0000000u) throw std::runtime_error("a whole row across 0xE0000000");
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(At(a,16)),v);
+  }
+};
+void RowsAcrossTheViewBoundary() {
+  std::vector<uint8_t> bytes(0x200);
+  for(size_t i=0;i<bytes.size();++i) bytes[i]=uint8_t(i*7+3);
+  const SplitMemory m{bytes};
+  for(uint32_t a=0xDFFFFFE0u;a<=0xE0000010u;++a) {
+    const __m128i v=NativeSkeletalLoadBytes(m,a);
+    alignas(16) uint8_t got[16];
+    _mm_store_si128(reinterpret_cast<__m128i*>(got),v);
+    for(uint32_t i=0;i<16;++i) Require(got[i]==m.U8(a+i),"row load across the boundary");
+    const __m128i w=_mm_add_epi8(v,_mm_set1_epi8(1));
+    NativeSkeletalStoreBytes(m,a,w);
+    for(uint32_t i=0;i<16;++i) Require(m.U8(a+i)==uint8_t(got[i]+1),"row store across the boundary");
+  }
+  std::cout<<"rows across 0xE0000000: byte by byte\n";
 }
 
 // Trees: random shapes, awkward values, some unaligned outputs (partial stvlx).
@@ -563,6 +718,41 @@ void MultiplyCallMatchesGuest() {
   _mm_setcsr(csr);
   std::cout<<"821C8198 with stack writes: 200000 calls match\n";
 }
+// The propagation's multiply (mulps/addps in the DPPS order) against the DPPS
+// transcription of 821C8198, flush mode off and on, over ordinary, awkward and
+// denormal-heavy rows (a NaN matches any NaN).
+void MultiplyRowsMatchDpps() {
+  Random r(23);
+  const uint32_t csr=_mm_getcsr();
+  uint64_t calls=0;
+  for(int flush=0;flush<2;++flush) {
+    _mm_setcsr(flush?(csr|0x8040u):(csr&~0x8040u));
+    for(uint32_t i=0;i<300000;++i) {
+      std::vector<uint8_t> heap(0x400),image=Image();
+      const Memory m{heap,image};
+      const uint32_t kind=r.U(4);
+      for(uint32_t k=0;k<0x200;k+=4) {
+        float v;
+        switch(kind) {
+          case 0: v=r.Uniform(-4,4); break;
+          case 1: v=r.Awkward(8); break;
+          case 2: v=r.U(2)?std::bit_cast<float>(r.U(0x01000000u)|(r.U(2)<<31)):r.Uniform(-1e-19f,1e-19f); break;  // tiny and denormal
+          default: v=std::bit_cast<float>(uint32_t(r.engine())); break;
+        }
+        m.StoreU32(k,std::bit_cast<uint32_t>(v));
+      }
+      const uint32_t a=r.U(8)*16+(r.U(4)==0?r.U(4)*4:0),b=0x100+r.U(8)*16+(r.U(4)==0?r.U(4)*4:0),out=0x300;
+      std::vector<uint8_t> heap_dpps=heap,image_dpps=image;
+      const Memory d{heap_dpps,image_dpps};
+      NativeSkeletalMultiplyRows(m,out,a,b);
+      NativeSkeletalMultiply(d,out,a,b);
+      RequireSame(heap,heap_dpps,0,0,flush?"821C8198 rows (flush on)":"821C8198 rows");
+      ++calls;
+    }
+  }
+  _mm_setcsr(csr);
+  std::cout<<"propagation multiply against DPPS: "<<calls<<" calls match\n";
+}
 // The helpers other native code already uses must agree with this file's.
 void RotationsMatchRenderHelpers() {
   Random r(7);
@@ -611,7 +801,11 @@ int main() {
   try {
     RotationsMatchRenderHelpers();
     BatchedTrigMatchesScalar();
+    LaneRotationsMatchScalar();
+    RowsAcrossTheViewBoundary();
     EvaluationMatchesGuest();
+    MemoStandsAside();
+    MultiplyRowsMatchDpps();
     PropagationMatchesGuest(false);
     PropagationMatchesGuest(true);
     MultiplyCallMatchesGuest();
