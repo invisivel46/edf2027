@@ -61,6 +61,8 @@ if(WIN32)
         src/native_graphics/edf/full_frame/host.cpp src/native_graphics/edf/full_frame/sky_pass.cpp
         src/native_graphics/edf/full_frame/static_world_pass.cpp src/native_graphics/edf/full_frame/models_pass.cpp
         src/native_graphics/edf/full_frame/effects_pass.cpp src/native_graphics/edf/full_frame/transparent_pass.cpp)
+    # The hooks, by subsystem, out of the bridge the same way (bridge_shared.h is what they share with it).
+    target_sources(edf2027 PRIVATE src/native_graphics/edf/hooks/diagnostics.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_full_frame_sky.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
@@ -336,9 +338,9 @@ if(BUILD_TESTING)
     add_executable(edf_native_display_gamma_tests tests/native_display_gamma_tests.cpp)
     set(_worker_callback_fixture ${CMAKE_CURRENT_BINARY_DIR}/native_worker_callback_audit_fixture.inc)
     add_custom_command(OUTPUT ${_worker_callback_fixture}
-        COMMAND ${CMAKE_COMMAND} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/guest_shader_bridge.cpp
+        COMMAND ${CMAKE_COMMAND} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/edf/hooks/diagnostics.cpp
             -DOUTPUT=${_worker_callback_fixture} -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/extract-worker-callback-audit-test.cmake
-        DEPENDS src/native_graphics/guest_shader_bridge.cpp tools/extract-worker-callback-audit-test.cmake VERBATIM)
+        DEPENDS src/native_graphics/edf/hooks/diagnostics.cpp tools/extract-worker-callback-audit-test.cmake VERBATIM)
     add_executable(edf_native_worker_callback_audit_tests tests/native_worker_callback_audit_tests.cpp ${_worker_callback_fixture})
     target_include_directories(edf_native_worker_callback_audit_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
     add_test(NAME edf_native_worker_callback_audit_tests COMMAND edf_native_worker_callback_audit_tests)
