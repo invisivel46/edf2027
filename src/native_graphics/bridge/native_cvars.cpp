@@ -131,8 +131,8 @@ inline REXCVAR_DEFINE_BOOL(edf_native_motion_vectors, false, "EDF2027",
                    "FSR motion vectors: camera reprojection from the scene depth plus a velocity re-render of moving models, per view before post; forces a single-sampled, shader-readable scene depth (restart required)");
 inline REXCVAR_DEFINE_INT32(edf_native_motion_vectors_debug, 0, "EDF2027",
                     "Motion vector debug view over the output before the HUD: 0 off, 1 motion as colour, 2 history-valid mask").range(0,2);
-inline REXCVAR_DEFINE_INT32(edf_native_render_height, 0, "EDF2027",
-                    "Native render height at startup: 0 is 720 lines (with width 0, exactly 1280x720 on a 16:9 window), -1 the window's size, otherwise the line count; paired with render width (restart required)");
+inline REXCVAR_DEFINE_INT32(edf_native_render_height, -1, "EDF2027",
+                    "Native render height at startup: -1 (default) the window's size, 0 the engine's original 720 lines (with width 0, exactly 1280x720 on a 16:9 window), otherwise the line count; paired with render width (restart required)");
 inline REXCVAR_DEFINE_BOOL(edf_native_pixel_centers,true,"EDF2027",
                    "Apply the guest PA_SU_VTX_CNTL half-pixel offset to the audited retail post passes; false restores the unshifted viewport for regression diagnosis");
 

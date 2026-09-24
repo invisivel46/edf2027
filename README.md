@@ -188,14 +188,15 @@ window's shape by default:
 - **HUD and menus** (`edf_hud_safe_area`). *16:9* keeps the HUD, menus, text
   and videos in the centred 16:9 area at their own shape. *Full* stretches
   them over the whole screen.
-- **Render resolution.** The size the game is drawn at, in the window's shape:
-  *Original (720 lines)*, which is the default and the game's own 1280x720 on
-  a 16:9 screen, then 900, 1080, 1440, 1800 or 2160 lines, or *Match window*.
-  You can also set a fixed custom size from 640x480 up to 8192 on either axis
-  (16.7 million pixels at most, for example 5120x2880). The image is then
-  scaled to the window, so a size above the window's is supersampled. This
-  setting needs a restart. For a sharp picture on a large screen, pick
-  *Match window* (`--edf_native_render_height=-1`).
+- **Render resolution.** The size the game is drawn at. The default is
+  *Match window*: the window's own size (`--edf_native_render_height=-1`).
+  The other choices use the window's shape: *Original (720 lines)*, the
+  game's own 1280x720 on a 16:9 screen (`--edf_native_render_height=0`), then
+  900, 1080, 1440, 1800 or 2160 lines. You can also set a fixed custom size
+  from 640x480 up to 8192 on either axis (16.7 million pixels at most, for
+  example 5120x2880). The image is then scaled to the window, so a size above
+  the window's is supersampled. This setting needs a restart. On a slow GPU
+  with a large screen, a lower setting such as 1080 lines is faster.
 - **Scaling filter** (`edf_present_filter`). *Auto* keeps whole-pixel
   placement, scales exactly at whole factors and area-filters when the render
   is larger than the window. *Bilinear* is the original single bilinear

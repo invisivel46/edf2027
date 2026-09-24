@@ -82,7 +82,7 @@ EDF_NATIVE_CVAR(std::string, edf_native_fsr, "off");
 EDF_NATIVE_CVAR(double, edf_native_fsr_sharpness, 0.2);
 EDF_NATIVE_CVAR(bool, edf_native_motion_vectors, false);
 EDF_NATIVE_CVAR(int32_t, edf_native_motion_vectors_debug, 0);
-EDF_NATIVE_CVAR(int32_t, edf_native_render_height, 0);
+EDF_NATIVE_CVAR(int32_t, edf_native_render_height, -1);
 EDF_NATIVE_CVAR(bool, edf_native_pixel_centers, true);
 
 // Reuse, batching and caches between draws and frames.
