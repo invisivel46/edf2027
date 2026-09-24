@@ -67,7 +67,7 @@ if(WIN32)
         src/native_graphics/edf/hooks/hud.cpp src/native_graphics/edf/hooks/effects.cpp
         src/native_graphics/edf/hooks/post.cpp src/native_graphics/edf/hooks/buffers.cpp
         src/native_graphics/edf/hooks/fences.cpp src/native_graphics/edf/hooks/models.cpp
-        src/native_graphics/edf/hooks/scene.cpp)
+        src/native_graphics/edf/hooks/scene.cpp src/native_graphics/edf/hooks/frame.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_full_frame_sky.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
