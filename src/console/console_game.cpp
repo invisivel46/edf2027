@@ -586,7 +586,8 @@ void Stats(Invocation& in) {
   for (uint32_t f = 0; f < kFactionCount; ++f)
     for (const uint32_t object : FactionObjects(m, f)) objects.insert(object);
   size_t grid_count = 0;
-  if (const auto box = GridBounds(m)) {
+  // The grid is the mission's; outside one it may be stale, so it is only asked in one.
+  if (const auto box = GameInMission(*ctx.frame) ? GridBounds(m) : std::nullopt) {
     GuestCalls g(*ctx.frame->ctx, ctx.frame->base);
     const auto grid = GridQuery(g, box->center, box->half);
     grid_count = grid.size();
