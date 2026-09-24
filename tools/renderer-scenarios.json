@@ -112,6 +112,76 @@
       "mission": "M202",
       "capture_start": 1500,
       "seconds": {"ab": 300, "unlocked": 300, "soak-ab": 300, "soak-unlocked": 300}
+    },
+    "horde-ants-100": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still under god mode: the console spawns 100 black ants around the player, lets them close in for 20 s and holds the engaged horde for a 60 s measurement window between the marks horde hold-begin/hold-end, then quits (tools/console/horde-ants-100.cfg; the horde scaling study)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/horde-ants-100.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 600, "unlocked": 600, "soak-ab": 600, "soak-unlocked": 600}
+    },
+    "horde-ants-300": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still under god mode: the console spawns 300 black ants around the player, lets them close in for 20 s and holds the engaged horde for a 60 s measurement window between the marks horde hold-begin/hold-end, then quits (tools/console/horde-ants-300.cfg; the horde scaling study)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/horde-ants-300.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 900, "unlocked": 900, "soak-ab": 900, "soak-unlocked": 900}
+    },
+    "horde-ants-600": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still under god mode: the console spawns 600 black ants around the player, lets them close in for 20 s and holds the engaged horde for a 60 s measurement window between the marks horde hold-begin/hold-end, then quits (tools/console/horde-ants-600.cfg; the horde scaling study)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/horde-ants-600.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 1200, "unlocked": 1200, "soak-ab": 1200, "soak-unlocked": 1200}
+    },
+    "horde-ants-1000": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still under god mode: the console spawns 1000 black ants around the player, lets them close in for 20 s and holds the engaged horde for a 60 s measurement window between the marks horde hold-begin/hold-end, then quits (tools/console/horde-ants-1000.cfg; the horde scaling study)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/horde-ants-1000.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 1800, "unlocked": 1800, "soak-ab": 1800, "soak-unlocked": 1800}
+    },
+    "horde-spiders-300": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still under god mode: the console spawns 300 giant spiders around the player, lets them close in for 20 s and holds the engaged horde for a 60 s measurement window between the marks horde hold-begin/hold-end, then quits (tools/console/horde-spiders-300.cfg; the horde scaling study)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/horde-spiders-300.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 900, "unlocked": 900, "soak-ab": 900, "soak-unlocked": 900}
+    },
+    "horde-hectors-100": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still under god mode: the console spawns 100 Hector walking robots around the player, lets them close in for 20 s and holds the engaged horde for a 60 s measurement window between the marks horde hold-begin/hold-end, then quits (tools/console/horde-hectors-100.cfg; the horde scaling study)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/horde-hectors-100.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 900, "unlocked": 900, "soak-ab": 900, "soak-unlocked": 900}
+    },
+    "horde-mixed": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still under god mode: the console spawns 400 ants, 200 spiders and 30 Hectors around the player, lets them close in for 20 s and holds the engaged horde for a 60 s measurement window between the marks horde hold-begin/hold-end, then quits (tools/console/horde-mixed.cfg; the horde scaling study)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/horde-mixed.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 1200, "unlocked": 1200, "soak-ab": 1200, "soak-unlocked": 1200}
     }
   },
   "variants": {

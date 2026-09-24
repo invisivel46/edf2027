@@ -261,7 +261,9 @@ def duration_ticks(text):
 class ConsoleScenarioTests(unittest.TestCase):
     def test_console_scripts_parse_and_wait_for_the_mission(self):
         scenarios = {n: e for n, e in TABLE['scenarios'].items() if e.get('console')}
-        self.assertEqual(set(scenarios), {'stress-ants', 'stress-collapse', 'stress-effects', 'stress-mixed'})
+        self.assertEqual(set(scenarios), {'stress-ants', 'stress-collapse', 'stress-effects', 'stress-mixed',
+                                          'horde-ants-100', 'horde-ants-300', 'horde-ants-600', 'horde-ants-1000',
+                                          'horde-spiders-300', 'horde-hectors-100', 'horde-mixed'})
         for name, entry in scenarios.items():
             with self.subTest(name):
                 path = ROOT / entry['console']
