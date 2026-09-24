@@ -1,4 +1,4 @@
-# EDF2027: Earth Defense Force 2017 for PC (v0.2.0)
+# EDF2027: Earth Defense Force 2017 for PC (v0.3.0-beta)
 
 A native Windows port of the Xbox 360 game *Earth Defense Force 2017*
 (USA/Europe), made by static recompilation with the
@@ -65,8 +65,6 @@ on Windows or `sha1sum <file>.iso` elsewhere.
   AMD Zen (Ryzen, 2017) or newer. On an older CPU the release build shows
   "This build requires a CPU with AVX2/FMA" and exits. See
   [older CPUs](#older-cpus) to build one that runs there.
-- The Microsoft Visual C++ 2015-2022 Redistributable (x64). Most systems
-  already have it.
 - About 6 GB of free disk space for the extracted game.
 - Your own dump of the game (see above).
 
@@ -77,7 +75,8 @@ because the renderer needs Direct3D 12.
 
 1. Unzip the release anywhere and run `edf2027.exe`. Keep the DLLs next to it.
    The game does not start without `rexruntime.dll` and
-   `amd_fidelityfx_dx12.dll`.
+   `amd_fidelityfx_dx12.dll`. The Visual C++ runtime DLLs are included, so no
+   separate redistributable is needed.
 2. On first run the setup screen appears. Click **Select disc image (.iso)…**
    and pick your dump. The game is extracted (about 6 GB) into your user
    folder, with a progress bar. If you already have the disc extracted (a
@@ -333,9 +332,12 @@ The renderer's diagnostic switches are described in
   restart after it is turned on. When FSR stays off, the log says why (search
   it for `FSR`).
 - **The game does not start and names a missing DLL.** `rexruntime.dll` and
-  `amd_fidelityfx_dx12.dll` must be next to `edf2027.exe`. The Visual C++
-  Redistributable (x64) provides `MSVCP140.dll` and `VCRUNTIME140.dll`.
-- **Logs.** `--log_file=run.log` writes the log next to the executable.
+  `amd_fidelityfx_dx12.dll` must be next to `edf2027.exe`, together with the
+  bundled Visual C++ runtime DLLs (`msvcp140*.dll`, `vcruntime140*.dll`).
+- **Logs and crash dumps.** Every run writes a log to `logs\` next to the
+  executable (or `%APPDATA%\edf2027\logs` when that folder is read-only); the
+  newest 10 runs are kept. A crash also writes a `.dmp` and a summary there and
+  names them in a message box. Attach both to a bug report.
 
 ## Building from source
 
@@ -512,10 +514,12 @@ The in-game test tools are under `tools/`. They need the game data:
 cmake --build out/build/win-amd64-release --target package_release
 ```
 
-This writes `out/package/EDF2027-PC-0.2.0/`. It contains the executable,
-`rexruntime.dll` (and `TracyClient.dll` if the SDK has it),
-`amd_fidelityfx_dx12.dll`, `gamecontrollerdb.txt`, this README and
-`LICENSES/`, and never any game data. Disc-image extraction is built in
+This writes `out/package/EDF2027-PC-<version>-<commit>.zip` and a separate
+`-symbols.zip` with the PDB. The package contains the executable,
+`rexruntime.dll`, `amd_fidelityfx_dx12.dll`, `d3dcompiler_47.dll`, the
+app-local Visual C++ runtime DLLs, `gamecontrollerdb.txt`, this README and
+`LICENSES/`, and never any game data; the build fails if anything else is in
+the folder or something is missing (see [docs/release.md](docs/release.md)). Disc-image extraction is built in
 (`src/xdvdfs.h` reads the XDVDFS game partition directly), so the package
 needs no external tools. From a developer prompt,
 `cmake --build <build-dir> --target audit_native_dependencies` checks that
