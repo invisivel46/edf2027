@@ -45,11 +45,11 @@
 #include <unordered_set>
 #include <vector>
 
-REXCVAR_DEFINE_BOOL(edf_native_skeletal_eval,false,"EDF2027",
+REXCVAR_DEFINE_BOOL(edf_native_skeletal_eval,true,"EDF2027",
   "Evaluate animation slots (821CE848: DXA key lerp, Euler rotation build, blend, node locals) natively, bit for bit as the recompiled code");
-REXCVAR_DEFINE_BOOL(edf_native_skeletal_propagation,false,"EDF2027",
+REXCVAR_DEFINE_BOOL(edf_native_skeletal_propagation,true,"EDF2027",
   "Propagate model hierarchies (821D1688: node world = local x parent, recursively) natively, bit for bit as the recompiled code");
-REXCVAR_DEFINE_BOOL(edf_native_skeletal_matrix,false,"EDF2027",
+REXCVAR_DEFINE_BOOL(edf_native_skeletal_matrix,true,"EDF2027",
   "Run every 4x4 multiply 821C8198 (hierarchy worlds, skinning palettes 821C9478, view and effect matrices) natively with its guest memory effects, bit for bit");
 REXCVAR_DEFINE_BOOL(edf_native_skeletal_audit,false,"EDF2027",
   "Run the native skeletal evaluation and propagation beside the originals and compare every output byte; the originals' results are kept (development)");
