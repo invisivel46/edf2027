@@ -64,7 +64,8 @@ bool NativeWriteCacheFile(const std::filesystem::path& path,std::span<const uint
 void SetNativeCacheDirectory(std::filesystem::path directory);
 std::filesystem::path NativeCacheDirectory();
 // <directory of the running executable>/native_cache: beside the binary, so
-// it survives across runs but belongs to one install.
+// it survives across runs but belongs to one install. When that folder cannot
+// be written, %LOCALAPPDATA%\edf2027\native_cache.
 std::filesystem::path NativeDefaultCacheDirectory();
 
 // A loaded module's identity (e.g. d3dcompiler_47.dll) as

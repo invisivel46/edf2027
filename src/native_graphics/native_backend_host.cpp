@@ -21,6 +21,13 @@ REXCVAR_DEFINE_STRING(edf_present_filter,"auto","EDF2027",
   "exactly at whole scale factors, area-filters a render size larger than the window and is bilinear otherwise; "
   "bilinear is the original single bilinear sample. Applies live").allowed({"auto","bilinear"});
 namespace edf::native {
+namespace {
+NativeBackendHost::FailureHandler& HostFailureHandler() {
+  static NativeBackendHost::FailureHandler handler;
+  return handler;
+}
+}  // namespace
+void NativeBackendHost::SetFailureHandler(FailureHandler handler) { HostFailureHandler()=std::move(handler); }
 std::shared_ptr<NativeBackendHost> NativeBackendHost::Create(HWND window,
     std::shared_ptr<NativeRenderBackend> backend,Overlay overlay,NativeUiTicker::Dispatch dispatch) {
   auto host=std::shared_ptr<NativeBackendHost>(new NativeBackendHost(window,std::move(backend),std::move(overlay)));
@@ -220,6 +227,7 @@ void NativeBackendHost::Paint() {
   } catch(const std::exception& error) {
     failed_=true; SetNativeBackendFrameConsumerActive(false); if(ticker_) ticker_->Stop();
     REXLOG_ERROR("Native D3D12 host stopped: {}",error.what());
+    if(const auto& handler=HostFailureHandler()) handler(error.what());
   }
 }
 LRESULT CALLBACK NativeBackendHost::WindowProcedure(HWND window,UINT message,WPARAM wparam,

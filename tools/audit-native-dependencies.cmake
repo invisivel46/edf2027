@@ -1,5 +1,8 @@
 # Read-only PE dependency audit. Run in a VS developer environment (dumpbin).
 # This checks loader imports, not dynamic LoadLibrary calls or GPU behavior.
+if(POLICY CMP0207)
+    cmake_policy(SET CMP0207 NEW)  # normalized paths in GET_RUNTIME_DEPENDENCIES matching
+endif()
 if(NOT DEFINED EXECUTABLE OR NOT EXISTS "${EXECUTABLE}")
     message(FATAL_ERROR "EXECUTABLE must name an existing native game executable")
 endif()
