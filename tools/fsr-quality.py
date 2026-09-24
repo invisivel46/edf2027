@@ -5,7 +5,8 @@ Three measurements over the BMP captures the native renderer writes
 (edf_native_scene_capture=<prefix>, <prefix>.output.<F>.bmp) or any
 24/32-bit uncompressed BMP. Standard library only.
 
-  reference  FSR native_aa against a supersampled reference: an FSR-off
+  reference  FSR (native_aa, or an upscaling mode: its captures are at the
+             output size) against a supersampled reference: an FSR-off
              capture of the same frame at N times the resolution
              (edf_native_render_width/height), box-downsampled by N. Reports
              mean absolute error, PSNR and the error on edge pixels (where the
@@ -323,7 +324,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = parser.add_subparsers(dest="measure", required=True)
     ref = sub.add_parser("reference", help="FSR against a supersampled FSR-off reference")
-    ref.add_argument("--fsr", nargs="+", required=True, help="FSR native_aa captures (globs allowed)")
+    ref.add_argument("--fsr", nargs="+", required=True, help="FSR captures, native_aa or upscaled, at the output size (globs allowed)")
     ref.add_argument("--reference", nargs="+", required=True, help="FSR-off captures at --scale times the resolution")
     ref.add_argument("--baseline", nargs="*", help="FSR-off captures at the FSR resolution")
     ref.add_argument("--scale", type=int, default=2)

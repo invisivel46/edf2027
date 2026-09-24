@@ -598,27 +598,38 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     for (size_t i = 0; i + 1 < kRenderPresets.size(); ++i)
       if (kRenderPresets[i].w == rw && kRenderPresets[i].h == rh) render = int(i);
     const auto [window_w, window_h] = CurrentWindowSize();
-    const auto resolved = native::ResolveNativeRenderSize(rw, rh, window_w, window_h,
+    // FSR upscaling decides the scene's resolution itself (a fraction of the window's),
+    // so this setting stands aside while an upscaling mode is chosen.
+    const bool fsr_upscaling = fsr && settings::NativeFsrUpscaleRatio(Pending("edf_native_fsr")) > 0.0f;
+    const auto request = native::NativeRenderRequest(rw, rh, fsr_upscaling);
+    const auto resolved = native::ResolveNativeRenderSize(request[0], request[1], window_w, window_h,
                                                           native::ParseNativeAspectMode(Pending("edf_aspect")));
-    const std::string render_note = "Renders at " + std::to_string(resolved.width) + " x " +
-                                    std::to_string(resolved.height) + " in a " + std::to_string(window_w) + " x " +
-                                    std::to_string(window_h) + " window" +
-                                    (resolved.clamped ? " (reduced to the largest size the game's memory allows)" : "") +
-                                    ". ";
+    const auto [scene_w, scene_h] = settings::NativeFsrSceneSize(Pending("edf_native_fsr"), resolved.width, resolved.height);
+    const std::string render_note =
+        fsr_upscaling
+            ? "Overridden by FSR upscaling: the 3D scene renders at " + std::to_string(scene_w) + " x " +
+                  std::to_string(scene_h) + " and is upscaled to " + std::to_string(resolved.width) + " x " +
+                  std::to_string(resolved.height) + " (the window). This choice applies again when upscaling is off. "
+            : "Renders at " + std::to_string(resolved.width) + " x " + std::to_string(resolved.height) + " in a " +
+                  std::to_string(window_w) + " x " + std::to_string(window_h) + " window" +
+                  (resolved.clamped ? " (reduced to the largest size the game's memory allows)" : "") + ". ";
     std::vector<const char*> render_names;
     for (const auto& p : kRenderPresets) render_names.push_back(p.name);
-    if (Combo("##render", &render, render_names)) {
+    const std::string overridden = "Set by FSR (" + std::to_string(scene_w) + " x " + std::to_string(scene_h) + ")";
+    ImGui::BeginDisabled(fsr_upscaling);
+    if (Combo("##render", &render, render_names, {}, fsr_upscaling ? overridden.c_str() : nullptr)) {
       if (render + 1 < int(kRenderPresets.size()))
         SetRenderSize(kRenderPresets[size_t(render)].w, kRenderPresets[size_t(render)].h);
       else
         custom_render_ = true;
     }
+    ImGui::EndDisabled();
     const std::string render_help = render_note +
         "The resolution the game is drawn at, in the window's shape unless a fixed size is chosen; the picture is "
         "then scaled to the window. Above the window's size it is supersampled, which looks smoother and costs GPU "
         "time and memory. Experimental.";
     EndRow(render_help.c_str());
-    if (render == int(kRenderPresets.size()) - 1 || custom_render_) {
+    if (!fsr_upscaling && (render == int(kRenderPresets.size()) - 1 || custom_render_)) {
       BeginRow("Custom render size");
       const float field = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x * 3) * 0.36f;
       ImGui::SetNextItemWidth(field);
@@ -701,10 +712,27 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     std::vector<const char*> labels(settings::kNativeFsrLabels.begin(), settings::kNativeFsrLabels.end());
     const bool native = settings::RendererIndex(Get("edf_native_renderer")) == 0;
     if (Combo("##fsr", &mode, labels)) ApplyOne("edf_native_fsr", std::string(settings::kNativeFsrValues[size_t(mode)]));
-    EndRow(native ? "AMD FidelityFX Super Resolution. The quality modes draw the scene at a lower resolution and "
-                    "rebuild a sharp full-resolution image, for a higher frame rate; Native AA uses the same "
-                    "technique for anti-aliasing only. Needs the Native renderer."
+    EndRow(native ? "AMD FidelityFX Super Resolution. The quality modes draw the 3D scene at a lower resolution and "
+                    "rebuild a sharp image at the window's resolution, for a higher frame rate; the HUD, menus and "
+                    "text stay at full resolution. Native AA uses the same technique for anti-aliasing only. Needs "
+                    "the Native renderer."
                   : "AMD FidelityFX Super Resolution. Needs the Native renderer, which is not the one running.");
+    if (mode != 0) {
+      // The effective sizes: what the scene is drawn at and what it is upscaled to.
+      const std::string value(settings::kNativeFsrValues[size_t(mode)]);
+      const auto [window_w, window_h] = CurrentWindowSize();
+      const bool upscaling = settings::NativeFsrUpscaleRatio(value) > 0.0f;
+      const auto request = native::NativeRenderRequest(GetInt(Pending("edf_native_render_width"), 0),
+                                                       GetInt(Pending("edf_native_render_height"), 0), upscaling);
+      const auto output = native::ResolveNativeRenderSize(request[0], request[1], window_w, window_h,
+                                                          native::ParseNativeAspectMode(Pending("edf_aspect")));
+      const auto [scene_w, scene_h] = settings::NativeFsrSceneSize(value, output.width, output.height);
+      ui::ScopedFont small_font(ui::FontRole::kSmall, metrics_);
+      if (upscaling)
+        ImGui::TextDisabled("3D scene %d x %d, upscaled to %d x %d", scene_w, scene_h, output.width, output.height);
+      else
+        ImGui::TextDisabled("3D scene %d x %d, anti-aliased at full resolution", scene_w, scene_h);
+    }
     if (mode != 0 && hooks_.fsr_unavailable) {
       // A missing or broken amd_fidelityfx_dx12.dll: the scene is resolved without FSR.
       if (const std::string why = hooks_.fsr_unavailable(); !why.empty()) {

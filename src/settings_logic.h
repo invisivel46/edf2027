@@ -66,6 +66,20 @@ inline int NativeFsrIndex(std::string_view value) {
     if (kNativeFsrValues[i] == value) return static_cast<int>(i);
   return 0;
 }
+// The upscaling modes' per-axis ratios (AMD's, as native_fsr.h's NativeFsrUpscaleRatio);
+// 0 for off and native AA, which draw at the output size.
+inline float NativeFsrUpscaleRatio(std::string_view value) {
+  return value == "quality" ? 1.5f : value == "balanced" ? 1.7f : value == "performance" ? 2.0f
+       : value == "ultra_performance" ? 3.0f : 0.0f;
+}
+// The scene's render size for an output size under an upscaling mode, as FidelityFX
+// computes it: (int)(output / ratio) per axis in single precision. The output itself
+// for the other modes.
+inline std::pair<int, int> NativeFsrSceneSize(std::string_view value, int output_width, int output_height) {
+  const float ratio = NativeFsrUpscaleRatio(value);
+  if (ratio <= 0.0f) return {output_width, output_height};
+  return {std::max(1, int(float(output_width) / ratio)), std::max(1, int(float(output_height) / ratio))};
+}
 
 // ---- Renderer preset (edf_native_renderer) -------------------------------------------
 // The menu offers the two supported configurations; world/full are development presets
