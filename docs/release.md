@@ -155,6 +155,11 @@ handler of its own; its vectored handler only serves guest memory.
 
 ## Release checklist
 
+1. Retrain the PGO profile: `tools/pgo-train.ps1` (about 1 hour, unattended; see
+   [pgo.md](pgo.md)). Rebuild, run the benchmark A/B image gate against the new
+   build, and commit `pgo/edf2027.profdata` with `pgo/training.json`. Check that
+   configure prints `EDF PGO: using .../pgo/edf2027.profdata` and not the "building
+   WITHOUT profile-guided optimization" warning.
 1. Commit on a clean tree, with `EDF2027_VERSION` set.
 2. Run `build.cmd win-amd64-release package_release`. Check that there's no `-dirty` in
    the name and that the audit line reads `Native PE import audit passed`.

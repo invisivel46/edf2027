@@ -90,8 +90,24 @@
                 "CMAKE_BUILD_TYPE": "Release",
                 "CMAKE_CXX_FLAGS_RELEASE": "-O2 -DNDEBUG",
                 "EDF_GUEST_OPT_PROFILE": "v3",
-                "EDF_HOST_OPT_PROFILE": "v3"
+                "EDF_HOST_OPT_PROFILE": "v3",
+                "EDF_PGO": "use",
+                "EDF_PGO_PROFILE": "${sourceDir}/pgo/edf2027.profdata"
             }
+        },
+        {
+            "name": "win-amd64-release-nopgo",
+            "displayName": "Windows AMD64 Release without PGO",
+            "description": "The release build without the committed PGO profile, for A/B measurements",
+            "inherits": "win-amd64-release",
+            "cacheVariables": { "EDF_PGO": "" }
+        },
+        {
+            "name": "win-amd64-pgo-train",
+            "displayName": "Windows AMD64 PGO training build (instrumented)",
+            "description": "The release build with -fprofile-generate; tools/pgo-train.ps1 builds and runs it",
+            "inherits": "win-amd64-release",
+            "cacheVariables": { "EDF_PGO": "generate" }
         },
         {
             "name": "linux-amd64-debug",
@@ -193,6 +209,8 @@
     "buildPresets": [
         { "name": "win-amd64-debug", "configurePreset": "win-amd64-debug" },
         { "name": "win-amd64-release", "configurePreset": "win-amd64-release" },
+        { "name": "win-amd64-release-nopgo", "configurePreset": "win-amd64-release-nopgo" },
+        { "name": "win-amd64-pgo-train", "configurePreset": "win-amd64-pgo-train" },
         { "name": "win-amd64-relwithdebinfo", "configurePreset": "win-amd64-relwithdebinfo" },
         { "name": "linux-amd64-debug", "configurePreset": "linux-amd64-debug" },
         { "name": "linux-amd64-release", "configurePreset": "linux-amd64-release" },

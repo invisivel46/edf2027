@@ -417,22 +417,26 @@ To build from an SDK source tree instead of an install, set `-DREXSDK_DIR=<rexgl
 
 | Preset | Build type | Code generation |
 |---|---|---|
-| `win-amd64-release` | Release, `-O2 -DNDEBUG` | x86-64-v3 for guest and host code (`EDF_GUEST_OPT_PROFILE=v3`, `EDF_HOST_OPT_PROFILE=v3`). This is the one to ship and to measure. |
+| `win-amd64-release` | Release, `-O2 -DNDEBUG` | x86-64-v3 for guest and host code (`EDF_GUEST_OPT_PROFILE=v3`, `EDF_HOST_OPT_PROFILE=v3`) and profile-guided optimization with the committed `pgo/edf2027.profdata` (`EDF_PGO=use`, see [docs/pgo.md](docs/pgo.md)). This is the one to ship and to measure. |
+| `win-amd64-release-nopgo` | Release, `-O2 -DNDEBUG` | The same without PGO, for A/B measurements. |
+| `win-amd64-pgo-train` | Release, `-O2 -DNDEBUG` | The instrumented build (`EDF_PGO=generate`) that `tools/pgo-train.ps1` trains the profile with. |
 | `win-amd64-relwithdebinfo` | RelWithDebInfo | Baseline x86-64 with no extra profile. It runs on any x86-64 CPU. |
 | `win-amd64-debug` | Debug | Baseline x86-64, unoptimized. Very slow in game. |
 
 The ARM64, Linux and macOS presets in `CMakePresets.json` are placeholders.
 They do not build the game.
 
-`cmake/edf_optimization.cmake` holds the optional optimization knobs, and
-every one is off unless set:
+`cmake/edf_optimization.cmake` holds the optimization knobs. Every one is off
+unless set, and the release preset sets `v3` and `EDF_PGO=use`:
 
 - `EDF_GUEST_OPT_PROFILE` and `EDF_HOST_OPT_PROFILE`: `""`, `O3`, `v3` or
   `O3-v3`. The `v3` profiles add `-ffp-contract=off`, so float results do not
   change.
 - `EDF_LTO=thin`: ThinLTO, linked by lld.
 - `EDF_PGO=generate|use`: clang IR profile-guided optimization, with
-  `EDF_PGO_RAW_FILE` and `EDF_PGO_PROFILE`.
+  `EDF_PGO_RAW_FILE` and `EDF_PGO_PROFILE`. If the profile is missing, `use`
+  prints a warning and builds without PGO. [docs/pgo.md](docs/pgo.md) covers
+  training (`tools/pgo-train.ps1`) and when to retrain.
 
 The release preset pins `CMAKE_CXX_FLAGS_RELEASE`, because an empty cached
 value once built the whole game at `-O0`. Configuring a Release or
