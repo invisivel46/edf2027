@@ -66,7 +66,7 @@ if(WIN32)
         src/native_graphics/edf/hooks/loading.cpp src/native_graphics/edf/hooks/resources.cpp
         src/native_graphics/edf/hooks/hud.cpp src/native_graphics/edf/hooks/effects.cpp
         src/native_graphics/edf/hooks/post.cpp src/native_graphics/edf/hooks/buffers.cpp
-        src/native_graphics/edf/hooks/fences.cpp)
+        src/native_graphics/edf/hooks/fences.cpp src/native_graphics/edf/hooks/models.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_full_frame_sky.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
@@ -350,9 +350,9 @@ if(BUILD_TESTING)
     add_test(NAME edf_native_worker_callback_audit_tests COMMAND edf_native_worker_callback_audit_tests)
     set(_model_constructor_fixture ${CMAKE_CURRENT_BINARY_DIR}/native_model_constructor_fixture.inc)
     add_custom_command(OUTPUT ${_model_constructor_fixture}
-        COMMAND ${CMAKE_COMMAND} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/guest_shader_bridge.cpp
+        COMMAND ${CMAKE_COMMAND} -DSOURCE=${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/edf/hooks/models.cpp
             -DOUTPUT=${_model_constructor_fixture} -P ${CMAKE_CURRENT_SOURCE_DIR}/tools/extract-model-constructor-test.cmake
-        DEPENDS src/native_graphics/guest_shader_bridge.cpp tools/extract-model-constructor-test.cmake VERBATIM)
+        DEPENDS src/native_graphics/edf/hooks/models.cpp tools/extract-model-constructor-test.cmake VERBATIM)
     add_executable(edf_native_model_constructor_tests tests/native_model_constructor_tests.cpp ${_model_constructor_fixture})
     target_include_directories(edf_native_model_constructor_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME edf_native_model_constructor_tests COMMAND edf_native_model_constructor_tests)
@@ -390,7 +390,7 @@ if(BUILD_TESTING)
         add_custom_command(OUTPUT ${_native_tail_fixture}
             COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_native_tail_fixture}
                 -P ${CMAKE_SOURCE_DIR}/tools/extract-native-tail-test.cmake
-            DEPENDS ${_native_tail_shards} tools/extract-native-tail-test.cmake src/native_graphics/edf/hooks/buffers.cpp src/native_graphics/guest_shader_bridge.cpp VERBATIM)
+            DEPENDS ${_native_tail_shards} tools/extract-native-tail-test.cmake src/native_graphics/edf/hooks/buffers.cpp src/native_graphics/guest_shader_bridge.cpp src/native_graphics/edf/hooks/models.cpp VERBATIM)
         add_executable(edf_native_immediate_tail_tests tests/native_immediate_tail_tests.cpp ${_native_tail_fixture} ${_native_indexed_tail} ${_native_derived_tail} ${_native_shader_output_tail} ${_native_shader_upload_tail} ${_native_main_state_tail} ${_native_device_reset} ${_native_cache_range} ${_native_ring_submit})
         target_sources(edf_native_immediate_tail_tests PRIVATE ${_native_immediate_tail})
         target_sources(edf_native_immediate_tail_tests PRIVATE ${_native_shader_cache_tail})
