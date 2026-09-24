@@ -156,7 +156,7 @@ class ConsoleDialog final : public rex::ui::ImGuiDialog {
       candidates_.clear();
       stick_to_bottom_ = true;
       service.Submit(line);
-      focus_input_ = true;
+      ImGui::SetKeyboardFocusHere(-1);  // keep typing: the next key goes to the line at once
     }
     if (!open_) ImGui::EndDisabled();
     if (open_ && ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_L)) service.ClearOutput();
