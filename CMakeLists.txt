@@ -79,6 +79,8 @@ if(WIN32)
         src/native_graphics/edf/hooks/fences.cpp src/native_graphics/edf/hooks/models.cpp
         src/native_graphics/edf/hooks/scene.cpp src/native_graphics/edf/hooks/frame.cpp
         src/native_graphics/edf/hooks/draw.cpp)
+    # Skeletal animation (native_skeletal.h): simulation hooks, not renderer.
+    target_sources(edf2027 PRIVATE src/native_graphics/edf/hooks/animation.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_full_frame_sky.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
