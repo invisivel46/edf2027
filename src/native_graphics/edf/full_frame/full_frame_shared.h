@@ -11,6 +11,7 @@
 #include "../../native_map_effects.h"
 #include "../../native_motion_vector_pass.h"
 #include "../../native_scene_pass_inputs.h"
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdint>
@@ -104,6 +105,48 @@ void CensusNativeWorldList(const Reader& reader,uint32_t owner) {
 // count it (an item that does lose its draw is counted where it is dropped).
 void NativeFullFrameNoted(const char* pass,const std::string& reason);
 void NativeFullFrameDeclined(const char* pass,const std::string& reason);
+// Whether the effect recording carries activations across items and encodes
+// vertices before taking the locks (edf_native_effect_activation_share).
+inline bool NativeEffectActivationShare() { return REXCVAR_GET(edf_native_effect_activation_share); }
+// Encodes every draw's vertices (EncodeNativeEffectDrawCalls) off the bridge
+// locks, when NativeEffectActivationShare; the recording uses them as it would
+// have encoded them.
+template<class Items>
+void EncodeNativeEffectItems(Items& items) {
+  if(!NativeEffectActivationShare()) return;
+  HookTiming timing(HookPhase::FrameNativeEffectEncode);
+  for(auto& item:items) for(auto& draw:item.draws) EncodeNativeEffectDrawCalls(draw);
+}
+// One pass's items recorded in order over short holds of the bridge locks
+// (NativeLockSlices; edf_native_effect_lock_slice_us, 0: all in one hold).
+// Each hold first re-validates what the pass planned for (`current`: the
+// active scene, backend and targets), then records items until the budget has
+// passed, at least one per hold. The CPU window and the effect activation
+// carry (reset at both ends) live for one hold: nothing read through them
+// outlives it. record(index, window, carry) records item `index`. Returns how
+// many items were recorded: fewer than `count` when a hold found the targets
+// changed, and the rest are not recorded.
+template<class Slices,class Current,class Record>
+size_t RecordNativeFullFrameItemsSliced(Slices& slices,size_t count,const GuestReader& reader,
+    NativeFullFrameEffectCarry& carry,Current&& current,Record&& record) {
+  const auto budget_us=std::max(0,REXCVAR_GET(edf_native_effect_lock_slice_us));
+  const std::chrono::microseconds budget(budget_us);
+  size_t next=0;
+  while(next<count) {
+    const bool valid=slices([&] {
+      if(!current()) return false;
+      const NativeSceneCpuWindow window(reader);
+      carry.Reset();
+      struct ResetAtEnd { NativeFullFrameEffectCarry& carry; ~ResetAtEnd() { carry.Reset(); } } reset_at_end{carry};
+      const auto start=std::chrono::steady_clock::now();
+      do { record(next,window,carry); ++next; }
+      while(next<count && (!budget_us || std::chrono::steady_clock::now()-start<budget));
+      return true;
+    });
+    if(!valid) break;
+  }
+  return next;
+}
 // What the Models, Sky (map effects) and Effects passes of one view hand to its
 // Transparent pass: the models' transparent batches (one item each, keyed),
 // the map effects' and the effects' filed items, and the filing counts that

@@ -160,6 +160,12 @@ inline REXCVAR_DEFINE_BOOL(edf_native_transient_batching,true,"EDF2027",
                    "Record a UI/immediate list draw (XUI brush, font run, Utility 2D quad or line) as the continuation of the draw before it when the two differ only in their vertices; the Utility 2D path then records its quads non-indexed. Set false to record every draw as its own");
 inline REXCVAR_DEFINE_BOOL(edf_native_prepared_geometry,true,"EDF2027",
                    "Reuse prepared queued geometry after guarded snapshot validation");
+inline REXCVAR_DEFINE_BOOL(edf_native_effect_mesh_buckets,true,"EDF2027",
+                   "Record the full frame's effect draws (particles, ribbons, colour strips, grass blades) on immediate meshes built for a power-of-two vertex count (at least 64) and drawn over their first vertices with their own count's indices (the same vertices and primitives), so a particle count that changes every frame reuses one mesh per bucket instead of building a GPU buffer per new count; false keys one mesh per exact count");
+inline REXCVAR_DEFINE_BOOL(edf_native_effect_activation_share,true,"EDF2027",
+                   "Full-frame effect recording (transparent, effects and map-effect passes): an effect activation (program, constants, samplers, render state) carries from one effect item to the next alike one within a hold of the bridge locks, so a run of alike items (a collapse's dust) activates once, and the transparent and effects passes' vertices are encoded before the locks are taken; false activates each item on its own and encodes under the locks. Reuse off (edf_native_reuse_off) also activates each draw on its own");
+inline REXCVAR_DEFINE_INT32(edf_native_effect_lock_slice_us,250,"EDF2027",
+                   "Full-frame effect recording (transparent, effects and map-effect passes) holds the bridge locks in slices of about this many microseconds, re-validating the targets between them, so a simulation step's hooks wait at most one slice; 0 records a pass's items in one hold").range(0,1000000);
 
 // Frame pacing, unlocked frame rate and threads.
 // The experimental unlocked render loop, its interpolation, waits and the engine/render-helper thread QoS.

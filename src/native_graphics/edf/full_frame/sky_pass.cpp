@@ -123,16 +123,37 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
     using namespace edf::native;
     if(draws.empty()) return;
     auto& state=State();
-    std::lock_guard submission(state.submissions);
-    std::lock_guard lock(state.mutex);
+    // The bridge locks in short holds (NativeLockSlices): the targets, then the
+    // draws in slices, one draw per item.
+    NativeLockSlices slices(state.submissions,state.mutex);
     NativeFullFramePassTargets formats; NativeBackendViewport backend_viewport; NativeBackendScissor scissor; NativeViewportState viewport;
-    const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
-    if(state.active_scene!=context.renderer || !targets.count || !targets.depth || !state.scene_backend) return;
-    const NativeSceneCpuWindow window(reader_);
+    decltype(ActiveTargetsLocked(state)) targets{};
+    std::shared_ptr<NativeRenderBackend> backend;
+    if(!slices([&] {
+      targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
+      backend=state.scene_backend;
+      return state.active_scene==context.renderer && targets.count && targets.depth && backend;
+    })) return;
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("map effects",reason); };
-    // A run of alike draws (the wires' strips) activates once.
-    map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,NativeSceneDrawCamera(),viewport,formats,
-      [&](const std::exception& error) { report(error.what()); });
+    const auto& camera=NativeSceneDrawCamera();
+    // A run of alike draws (the wires' strips) activates once: across draws
+    // of one hold through the carry, or within the one call when it is off.
+    NativeFullFrameEffectCarry carry;
+    if(!NativeEffectActivationShare()) {
+      slices([&] {
+        if(state.active_scene!=context.renderer || state.scene_backend!=backend || !(ActiveTargetsLocked(state)==targets)) return;
+        const NativeSceneCpuWindow window(reader_);
+        map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,draws,camera,viewport,formats,
+          [&](const std::exception& error) { report(error.what()); });
+      });
+      return;
+    }
+    RecordNativeFullFrameItemsSliced(slices,draws.size(),reader_,carry,
+      [&] { return state.active_scene==context.renderer && state.scene_backend==backend && ActiveTargetsLocked(state)==targets; },
+      [&](size_t index,const NativeSceneCpuWindow<GuestReader>& window,NativeFullFrameEffectCarry& held) {
+        map_effect_draws_+=RecordNativeFullFrameEffectsLocked(state,reader_,window,std::span(draws).subspan(index,1),camera,viewport,formats,
+          [&](const std::exception& error) { report(error.what()); },&held);
+      });
   }
   // The coverage census of one map-effect walk, member by member as
   // PlanNativeMapEffects routes it: the current sky, mode-0 wires and grass

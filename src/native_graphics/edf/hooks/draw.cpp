@@ -3351,7 +3351,18 @@ struct NativeSceneImmediateDraw {
   uint32_t declaration=0,element_count=0;
   std::shared_ptr<const NativeDeclaration> owned_declaration;
   uint32_t primitive=13,stride=0;
+  // edf_native_effect_mesh_buckets: the mesh is one built for the count's
+  // power-of-two bucket, drawn over these vertices (DrawTransientPrefix).
+  // Recorded draws only; the direct path keys the exact count.
+  bool bucketed=false;
 };
+// Zero bytes a bucketed immediate mesh is built from (its cached vertices are
+// never drawn: a recorded draw stages its own, DrawTransientPrefix).
+std::span<const uint8_t> NativeImmediateBucketBytes(size_t bytes) {
+  static thread_local std::vector<uint8_t> zeros;
+  if(zeros.size()<bytes) zeros.resize(bytes);
+  return {zeros.data(),bytes};
+}
 // Records the draw from vertices held in HOST memory, laid out as the guest
 // lays them out (big-endian words in declaration order): the DrawPrimitiveUP
 // hook passes the bytes it read at r6, the full-frame effect pass passes what
@@ -3365,13 +3376,22 @@ void RecordNativeSceneImmediate(Bridge& state,const Reader& reader,uint32_t devi
   if(!draw.stride || vertices.size()%draw.stride) throw std::runtime_error("native immediate vertices are not whole vertices");
   const auto count=uint32_t(vertices.size()/draw.stride);
   if(count<3 || count>16384 || (!strip && count%4)) throw std::runtime_error("unsupported native immediate vertex count");
-  const auto owned_indices=state.generated_indices.Get(strip?NativeIndexPattern::Strip:NativeIndexPattern::Quads,count);
+  // A bucketed draw's mesh is keyed and built for the bucket's count: the
+  // generated quad and strip indices over `count` vertices are the first
+  // index_count of the bucket's, so it draws the same primitives from the same
+  // vertices. One mesh then serves every count in the bucket, where a key per
+  // exact count built a mesh (and its GPU buffers) for each new particle count.
+  const bool bucketed=draw.bucketed && EDF_NATIVE_FLAG(seam_draws);
+  const uint32_t mesh_count=bucketed?std::max<uint32_t>(64,std::bit_ceil(count)):count;
+  const uint32_t index_count=strip?(count-2)*3:count/4*6;
+  const auto owned_indices=state.generated_indices.Get(strip?NativeIndexPattern::Strip:NativeIndexPattern::Quads,mesh_count);
   const auto indices=owned_indices->bytes();
+  const auto mesh_vertices=bucketed?NativeImmediateBucketBytes(size_t(mesh_count)*draw.stride):vertices;
   HookTiming acquire_timing(HookPhase::ImmediateAcquire);
   auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),draw.vertex.shader(),
-    ImmediateStreamKey(vertices.size(),draw.declaration,draw.shaders.vertex,draw.primitive,draw.viewport.reverse_depth),
+    ImmediateStreamKey(mesh_vertices.size(),draw.declaration,draw.shaders.vertex,draw.primitive,draw.viewport.reverse_depth),
     {draw.owned_declaration->bytes().data(),draw.element_count*12},draw.stride,
-    vertices,indices,2,draw.owned_declaration,owned_indices,{},{},{},{},0,{},
+    mesh_vertices,indices,2,draw.owned_declaration,owned_indices,{},{},{},{},0,{},
     // Where this mesh's dynamic vertices are rewritten when the draw
     // is recorded; the immediate context does it otherwise.
     EDF_NATIVE_FLAG(seam_draws)?&SceneRecorderLocked(state):nullptr);
@@ -3386,13 +3406,14 @@ void RecordNativeSceneImmediate(Bridge& state,const Reader& reader,uint32_t devi
       mesh.input_layout().elements(),mesh.input_layout().fingerprint(),
       (uint64_t(draw.shaders.vertex)<<1)|uint64_t(draw.viewport.reverse_depth?1:0),draw.shaders.pixel,
       NativeBackendTopology::TriangleList});
-    mesh.DrawTransient(recorder,vertices,0,uint32_t(indices.size()/2));
+    if(bucketed) mesh.DrawTransientPrefix(recorder,vertices,0,index_count);
+    else mesh.DrawTransient(recorder,vertices,0,index_count);
   } else {
     BindActiveTarget(state);
     BindGuestRenderState(render->second,*state.context.Get(),reader,device,&state.bind_generation);
     draw.viewport.Bind(*state.context.Get());
     draw.vertex.Bind(*state.context.Get()); draw.pixel.Bind(*state.context.Get());
-    mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
+    mesh.Draw(*state.context.Get(),0,index_count);
   }
 }
 }
@@ -3438,6 +3459,7 @@ struct NativeFullFrameEffectActivation {
 NativeFullFrameEffectActivation ActivateNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,
     const NativeSceneCpuWindow<GuestReader>& window,const NativeEffectDraw& draw,const NativeScenePassCamera& camera,
     const NativeViewportState& viewport,const NativeFullFramePassTargets& formats) {
+  HookTiming timing(HookPhase::FrameNativeEffectActivate);
   NativeFullFrameEffectActivation result;
   if(draw.texture) {
     const auto texture=state.textures.find(draw.texture);
@@ -3518,36 +3540,58 @@ NativeFullFrameEffectActivation ActivateNativeFullFrameEffectLocked(Bridge& stat
 void RecordNativeFullFrameEffectCallsLocked(Bridge& state,const GuestReader& reader,
     const NativeFullFrameEffectActivation& activation,const NativeEffectDraw& draw,const NativeViewportState& viewport) {
   const auto& declaration=*activation.declaration;
-  for(const auto& [first,count]:NativeEffectDrawCalls(draw)) {
-    const auto bytes=EncodeNativeEffectVertices(draw,first,count);
+  const auto calls=NativeEffectDrawCalls(draw);
+  // Encoded off the locks when the pass did (EncodeNativeEffectDrawCalls), the
+  // same bytes; encoded here otherwise.
+  const bool encoded=!draw.encoded_calls.empty();
+  if(encoded && draw.encoded_calls.size()!=calls.size()) throw std::runtime_error("native effect encoded calls do not match the draw");
+  for(size_t call=0;call<calls.size();++call) {
+    const auto [first,count]=calls[call];
+    std::vector<uint8_t> local;
+    if(!encoded) local=EncodeNativeEffectVertices(draw,first,count);
+    const std::span<const uint8_t> bytes=encoded?std::span<const uint8_t>(draw.encoded_calls[call]):std::span<const uint8_t>(local);
     RecordNativeSceneImmediate(state,reader,activation.device,{*activation.vertex,*activation.pixel,viewport,activation.render,
-      activation.shaders,activation.declaration_id,declaration->count(),declaration,draw.primitive(),draw.stride()},bytes);
+      activation.shaders,activation.declaration_id,declaration->count(),declaration,draw.primitive(),draw.stride(),
+      REXCVAR_GET(edf_native_effect_mesh_buckets)},bytes);
   }
 }
+struct NativeFullFrameEffectCarry::Held {
+  std::optional<NativeFullFrameEffectActivation> activation;
+  const NativeEffectDraw* activated=nullptr;
+};
+NativeFullFrameEffectCarry::NativeFullFrameEffectCarry():held_(std::make_unique<Held>()) {}
+NativeFullFrameEffectCarry::~NativeFullFrameEffectCarry()=default;
+void NativeFullFrameEffectCarry::Reset() { held_->activation.reset(); held_->activated=nullptr; }
 // A run of adjacent draws that NativeEffectDrawsShareActivation is activated
 // once: the activation reads only the fields that predicate compares (never
 // the vertices), so the next draw's would bind the same texture word, program,
 // constants, samplers and render state onto the same bindings, which only an
 // activation changes (the immediate recording reads them). A failed draw
 // drops the activation and goes to `failed` once, with its reason; the next
-// draw activates again, as it would alone.
+// draw activates again, as it would alone. With a carry the run continues
+// from the previous call's last activation (NativeFullFrameEffectCarry); the
+// pass camera, viewport and formats are the pass's own, the same in every
+// call of one hold.
 uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
     std::span<const NativeEffectDraw> draws,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
-    const NativeFullFramePassTargets& formats,const std::function<void(const std::exception&)>& failed) {
+    const NativeFullFramePassTargets& formats,const std::function<void(const std::exception&)>& failed,
+    NativeFullFrameEffectCarry* carry) {
   uint64_t recorded=0;
-  std::optional<NativeFullFrameEffectActivation> activation;
-  const NativeEffectDraw* activated=nullptr;
+  NativeFullFrameEffectCarry::Held local;
+  auto& held=carry?carry->held():local;
+  auto& activation=held.activation;
   for(const auto& draw:draws) {
     try {
       // Reuse off (native_reuse.h): every draw activates on its own.
-      if(!activation || !NativeReuseAllowed() || !NativeEffectDrawsShareActivation(*activated,draw)) {
-        activation.reset();
+      if(!activation || !NativeReuseAllowed() || !NativeEffectDrawsShareActivation(*held.activated,draw)) {
+        activation.reset(); held.activated=nullptr;
         activation=ActivateNativeFullFrameEffectLocked(state,reader,window,draw,camera,viewport,formats);
-        activated=&draw;
-      }
+        held.activated=&draw;
+        if(carry) ++carry->activations;
+      } else if(carry) ++carry->shared;
       RecordNativeFullFrameEffectCallsLocked(state,reader,*activation,draw,viewport);
       ++recorded;
-    } catch(const std::exception& error) { activation.reset(); failed(error); }
+    } catch(const std::exception& error) { activation.reset(); held.activated=nullptr; failed(error); }
   }
   return recorded;
 }

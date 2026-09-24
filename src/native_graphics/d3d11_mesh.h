@@ -39,6 +39,9 @@ class NativeVertexBuffer {
   // The same conversion into a caller-owned vector, so a per-draw caller can
   // reuse one instead of allocating.
   void ConvertVerticesInto(std::span<const uint8_t> source,std::vector<uint8_t>& native) const;
+  // The first vertex_count vertices only (source holds exactly those), for a
+  // draw of fewer vertices than the buffer was built for (DrawTransientPrefix).
+  void ConvertVertexPrefixInto(std::span<const uint8_t> source,uint32_t vertex_count,std::vector<uint8_t>& native) const;
   void Update(ID3D11DeviceContext& context,std::span<const uint8_t> source);
   void Update(NativeBackendRecorder& recorder,std::span<const uint8_t> source);
   // The backend that made storage_, kept for the identity checks that used to
@@ -164,6 +167,15 @@ class NativeIndexedMesh {
                      uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
   void DrawLinesTransient(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
                           uint32_t first_index,uint32_t index_count,int32_t base_vertex=0) const;
+  // DrawTransient of fewer vertices than this dynamic mesh was built for: the
+  // first guest_vertices.size()/stride of them, which must be every vertex the
+  // indices [first_index, first_index+index_count) name (checked). For index
+  // patterns whose indices over n vertices are the prefix of those over more
+  // (generated quads and strips, NativeGeneratedIndices), one mesh built for a
+  // larger count draws any smaller count with that count's own index range:
+  // the same vertices in the same order as a mesh of exactly that count.
+  void DrawTransientPrefix(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                           uint32_t first_index,uint32_t index_count) const;
   // DrawTransient / DrawLinesTransient recorded without the index buffer: the
   // converted vertices written out in index order and drawn as a non-indexed
   // list (ExpandIndexedVertices), the same primitives from the same vertex

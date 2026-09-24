@@ -97,6 +97,9 @@ EDF_NATIVE_CVAR(bool, edf_native_world_instancing, true);
 EDF_NATIVE_CVAR(bool, edf_native_world_constant_reuse, true);
 EDF_NATIVE_CVAR(bool, edf_native_transient_batching, true);
 EDF_NATIVE_CVAR(bool, edf_native_prepared_geometry, true);
+EDF_NATIVE_CVAR(bool, edf_native_effect_mesh_buckets, true);
+EDF_NATIVE_CVAR(bool, edf_native_effect_activation_share, true);
+EDF_NATIVE_CVAR(int32_t, edf_native_effect_lock_slice_us, 250);
 
 // Frame pacing, unlocked frame rate and threads.
 EDF_NATIVE_CVAR(int32_t, edf_native_wait_stall_ms, 5000);

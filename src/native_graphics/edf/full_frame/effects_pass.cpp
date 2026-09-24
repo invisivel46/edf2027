@@ -6,6 +6,7 @@
 #include "host.h"
 #include "../../native_full_frame_effects.h"
 #include "../../native_scene_cpu_window.h"
+#include "../../native_lock_slices.h"
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <algorithm>
@@ -84,24 +85,39 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
     uint64_t drawn=0;
     if(!collection.immediate.empty()) {
       auto& state=State();
-      std::lock_guard submission(state.submissions);
-      std::lock_guard lock(state.mutex);
+      // The bridge locks in short holds (NativeLockSlices): the targets, then
+      // the mode-0 items in slices, the vertices encoded before, off the locks.
+      NativeLockSlices slices(state.submissions,state.mutex);
       NativeFullFramePassTargets formats; NativeBackendViewport backend_viewport; NativeBackendScissor scissor; NativeViewportState viewport;
-      const auto targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
-      if(state.active_scene==context.renderer && targets.count && targets.depth && state.scene_backend) {
-        const NativeSceneCpuWindow window(reader_);
+      decltype(ActiveTargetsLocked(state)) targets{};
+      std::shared_ptr<NativeRenderBackend> backend;
+      if(slices([&] {
+        targets=NativeFullFrameSceneTargetsLocked(state,context.viewport,formats,backend_viewport,scissor,viewport);
+        backend=state.scene_backend;
+        return state.active_scene==context.renderer && targets.count && targets.depth && backend;
+      })) {
+        EncodeNativeEffectItems(collection.immediate);
         const auto report=[](const std::string& reason) { NativeFullFrameDeclined("effects",reason); };
-        for(const auto& item:collection.immediate)
-          drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,NativeSceneDrawCamera(),viewport,formats,
-            [&](const std::exception& error) { report(error.what()); });
+        const auto& camera=NativeSceneDrawCamera();
+        NativeFullFrameEffectCarry carry;
+        const bool share=NativeEffectActivationShare();
+        const auto recorded=RecordNativeFullFrameItemsSliced(slices,collection.immediate.size(),reader_,carry,
+          [&] { return state.active_scene==context.renderer && state.scene_backend==backend && ActiveTargetsLocked(state)==targets; },
+          [&](size_t index,const NativeSceneCpuWindow<GuestReader>& window,NativeFullFrameEffectCarry& held) {
+            drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,collection.immediate[index].draws,camera,viewport,formats,
+              [&](const std::exception& error) { report(error.what()); },share?&held:nullptr);
+          });
+        if(recorded<collection.immediate.size() && NativeCoverageCensusOn())
+          CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:effects","stale",collection.immediate.size()-recorded);
+        lock_slices_+=slices.slices();
       } else if(NativeCoverageCensusOn())
         CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:effects","no_targets",collection.immediate.size());
     }
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} failed={} (total {}) absent={} stale_guest_eye={} held_frames={}",
+      REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} failed={} (total {}) absent={} stale_guest_eye={} held_frames={} lock_slices={}",
         frames_,manager,collection.visited,collection.culled,collection.hidden,collection.immediate.size(),drawn,
         collection.items.size(),collection.undrawn_keys,collection.unsupported,collection.failures.size(),failed_objects_,
-        absent_,stale_eyes_,held_frames_);
+        absent_,stale_eyes_,held_frames_,lock_slices_);
     shared_->effects=std::move(collection.items);
   }
  private:
@@ -141,7 +157,7 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
   std::shared_ptr<edf::native::NativeFullFrameModelsShared> shared_;
   std::set<uint32_t> unsupported_;
   std::set<std::string> failure_reasons_;  // Logged once each.
-  uint64_t frames_=0,absent_=0,stale_eyes_=0,held_frames_=0,failed_objects_=0;
+  uint64_t frames_=0,absent_=0,stale_eyes_=0,held_frames_=0,failed_objects_=0,lock_slices_=0;
 };
 }
 
