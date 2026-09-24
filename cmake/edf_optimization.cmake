@@ -27,13 +27,23 @@
 #
 #   EDF_LTO=thin           ThinLTO for guest and host targets, linked by lld.
 #   EDF_PGO=generate|use   Clang IR PGO for guest and host targets.
-#       generate           instrumented build; the game rewrites
-#                          EDF_PGO_RAW_FILE every EDF_PGO_DUMP_SECONDS (env,
-#                          default 30) and at a clean exit.
+#       generate           instrumented build (preset win-amd64-pgo-train,
+#                          driven by tools/pgo-train.ps1); the game rewrites
+#                          EDF_PGO_RAW_FILE (env overrides the cache path)
+#                          every EDF_PGO_DUMP_SECONDS (env, default 30).
 #       use                optimize with EDF_PGO_PROFILE (llvm-profdata merge
-#                          output). Name each new profile differently: the
-#                          path is on the compile line, its contents are not
-#                          a Ninja dependency.
+#                          output; win-amd64-release uses the committed
+#                          pgo/edf2027.profdata). Configure copies it into the
+#                          build tree under a name carrying its MD5, so a new
+#                          profile changes the compile line and Ninja rebuilds
+#                          against it; a missing profile only warns and builds
+#                          without PGO. docs/pgo.md covers training and when
+#                          to retrain.
+#     Both modes pass -mllvm -static-func-full-module-prefix=false: the profile
+#     names internal-linkage functions by source file name only, not the full
+#     path, so a profile trained in one checkout matches another.
+#     EDF_PGO_STALE_WARNINGS=ON keeps clang's per-TU "profile data may be out
+#     of date" summary (how many functions no longer match the profile).
 #
 # Only Clang (the GNU-style clang++ driver the presets select) is supported.
 
@@ -47,10 +57,26 @@ set(EDF_PGO "" CACHE STRING "Profile-guided optimization: '', generate or use")
 set_property(CACHE EDF_PGO PROPERTY STRINGS "" generate use)
 set(EDF_PGO_RAW_FILE "${CMAKE_BINARY_DIR}/pgo/edf2027.profraw" CACHE FILEPATH
     "Raw profile the EDF_PGO=generate build writes")
-set(EDF_PGO_PROFILE "${CMAKE_BINARY_DIR}/pgo/edf2027.profdata" CACHE FILEPATH
+set(EDF_PGO_PROFILE "${CMAKE_SOURCE_DIR}/pgo/edf2027.profdata" CACHE FILEPATH
     "Merged profile the EDF_PGO=use build reads")
+option(EDF_PGO_STALE_WARNINGS "EDF_PGO=use: report functions whose profile no longer matches (-Wprofile-instr-out-of-date)" OFF)
 
-if(NOT EDF_GUEST_OPT_PROFILE AND NOT EDF_HOST_OPT_PROFILE AND NOT EDF_LTO AND NOT EDF_PGO)
+# What the build actually does with PGO: EDF_PGO=use falls back to no PGO when
+# the profile is missing.
+set(EDF_PGO_ACTIVE "${EDF_PGO}")
+if(EDF_PGO STREQUAL "use" AND NOT EXISTS "${EDF_PGO_PROFILE}")
+    message(WARNING "EDF_PGO=use, but the profile ${EDF_PGO_PROFILE} does not exist: building WITHOUT "
+        "profile-guided optimization (correct, about 10% slower). Restore pgo/edf2027.profdata from git, "
+        "train one with tools/pgo-train.ps1, or pass -DEDF_PGO= to silence this.")
+    set(EDF_PGO_ACTIVE "")
+    # Configure again once the profile appears.
+    get_filename_component(_edf_pgo_parent "${EDF_PGO_PROFILE}" DIRECTORY)
+    if(IS_DIRECTORY "${_edf_pgo_parent}")
+        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_edf_pgo_parent}")
+    endif()
+endif()
+
+if(NOT EDF_GUEST_OPT_PROFILE AND NOT EDF_HOST_OPT_PROFILE AND NOT EDF_LTO AND NOT EDF_PGO_ACTIVE)
     return()
 endif()
 
@@ -113,9 +139,10 @@ elseif(EDF_LTO)
     message(FATAL_ERROR "EDF_LTO must be '' or thin")
 endif()
 
-if(EDF_PGO STREQUAL "generate")
+set(_edf_pgo_name_flags "SHELL:-mllvm -static-func-full-module-prefix=false")
+if(EDF_PGO_ACTIVE STREQUAL "generate")
     foreach(_t IN LISTS _edf_guest_targets _edf_host_targets)
-        target_compile_options(${_t} PRIVATE -fprofile-generate)
+        target_compile_options(${_t} PRIVATE -fprofile-generate ${_edf_pgo_name_flags})
     endforeach()
     get_filename_component(_edf_pgo_dir "${EDF_PGO_RAW_FILE}" DIRECTORY)
     file(MAKE_DIRECTORY "${_edf_pgo_dir}")
@@ -123,21 +150,38 @@ if(EDF_PGO STREQUAL "generate")
     set_source_files_properties(${CMAKE_SOURCE_DIR}/src/pgo_profile_writer.cpp PROPERTIES
         COMPILE_DEFINITIONS "EDF_PGO_RAW_FILE=\"${EDF_PGO_RAW_FILE}\"")
     target_link_options(edf2027 PRIVATE -fprofile-generate)
-elseif(EDF_PGO STREQUAL "use")
-    if(NOT EXISTS "${EDF_PGO_PROFILE}")
-        message(FATAL_ERROR "EDF_PGO=use needs EDF_PGO_PROFILE (${EDF_PGO_PROFILE}); "
-            "run llvm-profdata merge -o <it> <the .profraw> first")
+elseif(EDF_PGO_ACTIVE STREQUAL "use")
+    # Ninja tracks the compile line, not the profile's contents. Compile
+    # against a copy named after the profile's MD5: a retrained profile gets a
+    # new name, so every object is rebuilt against it. The profile is also a
+    # configure dependency, so replacing it re-runs this on the next build.
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${EDF_PGO_PROFILE}")
+    file(MD5 "${EDF_PGO_PROFILE}" _edf_pgo_md5)
+    string(SUBSTRING "${_edf_pgo_md5}" 0 12 _edf_pgo_md5)
+    set(_edf_pgo_dir "${CMAKE_BINARY_DIR}/pgo")
+    set(_edf_pgo_copy "${_edf_pgo_dir}/use-${_edf_pgo_md5}.profdata")
+    if(NOT EXISTS "${_edf_pgo_copy}")
+        file(GLOB _edf_pgo_old "${_edf_pgo_dir}/use-*.profdata")
+        if(_edf_pgo_old)
+            file(REMOVE ${_edf_pgo_old})
+        endif()
+        file(MAKE_DIRECTORY "${_edf_pgo_dir}")
+        file(COPY_FILE "${EDF_PGO_PROFILE}" "${_edf_pgo_copy}")
+    endif()
+    # A stale profile (host changes since training) only loses the profile of
+    # the functions that changed; they are optimized as without PGO. The guest
+    # code (generated/) does not change, so its profile stays valid.
+    set(_edf_pgo_warnings -Wno-profile-instr-unprofiled -Wno-profile-instr-missing)
+    if(NOT EDF_PGO_STALE_WARNINGS)
+        list(APPEND _edf_pgo_warnings -Wno-profile-instr-out-of-date)
     endif()
     foreach(_t IN LISTS _edf_guest_targets _edf_host_targets)
-        # A stale profile (codegen or host changes since training) only loses
-        # coverage for the changed functions; keep the build quiet about it.
-        target_compile_options(${_t} PRIVATE "-fprofile-use=${EDF_PGO_PROFILE}"
-            -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-profile-instr-missing)
+        target_compile_options(${_t} PRIVATE "-fprofile-use=${_edf_pgo_copy}" ${_edf_pgo_name_flags}
+            ${_edf_pgo_warnings})
     endforeach()
-    # Ninja does not track the profile's contents, only the command line:
-    # give each new profile a new file name to recompile against it.
-elseif(EDF_PGO)
+    message(STATUS "EDF PGO: using ${EDF_PGO_PROFILE} (md5 ${_edf_pgo_md5})")
+elseif(EDF_PGO AND NOT EDF_PGO STREQUAL "use")
     message(FATAL_ERROR "EDF_PGO must be '', generate or use")
 endif()
 
-message(STATUS "EDF optimization: guest='${EDF_GUEST_OPT_PROFILE}' host='${EDF_HOST_OPT_PROFILE}' lto='${EDF_LTO}' pgo='${EDF_PGO}'")
+message(STATUS "EDF optimization: guest='${EDF_GUEST_OPT_PROFILE}' host='${EDF_HOST_OPT_PROFILE}' lto='${EDF_LTO}' pgo='${EDF_PGO_ACTIVE}'")

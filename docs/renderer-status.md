@@ -508,10 +508,12 @@ change-driven behaviour (`665e3e1`) has no cvar.
     an OS without AVX state support. The check is compiled out
     (`EDF_CPU_CHECK_REQUIRE_X86_64_V3=0`) when neither profile is v3.
   - `EDF_LTO=thin` turns on ThinLTO.
-  - `EDF_PGO=generate|use` turns on clang IR PGO.
+  - `EDF_PGO=generate|use` turns on clang IR PGO. `win-amd64-release` builds
+    with `use` against the committed `pgo/edf2027.profdata`, which
+    `tools/pgo-train.ps1` trains on four scenarios. See `docs/pgo.md` for the
+    pipeline and the measurements.
 
-  None of them has been measured in game. Micro-benchmarks put `O3` about
-  equal to `-O2`.
+  Micro-benchmarks put `O3` about equal to `-O2`.
 
 ## 8. Known gaps
 

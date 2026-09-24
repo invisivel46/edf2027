@@ -15,3 +15,6 @@ docs/media/** binary
 
 # Hash-pinned fixtures: byte-exact, never line-ending converted.
 tests/fixtures/** -text
+
+# The PGO profile (docs/pgo.md): binary, never diffed or line-ending converted.
+pgo/*.profdata binary

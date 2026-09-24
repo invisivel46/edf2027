@@ -1,0 +1,66 @@
+{
+    "started":  "2026-09-23T23:27:48",
+    "commit":  "43f3292",
+    "dirty":  true,
+    "preset":  "win-amd64-pgo-train",
+    "llvm_profdata":  "LLVM version 20.1.8",
+    "finished":  "2026-09-24T00:14:39",
+    "runs":  [
+                 {
+                     "scenario":  "benchmark",
+                     "seconds":  606,
+                     "exited_early":  false,
+                     "run":  "binding-validation-20260923-233218-a9c5c885"
+                 },
+                 {
+                     "scenario":  "ufo-swarm",
+                     "seconds":  605,
+                     "exited_early":  false,
+                     "run":  "binding-validation-20260923-234224-16857948"
+                 },
+                 {
+                     "scenario":  "cave",
+                     "seconds":  605,
+                     "exited_early":  false,
+                     "run":  "binding-validation-20260923-235229-a1526b31"
+                 },
+                 {
+                     "scenario":  "vehicle",
+                     "seconds":  725,
+                     "exited_early":  false,
+                     "run":  "binding-validation-20260924-000234-582484f0"
+                 }
+             ],
+    "parts":  [
+                  {
+                      "scenario":  "benchmark",
+                      "share":  2,
+                      "total_count":  275498914594,
+                      "weight":  26
+                  },
+                  {
+                      "scenario":  "ufo-swarm",
+                      "share":  1,
+                      "total_count":  236215435962,
+                      "weight":  15
+                  },
+                  {
+                      "scenario":  "cave",
+                      "share":  1,
+                      "total_count":  284150394217,
+                      "weight":  13
+                  },
+                  {
+                      "scenario":  "vehicle",
+                      "share":  1,
+                      "total_count":  356874922703,
+                      "weight":  10
+                  }
+              ],
+    "output":  {
+                   "path":  "pgo/edf2027.profdata",
+                   "bytes":  10207112,
+                   "functions":  27323
+               },
+    "total_seconds":  2811
+}
