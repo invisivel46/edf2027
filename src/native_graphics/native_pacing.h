@@ -1,4 +1,5 @@
 #pragma once
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
@@ -62,11 +63,25 @@ class NativePacingClock {
     baseline_ = baseline;
     initialized_ = true;
   }
+  // Ticks per second: 60 is retail and uses the exact integer path below. Any other
+  // rate (the console's "timescale") rebases at `now`, so the tick count stays continuous
+  // and the sub-tick fraction carries over.
+  void SetRate(Clock::time_point now, double ticks_per_second) {
+    if (!(ticks_per_second > 0) || ticks_per_second == rate_) return;
+    if (!initialized_) { rate_ = ticks_per_second; return; }
+    const uint64_t tick = Sample(now);
+    const double fraction = Fraction(now);
+    rate_ = ticks_per_second;
+    epoch_ = now - std::chrono::nanoseconds(int64_t(fraction * 1e9 / rate_));
+    baseline_ = tick;
+  }
+  double rate() const { return rate_; }
   uint64_t Sample(Clock::time_point now) const {
     if (!initialized_) throw std::logic_error("native pacing clock not initialized");
     if (now < epoch_) throw std::logic_error("native pacing clock moved backwards");
     const auto ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now - epoch_).count());
+    if (rate_ != 60.0) return baseline_ + uint64_t(double(ns) * rate_ / 1e9);
     // Split before multiplying: exact 60 Hz boundaries, no rounded-period drift.
     return baseline_ + (ns / 1000000000) * 60 + (ns % 1000000000) * 60 / 1000000000;
   }
@@ -74,19 +89,33 @@ class NativePacingClock {
     (void)Sample(now); // Same initialization/backwards-time contract.
     const auto ns=static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(now-epoch_).count());
+    if (rate_ != 60.0) return uint32_t(ScaledFraction(ns)*100.0)+1;
     return uint32_t(((ns%1000000000)*60%1000000000)/10000000)+1;
   }
   float Fraction(Clock::time_point now) const {
     (void)Sample(now);
     const auto ns=static_cast<uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(now-epoch_).count());
+    if (rate_ != 60.0) return float(ScaledFraction(ns));
     return float(double((ns%1000000000)*60%1000000000)/1000000000.0);
   }
  private:
+  double ScaledFraction(uint64_t ns) const {
+    const double ticks = double(ns) * rate_ / 1e9;
+    return ticks - double(uint64_t(ticks));
+  }
   Clock::time_point epoch_{};
   uint64_t baseline_ = 0;
+  double rate_ = 60.0;
   bool initialized_ = false;
 };
+// The console's "timescale" (src/console): the engine heartbeat runs 60 x this many
+// simulation ticks per second. The simulation is frame-locked, so this is the game's speed.
+// Read by the heartbeat hook (frame.cpp), which applies it to the pacing clock.
+inline std::atomic<double>& NativeTimeScaleRequest() {
+  static std::atomic<double> scale{1.0};
+  return scale;
+}
 
 // Movie playback keeps the retail clocks. It stays paced only while movie draws
 // keep arriving: a swap with no new draw since the previous swap counts as idle,

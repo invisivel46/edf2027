@@ -5,6 +5,7 @@
 #endif
 #include "host.h"
 #include "../../native_full_frame_effects.h"
+#include "../../native_console_counters.h"
 #include "../../native_scene_cpu_window.h"
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -96,6 +97,13 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
             [&](const std::exception& error) { report(error.what()); });
       } else if(NativeCoverageCensusOn())
         CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:effects","no_targets",collection.immediate.size());
+    }
+    {  // The console's "stats" (native_console_counters.h).
+      auto& counters=ConsoleCounters();
+      counters.effects_visited.store(collection.visited,std::memory_order_relaxed);
+      counters.effects_filed.store(uint32_t(collection.items.size()),std::memory_order_relaxed);
+      counters.effects_drawn.store(uint32_t(drawn),std::memory_order_relaxed);
+      counters.effects_frames.fetch_add(1,std::memory_order_relaxed);
     }
     if(++frames_<=4 || frames_%1000==0)
       REXLOG_INFO("Native full frame effects: frames={} manager={:#x} visited={} culled={} hidden={} immediate={} drawn={} filed={} undrawn_keys={} unsupported={} failed={} (total {}) absent={} stale_guest_eye={} held_frames={}",

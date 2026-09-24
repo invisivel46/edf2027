@@ -52,6 +52,9 @@ set(EDF2027_SOURCES
     src/input_latency.cpp
     src/diagnostics.cpp
     src/version.cpp
+    # In-game console (docs/console.md).
+    src/console/console.cpp
+    src/console/console_game.cpp
 )
 
 if(WIN32)
