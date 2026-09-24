@@ -1,0 +1,156 @@
+name: Bug report
+description: Something broke, crashed, looks wrong or runs badly.
+title: "[Bug] "
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing the EDF2027 beta. The log file answers most of the questions below,
+        so please attach it.
+
+        **Where to find the files:** the `logs` folder next to `edf2027.exe`. If the game's
+        folder can't be written to, for example under Program Files, they are in
+        `%APPDATA%\edf2027\logs` instead. Each run writes `edf2027_NNN.log`. The newest number
+        is the latest run. After a crash, the same folder also holds `edf2027_NNN_crash.dmp` and
+        `edf2027_NNN_crash.txt`, and the crash message box names both.
+
+        Please don't attach game files or disc images.
+  - type: input
+    id: version
+    attributes:
+      label: EDF2027 version
+      description: At the bottom of the F1 menu's section list, or on the first line of the log (`==== EDF2027 ... ====`).
+      placeholder: 0.3.0-beta+abc1234
+    validations:
+      required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: As exact as you can. Does it happen every time?
+      placeholder: |
+        1. Start Mission 12 on Hard
+        2. Switch to the rocket launcher
+        3. Fire at the ants near the bridge
+        4. The screen goes black
+    validations:
+      required: true
+  - type: input
+    id: mission
+    attributes:
+      label: Mission number and difficulty
+      description: Or "title screen", "menus", "loading screen" and so on.
+      placeholder: Mission 12, Hard
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of problem is it?
+      options:
+        - Crash (the game closed, or a crash message appeared)
+        - Freeze or hang
+        - Graphics glitch
+        - Performance or stutter
+        - Audio
+        - Controls or input
+        - Settings or F1 menu
+        - Setup or first run
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU and driver version
+      description: "The log lists them near the top (`GPU 0: ...`)."
+      placeholder: NVIDIA GeForce RTX 3060, driver 560.94
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU
+      placeholder: AMD Ryzen 5 5600X
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Windows version (or Linux distribution and Proton version)
+      placeholder: Windows 11 24H2 / Steam Deck, Proton 9.0
+    validations:
+      required: true
+  - type: input
+    id: display
+    attributes:
+      label: Resolution and display mode
+      description: Windowed or borderless fullscreen, the window or monitor resolution, and the refresh rate.
+      placeholder: Borderless fullscreen, 2560x1440, 144 Hz
+    validations:
+      required: true
+  - type: input
+    id: framerate
+    attributes:
+      label: Frame rate and VSync settings
+      description: VSync on or off, the frame-rate cap, and whether the frame-rate unlock is on (all in F1 > Performance).
+      placeholder: VSync on, no cap, unlock on
+    validations:
+      required: true
+  - type: dropdown
+    id: fsr
+    attributes:
+      label: FSR / anti-aliasing
+      description: F1 > Graphics > Upscaling / anti-aliasing.
+      options:
+        - "Off"
+        - Native AA
+        - An FSR quality mode (say which below)
+        - Don't know
+    validations:
+      required: true
+  - type: dropdown
+    id: input
+    attributes:
+      label: Input device
+      multiple: true
+      options:
+        - Keyboard and mouse
+        - Xbox controller
+        - PlayStation controller
+        - Other controller
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: Drag `edf2027_NNN.log` from the run that went wrong into this box. For a large log, zip it first.
+      placeholder: Drop the log file here.
+    validations:
+      required: true
+  - type: textarea
+    id: crash-dump
+    attributes:
+      label: Crash dump (crashes only)
+      description: |
+        Zip `edf2027_NNN_crash.dmp` (or `_error.dmp`) and drop it here, together with the `.txt` file next to it.
+        GitHub doesn't accept `.dmp` files unless they are zipped. The dump holds the game's state at the moment of the crash, not your personal files.
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or video
+      description: Very helpful for graphics glitches. Drop images here, or link a video.
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else?
+      description: Settings you changed from the defaults, mods or overlays running (RivaTuner, Discord, ReShade), whether it worked in an earlier version, and so on.

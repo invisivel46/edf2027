@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and setup help
+    url: https://github.com/invisivel46/edf2027/discussions
+    about: Getting the game running, or where to get the game data. Please ask in Discussions, not in bug reports.
