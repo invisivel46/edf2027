@@ -97,6 +97,9 @@ $arguments = @(
   ('--edf_native_loading_trace=' + $LoadingTrace.IsPresent.ToString().ToLowerInvariant()),
   ('--edf_native_load_timings=' + $LoadTimings.IsPresent.ToString().ToLowerInvariant())
 )
+# Automated runs start muted so they don't play over whatever the user is doing;
+# -ManualInput keeps the sound, and -ExtraArgs '--audio_mute=false' overrides it.
+if (-not $ManualInput) { $arguments += '--audio_mute=true' }
 $rendererOverride = @($ExtraArgs | Where-Object { (($_ -split '=', 2)[0]) -eq '--edf_native_renderer' }).Count -gt 0
 if ($Renderer -ne 'default' -and -not $rendererOverride) {
   if (Test-ExecutableOption $candidate 'edf_native_renderer') {
