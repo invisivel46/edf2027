@@ -305,6 +305,8 @@ inline REXCVAR_DEFINE_INT32(edf_native_coverage_census_interval,30,"EDF2027",
   "Seconds between edf_native_coverage_census summaries").range(1,3600);
 inline REXCVAR_DEFINE_BOOL(edf_native_frame_times, false, "EDF2027",
                    "Log present-to-present frame-time percentiles and one line per spike frame (over 25 ms or twice the rolling median) with its pipeline, shader, geometry and texture creations, declined passes and largest hook phases (development)");
+inline REXCVAR_DEFINE_BOOL(edf_native_first_use_log, false, "EDF2027",
+                   "Log one 'Native first use' line per shader compile, shader disk-cache read, shader wait, pipeline built or waited for on the thread that needed it, and boot precompile batch, with its duration, key and swap number (tools/frame-time-report.py sorts them by mission phase; development)");
 inline REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
                    "Sample end-frame publication eligibility and cumulative UI draws; does not capture pixels (development)");
 inline REXCVAR_DEFINE_BOOL(edf_native_load_timings, false, "EDF2027",

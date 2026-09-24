@@ -34,6 +34,7 @@
 #include "native_static_world_cache.h"
 #include "native_queued_scene.h"
 #include "native_decode_workers.h"
+#include "native_first_use.h"
 #include "native_d3d12_preview.h"
 #include "native_host_surface.h"
 #include "guest_instance_parameters.h"
@@ -154,6 +155,7 @@
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <algorithm>
 #include <optional>
 
 REXCVAR_DECLARE(int32_t, window_width);
@@ -663,6 +665,7 @@ void ApplyNativeCacheDirectory() {
     if(setting!="off") directory=setting.empty()?edf::native::NativeDefaultCacheDirectory():std::filesystem::path(setting);
     edf::native::SetNativeCacheDirectory(directory);
     edf::native::SetNativeD3D12SceneCacheDirectory(directory);
+    edf::native::NativeFirstUseLog::Get().SetEnabled(REXCVAR_GET(edf_native_first_use_log));
     REXLOG_INFO("Native persistent caches: {}",directory.empty()?std::string("off"):directory.string());
   });
 }
@@ -902,13 +905,14 @@ void SubmitSceneFrameLocked(Bridge& state) {
       counts.sampler_evictions,counts.retiring,counts.frame_waits,
       counts.frame_waits?counts.frame_wait_ns/counts.frame_waits/1000:0);
     const auto shaders=edf::native::GetNativeShaderCacheStatistics();
-    REXLOG_INFO("Native first-use caches: pipelines prebuilt={} content_hits={} waits={} ({}us) manifest_entries={}; "
+    REXLOG_INFO("Native first-use caches: pipelines prebuilt={} ({:.1f} ms) queued={} misses={} content_hits={} waits={} ({}us) manifest_entries={}; "
       "sampler_tables_prewarmed={}; buffers committed={} placed={} heaps={} ({} MB); "
-      "shaders compiled={} memory_hits={} disk_hits={} disk_stores={} disk_rejects={}",
-      counts.pipeline_prebuilt,counts.pipeline_content_hits,counts.pipeline_waits,counts.pipeline_wait_ns/1000,
+      "shaders compiled={} ({:.1f} ms) memory_hits={} disk_hits={} waits={} disk_stores={} disk_rejects={}",
+      counts.pipeline_prebuilt,counts.pipeline_prebuild_ns/1e6,counts.pipeline_queued,counts.pipeline_misses,
+      counts.pipeline_content_hits,counts.pipeline_waits,counts.pipeline_wait_ns/1000,
       counts.pipeline_manifest_entries,counts.sampler_prewarmed,counts.buffers_committed,counts.buffers_placed,
-      counts.buffer_heaps,counts.buffer_heap_bytes>>20,shaders.compiles,shaders.memory_hits,shaders.disk_hits,
-      shaders.disk_stores,shaders.disk_rejects);
+      counts.buffer_heaps,counts.buffer_heap_bytes>>20,shaders.compiles,shaders.compile_ms,shaders.memory_hits,
+      shaders.disk_hits,shaders.waits,shaders.disk_stores,shaders.disk_rejects);
     if(state.scene_frames%6000==0)
       if(const auto caches=state.scene_backend->DescribeCaches();!caches.empty())
         REXLOG_INFO("Native scene caches: {}",caches);

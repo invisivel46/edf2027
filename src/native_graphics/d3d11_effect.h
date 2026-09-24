@@ -54,8 +54,12 @@ struct NativeShaderCacheStatistics {
   uint64_t disk_stores=0;    // Files written.
   uint64_t disk_rejects=0;   // Files present but unusable (key or payload mismatch).
   uint64_t unkeyed=0;        // Compiles whose source could not be preprocessed for a key.
+  uint64_t waits=0;          // Served by waiting for another thread's read or compile of the same key.
+  double compile_ms=0;       // Wall time inside D3DCompile, summed over threads.
 };
 NativeShaderCacheStatistics GetNativeShaderCacheStatistics();
+// The loaded d3dcompiler's identity as it enters every cache key.
+std::string NativeShaderCompilerIdentity();
 // Tests: forget the in-process entries so the next lookup goes to disk, and
 // stand in for a different compiler version.
 void ClearNativeShaderMemoryCache();

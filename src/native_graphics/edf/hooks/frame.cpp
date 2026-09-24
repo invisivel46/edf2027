@@ -27,6 +27,7 @@
 #include "../../native_full_frame.h"
 #include "../../native_coverage_census.h"
 #include "../../native_frame_times.h"
+#include "../../native_first_use.h"
 #include "../../native_full_frame_static_world.h"
 #include "../../native_full_frame_models.h"
 #include "../../native_declarations.h"
@@ -1259,9 +1260,26 @@ void RecordNativeFrameTimeLocked(std::chrono::steady_clock::time_point entry) {
     window_spikes=0; suppressed=0;
   }
 }
+// edf_native_first_use_log: every record since the last swap, stamped with
+// this swap's number (native_first_use.h). A record made on a thread no frame
+// waits for says so, since it cannot have been a hitch.
+void LogNativeFirstUse() {
+  static uint64_t swaps=0;
+  ++swaps;
+  auto& log=edf::native::NativeFirstUseLog::Get();
+  if(!log.enabled()) return;
+  uint64_t dropped=0;
+  const auto events=log.Take(&dropped);
+  for(const auto& event:events)
+    REXLOG_INFO("Native first use: swap={} kind={} ms={:.3f} thread={} key={} {}",swaps,
+      edf::native::kNativeFirstUseNames[size_t(event.kind)],event.ms,event.background?"background":"caller",
+      event.key,event.detail);
+  if(dropped) REXLOG_INFO("Native first use: swap={} dropped={} (queue full)",swaps,dropped);
+}
 }
 REX_EXTERN(edf_native_swap_wait) {
   using namespace edf::native;
+  LogNativeFirstUse();
   const bool frame_times=REXCVAR_GET(edf_native_frame_times);
   const auto swap_entry=frame_times?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
   NativeSwapFrameTrace frame_trace(ctx.r3.u32);

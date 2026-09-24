@@ -192,7 +192,7 @@ struct NativeBackendStatistics {
   // build; and lookups that had to wait for a warmer's build in progress.
   // pipeline_misses counts only builds made on the drawing thread.
   uint64_t pipeline_prebuilt=0,pipeline_content_hits=0,pipeline_waits=0,pipeline_wait_ns=0;
-  uint64_t pipeline_manifest_entries=0;
+  uint64_t pipeline_manifest_entries=0,pipeline_prebuild_ns=0,pipeline_queued=0;
   // Sampler tables written ahead from the manifest.
   uint64_t sampler_prewarmed=0;
 };

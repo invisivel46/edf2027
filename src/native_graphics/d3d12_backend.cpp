@@ -1533,6 +1533,7 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
     out.pipeline_waits=pipeline_stats.waits;
     out.pipeline_wait_ns=pipeline_stats.wait_ns;
     out.pipeline_manifest_entries=pipeline_stats.manifest_entries;
+    out.pipeline_prebuild_ns=pipeline_stats.prebuild_ns; out.pipeline_queued=pipeline_stats.queued;
     out.sampler_prewarmed=gpu_.samplers().prewarmed();
     out.buffers_committed=buffers_committed_.load(std::memory_order_relaxed);
     if(pool_) {

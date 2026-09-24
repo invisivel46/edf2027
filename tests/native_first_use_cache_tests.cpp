@@ -11,6 +11,7 @@
 #include "native_graphics/d3d12_pipeline.h"
 #include "native_graphics/native_disk_cache.h"
 #include "native_graphics/native_frame_times.h"
+#include "native_graphics/native_first_use.h"
 #include "native_graphics/native_render_backend.h"
 #include <windows.h>
 #include <d3dcompiler.h>
@@ -20,6 +21,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -176,6 +178,43 @@ float4 PS(float4 p : SV_POSITION) : SV_TARGET { return Tint(); }
   const auto stats=GetNativeShaderCacheStatistics();
   std::cout<<"shader cache: compiles="<<stats.compiles<<" memory_hits="<<stats.memory_hits<<" disk_hits="
            <<stats.disk_hits<<" stores="<<stats.disk_stores<<" rejects="<<stats.disk_rejects<<'\n';
+}
+
+// ---------------------------------------------------------------------------
+// Two threads asking for the same uncached shader at once: one compiles, the
+// other waits for that compile, and both get its bytes.
+void TestShaderInFlight() {
+  const auto root=Scratch("in_flight");
+  SetNativeCacheDirectory(root/"cache");
+  ClearNativeShaderMemoryCache();
+  NativeFirstUseLog::Get().SetEnabled(true);
+  (void)NativeFirstUseLog::Get().Take();
+  Effect effect;
+  // Long enough to compile that the second thread arrives while it runs.
+  effect.source="float4 VS(float4 p : POSITION) : POSITION { float4 a=p;\n";
+  for(int index=0;index<400;++index) effect.source+="a=sin(a)*cos(a+"+std::to_string(index)+");\n";
+  effect.source+="return a; }\n";
+  const ShaderEntry vs{false,"VS","vs_3_0"};
+  const auto before=GetNativeShaderCacheStatistics();
+  NativeShader first,second;
+  std::thread other([&] { first=CompileNativeShader(nullptr,effect,vs,root/"effect.fx"); });
+  second=CompileNativeShader(nullptr,effect,vs,root/"effect.fx");
+  other.join();
+  const auto after=GetNativeShaderCacheStatistics();
+  Check(after.compiles==before.compiles+1,"two concurrent requests for one shader compiled it "+
+        std::to_string(after.compiles-before.compiles)+" times");
+  Check(BytesOf(*first.bytecode.Get())==BytesOf(*second.bytecode.Get()),"concurrent requests got different bytecode");
+  const auto events=NativeFirstUseLog::Get().Take();
+  size_t compiles=0;
+  for(const auto& event:events) if(event.kind==NativeFirstUseKind::ShaderCompile) {
+    ++compiles;
+    Check(event.detail.find("entry=VS target=vs_5_0 variant=plain")!=std::string::npos,
+          "a compile record does not name its entry: "+event.detail);
+    Check(event.ms>0 && event.key.size()==16,"a compile record lacks its time or key");
+  }
+  Check(compiles==1,"first-use records: "+std::to_string(compiles)+" compiles for one shader");
+  NativeFirstUseLog::Get().SetEnabled(false);
+  SetNativeCacheDirectory({});
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +597,7 @@ int main() {
   std::cout<<std::unitbuf;
   try {
     TestShaderCache();
+    TestShaderInFlight();
     TestPipelineManifest();
     TestSamplerPrewarm();
     TestBufferPool();
