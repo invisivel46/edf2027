@@ -425,6 +425,13 @@ inline void NativeSkeletalMultiply(const M& m,uint32_t out,uint32_t a,uint32_t b
     const uint32_t staged[3]{(stack-48)&~0xFu,(stack-32)&~0xFu,(stack-16)&~0xFu};
     const __m128i values[3]{row1,row2,row3};
     for(uint32_t k=0;k<3;++k) m.StoreRow(staged[k],_mm_shuffle_epi8(values[k],reverse));
+    if(!(out&0xFu)) {
+      // Whole rows: stvlx of a reloaded staged row writes its bytes as they are.
+      m.StoreRow(out,_mm_shuffle_epi8(v0,reverse));
+      for(uint32_t k=0;k<3;++k)
+        m.StoreRow(out+16*(k+1),_mm_loadu_si128(reinterpret_cast<const __m128i*>(m.Row(staged[k]))));
+      return;
+    }
     const uint32_t bytes=16u-(out&0xFu);
     const auto store=[&](uint32_t at,__m128i value) {
       alignas(16) uint8_t lanes[16];
