@@ -15,6 +15,10 @@ Reads the lines the native renderer writes with --edf_native_frame_times=true
       buffer_kb, textures, texture_kb, declines, post_fallbacks, ...)
   Native GPU timing: pass=P frames=N total_ms= avg_ms= max_ms=
       GPU time per full-frame pass from timestamps
+  Native first use: swap=N kind=K ms=M thread=caller|background key=H ...
+      one shader compile, shader disk-cache read, shader wait, pipeline
+      build or pipeline wait (--edf_native_first_use_log=true); summarized
+      per phase by kind, with the slowest records a frame waited for
 
 and cuts the log into the mission phases renderer-runtime-gate.py uses
 (pre_entry, intro, loading, gameplay; see that tool for the markers; a log
@@ -50,6 +54,7 @@ FRAME_TIMES = re.compile(
 SPIKE = re.compile(r'Native frame spike: (.*)$')
 GPU = re.compile(r'Native GPU timing: pass=(\S+) frames=(\d+) total_ms=' + NUMBER + r' avg_ms=' + NUMBER +
                  r' max_ms=' + NUMBER)
+FIRST_USE = re.compile(r'Native first use: swap=(\d+) kind=(\S+) ms=' + NUMBER + r' thread=(\S+) key=(\S+) ?(.*)$')
 GPU_WINDOW = re.compile(r'Native GPU timing window: frames=(\d+) skipped=(\d+) dropped_spans=(\d+) invalid_spans=(\d+)')
 PHASES = ('pre_entry', *gate.GAME_PHASES, 'boundary', 'unphased', 'all')
 # Spike fields that describe the frame rather than attribute it.
@@ -126,7 +131,7 @@ def new_phase():
     return dict(windows=0, frames=0, span_ms=0.0, spikes_counted=0, suppressed_spikes=0, max_ms=None,
                 mean_weighted=0.0, histogram=Counter(), spikes=[], gpu=defaultdict(
                     lambda: dict(frames=0, total_ms=0.0, max_ms=0.0)),
-                gpu_windows=dict(frames=0, skipped=0, dropped_spans=0, invalid_spans=0))
+                gpu_windows=dict(frames=0, skipped=0, dropped_spans=0, invalid_spans=0), first_use=[])
 
 
 def collect(lines, start=0.0, end=1e9):
@@ -167,6 +172,13 @@ def collect(lines, start=0.0, end=1e9):
                 row['total_ms'] += float(m.group(3))
                 row['max_ms'] = max(row['max_ms'], float(m.group(5)))
             continue
+        m = FIRST_USE.search(line)
+        if m:
+            record = dict(t_s=round(t, 3), swap=int(m.group(1)), kind=m.group(2), ms=float(m.group(3)),
+                          thread=m.group(4), key=m.group(5), detail=m.group(6).strip())
+            for phase in (classify(t, 0, entry, windows), 'all'):
+                phases[phase]['first_use'].append(record)
+            continue
         m = GPU_WINDOW.search(line)
         if m:
             for phase in (classify(t, 0, entry, windows), 'all'):
@@ -197,6 +209,35 @@ def summarize_spikes(spikes, top):
                 without_counter_cause=unexplained, top_phase_leaders=dict(leaders.most_common()), worst=worst)
 
 
+def summarize_first_use(records, top):
+    """Per kind: count and time on threads a frame waits for ('caller') and on
+    background threads, and the slowest caller records."""
+    kinds = {}
+    for record in records:
+        row = kinds.setdefault(record['kind'], dict(caller=0, caller_ms=0.0, caller_max_ms=0.0,
+                                                     background=0, background_ms=0.0))
+        if record['thread'] == 'background':
+            row['background'] += 1
+            row['background_ms'] += record['ms']
+        else:
+            row['caller'] += 1
+            row['caller_ms'] += record['ms']
+            row['caller_max_ms'] = max(row['caller_max_ms'], record['ms'])
+    for row in kinds.values():
+        for key in ('caller_ms', 'caller_max_ms', 'background_ms'):
+            row[key] = round(row[key], 3)
+    # Per swap, summed: several records in one swap add up to one hitch. Shader
+    # waits are left out, since their time overlaps the compile they wait for.
+    per_swap = defaultdict(float)
+    for record in records:
+        if record['thread'] != 'background' and record['kind'] != 'shader_wait':
+            per_swap[record['swap']] += record['ms']
+    worst = sorted((r for r in records if r['thread'] != 'background'), key=lambda r: r['ms'], reverse=True)[:top]
+    return dict(kinds=kinds, swaps_with_caller_work=len(per_swap),
+                caller_ms_per_swap_max=round(max(per_swap.values()), 3) if per_swap else 0.0,
+                swaps_over_4ms=sum(1 for v in per_swap.values() if v >= 4.0), worst=worst)
+
+
 def report(lines, start=0.0, end=1e9, top=5):
     entry, phases = collect(lines, start, end)
     out = dict(mission_entry_s=None if entry is None else round(entry, 1), phases={})
@@ -215,6 +256,8 @@ def report(lines, start=0.0, end=1e9, top=5):
                                      max_ms=g['max_ms']) for name, g in row['gpu'].items()}
         if row['gpu_windows']['frames'] or row['gpu_windows']['skipped']:
             summary['gpu_windows'] = row['gpu_windows']
+        if row['first_use']:
+            summary['first_use'] = summarize_first_use(row['first_use'], top)
         out['phases'][phase] = summary
     return out
 
@@ -234,7 +277,7 @@ def print_text(result, file=None):
               f'{fmt(row["p99_9"])} {fmt(row["max_ms"])} {fmt(row["mean_ms"])} {row["spikes"]["count"]:>6}', file=file)
     for phase, row in result['phases'].items():
         spikes = row['spikes']
-        if phase == 'all' or not (spikes['count'] or row['gpu']):
+        if phase == 'all' or not (spikes['count'] or row['gpu'] or row.get('first_use')):
             continue
         print(f'\n[{phase}]', file=file)
         if spikes['count']:
@@ -251,6 +294,16 @@ def print_text(result, file=None):
                           f'median={spike.get("median_ms")}', f'reason={spike.get("reason")}', moved,
                           f'top_phases={spike.get("top_phases")}']
                 print('    ' + ' '.join(f for f in fields if f), file=file)
+        if row.get('first_use'):
+            first = row['first_use']
+            kinds = ', '.join(f'{k} {v["caller"]}x/{v["caller_ms"]}ms (max {v["caller_max_ms"]})'
+                              + (f' +{v["background"]} background/{v["background_ms"]}ms' if v['background'] else '')
+                              for k, v in first['kinds'].items())
+            print(f'  first use: {kinds}; swaps with caller work {first["swaps_with_caller_work"]}, '
+                  f'over 4 ms {first["swaps_over_4ms"]}, worst swap {first["caller_ms_per_swap_max"]} ms', file=file)
+            for record in first['worst']:
+                print(f'    t={record["t_s"]}s swap={record["swap"]} {record["kind"]} ms={record["ms"]} '
+                      f'key={record["key"]} {record["detail"]}', file=file)
         if row['gpu']:
             print('  gpu: ' + ', '.join(f'{name} avg {g["avg_ms"]} max {g["max_ms"]}' for name, g in row['gpu'].items()),
                   file=file)

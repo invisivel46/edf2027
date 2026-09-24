@@ -34,6 +34,9 @@
 #include "native_static_world_cache.h"
 #include "native_queued_scene.h"
 #include "native_decode_workers.h"
+#include "native_first_use.h"
+#include "native_shader_precompile.h"
+#include "../version.h"
 #include "native_d3d12_preview.h"
 #include "native_host_surface.h"
 #include "guest_instance_parameters.h"
@@ -154,6 +157,7 @@
 #include <cmath>
 #include <chrono>
 #include <thread>
+#include <algorithm>
 #include <optional>
 
 REXCVAR_DECLARE(int32_t, window_width);
@@ -663,6 +667,7 @@ void ApplyNativeCacheDirectory() {
     if(setting!="off") directory=setting.empty()?edf::native::NativeDefaultCacheDirectory():std::filesystem::path(setting);
     edf::native::SetNativeCacheDirectory(directory);
     edf::native::SetNativeD3D12SceneCacheDirectory(directory);
+    edf::native::NativeFirstUseLog::Get().SetEnabled(REXCVAR_GET(edf_native_first_use_log));
     REXLOG_INFO("Native persistent caches: {}",directory.empty()?std::string("off"):directory.string());
   });
 }
@@ -902,18 +907,44 @@ void SubmitSceneFrameLocked(Bridge& state) {
       counts.sampler_evictions,counts.retiring,counts.frame_waits,
       counts.frame_waits?counts.frame_wait_ns/counts.frame_waits/1000:0);
     const auto shaders=edf::native::GetNativeShaderCacheStatistics();
-    REXLOG_INFO("Native first-use caches: pipelines prebuilt={} content_hits={} waits={} ({}us) manifest_entries={}; "
+    REXLOG_INFO("Native first-use caches: pipelines prebuilt={} ({:.1f} ms) queued={} misses={} content_hits={} waits={} ({}us) manifest_entries={}; "
       "sampler_tables_prewarmed={}; buffers committed={} placed={} heaps={} ({} MB); "
-      "shaders compiled={} memory_hits={} disk_hits={} disk_stores={} disk_rejects={}",
-      counts.pipeline_prebuilt,counts.pipeline_content_hits,counts.pipeline_waits,counts.pipeline_wait_ns/1000,
+      "shaders compiled={} ({:.1f} ms) memory_hits={} disk_hits={} waits={} disk_stores={} disk_rejects={}",
+      counts.pipeline_prebuilt,counts.pipeline_prebuild_ns/1e6,counts.pipeline_queued,counts.pipeline_misses,
+      counts.pipeline_content_hits,counts.pipeline_waits,counts.pipeline_wait_ns/1000,
       counts.pipeline_manifest_entries,counts.sampler_prewarmed,counts.buffers_committed,counts.buffers_placed,
-      counts.buffer_heaps,counts.buffer_heap_bytes>>20,shaders.compiles,shaders.memory_hits,shaders.disk_hits,
-      shaders.disk_stores,shaders.disk_rejects);
+      counts.buffer_heaps,counts.buffer_heap_bytes>>20,shaders.compiles,shaders.compile_ms,shaders.memory_hits,
+      shaders.disk_hits,shaders.waits,shaders.disk_stores,shaders.disk_rejects);
     if(state.scene_frames%6000==0)
       if(const auto caches=state.scene_backend->DescribeCaches();!caches.empty())
         REXLOG_INFO("Native scene caches: {}",caches);
   }
 }
+
+namespace {
+// edf_native_shader_precompile (native_shader_precompile.h): from the moment
+// the game folder is known. Once per process; a warm cache makes it a stamp
+// check.
+void StartShaderPrecompile(const std::filesystem::path& game_root) {
+  const auto requested=REXCVAR_GET(edf_native_shader_precompile);
+  if(requested==0 || game_root.empty()) return;
+  edf::native::NativeShaderPrecompileOptions options;
+  options.game_root=game_root;
+  options.cache_directory=edf::native::NativeCacheDirectory();
+  options.build_identity=edf::version::Full();
+  // Half the cores, at most four: the game is loading on the others, and the
+  // precompile only has to finish before the game asks, not as fast as it can.
+  const auto cores=std::thread::hardware_concurrency();
+  options.threads=requested>0?uint32_t(requested):std::clamp(cores/2,1u,4u);
+  options.finished=[](const edf::native::NativeShaderPrecompileStatus& status) {
+    REXLOG_INFO("Native shader precompile: {} in {:.0f} ms; effects={} entries={} done={} failed={} compiles={}{}{}",
+      status.state_name(),status.elapsed_ms,status.effects,status.jobs,status.done,status.failed,status.compiles,
+      status.reason.empty()?"":"; ",status.reason);
+  };
+  REXLOG_INFO("Native shader precompile: starting on {} threads for {}",options.threads,game_root.string());
+  edf::native::StartNativeShaderPrecompile(std::move(options));
+}
+}  // namespace
 
 void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
   // Before anything can compile a shader.
@@ -939,6 +970,7 @@ void InitializeGuestShaderBridge(const std::filesystem::path& game_root) {
   auto& state = State();
   std::lock_guard lock(state.mutex);
   state.root = game_root;
+  StartShaderPrecompile(game_root);
   // Native overlays may initialize the device before a game path/runtime
   // exists. The later OnPostSetup call supplies the root without replacing
   // a device already referenced by the host window and font textures.

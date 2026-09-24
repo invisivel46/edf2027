@@ -1,10 +1,12 @@
 #include "d3d12_pipeline.h"
+#include "native_first_use.h"
 #include <d3d12shader.h>
 #include <d3dcompiler.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <format>
 #include <stdexcept>
 
 using Microsoft::WRL::ComPtr;
@@ -16,6 +18,15 @@ void Require(HRESULT result, const char* what) {
   char code[16];
   std::snprintf(code,sizeof(code),"0x%08lx",static_cast<unsigned long>(result));
   throw std::runtime_error(std::string("D3D12 ")+what+" failed: "+code);
+}
+// A first-use record's description of a pipeline: the caller's shader and
+// layout ids, the pipeline-state words and the first target format.
+std::string DescribeRequest(const NativeD3D12PipelineCache::Request& request) {
+  const auto& key=request.key;
+  return std::format("vs={:#x} ps={:#x} layout={:#x} blend={:#x} depth={:#x} raster={:#x} alpha={:#x} mask={:#x} "
+                     "topology={} rts={} rt0={} ds={} samples={}",
+                     key.vertex_shader,key.pixel_shader,key.input_layout,key.blend,key.depth,key.raster,key.alpha,
+                     key.write_mask,key.topology,key.render_targets,key.rtv_format[0],key.dsv_format,key.sample_count);
 }
 }  // namespace
 
@@ -338,8 +349,12 @@ ID3D12PipelineState& NativeD3D12PipelineCache::Get(const Request& request) {
     const auto start=std::chrono::steady_clock::now();
     ++waits_;
     built_.wait(lock,[&] { return entry->state!=EntryState::Building; });
-    wait_ns_+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+    const auto waited=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
       std::chrono::steady_clock::now()-start).count());
+    wait_ns_+=waited;
+    if(NativeFirstUseLog::Get().enabled())
+      NativeFirstUseLog::Get().Record(NativeFirstUseKind::PipelineWait,double(waited)/1e6,
+                                      NativeHashHex(key).substr(0,16),DescribeRequest(request));
   }
   if(entry->state==EntryState::Ready) {
     ++content_hits_;
@@ -347,12 +362,17 @@ ID3D12PipelineState& NativeD3D12PipelineCache::Get(const Request& request) {
     // Queued (the draw got there before a warmer, so it takes the entry rather
     // than waiting behind the queue), failed in the background, or new: built
     // here, exactly as a cache without a manifest would have.
+    const bool queued=entry->state==EntryState::Queued;
     entry->state=EntryState::Building;
     ++building_;
     lock.unlock();
     ComPtr<ID3D12PipelineState> pipeline;
+    const NativeFirstUseTimer timer;
     try {
       pipeline=Build(entry->desc);
+      if(timer.on())
+        NativeFirstUseLog::Get().Record(NativeFirstUseKind::PipelineBuild,timer.ms(),NativeHashHex(key).substr(0,16),
+          std::string(queued?"source=manifest_queue ":"source=new ")+DescribeRequest(request));
     } catch(...) {
       lock.lock();
       entry->state=EntryState::Failed;
@@ -388,8 +408,12 @@ void NativeD3D12PipelineCache::Prebuild() {
     ++building_;
     lock.unlock();
     ComPtr<ID3D12PipelineState> pipeline;
+    const auto start=std::chrono::steady_clock::now();
     try { pipeline=Build(entry->desc); } catch(...) {}
+    const auto spent=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now()-start).count());
     lock.lock();
+    prebuild_ns_+=spent;
     --building_;
     if(pipeline) {
       entry->pipeline=std::move(pipeline);
@@ -424,6 +448,8 @@ NativeD3D12PipelineCache::Statistics NativeD3D12PipelineCache::statistics() cons
   Statistics out;
   out.hits=hits_; out.misses=misses_; out.content_hits=content_hits_;
   out.waits=waits_; out.wait_ns=wait_ns_; out.prebuilt=prebuilt_; out.prebuild_failures=prebuild_failures_;
+  out.prebuild_ns=prebuild_ns_; out.queued=0;
+  for(const auto& entry:queue_) if(entry->state==EntryState::Queued) ++out.queued;
   out.manifest_entries=manifest_entries_; out.saves=saves_; out.adapter_changed=adapter_changed_;
   out.pipelines=by_content_.size();
   return out;

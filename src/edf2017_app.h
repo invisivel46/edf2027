@@ -36,6 +36,7 @@
 #include "native_graphics/d3d12_backend.h"
 #include "native_graphics/native_ffx.h"
 #include "native_graphics/native_fsr.h"
+#include "shader_prep_overlay.h"
 #endif
 // edf_native_preview_window, edf_native_scene_backend, edf_native_untiled_scene, edf_native_mesh_watch_audit.
 #include "native_graphics/bridge/native_cvars.h"
@@ -349,6 +350,9 @@ class Edf2017App : public rex::ReXApp {
     if (window()) window()->SetTitle("EDF2027");
     auto* overlay = new edf::PerfOverlay(drawer, [this] { return PhysicalHeight(); });
     edf::PerfOverlay::Current() = overlay;
+#if defined(_WIN32)
+    new edf::ShaderPrepOverlay(drawer, [this] { return PhysicalHeight(); });
+#endif
     rex::ui::RegisterBind("bind_edf_settings", "F1", "EDF2027 settings", [this]() { ToggleSettings(); });
     rex::ui::RegisterBind("bind_edf_fps", "F2", "Toggle performance overlay", []() {
       rex::cvar::SetFlagByName("edf_show_fps", REXCVAR_GET(edf_show_fps) ? "false" : "true");

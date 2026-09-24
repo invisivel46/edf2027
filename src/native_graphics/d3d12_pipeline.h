@@ -166,6 +166,8 @@ class NativeD3D12PipelineCache {
     uint64_t content_hits=0;     // New identity, pipeline already built (usually by a warmer).
     uint64_t waits=0,wait_ns=0;  // Lookups that waited for a warmer's build in progress.
     uint64_t prebuilt=0;         // Built by the warmers.
+    uint64_t prebuild_ns=0;      // Warmer time inside pipeline creation, summed over warmers.
+    uint64_t queued=0;           // Manifest entries still waiting for a warmer.
     uint64_t prebuild_failures=0;
     uint64_t manifest_entries=0; // Loaded from the manifest.
     uint64_t saves=0;
@@ -245,7 +247,7 @@ class NativeD3D12PipelineCache {
   size_t building_=0;
   bool stopping_=false,dirty_=false;
   uint32_t run_=1;
-  uint64_t hits_=0,misses_=0,content_hits_=0,waits_=0,wait_ns_=0,prebuilt_=0,prebuild_failures_=0;
+  uint64_t hits_=0,misses_=0,content_hits_=0,waits_=0,wait_ns_=0,prebuilt_=0,prebuild_failures_=0,prebuild_ns_=0;
   uint64_t manifest_entries_=0,saves_=0;
   bool adapter_changed_=false;
   std::string manifest_status_="none";

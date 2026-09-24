@@ -1284,10 +1284,19 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
   void Submit() override {
     if(parallel_failure_) std::rethrow_exception(parallel_failure_);
     if(parallel_) parallel_->Flush(false); else SubmitRecorded();
-    // Every ~1,800 frames (seconds, at this game's rates) the manifest is
-    // brought up to date if this run added to it. The snapshot is taken here;
-    // encoding and the file write happen on a background thread.
-    if(++submits_%kPersistInterval==0) PersistCaches(true);
+    // The manifest is brought up to date every ~1,800 frames if this run
+    // changed it, and ~240 frames after this run built a pipeline it did not
+    // hold: a new pipeline is a hitch the next run avoids only if it reaches
+    // the file, and a run that ends without the destructor (a crash, a killed
+    // process) keeps only what was saved. The snapshot is taken here; encoding
+    // and the file write happen on a background thread.
+    const auto since=++submits_-persisted_at_;
+    if(since>=kPersistInterval ||
+       (since>=kPersistNewInterval && pipelines_.misses()!=persisted_misses_)) {
+      persisted_at_=submits_;
+      persisted_misses_=pipelines_.misses();
+      PersistCaches(true);
+    }
   }
   void PersistCaches(bool background) {
     const auto tables=gpu_.samplers().tables();
@@ -1533,6 +1542,7 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
     out.pipeline_waits=pipeline_stats.waits;
     out.pipeline_wait_ns=pipeline_stats.wait_ns;
     out.pipeline_manifest_entries=pipeline_stats.manifest_entries;
+    out.pipeline_prebuild_ns=pipeline_stats.prebuild_ns; out.pipeline_queued=pipeline_stats.queued;
     out.sampler_prewarmed=gpu_.samplers().prewarmed();
     out.buffers_committed=buffers_committed_.load(std::memory_order_relaxed);
     if(pool_) {
@@ -1831,11 +1841,11 @@ class D3D12Backend final : public NativeRenderBackend, public NativeD3D12RawAcce
                  gpu.adapter_driver()};
     return out;
   }
-  static constexpr uint64_t kPersistInterval=1800;
+  static constexpr uint64_t kPersistInterval=1800,kPersistNewInterval=240;
 
   NativeD3D12Device gpu_;
   std::unique_ptr<NativeD3D12BufferPool> pool_;
-  uint64_t submits_=0;
+  uint64_t submits_=0,persisted_at_=0,persisted_misses_=0;
   uint32_t saved_sampler_tables_=0;
   std::atomic<uint64_t> buffers_committed_{0};
   ComPtr<ID3D12Fence> completion_fence_;

@@ -11,6 +11,8 @@
 #include "native_graphics/d3d12_pipeline.h"
 #include "native_graphics/native_disk_cache.h"
 #include "native_graphics/native_frame_times.h"
+#include "native_graphics/native_first_use.h"
+#include "native_graphics/native_shader_precompile.h"
 #include "native_graphics/native_render_backend.h"
 #include <windows.h>
 #include <d3dcompiler.h>
@@ -20,6 +22,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -176,6 +179,170 @@ float4 PS(float4 p : SV_POSITION) : SV_TARGET { return Tint(); }
   const auto stats=GetNativeShaderCacheStatistics();
   std::cout<<"shader cache: compiles="<<stats.compiles<<" memory_hits="<<stats.memory_hits<<" disk_hits="
            <<stats.disk_hits<<" stores="<<stats.disk_stores<<" rejects="<<stats.disk_rejects<<'\n';
+}
+
+// ---------------------------------------------------------------------------
+// Two threads asking for the same uncached shader at once: one compiles, the
+// other waits for that compile, and both get its bytes.
+void TestShaderInFlight() {
+  const auto root=Scratch("in_flight");
+  SetNativeCacheDirectory(root/"cache");
+  ClearNativeShaderMemoryCache();
+  NativeFirstUseLog::Get().SetEnabled(true);
+  (void)NativeFirstUseLog::Get().Take();
+  Effect effect;
+  // Long enough to compile that the second thread arrives while it runs.
+  effect.source="float4 VS(float4 p : POSITION) : POSITION { float4 a=p;\n";
+  for(int index=0;index<400;++index) effect.source+="a=sin(a)*cos(a+"+std::to_string(index)+");\n";
+  effect.source+="return a; }\n";
+  const ShaderEntry vs{false,"VS","vs_3_0"};
+  const auto before=GetNativeShaderCacheStatistics();
+  NativeShader first,second;
+  std::thread other([&] { first=CompileNativeShader(nullptr,effect,vs,root/"effect.fx"); });
+  second=CompileNativeShader(nullptr,effect,vs,root/"effect.fx");
+  other.join();
+  const auto after=GetNativeShaderCacheStatistics();
+  Check(after.compiles==before.compiles+1,"two concurrent requests for one shader compiled it "+
+        std::to_string(after.compiles-before.compiles)+" times");
+  Check(BytesOf(*first.bytecode.Get())==BytesOf(*second.bytecode.Get()),"concurrent requests got different bytecode");
+  const auto events=NativeFirstUseLog::Get().Take();
+  size_t compiles=0;
+  for(const auto& event:events) if(event.kind==NativeFirstUseKind::ShaderCompile) {
+    ++compiles;
+    Check(event.detail.find("entry=VS target=vs_5_0 variant=plain")!=std::string::npos,
+          "a compile record does not name its entry: "+event.detail);
+    Check(event.ms>0 && event.key.size()==16,"a compile record lacks its time or key");
+  }
+  Check(compiles==1,"first-use records: "+std::to_string(compiles)+" compiles for one shader");
+  NativeFirstUseLog::Get().SetEnabled(false);
+  SetNativeCacheDirectory({});
+}
+
+// A minimal retail-layout DXSL (effect.cpp's ParseEffect): header, entry
+// records, their strings and the HLSL source; no techniques.
+std::vector<uint8_t> MakeDxsl(const std::string& source) {
+  std::vector<uint8_t> out(48,0);
+  const auto word=[&](size_t at,uint32_t value) { std::memcpy(out.data()+at,&value,4); };
+  const auto text=[&](const std::string& value) {
+    const auto at=uint32_t(out.size());
+    out.insert(out.end(),value.begin(),value.end());
+    out.push_back(0);
+    return at;
+  };
+  word(0,0x4c535844);  // "DXSL"
+  word(8,0); word(12,24);
+  word(16,2); word(20,24);
+  const uint32_t names[4]={text("VS"),text("vs_3_0"),text("PS"),text("ps_3_0")};
+  word(24,0); word(28,names[0]-24); word(32,names[1]-24);
+  word(36,1); word(40,names[2]-36); word(44,names[3]-36);
+  word(4,text(source));
+  return out;
+}
+
+void TestShaderPrecompile() {
+  const auto root=Scratch("precompile");
+  const auto cache=root/"cache";
+  std::filesystem::create_directories(root/"game"/"Shader");
+  const char* kSource=R"(
+float4x4 g_mWorld;
+float4x4 g_mViewProj;
+struct VOut { float4 position : POSITION; };
+VOut VS(float4 p : POSITION) { VOut o; o.position = mul(mul(p, g_mWorld), g_mViewProj); return o; }
+float4 PS(float4 p : SV_POSITION) : SV_TARGET { return float4(1,0.5,0.25,1); }
+)";
+  const auto dxsl=MakeDxsl(kSource);
+  {
+    std::ofstream file(root/"game"/"Shader"/"Test.dxsl",std::ios::binary);
+    file.write(reinterpret_cast<const char*>(dxsl.data()),std::streamsize(dxsl.size()));
+  }
+  WriteText(root/"game"/"Shader"/"Common.fx","// not included\n");
+  SetNativeCacheDirectory(cache);
+  ClearNativeShaderMemoryCache();
+  const auto options=[&](std::string build) {
+    NativeShaderPrecompileOptions out;
+    out.game_root=root/"game"; out.cache_directory=cache; out.build_identity=std::move(build); out.threads=2;
+    return out;
+  };
+  NativeShaderPrecompileStatus reported;
+  {
+    NativeShaderPrecompiler precompiler;
+    auto cold=options("build-a");
+    cold.finished=[&](const NativeShaderPrecompileStatus& status) { reported=status; };
+    precompiler.Start(cold);
+    precompiler.Wait();
+    const auto status=precompiler.status();
+    Check(status.state==NativeShaderPrecompileStatus::State::Finished,
+          std::string("a cold precompile did not finish: ")+status.state_name()+" "+status.reason);
+    Check(status.effects==1 && status.jobs==2 && status.done==2 && status.failed==0,
+          "a cold precompile did not take both entries: done="+std::to_string(status.done)+" failed="+
+          std::to_string(status.failed)+" "+status.reason);
+    // Plain VS, its instanced form, reversed VS, its instanced form, PS.
+    Check(status.compiles==5,"a cold precompile made "+std::to_string(status.compiles)+" compiles, not 5");
+    Check(reported.state==NativeShaderPrecompileStatus::State::Finished,"the finished callback was not called");
+    Check(std::filesystem::exists(cache/"shaders"/"precompile.stamp"),"a complete pass wrote no stamp");
+  }
+  // The game's registration in a later process: nothing left to compile.
+  ClearNativeShaderMemoryCache();
+  const auto effect=ParseEffect(DecodeSourceAsset(dxsl));
+  const auto source_path=GuestEffectSourcePath(root/"game");
+  auto count=GetNativeShaderCacheStatistics().compiles;
+  for(const auto& entry:effect.entries) {
+    auto shader=CompileNativeShader(nullptr,effect,entry,source_path);
+    if(entry.pixel) continue;
+    Check(AddNativeWorldInstancing(shader,effect,source_path),"the test VS does not instance");
+    auto reversed=CompileNativeShader(nullptr,effect,entry,source_path,true);
+    AddNativeWorldInstancing(reversed,effect,source_path,true);
+  }
+  Check(GetNativeShaderCacheStatistics().compiles==count,
+        "a registration after the precompile still compiled "+
+        std::to_string(GetNativeShaderCacheStatistics().compiles-count)+" shaders");
+  // A warm run: the stamp matches, nothing is read or compiled.
+  ClearNativeShaderMemoryCache();
+  count=GetNativeShaderCacheStatistics().compiles;
+  const auto disk_hits=GetNativeShaderCacheStatistics().disk_hits;
+  {
+    NativeShaderPrecompiler precompiler;
+    precompiler.Start(options("build-a"));
+    precompiler.Wait();
+    const auto status=precompiler.status();
+    Check(status.state==NativeShaderPrecompileStatus::State::Skipped && status.jobs==0,
+          std::string("a warm precompile was not skipped: ")+status.state_name()+" "+status.reason);
+    Check(GetNativeShaderCacheStatistics().compiles==count && GetNativeShaderCacheStatistics().disk_hits==disk_hits,
+          "a skipped precompile touched the shader cache");
+  }
+  // A new build runs the pass again; the cache still answers every entry.
+  {
+    NativeShaderPrecompiler precompiler;
+    precompiler.Start(options("build-b"));
+    precompiler.Wait();
+    const auto status=precompiler.status();
+    Check(status.state==NativeShaderPrecompileStatus::State::Finished && status.done==2,
+          std::string("a new build did not run the pass: ")+status.state_name());
+    Check(GetNativeShaderCacheStatistics().compiles==count,"a new build's pass recompiled cached shaders");
+  }
+  // No cache directory: nothing to keep, so nothing runs.
+  {
+    NativeShaderPrecompiler precompiler;
+    auto off=options("build-c");
+    off.cache_directory.clear();
+    precompiler.Start(off);
+    precompiler.Wait();
+    Check(precompiler.status().state==NativeShaderPrecompileStatus::State::Skipped,
+          "a precompile ran without a cache directory");
+  }
+  // Stopped at once: it ends, writes no stamp unless the pass completed, and
+  // the destructor after Stop is harmless.
+  {
+    std::filesystem::remove(cache/"shaders"/"precompile.stamp");
+    NativeShaderPrecompiler precompiler;
+    precompiler.Start(options("build-d"));
+    precompiler.Stop();
+    const auto state=precompiler.status().state;
+    Check(state!=NativeShaderPrecompileStatus::State::Running,"a stopped precompile still reports running");
+    if(state==NativeShaderPrecompileStatus::State::Stopped)
+      Check(!std::filesystem::exists(cache/"shaders"/"precompile.stamp"),"a stopped pass wrote a stamp");
+  }
+  SetNativeCacheDirectory({});
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +725,8 @@ int main() {
   std::cout<<std::unitbuf;
   try {
     TestShaderCache();
+    TestShaderInFlight();
+    TestShaderPrecompile();
     TestPipelineManifest();
     TestSamplerPrewarm();
     TestBufferPool();

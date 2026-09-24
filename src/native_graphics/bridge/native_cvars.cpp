@@ -108,6 +108,8 @@ inline REXCVAR_DEFINE_BOOL(edf_native_backend_present, true, "EDF2027",
                    "Use a separate presenting backend for the D3D11 fallback. D3D12 always uses its native host and presenter");
 inline REXCVAR_DEFINE_INT32(edf_native_shader_workers, -1, "EDF2027",
                     "Threads used to compile a shader registration's entries: -1 picks one per core up to eight, 0 compiles inline on the calling thread. Compilation is the load cost worth threading - the entries are a real batch and each takes milliseconds, unlike the per-draw work, which has neither property");
+inline REXCVAR_DEFINE_INT32(edf_native_shader_precompile, -1, "EDF2027",
+                    "Compile every effect in the game folder's Shader/*.dxsl into the shader cache on background threads at startup, so no first load of an effect (and no effect first loaded mid-mission) waits for FXC: -1 on, with half the cores up to four; N on with N threads; 0 off. Skipped when the cache already holds this build's pass (shaders/precompile.stamp), and off when edf_native_cache_dir is off");
 inline REXCVAR_DEFINE_BOOL(edf_native_backend_preview, false, "EDF2027",
                    "Open a second window drawn and presented entirely by the selected backend. Needs --edf_native_backend and --edf_native_publish_frames. The renderer's own window is untouched");
 inline REXCVAR_DEFINE_INT32(edf_native_frame_latency,2,"EDF2027",
@@ -311,6 +313,8 @@ inline REXCVAR_DEFINE_INT32(edf_native_coverage_census_interval,30,"EDF2027",
   "Seconds between edf_native_coverage_census summaries").range(1,3600);
 inline REXCVAR_DEFINE_BOOL(edf_native_frame_times, false, "EDF2027",
                    "Log present-to-present frame-time percentiles and one line per spike frame (over 25 ms or twice the rolling median) with its pipeline, shader, geometry and texture creations, declined passes and largest hook phases (development)");
+inline REXCVAR_DEFINE_BOOL(edf_native_first_use_log, false, "EDF2027",
+                   "Log one 'Native first use' line per shader compile, shader disk-cache read, shader wait, pipeline built or waited for on the thread that needed it, and boot precompile batch, with its duration, key and swap number (tools/frame-time-report.py sorts them by mission phase; development)");
 inline REXCVAR_DEFINE_BOOL(edf_native_loading_trace, false, "EDF2027",
                    "Sample end-frame publication eligibility and cumulative UI draws; does not capture pixels (development)");
 inline REXCVAR_DEFINE_BOOL(edf_native_load_timings, false, "EDF2027",

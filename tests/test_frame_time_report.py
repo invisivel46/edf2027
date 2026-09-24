@@ -145,6 +145,36 @@ class FrameTimeReportTests(unittest.TestCase):
         self.assertEqual(phases['gameplay']['gpu']['models'], dict(frames=600, avg_ms=3.0, max_ms=4.0))
         self.assertEqual(phases['all']['gpu']['models'], dict(frames=1200, avg_ms=2.5, max_ms=4.0))
 
+    def test_first_use_records_per_phase(self):
+        def first(seconds, swap, kind, ms, thread='caller', key='0123456789abcdef', detail='entry=VS'):
+            # The exact REXLOG_INFO format of LogNativeFirstUse in edf/hooks/frame.cpp.
+            return tline(seconds, 't1', f'Native first use: swap={swap} kind={kind} ms={ms:.3f} thread={thread} '
+                                        f'key={key} {detail}')
+        lines = mission() + [
+            first(70, 50, 'shader_compile', 30.0, detail='entry=PS_Model target=ps_5_0 variant=plain'),
+            first(70, 50, 'shader_compile', 12.0, thread='background'),
+            first(95, 900, 'pipeline_build', 3.0, detail='source=new vs=0x1 ps=0x2'),
+            first(95, 900, 'pipeline_build', 2.5),
+            first(97, 950, 'pipeline_wait', 1.0),
+            first(98, 960, 'shader_wait', 9.0),
+        ]
+        phases = report.report(lines, top=2)['phases']
+        loading = phases['loading']['first_use']
+        self.assertEqual(loading['kinds']['shader_compile'], dict(caller=1, caller_ms=30.0, caller_max_ms=30.0,
+                                                                  background=1, background_ms=12.0))
+        gameplay = phases['gameplay']['first_use']
+        self.assertEqual(gameplay['kinds']['pipeline_build']['caller'], 2)
+        # Per swap: the two builds in swap 900 add up; shader waits overlap a compile and are not summed.
+        self.assertEqual(gameplay['swaps_with_caller_work'], 2)
+        self.assertEqual(gameplay['caller_ms_per_swap_max'], 5.5)
+        self.assertEqual(gameplay['swaps_over_4ms'], 1)
+        self.assertEqual([r['ms'] for r in gameplay['worst']], [9.0, 3.0])
+        self.assertEqual(gameplay['worst'][1]['detail'], 'source=new vs=0x1 ps=0x2')
+        self.assertNotIn('first_use', phases['intro'])
+        out = io.StringIO()
+        report.print_text(report.report(lines), out)
+        self.assertIn('first use: pipeline_build 2x/5.5ms (max 3.0)', out.getvalue())
+
     def test_log_without_entry_is_unphased(self):
         lines = [tline(0, 't3', 'boot'), window(10, 100, 1000.0, '10.00:100', 10.1, 10.1)]
         phases = report.report(lines)['phases']

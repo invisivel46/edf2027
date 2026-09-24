@@ -70,6 +70,7 @@ EDF_NATIVE_CVAR(int32_t, edf_native_frame_operations, 8192);
 EDF_NATIVE_CVAR(bool, edf_native_d3d12_debug_layer, false);
 EDF_NATIVE_CVAR(bool, edf_native_backend_present, true);
 EDF_NATIVE_CVAR(int32_t, edf_native_shader_workers, -1);
+EDF_NATIVE_CVAR(int32_t, edf_native_shader_precompile, -1);
 EDF_NATIVE_CVAR(bool, edf_native_backend_preview, false);
 EDF_NATIVE_CVAR(int32_t, edf_native_frame_latency, 2);
 
@@ -177,6 +178,7 @@ EDF_NATIVE_CVAR(bool, edf_native_gpu_timings, false);
 EDF_NATIVE_CVAR(bool, edf_native_coverage_census, false);
 EDF_NATIVE_CVAR(int32_t, edf_native_coverage_census_interval, 30);
 EDF_NATIVE_CVAR(bool, edf_native_frame_times, false);
+EDF_NATIVE_CVAR(bool, edf_native_first_use_log, false);
 EDF_NATIVE_CVAR(bool, edf_native_loading_trace, false);
 EDF_NATIVE_CVAR(bool, edf_native_load_timings, false);
 EDF_NATIVE_CVAR(bool, edf_native_load_trace, false);
