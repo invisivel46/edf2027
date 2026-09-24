@@ -253,15 +253,39 @@ std::shared_ptr<const NativeSceneGroupMaterial> NativeModelPassProgramLocked(Bri
 NativeSceneGeometrySource NativeModelGeometrySource(const GuestReader& reader,const NativeModelBatchLayout& batch,uint32_t pass);
 std::shared_ptr<const NativeIndexedMesh::RetainedDraw> NativeModelGeometryLocked(Bridge& state,const GuestReader& reader,
   const NativeSceneGeometrySource& source,const NativeModelBatchLayout& batch);
+// An effect activation carried from one RecordNativeFullFrameEffectsLocked
+// call to the next (edf_native_effect_activation_share): the next call's first
+// draw keeps it when NativeEffectDrawsShareActivation holds against the draw
+// that made it, as a run of draws inside one call does, so a sequence of
+// alike effect items (one draw each, the dust of a collapse) activates once.
+// It holds pointers into the bridge's shader registry and relies on nothing
+// else binding in between, so it lives within one hold of the bridge locks:
+// Reset it when a hold starts and ends, and before anything else records (a
+// model batch). activations/shared count what the calls did with it.
+class NativeFullFrameEffectCarry {
+ public:
+  NativeFullFrameEffectCarry();
+  ~NativeFullFrameEffectCarry();
+  NativeFullFrameEffectCarry(const NativeFullFrameEffectCarry&)=delete;
+  NativeFullFrameEffectCarry& operator=(const NativeFullFrameEffectCarry&)=delete;
+  void Reset();
+  struct Held;  // draw.cpp's activation and the draw that made it
+  Held& held() { return *held_; }
+  uint64_t activations=0,shared=0;
+ private:
+  std::unique_ptr<Held> held_;
+};
 // Full-frame effect draws through the immediate path (defined after
 // RecordNativeSceneImmediate), recorded back to back in order, with the
 // activation (program, bindings, render state) done once per run of adjacent
-// draws that share it (NativeEffectDrawsShareActivation). Returns the draws
-// recorded; each failure goes to failed (the draw's error) and the next draw
-// activates again.
+// draws that share it (NativeEffectDrawsShareActivation), and across calls
+// through `carry` when one is given. Returns the draws recorded; each failure
+// goes to failed (the draw's error) and the next draw activates again. A
+// draw's encoded_calls, when present, are its vertices (encoded off the locks).
 uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
   std::span<const NativeEffectDraw> draws,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
-  const NativeFullFramePassTargets& formats,const std::function<void(const std::exception&)>& failed);
+  const NativeFullFramePassTargets& formats,const std::function<void(const std::exception&)>& failed,
+  NativeFullFrameEffectCarry* carry=nullptr);
 }  // namespace edf::native
 
 // The render helper's thread state (the 821A5080 hook and its guest routes; defined in guest_shader_bridge.cpp).

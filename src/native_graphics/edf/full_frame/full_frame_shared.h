@@ -11,6 +11,7 @@
 #include "../../native_map_effects.h"
 #include "../../native_motion_vector_pass.h"
 #include "../../native_scene_pass_inputs.h"
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdint>
@@ -104,6 +105,18 @@ void CensusNativeWorldList(const Reader& reader,uint32_t owner) {
 // count it (an item that does lose its draw is counted where it is dropped).
 void NativeFullFrameNoted(const char* pass,const std::string& reason);
 void NativeFullFrameDeclined(const char* pass,const std::string& reason);
+// Whether the effect recording carries activations across items and encodes
+// vertices before taking the locks (edf_native_effect_activation_share).
+inline bool NativeEffectActivationShare() { return REXCVAR_GET(edf_native_effect_activation_share); }
+// Encodes every draw's vertices (EncodeNativeEffectDrawCalls) off the bridge
+// locks, when NativeEffectActivationShare; the recording uses them as it would
+// have encoded them.
+template<class Items>
+void EncodeNativeEffectItems(Items& items) {
+  if(!NativeEffectActivationShare()) return;
+  HookTiming timing(HookPhase::FrameNativeEffectEncode);
+  for(auto& item:items) for(auto& draw:item.draws) EncodeNativeEffectDrawCalls(draw);
+}
 // What the Models, Sky (map effects) and Effects passes of one view hand to its
 // Transparent pass: the models' transparent batches (one item each, keyed),
 // the map effects' and the effects' filed items, and the filing counts that

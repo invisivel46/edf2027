@@ -1,4 +1,5 @@
 #include "native_graphics/native_full_frame_effects.h"
+#include <cstring>
 
 namespace edf::native {
 // sub_821A7640, loc_821A778C. f31 = zero, f30 = one, f29 = pi/2, f6 = pi,
@@ -150,12 +151,12 @@ std::vector<std::pair<uint32_t,uint32_t>> NativeEffectDrawCalls(const NativeEffe
 }
 std::vector<uint8_t> EncodeNativeEffectVertices(const NativeEffectDraw& draw,uint32_t first,uint32_t count) {
   if(uint64_t(first)+count>draw.vertex_count()) throw std::runtime_error("native effect vertex range out of bounds");
-  std::vector<uint8_t> bytes;
-  bytes.reserve(size_t(count)*draw.stride());
-  const auto put=[&](float value) {
-    const auto word=std::bit_cast<uint32_t>(value);
-    for(int shift=24;shift>=0;shift-=8) bytes.push_back(uint8_t(word>>shift));
-  };
+  // Big-endian words in declaration order, written in place: this runs for
+  // every effect vertex of every frame.
+  std::vector<uint8_t> bytes(size_t(count)*draw.stride());
+  auto* out=bytes.data();
+  const auto word=[&](uint32_t value) { value=std::byteswap(value); std::memcpy(out,&value,4); out+=4; };
+  const auto put=[&](float value) { word(std::bit_cast<uint32_t>(value)); };
   for(uint32_t i=first;i<first+count;++i) {
     if(draw.kind==NativeEffectDraw::Kind::Particles) {
       const auto& v=draw.particle_vertices[i];
@@ -166,7 +167,7 @@ std::vector<uint8_t> EncodeNativeEffectVertices(const NativeEffectDraw& draw,uin
     } else if(draw.kind==NativeEffectDraw::Kind::ColourStrip) {
       const auto& v=draw.colour_vertices[i];
       for(const float f:v.position) put(f);
-      for(int shift=24;shift>=0;shift-=8) bytes.push_back(uint8_t(v.colour>>shift));
+      word(v.colour);
     } else {
       const auto& v=draw.ribbon_vertices[i];
       for(const float f:v.position) put(f);
@@ -174,6 +175,11 @@ std::vector<uint8_t> EncodeNativeEffectVertices(const NativeEffectDraw& draw,uin
       for(const float f:v.colour) put(f);
     }
   }
+  if(out!=bytes.data()+bytes.size()) throw std::runtime_error("native effect vertex encoding does not fill its stride");
   return bytes;
+}
+void EncodeNativeEffectDrawCalls(NativeEffectDraw& draw) {
+  draw.encoded_calls.clear();
+  for(const auto& [first,count]:NativeEffectDrawCalls(draw)) draw.encoded_calls.push_back(EncodeNativeEffectVertices(draw,first,count));
 }
 }

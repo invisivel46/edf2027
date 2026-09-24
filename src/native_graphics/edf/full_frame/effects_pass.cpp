@@ -83,6 +83,7 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
       }
     uint64_t drawn=0;
     if(!collection.immediate.empty()) {
+      EncodeNativeEffectItems(collection.immediate);  // before the locks
       auto& state=State();
       std::lock_guard submission(state.submissions);
       std::lock_guard lock(state.mutex);
@@ -91,9 +92,12 @@ class NativeFullFrameEffectsPass final : public edf::native::NativeFramePass {
       if(state.active_scene==context.renderer && targets.count && targets.depth && state.scene_backend) {
         const NativeSceneCpuWindow window(reader_);
         const auto report=[](const std::string& reason) { NativeFullFrameDeclined("effects",reason); };
+        // One activation carried across alike items (NativeFullFrameEffectCarry).
+        NativeFullFrameEffectCarry carry;
+        const bool share=NativeEffectActivationShare();
         for(const auto& item:collection.immediate)
           drawn+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,NativeSceneDrawCamera(),viewport,formats,
-            [&](const std::exception& error) { report(error.what()); });
+            [&](const std::exception& error) { report(error.what()); },share?&carry:nullptr);
       } else if(NativeCoverageCensusOn())
         CoverageCensus().Add(NativeCoverageStatus::Uncovered,0,"pass:effects","no_targets",collection.immediate.size());
     }

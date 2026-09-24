@@ -3459,6 +3459,7 @@ struct NativeFullFrameEffectActivation {
 NativeFullFrameEffectActivation ActivateNativeFullFrameEffectLocked(Bridge& state,const GuestReader& reader,
     const NativeSceneCpuWindow<GuestReader>& window,const NativeEffectDraw& draw,const NativeScenePassCamera& camera,
     const NativeViewportState& viewport,const NativeFullFramePassTargets& formats) {
+  HookTiming timing(HookPhase::FrameNativeEffectActivate);
   NativeFullFrameEffectActivation result;
   if(draw.texture) {
     const auto texture=state.textures.find(draw.texture);
@@ -3539,37 +3540,58 @@ NativeFullFrameEffectActivation ActivateNativeFullFrameEffectLocked(Bridge& stat
 void RecordNativeFullFrameEffectCallsLocked(Bridge& state,const GuestReader& reader,
     const NativeFullFrameEffectActivation& activation,const NativeEffectDraw& draw,const NativeViewportState& viewport) {
   const auto& declaration=*activation.declaration;
-  for(const auto& [first,count]:NativeEffectDrawCalls(draw)) {
-    const auto bytes=EncodeNativeEffectVertices(draw,first,count);
+  const auto calls=NativeEffectDrawCalls(draw);
+  // Encoded off the locks when the pass did (EncodeNativeEffectDrawCalls), the
+  // same bytes; encoded here otherwise.
+  const bool encoded=!draw.encoded_calls.empty();
+  if(encoded && draw.encoded_calls.size()!=calls.size()) throw std::runtime_error("native effect encoded calls do not match the draw");
+  for(size_t call=0;call<calls.size();++call) {
+    const auto [first,count]=calls[call];
+    std::vector<uint8_t> local;
+    if(!encoded) local=EncodeNativeEffectVertices(draw,first,count);
+    const std::span<const uint8_t> bytes=encoded?std::span<const uint8_t>(draw.encoded_calls[call]):std::span<const uint8_t>(local);
     RecordNativeSceneImmediate(state,reader,activation.device,{*activation.vertex,*activation.pixel,viewport,activation.render,
       activation.shaders,activation.declaration_id,declaration->count(),declaration,draw.primitive(),draw.stride(),
       REXCVAR_GET(edf_native_effect_mesh_buckets)},bytes);
   }
 }
+struct NativeFullFrameEffectCarry::Held {
+  std::optional<NativeFullFrameEffectActivation> activation;
+  const NativeEffectDraw* activated=nullptr;
+};
+NativeFullFrameEffectCarry::NativeFullFrameEffectCarry():held_(std::make_unique<Held>()) {}
+NativeFullFrameEffectCarry::~NativeFullFrameEffectCarry()=default;
+void NativeFullFrameEffectCarry::Reset() { held_->activation.reset(); held_->activated=nullptr; }
 // A run of adjacent draws that NativeEffectDrawsShareActivation is activated
 // once: the activation reads only the fields that predicate compares (never
 // the vertices), so the next draw's would bind the same texture word, program,
 // constants, samplers and render state onto the same bindings, which only an
 // activation changes (the immediate recording reads them). A failed draw
 // drops the activation and goes to `failed` once, with its reason; the next
-// draw activates again, as it would alone.
+// draw activates again, as it would alone. With a carry the run continues
+// from the previous call's last activation (NativeFullFrameEffectCarry); the
+// pass camera, viewport and formats are the pass's own, the same in every
+// call of one hold.
 uint64_t RecordNativeFullFrameEffectsLocked(Bridge& state,const GuestReader& reader,const NativeSceneCpuWindow<GuestReader>& window,
     std::span<const NativeEffectDraw> draws,const NativeScenePassCamera& camera,const NativeViewportState& viewport,
-    const NativeFullFramePassTargets& formats,const std::function<void(const std::exception&)>& failed) {
+    const NativeFullFramePassTargets& formats,const std::function<void(const std::exception&)>& failed,
+    NativeFullFrameEffectCarry* carry) {
   uint64_t recorded=0;
-  std::optional<NativeFullFrameEffectActivation> activation;
-  const NativeEffectDraw* activated=nullptr;
+  NativeFullFrameEffectCarry::Held local;
+  auto& held=carry?carry->held():local;
+  auto& activation=held.activation;
   for(const auto& draw:draws) {
     try {
       // Reuse off (native_reuse.h): every draw activates on its own.
-      if(!activation || !NativeReuseAllowed() || !NativeEffectDrawsShareActivation(*activated,draw)) {
-        activation.reset();
+      if(!activation || !NativeReuseAllowed() || !NativeEffectDrawsShareActivation(*held.activated,draw)) {
+        activation.reset(); held.activated=nullptr;
         activation=ActivateNativeFullFrameEffectLocked(state,reader,window,draw,camera,viewport,formats);
-        activated=&draw;
-      }
+        held.activated=&draw;
+        if(carry) ++carry->activations;
+      } else if(carry) ++carry->shared;
       RecordNativeFullFrameEffectCallsLocked(state,reader,*activation,draw,viewport);
       ++recorded;
-    } catch(const std::exception& error) { activation.reset(); failed(error); }
+    } catch(const std::exception& error) { activation.reset(); held.activated=nullptr; failed(error); }
   }
   return recorded;
 }

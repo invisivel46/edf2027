@@ -267,6 +267,11 @@ struct NativeEffectDraw {
   std::vector<NativeParticleVertex> particle_vertices;
   std::vector<NativeRibbonVertex> ribbon_vertices;
   std::vector<NativeColourVertex> colour_vertices;
+  // Each DrawPrimitiveUP call's vertices (NativeEffectDrawCalls, in order)
+  // encoded ahead of recording, off the bridge locks
+  // (EncodeNativeEffectDrawCalls); empty when the recording encodes them.
+  // Derived from the vertices above, never read by an activation.
+  std::vector<std::vector<uint8_t>> encoded_calls;
   uint32_t primitive() const { return kind==Kind::RibbonStrip || kind==Kind::ColourStrip?6:13; }
   // 821A7C70 and 821A7B58 set blend and depth write (82135078/82135108/
   // 82135578) before their 821B94E8, so the technique's own state operations
@@ -300,6 +305,9 @@ std::vector<std::pair<uint32_t,uint32_t>> NativeEffectDrawCalls(const NativeEffe
 // big-endian words in declaration order. This is what the immediate recording
 // path (and the mesh's declaration-driven conversion) consumes.
 std::vector<uint8_t> EncodeNativeEffectVertices(const NativeEffectDraw& draw,uint32_t first,uint32_t count);
+// Fills draw.encoded_calls: EncodeNativeEffectVertices over each of
+// NativeEffectDrawCalls(draw), the bytes the recording would encode itself.
+void EncodeNativeEffectDrawCalls(NativeEffectDraw& draw);
 
 inline NativeEffectDraw MakeNativeParticleDraw(uint32_t effect,std::vector<NativeParticleRecord> records,
     uint32_t texture,int32_t blend,uint32_t technique,const NativeEffectConstants& k) {

@@ -49,6 +49,9 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
       shared_->map_effect_filings,shared_->effect_filings).map_effects;
     for(auto& item:map_effects) item.order+=map_base;
     if(((!frame || frame->batches.empty()) && effects.empty() && map_effects.empty()) || !context.renderer || !native_scene_pass_camera) return;
+    // The effects' vertices, encoded before the locks are taken.
+    EncodeNativeEffectItems(effects);
+    EncodeNativeEffectItems(map_effects);
     auto& state=State();
     std::lock_guard submission(state.submissions);
     std::lock_guard lock(state.mutex);
@@ -65,10 +68,15 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     const auto report=[](const std::string& reason) { NativeFullFrameDeclined("transparent",reason); };
     // The effects' activations draw with the jittered camera under FSR.
     const auto& camera=NativeSceneDrawCamera();
+    // One activation carried across alike effect items (NativeFullFrameEffectCarry).
+    NativeFullFrameEffectCarry carry;
+    const bool share=NativeEffectActivationShare();
     std::vector<NativeTransparentItem> models;
     if(frame) for(size_t index=0;index<frame->batches.size();++index)
-      models.push_back({frame->batches[index].key,frame->batches[index].order,[&state,&targets,frame,index](NativeBackendRecorder& recorder) {
+      models.push_back({frame->batches[index].key,frame->batches[index].order,[&state,&targets,&carry,frame,index](NativeBackendRecorder& recorder) {
         const auto& batch=frame->batches[index];
+        // The batch binds its own targets and pipelines: an effect after it activates again.
+        carry.Reset();
         recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
         state.scene_renderer.Render(*state.scene_backend,batch.snapshot,batch.view,1);
         // The batch bound its own targets and pipelines.
@@ -79,10 +87,11 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     // Per effect draw: recorded, or declined (reported once per reason).
     uint64_t effect_draws=0,effect_declined=0;
     const auto record_item=[&](NativeBackendRecorder&,const NativeEffectItem& item) {
-      // One item's draws in a row (a run of alike draws activated once); a
-      // model batch may run between items.
+      // One item's draws in a row (a run of alike draws activated once, and
+      // with the carry on from the item before it); a model batch may run
+      // between items.
       effect_draws+=RecordNativeFullFrameEffectsLocked(state,reader_,window,item.draws,camera,viewport,formats,
-        [&](const std::exception& error) { report(error.what()); ++effect_declined; });
+        [&](const std::exception& error) { report(error.what()); ++effect_declined; },share?&carry:nullptr);
     };
     auto effect_items=NativeEffectTransparentItems(std::move(effects),record_item);
     auto map_effect_items=NativeEffectTransparentItems(std::move(map_effects),record_item);
@@ -91,14 +100,17 @@ class NativeFullFrameTransparentPass final : public edf::native::NativeFramePass
     const auto sequence=MergeNativeTransparentItems(std::move(sources));
     RecordNativeTransparentItems(sequence,SceneRecorderLocked(state));
     if(frame) state.scene_recorded_frames.push_back(std::move(frame));
+    activations_+=carry.activations; shared_activations_+=carry.shared;
     if(++frames_<=4 || frames_%1000==0)
-      REXLOG_INFO("Native full frame transparent: frames={} model_batches={} effect_items={} map_effect_items={} merged_items={} effect_draws={} effect_declined={}",
-        frames_,model_count,effect_count,map_effect_count,sequence.size(),effect_draws,effect_declined);
+      REXLOG_INFO("Native full frame transparent: frames={} model_batches={} effect_items={} map_effect_items={} merged_items={} effect_draws={} effect_declined={} "
+        "activations={} shared={} (total {}/{})",
+        frames_,model_count,effect_count,map_effect_count,sequence.size(),effect_draws,effect_declined,
+        carry.activations,carry.shared,activations_,shared_activations_);
   }
  private:
   const edf::native::GuestReader reader_;
   std::shared_ptr<edf::native::NativeFullFrameModelsShared> shared_;
-  uint64_t frames_=0;
+  uint64_t frames_=0,activations_=0,shared_activations_=0;
 };
 }
 
