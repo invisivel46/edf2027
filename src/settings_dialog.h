@@ -62,6 +62,8 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
     std::function<bool()> user_mute;                // the player's mute setting
     std::function<void(bool)> set_user_mute;        // ...changed from the Audio section
     std::function<bool()> paused;                   // the game is paused under the menu
+    std::string version;                            // build identity, shown under the sections
+    std::function<std::string()> fsr_unavailable;   // why FSR cannot run ("" when it can)
   };
 
   SettingsDialog(rex::ui::ImGuiDrawer* drawer, std::filesystem::path config_path, Hooks hooks,
@@ -361,13 +363,23 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
         section_ = i;
       ImGui::PopID();
     }
-    if (pad_connected_) {
-      ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), height - ImGui::GetTextLineHeight() * 2.4f));
+    {
+      // The build a bug report should name, at the foot of the section list.
       ui::ScopedFont small_font(ui::FontRole::kSmall, metrics_);
-      ImGui::SetCursorPosX(18.0f * s);
-      ImGui::TextDisabled("LB / RB  switch section");
-      ImGui::SetCursorPosX(18.0f * s);
-      ImGui::TextDisabled("B / Start  resume");
+      const float lines = (pad_connected_ ? 2.0f : 0.0f) + (hooks_.version.empty() ? 0.0f : 1.0f);
+      if (lines > 0)
+        ImGui::SetCursorPosY(std::max(ImGui::GetCursorPosY(), height - ImGui::GetTextLineHeightWithSpacing() * lines -
+                                                                  ImGui::GetTextLineHeight() * 0.4f));
+      if (pad_connected_) {
+        ImGui::SetCursorPosX(18.0f * s);
+        ImGui::TextDisabled("LB / RB  switch section");
+        ImGui::SetCursorPosX(18.0f * s);
+        ImGui::TextDisabled("B / Start  resume");
+      }
+      if (!hooks_.version.empty()) {
+        ImGui::SetCursorPosX(18.0f * s);
+        ImGui::TextDisabled("v%s", hooks_.version.c_str());
+      }
     }
     ImGui::EndChild();
     ImGui::PopStyleVar(2);
@@ -693,6 +705,15 @@ class SettingsDialog final : public rex::ui::ImGuiDialog {
                     "rebuild a sharp full-resolution image, for a higher frame rate; Native AA uses the same "
                     "technique for anti-aliasing only. Needs the Native renderer."
                   : "AMD FidelityFX Super Resolution. Needs the Native renderer, which is not the one running.");
+    if (mode != 0 && hooks_.fsr_unavailable) {
+      // A missing or broken amd_fidelityfx_dx12.dll: the scene is resolved without FSR.
+      if (const std::string why = hooks_.fsr_unavailable(); !why.empty()) {
+        ui::ScopedFont small_font(ui::FontRole::kSmall, metrics_);
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextColored(ui::color::kOrange, "%s  FSR is unavailable, so it is off: %s", ui::icon::kWarning, why.c_str());
+        ImGui::PopTextWrapPos();
+      }
+    }
     if (Exists("edf_native_fsr_sharpness")) {
       BeginRow("Upscaler sharpness", NeedsRestart("edf_native_fsr_sharpness") ? "edf_native_fsr_sharpness" : nullptr);
       ImGui::BeginDisabled(mode == 0);

@@ -15,6 +15,11 @@ class NativeBackendHost : public std::enable_shared_from_this<NativeBackendHost>
     std::shared_ptr<NativeRenderBackend> backend,Overlay overlay,NativeUiTicker::Dispatch dispatch);
   ~NativeBackendHost();
   void Stop();
+  // Called on the UI thread, once per host, after the error is logged, when the host stops
+  // on an error (a lost or hung GPU, a device that could not be created): without it the
+  // window stays on its last image and only the log says why.
+  using FailureHandler=std::function<void(const std::string&)>;
+  static void SetFailureHandler(FailureHandler handler);
  private:
   NativeBackendHost(HWND window,std::shared_ptr<NativeRenderBackend> backend,Overlay overlay);
   static LRESULT CALLBACK WindowProcedure(HWND,UINT,WPARAM,LPARAM,UINT_PTR,DWORD_PTR);

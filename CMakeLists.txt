@@ -7,6 +7,11 @@ project(edf2027 LANGUAGES CXX)
 
 include(CTest)
 
+# The release version: the one place it lives. The game shows it (with the git commit,
+# tools/write-version.cmake) in its log and F1 menu, and package_release names the zip
+# after it.
+set(EDF2027_VERSION 0.3.0-beta)
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -45,6 +50,8 @@ set(EDF2027_SOURCES
     src/native_kbm.cpp
     src/manual_reload.cpp
     src/input_latency.cpp
+    src/diagnostics.cpp
+    src/version.cpp
 )
 
 if(WIN32)
@@ -98,6 +105,37 @@ endif()
 
 # The host owns native D3D12 rendering. Do not request an SDK GPU emulation plugin.
 rexglue_setup_target(edf2027)
+
+# Build identity (src/version.cpp): regenerated on every build, rewritten only when the
+# commit or the dirty flag changes, and seen only by version.cpp.
+set(_edf_version_dir ${CMAKE_CURRENT_BINARY_DIR}/edf_version)
+add_custom_target(edf_version_info
+    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${_edf_version_dir}/edf_version_info.h
+        -DVERSION=${EDF2027_VERSION} -P ${CMAKE_SOURCE_DIR}/tools/write-version.cmake
+    BYPRODUCTS ${_edf_version_dir}/edf_version_info.h
+    COMMENT "Build identity ${EDF2027_VERSION}"
+    VERBATIM)
+add_dependencies(edf2027 edf_version_info)
+set_source_files_properties(src/version.cpp PROPERTIES INCLUDE_DIRECTORIES ${_edf_version_dir})
+if(WIN32)
+    # Crash dumps (src/diagnostics.cpp).
+    target_link_libraries(edf2027 PRIVATE dbghelp)
+endif()
+
+# A PDB for the shipped executable, so a player's crash dump can be symbolized: line
+# tables for the host code, public symbols (every sub_XXXXXXXX) for the recompiled code.
+# Debug information does not change the generated code; /OPT:REF,ICF stay as without
+# /DEBUG, and /PDBALTPATH keeps the build machine's paths out of the executable. The PDB
+# ships separately (package_release's -symbols zip).
+option(EDF2027_RELEASE_PDB "Write edf2027.pdb for optimized Windows builds" ON)
+if(WIN32 AND EDF2027_RELEASE_PDB AND CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+    foreach(_edf_pdb_target edf2027 edf_native_d3d12 edf_native_d3d11 edf_native_effects edf_native_sdk_ui)
+        if(TARGET ${_edf_pdb_target})
+            target_compile_options(${_edf_pdb_target} PRIVATE -gcodeview -gline-tables-only)
+        endif()
+    endforeach()
+    target_link_options(edf2027 PRIVATE "LINKER:/DEBUG" "LINKER:/OPT:REF" "LINKER:/OPT:ICF" "LINKER:/PDBALTPATH:%_PDB%")
+endif()
 
 # Allow an independent candidate while the default executable is being playtested.
 set(EDF2027_EXECUTABLE_NAME "edf2027" CACHE STRING "Game executable basename (no directory or extension required)")
@@ -451,11 +489,10 @@ if(BUILD_TESTING)
 endif()
 
 # ---------------------------------------------------------------------------
-# Release package: out/package/EDF2027-PC-<version>/  (no game data, ever)
+# Release package: out/package/EDF2027-PC-<version>-<commit>[-dirty]/ and .zip, plus
+# -symbols.zip with the PDB (tools/package-release.cmake; no game data, ever).
 # ---------------------------------------------------------------------------
-set(EDF2027_VERSION 0.2.0)
-set(EDF2027_PKG_DIR ${CMAKE_SOURCE_DIR}/out/package/EDF2027-PC-${EDF2027_VERSION}
-    CACHE PATH "Release package output directory")
+set(EDF2027_PACKAGE_ROOT ${CMAKE_SOURCE_DIR}/out/package CACHE PATH "Where package_release writes its folder and zips")
 # Derive the SDK's bin/ from where find_package landed (<sdk>/lib/cmake/rexglue).
 # CMAKE_PREFIX_PATH is a list and may hold more than the SDK, so it cannot be used here.
 get_filename_component(EDF2027_SDK_ROOT ${rexglue_DIR}/../../.. ABSOLUTE)
@@ -533,14 +570,41 @@ foreach(_dll rexruntime TracyClient)
     endif()
 endforeach()
 
+# Microsoft's redistributables, shipped app-local (LICENSES/Microsoft-redistributables.txt):
+# - The Visual C++ runtime the exe, rexruntime.dll and the FidelityFX DLL import. Without
+#   it a machine lacking the VC++ 2015-2022 redistributable cannot start the game, and one
+#   with an older redistributable than the build's toolset can crash in std::mutex.
+# - d3dcompiler_47.dll, which compiles the game's HLSL at run time. Windows has one too,
+#   but Wine/Proton's builtin differs; the loader takes the one beside the exe first
+#   (it is not a KnownDLL), and the startup report logs which one was loaded.
+if(NOT EDF2027_VC_RUNTIME_DIR)
+    file(TO_CMAKE_PATH "$ENV{VCToolsRedistDir}" _edf_vc_redist)
+    file(GLOB _edf_vc_crt "${_edf_vc_redist}/x64/Microsoft.VC*.CRT")
+    if(NOT _edf_vc_crt)
+        file(GLOB _edf_vc_crt "C:/Program Files/Microsoft Visual Studio/*/*/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT")
+    endif()
+    if(_edf_vc_crt)
+        list(SORT _edf_vc_crt COMPARE NATURAL ORDER DESCENDING)
+        list(GET _edf_vc_crt 0 _edf_vc_crt)
+    endif()
+    set(EDF2027_VC_RUNTIME_DIR "${_edf_vc_crt}" CACHE PATH "Visual C++ runtime redist folder (Microsoft.VC14x.CRT) for package_release")
+endif()
+set(EDF2027_D3DCOMPILER_DLL "C:/Program Files (x86)/Windows Kits/10/Redist/D3D/x64/d3dcompiler_47.dll"
+    CACHE FILEPATH "Windows SDK redistributable d3dcompiler_47.dll for package_release")
+set(EDF2027_PACKAGE_DLLS ${EDF2027_RUNTIME_DLLS} ${EDF2027_SDK_AUX_DLLS} ${EDF2027_D3DCOMPILER_DLL})
+foreach(_dll msvcp140 msvcp140_atomic_wait vcruntime140 vcruntime140_1)
+    list(APPEND EDF2027_PACKAGE_DLLS ${EDF2027_VC_RUNTIME_DIR}/${_dll}.dll)
+endforeach()
+string(REPLACE ";" "|" _edf_package_dlls "${EDF2027_PACKAGE_DLLS}")
+set(_edf_package_pdb "")
+if(WIN32 AND EDF2027_RELEASE_PDB)
+    set(_edf_package_pdb "$<TARGET_FILE_DIR:edf2027>/$<TARGET_FILE_BASE_NAME:edf2027>.pdb")
+endif()
 add_custom_target(package_release
-    COMMAND ${CMAKE_COMMAND} -E rm -rf ${EDF2027_PKG_DIR}
-    COMMAND ${CMAKE_COMMAND} -E make_directory ${EDF2027_PKG_DIR}/LICENSES
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:edf2027> ${EDF2027_PKG_DIR}/
-    COMMAND ${CMAKE_COMMAND} -E copy ${EDF2027_RUNTIME_DLLS} ${EDF2027_SDK_AUX_DLLS}
-                                     ${CMAKE_SOURCE_DIR}/gamecontrollerdb.txt ${EDF2027_PKG_DIR}/
-    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/README.md ${EDF2027_PKG_DIR}/README.md
-    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/LICENSES ${EDF2027_PKG_DIR}/LICENSES
+    COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DPACKAGE_ROOT=${EDF2027_PACKAGE_ROOT}
+        -DVERSION=${EDF2027_VERSION} -DEXECUTABLE=$<TARGET_FILE:edf2027> "-DDLLS=${_edf_package_dlls}"
+        -DPDB=${_edf_package_pdb} -DAUDIT_SCRIPT=${CMAKE_SOURCE_DIR}/tools/audit-native-dependencies.cmake
+        -P ${CMAKE_SOURCE_DIR}/tools/package-release.cmake
     DEPENDS edf2027
     COMMENT "Packaging EDF2027-PC-${EDF2027_VERSION} (port only, no game data)"
     VERBATIM)

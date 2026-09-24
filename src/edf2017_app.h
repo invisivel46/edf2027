@@ -15,12 +15,14 @@
 #include <filesystem>
 #include <mutex>
 #include <thread>
+#include "diagnostics.h"
 #include "launcher.h"
 #include "pause_menu.h"
 #include "perf_overlay.h"
 #include "scripted_input.h"
 #include "settings_dialog.h"
 #include "setup_dialog.h"
+#include "version.h"
 #if defined(_WIN32)
 #include "native_graphics/guest_shader_bridge.h"
 #include "native_graphics/native_renderer_preset.h"
@@ -31,6 +33,8 @@
 #include "native_graphics/native_backend_immediate_drawer.h"
 #include "native_graphics/native_backend_host.h"
 #include "native_graphics/d3d12_backend.h"
+#include "native_graphics/native_ffx.h"
+#include "native_graphics/native_fsr.h"
 #endif
 // edf_native_preview_window, edf_native_scene_backend, edf_native_untiled_scene, edf_native_mesh_watch_audit.
 #include "native_graphics/bridge/native_cvars.h"
@@ -43,6 +47,7 @@ REXCVAR_DECLARE(bool, audio_mute);
 REXCVAR_DECLARE(bool, edf_menu_pause);
 REXCVAR_DECLARE(bool, edf_menu_mute_audio);
 REXCVAR_DECLARE(bool, edf_menu_pause_audio_engine);
+REXCVAR_DECLARE(std::string, hid_mappings_file);
 
 namespace edf {
 // Suspends and resumes the SDK audio engine (AudioSystem::Pause/Resume) for the F1
@@ -101,6 +106,8 @@ class Edf2017App : public rex::ReXApp {
   using rex::ReXApp::ReXApp;
 
   static std::unique_ptr<rex::ui::WindowedApp> Create(rex::ui::WindowedAppContext& ctx) {
+    // First thing the game itself runs: from here on a crash leaves a dump and says where.
+    edf::diag::InstallCrashHandler();
     return std::unique_ptr<Edf2017App>(new Edf2017App(ctx, "edf2027", PPCImageConfig));
   }
 
@@ -115,6 +122,11 @@ class Edf2017App : public rex::ReXApp {
       }
     }
     paths.config_path = paths.user_data_root / "edf2027.toml";
+    user_data_root_ = paths.user_data_root;
+    config_path_ = paths.config_path;
+    // Before the SDK opens the log: <exe>/logs, or <user data>/logs when the game folder
+    // is read-only; old runs pruned (diagnostics.h).
+    edf::diag::PrepareLogFile(paths.user_data_root);
     if (!rex::cvar::HasNonDefaultValue("fullscreen")) rex::cvar::SetFlagByName("fullscreen", "false");
     rex::cvar::SetFlagByName("present_letterbox", REXCVAR_GET(edf_aspect) == "stretch" ? "false" : "true");
     // The guest is always told a 16:9 video mode (core_logic.h GuestVideoMode); a
@@ -124,6 +136,36 @@ class Edf2017App : public rex::ReXApp {
          !edf::native::IsConsoleAspect(REXCVAR_GET(window_width), REXCVAR_GET(window_height))))
       edf::SettingsDialog::ApplyVideoMode(REXCVAR_GET(window_width), REXCVAR_GET(window_height));
     edf::ApplyControllerDbDefault();  // before the input backend loads gamecontrollerdb.txt
+  }
+
+  // The log is open (and the config loaded): start it with what a bug report needs.
+  void OnPostInitLogging() override { edf::diag::LogStartupReport(user_data_root_, config_path_); }
+
+  // Setup failures that would otherwise end the process with only a log line (or, for
+  // an exception, a crash report about the wrong thing) get a message box naming the log.
+  bool SetupPresentation() override {
+    try {
+      if (rex::ReXApp::SetupPresentation()) return true;
+      edf::diag::ReportFatalError("EDF2027 could not start",
+                                  "The game window or the renderer could not be created." + RendererAdvice());
+    } catch (const std::exception& error) {
+      edf::diag::ReportFatalError("EDF2027 could not start",
+                                  std::string("The game window or the renderer could not be created:\n\n") +
+                                      error.what() + RendererAdvice());
+    }
+    return false;
+  }
+  bool ConstructRuntime(const rex::PathConfig& paths) override {
+    try {
+      if (rex::ReXApp::ConstructRuntime(paths)) return true;
+      edf::diag::ReportFatalError("EDF2027 could not start",
+                                  "The game could not be started from:\n" + paths.game_data_root.string() +
+                                      "\n\nThe log says why. If the folder is wrong, start the game with --settings "
+                                      "and choose the extracted game folder again.");
+    } catch (const std::exception& error) {
+      edf::diag::ReportFatalError("EDF2027 could not start", std::string("The game could not be started:\n\n") + error.what());
+    }
+    return false;
   }
 
   void OnPreSetup(rex::RuntimeConfig& config) override {
@@ -162,6 +204,16 @@ class Edf2017App : public rex::ReXApp {
             return {int32_t(rect.right - rect.left), int32_t(rect.bottom - rect.top)};
           });
       edf::native::InitializeGuestShaderBridge({});
+      // The presenting host stops on a lost GPU or a device it cannot create; say so and
+      // close instead of leaving a frozen window.
+      edf::native::NativeBackendHost::SetFailureHandler([this, context = &app_context()](const std::string& error) {
+        context->CallInUIThreadDeferred([this, error] {
+          edf::diag::ReportFatalError("EDF2027 - the renderer stopped",
+                                      "The renderer stopped because of an error:\n\n" + error + RendererAdvice() +
+                                          "\n\nThe game will now close.");
+          if (window()) window()->RequestClose();
+        });
+      });
       if(REXCVAR_GET(edf_native_scene_backend).starts_with("d3d12")) {
         edf::native::RegisterNativeD3D12Backend();
         auto backend=std::shared_ptr<edf::native::NativeRenderBackend>(
@@ -228,6 +280,7 @@ class Edf2017App : public rex::ReXApp {
           [this]() { return !edf::menu::MenuOpen() && !imgui_drawer()->GetIO().WantCaptureMouse; });
     }
     booted_ = true;
+    edf::diag::RunCrashTest();  // edf_crash_test, off by default
   }
 
   // Runs after config load and window creation, before the runtime boots.
@@ -236,6 +289,14 @@ class Edf2017App : public rex::ReXApp {
     config_path_ = defaults.config_path;
     ApplyDisplayMode();
     edf::ApplyKeyboardDefaults();
+
+    // gamecontrollerdb.txt is found beside the exe at startup, and the saved config keeps
+    // that absolute path: after the game folder moves, look beside the exe again.
+    if (const std::string db = REXCVAR_GET(hid_mappings_file); !db.empty() && !std::filesystem::exists(db)) {
+      rex::cvar::ResetToDefault("hid_mappings_file");
+      edf::ApplyControllerDbDefault();
+      REXLOG_INFO("EDF2027: controller database {} is missing; using {}", db, REXCVAR_GET(hid_mappings_file));
+    }
 
     rex::PathConfig paths = defaults;
     // Priority: --game_data_root on the command line, then the saved edf_game_path,
@@ -389,6 +450,13 @@ class Edf2017App : public rex::ReXApp {
       else rex::cvar::SetFlagByName("audio_mute", mute ? "true" : "false");
     };
     hooks.paused = [this]() { return pause_.holding() && edf::menu::Engine().holding.load(); };
+    hooks.version = edf::version::Full();
+#if defined(_WIN32)
+    hooks.fsr_unavailable = []() -> std::string {
+      const auto& library = edf::native::NativeFsrLibrary();
+      return library.available() ? std::string() : library.error();
+    };
+#endif
     auto* dlg = new edf::SettingsDialog(imgui_drawer(), config_path_, std::move(hooks), by_pad);
     edf::SettingsDialog::Current() = dlg;
     imgui_drawer()->AddDialog(dlg);
@@ -473,7 +541,15 @@ class Edf2017App : public rex::ReXApp {
     return true;
   }
 
+  // What a player should try when the renderer fails.
+  static std::string RendererAdvice() {
+    return "\n\nThis port needs a GPU and driver with Direct3D 12 (feature level 11_0). Update the graphics driver "
+           "and try again; if the GPU was lost or hung, closing other GPU-heavy programs or lowering the frame-rate "
+           "cap can help.";
+  }
+
   std::filesystem::path config_path_;
+  std::filesystem::path user_data_root_;
   std::function<void()> pending_resume_;
   bool booted_ = false;  // the runtime is up (OnPostSetup); before it, --settings has nothing to pause
   edf::menu::PauseController pause_;

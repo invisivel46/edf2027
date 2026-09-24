@@ -33,7 +33,7 @@ void ResetKeyboardDefaults();
 void ApplyControllerDbDefault();
 
 constexpr uint32_t kTitleId = 0x445007D3;  // Earth Defense Force 2017 (USA/Europe)
-constexpr const char* kVersion = "0.2.0";
+// The version is edf::version (version.h), from EDF2027_VERSION in CMakeLists.txt.
 
 inline std::filesystem::path GameDir(const std::filesystem::path& user_data_root) {
   return user_data_root / "game";

@@ -111,7 +111,28 @@ std::filesystem::path NativeDefaultCacheDirectory() {
     if(length<path.size()) { path.resize(length); break; }
     path.resize(path.size()*2);
   }
-  return std::filesystem::path(path).parent_path()/"native_cache";
+  const auto beside=std::filesystem::path(path).parent_path()/"native_cache";
+  // An install the player cannot write to (under Program Files, or a read-only share)
+  // would leave every run compiling every shader again: use the per-user local app data
+  // instead, which the bridge's "Native persistent caches" log line then names.
+  auto writable=[](const std::filesystem::path& directory) {
+    std::error_code error;
+    std::filesystem::create_directories(directory,error);
+    const auto probe=directory/L".edf2027-write-test";
+    const HANDLE file=CreateFileW(probe.c_str(),GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_TEMPORARY|FILE_FLAG_DELETE_ON_CLOSE,nullptr);
+    if(file==INVALID_HANDLE_VALUE) return false;
+    CloseHandle(file);
+    return true;
+  };
+  if(writable(beside)) return beside;
+  wchar_t local[MAX_PATH];
+  const DWORD length=GetEnvironmentVariableW(L"LOCALAPPDATA",local,MAX_PATH);
+  if(length && length<MAX_PATH) {
+    const auto fallback=std::filesystem::path(local)/L"edf2027"/L"native_cache";
+    if(writable(fallback)) return fallback;
+  }
+  return beside;  // nothing writable: every cache write fails quietly, as before
 }
 
 std::string NativeModuleIdentity(const wchar_t* module_name) {
