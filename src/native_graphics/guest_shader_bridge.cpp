@@ -348,7 +348,12 @@ std::optional<NativeTexture> DispatchNativeFsrLocked(Bridge& state,uint32_t owne
   fsr.frame=false;
   if(!scene.color.sampled.content_valid || !scene.color.sampled.backend || !state.scene_backend) return std::nullopt;
   try {
-    const auto width=scene.color.sampled.width,height=scene.color.sampled.height;
+    // The render size the frame was drawn at (the output's for native AA).
+    const auto width=fsr.upscaler.width(),height=fsr.upscaler.height();
+    const auto display_width=scene.color.sampled.width,display_height=scene.color.sampled.height;
+    if(fsr.upscaler.display_width()!=display_width || fsr.upscaler.display_height()!=display_height ||
+       fsr.scale.render_width!=width || fsr.scale.render_height!=height)
+      throw std::runtime_error("the scene or the upscaler changed size since the frame was armed");
     const auto plan=PlanNativeFsrMotion(fsr.motion,fsr.camera);
     const auto reasons=fsr.resets.Next({fsr.helper_frame,width,height,scene.color.format,fsr.mode,NativeAbNativeSide(),
       plan.camera,plan.reset});
@@ -361,8 +366,9 @@ std::optional<NativeTexture> DispatchNativeFsrLocked(Bridge& state,uint32_t owne
     inputs.motion=plan.motion;
     inputs.opaque=fsr.opaque;
     inputs.jitter=fsr.jitter;
-    // Workstream B's vectors are UV offsets (current to previous position);
-    // this scales them to render pixels, as FSR takes them.
+    // Workstream B's vectors are UV offsets (current to previous position)
+    // over the view's viewport, which is the render rectangle; this scales
+    // them to render pixels, as FSR takes them.
     inputs.motion_scale={float(width),float(height)};
     inputs.sharpness=float(REXCVAR_GET(edf_native_fsr_sharpness));
     inputs.frame_ms=frame_ms;
@@ -380,8 +386,8 @@ std::optional<NativeTexture> DispatchNativeFsrLocked(Bridge& state,uint32_t owne
     if((reasons&~kNativeFsrResetMotion) && (++logged_resets<=8 || !(logged_resets&(logged_resets-1))))
       REXLOG_INFO("FSR history reset: {} (frame={} count={})",NativeFsrResetTracker::Describe(reasons),fsr.helper_frame,logged_resets);
     if(fsr.dispatched<=4 || fsr.dispatched%1000==0)
-      REXLOG_INFO("FSR dispatch: count={} {}x{} jitter=({:.4f},{:.4f})px phase={}/{} reset={} reactive={} motion={} near={} far={} fov_y={:.4f}{} sharpness={:.2f} dropped={} failures={}",
-        fsr.dispatched,width,height,inputs.jitter.pixel_x,inputs.jitter.pixel_y,fsr.index,fsr.upscaler.JitterPhaseCount(),
+      REXLOG_INFO("FSR dispatch: count={} mode={} {}x{} -> {}x{} jitter=({:.4f},{:.4f})px phase={}/{} reset={} reactive={} motion={} near={} far={} fov_y={:.4f}{} sharpness={:.2f} dropped={} failures={}",
+        fsr.dispatched,NativeFsrModeName(fsr.mode),width,height,display_width,display_height,inputs.jitter.pixel_x,inputs.jitter.pixel_y,fsr.index,fsr.upscaler.JitterPhaseCount(),
         NativeFsrResetTracker::Describe(reasons),inputs.opaque,plan.motion?"workstream_b":"zero",plan.camera.near_plane,
         plan.camera.far_plane,plan.camera.fov_y,plan.camera.derived?"":" (defaults)",inputs.sharpness,fsr.dropped,fsr.failures);
     for(const auto& message:DrainNativeFsrMessages()) {
@@ -390,7 +396,7 @@ std::optional<NativeTexture> DispatchNativeFsrLocked(Bridge& state,uint32_t owne
     }
     NativeTexture output;
     output.backend=fsr.upscaler.output();
-    output.width=width; output.height=height; output.mip_count=1;
+    output.width=display_width; output.height=display_height; output.mip_count=1;
     output.format=DXGI_FORMAT_R16G16B16A16_FLOAT;
     output.content_valid=true;
     return output;
@@ -398,6 +404,14 @@ std::optional<NativeTexture> DispatchNativeFsrLocked(Bridge& state,uint32_t owne
     fsr.resets.Forget();
     if(++fsr.failures<=8 || !(fsr.failures&(fsr.failures-1)))
       REXLOG_ERROR("FSR dispatch failed, the plain resolve is used: {} (failures={})",error.what(),fsr.failures);
+    // This frame's scene sits in the render-size corner of the plain
+    // resolve; later frames draw at the output size (FSR as native AA).
+    if(fsr.scale.active() && !fsr.upscale_disabled) {
+      fsr.upscale_disabled=true;
+      REXLOG_ERROR("FSR upscaling ({}) disabled after a failed dispatch: the scene is drawn at the output size {}x{} until the mode changes",
+        NativeFsrModeName(fsr.mode),fsr.scale.display_width,fsr.scale.display_height);
+      SetNativeFsrRuntimeError(fsr.runtime_error=std::string("upscaling failed (")+error.what()+"), drawn at full resolution");
+    }
     for(const auto& message:DrainNativeFsrMessages()) REXLOG_WARN("FidelityFX: {}",message);
     return std::nullopt;
   }
@@ -489,6 +503,7 @@ thread_local constinit uint32_t native_scene_animation_owner=0;
 // NativeSceneRenderer::SetClipJitter. Null (no jitter) outside such a view.
 thread_local constinit std::optional<NativeScenePassCamera> native_scene_draw_camera;
 thread_local constinit NativeFsrJitter native_scene_view_jitter;
+thread_local constinit int32_t native_scene_mip_bias_steps=0;
 NativeFsrMode NativeFsrRequestedMode() {
   const std::string text=REXCVAR_GET(edf_native_fsr);
   if(const auto mode=ParseNativeFsrMode(text)) return *mode;
@@ -526,27 +541,39 @@ bool ArmNativeFsrFrameLocked(Bridge& state,uint32_t renderer,NativeScene& scene,
     return false;
   }
   if(!state.scene_backend) return false;
-  if(NativeFsrEffectiveMode(mode)!=mode) {
-    static std::atomic<bool> reported=false;
-    if(!reported.exchange(true))
-      REXLOG_WARN("edf_native_fsr={} runs as native_aa: only native AA is implemented",NativeFsrModeName(mode));
-  }
-  const auto width=scene.color.sampled.width,height=scene.color.sampled.height;
+  // The display size is the scene targets' (the output's); an upscaling mode
+  // draws the scene into its render-size corner (native_fsr.h, "Upscaling").
+  // After a failed upscale dispatch the mode draws at the output size again
+  // (FSR as native AA) until edf_native_fsr changes.
+  if(fsr.upscale_disabled && mode!=fsr.mode) fsr.upscale_disabled=false;
+  const auto display_width=scene.color.sampled.width,display_height=scene.color.sampled.height;
+  auto render=NativeFsrUpscales(mode) && !fsr.upscale_disabled?NativeFsrRenderSizeFor(mode,display_width,display_height):
+    NativeFsrRenderSize{display_width,display_height};
+  if(!render.width || !render.height) render={display_width,display_height};
   std::string error;
-  if(!fsr.upscaler.Prepare(*state.scene_backend,width,height,scene.color.format,&error)) {
+  if(!fsr.upscaler.Prepare(*state.scene_backend,render.width,render.height,display_width,display_height,scene.color.format,&error)) {
     static uint64_t failures=0;
-    if(++failures<=4 || !(failures&(failures-1))) REXLOG_WARN("FSR unavailable: {} (count={})",error,failures);
+    if(++failures<=4 || !(failures&(failures-1)))
+      REXLOG_WARN("FSR unavailable: {}; the scene is drawn at the output size {}x{} without FSR (count={})",error,
+        display_width,display_height,failures);
     for(const auto& message:DrainNativeFsrMessages()) REXLOG_WARN("FidelityFX: {}",message);
+    if(fsr.runtime_error!=error) SetNativeFsrRuntimeError(fsr.runtime_error=error);
     return false;
   }
+  if(!fsr.runtime_error.empty() && !fsr.upscale_disabled) SetNativeFsrRuntimeError(fsr.runtime_error={});
+  const auto width=render.width,height=render.height;
   if(fsr.upscaler.recreated())
-    REXLOG_INFO("FSR context: {}x{} provider={} flags=HDR|DEPTH_INVERTED|AUTO_EXPOSURE jitter_phases={} ({}) gpu_memory={:.1f}MB contexts={} retired={}",
-      width,height,fsr.upscaler.provider().empty()?"?":fsr.upscaler.provider(),fsr.upscaler.JitterPhaseCount(),
-      fsr.upscaler.jitter_from_ffx()?"ffx":"local",double(fsr.upscaler.stats().context_bytes)/1048576.0,fsr.upscaler.stats().contexts,fsr.upscaler.stats().retired);
+    REXLOG_INFO("FSR context: mode={} render={}x{} display={}x{} (ratio {:.2f}) provider={} flags=HDR|DEPTH_INVERTED|AUTO_EXPOSURE jitter_phases={} ({}) mip_bias={:.3f} gpu_memory={:.1f}MB contexts={} retired={}",
+      NativeFsrModeName(mode),width,height,display_width,display_height,double(display_width)/double(width),
+      fsr.upscaler.provider().empty()?"?":fsr.upscaler.provider(),fsr.upscaler.JitterPhaseCount(),
+      fsr.upscaler.jitter_from_ffx()?"ffx":"local",NativeFsrMipBiasSteps(width,display_width)/32.0,
+      double(fsr.upscaler.stats().context_bytes)/1048576.0,fsr.upscaler.stats().contexts,fsr.upscaler.stats().retired);
   const auto phases=(std::max)(1,fsr.upscaler.JitterPhaseCount());
   fsr.index%=phases;
+  // Render pixels: the projection maps onto the render-size viewport.
   fsr.jitter=MakeNativeFsrJitter(fsr.upscaler.JitterOffset(fsr.index),width,height);
   fsr.index=(fsr.index+1)%phases;
+  fsr.scale={width,height,display_width,display_height};
   fsr.mode=mode; fsr.frame=true; fsr.owner=renderer; fsr.helper_frame=helper_frame;
   ++fsr.armed;
   return true;

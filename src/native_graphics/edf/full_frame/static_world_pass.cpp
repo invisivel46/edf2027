@@ -92,7 +92,7 @@ class NativeFullFrameStaticWorldPass final : public edf::native::NativeFramePass
     const auto& d=viewport.viewport; const auto& s=viewport.scissor;
     pass.viewport={d.TopLeftX,d.TopLeftY,d.Width,d.Height,d.MinDepth,d.MaxDepth};
     pass.scissor={s.left,s.top,s.right,s.bottom};
-    pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
+    pass.filtering=NativeSceneMaterialFiltering();  // with FSR upscaling's mip bias
     // A cache miss's resolve creates backend pipelines and samplers and interns
     // the material: one slice each (the resolver's intern runs inside it).
     const auto resolver=NativeFullFrameStaticResolver(pass,

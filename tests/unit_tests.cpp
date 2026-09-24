@@ -496,6 +496,16 @@ void TestRendererAndUpscalerMapping() {
   for (int i = 0; i < int(kNativeFsrValues.size()); ++i) CHECK(NativeFsrIndex(kNativeFsrValues[size_t(i)]) == i);
   CHECK(NativeFsrIndex("bogus") == 0);
   CHECK(kNativeFsrValues[5] == "ultra_performance");
+  // The F1 menu's effective sizes (as native_fsr.h computes them for the renderer).
+  CHECK(NativeFsrUpscaleRatio("off") == 0.0f && NativeFsrUpscaleRatio("native_aa") == 0.0f);
+  CHECK(NativeFsrUpscaleRatio("quality") == 1.5f && NativeFsrUpscaleRatio("balanced") == 1.7f);
+  CHECK(NativeFsrUpscaleRatio("performance") == 2.0f && NativeFsrUpscaleRatio("ultra_performance") == 3.0f);
+  CHECK(NativeFsrSceneSize("quality", 1920, 1080) == std::make_pair(1280, 720));
+  CHECK(NativeFsrSceneSize("balanced", 1920, 1080) == std::make_pair(1129, 635));
+  CHECK(NativeFsrSceneSize("performance", 1920, 1080) == std::make_pair(960, 540));
+  CHECK(NativeFsrSceneSize("ultra_performance", 2560, 1440) == std::make_pair(853, 480));
+  CHECK(NativeFsrSceneSize("native_aa", 1920, 1080) == std::make_pair(1920, 1080));
+  CHECK(NativeFsrSceneSize("off", 2560, 1440) == std::make_pair(2560, 1440));
 }
 
 void TestGraphicsPresets() {

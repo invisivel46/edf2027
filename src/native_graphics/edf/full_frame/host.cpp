@@ -660,12 +660,24 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     }
     edf::native::native_scene_draw_camera.reset();
     edf::native::native_scene_view_jitter={};
+    edf::native::native_scene_mip_bias_steps=0;
+    state.fsr.view_scale={};
     if(state.fsr.frame && state.fsr.owner==renderer) {
       const auto& jitter=state.fsr.jitter;
       edf::native::native_scene_view_jitter=jitter;
       edf::native::native_scene_draw_camera=edf::native::NativeFsrJitterCamera(*edf::native::native_scene_pass_camera,jitter);
       state.scene_renderer.SetClipJitter(jitter.clip_x,jitter.clip_y);
       state.fsr.camera=edf::native::NativeFsrCameraFromProjectionWords(edf::native::native_scene_pass_camera->projection);
+      // Upscaling (native_fsr.h): the view's draws land in the render-size
+      // corner of the scene targets - the renderer's views and the recorded
+      // draws (RecordDrawSetup) are mapped there, context.viewport and every
+      // cache key keep the output's rectangle - and the scene's materials
+      // sample with the mip bias. EndView (EndFsrView) takes both off.
+      if(const auto& scale=state.fsr.scale;scale.active()) {
+        state.fsr.view_scale=scale;
+        state.scene_renderer.SetRenderScale(scale);
+        edf::native::native_scene_mip_bias_steps=edf::native::NativeFsrMipBiasSteps(scale.render_width,scale.display_width);
+      }
     }
     edf::native::BindActiveTarget(state);
     if(state.context) edf::native::MakeNativeDrawViewport(viewport.x,viewport.y,viewport.width,viewport.height,
@@ -759,11 +771,14 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     RestoreFsrViewGlobals();
     edf::native::native_scene_draw_camera.reset();
     edf::native::native_scene_view_jitter={};
+    edf::native::native_scene_mip_bias_steps=0;
     try {
       auto& state=edf::native::State();
       std::lock_guard submission(state.submissions);
       std::lock_guard lock(state.mutex);
       state.scene_renderer.SetClipJitter(0,0);
+      state.scene_renderer.SetRenderScale({});
+      state.fsr.view_scale={};
     } catch(...) {}
   }
   void EndView(edf::native::NativeFrameContext&) override { EndFsrView(); }
@@ -794,7 +809,11 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     record.depth_format=scene->second.depth.format;
     record.width=scene->second.color.sampled.width; record.height=scene->second.color.sampled.height;
     const auto& v=context.viewport;
-    record.viewport={float(v.x),float(v.y),float(v.width),float(v.height),0,1};
+    // Upscaling: the view drew into the render-size corner; the vectors are
+    // written there too, in UV over that rectangle (FSR scales them by the
+    // render size).
+    record.viewport=edf::native::ScaleNativeViewport({float(v.x),float(v.y),float(v.width),float(v.height),0,1},
+      state.fsr.view_scale);
     record.scene=context.view.scene;
     record.frame=context.inputs.frame;
     record.camera=&*edf::native::native_scene_pass_camera;
@@ -896,8 +915,12 @@ class NativeFullFrameHost final : public edf::native::NativeFrameHost {
     const auto scene=state.scenes.find(renderer);
     if(scene==state.scenes.end() || state.active_output!=renderer || !scene->second.output.backend_surface || !state.scene_backend) return;
     auto& output=scene->second.output;
+    // An upscaled frame's vectors fill the render-size corner of their target.
+    const auto& scale=state.fsr.scale;
+    const std::array<uint32_t,2> extent=scale.active()?std::array<uint32_t,2>{scale.render_width,scale.render_height}:
+      std::array<uint32_t,2>{};
     MotionVectorState().RecordDebug(*state.scene_backend,edf::native::SceneRecorderLocked(state),*output.backend_surface,
-      output.format,mode,motion);
+      output.format,mode,motion,extent);
     ++state.bind_generation; state.recorded={};
     edf::native::BindActiveTarget(state);
   }

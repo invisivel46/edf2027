@@ -3497,7 +3497,8 @@ NativeFullFrameEffectActivation ActivateNativeFullFrameEffectLocked(Bridge& stat
   std::vector<NativeBackendSampler*> samplers;
   for(const auto& texture:program.inputs.textures) {
     if(texture.slot>=resolved.size()) throw std::runtime_error("invalid native effect sampler slot");
-    const auto key=NativeFilteringKey(resolved[texture.slot].words,REXCVAR_GET(edf_native_anisotropic_filtering));
+    // The effects are scene materials: FSR upscaling's mip bias applies.
+    const auto key=NativeFilteringKey(resolved[texture.slot].words,NativeSceneMaterialFiltering());
     auto cached=state.samplers.find(key);
     if(cached==state.samplers.end())
       cached=state.samplers.emplace(key,&EnsureSceneBackendLocked(state).CreateSampler(DecodeNativeGuestSampler(key))).first;

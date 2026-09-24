@@ -1,6 +1,7 @@
 #pragma once
-// FSR 3.1 native anti-aliasing (edf_native_fsr=native_aa) on the full-frame
-// scene: the upscaler context, its jitter sequence, the camera and reset
+// FSR 3.1 on the full-frame scene: native anti-aliasing (edf_native_fsr=
+// native_aa) and upscaling (quality .. ultra_performance: see "Upscaling"
+// below): the upscaler context, its jitter sequence, the camera and reset
 // inputs it needs, and the dispatch recorded at the end of the scene.
 //
 // Where it sits in a full frame (guest_shader_bridge.cpp, NativeFullFrameHost):
@@ -61,17 +62,73 @@ struct NativeMotionVectorOutput {
 namespace edf::native {
 class NativeFfxLibrary;
 
-// edf_native_fsr. Every FSR quality mode is read, so the settings screen and
-// configs can name them now; only native_aa (1.0x) is implemented, and the
-// others run as native_aa until render scaling exists (NativeFsrEffectiveMode).
+// edf_native_fsr. native_aa is FSR at 1.0x (temporal anti-aliasing); quality,
+// balanced, performance and ultra_performance draw the 3D scene smaller and
+// upscale it (NativeFsrUpscaleRatio, NativeFsrRenderSizeFor).
 enum class NativeFsrMode : uint32_t { Off, NativeAA, Quality, Balanced, Performance, UltraPerformance };
 std::optional<NativeFsrMode> ParseNativeFsrMode(std::string_view text);
 std::string_view NativeFsrModeName(NativeFsrMode mode);
 // FFX_UPSCALE_QUALITY_MODE_* for a mode (Off has none).
 uint32_t NativeFsrQualityMode(NativeFsrMode mode);
-constexpr NativeFsrMode NativeFsrEffectiveMode(NativeFsrMode mode) {
-  return mode==NativeFsrMode::Off?NativeFsrMode::Off:NativeFsrMode::NativeAA;
+constexpr NativeFsrMode NativeFsrEffectiveMode(NativeFsrMode mode) { return mode; }
+
+// ---------------------------------------------------------------------------
+// Upscaling (edf_native_fsr = quality .. ultra_performance).
+//
+// How the scene is drawn smaller (the "sub-rectangle" scheme FSR's dynamic
+// resolution is built for): the guest keeps the output size everywhere - its
+// render size, targets, EDRAM placement, post pyramid, 2D canvas and camera
+// aspect are those of the output (native_display_layout.h) - and only the
+// native recording of the scene's draws is narrowed. While an upscaling view
+// records, every viewport and scissor that lands on the scene's colour/depth
+// is mapped from output pixels into the top-left render rectangle
+// (NativeRenderScale, native_render_scale.h): NativeSceneRenderer::Record for
+// the sky, models, static world and transparent batches, RecordDrawSetup for
+// effects and the guest listeners' draws, the motion vectors' viewport. The
+// resolve still copies the whole scene texture; FSR reads its render-size
+// top-left corner (ffxDispatchDescUpscale::renderSize, maxRenderSize at
+// creation) and writes the output-size image the post chain then reads as
+// owner+104, so bloom, tone mapping, blur and the HUD run at output size.
+//
+// Where FSR runs: after the scene (opaque, effects, transparent, the guest
+// listeners, the motion vectors), at the scene's resolve, before the post
+// chain (native_post_finish_plan.h). What each post pass reads, and so where
+// it runs:
+//   Downsample 0      owner+104 (scene colour)  -> the upscaled colour, at output size
+//   Downsample 1..4   the previous pyramid level (no scene read)
+//   Mono, second pyramid, DownsampleTone (m_OldTone history)
+//                     pyramid levels only
+//   Tone, BlurH/BlurV the pyramid and the tone history only
+//   Bloom composite   owner+104 + the blur + the tone history -> the output,
+//                     at output size (the upscaled colour)
+// No post pass samples the scene depth (their setters name only
+// m_DiffuseTexture0/1, m_OldTone and m_Tone), so no depth is upscaled; only
+// the motion vectors and FSR read it, at render size. No scene pass samples
+// the scene colour or depth either (the Utility paths refuse a draw that
+// samples its own target). So nothing has to run at render size after the
+// scene, and the post is unchanged: the same passes over an output-size input.
+//
+// AMD's per-dimension ratios (FFX_UPSCALE_QUALITY_MODE_*): 1.5, 1.7, 2.0, 3.0;
+// 1 for off and native_aa.
+float NativeFsrUpscaleRatio(NativeFsrMode mode);
+constexpr bool NativeFsrUpscales(NativeFsrMode mode) {
+  return mode==NativeFsrMode::Quality || mode==NativeFsrMode::Balanced ||
+         mode==NativeFsrMode::Performance || mode==NativeFsrMode::UltraPerformance;
 }
+struct NativeFsrRenderSize {
+  uint32_t width=0,height=0;
+  bool operator==(const NativeFsrRenderSize&) const=default;
+};
+// The render size for an output (display) size, as FFX's
+// GETRENDERRESOLUTIONFROMQUALITYMODE computes it: (uint32)(display / ratio)
+// per axis in single precision, at least 1. 1920x1080 quality is 1280x720.
+NativeFsrRenderSize NativeFsrRenderSizeFor(NativeFsrMode mode,uint32_t display_width,uint32_t display_height);
+// The texture mip LOD bias for the 3D scene's materials while upscaling
+// (AMD's guidance: log2(render / display) - 1, from the width ratio), 0 when
+// render and display are the same size (off and native_aa stay unbiased).
+float NativeFsrMipBias(uint32_t render_width,uint32_t display_width);
+// The same in the guest sampler's LOD bias units (1/32, NativeFilteringKey).
+int32_t NativeFsrMipBiasSteps(uint32_t render_width,uint32_t display_width);
 
 // The validation tools assume deterministic, unjittered, same-size scenes
 // (shadow-diff, A/B and reuse alternation compare pixels across routes), so
@@ -84,7 +141,9 @@ const char* NativeFsrExcludedBy(const NativeFsrExclusions& exclusions);
 // GETJITTERPHASECOUNT/GETJITTEROFFSET answer): 8 * (display/render)^2 phases,
 // offset i = (Halton(i % n + 1, 2) - 0.5, Halton(i % n + 1, 3) - 0.5) pixels.
 // The local copies are the fallback when the query fails and what the tests
-// hold the DLL's answers against.
+// hold the DLL's answers against. The offsets are RENDER pixels: while
+// upscaling, MakeNativeFsrJitter takes the render size (the viewport the
+// projection maps onto), not the output's.
 int32_t NativeFsrJitterPhaseCount(uint32_t render_width,uint32_t display_width);
 float NativeFsrHalton(int32_t index,int32_t base);
 std::array<float,2> NativeFsrJitterOffset(int32_t index,int32_t phase_count);
@@ -166,7 +225,7 @@ enum NativeFsrReset : uint32_t {
 };
 struct NativeFsrFrameFacts {
   uint64_t helper_frame=0;      // the render helper call counter (one per 821A5080)
-  uint32_t width=0,height=0,format=0;
+  uint32_t width=0,height=0,format=0;  // the render size (the output's for native AA)
   NativeFsrMode mode=NativeFsrMode::NativeAA;
   bool ab_native=true;
   NativeFsrCameraParams camera;
@@ -188,11 +247,19 @@ std::vector<std::string> DrainNativeFsrMessages();
 // The process's FidelityFX DLL (NativeFfxLibrary::DefaultPath), loaded on
 // first use.
 NativeFfxLibrary& NativeFsrLibrary();
+// Why FSR is not running although the DLL loaded (a context that could not
+// be made, an upscale dispatch that failed), for the settings screen's "FSR
+// unavailable" line; empty while it runs. Set by the renderer, any thread.
+void SetNativeFsrRuntimeError(std::string error);
+std::string NativeFsrRuntimeError();
 
 struct NativeFsrDispatchInputs {
-  NativeBackendTexture* color=nullptr;       // render-size RGBA16F: the resolved scene, jittered
-  NativeBackendRenderTarget* depth=nullptr;  // the sampled scene depth target (reversed Z)
-  NativeBackendTexture* motion=nullptr;      // null: zero motion
+  // The resolved scene, jittered (RGBA16F), and the sampled scene depth
+  // target (reversed Z): output-size textures whose top-left render-size
+  // corner holds the frame (the whole texture for native AA).
+  NativeBackendTexture* color=nullptr;
+  NativeBackendRenderTarget* depth=nullptr;
+  NativeBackendTexture* motion=nullptr;      // null: zero motion (same layout as colour)
   bool opaque=false;                         // opaque_texture() holds this frame's opaque-only colour
   NativeFsrJitter jitter;
   std::array<float,2> motion_scale{};        // motion vector units to render pixels
@@ -205,12 +272,12 @@ struct NativeFsrStats {
   uint64_t contexts=0,dispatches=0,reactive=0,resets=0,retired=0;
   uint64_t context_bytes=0;  // the current context's GPU memory (FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE), 0 if unknown
 };
-// One FSR upscaler context on a D3D12 scene backend (NativeD3D12RawAccess),
-// native AA: render size = display size. Made lazily by Prepare and made
-// again when the size or colour format changes; a replaced context is
-// destroyed only after kRetireFrames further Prepares, by which time the GPU
-// has finished the frames that used it (the backend's frame slots are far
-// fewer).
+// One FSR upscaler context on a D3D12 scene backend (NativeD3D12RawAccess):
+// render size = display size for native AA, smaller when upscaling. Made
+// lazily by Prepare and made again when a size or the colour format changes;
+// a replaced context is destroyed only after kRetireFrames further Prepares,
+// by which time the GPU has finished the frames that used it (the backend's
+// frame slots are far fewer).
 class NativeFsrUpscaler {
  public:
   static constexpr uint32_t kRetireFrames=16;
@@ -218,24 +285,37 @@ class NativeFsrUpscaler {
   ~NativeFsrUpscaler();
   NativeFsrUpscaler(const NativeFsrUpscaler&)=delete;
   NativeFsrUpscaler& operator=(const NativeFsrUpscaler&)=delete;
-  // Ready for a frame of this size and colour format on this backend: the
-  // context, output, reactive, opaque-copy and zero-motion textures. False
-  // with *error when it cannot be (no D3D12 raw access, no FFX DLL or
-  // provider, a failed create). recreated() says this call made them.
-  bool Prepare(NativeRenderBackend& backend,uint32_t width,uint32_t height,uint32_t color_format,std::string* error);
+  // Ready for a frame of this render size, display (output) size and colour
+  // format on this backend: the context (maxRenderSize = render, maxUpscaleSize
+  // = display), the display-size output, the render-size reactive mask and
+  // zero-motion field, and the display-size opaque copy (a whole copy of the
+  // scene target). False with *error when it cannot be (no D3D12 raw access,
+  // no FFX DLL or provider, a failed create). recreated() says this call made
+  // them.
+  bool Prepare(NativeRenderBackend& backend,uint32_t render_width,uint32_t render_height,
+               uint32_t display_width,uint32_t display_height,uint32_t color_format,std::string* error);
+  // Native AA: render = display.
+  bool Prepare(NativeRenderBackend& backend,uint32_t width,uint32_t height,uint32_t color_format,std::string* error) {
+    return Prepare(backend,width,height,width,height,color_format,error);
+  }
   // A provider id from NativeFfxLibrary::Versions (0: the DLL's default,
   // newest), used by the next context made (FFX's ffxOverrideVersion).
   void SetVersionOverride(uint64_t id) { version_override_=id; }
   bool recreated() const { return recreated_; }
   bool ready() const { return context_!=nullptr; }
+  // The render size (what the scene is drawn at) and the display size (the
+  // output's).
   uint32_t width() const { return width_; }
   uint32_t height() const { return height_; }
+  uint32_t display_width() const { return display_width_; }
+  uint32_t display_height() const { return display_height_; }
   // The context's jitter sequence (GETJITTERPHASECOUNT/GETJITTEROFFSET), or
   // the local copy when the context cannot answer.
   int32_t JitterPhaseCount() const { return phase_count_; }
   std::array<float,2> JitterOffset(int32_t index) const;
   bool jitter_from_ffx() const { return jitter_from_ffx_; }
-  // Where the opaque-only colour is copied to (render size, colour format).
+  // Where the opaque-only colour is copied to (display size - the scene
+  // target's - and its colour format; the render-size corner is what counts).
   NativeBackendTexture* opaque_texture() const { return opaque_.get(); }
   // The upscaled image (display size, RGBA16F, UAV), for the post.
   const std::shared_ptr<NativeBackendTexture>& output() const { return output_; }
@@ -250,7 +330,7 @@ class NativeFsrUpscaler {
   void Release();
   NativeRenderBackend* backend_=nullptr;
   void* context_=nullptr;  // ffxContext
-  uint32_t width_=0,height_=0,format_=0;
+  uint32_t width_=0,height_=0,display_width_=0,display_height_=0,format_=0;
   int32_t phase_count_=8;
   uint64_t version_override_=0;
   bool jitter_from_ffx_=false,recreated_=false;

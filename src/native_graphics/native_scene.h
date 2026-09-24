@@ -1,5 +1,6 @@
 #pragma once
 #include "d3d11_mesh.h"
+#include "native_render_scale.h"
 #include "native_shared_vector.h"
 #include <atomic>
 #include <map>
@@ -197,6 +198,13 @@ class NativeSceneRenderer {
   // default, records exactly what it did before the jitter existed.
   void SetClipJitter(float x,float y) { clip_jitter_={x,y}; }
   std::array<float,2> clip_jitter() const { return clip_jitter_; }
+  // FSR upscaling (native_fsr.h, native_render_scale.h): while active, every
+  // view's viewport and scissor are recorded mapped into the render-size
+  // corner of the output-size targets. Like the jitter, the views handed in
+  // (and every cache keyed on them) keep the output's rectangles; inactive,
+  // the default, records exactly what it did before.
+  void SetRenderScale(const NativeRenderScale& scale) { render_scale_=scale; }
+  const NativeRenderScale& render_scale() const { return render_scale_; }
  private:
   struct Visible {
     const NativeSceneInstance* instance;
@@ -211,5 +219,6 @@ class NativeSceneRenderer {
   std::vector<Visible> visible_;
   std::vector<uint8_t> constants_scratch_,instances_scratch_;
   std::array<float,2> clip_jitter_{};
+  NativeRenderScale render_scale_{};
 };
 }

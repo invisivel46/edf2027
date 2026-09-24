@@ -107,10 +107,23 @@ std::array<int32_t,2> NativeDisplaySize();
 inline const std::array<int32_t,2>& NativeRenderDimensions() {
   static const std::array<int32_t,2> dimensions=[] {
     const auto display=NativeDisplaySize();
-    const auto size=ResolveNativeRenderSize(REXCVAR_GET(edf_native_render_width),
-      REXCVAR_GET(edf_native_render_height),display[0],display[1],ParseNativeAspectMode(REXCVAR_GET(edf_aspect)));
+    // FSR upscaling at startup: the engine renders (and FSR outputs) at the
+    // window's size, the scene at a fraction of it (NativeRenderRequest). The
+    // validation runs that keep FSR off keep the request.
+    const auto fsr=ParseNativeFsrMode(std::string(REXCVAR_GET(edf_native_fsr)));
+    const bool upscaling=fsr && NativeFsrUpscales(*fsr) &&
+      !NativeFsrExcludedBy({REXCVAR_GET(edf_native_ab_alternate)>0,REXCVAR_GET(edf_native_reuse_off_alternate)>0,
+                            REXCVAR_GET(edf_native_shadow_render)>0});
+    const auto request=NativeRenderRequest(REXCVAR_GET(edf_native_render_width),REXCVAR_GET(edf_native_render_height),upscaling);
+    const auto size=ResolveNativeRenderSize(request[0],request[1],display[0],display[1],ParseNativeAspectMode(REXCVAR_GET(edf_aspect)));
+    if(upscaling) {
+      const auto scene=NativeFsrRenderSizeFor(*fsr,uint32_t(size.width),uint32_t(size.height));
+      REXLOG_INFO("Native render size: FSR {} draws the scene at {}x{} and upscales it to the output size below; "
+        "edf_native_render_width/height ({}x{}) are not used while it upscales",NativeFsrModeName(*fsr),scene.width,scene.height,
+        REXCVAR_GET(edf_native_render_width),REXCVAR_GET(edf_native_render_height));
+    }
     REXLOG_INFO("Native render size: {}x{}{} (request {}x{}, display {}x{}, aspect {}){}",size.width,size.height,
-      size.original?" (engine original)":"",REXCVAR_GET(edf_native_render_width),REXCVAR_GET(edf_native_render_height),
+      size.original?" (engine original)":"",request[0],request[1],
       display[0],display[1],std::string(REXCVAR_GET(edf_aspect)),size.clamped?"; scaled to fit the render size limits":"");
     return size.original?std::array<int32_t,2>{0,0}:std::array<int32_t,2>{size.width,size.height};
   }();
@@ -228,8 +241,18 @@ edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& 
     recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
     last.color_count=targets.count; last.colors=targets.colors; last.depth=targets.depth;
   }
-  const auto& view=draw.viewport.viewport;
-  const auto& scissor=draw.viewport.scissor;
+  // FSR upscaling (native_fsr.h): a draw into the scene while an upscaling
+  // view records lands in the render-size corner of the targets.
+  auto view=draw.viewport.viewport;
+  auto scissor=draw.viewport.scissor;
+  if(state.fsr.view_scale.active() && state.active_scene && !state.active_target) {
+    const auto scaled=ScaleNativeViewport({view.TopLeftX,view.TopLeftY,view.Width,view.Height,view.MinDepth,view.MaxDepth},
+      state.fsr.view_scale);
+    view.TopLeftX=scaled.x; view.TopLeftY=scaled.y; view.Width=scaled.width; view.Height=scaled.height;
+    const auto rect=ScaleNativeScissor({int32_t(scissor.left),int32_t(scissor.top),int32_t(scissor.right),int32_t(scissor.bottom)},
+      state.fsr.view_scale);
+    scissor.left=rect.left; scissor.top=rect.top; scissor.right=rect.right; scissor.bottom=rect.bottom;
+  }
   const bool scissor_enabled=draw.state[5]!=0;
   if(!same_frame || std::memcmp(&last.viewport,&view,sizeof(view))!=0) {
     recorder.SetViewport({view.TopLeftX,view.TopLeftY,view.Width,view.Height,

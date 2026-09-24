@@ -8,9 +8,12 @@
 // in edf_native_scene_tests: they need its fixtures.)
 #include "native_graphics/d3d12_backend.h"
 #include "native_graphics/native_d3d12_raw.h"
+#include "native_graphics/native_display_layout.h"
 #include "native_graphics/native_ffx.h"
 #include "native_graphics/native_fsr.h"
 #include "native_graphics/native_render_backend.h"
+#include "native_graphics/native_render_scale.h"
+#include "native_graphics/native_sampler_decode.h"
 #include "native_graphics/native_scene.h"
 #include "native_graphics/native_scene_pass_inputs.h"
 #include <windows.h>
@@ -53,9 +56,12 @@ void TestModes() {
   }
   Check(ParseNativeFsrMode("")==M::Off,"an empty edf_native_fsr is not off");
   Check(!ParseNativeFsrMode("fsr3") && !ParseNativeFsrMode("Native_AA"),"an unknown mode was accepted");
-  // Only native AA is implemented: every other on-mode runs as it.
+  // Every mode runs as itself (Phase 1 ran the upscaling ones as native AA).
   Check(NativeFsrEffectiveMode(M::Off)==M::Off && NativeFsrEffectiveMode(M::NativeAA)==M::NativeAA &&
-        NativeFsrEffectiveMode(M::Performance)==M::NativeAA,"effective modes");
+        NativeFsrEffectiveMode(M::Performance)==M::Performance,"effective modes");
+  Check(!NativeFsrUpscales(M::Off) && !NativeFsrUpscales(M::NativeAA) && NativeFsrUpscales(M::Quality) &&
+        NativeFsrUpscales(M::Balanced) && NativeFsrUpscales(M::Performance) && NativeFsrUpscales(M::UltraPerformance),
+        "which modes upscale");
   Check(NativeFsrQualityMode(M::NativeAA)==0 && NativeFsrQualityMode(M::Quality)==1 &&
         NativeFsrQualityMode(M::UltraPerformance)==4,"FFX quality mode numbers");
   Check(!NativeFsrExcludedBy({}),"no validation run excluded FSR");
@@ -63,6 +69,130 @@ void TestModes() {
         std::string(NativeFsrExcludedBy({false,true,false}))=="edf_native_reuse_off_alternate" &&
         std::string(NativeFsrExcludedBy({false,false,true}))=="edf_native_shadow_render","exclusions name their cvar");
   std::cout << "modes: parsed, native_aa effective, exclusions named\n";
+}
+
+// ---------------------------------------------------------------------------
+// Upscaling sizes (AMD's ratios, FFX's truncation), the jitter sequence length
+// per ratio, the mip bias, and render-pixel jitter.
+void TestUpscaleSizes() {
+  using M=NativeFsrMode;
+  Check(NativeFsrUpscaleRatio(M::Off)==1 && NativeFsrUpscaleRatio(M::NativeAA)==1 && NativeFsrUpscaleRatio(M::Quality)==1.5f &&
+        NativeFsrUpscaleRatio(M::Balanced)==1.7f && NativeFsrUpscaleRatio(M::Performance)==2 &&
+        NativeFsrUpscaleRatio(M::UltraPerformance)==3,"upscale ratios");
+  struct Case { M mode; uint32_t dw,dh,rw,rh; int32_t phases,bias_steps; };
+  // Phases: 8 * (display/render)^2 truncated; bias: round(32 * (log2(render/display) - 1)).
+  const Case cases[]{
+    {M::NativeAA,1920,1080,1920,1080,8,0},
+    {M::Quality,1920,1080,1280,720,18,-51},
+    {M::Balanced,1920,1080,1129,635,23,-57},
+    {M::Performance,1920,1080,960,540,32,-64},
+    {M::UltraPerformance,1920,1080,640,360,72,-83},
+    {M::Quality,2560,1440,1706,960,18,-51},
+    {M::Balanced,2560,1440,1505,847,23,-57},
+    {M::Performance,2560,1440,1280,720,32,-64},
+    {M::UltraPerformance,2560,1440,853,480,72,-83},
+    {M::Quality,3840,2160,2560,1440,18,-51},
+    {M::Performance,3840,2160,1920,1080,32,-64},
+    {M::Quality,1280,800,853,533,18,-51},  // the Steam Deck's 16:10
+  };
+  for(const auto& c:cases) {
+    const auto size=NativeFsrRenderSizeFor(c.mode,c.dw,c.dh);
+    const auto name=std::string(NativeFsrModeName(c.mode))+" at "+std::to_string(c.dw)+"x"+std::to_string(c.dh);
+    Check(size==NativeFsrRenderSize{c.rw,c.rh},name+": render size "+std::to_string(size.width)+"x"+std::to_string(size.height));
+    Check(NativeFsrJitterPhaseCount(size.width,c.dw)==c.phases,
+          name+": jitter phases "+std::to_string(NativeFsrJitterPhaseCount(size.width,c.dw)));
+    Check(NativeFsrMipBiasSteps(size.width,c.dw)==c.bias_steps,name+": mip bias steps "+std::to_string(NativeFsrMipBiasSteps(size.width,c.dw)));
+    const float bias=NativeFsrMipBias(size.width,c.dw);
+    Check(c.mode==M::NativeAA?bias==0:Near(bias,std::log2(float(size.width)/float(c.dw))-1,1e-6f),name+": mip bias");
+  }
+  Check(Near(NativeFsrMipBias(1280,1920),-1.5849625f,1e-5f),"quality mip bias is log2(2/3) - 1");
+  Check(NativeFsrRenderSizeFor(M::UltraPerformance,2,2)==NativeFsrRenderSize{1,1} &&
+        NativeFsrRenderSizeFor(M::Quality,0,0)==NativeFsrRenderSize{0,0},"degenerate sizes");
+  // Jitter in render pixels: the NDC offset is 2 px / render width, so one
+  // render pixel of jitter is display/render output pixels.
+  const auto jitter=MakeNativeFsrJitter({0.25f,-0.25f},1280,720);
+  Check(Near(jitter.clip_x,-0.5f/1280,1e-9f) && Near(jitter.clip_y,-0.5f/720,1e-9f),"render-pixel jitter");
+  // The sequence covers every phase before repeating at each ratio.
+  for(const auto& c:cases) {
+    std::set<std::pair<float,float>> distinct;
+    for(int32_t i=0;i<c.phases;++i) { const auto o=NativeFsrJitterOffset(i,c.phases); distinct.insert({o[0],o[1]}); }
+    Check(int32_t(distinct.size())==c.phases,"jitter phases repeat within a cycle of "+std::to_string(c.phases));
+  }
+  std::cout << "upscale sizes: 1920x1080 -> 1280x720 / 1129x635 / 960x540 / 640x360, phases 18/23/32/72, bias -1.58/-1.77/-2/-2.58\n";
+}
+
+// The recording's rectangle mapping (native_render_scale.h): exact for the
+// whole surface, proportional for split views, scissors outward and clamped.
+void TestRenderScale() {
+  const NativeRenderScale scale{1280,720,1920,1080},identity{1920,1080,1920,1080};
+  Check(scale.active() && !identity.active() && !NativeRenderScale{}.active(),"scale activity");
+  const NativeBackendViewport whole{0,0,1920,1080,0,1};
+  const auto mapped=ScaleNativeViewport(whole,scale);
+  Check(mapped.x==0 && mapped.y==0 && mapped.width==1280 && mapped.height==720 && mapped.min_depth==0 && mapped.max_depth==1,
+        "the whole surface does not map exactly onto the render rectangle");
+  const auto unchanged=ScaleNativeViewport(whole,identity);
+  Check(std::memcmp(&whole,&unchanged,sizeof(whole))==0,"identity changed a viewport");
+  // Balanced: 1129x635 of 1920x1080 is not a whole ratio; the whole surface is still exact.
+  const auto balanced=ScaleNativeViewport(whole,{1129,635,1920,1080});
+  Check(balanced.width==1129 && balanced.height==635,"balanced whole-surface viewport");
+  // A split view (right half) maps to the right half of the render rectangle.
+  const auto right=ScaleNativeViewport({960,0,960,1080,0,1},scale);
+  Check(right.x==640 && right.width==640 && right.height==720,"split view");
+  const auto scissor=ScaleNativeScissor({0,0,1920,1080},scale);
+  Check(scissor.left==0 && scissor.top==0 && scissor.right==1280 && scissor.bottom==720,"whole scissor");
+  const auto odd=ScaleNativeScissor({1,1,1919,1079},scale);  // 0.667 .. 1279.33: outward
+  Check(odd.left==0 && odd.top==0 && odd.right==1280 && odd.bottom==720,"scissor rounds outward");
+  const auto big=ScaleNativeScissor({-100,-100,4000,4000},scale);
+  Check(big.left==0 && big.top==0 && big.right==1280 && big.bottom==720,"scissor clamped to the render rectangle");
+  const auto empty=ScaleNativeScissor({300,300,300,200},scale);
+  Check(empty.right==empty.left && empty.bottom==empty.top,"an empty scissor stays empty");
+  std::cout << "render scale: whole surface exact, split views proportional, scissors outward\n";
+}
+
+// The mip bias rides the pass's filtering value into the sampler key: added
+// to the guest's own bias, clamped, and absent (bit for bit) at 0.
+void TestMipBiasFiltering() {
+  for(const int mode:{-1,0,1,5}) {
+    Check(NativeFilteringWithMipBias(mode,0)==mode,"no bias changed the filtering value "+std::to_string(mode));
+    for(const int steps:{-51,-64,-83,-512,511,7}) {
+      const int value=NativeFilteringWithMipBias(mode,steps);
+      Check(NativeFilteringMode(value)==mode && NativeFilteringMipBias(value)==steps,
+            "filtering "+std::to_string(mode)+" bias "+std::to_string(steps)+" does not round-trip");
+    }
+    Check(NativeFilteringMode(mode)==mode && NativeFilteringMipBias(mode)==0,"a plain mode reads as biased");
+  }
+  // A trilinear sampler with a guest bias of +0.5 (16 steps).
+  SamplerStateWords words{0,(1u<<19)|(1u<<21)|(1u<<23),(16u<<12)|(10u<<6),0};
+  for(const int mode:{-1,0,4}) {
+    Check(NativeFilteringKey(words,mode)==NativeFilteringKey(words,NativeFilteringWithMipBias(mode,0)),"zero bias changed a key");
+    const auto biased=DecodeNativeGuestSampler(NativeFilteringKey(words,NativeFilteringWithMipBias(mode,-51)));
+    const auto plain=DecodeNativeGuestSampler(NativeFilteringKey(words,mode));
+    Check(Near(plain.mip_lod_bias,0.5f,0) && Near(biased.mip_lod_bias,0.5f-51/32.f,1e-6f),
+          "biased sampler lod bias "+std::to_string(biased.mip_lod_bias));
+    Check(biased.min==plain.min && biased.mag==plain.mag && biased.mip==plain.mip && biased.max_anisotropy==plain.max_anisotropy &&
+          biased.max_lod==plain.max_lod,"the bias changed more than the LOD bias");
+  }
+  const auto floor=DecodeNativeGuestSampler(NativeFilteringKey({0,(1u<<19)|(1u<<21)|(1u<<23),(1000u<<12),0},
+    NativeFilteringWithMipBias(-1,-83)));  // -24 steps - 83 -> -107
+  Check(Near(floor.mip_lod_bias,-107/32.f,1e-6f),"negative guest bias plus FSR bias");
+  const auto clamp=DecodeNativeGuestSampler(NativeFilteringKey({0,(1u<<19)|(1u<<21)|(1u<<23),(600u<<12),0},
+    NativeFilteringWithMipBias(-1,-200)));  // -424 - 200 clamps at -512
+  Check(Near(clamp.mip_lod_bias,-16.f,1e-6f),"the bias is clamped to the field's range");
+  std::cout << "mip bias filtering: round-trips, adds to the guest bias, clamps, zero is identity\n";
+}
+
+// Upscaling makes the output the window's: the render size request is replaced.
+void TestRenderRequest() {
+  Check((NativeRenderRequest(2560,1440,true)==std::array<int32_t,2>{0,-1}) &&
+        (NativeRenderRequest(0,0,true)==std::array<int32_t,2>{0,-1}),"upscaling keeps a render size request");
+  Check((NativeRenderRequest(2560,1440,false)==std::array<int32_t,2>{2560,1440}) &&
+        (NativeRenderRequest(0,-1,false)==std::array<int32_t,2>{0,-1}) &&
+        (NativeRenderRequest(0,0,false)==std::array<int32_t,2>{0,0}),"off and native AA changed the request");
+  const auto output=ResolveNativeRenderSize(0,-1,1920,1080,NativeAspectMode::Native);
+  Check(output.width==1920 && output.height==1080,"match window on the Ally's screen");
+  const auto scene=NativeFsrRenderSizeFor(NativeFsrMode::Quality,uint32_t(output.width),uint32_t(output.height));
+  Check(scene==NativeFsrRenderSize{1280,720},"the Ally's quality scene is 1280x720");
+  std::cout << "render request: upscaling renders the output at the window's size\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -452,6 +582,175 @@ float4 PS(float4 p : SV_POSITION) : SV_TARGET { return tint; }
             << edge_fsr << " vs " << edge_aliased << " over " << edges << " edge pixels; context GPU memory "
             << context_bytes/1024 << " KiB at " << kSize << "x" << kSize << '\n';
 }
+
+// Upscaling on WARP, the way the full frame does it: display-size targets
+// (the scene's), the frame drawn into their render-size top-left corner (the
+// viewport mapped by ScaleNativeViewport) with render-pixel jitter, the whole
+// colour resolved, and FSR told renderSize = the corner, upscaleSize = the
+// display. The same frames are also drawn into targets exactly the render
+// size (FSR's plain use); the two outputs must agree, which shows the
+// resources' extra width and height are ignored rather than read (the
+// sub-rectangle scheme FFX's dynamic resolution is made for). The output must
+// also be the scene at display resolution: finite, covering the triangle at
+// display size, and closer to its exact coverage than the aliased render
+// frame stretched up (nearest).
+void TestFfxUpscaleDispatch() {
+  const auto staged=NativeFfxLibrary::DefaultPath();
+  std::error_code ignored;
+  if(!std::filesystem::exists(staged,ignored)) { std::cout << "FSR upscale dispatch: SKIPPED, no DLL\n"; return; }
+  auto& library=NativeFsrLibrary();
+  if(!library.available()) { std::cout << "FSR upscale dispatch: SKIPPED, " << library.error() << '\n'; return; }
+  NativeD3D12Options options;
+  options.prefer_warp=true; options.debug_layer=true;
+  auto backend=CreateNativeD3D12Backend(options);
+  auto* raw=backend->D3D12Raw();
+  if(!library.upscaler_available(raw->Device())) { std::cout << "FSR upscale dispatch: SKIPPED, no upscaler provider\n"; return; }
+  const char* requested=std::getenv("EDF_FSR_TEST_VERSION");
+  const std::string wanted=requested?requested:"2.3.3";  // see TestFfxDispatch: 3.1.4 crashes WARP
+  uint64_t version=0;
+  for(const auto& v:library.Versions(0x00010000u,raw->Device())) if(v.name==wanted) version=v.id;
+  if(!version) { std::cout << "FSR upscale dispatch: SKIPPED, provider " << wanted << " is not in the DLL\n"; return; }
+  constexpr uint32_t kDisplay=kSize;
+  const auto render=NativeFsrRenderSizeFor(NativeFsrMode::Performance,kDisplay,kDisplay);  // 32x32
+  const NativeRenderScale scale{render.width,render.height,kDisplay,kDisplay};
+  const NativeBackendInputElement layout[]{{"POSITION",0,DXGI_FORMAT_R32G32B32_FLOAT,0,0,false,0}};
+  static const char* kSource=R"(
+cbuffer V : register(b0) { float4 jitter; };
+float4 VS(float3 p : POSITION) : SV_POSITION { return float4(p.xy + jitter.xy, p.z, 1); }
+cbuffer P : register(b0) { float4 tint; };
+float4 PS(float4 p : SV_POSITION) : SV_TARGET { return tint; }
+)";
+  const auto vs=Compile(kSource,"VS","vs_5_0"),ps=Compile(kSource,"PS","ps_5_0");
+  NativeBackendPipelineDesc pipeline_desc{};
+  pipeline_desc.vertex=Bytes(*vs.Get()); pipeline_desc.pixel=Bytes(*ps.Get());
+  pipeline_desc.vertex_id=0xF5B0; pipeline_desc.pixel_id=0xF5B1;
+  pipeline_desc.input_layout=layout; pipeline_desc.input_layout_id=0xF5B2;
+  pipeline_desc.state={0x10001,0x46,0,0,15,0};
+  pipeline_desc.render_targets=1; pipeline_desc.rtv_format[0]=DXGI_FORMAT_R16G16B16A16_FLOAT;
+  pipeline_desc.dsv_format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+  auto& pipeline=backend->CreatePipeline(pipeline_desc);
+  NativeBackendBufferDesc buffer_desc{}; buffer_desc.bytes=sizeof(kTriangle); buffer_desc.vertex=true;
+  const auto triangle=backend->CreateBuffer(buffer_desc,Raw(kTriangle));
+  const std::array<float,4> white{1,1,1,1};
+  constexpr uint32_t kFrames=48;
+  // One run: targets of `extent` (the display's: the corner scheme; the
+  // render's: FSR's plain use). Returns the display-size output's luma, and
+  // the first frame's aliased render-size image.
+  std::vector<float> aliased;
+  bool ok=true;
+  const auto run=[&](uint32_t extent,std::vector<float>* first) -> std::vector<float> {
+    NativeFsrUpscaler upscaler;
+    upscaler.SetVersionOverride(version);
+    std::string error;
+    if(!upscaler.Prepare(*backend,render.width,render.height,kDisplay,kDisplay,DXGI_FORMAT_R16G16B16A16_FLOAT,&error)) {
+      for(const auto& message:DrainNativeFsrMessages()) std::cout << "  FidelityFX: " << message << '\n';
+      std::cout << "FSR upscale dispatch: SKIPPED, WARP cannot create the FFX context: " << error << '\n';
+      ok=false; return {};
+    }
+    Check(upscaler.width()==render.width && upscaler.display_width()==kDisplay,"upscaler sizes");
+    Check(upscaler.JitterPhaseCount()==NativeFsrJitterPhaseCount(render.width,kDisplay) && upscaler.JitterPhaseCount()==32,
+          "FFX phase count at 2x is "+std::to_string(upscaler.JitterPhaseCount()));
+    for(int32_t i=0;i<40;++i) {
+      const auto ffx=upscaler.JitterOffset(i),local=NativeFsrJitterOffset(i,upscaler.JitterPhaseCount());
+      Check(Near(ffx[0],local[0],1e-6f) && Near(ffx[1],local[1],1e-6f),"FFX 2x jitter offset "+std::to_string(i));
+    }
+    NativeBackendTextureDesc color_desc{};
+    color_desc.width=color_desc.height=extent; color_desc.format=DXGI_FORMAT_R16G16B16A16_FLOAT; color_desc.render_target=true;
+    const auto color=backend->CreateRenderTarget(color_desc);
+    NativeBackendTextureDesc resolved_desc{};
+    resolved_desc.width=resolved_desc.height=extent; resolved_desc.format=DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const auto resolved=backend->CreateTexture(resolved_desc,{});
+    // The opaque copy is a whole copy of the scene target: its size here.
+    const auto opaque=backend->CreateTexture(resolved_desc,{});
+    NativeBackendTextureDesc depth_desc{};
+    depth_desc.width=depth_desc.height=extent; depth_desc.format=DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    depth_desc.depth=true; depth_desc.render_target=true; depth_desc.sampled=true; depth_desc.clear_depth=0;
+    const auto depth=backend->CreateRenderTarget(depth_desc);
+    NativeBackendRenderTarget* colors[]{color.get()};
+    // The display viewport, as the guest describes it, mapped into the corner
+    // (or the render size itself when the targets are that size).
+    const auto viewport=extent==kDisplay?ScaleNativeViewport({0,0,float(kDisplay),float(kDisplay),0,1},scale):
+      NativeBackendViewport{0,0,float(render.width),float(render.height),0,1};
+    Check(viewport.width==float(render.width) && viewport.height==float(render.height),"the mapped viewport is the render size");
+    for(uint32_t frame=0;frame<kFrames;++frame) {
+      const auto jitter=MakeNativeFsrJitter(upscaler.JitterOffset(int32_t(frame)),render.width,render.height);
+      backend->BeginFrame();
+      auto& recorder=backend->Recorder();
+      recorder.SetRenderTargets(colors,depth.get());
+      recorder.SetViewport(viewport);
+      recorder.ClearColor(*color,{0,0,0,1});
+      recorder.ClearDepthStencil(*depth,true,true,0.0f,0);
+      recorder.SetPipeline(pipeline);
+      const std::array<float,4> offset{jitter.clip_x,jitter.clip_y,0,0};
+      recorder.SetConstants(NativeBackendStage::Vertex,0,Raw(offset));
+      recorder.SetConstants(NativeBackendStage::Pixel,0,Raw(white));
+      recorder.SetVertexBuffer(0,*triangle,12,0);
+      recorder.Draw(3,0);
+      recorder.ResolveTarget(*resolved,*color);
+      NativeFsrDispatchInputs inputs;
+      inputs.color=resolved.get(); inputs.depth=depth.get(); inputs.opaque=false;
+      inputs.jitter=jitter; inputs.motion_scale={float(render.width),float(render.height)};
+      inputs.sharpness=0; inputs.frame_ms=16.6667f; inputs.reset=frame==0;
+      inputs.camera.near_plane=0.5f; inputs.camera.far_plane=5000; inputs.camera.fov_y=1; inputs.camera.derived=true;
+      try { upscaler.Dispatch(*backend,recorder,inputs); }
+      catch(const std::exception& failure) {
+        backend->Submit();
+        for(const auto& message:DrainNativeFsrMessages()) std::cout << "  FidelityFX: " << message << '\n';
+        Check(false,std::string("FSR upscale dispatch threw: ")+failure.what());
+        ok=false; return {};
+      }
+      backend->Submit();
+      if(frame==0 && first) {
+        const auto whole=Luma(backend->ReadTexture(*resolved),extent);
+        first->assign(size_t(render.width)*render.height,0);
+        for(uint32_t y=0;y<render.height;++y) for(uint32_t x=0;x<render.width;++x) (*first)[y*render.width+x]=whole[y*extent+x];
+      }
+    }
+    auto output=Luma(backend->ReadTexture(*upscaler.output()),kDisplay);
+    for(const auto& message:DrainNativeFsrMessages()) std::cout << "  FidelityFX: " << message << '\n';
+    return output;
+  };
+  const auto corner=run(kDisplay,&aliased);
+  if(!ok) return;
+  std::vector<float> plain_aliased;
+  const auto plain=run(render.width,&plain_aliased);
+  if(!ok) return;
+  Check(aliased==plain_aliased,"the corner and the render-size target rasterized differently");
+  double max_difference=0;
+  for(size_t i=0;i<corner.size();++i) max_difference=(std::max)(max_difference,double(std::abs(corner[i]-plain[i])));
+  Check(max_difference<1e-3,"the corner scheme's output differs from FSR over render-size resources (max "+
+        std::to_string(max_difference)+")");
+  // Error against the exact coverage at display pixels; the aliased
+  // reference is the first frame stretched to the display (nearest).
+  double fsr_error=0,stretched_error=0;
+  uint32_t finite=0,lit=0,covered_area=0;
+  for(uint32_t y=0;y<kDisplay;++y) for(uint32_t x=0;x<kDisplay;++x) {
+    const float value=corner[y*kDisplay+x];
+    finite+=std::isfinite(value);
+    lit+=value>0.5f;
+    covered_area+=Inside(x+0.5f,y+0.5f);
+    uint32_t covered=0;
+    for(uint32_t sy=0;sy<16;++sy) for(uint32_t sx=0;sx<16;++sx) covered+=Inside(x+(sx+0.5f)/16,y+(sy+0.5f)/16);
+    const float coverage=covered/256.f;
+    const float stretched=aliased[(y*render.height/kDisplay)*render.width+x*render.width/kDisplay];
+    fsr_error+=std::abs(value-coverage); stretched_error+=std::abs(stretched-coverage);
+  }
+  fsr_error/=double(kDisplay)*kDisplay; stretched_error/=double(kDisplay)*kDisplay;
+  Check(finite==kDisplay*kDisplay,"the upscaled output has non-finite pixels");
+  // A corner-only output (the render rectangle not upscaled) would light
+  // about a quarter of the triangle's display-size area.
+  Check(std::abs(double(lit)-covered_area)<0.15*covered_area,"the upscaled output does not cover the triangle at display size (lit "+
+        std::to_string(lit)+" of "+std::to_string(covered_area)+")");
+  Check(fsr_error<stretched_error,"the upscaled output is no closer to the coverage than the stretched aliased frame ("+
+        std::to_string(fsr_error)+" vs "+std::to_string(stretched_error)+")");
+  const auto messages=backend->DrainValidationMessages();
+  for(const auto& message:messages) std::cerr << "  validation: " << message << '\n';
+  Check(messages.empty(),"the debug layer reported "+std::to_string(messages.size())+" message(s) around the upscale dispatch");
+  std::cout << "FSR upscale dispatch (" << wanted << ", WARP, " << render.width << "x" << render.height << " -> "
+            << kDisplay << "x" << kDisplay << "): corner of display-size targets vs render-size targets max |diff| "
+            << max_difference << "; mean |error| vs coverage " << fsr_error << " (stretched aliased " << stretched_error
+            << "), lit " << lit << " of " << covered_area << '\n';
+}
 }  // namespace
 
 int main() {
@@ -470,12 +769,17 @@ int main() {
   });
   try {
     TestModes();
+    TestUpscaleSizes();
+    TestRenderScale();
+    TestMipBiasFiltering();
+    TestRenderRequest();
     TestJitterSequence();
     TestJitterProjection();
     TestCameraParams();
     TestMotionPlan();
     TestResetRules();
     TestFfxDispatch();
+    TestFfxUpscaleDispatch();
   } catch(const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
     return 1;

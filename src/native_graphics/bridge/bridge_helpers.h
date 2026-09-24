@@ -234,8 +234,19 @@ extern thread_local std::shared_ptr<const NativeSceneAdapter::WorldAnimations> n
 extern thread_local constinit uint32_t native_scene_animation_owner;
 extern thread_local constinit std::optional<NativeScenePassCamera> native_scene_draw_camera;
 extern thread_local constinit NativeFsrJitter native_scene_view_jitter;
+// FSR upscaling's texture mip LOD bias for the 3D scene's materials (1/32
+// steps, NativeFsrMipBiasSteps), set for an upscaling view's passes and 0
+// otherwise (off and native AA never set it).
+extern thread_local constinit int32_t native_scene_mip_bias_steps;
 inline const NativeScenePassCamera& NativeSceneDrawCamera() {
   return native_scene_draw_camera?*native_scene_draw_camera:*native_scene_pass_camera;
+}
+// The filtering value the scene passes' material samplers resolve with
+// (models, static world, sky, effects): edf_native_anisotropic_filtering, with
+// the view's mip bias when upscaling (NativeFilteringWithMipBias). Not the HUD,
+// UI or post: those read the cvar themselves.
+inline int NativeSceneMaterialFiltering() {
+  return NativeFilteringWithMipBias(REXCVAR_GET(edf_native_anisotropic_filtering),native_scene_mip_bias_steps);
 }
 bool ArmNativeFsrFrameLocked(Bridge& state,uint32_t renderer,NativeScene& scene,uint64_t helper_frame);
 void DisarmNativeFsrLocked(Bridge& state);

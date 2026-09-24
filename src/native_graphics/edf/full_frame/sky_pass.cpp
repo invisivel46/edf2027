@@ -230,7 +230,7 @@ class NativeFullFrameSkyPass final : public edf::native::NativeFramePass {
       if(state.active_scene!=context.renderer || state.scene_backend!=backend || !(ActiveTargetsLocked(state)==targets))
         return refuse("scene targets changed during the pose walk");
       auto before=base.render;
-      const int filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
+      const int filtering=NativeSceneMaterialFiltering();  // with FSR upscaling's mip bias
       const NativeSceneCpuWindow window(reader_);  // Valid for this hold only.
       // Each draw declines alone (one decline each, with its reason): the
       // guest activates and draws every sky pass on its own, so one pass

@@ -303,6 +303,17 @@ struct NativeFsrBridgeState {
   NativeFsrJitter jitter;
   NativeFsrCameraParams camera;       // from the unjittered pass camera
   NativeMotionVectorOutput motion;    // workstream B's, for the last view
+  // The armed frame's sizes: render (what the scene is drawn at) and display
+  // (the scene targets', the output's). Equal for native AA; smaller render
+  // for an upscaling mode (NativeFsrRenderSizeFor).
+  NativeRenderScale scale;
+  // While an upscaling view records (BeginView to EndView): the mapping
+  // RecordDrawSetup applies to draws into the scene. Inactive otherwise.
+  NativeRenderScale view_scale;
+  // A dispatch failed while upscaling: the scaled scene had no upscale, so
+  // the modes fall back to drawing at the output size until the mode changes.
+  bool upscale_disabled=false;
+  std::string runtime_error;  // what NativeFsrRuntimeError was last given
   std::chrono::steady_clock::time_point last_dispatch{};
   uint64_t armed=0,dispatched=0,dropped=0,failures=0,history_resets=0;
 };

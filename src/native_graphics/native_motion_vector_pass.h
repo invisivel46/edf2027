@@ -96,9 +96,10 @@ class NativeMotionVectors {
   // the history-valid mask (green where the previous position is on screen
   // and history is valid, red elsewhere), drawn over the whole of `output`
   // (any size: the motion is point-sampled at the scaled position). Records
-  // nothing without a motion texture.
+  // nothing without a motion texture. `extent`, when set, is the part of the
+  // motion target the frame used (FSR upscaling's render-size corner).
   void RecordDebug(NativeRenderBackend& backend,NativeBackendRecorder& recorder,NativeBackendRenderTarget& output,
-    uint32_t output_format,int mode,const NativeMotionVectorOutput& motion);
+    uint32_t output_format,int mode,const NativeMotionVectorOutput& motion,std::array<uint32_t,2> extent={});
   // Forget every scene's history (the next record of each resets).
   void Reset() { history_.Reset(); }
 

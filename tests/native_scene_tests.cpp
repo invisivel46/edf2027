@@ -3627,6 +3627,27 @@ void Run(std::shared_ptr<NativeRenderBackend> backend,bool column_major) {
       if(x) Require(at(right,x,y,channel)==at(base,x-1,y,channel),"a one-pixel x clip jitter did not move the image one pixel right");
       if(y) Require(at(down,x,y,channel)==at(base,x,y-1,channel),"a one-pixel y clip jitter did not move the image one pixel down");
     }
+    // FSR upscaling's render scale (NativeSceneRenderer::SetRenderScale): the
+    // view (keyed and passed as the whole 64x32 target) records into the
+    // top-left 32x16 corner, the rest of the target untouched; an identity or
+    // cleared scale records the unscaled image exactly.
+    Require(!renderer.render_scale().active(),"the renderer starts scaled");
+    renderer.SetRenderScale({64,32,64,32}); render(*initial);
+    Require(pixels==base,"an identity render scale changed the recorded image");
+    renderer.SetRenderScale({32,16,64,32}); render(*initial);
+    const auto corner=pixels;
+    renderer.SetRenderScale({}); render(*initial);
+    Require(pixels==base,"clearing the render scale did not restore the image");
+    uint32_t base_lit=0,corner_lit=0,outside_lit=0;
+    for(uint32_t y=0;y<32;++y) for(uint32_t x=0;x<64;++x) {
+      const bool lit=at(base,x,y,0) || at(base,x,y,1) || at(base,x,y,2);
+      const bool scaled=at(corner,x,y,0) || at(corner,x,y,1) || at(corner,x,y,2);
+      base_lit+=lit;
+      if(x<32 && y<16) corner_lit+=scaled; else outside_lit+=scaled;
+    }
+    Require(outside_lit==0,"a scaled view drew outside its render rectangle");
+    Require(base_lit>0 && corner_lit*4>=base_lit/2 && corner_lit*4<=base_lit*2,
+      ("the scaled view is not the image at half size ("+std::to_string(corner_lit)+" of "+std::to_string(base_lit)+" pixels)").c_str());
   }
   NativeSceneAdapter adapter;
   Require(!adapter.PreviousGroupMaterial(500),"empty material history returned an asset");

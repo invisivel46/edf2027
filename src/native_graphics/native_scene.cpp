@@ -236,7 +236,10 @@ void NativeSceneRenderer::Record(NativeRenderBackend& backend,size_t count,const
     NativeSceneRenderStatistics& statistics) {
   auto& recorder=backend.Recorder();
   recorder.SetWorldInstancing(false);
-  recorder.SetViewport(view.viewport); recorder.SetScissor(view.scissor,view.scissor_enabled);
+  if(render_scale_.active()) {
+    recorder.SetViewport(ScaleNativeViewport(view.viewport,render_scale_));
+    recorder.SetScissor(ScaleNativeScissor(view.scissor,render_scale_),view.scissor_enabled);
+  } else { recorder.SetViewport(view.viewport); recorder.SetScissor(view.scissor,view.scissor_enabled); }
   // The clip-space matrices the draws record with: the view's, or with the
   // FSR jitter folded in (SetClipJitter). Culling used the unjittered vp.
   const NativeSceneMatrix* projection=&view.projection;

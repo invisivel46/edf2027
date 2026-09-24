@@ -471,7 +471,7 @@ class Edf2017App : public rex::ReXApp {
 #if defined(_WIN32)
     hooks.fsr_unavailable = []() -> std::string {
       const auto& library = edf::native::NativeFsrLibrary();
-      return library.available() ? std::string() : library.error();
+      return library.available() ? edf::native::NativeFsrRuntimeError() : library.error();
     };
 #endif
     auto* dlg = new edf::SettingsDialog(imgui_drawer(), config_path_, std::move(hooks), by_pad);
