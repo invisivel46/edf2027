@@ -1,0 +1,39 @@
+# Scenario: collapse. Campaign mission 1 "Arrival" (M202, Map01 City 1) through
+# the seeded route (make-edf-save.py --mission 1 --armour 1000000: 1200200
+# stamina, the default loadout: AF14, then the Stingray M1 rocket launcher).
+# Exercises: one building brought down by rockets with the camera still on it,
+# the render thread's effect load of a collapse (dust, smoke, debris: several
+# hundred effect items) against the windows before and after it, for
+# frame.native.transparent, effect_items and the lock slices
+# (docs/sim-parallel-analysis 4.5 Run B). The control scenario
+# (native-scenario-collapse-control-input.txt) is this route with the turn
+# replaced by a look up at the sky, so the same rockets hit nothing.
+# Marker of a collapse in the log: "Native full frame effects: unsupported class
+# clBrokenObject" (a building's falling model) and a
+# "Native scene geometry preload: ... loaded=" increment (its rubble).
+clock game
+# Menu route with a seeded save, as tools/native-scenario-soak-input.txt.
+20000 1000 0010
+25000 1000 0010
+30000 1000 1000
+35000 1000 1000
+40000 1000 1000
+45000 1000 1000
+50000 1000 1000
+55000 1000 1000
+60000 1000 1000
+# Gameplay from ~122-130 s. Window A 140-160 s: idle at the spawn view.
+# 160 s: turn right about 65 degrees (a full right stick turns about 100 degrees
+# in 1162 ms, native-scenario-soak-input.txt), facing the brown office block on
+# the near corner of the crossing; 163 s: RB switches to the Stingray.
+160000 745 0000 0 0 0 0 32767 0
+163000 250 0200
+# Window B 165-185 s: the camera still on the building.
+# Window C 185-215 s: a rocket every 3 s for 15 s (the Stingray M1 holds two
+# rockets, 002/002 on the HUD), the collapse and its dust.
+185000 300 0000 0 255 0 0 0 0
+188000 300 0000 0 255 0 0 0 0
+191000 300 0000 0 255 0 0 0 0
+194000 300 0000 0 255 0 0 0 0
+197000 300 0000 0 255 0 0 0 0
+# Window D 215-245 s: recovery, no input. After 245 s the run just idles.

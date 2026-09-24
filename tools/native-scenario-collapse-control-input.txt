@@ -1,0 +1,26 @@
+# Scenario: collapse-control. The collapse route (native-scenario-collapse-input.txt;
+# campaign mission 1 "Arrival", M202, seeded with make-edf-save.py --mission 1
+# --armour 1000000) with the 90-degree turn replaced by a look up at the sky:
+# the same weapon switch and the same five rockets at the same times, which
+# hit no building. The windows B, C and D compare against the collapse's.
+clock game
+# Menu route with a seeded save, as tools/native-scenario-soak-input.txt.
+20000 1000 0010
+25000 1000 0010
+30000 1000 1000
+35000 1000 1000
+40000 1000 1000
+45000 1000 1000
+50000 1000 1000
+55000 1000 1000
+60000 1000 1000
+# Window A 140-160 s: idle at the spawn view. 160 s: look up (as the soak
+# route's 290 ms full up stick, about 25 degrees). 163 s: RB, the Stingray.
+160000 290 0000 0 0 0 0 0 32767
+163000 250 0200
+# Window C 185-215 s: the same five rockets, into the sky.
+185000 300 0000 0 255 0 0 0 0
+188000 300 0000 0 255 0 0 0 0
+191000 300 0000 0 255 0 0 0 0
+194000 300 0000 0 255 0 0 0 0
+197000 300 0000 0 255 0 0 0 0

@@ -47,6 +47,22 @@
       "capture_start": 12000,
       "seconds": {"ab": 540, "unlocked": 720, "soak-ab": 1950, "soak-unlocked": 1950}
     },
+    "collapse": {
+      "description": "Mission 1 Arrival (M202, Map01 City 1) through the seeded route: turn to the buildings beside the street and bring one down with Stingray rockets (window C 185-215 s of game time): the render thread's effect load of a collapse",
+      "input": "tools/native-scenario-collapse-input.txt",
+      "seed": ["--mission", "1", "--armour", "1000000"],
+      "mission": "M202",
+      "capture_start": 7800,
+      "seconds": {"ab": 300, "unlocked": 300, "soak-ab": 300, "soak-unlocked": 300}
+    },
+    "collapse-control": {
+      "description": "The collapse route on Mission 1 Arrival (M202) with the turn replaced by a look up: the same rockets at the same times into the sky, no building hit",
+      "input": "tools/native-scenario-collapse-control-input.txt",
+      "seed": ["--mission", "1", "--armour", "1000000"],
+      "mission": "M202",
+      "capture_start": 7800,
+      "seconds": {"ab": 300, "unlocked": 300, "soak-ab": 300, "soak-unlocked": 300}
+    },
     "soak": {
       "description": "Mission 1 Arrival (M202) through the seeded route with 1200200 stamina: 30 minutes of gameplay",
       "input": "tools/native-scenario-soak-input.txt",
