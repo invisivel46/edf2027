@@ -84,7 +84,10 @@ because the renderer needs Direct3D 12.
    folder containing `default.xex`), use **Select extracted game folder…**
    instead.
 3. The game boots straight into the title screen. Press **Start** twice (Enter
-   on the keyboard). The first press skips the intro.
+   on the keyboard). The first press skips the intro. On the first run of a new
+   version, a small "Preparing shaders" panel in the bottom-right corner counts
+   the game's shaders as they compile in the background (about a second on a
+   desktop CPU). The game does not wait for it, and later runs skip it.
 4. Press **F1** at any time for the settings.
 
 The config file is `%APPDATA%\edf2027\edf2027.toml`, and the extracted game is
