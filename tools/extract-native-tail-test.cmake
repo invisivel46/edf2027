@@ -76,7 +76,7 @@ endforeach()
 # The hooks exercised below, from the files they are in: the buffer providers and locks, the declaration and shader
 # binding setters and the physical frees (edf/hooks/buffers.cpp, draw.cpp and models.cpp once split out).
 set(bridge "")
-foreach(hook_file edf/hooks/buffers.cpp guest_shader_bridge.cpp edf/hooks/models.cpp)
+foreach(hook_file edf/hooks/buffers.cpp edf/hooks/draw.cpp edf/hooks/models.cpp)
     file(READ "${SOURCE_DIR}/src/native_graphics/${hook_file}" hook_text)
     string(APPEND bridge "${hook_text}\n")
 endforeach()
