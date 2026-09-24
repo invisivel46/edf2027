@@ -88,7 +88,7 @@ class NativeFullFrameModelsPass final : public edf::native::NativeFramePass {
     camera.animation=NativeFullFrameAnimation(context.inputs);
     NativeFullFrameModelPass pass;
     pass.palette_limit=NativeFullFramePaletteLimit(reader_);
-    pass.filtering=REXCVAR_GET(edf_native_anisotropic_filtering);
+    pass.filtering=NativeSceneMaterialFiltering();  // with FSR upscaling's mip bias
     pass.motion=context.inputs.motion;
     // The guest's slot-4 order (its gather walk over the owner+44 managers)
     // and the pool carry's inputs. Without the order every entry is taken as

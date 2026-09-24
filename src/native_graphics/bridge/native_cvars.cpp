@@ -124,7 +124,7 @@ inline REXCVAR_DEFINE_INT32(edf_native_msaa, 0, "EDF2027",
 inline REXCVAR_DEFINE_BOOL(edf_native_scene_depth_srv, false, "EDF2027",
                    "Create a single-sampled native scene depth shader-readable (typeless, with a depth SRV) for FSR; ignored with MSAA (restart required)");
 inline REXCVAR_DEFINE_STRING(edf_native_fsr, "off", "EDF2027",
-                     "FSR 3.1 on the native full-frame scene (native_fsr.h): off, or native_aa (1.0x temporal anti-aliasing); quality, balanced, performance and ultra_performance are accepted and run as native_aa until render scaling exists. On at startup it forces 1x scene MSAA and the sampled scene depth (edf_native_msaa, edf_native_scene_depth_srv; restart-time), so turning it on later needs a restart unless those already hold. Off while edf_native_ab_alternate, edf_native_reuse_off_alternate or edf_native_shadow_render is set");
+                     "FSR 3.1 on the native full-frame scene (native_fsr.h): off; native_aa (1.0x temporal anti-aliasing); quality, balanced, performance or ultra_performance (the 3D scene drawn at 1/1.5, 1/1.7, 1/2 or 1/3 of the output per axis and upscaled; the output is then the window's size and edf_native_render_width/height are not used). On at startup it forces 1x scene MSAA and the sampled scene depth (edf_native_msaa, edf_native_scene_depth_srv; restart-time), so turning it on later needs a restart unless those already hold. Off while edf_native_ab_alternate, edf_native_reuse_off_alternate or edf_native_shadow_render is set");
 inline REXCVAR_DEFINE_DOUBLE(edf_native_fsr_sharpness, 0.2, "EDF2027",
                      "FSR sharpening (RCAS) strength, 0 (off) to 1").range(0.0,1.0);
 inline REXCVAR_DEFINE_BOOL(edf_native_motion_vectors, false, "EDF2027",
