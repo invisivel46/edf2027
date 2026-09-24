@@ -54,6 +54,34 @@ uint32_t NativeFsrQualityMode(NativeFsrMode mode) {
     default: return FFX_UPSCALE_QUALITY_MODE_NATIVEAA;
   }
 }
+float NativeFsrUpscaleRatio(NativeFsrMode mode) {
+  // ffxFsr3GetUpscaleRatioFromQualityMode.
+  switch(mode) {
+    case NativeFsrMode::Quality: return 1.5f;
+    case NativeFsrMode::Balanced: return 1.7f;
+    case NativeFsrMode::Performance: return 2.0f;
+    case NativeFsrMode::UltraPerformance: return 3.0f;
+    default: return 1.0f;
+  }
+}
+NativeFsrRenderSize NativeFsrRenderSizeFor(NativeFsrMode mode,uint32_t display_width,uint32_t display_height) {
+  // ffxFsr3GetRenderResolutionFromQualityMode: (uint32_t)((float)display / ratio).
+  const float ratio=NativeFsrUpscaleRatio(mode);
+  const auto scale=[&](uint32_t extent) {
+    if(!extent) return 0u;
+    return (std::max)(1u,uint32_t(float(extent)/ratio));
+  };
+  return {scale(display_width),scale(display_height)};
+}
+float NativeFsrMipBias(uint32_t render_width,uint32_t display_width) {
+  if(!render_width || !display_width || render_width>=display_width) return 0.0f;
+  return std::log2(float(render_width)/float(display_width))-1.0f;
+}
+int32_t NativeFsrMipBiasSteps(uint32_t render_width,uint32_t display_width) {
+  // The guest's LOD bias field is 10-bit signed in 1/32 (DecodeNativeGuestSampler).
+  const float bias=NativeFsrMipBias(render_width,display_width);
+  return std::clamp(int32_t(std::lround(bias*32.0f)),-512,511);
+}
 const char* NativeFsrExcludedBy(const NativeFsrExclusions& exclusions) {
   if(exclusions.ab_alternate) return "edf_native_ab_alternate";
   if(exclusions.reuse_off_alternate) return "edf_native_reuse_off_alternate";
@@ -181,6 +209,18 @@ std::vector<std::string> DrainNativeFsrMessages() {
   out.swap(Messages());
   return out;
 }
+namespace {
+std::mutex& RuntimeErrorMutex() { static std::mutex mutex; return mutex; }
+std::string& RuntimeError() { static std::string error; return error; }
+}  // namespace
+void SetNativeFsrRuntimeError(std::string error) {
+  std::lock_guard lock(RuntimeErrorMutex());
+  RuntimeError()=std::move(error);
+}
+std::string NativeFsrRuntimeError() {
+  std::lock_guard lock(RuntimeErrorMutex());
+  return RuntimeError();
+}
 NativeFfxLibrary& NativeFsrLibrary() {
   // Never unloaded: upscalers owned by other statics destroy their contexts
   // through it at exit, whatever order the statics go in.
@@ -206,11 +246,11 @@ void NativeFsrUpscaler::Release() {
   Destroy(context_);
   context_=nullptr;
   output_.reset(); reactive_.reset(); opaque_.reset(); zero_motion_.reset();
-  backend_=nullptr; width_=height_=format_=0;
+  backend_=nullptr; width_=height_=display_width_=display_height_=format_=0;
 }
 
-bool NativeFsrUpscaler::Prepare(NativeRenderBackend& backend,uint32_t width,uint32_t height,uint32_t color_format,
-                                std::string* error) {
+bool NativeFsrUpscaler::Prepare(NativeRenderBackend& backend,uint32_t width,uint32_t height,
+                                uint32_t display_width,uint32_t display_height,uint32_t color_format,std::string* error) {
   recreated_=false;
   // Contexts replaced earlier are destroyed once their frames are long done.
   for(auto& retired:retired_) if(retired.frames) --retired.frames;
@@ -221,10 +261,12 @@ bool NativeFsrUpscaler::Prepare(NativeRenderBackend& backend,uint32_t width,uint
     it=retired_.erase(it);
   }
   const auto fail=[&](std::string why) { if(error) *error=std::move(why); return false; };
-  if(context_ && backend_==&backend && width_==width && height_==height && format_==color_format) return true;
+  if(context_ && backend_==&backend && width_==width && height_==height && display_width_==display_width &&
+     display_height_==display_height && format_==color_format) return true;
   auto* raw=backend.D3D12Raw();
   if(!raw) return fail("the scene backend "+std::string(backend.name())+" has no D3D12 raw access");
-  if(!width || !height) return fail("empty scene");
+  if(!width || !height || !display_width || !display_height) return fail("empty scene");
+  if(width>display_width || height>display_height) return fail("render size above the display size");
   auto& library=NativeFsrLibrary();
   if(!library.available()) return fail(library.error());
   if(!library.upscaler_available(raw->Device())) return fail("the FidelityFX DLL offers no upscaler");
@@ -245,7 +287,7 @@ bool NativeFsrUpscaler::Prepare(NativeRenderBackend& backend,uint32_t width,uint
   create.header.pNext=&backend_desc.header;
   create.flags=FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE|FFX_UPSCALE_ENABLE_DEPTH_INVERTED|FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
   create.maxRenderSize={width,height};
-  create.maxUpscaleSize={width,height};
+  create.maxUpscaleSize={display_width,display_height};
   create.fpMessage=&OnFfxMessage;
   ffxOverrideVersion version{};
   if(version_override_) {
@@ -257,6 +299,7 @@ bool NativeFsrUpscaler::Prepare(NativeRenderBackend& backend,uint32_t width,uint
   if(const auto code=ffx.CreateContext(&context,&create.header,nullptr);code!=FFX_API_RETURN_OK || !context)
     return fail("ffxCreateContext(upscale) returned "+std::to_string(code));
   context_=context; backend_=&backend; width_=width; height_=height; format_=color_format;
+  display_width_=display_width; display_height_=display_height;
   ++stats_.contexts; recreated_=true;
   provider_.clear();
   {
@@ -271,29 +314,30 @@ bool NativeFsrUpscaler::Prepare(NativeRenderBackend& backend,uint32_t width,uint
     query.gpuMemoryUsageUpscaler=&usage;
     stats_.context_bytes=ffx.Query(&context,&query.header)==FFX_API_RETURN_OK?usage.totalUsageInBytes:0;
   }
-  // The jitter sequence, from the context (native AA: render = display).
+  // The jitter sequence, from the context: 8 * (display / render)^2 phases.
   int32_t phases=0;
   ffxQueryDescUpscaleGetJitterPhaseCount count{};
   count.header.type=FFX_API_QUERY_DESC_TYPE_UPSCALE_GETJITTERPHASECOUNT;
-  count.renderWidth=width; count.displayWidth=width; count.pOutPhaseCount=&phases;
+  count.renderWidth=width; count.displayWidth=display_width; count.pOutPhaseCount=&phases;
   jitter_from_ffx_=ffx.Query(&context,&count.header)==FFX_API_RETURN_OK && phases>0;
-  phase_count_=jitter_from_ffx_?phases:NativeFsrJitterPhaseCount(width,width);
+  phase_count_=jitter_from_ffx_?phases:NativeFsrJitterPhaseCount(width,display_width);
   // Resources: output (display size, RGBA16F, UAV: the post's input), the
-  // reactive mask (R8, UAV), the opaque-only copy (colour format) and a zero
-  // motion field (RG16F) for when there are no motion vectors.
-  const auto texture=[&](uint32_t format,bool uav,std::span<const uint8_t> initial) {
+  // reactive mask (R8, UAV, render size), the opaque-only copy (the scene
+  // target's colour format and whole size: a plain copy of it) and a zero
+  // motion field (RG16F, render size) for when there are no motion vectors.
+  const auto texture=[&](uint32_t w,uint32_t h,uint32_t format,bool uav,std::span<const uint8_t> initial) {
     NativeBackendTextureDesc desc{};
-    desc.width=width; desc.height=height; desc.levels=1; desc.format=format; desc.unordered_access=uav;
+    desc.width=w; desc.height=h; desc.levels=1; desc.format=format; desc.unordered_access=uav;
     auto created=backend.CreateTexture(desc,initial);
     if(!created) throw std::runtime_error("FSR texture creation failed");
     return created;
   };
   try {
-    output_=texture(DXGI_FORMAT_R16G16B16A16_FLOAT,true,{});
-    reactive_=texture(DXGI_FORMAT_R8_UNORM,true,{});
-    opaque_=texture(color_format,false,{});
+    output_=texture(display_width,display_height,DXGI_FORMAT_R16G16B16A16_FLOAT,true,{});
+    reactive_=texture(width,height,DXGI_FORMAT_R8_UNORM,true,{});
+    opaque_=texture(display_width,display_height,color_format,false,{});
     const std::vector<uint8_t> zeros(size_t(width)*height*4,0);
-    zero_motion_=texture(DXGI_FORMAT_R16G16_FLOAT,false,zeros);
+    zero_motion_=texture(width,height,DXGI_FORMAT_R16G16_FLOAT,false,zeros);
   } catch(const std::exception& failure) {
     Release();
     return fail(failure.what());
@@ -363,7 +407,7 @@ void NativeFsrUpscaler::Dispatch(NativeRenderBackend& backend,NativeBackendRecor
     upscale.jitterOffset={inputs.jitter.pixel_x,inputs.jitter.pixel_y};
     upscale.motionVectorScale={inputs.motion_scale[0],inputs.motion_scale[1]};
     upscale.renderSize={width_,height_};
-    upscale.upscaleSize={width_,height_};
+    upscale.upscaleSize={display_width_,display_height_};
     upscale.enableSharpening=inputs.sharpness>0;
     upscale.sharpness=std::clamp(inputs.sharpness,0.0f,1.0f);
     upscale.frameTimeDelta=std::clamp(inputs.frame_ms,0.1f,200.0f);

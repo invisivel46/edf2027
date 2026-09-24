@@ -420,7 +420,7 @@ NativeMotionVectorOutput RecordNativeMotionVectors(NativeMotionVectors& state,co
   return output;
 }
 void NativeMotionVectors::RecordDebug(NativeRenderBackend& backend,NativeBackendRecorder& recorder,NativeBackendRenderTarget& output,
-    uint32_t output_format,int mode,const NativeMotionVectorOutput& motion) {
+    uint32_t output_format,int mode,const NativeMotionVectorOutput& motion,std::array<uint32_t,2> extent) {
   if(mode<1 || !motion.motion || !resources_ || backend_!=&backend || motion.motion!=resources_->target->texture()) return;
   auto& r=*resources_;
   auto& pipeline=r.debug[output_format];
@@ -435,7 +435,8 @@ void NativeMotionVectors::RecordDebug(NativeRenderBackend& backend,NativeBackend
     pipeline=&backend.CreatePipeline(desc);
   }
   DebugConstants constants;
-  constants.scale={float(r.width)/float(output.width()),float(r.height)/float(output.height()),float(r.width),float(r.height)};
+  const float width=float(extent[0]?extent[0]:r.width),height=float(extent[1]?extent[1]:r.height);
+  constants.scale={width/float(output.width()),height/float(output.height()),width,height};
   constants.mode={float(mode),motion.reset?1.f:0.f,0,0};
   NativeBackendRenderTarget* colors[]{&output};
   recorder.SetRenderTargets(colors,nullptr);

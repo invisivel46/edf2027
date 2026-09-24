@@ -121,6 +121,16 @@ inline NativeRenderSize ResolveNativeRenderSize(int32_t request_width,int32_t re
   return size;
 }
 
+// FSR upscaling (edf_native_fsr = quality .. ultra_performance, native_fsr.h)
+// defines the scene's render size itself, as a fraction of the output, so the
+// output - the size the engine is told, which its post chain, HUD and targets
+// take - is the window's: the render size request is replaced by "match
+// window" (0, -1). Off and native AA keep the request.
+inline std::array<int32_t,2> NativeRenderRequest(int32_t request_width,int32_t request_height,bool fsr_upscaling) {
+  if(fsr_upscaling) return {0,-1};
+  return {request_width,request_height};
+}
+
 // ---- Guest EDRAM budget for the device's own surfaces ---------------------------
 // 8213B850 (surface creation) fills a descriptor (8213B280) and then places the
 // surface in EDRAM. A caller that passes a placement in r7 (base, hi-z base, ..)

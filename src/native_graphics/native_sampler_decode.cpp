@@ -10,8 +10,15 @@ SamplerStateWords SamplerStateKey(SamplerStateWords words) {
   return words;
 }
 
-SamplerStateWords NativeFilteringKey(SamplerStateWords words, int override_mode) {
+SamplerStateWords NativeFilteringKey(SamplerStateWords words, int filtering) {
   words = SamplerStateKey(words);
+  if (const int steps = NativeFilteringMipBias(filtering)) {
+    int32_t bias = (words[2] >> 12) & 1023;
+    if (bias & 512) bias -= 1024;
+    bias = bias + steps < -512 ? -512 : bias + steps > 511 ? 511 : bias + steps;
+    words[2] = (words[2] & ~0x003ff000u) | ((uint32_t(bias) & 1023u) << 12);
+  }
+  const int override_mode = NativeFilteringMode(filtering);
   if (override_mode < 0 || override_mode > 5) return words;
   const auto min = (words[1] >> 21) & 3, mag = (words[1] >> 19) & 3;
   const auto mip = (words[1] >> 23) & 3;
