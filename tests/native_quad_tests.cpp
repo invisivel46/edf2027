@@ -1619,6 +1619,38 @@ float4 PS_Tex(U i):SV_TARGET { return m_Texture.Sample(m_Sampler,i.uv)*i.color; 
           catch(const std::runtime_error&) { refused=true; }
           Require(refused,"an expanded transient draw accepted a strip");
         }
+        // A bucketed effect draw (DrawTransientPrefix, edf_native_effect_mesh_buckets):
+        // a mesh built from zeros for 16 vertices, drawn over two quads'
+        // vertices with those 8 vertices' own index range, assembles the
+        // primitives of the exact 8-vertex mesh's transient draw; an index past
+        // the vertices given is refused.
+        {
+          const auto exact=generated_indices.Get(NativeIndexPattern::Quads,8);
+          const auto bucket=generated_indices.Get(NativeIndexPattern::Quads,16);
+          AssemblyRecorder reference,prefix;
+          const auto values=[](const std::shared_ptr<const NativeGeneratedIndices>& pattern) {
+            std::vector<uint32_t> out;
+            for(size_t at=0;at<pattern->bytes().size();at+=2) out.push_back((uint32_t(pattern->bytes()[at])<<8)|pattern->bytes()[at+1]);
+            return out;
+          };
+          reference.index_values=values(exact); prefix.index_values=values(bucket);
+          auto& exact_mesh=dynamic_meshes.Acquire(*backend,utility_vs.shader(),{71,72,73,13,0},
+            converted_declaration->bytes(),uint32_t(stride),two_quads,exact->bytes(),2,converted_declaration,exact,
+            {},{},{},{},0,{},&reference);
+          exact_mesh.DrawTransient(reference,two_quads,0,12);
+          const std::vector<uint8_t> zeros(two_quads.size()*2,0);
+          auto& bucket_mesh=dynamic_meshes.Acquire(*backend,utility_vs.shader(),{74,72,73,13,0},
+            converted_declaration->bytes(),uint32_t(stride),zeros,bucket->bytes(),2,converted_declaration,bucket,
+            {},{},{},{},0,{},&prefix);
+          bucket_mesh.DrawTransientPrefix(prefix,two_quads,0,12);
+          Require(reference.indexed_draws==1 && prefix.indexed_draws==1 && prefix.stride==reference.stride &&
+            reference.primitives.size()==4 && prefix.primitives==reference.primitives,
+            "a prefix draw of a bucketed mesh assembles different primitives than the exact mesh");
+          bool refused=false;
+          try { bucket_mesh.DrawTransientPrefix(prefix,two_quads,0,18); }
+          catch(const std::runtime_error&) { refused=true; }
+          Require(refused,"a prefix draw accepted an index past its vertices");
+        }
       }
       // Scene overlays have a real depth attachment, unlike ordinary output.
       // Exercise both clip-space variants with enabled depth testing, including

@@ -160,6 +160,8 @@ inline REXCVAR_DEFINE_BOOL(edf_native_transient_batching,true,"EDF2027",
                    "Record a UI/immediate list draw (XUI brush, font run, Utility 2D quad or line) as the continuation of the draw before it when the two differ only in their vertices; the Utility 2D path then records its quads non-indexed. Set false to record every draw as its own");
 inline REXCVAR_DEFINE_BOOL(edf_native_prepared_geometry,true,"EDF2027",
                    "Reuse prepared queued geometry after guarded snapshot validation");
+inline REXCVAR_DEFINE_BOOL(edf_native_effect_mesh_buckets,true,"EDF2027",
+                   "Record the full frame's effect draws (particles, ribbons, colour strips, grass blades) on immediate meshes built for a power-of-two vertex count (at least 64) and drawn over their first vertices with their own count's indices (the same vertices and primitives), so a particle count that changes every frame reuses one mesh per bucket instead of building a GPU buffer per new count; false keys one mesh per exact count");
 
 // Frame pacing, unlocked frame rate and threads.
 // The experimental unlocked render loop, its interpolation, waits and the engine/render-helper thread QoS.

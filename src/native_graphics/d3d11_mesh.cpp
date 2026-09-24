@@ -272,11 +272,17 @@ std::vector<uint8_t> NativeVertexBuffer::ConvertVertices(std::span<const uint8_t
 void NativeVertexBuffer::ConvertVerticesInto(std::span<const uint8_t> vertices,std::vector<uint8_t>& native_vertices) const {
   if(vertices.size()!=size_t(vertex_count_)*guest_stride_)
     throw std::runtime_error("native mesh vertex update size mismatch");
+  ConvertVertexPrefixInto(vertices,vertex_count_,native_vertices);
+}
+void NativeVertexBuffer::ConvertVertexPrefixInto(std::span<const uint8_t> vertices,uint32_t vertex_count,
+                                                 std::vector<uint8_t>& native_vertices) const {
+  if(vertex_count>vertex_count_ || vertices.size()!=size_t(vertex_count)*guest_stride_)
+    throw std::runtime_error("native mesh vertex prefix size mismatch");
   const auto native_stride=stride_;
-  const size_t native_size=size_t(vertex_count_)*native_stride;
+  const size_t native_size=size_t(vertex_count)*native_stride;
   if (native_size>128*1024*1024) throw std::runtime_error("expanded native mesh exceeds size limit");
   native_vertices.assign(native_size,0);
-  for (size_t vertex=0;vertex<vertex_count_;++vertex) for (const auto& attribute:attributes_) {
+  for (size_t vertex=0;vertex<vertex_count;++vertex) for (const auto& attribute:attributes_) {
     const auto source=vertex*guest_stride_+attribute.guest_offset;
     const auto target=vertex*native_stride+attribute.host_offset;
     for (UINT c=0;c<attribute.components;++c) {
@@ -472,6 +478,29 @@ bool NativeIndexedMesh::DrawTransientExpanded(NativeBackendRecorder& recorder,co
   recorder.SetTopology(topology);
   recorder.Draw(count,0);
   return true;
+}
+void NativeIndexedMesh::DrawTransientPrefix(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
+                                            uint32_t first,uint32_t count) const {
+  ValidateDraw(first,count,0);
+  const auto& storage=*vertex_storage_;
+  if(!storage.dynamic_vertices_)
+    throw std::runtime_error("transient vertices are for a dynamic mesh; an immutable one draws its own buffer");
+  if(!storage.guest_stride_ || guest_vertices.size()%storage.guest_stride_)
+    throw std::runtime_error("native mesh prefix vertices are not whole vertices");
+  const auto vertices=uint32_t(guest_vertices.size()/storage.guest_stride_);
+  // Every index drawn names one of the vertices given, not only one of the
+  // mesh's: the rest of the mesh's extent has no vertices in this draw.
+  const auto& values=index_storage_->values_;
+  for(size_t i=first;i<size_t(first)+count;++i)
+    if(values[i]>=vertices) throw std::runtime_error("native mesh prefix index outside its vertices: index="+
+      std::to_string(values[i])+" vertices="+std::to_string(vertices));
+  static thread_local std::vector<uint8_t> converted;
+  storage.ConvertVertexPrefixInto(guest_vertices,vertices,converted);
+  recorder.SetTransientVerticesOwned(0,converted,stride_);
+  recorder.SetIndexBuffer(*index_storage_->storage_,
+    index_storage_->width_==2?NativeBackendIndexFormat::Uint16:NativeBackendIndexFormat::Uint32,0);
+  recorder.SetTopology(NativeBackendTopology::TriangleList);
+  recorder.DrawIndexed(count,first,0);
 }
 void NativeIndexedMesh::BindTransientAndDraw(NativeBackendRecorder& recorder,std::span<const uint8_t> guest_vertices,
                                              uint32_t first,uint32_t count,int32_t base,

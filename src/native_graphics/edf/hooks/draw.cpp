@@ -3351,7 +3351,18 @@ struct NativeSceneImmediateDraw {
   uint32_t declaration=0,element_count=0;
   std::shared_ptr<const NativeDeclaration> owned_declaration;
   uint32_t primitive=13,stride=0;
+  // edf_native_effect_mesh_buckets: the mesh is one built for the count's
+  // power-of-two bucket, drawn over these vertices (DrawTransientPrefix).
+  // Recorded draws only; the direct path keys the exact count.
+  bool bucketed=false;
 };
+// Zero bytes a bucketed immediate mesh is built from (its cached vertices are
+// never drawn: a recorded draw stages its own, DrawTransientPrefix).
+std::span<const uint8_t> NativeImmediateBucketBytes(size_t bytes) {
+  static thread_local std::vector<uint8_t> zeros;
+  if(zeros.size()<bytes) zeros.resize(bytes);
+  return {zeros.data(),bytes};
+}
 // Records the draw from vertices held in HOST memory, laid out as the guest
 // lays them out (big-endian words in declaration order): the DrawPrimitiveUP
 // hook passes the bytes it read at r6, the full-frame effect pass passes what
@@ -3365,13 +3376,22 @@ void RecordNativeSceneImmediate(Bridge& state,const Reader& reader,uint32_t devi
   if(!draw.stride || vertices.size()%draw.stride) throw std::runtime_error("native immediate vertices are not whole vertices");
   const auto count=uint32_t(vertices.size()/draw.stride);
   if(count<3 || count>16384 || (!strip && count%4)) throw std::runtime_error("unsupported native immediate vertex count");
-  const auto owned_indices=state.generated_indices.Get(strip?NativeIndexPattern::Strip:NativeIndexPattern::Quads,count);
+  // A bucketed draw's mesh is keyed and built for the bucket's count: the
+  // generated quad and strip indices over `count` vertices are the first
+  // index_count of the bucket's, so it draws the same primitives from the same
+  // vertices. One mesh then serves every count in the bucket, where a key per
+  // exact count built a mesh (and its GPU buffers) for each new particle count.
+  const bool bucketed=draw.bucketed && EDF_NATIVE_FLAG(seam_draws);
+  const uint32_t mesh_count=bucketed?std::max<uint32_t>(64,std::bit_ceil(count)):count;
+  const uint32_t index_count=strip?(count-2)*3:count/4*6;
+  const auto owned_indices=state.generated_indices.Get(strip?NativeIndexPattern::Strip:NativeIndexPattern::Quads,mesh_count);
   const auto indices=owned_indices->bytes();
+  const auto mesh_vertices=bucketed?NativeImmediateBucketBytes(size_t(mesh_count)*draw.stride):vertices;
   HookTiming acquire_timing(HookPhase::ImmediateAcquire);
   auto& mesh=state.immediate_meshes.Acquire(EnsureSceneBackendLocked(state),draw.vertex.shader(),
-    ImmediateStreamKey(vertices.size(),draw.declaration,draw.shaders.vertex,draw.primitive,draw.viewport.reverse_depth),
+    ImmediateStreamKey(mesh_vertices.size(),draw.declaration,draw.shaders.vertex,draw.primitive,draw.viewport.reverse_depth),
     {draw.owned_declaration->bytes().data(),draw.element_count*12},draw.stride,
-    vertices,indices,2,draw.owned_declaration,owned_indices,{},{},{},{},0,{},
+    mesh_vertices,indices,2,draw.owned_declaration,owned_indices,{},{},{},{},0,{},
     // Where this mesh's dynamic vertices are rewritten when the draw
     // is recorded; the immediate context does it otherwise.
     EDF_NATIVE_FLAG(seam_draws)?&SceneRecorderLocked(state):nullptr);
@@ -3386,13 +3406,14 @@ void RecordNativeSceneImmediate(Bridge& state,const Reader& reader,uint32_t devi
       mesh.input_layout().elements(),mesh.input_layout().fingerprint(),
       (uint64_t(draw.shaders.vertex)<<1)|uint64_t(draw.viewport.reverse_depth?1:0),draw.shaders.pixel,
       NativeBackendTopology::TriangleList});
-    mesh.DrawTransient(recorder,vertices,0,uint32_t(indices.size()/2));
+    if(bucketed) mesh.DrawTransientPrefix(recorder,vertices,0,index_count);
+    else mesh.DrawTransient(recorder,vertices,0,index_count);
   } else {
     BindActiveTarget(state);
     BindGuestRenderState(render->second,*state.context.Get(),reader,device,&state.bind_generation);
     draw.viewport.Bind(*state.context.Get());
     draw.vertex.Bind(*state.context.Get()); draw.pixel.Bind(*state.context.Get());
-    mesh.Draw(*state.context.Get(),0,uint32_t(indices.size()/2));
+    mesh.Draw(*state.context.Get(),0,index_count);
   }
 }
 }
@@ -3521,7 +3542,8 @@ void RecordNativeFullFrameEffectCallsLocked(Bridge& state,const GuestReader& rea
   for(const auto& [first,count]:NativeEffectDrawCalls(draw)) {
     const auto bytes=EncodeNativeEffectVertices(draw,first,count);
     RecordNativeSceneImmediate(state,reader,activation.device,{*activation.vertex,*activation.pixel,viewport,activation.render,
-      activation.shaders,activation.declaration_id,declaration->count(),declaration,draw.primitive(),draw.stride()},bytes);
+      activation.shaders,activation.declaration_id,declaration->count(),declaration,draw.primitive(),draw.stride(),
+      REXCVAR_GET(edf_native_effect_mesh_buckets)},bytes);
   }
 }
 // A run of adjacent draws that NativeEffectDrawsShareActivation is activated
