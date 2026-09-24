@@ -222,5 +222,78 @@ class InputScriptTests(unittest.TestCase):
         self.assertLess(enters[0] - 242600, 2000)
 
 
+CONSOLE_COMMANDS = {
+    # src/console/console.cpp (built-ins) and console_game.cpp (game commands).
+    'help', 'echo', 'mark', 'exec', 'wait', 'waitmission', 'at', 'alias', 'unalias', 'set', 'get', 'reset',
+    'cvarlist', 'clear', 'cheats', 'runners', 'stop', 'console', 'quit',
+    'spawn', 'killall', 'god', 'ammo', 'pos', 'teleport', 'destroy', 'effects', 'timescale', 'stats',
+}
+GAME_COMMANDS = {'spawn', 'killall', 'ammo', 'pos', 'teleport', 'destroy', 'effects'}
+
+
+def console_commands(text):
+    """tools-side copy of edf::console::ParseScript for scripts without quotes: one or more
+    ';'-separated commands per line, '//' or '#' starting a comment."""
+    commands = []
+    for line in text.splitlines():
+        for part in line.split(';'):
+            words = []
+            for word in part.split():
+                if word.startswith('#') or word.startswith('//'):
+                    break
+                words.append(word)
+            if words:
+                commands.append(words)
+            if any(w.startswith('#') or w.startswith('//') for w in part.split()):
+                break
+    return commands
+
+
+def duration_ticks(text):
+    """edf::console::ParseDuration: ticks, Ns or Nms."""
+    if text.endswith('ms'):
+        return float(text[:-2]) * 60 / 1000
+    if text.endswith('s'):
+        return float(text[:-1]) * 60
+    return float(text.rstrip('t'))
+
+
+class ConsoleScenarioTests(unittest.TestCase):
+    def test_console_scripts_parse_and_wait_for_the_mission(self):
+        scenarios = {n: e for n, e in TABLE['scenarios'].items() if e.get('console')}
+        self.assertEqual(set(scenarios), {'stress-ants', 'stress-collapse', 'stress-effects', 'stress-mixed'})
+        for name, entry in scenarios.items():
+            with self.subTest(name):
+                path = ROOT / entry['console']
+                self.assertTrue(path.is_file(), entry['console'])
+                commands = console_commands(path.read_text(encoding='utf-8'))
+                self.assertGreater(len(commands), 5)
+                for words in commands:
+                    self.assertIn(words[0], CONSOLE_COMMANDS, ' '.join(words))
+                    if words[0] == 'wait':
+                        self.assertGreaterEqual(duration_ticks(words[1]), 0)
+                # Game commands need a mission: the script waits for it first.
+                first_game = next(i for i, w in enumerate(commands) if w[0] in GAME_COMMANDS)
+                waits = [i for i, w in enumerate(commands) if w[0] == 'waitmission']
+                self.assertTrue(waits and waits[0] < first_game)
+                # Stats and marks bracket the phases for the reports.
+                self.assertTrue(any(w[0] == 'stats' for w in commands))
+                self.assertGreaterEqual(sum(w[0] == 'mark' for w in commands), 3)
+
+    def test_stress_scenarios_time_the_reports(self):
+        for name, entry in TABLE['scenarios'].items():
+            if not entry.get('console'):
+                continue
+            with self.subTest(name):
+                self.assertIn('--edf_native_hook_timings=true', entry['args'])
+                names = [a.split('=')[0] for a in entry['args']]
+                self.assertEqual(len(names), len(set(names)))
+                self.assertNotIn('--edf_exec', names)  # the runner adds it from "console"
+                # With the unlocked variant: frame times and GPU timings come from the variant.
+                unlocked = TABLE['variants']['unlocked']['args']
+                self.assertIn('--edf_native_frame_times=true', unlocked)
+                self.assertIn('--edf_native_gpu_timings=true', unlocked)
+
+
 if __name__ == '__main__':
     unittest.main()

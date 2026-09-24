@@ -14,6 +14,9 @@
 # -Seconds and -CaptureStart override the scenario's values. -NoWait launches
 # and returns (the caller stops the process). -DryRun prints the plan only.
 # -NoMemoryLog drops --edf_native_memory_log for executables built before it.
+# A scenario may add its own flags ("args") and a console script ("console", run
+# through --edf_exec): the stress-* scenarios drive the game with console commands
+# (docs/console.md) on the same game clock as their input script.
 param(
   [Parameter(Mandatory = $true)][string]$Scenario,
   [Parameter(Mandatory = $true)][ValidateSet('ab', 'unlocked', 'soak-ab', 'soak-unlocked')][string]$Variant,
@@ -45,6 +48,20 @@ if ($null -ne $entry.seed) {
   $seedDir = Join-Path $outRoot ('seeds/' + $Scenario)
 }
 $gameArgs = @($variantEntry.args | Where-Object { -not ($NoMemoryLog -and $_ -like '--edf_native_memory_log=*') })
+# A scenario's own flags replace the variant's flag of the same name (a flag passed
+# twice is mis-parsed; see start-native-binding-validation.ps1).
+$scenarioArgs = @()
+if ($entry.PSObject.Properties.Name -contains 'args') { $scenarioArgs += @($entry.args) }
+# A console script (docs/console.md) runs through --edf_exec on the game clock.
+if ($entry.PSObject.Properties.Name -contains 'console' -and $entry.console) {
+  $consoleScript = (Resolve-Path -LiteralPath (Join-Path $workspace $entry.console)).Path
+  $scenarioArgs += ('--edf_exec="' + $consoleScript + '"')
+}
+foreach ($extra in $scenarioArgs) {
+  $name = ($extra -split '=', 2)[0]
+  $gameArgs = @($gameArgs | Where-Object { (($_ -split '=', 2)[0]) -ne $name })
+  $gameArgs += $extra
+}
 $captureDir = $null
 if ($variantEntry.captures) {
   $captureDir = Join-Path $workspace ('out/renderer-ab/scenario-' + $Scenario + '-' + $Variant + '-' + $Tag)
@@ -55,6 +72,7 @@ if ($variantEntry.captures) {
 $gameArgs += $ExtraArgs
 $plan = [ordered]@{ scenario = $Scenario; variant = $Variant; executable = $Executable; input = $entry.input
   mission = $entry.mission; seed = $seedDir; seed_args = $entry.seed; seconds = $Seconds; captures = $captureDir
+  console = $(if ($entry.PSObject.Properties.Name -contains 'console') { $entry.console } else { $null })
   args = $gameArgs }
 if ($DryRun) { [pscustomobject]$plan | ConvertTo-Json -Depth 4; return }
 
