@@ -340,8 +340,12 @@ void Stvlx(const Memory& m,uint32_t ea,const Lanes& v) {
   std::memcpy(bytes,v.data(),16);
   for(uint32_t i=0;i<16-(ea&0xF);++i) m.StoreU8(ea+i,bytes[15-i]);
 }
-void Guest821C8198(const Memory& m,uint32_t r3,uint32_t r4,uint32_t r5) {
-  Lanes v10=Load(m,r5),v0=Load(m,r4),v9=Load(m,r5+16),v7=Load(m,r5+48),v8=Load(m,r5+32);
+void StoreLanes(const Memory& m,uint32_t ea,const Lanes& v) { ea&=~0xFu; for(unsigned i=0;i<4;++i) m.StoreU32(ea+i*4,std::bit_cast<uint32_t>(v[3-i])); }
+// r1: 0 skips the stack writes (as the propagation walk, whose frames do not exist).
+void Guest821C8198(const Memory& m,uint32_t r3,uint32_t r4,uint32_t r5,uint32_t r1=0) {
+  Lanes v10=Load(m,r5),v0=Load(m,r4);
+  if(r1) m.StoreU32(r1+20,r3);
+  Lanes v9=Load(m,r5+16),v7=Load(m,r5+48),v8=Load(m,r5+32);
   Lanes v5=Hi(v7,v9),v6=Hi(v8,v10);
   Lanes v13=Load(m,r4+16);
   Lanes v4=Lo(v8,v10);
@@ -358,6 +362,12 @@ void Guest821C8198(const Memory& m,uint32_t r3,uint32_t r4,uint32_t r5) {
   const Lanes s32=v13;
   v13=Hi(v11,v10);
   const Lanes s16=v13;
+  if(r1) {
+    StoreLanes(m,r1-48,s48); StoreLanes(m,r1-32,s32); StoreLanes(m,r1-16,s16);
+    Stvlx(m,r3,v0);
+    Stvlx(m,r3+16,Load(m,r1-48)); Stvlx(m,r3+32,Load(m,r1-32)); Stvlx(m,r3+48,Load(m,r1-16));
+    return;
+  }
   Stvlx(m,r3,v0); Stvlx(m,r3+16,s48); Stvlx(m,r3+32,s32); Stvlx(m,r3+48,s16);
 }
 void Guest821D1688(const Memory& m,uint32_t node,uint32_t parent) {
@@ -531,6 +541,28 @@ void PropagationMatchesGuest(bool flush) {
   std::cout<<"821D1688"<<(flush?" (flush on)":"")<<": "<<nodes_total<<" nodes match\n";
 }
 
+// 821C8198 as a whole call (its stack writes included), with out, a and b
+// anywhere: unaligned, overlapping each other, overlapping the stack slots.
+void MultiplyCallMatchesGuest() {
+  Random r(21);
+  const uint32_t csr=_mm_getcsr();
+  _mm_setcsr(csr|0x8040u);
+  for(uint32_t i=0;i<200000;++i) {
+    std::vector<uint8_t> heap(0x2000,0),image=Image();
+    const Memory m{heap,image};
+    for(uint32_t k=0x100;k<0x1F00;k+=4) m.StoreU32(k,std::bit_cast<uint32_t>(r.U(8)?r.Uniform(-50,50):r.Awkward(10)));
+    const uint32_t r1=0x1000+r.U(16)*16+(r.U(8)==0?r.U(4)*4:0);
+    const auto pick=[&] { return (r.U(6)==0?r1-64+r.U(128):0x200+r.U(0xC00))&~3u; };  // floats are word aligned
+    const uint32_t out=pick(),a=pick(),b=pick();
+    std::vector<uint8_t> heap_guest=heap,image_guest=image;
+    const Memory g{heap_guest,image_guest};
+    NativeSkeletalMultiply(m,out,a,b,r1);
+    Guest821C8198(g,out,a,b,r1);
+    RequireSame(heap,heap_guest,0,0,"821C8198 call");
+  }
+  _mm_setcsr(csr);
+  std::cout<<"821C8198 with stack writes: 200000 calls match\n";
+}
 // The helpers other native code already uses must agree with this file's.
 void RotationsMatchRenderHelpers() {
   Random r(7);
@@ -582,6 +614,7 @@ int main() {
     EvaluationMatchesGuest();
     PropagationMatchesGuest(false);
     PropagationMatchesGuest(true);
+    MultiplyCallMatchesGuest();
   } catch(const std::exception& error) {
     std::cerr<<"FAILED: "<<error.what()<<"\n";
     return 1;

@@ -364,7 +364,11 @@ NativeSkeletalEvalStats NativeSkeletalEvaluate(const M& m,uint32_t slot) {
 // M::Row(address) returns the 16 guest bytes at a 16-byte aligned address and
 // M::StoreRow(address,bytes) stores 16 bytes there (memory order).
 template<class M>
-inline void NativeSkeletalMultiply(const M& m,uint32_t out,uint32_t a,uint32_t b) {
+// With stack!=0 (the caller's r1) it also makes the original's guest stack
+// writes, in its order: r3 (out) at r1+20 between the first two row loads and
+// the rest, rows 1-3 staged at r1-48/-32/-16 (16-byte aligned) and read back
+// from there before their stores, so it is the whole memory effect of a call.
+inline void NativeSkeletalMultiply(const M& m,uint32_t out,uint32_t a,uint32_t b,uint32_t stack=0) {
   const __m128i reverse=_mm_setr_epi8(15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0);
   const auto load=[&](uint32_t address) {
     return _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(m.Row(address&~0xFu))),reverse);
@@ -374,7 +378,9 @@ inline void NativeSkeletalMultiply(const M& m,uint32_t out,uint32_t a,uint32_t b
   const auto dp=[](__m128i x,__m128i y) {
     return _mm_castps_si128(_mm_dp_ps(_mm_castsi128_ps(x),_mm_castsi128_ps(y),0xFF));
   };
-  __m128i v10=load(b),v0=load(a),v9=load(b+16),v7=load(b+48),v8=load(b+32);
+  __m128i v10=load(b),v0=load(a);
+  if(stack) m.StoreU32(stack+20,out);   // stw r3,20(r1)
+  __m128i v9=load(b+16),v7=load(b+48),v8=load(b+32);
   __m128i v5=hi(v7,v9);             // vmrghw v5,v9,v7
   __m128i v6=hi(v8,v10);            // vmrghw v6,v10,v8
   __m128i v13=load(a+16);
@@ -415,6 +421,20 @@ inline void NativeSkeletalMultiply(const M& m,uint32_t out,uint32_t a,uint32_t b
   const __m128i row2=v13;           // stvx v13 -> r1-32
   v13=hi(v11,v10);                  // vmrghw v13,v10,v11
   const __m128i row3=v13;           // stvx v13 -> r1-16
+  if(stack) {
+    const uint32_t staged[3]{(stack-48)&~0xFu,(stack-32)&~0xFu,(stack-16)&~0xFu};
+    const __m128i values[3]{row1,row2,row3};
+    for(uint32_t k=0;k<3;++k) m.StoreRow(staged[k],_mm_shuffle_epi8(values[k],reverse));
+    const uint32_t bytes=16u-(out&0xFu);
+    const auto store=[&](uint32_t at,__m128i value) {
+      alignas(16) uint8_t lanes[16];
+      _mm_store_si128(reinterpret_cast<__m128i*>(lanes),value);
+      for(uint32_t i=0;i<bytes;++i) m.StoreU8(at+i,lanes[15-i]);
+    };
+    store(out,v0);
+    for(uint32_t k=0;k<3;++k) store(out+16*(k+1),load(staged[k]));
+    return;
+  }
   const __m128i rows[4]{v0,row1,row2,row3};
   if(!(out&0xFu)) {
     // Aligned (every node world): all 16 bytes of each row, guest order.

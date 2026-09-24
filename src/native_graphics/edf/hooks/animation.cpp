@@ -16,6 +16,11 @@
 //                                    NaN); the original's result is kept, so
 //                                    the game runs the guest path. Overrides
 //                                    the two above.
+//   edf_native_skeletal_matrix       native 821C8198, the 4x4 multiply, for
+//                                    every caller (the skinning palette 821C9478
+//                                    in the frame transition above all), with
+//                                    its guest stack writes; audited like the
+//                                    others under edf_native_skeletal_audit
 //   edf_native_hook_timings          per-thread inclusive wall time of
 //                                    Animation_Update 8210B4E8, 821CE848 and
 //                                    top-level 821D1688 entries, every 5 s.
@@ -44,12 +49,15 @@ REXCVAR_DEFINE_BOOL(edf_native_skeletal_eval,false,"EDF2027",
   "Evaluate animation slots (821CE848: DXA key lerp, Euler rotation build, blend, node locals) natively, bit for bit as the recompiled code");
 REXCVAR_DEFINE_BOOL(edf_native_skeletal_propagation,false,"EDF2027",
   "Propagate model hierarchies (821D1688: node world = local x parent, recursively) natively, bit for bit as the recompiled code");
+REXCVAR_DEFINE_BOOL(edf_native_skeletal_matrix,false,"EDF2027",
+  "Run every 4x4 multiply 821C8198 (hierarchy worlds, skinning palettes 821C9478, view and effect matrices) natively with its guest memory effects, bit for bit");
 REXCVAR_DEFINE_BOOL(edf_native_skeletal_audit,false,"EDF2027",
   "Run the native skeletal evaluation and propagation beside the originals and compare every output byte; the originals' results are kept (development)");
 
 REX_EXTERN(__imp__sub_8210B4E8);
 REX_EXTERN(__imp__sub_821CE848);
 REX_EXTERN(__imp__sub_821D1688);
+REX_EXTERN(__imp__sub_821C8198);
 
 namespace {
 using namespace edf::native;
@@ -127,7 +135,7 @@ class SkeletalTiming {
 struct AuditRegion { uint32_t address,size; int32_t record; uint32_t kind; };  // kind 0 slot byte, 1 record, 2 local, 3 world
 struct AuditCounters {
   std::atomic<uint64_t> eval_calls{0},eval_records{0},eval_bytes{0},eval_mismatched_calls{0},eval_mismatched_words{0},
-    eval_skipped{0},propagate_calls{0},propagate_nodes{0},propagate_bytes{0},propagate_mismatched_calls{0},
+    eval_skipped{0},matrix_calls{0},matrix_mismatched_calls{0},propagate_calls{0},propagate_nodes{0},propagate_bytes{0},propagate_mismatched_calls{0},
     propagate_mismatched_words{0},propagate_skipped{0},logged{0};
   std::atomic<int64_t> reported{0};
   // Distinct objects (Animation_Update's r3) and propagation roots audited.
@@ -149,11 +157,11 @@ void MaybeReportAudit() {
   }
   REXLOG_INFO("Native skeletal audit: eval calls={} records={} bytes={} mismatched_calls={} mismatched_words={} skipped={} "
     "propagate calls={} nodes={} bytes={} mismatched_calls={} mismatched_words={} skipped={} distinct_objects={} "
-    "distinct_roots={} (cumulative)",
+    "distinct_roots={} matrix calls={} mismatched_calls={} (cumulative)",
     a.eval_calls.load(),a.eval_records.load(),a.eval_bytes.load(),a.eval_mismatched_calls.load(),
     a.eval_mismatched_words.load(),a.eval_skipped.load(),a.propagate_calls.load(),a.propagate_nodes.load(),
     a.propagate_bytes.load(),a.propagate_mismatched_calls.load(),a.propagate_mismatched_words.load(),
-    a.propagate_skipped.load(),objects,roots);
+    a.propagate_skipped.load(),objects,roots,a.matrix_calls.load(),a.matrix_mismatched_calls.load());
 }
 void NoteAudited(std::unordered_set<uint32_t> AuditCounters::*set,uint32_t address) {
   auto& a=Audit();
@@ -321,11 +329,46 @@ void AuditPropagate(PPCContext& ctx,uint8_t* base) {
   MaybeReportAudit();
 }
 
+void AuditMultiply(PPCContext& ctx,uint8_t* base) {
+  const GuestDirect m{base};
+  const uint32_t out=ctx.r3.u32,a=ctx.r4.u32,b=ctx.r5.u32,stack=ctx.r1.u32;
+  auto& audit=Audit();
+  thread_local std::vector<AuditRegion> regions;
+  thread_local std::vector<uint8_t> before,native,guest;
+  regions.clear();
+  regions.push_back({out,16u-(out&0xFu),0,4});
+  for(uint32_t k=1;k<4;++k) regions.push_back({out+16*k,16u-(out&0xFu),int32_t(k),4});
+  regions.push_back({stack+20,4,-1,5});
+  for(uint32_t k=0;k<3;++k) regions.push_back({(stack-48+16*k)&~0xFu,16,int32_t(k),5});
+  Snapshot(m,regions,before);
+  ctx.fpscr.enableFlushMode();
+  NativeSkeletalMultiply(m,out,a,b,stack);
+  Snapshot(m,regions,native);
+  Restore(m,regions,before);
+  __imp__sub_821C8198(ctx,base);
+  Snapshot(m,regions,guest);
+  audit.matrix_calls.fetch_add(1,std::memory_order_relaxed);
+  // Byte compare (a partial row is not whole words); NaN rows are rare and
+  // would show up as mismatches here rather than pass silently.
+  uint64_t differing=0;
+  for(size_t i=0;i<native.size();++i) differing+=native[i]!=guest[i];
+  if(differing) {
+    audit.matrix_mismatched_calls.fetch_add(1,std::memory_order_relaxed);
+    if(audit.logged.fetch_add(1,std::memory_order_relaxed)<kAuditMaxLogs)
+      REXLOG_WARN("Native skeletal audit mismatch: matrix out={:#x} a={:#x} b={:#x} r1={:#x} lr={:#x} differing_bytes={}",
+        out,a,b,stack,uint32_t(ctx.lr),differing);
+  }
+  MaybeReportAudit();
+}
+
 // Out of line, so the compiler cannot move the vector math across the flush-mode
 // change (ldmxcsr) the hook makes before calling them.
 __declspec(noinline) void RunNativeEvaluate(uint8_t* base,uint32_t slot,SkeletalTimes* times) {
   const auto stats=NativeSkeletalEvaluate(GuestDirect{base},slot);
   if(times) times->eval_records+=stats.records;
+}
+__declspec(noinline) void RunNativeMultiply(uint8_t* base,uint32_t out,uint32_t a,uint32_t b,uint32_t stack) {
+  NativeSkeletalMultiply(GuestDirect{base},out,a,b,stack);
 }
 __declspec(noinline) uint32_t RunNativePropagate(uint8_t* base,uint32_t node,uint32_t parent) {
   return NativeSkeletalPropagate(GuestDirect{base},node,parent);
@@ -397,4 +440,17 @@ REX_HOOK_RAW(sub_821D1688) {
     ++t.propagate_calls; t.propagate_nodes+=nodes;
     MaybeReportTimes(t,now);
   }
+}
+
+// The 4x4 multiply (out=r3, a=r4, b=r5): out = a x b. Its first vector
+// instruction turns the guest flush mode on; nothing in it turns it off. The
+// original's own calls under the skeletal hooks' guest runs come here too.
+REX_HOOK_RAW(sub_821C8198) {
+  if(REXCVAR_GET(edf_native_skeletal_audit)) { AuditMultiply(ctx,base); return; }
+  if(REXCVAR_GET(edf_native_skeletal_matrix)) {
+    ctx.fpscr.enableFlushMode();
+    RunNativeMultiply(base,ctx.r3.u32,ctx.r4.u32,ctx.r5.u32,ctx.r1.u32);
+    return;
+  }
+  __imp__sub_821C8198(ctx,base);
 }
