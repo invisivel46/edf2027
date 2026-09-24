@@ -127,6 +127,14 @@ inline std::atomic<uint64_t>& SimulationTicks() {
   return ticks;
 }
 
+// SimulationTicks() when the scripted pad first polled, plus one; zero until then (and
+// without a scripted pad). The console's "at <time>" schedules on this clock, so console
+// commands and a "clock game" input script share one timeline.
+inline std::atomic<uint64_t>& ScriptedClockOrigin() {
+  static std::atomic<uint64_t> origin{0};
+  return origin;
+}
+
 inline uint32_t GameTicksToMs(uint64_t ticks) {
   if(ticks/60>UINT32_MAX/1000) return UINT32_MAX;
   const uint64_t ms=ticks/60*1000+ticks%60*1000/60;

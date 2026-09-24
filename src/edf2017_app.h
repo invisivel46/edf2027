@@ -15,6 +15,7 @@
 #include <filesystem>
 #include <mutex>
 #include <thread>
+#include "console/console_dialog.h"
 #include "diagnostics.h"
 #include "launcher.h"
 #include "pause_menu.h"
@@ -48,6 +49,7 @@ REXCVAR_DECLARE(bool, edf_menu_pause);
 REXCVAR_DECLARE(bool, edf_menu_mute_audio);
 REXCVAR_DECLARE(bool, edf_menu_pause_audio_engine);
 REXCVAR_DECLARE(std::string, hid_mappings_file);
+REXCVAR_DECLARE(bool, edf_console_pause);
 
 namespace edf {
 // Suspends and resumes the SDK audio engine (AudioSystem::Pause/Resume) for the F1
@@ -189,7 +191,10 @@ class Edf2017App : public rex::ReXApp {
   }
 
   // The F1 menu's fonts (menu_ui.h), baked next to the SDK's default font.
-  void OnConfigureFonts(ImFontAtlas* atlas) override { edf::ui::LoadMenuFonts(atlas); }
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+    edf::ui::LoadMenuFonts(atlas);
+    edf::console::LoadConsoleFonts(atlas);  // the console's monospace face (console_dialog.h)
+  }
 
   std::unique_ptr<rex::ui::ImmediateDrawer> OnCreateImmediateDrawer() override {
 #if defined(_WIN32)
@@ -348,6 +353,7 @@ class Edf2017App : public rex::ReXApp {
     rex::ui::RegisterBind("bind_edf_fps", "F2", "Toggle performance overlay", []() {
       rex::cvar::SetFlagByName("edf_show_fps", REXCVAR_GET(edf_show_fps) ? "false" : "true");
     });
+    CreateConsole(drawer);
     // The pad chord (edf_menu_pad_chord) is seen on the guest's pad poll; open the menu
     // from the UI thread.
     edf::menu::SetOpenRequestHandler([context = &app_context(), this] {
@@ -368,6 +374,11 @@ class Edf2017App : public rex::ReXApp {
     }
     if (event.virtual_key() == rex::ui::VirtualKey::kEscape) {
       event.set_handled(true);
+      // The console closes first (it never quits the game).
+      if (auto* console = edf::console::ConsoleDialog::Current(); console && console->open()) {
+        console->SetOpen(false);
+        return;
+      }
       // With the menu open, Escape resumes (unless ImGui has a popup or an edit to
       // cancel first); otherwise it quits, as before.
       if (auto* settings = edf::SettingsDialog::Current()) {
@@ -429,6 +440,8 @@ class Edf2017App : public rex::ReXApp {
   }
   void OpenSettings(bool by_pad = false) {
     if (edf::SettingsDialog::Current() || !imgui_drawer()) return;
+    // One owner of the input gate at a time: the menu replaces the console.
+    if (auto* console = edf::console::ConsoleDialog::Current(); console && console->open()) console->SetOpen(false);
     BeginPause();
     edf::SettingsDialog::Hooks hooks;
     hooks.on_close = [this]() {
@@ -460,6 +473,55 @@ class Edf2017App : public rex::ReXApp {
     auto* dlg = new edf::SettingsDialog(imgui_drawer(), config_path_, std::move(hooks), by_pad);
     edf::SettingsDialog::Current() = dlg;
     imgui_drawer()->AddDialog(dlg);
+  }
+
+  // ---- Console (console/console_dialog.h, docs/console.md) ------------------------------
+  // The console takes the backtick key. The SDK's own log console defaulted to it too; it
+  // moves to F9 unless the player bound it elsewhere.
+  void CreateConsole(rex::ui::ImGuiDrawer* drawer) {
+    edf::console::Service::Get().Initialize({
+        .quit = [context = &app_context(), this] {
+          context->CallInUIThreadDeferred([this] { if (window()) window()->RequestClose(); });
+        },
+        .clear_view = {},
+        .show = [context = &app_context(), this](int state) {
+          context->CallInUIThreadDeferred([this, state] {
+            if (edf::SettingsDialog::Current()) return;
+            if (auto* current = edf::console::ConsoleDialog::Current())
+              current->SetOpen(state < 0 ? !current->open() : state > 0);
+          });
+        }});
+    auto* console = new edf::console::ConsoleDialog(
+        drawer, {.on_toggle = [this](bool open) { open ? BeginConsoleCapture() : EndConsoleCapture(); },
+                 .physical_height = [this] { return PhysicalHeight(); }});
+    edf::console::ConsoleDialog::Current() = console;
+    if (rex::cvar::GetFlagByName("bind_console") == "Backtick") {
+      rex::cvar::SetFlagByName("bind_console", "F9");
+      REXLOG_INFO("EDF2027: the SDK log console moved from ` to F9 (bind_console); ` opens the EDF2027 console");
+    }
+    rex::ui::RegisterBind("bind_edf_console", "Backtick", "EDF2027 console (docs/console.md)", [] {
+      if (edf::SettingsDialog::Current()) return;  // the menu owns input while it is open
+      if (auto* current = edf::console::ConsoleDialog::Current()) current->Toggle();
+    });
+  }
+  // Like the F1 menu (BeginPause), without the mute: the input gate closes so keyboard,
+  // mouse and pad stop reaching the game, the mouse is freed, and with edf_console_pause
+  // the engine heartbeat holds.
+  void BeginConsoleCapture() {
+    edf::menu::OpenGate();
+    NativeKbmDriver::ReleaseForMenu();
+    if (window()) {
+      cursor_before_console_ = window()->GetCursorVisibility();
+      window()->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
+    }
+    console_paused_ = booted_ && REXCVAR_GET(edf_console_pause);
+    if (console_paused_) edf::menu::Engine().requested.store(true, std::memory_order_release);
+  }
+  void EndConsoleCapture() {
+    if (console_paused_) edf::menu::Engine().requested.store(false, std::memory_order_release);
+    console_paused_ = false;
+    edf::menu::CloseGate();
+    if (window()) window()->SetCursorVisibility(cursor_before_console_);
   }
 
   // ---- F1 pause (pause_menu.h) -------------------------------------------------------
@@ -555,4 +617,6 @@ class Edf2017App : public rex::ReXApp {
   edf::menu::PauseController pause_;
   edf::AudioSuspender audio_suspender_;
   rex::ui::Window::CursorVisibility cursor_before_menu_ = rex::ui::Window::CursorVisibility::kVisible;
+  rex::ui::Window::CursorVisibility cursor_before_console_ = rex::ui::Window::CursorVisibility::kVisible;
+  bool console_paused_ = false;
 };

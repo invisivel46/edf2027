@@ -4,7 +4,9 @@
     "input: the scripted-pad file. seed: tools/make-edf-save.py arguments, or null for a fresh profile (Mission 1).",
     "mission: the id renderer-runtime-gate.py --expect-mission checks (MISSION.CAM lookup).",
     "capture_start: indexed output frame (3D frames since the first scene draw, pre-mission scene included) where",
-    "A/B captures begin; estimated, see each input file. seconds: how long each variant runs before it is stopped."
+    "A/B captures begin; estimated, see each input file. seconds: how long each variant runs before it is stopped.",
+    "console (optional): a console script (docs/console.md) passed as --edf_exec; its commands run on the same game clock.",
+    "args (optional): extra game flags for this scenario; a flag here replaces the variant's flag of the same name."
   ],
   "scenarios": {
     "benchmark": {
@@ -70,6 +72,46 @@
       "mission": "M202",
       "capture_start": 4000,
       "seconds": {"ab": 420, "unlocked": 600, "soak-ab": 1950, "soak-unlocked": 1950}
+    },
+    "stress-ants": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still: the console spawns 300 ants around the player, lets them swarm for 40 s under god mode, then kills them all (tools/console/stress-ants.cfg)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/stress-ants.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 330, "unlocked": 330, "soak-ab": 330, "soak-unlocked": 330}
+    },
+    "stress-collapse": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still: the console collapses every building within 150 units, then every standing building on the map (tools/console/stress-collapse.cfg)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/stress-collapse.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 300, "unlocked": 300, "soak-ab": 300, "soak-unlocked": 300}
+    },
+    "stress-effects": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still: the console sets off waves of the game's explosion effect around the player for 40 s (tools/console/stress-effects.cfg)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/stress-effects.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 300, "unlocked": 300, "soak-ab": 300, "soak-unlocked": 300}
+    },
+    "stress-mixed": {
+      "description": "Mission 1 (M202, Map01 City 1), fresh profile, intro skipped, player still: ants, spiders and UFOs around the player, nearby buildings collapsing and explosions, then killall (tools/console/stress-mixed.cfg)",
+      "input": "tools/native-scenario-stress-input.txt",
+      "console": "tools/console/stress-mixed.cfg",
+      "args": ["--edf_native_hook_timings=true", "--edf_fps_cap=0"],
+      "seed": null,
+      "mission": "M202",
+      "capture_start": 1500,
+      "seconds": {"ab": 300, "unlocked": 300, "soak-ab": 300, "soak-unlocked": 300}
     }
   },
   "variants": {

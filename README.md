@@ -117,7 +117,11 @@ Other keys:
   graph, and CPU and GPU time. Its level of detail is set in F1 >
   Performance.
 - **F4** opens the advanced ReXGlue settings (every runtime option).
-- **F3** opens the debug overlay, and **`** opens the console.
+- **`** opens the EDF2027 console: spawn enemies, collapse buildings, set off
+  explosions, read performance numbers, change any setting, and run command scripts
+  (see [docs/console.md](docs/console.md)). The console's game commands are cheats and
+  mark the run as such.
+- **F3** opens the debug overlay, and **F9** the ReXGlue log console.
 - `edf2027.exe --settings` opens the settings before the game boots.
 
 ### Frame rate and latency

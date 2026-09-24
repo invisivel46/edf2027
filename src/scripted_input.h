@@ -54,7 +54,10 @@ class ScriptedInputDriver final : public rex::input::InputDriver {
   }
   rex::X_RESULT GetDeviceState(rex::input::DeviceId id, rex::input::X_INPUT_STATE* out) override {
     const uint64_t ticks = edf::SimulationTicks().load(std::memory_order_relaxed);
-    if (!started_) { t0_ = std::chrono::steady_clock::now(); clock_.tick_base = ticks; started_ = true; } // clock starts at first poll (Setup is not called for late drivers)
+    if (!started_) {  // clock starts at first poll (Setup is not called for late drivers)
+      t0_ = std::chrono::steady_clock::now(); clock_.tick_base = ticks; started_ = true;
+      edf::ScriptedClockOrigin().store(ticks + 1, std::memory_order_relaxed);  // console "at" (console.h)
+    }
     const uint32_t wall_ms = (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0_).count();
     const uint32_t ms = edf::ScriptElapsedMs(clock_, wall_ms, ticks);
     if (clock_.fell_back && !fallback_logged_) {

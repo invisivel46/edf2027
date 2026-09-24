@@ -131,6 +131,19 @@ int main() {
     fractional.Reset(epoch,123);
     check(fractional.Fraction(epoch)==0 && std::abs(fractional.Fraction(epoch+milliseconds(25))-.5f)<.000001f &&
       fractional.Sample(epoch+milliseconds(25))==124,"fractional render phase disagrees with simulation ticks");
+    // The console's timescale: a rate change rebases, keeping the tick and its fraction.
+    NativePacingClock scaled;
+    scaled.Reset(epoch,1000);
+    scaled.SetRate(epoch+milliseconds(1025),30.0);  // 61.5 ticks elapsed at 60 Hz
+    check(scaled.rate()==30.0 && scaled.Sample(epoch+milliseconds(1025))==1061 &&
+      std::abs(scaled.Fraction(epoch+milliseconds(1025))-.5f)<.001f,"rate change moved the tick or its fraction");
+    check(scaled.Sample(epoch+milliseconds(1025+1000))==1091,"half rate did not run 30 ticks a second");
+    scaled.SetRate(epoch+milliseconds(2025),60.0);
+    check(scaled.Sample(epoch+milliseconds(3025))==1151,"returning to 60 Hz did not run 60 ticks a second");
+    NativePacingClock unset;  // a rate set before the first Reset applies from it
+    unset.SetRate(epoch,120.0);
+    unset.Reset(epoch,0);
+    check(unset.Sample(epoch+seconds(1))==120,"a rate set before Reset was lost");
   }
   for(uint32_t interval:{1u,2u,3u}) {
     NativeSwapPacingState unpaced{100,99,3,7};

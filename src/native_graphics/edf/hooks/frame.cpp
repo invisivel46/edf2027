@@ -27,6 +27,7 @@
 #include "../../native_full_frame.h"
 #include "../../native_coverage_census.h"
 #include "../../native_frame_times.h"
+#include "../../../console/console_hook.h"
 #include "../../native_full_frame_static_world.h"
 #include "../../native_full_frame_models.h"
 #include "../../native_declarations.h"
@@ -211,7 +212,11 @@ REX_HOOK_RAW(sub_821A4BA0) {
     edf::native::HookTiming timing(edf::native::HookPhase::ResourceCoordinator);
     edf::native::HookTiming engine_timing(edf::native::HookPhase::SimulationDispatch);
     const edf::native::EngineRegionScope region(edf::native::EngineRegion::Dispatch,ctx.r4.u32,ctx.fpscr.csr);
+    // In-game console (src/console/console.h): due commands run here, on the engine thread,
+    // before this iteration's simulation steps; nothing when the console is idle.
+    edf::console::EngineStepBegin(ctx,base,ctx.r4.u32);
     __imp__sub_821A4BA0(ctx,base);
+    edf::console::EngineStepEnd();
   }
   edf::native::RunEngineCalibration(edf::native::EngineRegion::Dispatch);
 }
@@ -1497,7 +1502,7 @@ void HoldEngineForMenu() {
   if(!edf::menu::HoldWhilePaused()) return;
   std::lock_guard lock(pacing.mutex);
   const auto now=edf::native::NativePacingClock::Clock::now();
-  pacing.clock.Reset(now-std::chrono::nanoseconds(int64_t(double(fraction)*1e9/60.0)),tick);
+  pacing.clock.Reset(now-std::chrono::nanoseconds(int64_t(double(fraction)*1e9/pacing.clock.rate())),tick);
   REXLOG_INFO("Native engine pacing: paused by the settings menu for {} ms; resumed at tick {} (clock rebased, no catch-up)",
     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-began).count(),tick);
 }
@@ -1519,6 +1524,9 @@ REX_HOOK_RAW(sub_821BEAB0) {
   const auto divisor=reader.Word(reader.Add(object,4));
   auto& state=edf::native::PacingState();
   std::lock_guard lock(state.mutex);
+  // The console's "timescale" (native_pacing.h NativeTimeScaleRequest): 60 x scale ticks/s.
+  if(const double rate=60.0*edf::native::NativeTimeScaleRequest().load(std::memory_order_relaxed); rate!=state.clock.rate())
+    state.clock.SetRate(edf::native::NativePacingClock::Clock::now(),rate);
   const auto previous=reader.DoubleWord(0x8257C308);
   auto sampled_at=edf::native::NativePacingClock::Clock::now();
   auto current=state.clock.Sample(sampled_at);

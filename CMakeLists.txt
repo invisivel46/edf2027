@@ -52,6 +52,9 @@ set(EDF2027_SOURCES
     src/input_latency.cpp
     src/diagnostics.cpp
     src/version.cpp
+    # In-game console (docs/console.md).
+    src/console/console.cpp
+    src/console/console_game.cpp
 )
 
 if(WIN32)
@@ -468,6 +471,11 @@ if(BUILD_TESTING)
     add_executable(edf2027_tests tests/unit_tests.cpp)
     target_include_directories(edf2027_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
     add_test(NAME edf2027_unit_tests COMMAND edf2027_tests)
+    # The console's command language: parser, registry, validation, completion (console_logic.h).
+    add_executable(edf_console_tests tests/console_tests.cpp)
+    target_include_directories(edf_console_tests PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME edf_console_tests COMMAND edf_console_tests)
+    set_tests_properties(edf_console_tests PROPERTIES TIMEOUT 30)
     # Input latency: the trace, the low-latency presentation pieces and the mouse path
     # (input_latency_logic.h, native_present_slot.h, native_backend_frame_queue.h, ui_ticker.h).
     add_executable(edf_input_latency_tests tests/input_latency_tests.cpp)

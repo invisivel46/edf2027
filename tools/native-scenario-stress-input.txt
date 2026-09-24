@@ -1,0 +1,31 @@
+# Scenario: stress-ants, stress-collapse, stress-effects, stress-mixed. Mission 1
+# "Arrival" (M202, Map01 City 1) from a fresh profile, intro skipped, then no
+# input at all: the player stands at the street spawn while the scenario's
+# console script (tools/console/stress-*.cfg, passed as --edf_exec) does the
+# work on the same game clock -- spawns, building collapses, explosions, and
+# "stats"/"mark" lines for the reports. Nothing here moves the camera, so two
+# runs of one scenario draw the same view and differ only by the build.
+#
+# Clock: game ticks, as in the benchmark route (the clock does not advance on
+# loading screens). The console script waits for the mission itself
+# ("waitmission"), so its timing does not depend on load speed either.
+clock game
+#
+# Menus and intro skip: identical to tools/native-benchmark-skipintro-input.txt
+# (fresh profile, default Mission 1; Start at 85 s skips the intro through the
+# pause handler's skip path, and the street loads ~5-9 s later).
+20000 1000 0010
+25000 1000 0010
+30000 1000 1000
+35000 1000 1000
+40000 1000 1000
+45000 1000 1000
+50000 1000 1000
+55000 1000 1000
+60000 1000 1000
+65000 1000 1000
+70000 1000 1000
+85000 500 0010
+# Gameplay: no input. (One idle no-button line keeps the analog state explicitly
+# released for the rest of the run.)
+100000 900000 0000 0 0 0 0 0 0
