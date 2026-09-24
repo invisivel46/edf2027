@@ -131,6 +131,7 @@
 #include "bridge/native_cvars.h"
 #include "bridge/bridge_state.h"
 #include "bridge/bridge_helpers.h"
+#include "bridge/bridge_shared.h"
 #include "edf/full_frame/host.h"
 #include <rex/cvar.h>
 #include <rex/chrono/clock.h>
@@ -155,42 +156,12 @@
 #include <thread>
 #include <optional>
 
-// Launcher cvars (launcher_cvars.cpp) and the SDK's window size, for the
-// render size and the 2D canvas layout (native_display_layout.h).
-REXCVAR_DECLARE(std::string, edf_aspect);
 REXCVAR_DECLARE(std::string, edf_hud_safe_area);
 REXCVAR_DECLARE(int32_t, window_width);
 REXCVAR_DECLARE(int32_t, window_height);
-// Transient batching (edf_native_transient_batching), off whenever reuse is
-// (native_reuse.h): a batched run is recorded as its separate draws.
-static bool NativeTransientBatchingEnabled() {
-  return REXCVAR_GET(edf_native_transient_batching) && edf::native::NativeReuseAllowed();
-}
-REXCVAR_DECLARE(bool, edf_native_host);
 REX_EXTERN(__imp__KeSetEvent);
 
-// edf_native_load_trace (native_load_trace.h): phase events and 250 ms ticks.
-// Everything here runs only with the cvar on; off, each hook pays one cvar read.
 namespace {
-struct NativeLoadTraceState {
-  using Clock=std::chrono::steady_clock;
-  std::mutex mutex;
-  std::atomic<bool> loading{false};   // BeginLoading request .. presenter exit
-  std::atomic<int64_t> next_tick{0};  // steady_clock ticks
-  std::atomic<HANDLE> engine{nullptr};
-  Clock::time_point origin{},last_event{},last_tick{},window_start{};
-  edf::native::LoadTraceSample at_event{},at_tick{},at_window{};
-  uint64_t engine_cpu_event=0,engine_cpu_tick=0,engine_cpu_window=0;
-  std::atomic<uint64_t> presenter_frames{0};
-  uint64_t presenter_frames_event=0,presenter_frames_tick=0,presenter_frames_window=0;
-  bool started=false;
-  // Mission script natives (dispatcher 820D1518, by native number): which
-  // script calls the loading window's time went to. Reported at window close.
-  static constexpr size_t kNatives=2048;
-  std::array<std::atomic<uint64_t>,kNatives> native_calls{},native_nanos{};
-  std::array<uint64_t,kNatives> native_calls_window{},native_nanos_window{};
-};
-NativeLoadTraceState& LoadTraceState() { static auto* state=new NativeLoadTraceState; return *state; }
 // The engine thread's kernel+user time in 100 ns units (GetThreadTimes'
 // granularity is the scheduler tick; fine against 250 ms windows).
 uint64_t LoadTraceEngineCpu(NativeLoadTraceState& state) {
@@ -223,10 +194,11 @@ bool LoadTraceLoadingActivity(const edf::native::LoadTraceSample& now,const edf:
     if(now.calls[size_t(kind)]!=before.calls[size_t(kind)]) return true;
   return false;
 }
+}  // namespace (shared: bridge/bridge_shared.h)
 // Phase transition: logs what happened since the previous event. `open`
 // starts the loading window (ticks every 250 ms), `close` ends it and logs the
 // window's totals. `detail` is event-specific (manager, mode, caller).
-void LoadTraceEvent(const char* event,uint32_t detail,bool open=false,bool close=false) {
+void LoadTraceEvent(const char* event,uint32_t detail,bool open,bool close) {
   if(!LoadTraceOn()) return;
   auto& state=LoadTraceState();
   std::lock_guard lock(state.mutex);
@@ -308,14 +280,9 @@ void LoadTraceTick() {
 }
 // The loading presenter (clSatoCallback::slot6, 8216EBC0) runs on its own
 // thread; its scene setups are counted as presenter frames.
-thread_local bool native_load_trace_presenter_thread=false;
-}
+thread_local constinit bool native_load_trace_presenter_thread=false;
 
 namespace edf::native {
-NativeSceneTreePublications& TreePublications() {
-  static NativeSceneTreePublications publications;
-  return publications;
-}
 // Lock-free prefilters for hot simulation hooks (NativeAddressFilter): list
 // headers and member nodes the static walk plans or the scene membership
 // track, and owners the scene sources have seen born. A hook whose addresses
@@ -341,24 +308,6 @@ std::array<int32_t,2> NativeDisplaySize() {
   } catch(const std::exception& error) { REXLOG_WARN("Native display size provider: {}",error.what()); }
   return {REXCVAR_GET(window_width),REXCVAR_GET(window_height)};
 }
-// Resolved once, at renderer initialization (native_display_layout.h): the
-// engine allocates its targets, post pyramid, 2D canvas and camera viewports
-// from this size and none of them follows a later change, so saving a new F1
-// choice or resizing the window must not change live canvas scaling while
-// those still have the old size. {0,0} is the engine's own 1280x720: no
-// override and no canvas mapping, byte for byte the unmodified path.
-const std::array<int32_t,2>& NativeRenderDimensions() {
-  static const std::array<int32_t,2> dimensions=[] {
-    const auto display=NativeDisplaySize();
-    const auto size=ResolveNativeRenderSize(REXCVAR_GET(edf_native_render_width),
-      REXCVAR_GET(edf_native_render_height),display[0],display[1],ParseNativeAspectMode(REXCVAR_GET(edf_aspect)));
-    REXLOG_INFO("Native render size: {}x{}{} (request {}x{}, display {}x{}, aspect {}){}",size.width,size.height,
-      size.original?" (engine original)":"",REXCVAR_GET(edf_native_render_width),REXCVAR_GET(edf_native_render_height),
-      display[0],display[1],std::string(REXCVAR_GET(edf_aspect)),size.clamped?"; scaled to fit the render size limits":"");
-    return size.original?std::array<int32_t,2>{0,0}:std::array<int32_t,2>{size.width,size.height};
-  }();
-  return dimensions;
-}
 // The 2D canvas layout for a target. edf_hud_safe_area is read per draw: it
 // is a constant mapping, not an allocation, so it applies live.
 NativeClipAffine NativeHudLayout(uint32_t width,uint32_t height) {
@@ -376,52 +325,17 @@ NativeViewportState MapNativeCanvasViewportScissor(NativeViewportState state,con
   return state;
 }
 namespace {
-// Coarse wait totals are sampled once per swap. They include all participating
-// threads, so they locate waits but must not be summed as a CPU-time partition.
-enum class FrameWaitKind { Engine,GuestFence,SharedSlot };
 // Extra simulation steps folded into one engine update. This is diagnostic
 // bookkeeping only; the retail result and clock writeback remain unchanged.
 std::atomic<uint64_t>& FrameExtraSimulationSteps() {
   static std::atomic<uint64_t> total{0};
   return total;
 }
-std::array<std::atomic<uint64_t>,3>& FrameWaitTotals() {
-  static std::array<std::atomic<uint64_t>,3> totals{};
-  return totals;
-}
-class NativeFrameWaitTrace {
- public:
-  explicit NativeFrameWaitTrace(FrameWaitKind kind,bool active=true)
-      : kind_(kind),enabled_(active && !REXCVAR_GET(edf_native_frame_trace).empty()) {
-    if(enabled_) start_=Clock::now();
-  }
-  ~NativeFrameWaitTrace() { Finish(); }
-  void Finish() {
-    if(!enabled_) return;
-    enabled_=false;
-    const auto ns=std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now()-start_).count();
-    FrameWaitTotals()[size_t(kind_)].fetch_add(uint64_t(ns),std::memory_order_relaxed);
-  }
- private:
-  using Clock=std::chrono::steady_clock;
-  FrameWaitKind kind_;
-  bool enabled_;
-  Clock::time_point start_{};
-};
 
-NativeViewportState DecodeDrawViewport(const GuestViewportWords& snapshot) {
-  const auto& words=snapshot.words;
-  return MakeNativeDrawViewport(words[0],words[1],words[2],words[3],
-    std::bit_cast<float>(words[4]),std::bit_cast<float>(words[5]),snapshot.scissor_enabled,
-    {std::bit_cast<int32_t>(words[6]),std::bit_cast<int32_t>(words[7]),
-     std::bit_cast<int32_t>(words[8]),std::bit_cast<int32_t>(words[9])});
-}
 template<class Reader>
 NativeViewportState ReadDrawViewport(const Reader& reader,uint32_t device) {
   return DecodeDrawViewport(ReadViewportWords(reader,device));
 }
-std::array<float,4> ResolveBlendFactorForDraw(uint32_t device,
-    const NativeRenderStateSnapshots::BlendWords* live);
 template<class Reader>
 void BindGuestRenderState(const NativeRenderState& state,ID3D11DeviceContext& context,
                           const Reader& reader,uint32_t device,uint64_t* generation=nullptr) {
@@ -439,15 +353,6 @@ void BindGuestRenderState(const NativeRenderState& state,ID3D11DeviceContext& co
   if(audit) live=ReadGuestWords<4>(reader,reader.Add(device,10336));
   state.Bind(context,ResolveBlendFactorForDraw(device,audit?&live:nullptr));
 }
-template <typename Reader>
-std::array<float,4> GuestBlendFactorForDraw(const Reader& reader,uint32_t device) {
-  if(!REXCVAR_GET(edf_native_owned_render_state) && !REXCVAR_GET(edf_native_render_state_audit))
-    return ReadBlendFactor(reader,device);
-  NativeRenderStateSnapshots::BlendWords live{};
-  const bool audit=REXCVAR_GET(edf_native_render_state_audit);
-  if(audit) live=ReadGuestWords<4>(reader,reader.Add(device,10336));
-  return ResolveBlendFactorForDraw(device,audit?&live:nullptr);
-}
 // State().mutex for one visibility walk; see native_scene_walk_lock.h.
 using BridgeWalkLock=NativeWalkLockScope<BridgeMutex>;
 using BridgeGuestCall=NativeWalkGuestCall<BridgeMutex>;
@@ -461,6 +366,7 @@ struct BridgeWalkView {
   const NativeSceneCpuWindow<GuestReader>* window=nullptr;
 };
 inline thread_local BridgeWalkView* bridge_walk_view=nullptr;
+}  // namespace (shared: bridge/bridge_shared.h)
 // Called under the registry lock at consumption, never from a writer callback.
 void AuditGeneratedWrites(Bridge& state,const NativeBufferWrites::Batch& batch) {
   for(size_t i=0;i<batch.writer_hit_count;++i) {
@@ -501,6 +407,7 @@ void AuditGeneratedWrites(Bridge& state,const NativeBufferWrites::Batch& batch) 
     REXLOG_INFO("Native exact write versions: batch={}, generated_owner_hits={}, provider_owner_hits={}, total_generated_hits={}, total_provider_hits={} (unsampled overlap counts at notification, not writer PCs)",
       batches,batch.generated_exact_owner_hits,batch.provider_exact_owner_hits,total_generated_hits,total_provider_hits);
 }
+namespace {
 void CaptureScene(Bridge& state,uint32_t owner) {
   const auto prefix=REXCVAR_GET(edf_native_scene_capture);
   if (prefix.empty() || state.scene_captures>=3 ||
@@ -619,6 +526,7 @@ std::optional<NativeTexture> DispatchNativeFsrLocked(Bridge& state,uint32_t owne
     return std::nullopt;
   }
 }
+}  // namespace (shared: bridge/bridge_shared.h)
 void ResolveScene(const GuestReader& reader,Bridge& state,uint32_t owner) {
   try {
     auto& scene=state.scenes.at(owner);
@@ -652,6 +560,7 @@ void ResolveScene(const GuestReader& reader,Bridge& state,uint32_t owner) {
     if (++state.scene_resolve_errors<=10) REXLOG_ERROR("Native HDR scene resolve: {}",error.what());
   }
 }
+namespace {
 
 void ForgetOwner(uint32_t owner) {
   auto& state = State();
@@ -1177,16 +1086,9 @@ void EnterNativeSceneBoundary(NativeSceneBoundary boundary) {
   if(native_queued_scene_group)
     native_queued_scene_group->execution.Enter(boundary,REXCVAR_GET(edf_native_scene_reject_compatibility));
 }
-struct NativeScenePassCursorState {
-  uint32_t device=0;
-  NativeSceneMaterialPassState material;
-  std::optional<GuestViewportWords> viewport;
-  ActiveTargets targets;
-};
-using NativeMaterialPassCursor=std::optional<NativeScenePassCursorState>;
-thread_local NativeMaterialPassCursor* native_material_pass_cursor=nullptr;
-thread_local NativeSceneQueues* native_scene_queues=nullptr;
-}  // namespace (shared with the full frame: bridge/bridge_helpers.h)
+}  // namespace (shared: bridge/bridge_shared.h)
+thread_local constinit NativeMaterialPassCursor* native_material_pass_cursor=nullptr;
+thread_local constinit NativeSceneQueues* native_scene_queues=nullptr;
 thread_local std::shared_ptr<const NativeScenePublication> native_scene_publication;
 thread_local constinit std::optional<NativeScenePassCamera> native_scene_pass_camera;
 thread_local std::shared_ptr<const NativeScenePassCameras> native_scene_pass_cameras;
@@ -1203,7 +1105,6 @@ thread_local constinit uint32_t native_scene_animation_owner=0;
 // NativeSceneRenderer::SetClipJitter. Null (no jitter) outside such a view.
 thread_local constinit std::optional<NativeScenePassCamera> native_scene_draw_camera;
 thread_local constinit NativeFsrJitter native_scene_view_jitter;
-namespace {
 NativeFsrMode NativeFsrRequestedMode() {
   const std::string text=REXCVAR_GET(edf_native_fsr);
   if(const auto mode=ParseNativeFsrMode(text)) return *mode;
@@ -1212,10 +1113,7 @@ NativeFsrMode NativeFsrRequestedMode() {
     REXLOG_WARN("edf_native_fsr={} is not a mode (off, native_aa, quality, balanced, performance, ultra_performance); FSR stays off",text);
   return NativeFsrMode::Off;
 }
-NativeFsrExclusions NativeFsrCurrentExclusions() {
-  return {REXCVAR_GET(edf_native_ab_alternate)>0,REXCVAR_GET(edf_native_reuse_off_alternate)>0,
-          REXCVAR_GET(edf_native_shadow_render)>0};
-}
+namespace {
 // Whether the scene targets are made for FSR (1x colour, sampled depth):
 // edf_native_fsr on at the first scene allocation and no validation run.
 // Restart-time, like the two settings it overrides.
@@ -1297,7 +1195,6 @@ void DisarmNativeFsrLocked(Bridge& state) {
   if(const auto dropped=++state.fsr.dropped;dropped<=4 || !(dropped&(dropped-1)))
     REXLOG_INFO("FSR frame not dispatched: nothing resolved the scene to owner+104 (direct frame or post failure; dropped={})",dropped);
 }
-namespace {
 const NativeSceneSources& NativeSceneSourcesForPass(const Bridge& state) {
   if(EDF_NATIVE_FLAG(scene_sources_owned) && native_scene_publication && native_scene_publication->sources) {
     static uint64_t reads=0;
@@ -1307,6 +1204,7 @@ const NativeSceneSources& NativeSceneSourcesForPass(const Bridge& state) {
   }
   return state.scene_sources;
 }
+namespace {
 // The immutable source generation this pass reads, or null when the pass reads
 // the producer's current sources (under state.mutex) instead. Taken once per
 // walk: a published generation needs no lock, and cannot change within a pass.
@@ -1420,174 +1318,6 @@ void FlushNativeQueuedSceneLocked(Bridge& state,NativeQueuedSceneGroup& group) {
   ++state.bind_generation;
   state.recorded={};
 }
-// Everything a recorded draw needs before its geometry.
-//
-// The D3D11 paths spell this out as four separate bindings - target, render
-// state, viewport, shader pair - because D3D11 keeps those apart. One pipeline
-// carries most of it here, and the rest is recorder state, so every draw path
-// that used those four calls uses this one instead. Written once because five
-// paths need it and five copies would drift.
-struct RecordedDraw {
-  ShaderBindings& vertex;
-  ShaderBindings& pixel;
-  const NativeViewportState& viewport;
-  const RenderStateWords& state;
-  std::span<const edf::native::NativeBackendInputElement> layout;
-  uint64_t layout_id=0;
-  // The guest handles, plus whatever else makes two compiled shaders under one
-  // handle different - the reversed-depth variant being the one that does.
-  uint64_t vertex_id=0,pixel_id=0;
-  edf::native::NativeBackendTopology topology=edf::native::NativeBackendTopology::TriangleList;
-  bool world_instancing=false;
-};
-template <typename Reader>
-edf::native::NativeBackendRecorder& RecordDrawSetup(Bridge& state,const Reader& reader,
-                                                    uint32_t device,const RecordedDraw& draw) {
-  auto& backend=EnsureSceneBackendLocked(state);
-  auto& recorder=SceneRecorderLocked(state);
-  recorder.SetWorldInstancing(draw.world_instancing,REXCVAR_GET(edf_native_world_constant_reuse));
-  recorder.SetTransientBatching(NativeTransientBatchingEnabled());
-  const auto targets=ActiveTargetsLocked(state);
-  if(!targets.count) throw std::runtime_error("a recorded draw has no colour target to record into");
-  ++state.recorded_draws;
-  auto& last=state.recorded;
-  // Nothing the recorder already holds is re-sent. The comparison is against
-  // what this code last sent, not against device state, because neither target
-  // API has device state to ask - which is also why a direct bind on the shared
-  // context has to invalidate it explicitly.
-  const bool same_frame=last.valid && last.frame==state.scene_frames &&
-                        last.bind_generation==state.bind_generation;
-  bool same_targets=same_frame && last.color_count==targets.count && last.depth==targets.depth;
-  for(uint32_t index=0;same_targets && index<targets.count;++index)
-    same_targets=last.colors[index]==targets.colors[index];
-  if(!same_targets) {
-    recorder.SetRenderTargets({targets.colors.data(),targets.count},targets.depth);
-    last.color_count=targets.count; last.colors=targets.colors; last.depth=targets.depth;
-  }
-  const auto& view=draw.viewport.viewport;
-  const auto& scissor=draw.viewport.scissor;
-  const bool scissor_enabled=draw.state[5]!=0;
-  if(!same_frame || std::memcmp(&last.viewport,&view,sizeof(view))!=0) {
-    recorder.SetViewport({view.TopLeftX,view.TopLeftY,view.Width,view.Height,
-                          view.MinDepth,view.MaxDepth});
-    last.viewport=view;
-  }
-  if(!same_frame || last.scissor_enabled!=scissor_enabled ||
-     std::memcmp(&last.scissor,&scissor,sizeof(scissor))!=0) {
-    recorder.SetScissor({scissor.left,scissor.top,scissor.right,scissor.bottom},scissor_enabled);
-    last.scissor=scissor; last.scissor_enabled=scissor_enabled;
-  }
-  // Pixel-stage resources only, which is what every shader in this game and
-  // this renderer uses. A vertex shader that sampled something would have it
-  // silently unbound, so it is refused instead: no backend root signature
-  // declares vertex-stage textures, and this is where that would be noticed.
-  if(draw.vertex.BindsResources())
-    throw std::runtime_error("a vertex shader with textures or samplers cannot be recorded: "
-                             "no backend root signature declares them");
-  const bool same_pipeline=same_frame && last.pipeline &&
-    last.vertex_id==draw.vertex_id && last.pixel_id==draw.pixel_id &&
-    last.layout_id==draw.layout_id && last.state==draw.state && last.topology==draw.topology &&
-    last.render_targets==targets.count && last.sample_count==targets.samples &&
-    last.dsv_format==targets.dsv_format && last.rtv_format==targets.rtv_format;
-  if(same_pipeline) ++state.recorded_pipeline_skips;
-  else {
-    edf::native::NativeBackendPipelineDesc desc{};
-    auto* vertex_code=draw.vertex.shader().bytecode.Get();
-    auto* pixel_code=draw.pixel.shader().bytecode.Get();
-    desc.vertex={static_cast<const uint8_t*>(vertex_code->GetBufferPointer()),vertex_code->GetBufferSize()};
-    desc.pixel={static_cast<const uint8_t*>(pixel_code->GetBufferPointer()),pixel_code->GetBufferSize()};
-    desc.vertex_id=draw.vertex_id;
-    desc.pixel_id=draw.pixel_id;
-    desc.input_layout=draw.layout;
-    desc.input_layout_id=draw.layout_id;
-    desc.state=draw.state;
-    desc.topology=draw.topology;
-    desc.render_targets=targets.count;
-    desc.rtv_format=targets.rtv_format;
-    desc.dsv_format=targets.dsv_format;
-    desc.sample_count=targets.samples;
-    auto& pipeline=backend.CreatePipeline(desc);
-    // A property of the two shaders and the layout, which is what the cached
-    // pipeline is keyed on, so it is decided once per pipeline: reflecting
-    // on every pipeline switch would cost more than the switch.
-    if(!pipeline.transient_batchable_known) {
-      pipeline.transient_batchable=NativePipelineTransientBatchable(draw.layout,
-        draw.vertex.shader().reflection.Get(),draw.pixel.shader().reflection.Get());
-      pipeline.transient_batchable_known=true;
-    }
-    if(auto* code=draw.vertex.shader().instanced_bytecode.Get(); code && !pipeline.world_instanced &&
-       draw.layout.size()<=28 && std::none_of(draw.layout.begin(),draw.layout.end(),
-         [](const auto& element) { return element.slot==15 || element.per_instance; })) {
-      edf::native::NativeOwnedInputLayout instanced_layout;
-      for(const auto& element:draw.layout) instanced_layout.Add(element.semantic,element.semantic_index,
-        element.format,element.slot,element.offset,element.per_instance,element.step_rate);
-      for(uint32_t row=0;row<4;++row)
-        instanced_layout.Add("EDFINSTANCE",row,DXGI_FORMAT_R32G32B32A32_FLOAT,15,row*16,true,1);
-      desc.vertex={static_cast<const uint8_t*>(code->GetBufferPointer()),code->GetBufferSize()};
-      desc.vertex_id|=uint64_t(1)<<63;
-      desc.input_layout=instanced_layout.elements();
-      desc.input_layout_id=instanced_layout.fingerprint();
-      pipeline.world_instanced=&backend.CreatePipeline(desc);
-      pipeline.instance_world_slot=draw.vertex.shader().instance_world_slot;
-      pipeline.instance_world_offset=draw.vertex.shader().instance_world_offset;
-    }
-    recorder.SetPipeline(pipeline);
-    last.pipeline=&pipeline;
-    last.vertex_id=draw.vertex_id; last.pixel_id=draw.pixel_id; last.layout_id=draw.layout_id;
-    last.state=draw.state; last.topology=draw.topology;
-    last.render_targets=targets.count; last.sample_count=targets.samples;
-    last.dsv_format=targets.dsv_format; last.rtv_format=targets.rtv_format;
-    // A blend factor belongs to the pipeline that was bound with it; a new
-    // pipeline has not been given one.
-    last.blend_factor_needed=false;
-  }
-  if(last.pipeline->requires_blend_factor()) {
-    const auto factor=GuestBlendFactorForDraw(reader,device);
-    if(!last.blend_factor_needed || factor!=last.blend_factor) {
-      recorder.SetBlendFactor(factor);
-      last.blend_factor=factor; last.blend_factor_needed=true;
-    }
-  }
-  // Constants are re-sent when they have changed. An activation patches the
-  // vertex constants between draws, which is the whole reason a run of
-  // otherwise identical draws exists - but the pixel constants usually do not
-  // move, and every re-send stages a copy in the backend's upload ring. The
-  // bindings count their own changes, so this is an integer comparison per
-  // register rather than the memcmp and the private copy it used to be.
-  const auto send=[&](edf::native::NativeBackendStage stage,
-                      edf::native::NativeConstantCache& sent,
-                      const edf::native::ShaderBindings& bindings) {
-    if(same_frame && sent.MatchesComplete(&bindings,bindings.constant_generation())) {
-      state.recorded_constant_skips+=bindings.ConstantImages().size();
-      return;
-    }
-    for(const auto& image:bindings.ConstantImages()) {
-      // Reflection order is not a binding slot. Different shaders can put
-      // identical bytes in different registers; each register must be bound.
-      if(same_frame && sent.Matches(image.slot,&bindings,*image.version)) {
-        ++state.recorded_constant_skips;
-        continue;
-      }
-      recorder.SetConstants(stage,image.slot,image.bytes);
-      sent.Store(image.slot,&bindings,*image.version);
-    }
-    sent.StoreComplete(&bindings,bindings.constant_generation());
-  };
-  send(edf::native::NativeBackendStage::Vertex,last.vertex_constants,draw.vertex);
-  send(edf::native::NativeBackendStage::Pixel,last.pixel_constants,draw.pixel);
-  if(&draw.pixel!=last.pixel || draw.pixel.resource_generation()!=last.pixel_resources || !same_frame) {
-    for(const auto& image:draw.pixel.TextureImages())
-      recorder.SetTexture(edf::native::NativeBackendStage::Pixel,image.slot,image.texture);
-    for(const auto& image:draw.pixel.SamplerImages())
-      recorder.SetSampler(edf::native::NativeBackendStage::Pixel,image.slot,image.sampler);
-    last.pixel=&draw.pixel;
-    last.pixel_resources=draw.pixel.resource_generation();
-  } else ++state.recorded_material_skips;
-  last.valid=true;
-  last.frame=state.scene_frames;
-  last.bind_generation=state.bind_generation;
-  return recorder;
-}
 // render_states[key], created on first use, as the UI draw paths look it up:
 // a std::map search of array keys per draw, where consecutive draws almost
 // always ask for the key they asked for last.
@@ -1604,6 +1334,7 @@ NativeRenderState& RenderStateLocked(Bridge& state,const RenderStateWords& key) 
   memo[1]=memo[0]; memo[0]={key,&found->second};
   return found->second;
 }
+}  // namespace (shared: bridge/bridge_shared.h)
 // samplers[key], created on the scene backend on first use; memoized likewise.
 NativeBackendSampler* SamplerLocked(Bridge& state,const SamplerStateWords& key) {
   auto& memo=state.sampler_memo;
@@ -1619,6 +1350,7 @@ NativeBackendSampler* SamplerLocked(Bridge& state,const SamplerStateWords& key) 
   memo[1]=memo[0]; memo[0]={key,found->second};
   return found->second;
 }
+namespace {
 // The immediate hook's pair classification, memoized (native_immediate_classify.h).
 const NativeImmediatePairMemo<Bridge::ImmediatePairShaders>::Entry&
 ClassifyImmediatePairLocked(Bridge& state,const GuestShaderPair& pair) {
@@ -1968,7 +1700,6 @@ void SetNativeMeshWatchAudit(std::weak_ptr<GuestMeshWatchAudit> audit) {
   std::lock_guard lock(state.mutex);
   state.mesh_watch_audit=std::move(audit);
 }
-namespace {
 std::array<float,4> ResolveBlendFactorForDraw(uint32_t device,
     const NativeRenderStateSnapshots::BlendWords* live) {
   auto& snapshots=State().render_state_snapshots;
@@ -1985,34 +1716,6 @@ std::array<float,4> ResolveBlendFactorForDraw(uint32_t device,
   const auto words=REXCVAR_GET(edf_native_owned_render_state)?snapshots.RequireBlend(device):*live;
   return {std::bit_cast<float>(words[0]),std::bit_cast<float>(words[1]),
           std::bit_cast<float>(words[2]),std::bit_cast<float>(words[3])};
-}
-}
-// make_reader supplies what the words are read through, inside the lock and
-// the try, as the plain overload always built its GuestReader: a caller that
-// already holds a validated window over the device (the material activation,
-// once per state override) reads them through it instead.
-template<class MakeReader>
-void PublishNativeRenderStateWith(uint32_t device,uint32_t producer,MakeReader&& make_reader) {
-  if((!REXCVAR_GET(edf_native_render_state_audit) && !REXCVAR_GET(edf_native_owned_render_state)) ||
-      !EDF_NATIVE_FLAG(shader_bridge)) return;
-  auto& state=State();
-  std::lock_guard lock(state.mutex);
-  try {
-    const auto fields=NativeRenderStateProducerFields(producer);
-    decltype(auto) reader=make_reader();
-    constexpr std::array<uint32_t,6> offsets{10424,10420,10440,10428,10332,11584};
-    NativeRenderStateSnapshots::Words words{};
-    for(size_t field=0;field<words.size();++field) if(fields&(1u<<field)) {
-      auto word=reader.Word(reader.Add(device,offsets[field]));
-      if(field==4) word&=15;
-      if(field==5) word=uint32_t(word!=0);
-      words[field]=word;
-    }
-    state.render_state_snapshots.Publish(device,words,producer,fields);
-  } catch(const std::exception& error) {
-    state.render_state_snapshots.Retire(device);
-    REXLOG_ERROR("Native render-state publication failed: device={:#x}, producer={:#x}, error={}",device,producer,error.what());
-  }
 }
 void PublishNativeRenderState(uint8_t* base,uint32_t device,uint32_t producer) {
   PublishNativeRenderStateWith(device,producer,[&] { return GuestReader(base); });
@@ -2037,29 +1740,12 @@ void AuditNativeRenderState(uint32_t device,const NativeRenderStateSnapshots::Wo
   }
 }
 template <typename Reader>
-NativeRenderStateSnapshots::Words ReadAuditedRenderStateWords(const Reader& reader,uint32_t device) {
-  return ResolveNativeRenderState(State().render_state_snapshots,device,
-    REXCVAR_GET(edf_native_owned_render_state),REXCVAR_GET(edf_native_render_state_audit),
-    [&]{return ReadRenderStateWords(reader,device);},
-    [&](const auto& live){AuditNativeRenderState(device,live);});
-}
-template <typename Reader>
 GuestXuiDeviceWords ReadAuditedXuiDeviceWords(const Reader& reader,uint32_t device) {
   if(REXCVAR_GET(edf_native_owned_render_state))
     return ReadXuiDeviceWords(reader,device,ReadAuditedRenderStateWords(reader,device));
   auto snapshot=ReadXuiDeviceWords(reader,device);
   AuditNativeRenderState(device,snapshot.render);
   return snapshot;
-}
-template <typename Reader>
-GuestViewportWords ReadNativeDrawViewportWords(const Reader& reader,uint32_t device) {
-  if(!REXCVAR_GET(edf_native_owned_render_state)) return ReadViewportWords(reader,device);
-  const auto render=ReadAuditedRenderStateWords(reader,device);
-  return ReadViewportWords(reader,device,render[5]!=0);
-}
-template <typename Reader>
-NativeViewportState ReadNativeDrawViewport(const Reader& reader,uint32_t device) {
-  return DecodeDrawViewport(ReadNativeDrawViewportWords(reader,device));
 }
 namespace {
 // The persistent cache root from --edf_native_cache_dir, applied before the
@@ -2466,7 +2152,7 @@ bool VisitNativePresentationContext(
 // Native mode is the only path permitted to publish guest GPU completion.
 // Cursor and fence come from the same completed native event, never from the
 // current issued value or an unsubmitted target. Caller holds the bridge lock.
-void PublishNativeCompletion(const GuestReader& reader,Bridge& state,uint32_t device,bool allow_flush=false) {
+void PublishNativeCompletion(const GuestReader& reader,Bridge& state,uint32_t device,bool allow_flush) {
   const auto found=state.completion_queues.find(device);
   if(found==state.completion_queues.end() || !found->second)
     throw std::runtime_error("native completion has no submitted queue");
@@ -2750,43 +2436,16 @@ REX_HOOK_RAW(sub_821A41E8) {
   if(trace) REXLOG_INFO("Native load request: disarmed manager={:#x}",manager);
 }
 REX_EXTERN(__imp__sub_821A4BA0);
-namespace {
-thread_local NativeLoopBudget native_loop_budget;
-struct NativeModelMotionState {
-  struct Source {
-    uint32_t vector=0,owner=0,node=0;
-    uint64_t publication=0;
-    edf::native::NativeModelPoseHistory history;
-    size_t history_bytes=0;
-    bool trace=false;
-    uint64_t samples=0,source_changes=0,rendered_changes=0,blended=0,trace_publication=0;
-    uint64_t source_hash=0,rendered_hash=0;
-  };
-  std::mutex mutex;
-  NativeLoopBudget published;
-  uint64_t publication=0;
-  uint32_t trace_sources=0;
-  std::unordered_map<uint32_t,Source> sources;
-  size_t history_bytes=0;
-  void Clear() { sources.clear(); history_bytes=0; }
-  void Erase(uint32_t address) {
-    const auto found=sources.find(address);
-    if(found==sources.end()) return;
-    history_bytes-=found->second.history_bytes;
-    sources.erase(found);
-  }
-};
-NativeModelMotionState& ModelMotionState() { static NativeModelMotionState value; return value; }
+thread_local constinit NativeLoopBudget native_loop_budget;
 // Leaked: guest frees (820B2510) may still arrive during static destruction.
 edf::native::NativeModelPublications& ModelPublications() { static auto* value=new edf::native::NativeModelPublications; return *value; }
 // Pose vectors rebuilt by 821C9478 during this thread's 821A4DE8 dirty walk
 // (slot +8 after the helper join); null outside that walk.
-thread_local std::vector<uint32_t>* native_model_dirty_poses=nullptr;
+thread_local constinit std::vector<uint32_t>* native_model_dirty_poses=nullptr;
 // World owners whose tree the 820B4250 post-hook published (current at the
 // time) since this thread's last 821A4DE8 publication, which skips them while
 // they are still current instead of comparing every tree byte a second time.
 thread_local std::vector<uint32_t> native_step_trees;
-}  // namespace (shared with the full frame: bridge/bridge_helpers.h)
 thread_local constinit NativeLoopBudget native_render_budget;
 thread_local constinit uint64_t native_render_publication=0;
 // Whether the guest render helper running on this thread (the 821A5080 hook's
@@ -2948,19 +2607,8 @@ REX_EXTERN(sub_821BCF28);
 REX_EXTERN(sub_821B94E8);
 REX_EXTERN(sub_821A79B8);
 namespace edf::native {
+thread_local constinit PostFinishRecorder* post_finish_recorder=nullptr;
 namespace {
-// Guest-thread only: the post chain, its setters and its quad draws all run
-// synchronously inside the hooked call.
-struct PostFinishRecorder {
-  uint32_t self=0;
-  std::set<uint32_t> targets,techniques;
-  PostFinishObservation seen;
-  uint64_t errors=0;
-  std::string first_error;
-  bool Effect(uint32_t effect) const { return effect>=self && effect-self<PostFinishLayout::kEffectSpan; }
-  void Fail(const std::exception& error) { if(!errors++) first_error=error.what(); }
-};
-thread_local PostFinishRecorder* post_finish_recorder=nullptr;
 struct PostFinishStats {
   uint64_t planned=0,rejected=0,audited=0,clean=0,mismatches=0,unobserved=0,recorder_errors=0;
   std::optional<std::array<float,3>> tone; // last values the native bindings reflected
@@ -3957,13 +3605,6 @@ REX_HOOK_RAW(sub_820B4250) {
 REX_EXTERN(__imp__sub_820B4310);
 REX_EXTERN(sub_821C61D8);
 REX_EXTERN(sub_821C3BB8);
-namespace edf::native {
-bool NativeStaticWorldPassEnabled();
-void RenderNativeStaticWorldPass(PPCContext& ctx,uint8_t* base,uint32_t owner);
-bool NativeModelPassEnabled();
-bool RenderNativeModelPass(PPCContext& ctx,uint8_t* base,const std::vector<NativePoseMatrix>* interpolated,
-  bool interpolating,bool render_dependent);
-}
 REX_HOOK_RAW(sub_820B4310) {
   if(REXCVAR_GET(edf_native_scene_group_order_audit)) {
     static thread_local std::vector<uint32_t> live;
@@ -4499,26 +4140,6 @@ REX_HOOK_RAW(sub_821D96D8) {
 }
 namespace edf::native {
 namespace {
-// Retains one descriptor's observed VB/IB snapshots as native indexed geometry
-// and commits them as the buffers' observed storage; throws if either buffer
-// changed generation or version meanwhile. Shared by the static preload and
-// the model pass, which draw the same 148-byte descriptor shape.
-std::shared_ptr<const NativeIndexedMesh::RetainedDraw> RetainNativeSceneGeometryLocked(Bridge& state,
-    const NativeSceneGeometrySource& input,const auto& vb,const auto& ib,const auto& declaration,const auto& shader,
-    const std::array<NativeBufferWrites::ObservedSnapshot,2>& observed) {
-  auto& backend=EnsureSceneBackendLocked(state);
-  auto& mesh=state.meshes.Acquire(backend,shader,
-    {input.vertex,input.index,input.declaration,input.shader,0},declaration->bytes(),input.stride,
-    *observed[0].contents,*observed[1].contents,ib.stride,declaration,{},
-    ib.index_storage,vb.vertex_storage,{},observed[0].contents,0,observed[1].contents);
-  auto geometry=state.scene_adapter.RetainGeometry(state.scene_backend,mesh,0,input.count);
-  if(!state.model_buffers.CommitObservedGeometry(
-      {input.vertex,vb.generation,observed[0].version},
-      {input.index,ib.generation,observed[1].version},
-      mesh.VertexStorage(),observed[0].contents,mesh.IndexStorage(),observed[1].contents))
-    throw std::runtime_error("native scene geometry changed before publication");
-  return geometry;
-}
 // Workers for the static preloads' per-group checks (edf_native_preload_workers).
 // Created on first use, so a run without a static world starts no thread.
 NativeDecodeWorkers& PreloadWorkers() {
@@ -4697,6 +4318,7 @@ void PreloadStaticSceneGeometryLocked(Bridge& state,const GuestReader& backing) 
       state.scene_sources.Groups().size(),state.scene_adapter.geometry_groups(),state.scene_geometry_loaded,
       state.scene_geometry_reused,state.scene_geometry_verified,state.scene_geometry_unchanged,state.scene_geometry_deferred);
 }
+}  // namespace (shared: bridge/bridge_shared.h)
 // Host identities behind a published material program: backend, schema,
 // shader variants and ready textures. Guest bytes are the caller's reads.
 bool NativeSceneMaterialHostCurrent(Bridge& state,const NativeSceneMaterialProgram& program,uint32_t material,
@@ -4719,62 +4341,7 @@ bool NativeSceneMaterialHostCurrent(Bridge& state,const NativeSceneMaterialProgr
   }
   return true;
 }
-// One material (a 112-byte pass record: +96/+104 state operations, +108 the
-// shader pair) as an owned program plus its constant layout and values.
-// Program inputs go through `recorder` (the change signal); constant values
-// through `reader`, unrecorded, for the per-use refresh. The previous program
-// is kept when every program input and host identity is unchanged.
-struct NativeSceneMaterialBuild {
-  std::shared_ptr<const NativeMaterialParameters::Groups> schema;
-  NativeSceneMaterialConstantLayout layout;
-  std::shared_ptr<const NativeSceneMaterialProgram> program;
-  std::vector<NativeSceneMaterialInputs::Constant> constants;
-  bool reused=false;
-};
-template<class Recorder,class Reader>
-NativeSceneMaterialBuild BuildNativeSceneMaterialLocked(Bridge& state,const Recorder& recorder,const Reader& reader,
-    uint32_t material,const NativeSceneMaterialProgram* previous) {
-  const auto pass=recorder.Word(recorder.Add(material,108));
-  const auto vertex=recorder.Word(recorder.Word(pass));
-  const auto pixel=recorder.Word(recorder.Add(recorder.Word(recorder.Add(pass,4)),4));
-  const auto& vs=state.shaders.at(vertex);
-  const auto& ps=state.shaders.at(pixel);
-  if(!vs.reversed_bindings) throw std::runtime_error("native material has no vertex variants");
-  NativeSceneMaterialBuild result;
-  result.schema=state.material_parameters.Get(material);
-  const auto& schema=*result.schema;
-  result.layout=ResolveNativeSceneMaterialConstants(schema,[&](bool pixel_stage,const std::string& name) {
-    return pixel_stage?ps.bindings->GuestFloatRegisterBytes(name):std::max(
-      vs.bindings->GuestFloatRegisterBytes(name),vs.reversed_bindings->GuestFloatRegisterBytes(name));
-  });
-  auto definition=ReadNativeSceneMaterialDefinition(recorder,material,schema,
-    [&](const std::string& name) { return ps.bindings->ResolveResource(name).used(); });
-  auto sampler_operations=ReadNativeMaterialSamplerOperations(recorder,schema);
-  result.constants=ReadNativeSceneMaterialConstants(reader,schema,result.layout);
-  std::vector<std::shared_ptr<NativeBackendTexture>> textures;
-  for(const auto& input:definition.textures) {
-    if(!input.handle) { textures.emplace_back(); continue; }
-    const auto texture=state.textures.find(input.handle);
-    if(texture==state.textures.end() || !texture->second.content_valid || !texture->second.backend)
-      throw std::runtime_error("native material texture is not ready");
-    textures.push_back(texture->second.backend);
-  }
-  if(previous && previous->inputs==definition && previous->textures==textures &&
-     previous->sampler_operations==sampler_operations && previous->backend==state.scene_backend &&
-     previous->vertex.bytecode==vs.bindings->shader().bytecode &&
-     previous->reversed_vertex.bytecode==vs.reversed_bindings->shader().bytecode &&
-     previous->pixel.bytecode==ps.bindings->shader().bytecode) {
-    result.reused=true;
-    return result;
-  }
-  auto program=std::make_shared<NativeSceneMaterialProgram>();
-  program->backend=state.scene_backend; program->inputs=std::move(definition); program->textures=std::move(textures);
-  program->sampler_operations=std::move(sampler_operations);
-  program->vertex=vs.bindings->shader(); program->reversed_vertex=vs.reversed_bindings->shader();
-  program->pixel=ps.bindings->shader();
-  result.program=std::move(program);
-  return result;
-}
+namespace {
 void PreloadStaticSceneMaterialsLocked(Bridge& state,const GuestReader& backing) {
   const NativeSceneCpuWindow reader(backing);
   // Program change signals: group revision, the descriptor's material, the
@@ -9126,9 +8693,8 @@ REX_HOOK_RAW(sub_821D76A8) {
 // Bulk writes can run under a native submission lock. Queue completed physical
 // writes without entering renderer state; the next indexed draw retires affected
 // storage. Scalar/inline stores and other native providers are not covered here.
-namespace {
 edf::native::NativeBufferWrites* NativeBufferWriteQueue(uint8_t* base,uint32_t destination,uint32_t bytes,
-    std::optional<edf::native::NativeBufferWrites::Range>* range=nullptr) {
+    std::optional<edf::native::NativeBufferWrites::Range>* range) {
   if(range) range->reset();
   auto* memory=REX_KERNEL_MEMORY();
   if(!EDF_NATIVE_FLAG(shader_bridge) || !memory || memory->virtual_membase()!=base) return nullptr;
@@ -9137,14 +8703,8 @@ edf::native::NativeBufferWrites* NativeBufferWriteQueue(uint8_t* base,uint32_t d
   if(range && !extent->all) *range=edf::native::NativeBufferWrites::Range{extent->address,extent->bytes};
   return &edf::native::BufferWrites();
 }
-edf::native::NativeBufferWrites::WriterScope BeginNativeBufferWrite(uint8_t* base,uint32_t destination,uint32_t bytes,bool exact=false,
-    edf::native::NativeBufferWrites::WriterKind kind=edf::native::NativeBufferWrites::WriterKind::Bulk) {
-  std::optional<edf::native::NativeBufferWrites::Range> range;
-  auto* queue=NativeBufferWriteQueue(base,destination,bytes,exact?&range:nullptr);
-  return edf::native::NativeBufferWrites::WriterScope(queue,range,kind);
-}
-void NotifyCompletedNativeBufferWrite(uint8_t* base,uint32_t destination,uint32_t bytes,bool notify_versions=false,bool generated=false,
-    edf::native::NativeBufferWrites::WriterSite site={nullptr,0}) {
+void NotifyCompletedNativeBufferWrite(uint8_t* base,uint32_t destination,uint32_t bytes,bool notify_versions,bool generated,
+    edf::native::NativeBufferWrites::WriterSite site) {
   if(!EDF_NATIVE_FLAG(shader_bridge) || !bytes || destination<0xa0000000u) return;
   auto* memory=REX_KERNEL_MEMORY();
   if(!memory || memory->virtual_membase()!=base) return;
@@ -9154,7 +8714,6 @@ void NotifyCompletedNativeBufferWrite(uint8_t* base,uint32_t destination,uint32_
   edf::native::BufferWrites().Record(extent->address,extent->bytes,generated,site);
   if(!extent->all && notify_versions && REXCVAR_GET(edf_native_mesh_watch_audit))
     edf::native::NotifyPhysicalProviderWrite(*memory,extent->address,extent->bytes);
-}
 }
 REX_EXTERN(__imp__sub_821E8320);
 // Called by the hash-gated native lock tail only after retained fence/range
