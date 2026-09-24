@@ -239,10 +239,24 @@ python tools/frame-time-report.py <log>
 python tools/renderer-runtime-gate.py <log> --baseline <baseline game.log> --expect-mission M202
 ```
 
-Each script brackets its phases with `mark` lines (`mark stress-ants swarm-begin`) and
+With hook timings on, a run writes more than the log's 5 MB rotation size, so the
+console lines of the early phases may be in `game.1.log` beside `game.log`
+(`log_max_file_size_mb`). Each script brackets its phases with `mark` lines (`mark stress-ants swarm-begin`) and
 prints `stats` in each, so the log says when the load was applied and what the game
 held at the time. Run the same scenario against two builds for before/after numbers;
 nothing in the scenario depends on the build.
+
+First runs (variant `unlocked`, uncapped, 1280x720, Core i7-14700 / RTX 4070 Ti SUPER,
+build 5de8cba; gameplay frame times from `frame-time-report.py`, the rest from the
+scripts' `stats`):
+
+| scenario | load | gameplay p50 / p99 / max (ms) | during the load |
+|---|---|---|---|
+| (baseline, all four) | Mission 1 street, 44 ants | | 224 FPS, step dispatch 2.6 ms |
+| stress-ants | 300 ants spawned, 336 live | 12.3 / 18.0 / 37.0 | 50-73 FPS; step dispatch 11-19 ms (CPU-bound in the simulation) |
+| stress-collapse | 657 map objects within 150 (54 buildings), then 10,688 (1,243 buildings) at once | 2.5 / 12.0 / 681.5 | 81 FPS after the near collapse; the whole-map collapse is one 0.7 s frame, then 69 ms 1% lows |
+| stress-effects | 20 waves of 240 explosions | 4.5 / 9.5 / 26.3 | 120-130 FPS; ~190 effect objects walked, ~130 drawn |
+| stress-mixed | 150 ants, 60 spiders, 20 UFOs, 400 map objects, 720 explosions | 8.5 / 30.3 / 311.3 | 21 FPS at the peak (step dispatch 48 ms), then 70-74 FPS |
 
 To add one: write `tools/console/<name>.cfg` (start with `waitmission`, bracket phases
 with `mark`, add `stats`), add a scenario entry with `"console"` pointing at it, and run
@@ -390,7 +404,10 @@ nothing is queued the cost is a lock and a few loads per engine iteration.
 - `timescale` does not stretch audio or movies; above about 3 the engine may not keep up
   (it runs at most 4 ticks per iteration).
 - `killall spawned` recognises objects by address; an address the game frees and reuses
-  could be misattributed.
+  could be misattributed, and an object whose game object is not the one CreateObject
+  returned (seen once with the ant hill) is missed; plain `killall` still gets it.
+- Killing a mission's own enemies advances its script like any other kill: in Mission 1,
+  repeated `killall` clears the waves and ends the mission.
 - The first spawn of a type the mission did not preload loads it synchronously on the
   engine thread (tens to hundreds of milliseconds).
 - Soldiers, vehicles and the mothership cannot be spawned.
