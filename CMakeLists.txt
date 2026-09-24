@@ -63,7 +63,8 @@ if(WIN32)
         src/native_graphics/edf/full_frame/effects_pass.cpp src/native_graphics/edf/full_frame/transparent_pass.cpp)
     # The hooks, by subsystem, out of the bridge the same way (bridge_shared.h is what they share with it).
     target_sources(edf2027 PRIVATE src/native_graphics/edf/hooks/diagnostics.cpp
-        src/native_graphics/edf/hooks/loading.cpp src/native_graphics/edf/hooks/resources.cpp)
+        src/native_graphics/edf/hooks/loading.cpp src/native_graphics/edf/hooks/resources.cpp
+        src/native_graphics/edf/hooks/hud.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_fallback_imports.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_full_frame_sky.cpp)
     target_sources(edf2027 PRIVATE src/native_graphics/native_preview_window.cpp)
