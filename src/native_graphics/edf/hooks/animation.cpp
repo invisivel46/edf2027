@@ -9,6 +9,13 @@
 //   edf_native_skeletal_eval         native 821CE848
 //   edf_native_skeletal_propagation  native 821D1688 (every entry: 821C8C58's
 //                                    roots, 821D16E8's grandchildren, ...)
+//   edf_native_skeletal_batched      the evaluation four records at a time
+//                                    (NativeSkeletalEvaluate); off: one at a
+//                                    time (NativeSkeletalEvaluateScalar). The
+//                                    same bits either way.
+//   edf_native_skeletal_rotation_cache  memoise the constant rotations (channel
+//                                    flag 16) by their angles' bits (batched
+//                                    evaluation only; per thread)
 //   edf_native_skeletal_audit        each call computes natively into guest
 //                                    memory, snapshots that, restores the
 //                                    inputs, runs the original and compares
@@ -51,6 +58,10 @@ REXCVAR_DEFINE_BOOL(edf_native_skeletal_propagation,true,"EDF2027",
   "Propagate model hierarchies (821D1688: node world = local x parent, recursively) natively, bit for bit as the recompiled code");
 REXCVAR_DEFINE_BOOL(edf_native_skeletal_matrix,true,"EDF2027",
   "Run every 4x4 multiply 821C8198 (hierarchy worlds, skinning palettes 821C9478, view and effect matrices) natively with its guest memory effects, bit for bit");
+REXCVAR_DEFINE_BOOL(edf_native_skeletal_batched,true,"EDF2027",
+  "Evaluate animation slots natively four records at a time (the rotations in AVX2 lanes); off: one record at a time. The same bits either way");
+REXCVAR_DEFINE_BOOL(edf_native_skeletal_rotation_cache,true,"EDF2027",
+  "Memoise the batched native evaluation's constant Euler rotations (channel flag 16) by their angles' bits, a pure function of them under the usual constants and MXCSR (checked)");
 REXCVAR_DEFINE_BOOL(edf_native_skeletal_audit,false,"EDF2027",
   "Run the native skeletal evaluation and propagation beside the originals and compare every output byte; the originals' results are kept (development)");
 
@@ -76,8 +87,15 @@ struct GuestDirect {
   void StoreU32(uint32_t address,uint32_t value) const { value=_byteswap_ulong(value); std::memcpy(At(address),&value,4); }
   void StoreU64(uint32_t address,uint64_t value) const { value=_byteswap_uint64(value); std::memcpy(At(address),&value,8); }
   const uint8_t* Row(uint32_t address) const { return At(address); }
-  // A 16-byte aligned row never straddles 0xE0000000.
+  // A 16-byte aligned row never straddles 0xE0000000 (native_skeletal.h checks
+  // the unaligned rows it loads and stores through Row/StoreRow).
   void StoreRow(uint32_t address,__m128i bytes) const { _mm_storeu_si128(reinterpret_cast<__m128i*>(At(address)),bytes); }
+  // [address, address+size) through one host pointer, unless it crosses the
+  // jump at 0xE0000000.
+  uint8_t* Host(uint32_t address,uint32_t size) const {
+    return address<0xE0000000u && address+size>0xE0000000u?nullptr:At(address);
+  }
+  void Prefetch(uint32_t address) const { _mm_prefetch(reinterpret_cast<const char*>(At(address)),_MM_HINT_T0); }
 };
 
 // The object Animation_Update is running for (mismatch detail only).
@@ -88,7 +106,8 @@ thread_local constinit uint32_t skeletal_passthrough=0;
 
 // ---- Timings (edf_native_hook_timings). ----
 struct SkeletalTimes {
-  uint64_t update_calls=0,eval_calls=0,eval_records=0,propagate_calls=0,propagate_nodes=0;
+  uint64_t update_calls=0,eval_calls=0,eval_records=0,eval_blended_calls=0,eval_blended_records=0,
+    propagate_calls=0,propagate_nodes=0;
   double update_ms=0,eval_ms=0,propagate_ms=0;
   // Audit mode: the native and the original halves of the same calls.
   double audit_eval_native_ms=0,audit_eval_guest_ms=0,audit_propagate_native_ms=0,audit_propagate_guest_ms=0;
@@ -98,10 +117,18 @@ SkeletalTimes& Times() {
   static thread_local SkeletalTimes times;
   return times;
 }
+// The constant-rotation memo (native_skeletal.h), per thread; null when off.
+NativeSkeletalRotationCache& RotationCache() { static thread_local NativeSkeletalRotationCache cache; return cache; }
+NativeSkeletalRotationCache* SelectedRotationCache() {
+  return REXCVAR_GET(edf_native_skeletal_rotation_cache)?&RotationCache():nullptr;
+}
 const char* SkeletalMode() {
   if(REXCVAR_GET(edf_native_skeletal_audit)) return "audit";
   const bool eval=REXCVAR_GET(edf_native_skeletal_eval),propagation=REXCVAR_GET(edf_native_skeletal_propagation);
-  return eval?(propagation?"native":"native_eval"):(propagation?"native_propagation":"guest");
+  if(!eval) return propagation?"native_propagation":"guest";
+  const bool batched=REXCVAR_GET(edf_native_skeletal_batched),cached=REXCVAR_GET(edf_native_skeletal_rotation_cache);
+  if(propagation) return batched?(cached?"native":"native_uncached"):"native_scalar";
+  return batched?(cached?"native_eval":"native_eval_uncached"):"native_eval_scalar";
 }
 void MaybeReportTimes(SkeletalTimes& t,Clock::time_point now) {
   if(t.reported==Clock::time_point{}) { t.reported=now; return; }
@@ -110,10 +137,13 @@ void MaybeReportTimes(SkeletalTimes& t,Clock::time_point now) {
   REXLOG_INFO("Native skeletal timing: thread={} mode={} interval_s={:.2f} update calls={} ms={:.3f} "
     "eval calls={} records={} ms={:.3f} us/record={:.4f} propagate calls={} nodes={} ms={:.3f} "
     "audit[eval native/guest ms={:.3f}/{:.3f} propagate native/guest ms={:.3f}/{:.3f}] "
+    "blended calls={} records={} rotation_cache hits={} misses={} "
     "(inclusive CPU wall time; eval and propagate are inside update when called from it)",
     GetCurrentThreadId(),SkeletalMode(),seconds,t.update_calls,t.update_ms,t.eval_calls,t.eval_records,t.eval_ms,
     t.eval_records?t.eval_ms*1000.0/double(t.eval_records):0.0,t.propagate_calls,t.propagate_nodes,t.propagate_ms,
-    t.audit_eval_native_ms,t.audit_eval_guest_ms,t.audit_propagate_native_ms,t.audit_propagate_guest_ms);
+    t.audit_eval_native_ms,t.audit_eval_guest_ms,t.audit_propagate_native_ms,t.audit_propagate_guest_ms,
+    t.eval_blended_calls,t.eval_blended_records,RotationCache().hits,RotationCache().misses);
+  RotationCache().hits=RotationCache().misses=0;
   const auto reported=now;
   t=SkeletalTimes{};
   t.reported=reported;
@@ -130,6 +160,13 @@ class SkeletalTiming {
   bool on_;
   Clock::time_point start_{};
 };
+
+// The native evaluation the cvars select (the audit checks the same one).
+template<class M>
+NativeSkeletalEvalStats EvaluateSelected(const M& m,uint32_t slot) {
+  if(REXCVAR_GET(edf_native_skeletal_batched)) return NativeSkeletalEvaluate(m,slot,SelectedRotationCache());
+  return NativeSkeletalEvaluateScalar(m,slot);
+}
 
 // ---- Audit. ----
 struct AuditRegion { uint32_t address,size; int32_t record; uint32_t kind; };  // kind 0 slot byte, 1 record, 2 local, 3 world
@@ -227,7 +264,7 @@ void AuditEvaluate(PPCContext& ctx,uint8_t* base) {
   const bool timed=REXCVAR_GET(edf_native_hook_timings);
   auto t0=timed?Clock::now():Clock::time_point{};
   ctx.fpscr.disableFlushMode();
-  NativeSkeletalEvaluate(m,slot);
+  EvaluateSelected(m,slot);
   auto t1=timed?Clock::now():Clock::time_point{};
   Snapshot(m,regions,native);
   Restore(m,regions,before);
@@ -364,8 +401,11 @@ void AuditMultiply(PPCContext& ctx,uint8_t* base) {
 // Out of line, so the compiler cannot move the vector math across the flush-mode
 // change (ldmxcsr) the hook makes before calling them.
 __declspec(noinline) void RunNativeEvaluate(uint8_t* base,uint32_t slot,SkeletalTimes* times) {
-  const auto stats=NativeSkeletalEvaluate(GuestDirect{base},slot);
-  if(times) times->eval_records+=stats.records;
+  const auto stats=EvaluateSelected(GuestDirect{base},slot);
+  if(times) {
+    times->eval_records+=stats.records;
+    if(stats.blended) { ++times->eval_blended_calls; times->eval_blended_records+=stats.records; }
+  }
 }
 __declspec(noinline) void RunNativeMultiply(uint8_t* base,uint32_t out,uint32_t a,uint32_t b,uint32_t stack) {
   NativeSkeletalMultiply(GuestDirect{base},out,a,b,stack);
