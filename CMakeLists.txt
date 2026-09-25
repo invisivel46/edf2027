@@ -229,6 +229,16 @@ if(EDF_CODEGEN_EXPERIMENT)
         "${CMAKE_SOURCE_DIR}/src/codegen_experiments/guest_codegen_experiments.h")
     message(WARNING "EDF_CODEGEN_EXPERIMENT=${EDF_CODEGEN_EXPERIMENT}: timing-only, inexact guest code")
 endif()
+# Differential audit of the codegen fork's locals form (docs/codegen-fork.md). Needs
+# edf_ipa_audit = true in edf2017_codegen_fork.toml (the generated wrappers call
+# edf_ipa_audit()); journals every guest scalar store, so audit builds only.
+option(EDF_CODEGEN_FORK_AUDIT "Codegen fork: link the differential audit and journal guest stores" OFF)
+if(EDF_CODEGEN_FORK_AUDIT)
+    target_sources(edf2027 PRIVATE src/codegen_fork/ipa_audit.cpp)
+    target_precompile_headers(edf2027_recomp PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/codegen_fork/ipa_audit_pch.h")
+    message(WARNING "EDF_CODEGEN_FORK_AUDIT: audit build (journaled guest stores)")
+endif()
 
 set(_native_indexed_tail ${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/native_indexed_completion.cpp)
 target_sources(edf2027 PRIVATE ${_native_indexed_tail})

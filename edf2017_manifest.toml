@@ -8,4 +8,4 @@ game_root = "../edf3-translation-project/work/x360"
 [entrypoint]
 file_path = "../edf3-translation-project/work/x360/default.xex"
 out_directory_path = "generated/default"
-includes = ["edf2017_overrides.toml"]
+includes = ["edf2017_overrides.toml", "edf2017_codegen_fork.toml"]
