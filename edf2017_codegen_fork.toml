@@ -3,8 +3,8 @@
 # Build with -DEDF_REXGLUE_CODEGEN_EXE=<fork>/out/win-amd64/Release/rexglue.exe.
 
 # Guest registers as C++ locals with PPCContext synced at calls and exits from
-# interprocedural READS/WRITES summaries. Off by default.
-edf_ipa_locals = false
+# interprocedural READS/WRITES summaries. On (exact mode), with the fast register-passing ABI below.
+edf_ipa_locals = true
 
 # Differential audit (needs -DEDF_CODEGEN_FORK_AUDIT=ON): replayable functions get both
 # bodies and a wrapper calling edf_ipa_audit() (src/codegen_fork/ipa_audit.cpp).
@@ -19,7 +19,7 @@ edf_ipa_abi_boundary = false
 # Model RTTI virtual calls by vtable slot target sets behind a runtime guard (negative result,
 # docs/codegen-fork.md step 2), and __fast_sub_X register-passing variants (step 3).
 edf_ipa_vtables = false
-edf_ipa_fast_abi = false
+edf_ipa_fast_abi = true
 
 # Static survey of the pass (one JSON object per function).
 edf_ipa_report = "out/codegen-fork/ipa-report.jsonl"

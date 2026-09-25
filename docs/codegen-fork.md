@@ -9,7 +9,41 @@ arithmetic and the physical-offset check (15%), calls and save/restore (6-8%).
 
 This page covers the fork, the first optimization (guest registers as C++ locals with an
 interprocedural call protocol), the in-process exactness audit, the static ABI survey,
-and what comes next. Everything is opt-in; the default build is unchanged.
+and what comes next. Exact locals + the fast ABI are the default build on this branch (next section); everything else is opt-in.
+
+## The default build uses the fork
+
+On this branch the release build's guest code comes from the fork with **exact locals +
+the fast ABI** (`edf_ipa_locals = true`, `edf_ipa_fast_abi = true`; `edf_ipa_abi_boundary`,
+`edf_ipa_vtables` and `edf_ipa_audit` stay off). `generated/default` is tracked, and the
+committed text is what the fork emits for the committed manifest.
+
+How the build guarantees that the fork runs:
+
+- `edf2017_codegen_fork.toml` turns fork options on, and configure notices (a regex over
+  the file, which is also a configure dependency). Then configure **requires** the fork:
+  - `EDF_REXGLUE_CODEGEN_EXE` (cache variable; default: the `EDF_REXGLUE_CODEGEN_EXE`
+    environment variable, else `D:/roms2/rexglue-sdk-edf/out/win-amd64/Release/rexglue.exe`
+    if it exists) must exist;
+  - `rexglue.exe --edf-fork-version` must print exactly `EDF_CODEGEN_FORK_VERSION`
+    (`CMakeLists.txt`, currently `edf-codegen-3`). The stock SDK tool prints nothing, so it
+    fails with "reports codegen version '', this tree needs 'edf-codegen-3'".
+  - The codegen custom command is pointed at that exe and depends on it.
+- So a stock `rexglue.exe` can never silently regenerate the old code: configure fails
+  before any build step runs. `build.cmd win-amd64-release [package_release]`,
+  `tools/pgo-train.ps1` and every preset need no extra flags on a machine where the fork
+  is built at the default path.
+- The fork bumps `kForkVersion` (`src/codegen/edf_ipa.h`) whenever its output can change for
+  the same manifest; the game bumps `EDF_CODEGEN_FORK_VERSION` together with the regenerated
+  `generated/default`. The codegen fingerprint also includes the tool's own image hash, so
+  rebuilding the tool re-runs codegen (identical output, new stamp).
+- To go back to the stock generator, set the fork options to `false`; configure then
+  uses the SDK's tool and codegen regenerates the stock text.
+
+Pinned fork: `D:\roms2\rexglue-sdk-edf`, branch `edf-codegen` (local only; it is not a
+submodule because the fork must not be pushed anywhere). The version string identifies the
+fork commit range whose output this tree was generated with; the commit at the time of
+writing is in the commit message of the change that set `EDF_CODEGEN_FORK_VERSION`.
 
 ## Where things are
 

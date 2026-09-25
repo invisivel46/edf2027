@@ -20,6 +20,13 @@ following to `out/package/` (`EDF2027_PACKAGE_ROOT`):
 | `EDF2027-PC-<version>-<commit>.zip` | the release zip; it holds that folder |
 | `EDF2027-PC-<version>-<commit>-symbols.zip` | `edf2027.pdb`, for crash dumps from this exact build |
 
+The guest code (`generated/default`) is emitted by the local ReXGlue codegen fork, and
+configure refuses to run without it: `EDF_REXGLUE_CODEGEN_EXE` (default
+`D:/roms2/rexglue-sdk-edf/out/win-amd64/Release/rexglue.exe`) must report the pinned
+`EDF_CODEGEN_FORK_VERSION` through `rexglue.exe --edf-fork-version`. Build the fork first on
+a new machine ([codegen-fork.md](codegen-fork.md), "Building the fork"). The runtime
+(`rexruntime.dll`) is still the prebuilt SDK's.
+
 If tracked files differ from the commit, the name ends in `-dirty` and CMake prints a
 warning. Build releases from a clean checkout. The codegen stamp that every configure
 rewrites doesn't count as a change.

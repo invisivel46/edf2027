@@ -87,4 +87,5 @@ set(GENERATED_SOURCES
     ${CMAKE_CURRENT_LIST_DIR}/edf2017_recomp.78.cpp
     ${CMAKE_CURRENT_LIST_DIR}/edf2017_recomp.79.cpp
     ${CMAKE_CURRENT_LIST_DIR}/edf2017_recomp.80.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/edf2017_edf_vtables.cpp
 )

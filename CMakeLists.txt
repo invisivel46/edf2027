@@ -42,15 +42,40 @@ endif()
 
 include(generated/rexglue.cmake)
 
-# Opt-in: run codegen with a custom rexglue.exe (the local codegen fork, docs/codegen-fork.md)
-# while the game keeps linking the prebuilt SDK runtime. Only the codegen tool changes; the
-# generated code's contract with rexruntime.dll (PPCContext layout, dispatch table, exports)
-# stays the same. Empty = the SDK's own rexglue.exe.
-set(EDF_REXGLUE_CODEGEN_EXE "" CACHE FILEPATH
-    "Custom rexglue.exe used for the codegen step (empty = the SDK's bin/rexglue.exe)")
-if(EDF_REXGLUE_CODEGEN_EXE)
-    if(NOT EXISTS "${EDF_REXGLUE_CODEGEN_EXE}")
-        message(FATAL_ERROR "EDF_REXGLUE_CODEGEN_EXE does not exist: ${EDF_REXGLUE_CODEGEN_EXE}")
+# Guest codegen: the local ReXGlue codegen fork (docs/codegen-fork.md). The game keeps
+# linking the prebuilt SDK runtime; only the codegen tool differs. When
+# edf2017_codegen_fork.toml turns fork options on, the codegen step must run the fork at
+# exactly the pinned version: a stock rexglue.exe ignores those options and would silently
+# regenerate the old code, so configure fails instead.
+set(EDF_CODEGEN_FORK_VERSION "edf-codegen-3")  # what `rexglue --edf-fork-version` must print
+set(_edf_fork_default "")
+if(DEFINED ENV{EDF_REXGLUE_CODEGEN_EXE})
+    set(_edf_fork_default "$ENV{EDF_REXGLUE_CODEGEN_EXE}")
+elseif(EXISTS "D:/roms2/rexglue-sdk-edf/out/win-amd64/Release/rexglue.exe")
+    set(_edf_fork_default "D:/roms2/rexglue-sdk-edf/out/win-amd64/Release/rexglue.exe")
+endif()
+set(EDF_REXGLUE_CODEGEN_EXE "${_edf_fork_default}" CACHE FILEPATH
+    "rexglue.exe of the codegen fork (edf-codegen branch) used for the codegen step")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/edf2017_codegen_fork.toml" _edf_fork_toml)
+string(REGEX MATCH "\n(edf_ipa_locals|edf_ipa_fast_abi|edf_ipa_abi_boundary|edf_ipa_vtables|edf_ipa_audit)[ \t]*=[ \t]*true" _edf_fork_needed "\n${_edf_fork_toml}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/edf2017_codegen_fork.toml")
+if(_edf_fork_needed OR EDF_REXGLUE_CODEGEN_EXE)
+    if(NOT EDF_REXGLUE_CODEGEN_EXE OR NOT EXISTS "${EDF_REXGLUE_CODEGEN_EXE}")
+        message(FATAL_ERROR
+            "edf2017_codegen_fork.toml enables codegen-fork options, but the fork's rexglue.exe "
+            "was not found ('${EDF_REXGLUE_CODEGEN_EXE}'). Build it (docs/codegen-fork.md, "
+            "'Building the fork') and pass -DEDF_REXGLUE_CODEGEN_EXE=<path> or set the "
+            "EDF_REXGLUE_CODEGEN_EXE environment variable.")
+    endif()
+    execute_process(COMMAND "${EDF_REXGLUE_CODEGEN_EXE}" --edf-fork-version
+        OUTPUT_VARIABLE _edf_fork_version OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _edf_fork_rc ERROR_QUIET)
+    if(NOT _edf_fork_rc EQUAL 0 OR NOT _edf_fork_version STREQUAL EDF_CODEGEN_FORK_VERSION)
+        message(FATAL_ERROR
+            "${EDF_REXGLUE_CODEGEN_EXE} reports codegen version '${_edf_fork_version}', "
+            "this tree needs '${EDF_CODEGEN_FORK_VERSION}'. Rebuild the fork at the matching "
+            "edf-codegen commit (docs/codegen-fork.md).")
     endif()
     if(TARGET rex::rexglue)
         foreach(_edf_cfg "" _RELEASE _DEBUG _RELWITHDEBINFO _MINSIZEREL)
@@ -63,7 +88,7 @@ if(EDF_REXGLUE_CODEGEN_EXE)
         OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/codegen.build.stamp"
         DEPENDS "${EDF_REXGLUE_CODEGEN_EXE}"
         APPEND)
-    message(STATUS "Codegen uses custom rexglue.exe: ${EDF_REXGLUE_CODEGEN_EXE}")
+    message(STATUS "Codegen: fork ${_edf_fork_version} at ${EDF_REXGLUE_CODEGEN_EXE}")
 endif()
 
 # Sources
