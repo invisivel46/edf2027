@@ -8,6 +8,23 @@
 #include <thread>
 
 namespace edf::native {
+// The ticker's next timed wake: the next slot of an absolute grid of `period`
+// (previous deadline + period), so the paint cadence averages exactly the
+// period whatever the wake-up latency. It restarts at now + period (no
+// catch-up burst) when that slot has already passed (a late wake or a long
+// dispatch) or lies more than a period ahead (the period shrank, or request
+// wakes pushed it forward), and on the first call (previous is the epoch).
+// The previous rule, now + period after each dispatch, added every wake's
+// latency to the period: the locked 60 Hz presenter ran at 17.47 ms, 57.2 FPS,
+// and the game, whose frame queue that presenter backpressures, rendered
+// 57.2 frames for 60 simulation steps a second (one frame in twenty ran two).
+template<class TimePoint,class Duration>
+TimePoint NextUiTickerDeadline(TimePoint previous,TimePoint now,Duration period) {
+  if(previous==TimePoint{}) return now+period;
+  const auto next=previous+period;
+  if(next<=now || next>now+period) return now+period;
+  return next;
+}
 // Dispatcher must enqueue without waiting for UI execution. At most one callback
 // may be queued/executing. Stop never waits for the UI to drain that callback.
 class NativeUiTicker {
@@ -15,7 +32,7 @@ class NativeUiTicker {
   using Dispatch=std::function<bool(std::function<void()>)>;
   NativeUiTicker(Dispatch dispatch,std::function<void()> paint)
       : state_(std::make_shared<State>()),thread_([state=state_,dispatch=std::move(dispatch),paint=std::move(paint)](std::stop_token stop) {
-        auto deadline=std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point deadline{};
         std::unique_lock lock(state->mutex);
         while(!stop.stop_requested()) {
           if(!state->pending.exchange(true)) {
@@ -39,8 +56,8 @@ class NativeUiTicker {
             }
             lock.lock();
           }
-          const auto now=std::chrono::steady_clock::now();
-          deadline=now+std::chrono::nanoseconds(state->period.load());
+          deadline=NextUiTickerDeadline(deadline,std::chrono::steady_clock::now(),
+            std::chrono::nanoseconds(state->period.load()));
           state->wake.wait_until(lock,stop,deadline,[&]{
             return state->requested && !state->occluded && !state->pending.load();
           });

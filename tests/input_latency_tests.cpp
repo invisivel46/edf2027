@@ -237,6 +237,31 @@ void TestPresentSlot() {
 }
 
 // ---- the presenter's ticker --------------------------------------------------------------
+void TestTickerDeadlineGrid() {
+  using Clock = std::chrono::steady_clock;
+  using std::chrono::nanoseconds;
+  const nanoseconds period(16'666'667);
+  const Clock::time_point origin = Clock::time_point{} + std::chrono::hours(1);
+  Check(edf::native::NextUiTickerDeadline(Clock::time_point{}, origin, period) == origin + period,
+        "the first timed wake is one period from now");
+  // Wakes that land 0..1.4 ms after their slot (timer latency) keep the grid: 600 wakes span
+  // exactly 600 periods, where now + period after each wake ran 0.7 ms per wake slow (57.2 Hz).
+  Clock::time_point deadline{}, now = origin, first{};
+  for (int i = 0; i < 601; ++i) {
+    deadline = edf::native::NextUiTickerDeadline(deadline, now, period);
+    if (i == 0) first = deadline;
+    now = deadline + nanoseconds((i * 7919 % 15) * 100'000);  // the next wake, 0..1.4 ms late
+  }
+  Check(deadline - first == period * 600, "timed wakes keep an absolute grid (60.000 Hz on average)");
+  // A wake later than the next slot restarts the grid at now + period (no catch-up burst).
+  const auto late = origin + period * 2 + nanoseconds(1'000'000);
+  Check(edf::native::NextUiTickerDeadline(origin + period, late, period) == late + period,
+        "a slot that has passed restarts the grid");
+  // A slot more than one period ahead (the period shrank from the occluded 250 ms) restarts it.
+  Check(edf::native::NextUiTickerDeadline(origin + std::chrono::milliseconds(250), origin, period) == origin + period,
+        "a slot more than a period ahead restarts the grid");
+}
+
 void TestTickerBeforeDispatch() {
   std::mutex mutex;
   std::vector<char> order;
@@ -558,6 +583,7 @@ int main() {
   TestSummaries();
   TestMouseRouter();
   TestPresentSlot();
+  TestTickerDeadlineGrid();
   TestTickerBeforeDispatch();
   TestFrameFlight();
   TestFrameQueueModes();
