@@ -42,6 +42,30 @@ endif()
 
 include(generated/rexglue.cmake)
 
+# Opt-in: run codegen with a custom rexglue.exe (the local codegen fork, docs/codegen-fork.md)
+# while the game keeps linking the prebuilt SDK runtime. Only the codegen tool changes; the
+# generated code's contract with rexruntime.dll (PPCContext layout, dispatch table, exports)
+# stays the same. Empty = the SDK's own rexglue.exe.
+set(EDF_REXGLUE_CODEGEN_EXE "" CACHE FILEPATH
+    "Custom rexglue.exe used for the codegen step (empty = the SDK's bin/rexglue.exe)")
+if(EDF_REXGLUE_CODEGEN_EXE)
+    if(NOT EXISTS "${EDF_REXGLUE_CODEGEN_EXE}")
+        message(FATAL_ERROR "EDF_REXGLUE_CODEGEN_EXE does not exist: ${EDF_REXGLUE_CODEGEN_EXE}")
+    endif()
+    if(TARGET rex::rexglue)
+        foreach(_edf_cfg "" _RELEASE _DEBUG _RELWITHDEBINFO _MINSIZEREL)
+            set_target_properties(rex::rexglue PROPERTIES
+                IMPORTED_LOCATION${_edf_cfg} "${EDF_REXGLUE_CODEGEN_EXE}")
+        endforeach()
+    endif()
+    # Re-run codegen when the tool itself is rebuilt (the depfile only lists its inputs).
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/codegen.build.stamp"
+        DEPENDS "${EDF_REXGLUE_CODEGEN_EXE}"
+        APPEND)
+    message(STATUS "Codegen uses custom rexglue.exe: ${EDF_REXGLUE_CODEGEN_EXE}")
+endif()
+
 # Sources
 set(EDF2027_SOURCES
     src/main.cpp
