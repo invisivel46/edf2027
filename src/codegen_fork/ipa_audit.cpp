@@ -142,7 +142,12 @@ void CompareContexts(const PPCContext& a, const PPCContext& b, const LiveOut& li
   }
 }
 
-void Report(bool force) {
+}  // namespace
+extern "C" uint32_t edf_vt_miss_count();
+extern "C" uint32_t edf_vt_verify(const uint8_t* base);
+namespace {
+
+void Report(bool force, const uint8_t* base) {
   int64_t now = NowMs();
   int64_t last = g_last_report_ms.load(std::memory_order_relaxed);
   if (!force && now - last < 10000)
@@ -151,9 +156,10 @@ void Report(bool force) {
     return;
   REXLOG_INFO(
       "IPA audit: audited={} functions={} mismatches={} (registers {}, memory {}) "
-      "functions_mismatched={}",
+      "functions_mismatched={} vtable_guard_misses={} vtable_words_changed={}",
       g_audited.load(), g_functions_audited.load(), g_mismatches.load(), g_reg_mismatches.load(),
-      g_mem_mismatches.load(), g_functions_mismatched.load());
+      g_mem_mismatches.load(), g_functions_mismatched.load(), edf_vt_miss_count(),
+      edf_vt_verify(base));
 }
 
 }  // namespace
@@ -243,5 +249,5 @@ extern "C" void edf_ipa_audit(uint32_t index, uint32_t addr, PPCContext& ctx, ui
     }
   }
   --t_depth;
-  Report(false);
+  Report(false, base);
 }

@@ -57,6 +57,8 @@ a rebuilt tool re-runs codegen instead of trusting the old stamp.
 |---|---|---|
 | `edf_ipa_locals` | false | the pass below |
 | `edf_ipa_abi_boundary` | false | trust the PPC ABI at opaque boundaries (below); not bit-exact for dead volatile values |
+| `edf_ipa_vtables` | false | model RTTI virtual calls by slot target sets, guarded (step 2; negative result) |
+| `edf_ipa_fast_abi` | false | `__fast_sub_X` register-passing variants (step 3) |
 | `edf_ipa_audit` | false | emit both bodies of every replayable function plus a wrapper calling `edf_ipa_audit()`; needs `-DEDF_CODEGEN_FORK_AUDIT=ON` |
 | `edf_ipa_only` / `edf_ipa_exclude` | [] | restrict the pass to / keep out of it (the 138 bodies fingerprinted by `tools/extract-native-*.cmake` are excluded, so those scripts keep passing) |
 | `edf_hooked` | 293 addresses | functions replaced by native hooks in this build (`sub_X != __imp__sub_X` in the PDB) |
@@ -249,55 +251,143 @@ bodies moved both ways: 8211CE10 903 -> 701 (-22%), 821C9688 1010 -> 780 (-23%),
 821AEE50 1252 -> 1251, 821C58F8 474 -> 724 (+53%), 821AF7A0 289 -> 457 (+58%). Whether
 the trade pays is a timing question (below).
 
+## Timing (engine step dispatch ms per simulation step)
+
+`tools/codegen-fork/time-series.ps1` runs the variants interleaved (round-robin, 3 rounds)
+through `run-timed.ps1` (phase 1's script: waits for a quiet machine - no other EDF game,
+no clang/ninja/lld - runs uncapped and muted with `--edf_step_timing`) and `tim.py`
+summarizes: Mission 1 = benchmark route, `MISSION.CAM` +20..+80 s; horde = 1000 ants,
+`hold-begin`..`hold-end`. All nopgo builds. Median of 3 runs (range):
+
+| variant | options | M1 ms/step | vs base | horde ms/step | vs base | horde steps/s |
+|---|---|---|---|---|---|---|
+| base | stock codegen | 2.034 (1.978-2.189), n=6 | | 24.18 (21.84-25.29), n=6 | | 35.1 |
+| ipa-exact | `edf_ipa_locals` | 1.615 (1.587-1.719), n=6 | **-20.6%** | 20.57 (17.97-22.22), n=6 | **-14.9%** | 40.4 |
+| ipa-abi | + `edf_ipa_abi_boundary` | 1.529 (1.439-1.537) | -24.9% | 18.73 (17.90-19.20) | -22.5% | 46.7 |
+| vt-exact | + `edf_ipa_vtables` | 1.690 (1.603-1.741) | -17.0% | 21.04 (20.49-21.65) | -13.0% | 41.3 |
+| fast-exact | + `edf_ipa_fast_abi` | 1.535 (1.513-1.627) | **-24.6%** | 19.93 (19.31-20.55) | **-17.5%** | 43.0 |
+| fast-abi | fast + ABI boundary | 1.562 (1.558-1.651) | -23.2% | 19.59 (19.36-19.95) | -19.0% | 43.4 |
+
+Rounds 1-3 (base, ipa-exact, ipa-abi) and 4-6 (base, ipa-exact, vt-exact, fast-exact,
+fast-abi) were separate series; base and ipa-exact ran in both and agree on M1 (base 2.041 /
+2.027, ipa-exact 1.609 / 1.620). The horde base moved ~7% between series (22.9 / 24.5), so
+compare the horde within a series: rounds 4-6 give ipa-exact -12.9%, fast-exact -18.6%,
+fast-abi -20.0%. Raw logs: `out/codegen-fork/runs`; summaries
+`out/codegen-fork/timing-{step1,step23,all}.txt`. The timing runs doubled as smoke tests:
+every run of every variant finished its scenario (the horde ran to `quit`) with no errors,
+except vt-exact's guard-miss log lines (below). `--edf_deterministic_steps` was dropped
+for timing: with it, the benchmark's input script (which runs on the game clock) had not
+reached `MISSION.CAM` after 8 minutes.
+
+**Exact mode is faster, not slower**, despite +30% static instructions: most of the
+call-boundary syncs are dead and clang removes them, and the bodies lose most of their
+ctx traffic. The hot bodies that grew statically (821C58F8 +53%, 821AF7A0 +58%) call a
+poisoned subtree (16+ non-volatiles written back before each call) with 30+ live locals
+(host spills); the fast ABI and precise summaries target exactly that.
+
+## Step 2: vtable slot target sets (negative result)
+
+`edf_ipa_vtables` models `lwz vt,0(obj); lwz rY,N(vt); mtctr rY; bctrl` (one straight
+path, no label or call in between, registers unchanged) by the union of the summaries of
+slot N/4 of every RTTI vtable (the SDK's `VTableScanner`: 297 vtables, 1,798 slots in
+0x82000988-0x82020678). The guard `EDF_VT_OK(vt, slot)` (a byte table holding the slot
+count at each vtable start) is evaluated before the slot load. A miss calls
+`edf_vt_miss()` (logged, counted) and takes a write-back-everything/reload-everything
+path. `edf_vt_verify()` compares every vtable word in guest memory with the image (the
+audit log prints it).
+
+Results:
+- 2,362 of 5,202 indirect call sites match the pattern, but **no summary improves**: a
+  slot's target set is every class's slot N, and most targets themselves read everything
+  (slot 0, the destructors: 161 of 185 targets read >64 registers, because they call
+  operator delete, an import; slot 5, which 821CE3A0 uses: 27 of 30). The collision
+  cluster stays poisoned (821AEE50 READS 70). In ABI mode the unions do worse than
+  treating the call as an ABI-respecting opaque call (READS 56 -> 70), because a slot that
+  holds a hooked or unparsed function becomes "everything".
+- **The guard misses constantly**: up to 1.3e8 misses per run (sites 0x82240860,
+  0x82240D28, 0x8224171C, 0x824158EC, ...). Many objects' vtables are not RTTI vtables
+  (classes compiled without RTTI, COM-style interfaces), so "the vptr is a known vtable"
+  is not a usable assumption here, and a miss path cannot be exact (the unknown target may
+  read a register the caller's caller never wrote back). The audit (M1 2.8 M calls, horde
+  7.7 M) still found 0 mismatches and `vtable_words_changed` stayed 0, but it covers only
+  replayable functions, which contain no guarded site whose target misses.
+- vt-exact times slightly *slower* than ipa-exact (M1 1.690 vs 1.620): the guards and miss
+  logging cost something and buy no precision. Keep it off.
+
+What would un-poison the cluster: precise per-site types (not available statically), or
+making the opaque boundaries precise *and exact*. That means per-import summaries from the
+SDK export shims (every export reads its ArgTranslator arguments, r1 for stack arguments
+and r13; the exports that can run guest code on the calling thread, i.e. alertable waits
+delivering APCs via `FunctionDispatcher::ExecuteTrap` (`xboxkrnl_threading.cpp:380-942`),
+stay opaque), plus a verified "ABI class" for indirect targets: a generated per-function
+class byte and a guard at each indirect site checking `class(ctr)` respects the ABI, with
+misses logged. ABI mode's timing (-22.5% horde vs -14.9% exact) is the upper bound of
+that work.
+
+## Step 3: fast register-passing ABI
+
+`edf_ipa_fast_abi` builds on the locals pass. Every locals-form, non-hooked function whose
+READS contain at most 7 GPR and 8 FPR argument registers (r1, r3-r10, f1-f13) gets
+`extern "C" EDF_FAST_CC void __fast_sub_X(ctx, base, a_r1, a_r3, ..., a_f1, ...)` with
+`EDF_FAST_CC = __attribute__((regcall))`. Evidence for regcall: on x86_64-windows it
+passes up to ~11 integer and 16 vector arguments in registers; the MS default passes four.
+`sub_X` becomes the ctx wrapper (`__fast_sub_X(ctx, base, ctx.r3.u64, ...)`) for indirect
+calls, the runtime, native code and hooks.
+
+A direct call to a fast callee passes the callee's params from the caller's locals
+instead of writing them back. The callee treats them as dirty from entry, so at its exits
+it writes back exactly what its LIVEOUT needs. The caller keeps a passed register dirty
+unless the callee may write it. Functions that read every argument register (poisoned)
+stay ctx-only. 3,388 functions qualify in exact mode (3,495 in ABI mode). The
+declarations go into the per-shard headers, so the fingerprinted bodies' extraction
+boundaries are unchanged.
+
+Not done yet: returning r3 in rax / f1 in xmm0 (the callee still writes r3 back and the
+caller reloads it); tuning the argument limits by call-site count; r1 is still passed as
+an argument (nearly everything reads it).
+
+Audit: fast entries are audited too. In audit builds `__fast_sub_X` stores its arguments
+to ctx and calls the audited wrapper, and the candidate's own fast body is renamed.
+Result: M1 2.84 M calls in 1,536 functions, horde 7.71 M calls in 1,537 functions,
+**0 mismatches**.
+
+Timing: fast-exact is -24.6% on M1 and -17.5% on the horde vs base (ipa-exact: -20.6% /
+-14.9%).
+
 ## Problems found
 
 1. The may-write reload bug (fixed; found by the audit, see above).
 2. Opaque boundaries dominate precision: in exact mode LIVEOUT is "everything" for every
-   function, and 9.6 k functions read "everything". Without trusting something at imports
-   and indirect calls, interprocedural CR/XER liveness only helps inside bodies and at
-   calls into analyzable subtrees.
-3. The 138 fingerprinted bodies (e.g. 821B0258, 7.8% of M1) must stay byte-identical;
+   function, and 9.6 k functions read "everything". Imports (operator new/delete, critical
+   sections) and indirect calls are the poison; vtable slot sets do not fix it (step 2).
+3. The 138 fingerprinted bodies (e.g. 821B0258, 7.8% of M1) must stay byte-identical, so
    they keep the ctx form. Re-auditing their `extract-native-*` fingerprints would let them
    join.
 4. Host register pressure: a body with 30+ live guest registers spills to the host stack.
-   Spills are cheaper than ctx traffic only when they are fewer.
-5. MXCSR sticky flags differ between the two forms (clang drops dead FP operations); no
+5. MXCSR sticky flags differ between the two forms (clang drops dead FP operations). No
    guest reads them, and the audit compares only the guest-owned MXCSR bits.
-6. Timing was not measured in this phase (on request).
+6. The RTTI-vtable guard misses ~1e8 times per run: non-RTTI vtables are common.
 
 ## Next steps
 
-1. **Time it** (when timing is allowed again): `ipa-exact` and `ipa-abi` against the
-   nopgo base with `--edf_deterministic_steps --edf_step_timing`, M1 and horde, 3 runs
-   (phase-1 `run-timed.ps1`). Built binaries: `out/exp/{base,ipa-exact,ipa-abi}`.
-2. **Precision without giving up exactness**, most valuable first:
-   - vtable slot target sets for `lwz r11,0(r3); lwz r11,N(r11); mtctr; bctrl` call sites
-     (union of the summaries of every function in slot N of every vtable; falls back to
-     opaque when a slot holds a hook or an unknown); this is also backlog item 2;
-   - per-import summaries from the SDK's export shims (argument count from the
-     `ArgTranslator` signature; exports that can run guest code, like alertable waits
-     delivering APCs, stay opaque);
-   - must-write summaries (a callee that writes r3 on every path makes r3's old value dead
-     at the call).
-3. **Fast register-passing ABI** on top of the summaries: `sub_X_fast(ctx, base, <P>)`
-   with P = READS(X) & {r1, r3-r10, f1-f13}, the caller passing its locals instead of
-   writing them back, the callee treating P as dirty on entry, and returning r3 in rax or
-   f1 in xmm0; `sub_X` becomes a ctx wrapper (indirect calls, hooks, the runtime and
-   native code keep working). Evidence for the host convention (clang, x86_64-windows):
-   `__attribute__((regcall))` passes ctx/base/r1/r3-r7 in rcx, rdx, rsi, rdi, r8-r11 and
-   doubles in xmm0-xmm2 (the MS x64 default has only four argument registers); a
-   `{u64, double}` pair is returned through memory, so return only one register and write
-   the rare second one back. Keep `base` an argument (a global costs a load per function).
-   r13 is the KPCR address the runtime sets per thread (`thread_state.cpp:36`) and that
-   exports read back (`kernel_state.cpp:1250`). The only guest write is `ld r13,152(r7)`
-   in sub_82520FC0 (a context-restore routine, which writes everything), so r13 is a
-   read-only local loaded once elsewhere, never an argument.
+1. **Exact import summaries** from an audit of the SDK export shims (reads: ArgTranslator
+   arguments, r1, r13; writes: r3 / f1 only), with APC-delivering and guest-executing
+   exports kept opaque. Verify in audit builds by wrapping import calls and comparing ctx
+   before and after against the claimed WRITES. Upper bound: ABI mode's extra -5..-8%.
+2. **Verified ABI class for indirect targets** (per-function class byte + guard + logged
+   misses): the only realistic way to make virtual calls precise here.
+3. **Fast ABI returns** (r3 in rax / f1 in xmm0, no reload) and must-write summaries.
 4. **Stack accesses without volatile and without the phys-offset check** (r1-relative
    D-form loads/stores; phase 1's STACK_FAST, exact because stacks are thread-private and
    below 0xE0000000), then constant bases (`lis 0x82xx`) - backlog item 3.
 5. **Single-precision tracking** (keep lfs/fadds/fmuls/... results as float where double
    rounding is provably identical: + - * / sqrt, not fmadds), and **inlining** of small
-   non-hooked callees (drop weak/noinline on the `__imp__` bodies the analysis owns).
+   non-hooked callees.
+
+r13 is the KPCR address the runtime sets per thread (`thread_state.cpp:36`) and exports
+read it back (`kernel_state.cpp:1250`). The only guest write is `ld r13,152(r7)` in
+sub_82520FC0 (a context-restore routine, which writes everything), so r13 stays a
+read-only local, never an argument.
 
 ### Backlog (from the main session; each behind its own option, each audited)
 
@@ -323,6 +413,7 @@ Priority from the main session: 1, 3, 2, 4, then 5 and 6.
 - `tools/codegen-fork/smoke.ps1 -Exe out/exp/<dir> -Scenario benchmark-skipintro|horde-ants-1000 -Seconds N -Tag t`:
   waits for a free machine, runs muted and uncapped, reports markers and log faults.
 - `tools/codegen-fork/survey.py [report.jsonl]`: the survey above.
+- `tools/codegen-fork/time-series.ps1 -Variants a,b,c -Rounds 3 -Start N` (variants are `out/exp/<name>`), `run-timed.ps1`, `tim.py out/codegen-fork/runs`: the timing above.
 - The audit: `edf_ipa_audit = true` + `-DEDF_CODEGEN_FORK_AUDIT=ON`; the log gets
   `IPA audit: audited=... mismatches=...` every 10 s and `IPA audit MISMATCH sub_X ...`
   with the differing registers and bytes (first 3 per function).

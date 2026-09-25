@@ -16,6 +16,11 @@ edf_ipa_audit = false
 # (e.g. the volatile CR fields a callback's mfcr saves into a dead stack slot).
 edf_ipa_abi_boundary = false
 
+# Model RTTI virtual calls by vtable slot target sets behind a runtime guard (negative result,
+# docs/codegen-fork.md step 2), and __fast_sub_X register-passing variants (step 3).
+edf_ipa_vtables = false
+edf_ipa_fast_abi = false
+
 # Static survey of the pass (one JSON object per function).
 edf_ipa_report = "out/codegen-fork/ipa-report.jsonl"
 

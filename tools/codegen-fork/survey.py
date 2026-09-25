@@ -44,6 +44,14 @@ def pct(a, b):
 total = len(R)
 loc = [r for r in R if r['locals']]
 print(f'functions: {total}; locals form: {len(loc)} ({pct(len(loc), total)})')
+if any('vt_sites' in r for r in R):
+    vs = sum(r.get('vt_sites', 0) for r in R)
+    ind = sum(r.get('indirect', 0) for r in R)
+    left = sum(r.get('indirect_left', 0) for r in R)
+    print(f'indirect call sites: {ind}; modelled by vtable slot target sets: {vs}; still opaque: {left}')
+    fast = sum(1 for r in R if r.get('fast'))
+    if fast:
+        print(f'fast-ABI variants: {fast}')
 reasons = collections.Counter(r['reason'] or 'locals' for r in R)
 for k, v in reasons.most_common():
     print(f'  {k:28s} {v:6d}')
@@ -111,5 +119,5 @@ for name, hot in HOT.items():
         cov += share if r['locals'] else 0
         print(f"  sub_{a} {share:5.1f}%  locals={str(r['locals']):5s} {r['reason'] or '':10s} "
               f"|READS|={r['nreads']:2d} |LIVEOUT|={r.get('nliveout', 76):2d} ABI-in={'yes' if ok else 'no':3s} "
-              f"auditable={r['auditable']}")
+              f"auditable={r['auditable']} vt_sites={r.get('vt_sites', 0)} indirect_left={r.get('indirect_left', '?')}")
     print(f'  locals form covers {cov:.1f}% of {tot:.1f}% listed')
