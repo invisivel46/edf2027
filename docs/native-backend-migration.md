@@ -260,6 +260,17 @@ it is not an exact association with one rendered image. Long pauses clamped to
 one returned step contribute zero. The reporter summarizes totals, affected
 swap windows, and maximum extra steps, and accepts old traces without the column.
 Synthetic old/new-schema checks and all 32 native tests passed (35.08 s).
+
+Since 2026-09-24 the trace also has per-swap cost columns (appended, so older
+readers keep working): `steps` (simulation steps dispatched since the previous
+swap), `step_dispatch_ms` (wall time in the step dispatcher 821A4BA0, engine
+thread), `render_helper_ms` (the render helper 821A5080, render thread; it runs
+beside the steps), `frame_transition_ms` (821A4DE8, engine thread, serial after
+the helper join), `geometry_draws` (scene backend draws) and `game_tick` (the
+simulation tick count at the swap). Dividing `step_dispatch_ms` by `steps` gives
+the cost of one simulation step; a frame costs about
+max(`step_dispatch_ms`, `render_helper_ms`) + `frame_transition_ms` + the swap.
+The timers run only while the trace is on.
 Logs: `out/engine-step-trace-build.log`, `out/engine-step-trace-tests.log`.
 The shorter 1080p approach route is now tracing into `out/engine-step-1080.csv`,
 with a capture scheduled for 183 seconds at `out/engine-step-1080.bmp`.
