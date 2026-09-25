@@ -1,66 +1,73 @@
-{
-    "started":  "2026-09-23T23:27:48",
-    "commit":  "43f3292",
-    "dirty":  true,
+﻿{
+    "started":  "2026-09-25T09:50:34",
+    "commit":  "45b4f69",
+    "dirty":  false,
     "preset":  "win-amd64-pgo-train",
     "llvm_profdata":  "LLVM version 20.1.8",
-    "finished":  "2026-09-24T00:14:39",
+    "build":  {
+                  "jobs":  6,
+                  "seconds":  65,
+                  "exit":  0,
+                  "peak_compiler_working_set_mb":  4976,
+                  "peak_single_process_mb":  1117
+              },
+    "finished":  "2026-09-25T10:34:01",
     "runs":  [
                  {
                      "scenario":  "benchmark",
                      "seconds":  606,
                      "exited_early":  false,
-                     "run":  "binding-validation-20260923-233218-a9c5c885"
+                     "run":  "binding-validation-20260925-095139-07e6cff4"
                  },
                  {
                      "scenario":  "ufo-swarm",
                      "seconds":  605,
                      "exited_early":  false,
-                     "run":  "binding-validation-20260923-234224-16857948"
+                     "run":  "binding-validation-20260925-100145-b8d89a70"
                  },
                  {
                      "scenario":  "cave",
                      "seconds":  605,
                      "exited_early":  false,
-                     "run":  "binding-validation-20260923-235229-a1526b31"
+                     "run":  "binding-validation-20260925-101150-c2864f37"
                  },
                  {
                      "scenario":  "vehicle",
                      "seconds":  725,
                      "exited_early":  false,
-                     "run":  "binding-validation-20260924-000234-582484f0"
+                     "run":  "binding-validation-20260925-102155-28117948"
                  }
              ],
     "parts":  [
                   {
                       "scenario":  "benchmark",
                       "share":  2,
-                      "total_count":  275498914594,
-                      "weight":  26
+                      "total_count":  204495562480,
+                      "weight":  27
                   },
                   {
                       "scenario":  "ufo-swarm",
                       "share":  1,
-                      "total_count":  236215435962,
-                      "weight":  15
+                      "total_count":  212392197607,
+                      "weight":  13
                   },
                   {
                       "scenario":  "cave",
                       "share":  1,
-                      "total_count":  284150394217,
+                      "total_count":  209175254196,
                       "weight":  13
                   },
                   {
                       "scenario":  "vehicle",
                       "share":  1,
-                      "total_count":  356874922703,
+                      "total_count":  281162067420,
                       "weight":  10
                   }
               ],
     "output":  {
                    "path":  "pgo/edf2027.profdata",
-                   "bytes":  10207112,
-                   "functions":  27323
+                   "bytes":  10685448,
+                   "functions":  32070
                },
-    "total_seconds":  2811
+    "total_seconds":  2606
 }
