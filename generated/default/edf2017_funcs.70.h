@@ -5,32 +5,10 @@
 #ifndef EDF_FAST_CC
 #define EDF_FAST_CC __attribute__((regcall))
 #endif
-extern "C" EDF_FAST_CC void __fast___restgprlr_14([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
 extern "C" EDF_FAST_CC void __fast___restgprlr_15([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
 extern "C" EDF_FAST_CC void __fast___restgprlr_16([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_18([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_20([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_22([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_23([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_24([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_25([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_26([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_27([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_28([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___restgprlr_29([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_14([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
 extern "C" EDF_FAST_CC void __fast___savegprlr_15([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
 extern "C" EDF_FAST_CC void __fast___savegprlr_16([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_18([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_20([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_22([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_23([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_24([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_25([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_26([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_27([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_28([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
-extern "C" EDF_FAST_CC void __fast___savegprlr_29([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1);
 extern "C" EDF_FAST_CC void __fast_sub_820A2AF0([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r3, double a_f1);
 extern "C" EDF_FAST_CC void __fast_sub_820B7020([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1, double a_f1);
 extern "C" EDF_FAST_CC void __fast_sub_820B8460([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r3, uint64_t a_r4, uint64_t a_r9);
@@ -65,7 +43,6 @@ extern "C" EDF_FAST_CC void __fast_sub_821B0130([[maybe_unused]] PPCContext& __r
 extern "C" EDF_FAST_CC void __fast_sub_821B0320([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r3, double a_f1);
 extern "C" EDF_FAST_CC void __fast_sub_821B03C8([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r3);
 extern "C" EDF_FAST_CC void __fast_sub_821B0558([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r3, uint64_t a_r4);
-extern "C" EDF_FAST_CC void __fast_sub_821BC430([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1, uint64_t a_r4, uint64_t a_r5, uint64_t a_r6, uint64_t a_r7, uint64_t a_r8, uint64_t a_r9);
 extern "C" EDF_FAST_CC void __fast_sub_821C0B08([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r1, uint64_t a_r3, uint64_t a_r4, uint64_t a_r5, double a_f1);
 extern "C" EDF_FAST_CC void __fast_sub_821C1030([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r3, uint64_t a_r4, uint64_t a_r9);
 extern "C" EDF_FAST_CC void __fast_sub_821C24A8([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base, uint64_t a_r3, uint64_t a_r4, uint64_t a_r8);
