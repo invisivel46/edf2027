@@ -34,6 +34,7 @@
 #include "../../native_declarations.h"
 #include "../../native_load_trace.h"
 #include "../../native_pacing.h"
+#include "../../../guest_state_hash.h"
 #include "../../native_render_registry.h"
 #include "../../native_profile_result.h"
 #include "../../native_capture_policy.h"
@@ -249,8 +250,13 @@ REX_HOOK_RAW(sub_821A4BA0) {
     const edf::native::EngineRegionScope region(edf::native::EngineRegion::Dispatch,ctx.r4.u32,ctx.fpscr.csr);
     // In-game console (src/console/console.h): due commands run here, on the engine thread,
     // before this iteration's simulation steps; nothing when the console is idle.
+    const uint32_t dispatched_steps=ctx.r4.u32;
     edf::console::EngineStepBegin(ctx,base,ctx.r4.u32);
+    // Step timing and the exactness gate (src/guest_state_hash.h): off unless
+    // --edf_step_timing / --edf_guest_hash_trace are set.
+    const auto dispatch_started=edf::gate::BeforeStepDispatch();
     __imp__sub_821A4BA0(ctx,base);
+    edf::gate::AfterStepDispatch(base,dispatched_steps,dispatch_started);
     edf::console::EngineStepEnd();
   }
   edf::native::RunEngineCalibration(edf::native::EngineRegion::Dispatch);
@@ -1574,6 +1580,10 @@ void HoldEngineForMenu() {
     std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-began).count(),tick);
 }
 }
+namespace {
+// --edf_deterministic_steps: the virtual tick the heartbeat last granted (engine thread).
+uint64_t& DeterministicTick() { static uint64_t tick=0; return tick; }
+}
 REX_HOOK_RAW(sub_821BEAB0) {
   if(!EDF_NATIVE_FLAG(host)) { __imp__sub_821BEAB0(ctx,base); return; }
   // The main loop's heartbeat only (the call site the frame-rate unlock also keys on),
@@ -1585,7 +1595,7 @@ REX_HOOK_RAW(sub_821BEAB0) {
   edf::native::HookTiming engine_timing(edf::native::HookPhase::EngineWait);
   const edf::native::GuestReader reader(base);
   const auto object=ctx.r3.u32;
-  const bool unlocked=REXCVAR_GET(edf_native_unlock_framerate) && ctx.lr==0x821A6894 &&
+  const bool unlocked=!edf::gate::DeterministicSteps() && REXCVAR_GET(edf_native_unlock_framerate) && ctx.lr==0x821A6894 &&
     !edf::native::State().movie_pacing_active.load(std::memory_order_relaxed);
   native_loop_budget={};
   const auto divisor=reader.Word(reader.Add(object,4));
@@ -1597,11 +1607,14 @@ REX_HOOK_RAW(sub_821BEAB0) {
   const auto previous=reader.DoubleWord(0x8257C308);
   auto sampled_at=edf::native::NativePacingClock::Clock::now();
   auto current=state.clock.Sample(sampled_at);
+  // Exactness gate (src/guest_state_hash.h): one virtual tick per heartbeat, no wall clock.
+  const bool deterministic=edf::gate::DeterministicSteps();
+  if(deterministic) { current=previous+divisor; DeterministicTick()=current; }
   auto steps=edf::native::NativePacingSteps(current,previous,divisor);
   edf::native::NativeFrameWaitTrace waiting(edf::native::FrameWaitKind::Engine,
     !unlocked && edf::native::NativePacingPending(steps));
   const auto wait_began=sampled_at;
-  while(!unlocked && edf::native::NativePacingPending(steps)) {
+  while(!deterministic && !unlocked && edf::native::NativePacingPending(steps)) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     sampled_at=edf::native::NativePacingClock::Clock::now();
     current=state.clock.Sample(sampled_at);
@@ -1636,7 +1649,8 @@ REX_HOOK_RAW(sub_821BEB38) {
   auto& state=edf::native::PacingState();
   std::lock_guard lock(state.mutex);
   const edf::native::GuestReader reader(base);
-  reader.StoreDoubleWord(0x8257C300,state.clock.Sample(edf::native::NativePacingClock::Clock::now()));
+  reader.StoreDoubleWord(0x8257C300,edf::gate::DeterministicSteps() ? DeterministicTick()
+    : state.clock.Sample(edf::native::NativePacingClock::Clock::now()));
   __imp__sub_821BEB38(ctx,base);
 }
 REX_EXTERN(sub_8213C788);

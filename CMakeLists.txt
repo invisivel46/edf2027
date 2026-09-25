@@ -56,6 +56,8 @@ set(EDF2027_SOURCES
     # In-game console (docs/console.md).
     src/console/console.cpp
     src/console/console_game.cpp
+    # Exactness gate for guest codegen changes (docs/codegen-overhead.md).
+    src/guest_state_hash.cpp
 )
 
 if(WIN32)
@@ -189,6 +191,19 @@ option(EDF2027_OBSERVE_SCALAR_STORES "Diagnostic generated-store notifications (
 if(EDF2027_OBSERVE_SCALAR_STORES)
     target_precompile_headers(edf2027_recomp PRIVATE
         "${CMAKE_SOURCE_DIR}/src/native_graphics/guest_raw_store_observer.h")
+endif()
+# Timing-only codegen overhead experiments (docs/codegen-overhead.md): a
+# comma list of NO_VOLATILE, NO_PHYS, NO_FLUSH. Empty (the default) leaves
+# the generated code untouched. Not exact; never for a shipped build.
+set(EDF_CODEGEN_EXPERIMENT "" CACHE STRING "Timing-only guest codegen experiments, comma list: NO_VOLATILE,NO_PHYS,NO_FLUSH")
+if(EDF_CODEGEN_EXPERIMENT)
+    string(REPLACE "," ";" _edf_exps "${EDF_CODEGEN_EXPERIMENT}")
+    foreach(_edf_exp ${_edf_exps})
+        target_compile_definitions(edf2027_recomp PRIVATE EDF_EXP_${_edf_exp}=1)
+    endforeach()
+    target_precompile_headers(edf2027_recomp PRIVATE
+        "${CMAKE_SOURCE_DIR}/src/codegen_experiments/guest_codegen_experiments.h")
+    message(WARNING "EDF_CODEGEN_EXPERIMENT=${EDF_CODEGEN_EXPERIMENT}: timing-only, inexact guest code")
 endif()
 
 set(_native_indexed_tail ${CMAKE_CURRENT_SOURCE_DIR}/src/native_graphics/native_indexed_completion.cpp)
