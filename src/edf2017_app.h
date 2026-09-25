@@ -17,6 +17,7 @@
 #include <thread>
 #include "console/console_dialog.h"
 #include "diagnostics.h"
+#include "kernel_tick_timer.h"
 #include "launcher.h"
 #include "pause_menu.h"
 #include "perf_overlay.h"
@@ -265,6 +266,7 @@ class Edf2017App : public rex::ReXApp {
   }
 
   void OnPostSetup() override {
+    edf::StartKernelTickTimer(runtime());  // before the guest runs (kernel_tick_timer.cpp)
 #if defined(_WIN32)
     edf::native::InitializeGuestShaderBridge(runtime()->game_data_root());
     if(REXCVAR_GET(edf_native_mesh_watch_audit)) {
@@ -397,6 +399,7 @@ class Edf2017App : public rex::ReXApp {
 
   void OnShutdown() override {
     ReleasePause();
+    edf::StopKernelTickTimer();  // while the runtime and guest memory are still up
 #if defined(_WIN32)
     edf::native::LogNativeCoverageCensusFinal();
     edf::native::SetNativeMeshWatchAudit({});

@@ -51,6 +51,7 @@ set(EDF2027_SOURCES
     src/manual_reload.cpp
     src/input_latency.cpp
     src/diagnostics.cpp
+    src/kernel_tick_timer.cpp
     src/version.cpp
     # In-game console (docs/console.md).
     src/console/console.cpp

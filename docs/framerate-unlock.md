@@ -743,3 +743,21 @@ also writes every event. `--edf_kbm_test_sweep=N` stands in for a mouse: N count
 right 500 ms, still, left, still, from a 1 kHz thread, only while the soldier's aim update
 runs. `python tools/latency-report.py game.log [after.log --compare]` summarises (exact
 percentiles from the CSV, count-weighted window percentiles from the log).
+
+## Locked 60 Hz presenter grid and the kernel tick timer (2026-09-24)
+
+- In locked mode the presenter's ticker paces presentation. It used to re-arm at
+  `now + 16.67 ms` after each paint, so every wake's latency lengthened the period: 57.2 FPS,
+  and one frame in twenty ran two simulation steps. `NextUiTickerDeadline` (`ui_ticker.h`)
+  keeps an absolute grid and restarts it, with no catch-up burst, when a slot has already
+  passed or lies more than a period ahead. Locked, VSync off, benchmark route: 60.0 FPS,
+  16.668 ms host interval, 0.03% two-step frames. Unlocked mode is unchanged: request wakes
+  still re-arm at `now + period`.
+- The SDK updates the guest's `KeTimeStampBundle.TickCount` (the title imports it) from a
+  1 ms `HighResolutionTimer`. Its TimerQueue dispatch thread waits in a disruptorplus spin
+  and holds ~13.5% of a core in every phase. `src/kernel_tick_timer.cpp` disarms that timer
+  and stores the same `Clock::QueryGuestUptimeMillis()` value from a thread that sleeps on a
+  1 ms high-resolution waitable timer: ~1000 updates a second, largest gap 2.6-2.8 ms. The two
+  threads now use about 1.2% of a core together (TimerQueue 0.4%, the new thread 0.8%).
+  `--edf_kernel_tick_timer=false` restores the SDK's timer. With `edf_frametime_log`, the thread
+  logs its update count and largest gap every 10 s.

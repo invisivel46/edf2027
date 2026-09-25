@@ -97,6 +97,37 @@ std::atomic<uint64_t>& FrameExtraSimulationSteps() {
   static std::atomic<uint64_t> total{0};
   return total;
 }
+// edf_native_frame_trace's per-frame cost columns: wall time inside the step
+// dispatch (821A4BA0, engine thread), the render helper (821A5080, render
+// thread) and the frame transition (821A4DE8, engine thread), and the steps
+// dispatched. Cumulative; the trace writes the delta per swap. Only counted
+// with the trace on (the path is read once: it needs a restart anyway).
+struct FrameTraceCostTotals {
+  std::atomic<uint64_t> steps{0},dispatch_ns{0},helper_ns{0},transition_ns{0};
+};
+FrameTraceCostTotals& FrameTraceCosts() {
+  static FrameTraceCostTotals totals;
+  return totals;
+}
+bool FrameTraceCostsOn() {
+  static const bool on=!REXCVAR_GET(edf_native_frame_trace).empty();
+  return on;
+}
+class FrameTraceCostScope {
+ public:
+  explicit FrameTraceCostScope(std::atomic<uint64_t>& total):total_(FrameTraceCostsOn()?&total:nullptr) {
+    if(total_) start_=std::chrono::steady_clock::now();
+  }
+  ~FrameTraceCostScope() {
+    if(total_) total_->fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now()-start_).count()),std::memory_order_relaxed);
+  }
+  FrameTraceCostScope(const FrameTraceCostScope&)=delete;
+  FrameTraceCostScope& operator=(const FrameTraceCostScope&)=delete;
+ private:
+  std::atomic<uint64_t>* total_;
+  std::chrono::steady_clock::time_point start_{};
+};
 void CaptureScene(Bridge& state,uint32_t owner) {
   const auto prefix=REXCVAR_GET(edf_native_scene_capture);
   if (prefix.empty() || state.scene_captures>=3 ||
@@ -209,6 +240,9 @@ REX_HOOK_RAW(sub_821A4BA0) {
     ctx.r4.u64=native_loop_budget.steps;
   edf::native::ApplyNativeThreadQos(edf::native::NativeThreadRole::Engine);
   NativeLoopTrace trace("step_dispatch",ctx.r3.u32,ctx.lr,ctx.r4.u32);
+  if(edf::native::FrameTraceCostsOn())
+    edf::native::FrameTraceCosts().steps.fetch_add(ctx.r4.u32,std::memory_order_relaxed);
+  edf::native::FrameTraceCostScope trace_cost(edf::native::FrameTraceCosts().dispatch_ns);
   {
     edf::native::HookTiming timing(edf::native::HookPhase::ResourceCoordinator);
     edf::native::HookTiming engine_timing(edf::native::HookPhase::SimulationDispatch);
@@ -663,6 +697,7 @@ REX_HOOK_RAW(sub_821A5080) {
   NativeLoopTrace trace("helper_dispatch",ctx.r3.u32,ctx.lr);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceHelper);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::RenderHelper);
+  edf::native::FrameTraceCostScope trace_cost(edf::native::FrameTraceCosts().helper_ns);
   // A/B guest-side frames take today's path (frame dispatch or the guest helper).
   const auto route=edf::native::SelectNativeFrameRoute(EDF_NATIVE_FLAG(full_frame),EDF_NATIVE_FLAG(frame_dispatch),
     EDF_NATIVE_FLAG(shader_bridge),EDF_NATIVE_FLAG(host),ab_native);
@@ -887,6 +922,7 @@ REX_HOOK_RAW(sub_821A4DE8) {
   edf::native::RunEngineCalibration(edf::native::EngineRegion::Transition);
   edf::native::HookTiming timing(edf::native::HookPhase::ResourceTransition,edge);
   edf::native::HookTiming engine_timing(edf::native::HookPhase::FrameTransition);
+  edf::native::FrameTraceCostScope trace_cost(edf::native::FrameTraceCosts().transition_ns);
   edf::native::EngineRegionScope region(edf::native::EngineRegion::Transition,native_loop_budget.steps,ctx.fpscr.csr);
   // Model poses (ModelPublications) feed only the hybrid model pass and its
   // audit: layouts are registered by 821C9C20 draws, which a full frame
@@ -1152,10 +1188,15 @@ class NativeSwapFrameTrace {
       return ticks(kernel)+ticks(user); // 100 ns accounting units, not wall time.
     };
     const auto process_cpu=cpu_time(true),thread_cpu=cpu_time(false);
+    auto& costs=edf::native::FrameTraceCosts();
+    const std::array<uint64_t,6> totals{costs.steps.load(std::memory_order_relaxed),
+      costs.dispatch_ns.load(std::memory_order_relaxed),costs.helper_ns.load(std::memory_order_relaxed),
+      costs.transition_ns.load(std::memory_order_relaxed),backend.Statistics().geometry_draws,
+      edf::SimulationTicks().load(std::memory_order_relaxed)};
     struct Writer {
       std::mutex mutex;
       std::ofstream file;
-      struct Previous { Clock::time_point entry{},exit{}; std::array<uint64_t,4> waits{}; uint64_t extra_steps=0,process_cpu=0,thread_cpu=0; DWORD thread_id=0; };
+      struct Previous { Clock::time_point entry{},exit{}; std::array<uint64_t,4> waits{}; uint64_t extra_steps=0,process_cpu=0,thread_cpu=0; DWORD thread_id=0; std::array<uint64_t,6> totals{}; };
       std::map<uint32_t,Previous> previous;
       uint64_t samples=0;
     };
@@ -1166,7 +1207,8 @@ class NativeSwapFrameTrace {
       if(std::filesystem::exists(path)) throw std::runtime_error("frame trace output already exists");
       writer.file.open(path);
       if(!writer.file) throw std::runtime_error("cannot create frame trace output");
-      writer.file << "epoch_ms,device,interval_ms,between_swaps_ms,submit_ms,gpu_wait_ms,pacing_ms,engine_wait_ms,guest_fence_sleep_ms,shared_slot_wait_ms,backend_frame_wait_ms,engine_extra_steps,process_cpu_ms,swap_thread_cpu_ms,swap_thread_id\n";
+      writer.file << "epoch_ms,device,interval_ms,between_swaps_ms,submit_ms,gpu_wait_ms,pacing_ms,engine_wait_ms,guest_fence_sleep_ms,shared_slot_wait_ms,backend_frame_wait_ms,engine_extra_steps,process_cpu_ms,swap_thread_cpu_ms,swap_thread_id,"
+        "steps,step_dispatch_ms,render_helper_ms,frame_transition_ms,geometry_draws,game_tick\n";
     }
     auto& previous=writer.previous[device_];
     const auto ms=[](auto duration){return std::chrono::duration<double,std::milli>(duration).count();};
@@ -1183,8 +1225,15 @@ class NativeSwapFrameTrace {
     writer.file << ',' << (previous.entry==Clock::time_point{} ? 0 : extra_steps-previous.extra_steps)
       << ',' << (previous.entry==Clock::time_point{} ? 0 : double(process_cpu-previous.process_cpu)/10000.0)
       << ',' << (previous.thread_id!=thread_id ? 0 : double(thread_cpu-previous.thread_cpu)/10000.0)
-      << ',' << thread_id << '\n';
-    previous={marks_[0],marks_[4],waits,extra_steps,process_cpu,thread_cpu,thread_id};
+      << ',' << thread_id;
+    // Steps, the three phases' wall ms and the draws since the previous swap; the game clock now.
+    const bool first=previous.entry==Clock::time_point{};
+    writer.file << ',' << (first?0:totals[0]-previous.totals[0]);
+    for(size_t index=1;index<4;++index)
+      writer.file << ',' << (first?0:double(totals[index]-previous.totals[index])/1000000.0);
+    writer.file << ',' << (first || totals[4]<previous.totals[4]?0:totals[4]-previous.totals[4])
+      << ',' << totals[5] << '\n';
+    previous={marks_[0],marks_[4],waits,extra_steps,process_cpu,thread_cpu,thread_id,totals};
     if(++writer.samples%60==0) writer.file.flush();
   }
  private:
