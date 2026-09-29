@@ -1,4 +1,4 @@
-# EDF2027: Earth Defense Force 2017 for PC (v0.3.0-beta)
+# EDF2027: EDF 3 recompilation from the 360 version (v0.3.0-beta)
 
 ![The in-game console types "spawn ant 1000 80" and a thousand giant ants pour down the Mission 1 street](docs/media/horde-1000-ants.gif)
 
