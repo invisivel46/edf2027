@@ -161,7 +161,7 @@ Other findings:
   To make a dump: `xperf -i w0.etl -symbols -o w0-dump.txt -a dumper`, with `_NT_SYMBOL_PATH` set
   to the build dir.
 - Run data (trace.csv, game.log, ETL dumps) is in the session scratchpad
-  `%USERPROFILE%\AppData\Local\Temp\claude\D--roms2-edf2027\c0bb9598-13c3-4be9-9d79-1b99d8f65ac7\scratchpad\runs\`
+  `%TEMP%\edf2027-scratch\runs\`
   (u0-unmuted, u0-muted, prof-partial, prof-unmuted, ecore8, ecore8-cap60). It may be cleared.
   Epistemic evidence: ev-20260924234933-4445988e and ev-20260925011242-3dcd077d.
 - `generated/default/codegen.*` are modified by every build. Do not commit them.

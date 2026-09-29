@@ -3,7 +3,7 @@ param([string]$Name, [string[]]$Extra = @(), [int]$Seconds = 300, [long]$Affinit
 # Like run.ps1, plus xperf CPU sampling windows at the given seconds after the mission-load marker (MISSION.CAM).
 $ErrorActionPreference = 'Continue'
 $ws = 'D:\roms2\edf2027\.claude\worktrees\m1-intro-perf'
-$s = '%USERPROFILE%\AppData\Local\Temp\claude\D--roms2-edf2027\c0bb9598-13c3-4be9-9d79-1b99d8f65ac7\scratchpad'
+$s = Join-Path $env:TEMP 'edf2027-scratch'
 $xperf = 'C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe'
 $Exe = "$ws\out\build\win-amd64-release\edf2027.exe"
 while (Get-Process edf2027* -ErrorAction SilentlyContinue) { Start-Sleep -Milliseconds 500 }
