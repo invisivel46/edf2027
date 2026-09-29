@@ -1,9 +1,0 @@
-Caller,CallPC,VectorOrigin,ValueSource,Status
-821D79D8,821D7B74,entry r4 from empty loader-local vector at 821D88C0 SP+50,node pointer entry r5 via SP+e4,direct loader chain classified; downstream list use separate
-820E0B00,820E1030,empty local vector SP+a8,owner+570 pointer via SP+70,local vector initialization classified; downstream use separate
-8210C3B8,8210C43C,empty local vector SP+68,indexed owner node pointer plus f0 via SP+50,local vector initialization classified; downstream use separate
-821C8AD0,821C8B78,vector pointer loaded from entry owner+4,entry r4 address saved to stack,normal conversion tracker starts with fresh CPU-heap vector; reentrancy and input aliases remain open
-8212E520,8212E5BC,empty local vector SP+60,8212DD40 result via SP+50,local vector initialization classified; output copy separate
-820BC3D0,820BC6CC,empty local vector SP+80,selected owner+1bc array entry via SP+60,local vector initialization classified; downstream use separate
-820E7130,820E7AB8,empty local vector SP+68,indexed owner node pointer plus f0 via SP+50,local vector initialization classified; downstream use separate
-820F82D8,820F8954,empty local vector SP+b8,indexed owner node pointer plus f0 via SP+50,local vector initialization classified; downstream use separate

@@ -49,3 +49,6 @@ Desktop.ini
 
 # Python bytecode caches from the tools/ report scripts
 __pycache__/
+
+# Internal notes, audits and one-off RE scripts (local only)
+/internal/

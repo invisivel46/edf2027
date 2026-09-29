@@ -1,9 +1,0 @@
-Function,ActualBase,RoleAtOffset1B4,ReviewLimit
-8245C420,codec,Initialize shared-output pointer to zero,Constructor path
-8245A948,codec,Publish fresh shared-output allocation if null,Non-null reuse remains
-8245A320,codec,Clear shared-output pointer after release,Cleanup path and external aliases
-82462C38,processing object,Reset parser state value to zero,Not a codec-pointer assignment
-8246BBA0,processing object,Update state-machine value in range 0 through 4,Fragmented body and separate matrix writes
-82463258,channel record,Initialize channel scalar value,Not a codec-pointer assignment
-8245AE18,channel record,Initialize channel scalar value to one,Not a codec-pointer assignment
-8246BE40,channel record,Store decoded scalar plus one,Not a codec-pointer assignment

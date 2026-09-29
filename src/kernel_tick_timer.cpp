@@ -7,7 +7,7 @@
 // time in a disruptorplus spin_wait: ~4000 pause instructions after every fire,
 // then SwitchToThread in a loop with a 1 ms Sleep every twentieth pass. With a
 // 1 ms period it never gets further than that, so it holds ~14% of a core in every
-// phase of the game (measured, docs/handoff/m1-intro-perf.md) - wasted power on
+// phase of the game (measured on the Mission 1 intro) - wasted power on
 // a handheld whose CPU and GPU share one budget.
 //
 // This disarms that timer (TimerQueueWaitItem::Disarm: no callback runs after it

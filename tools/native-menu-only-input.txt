@@ -1,5 +1,0 @@
-# Enter the title menu and decline storage setup; do not start a mission.
-20000 1000 0010
-25000 1000 0010
-30000 1000 1000
-35000 1000 1000
