@@ -1,5 +1,9 @@
 # EDF2027: Earth Defense Force 2017 for PC (v0.3.0-beta)
 
+![The in-game console types "spawn ant 1000 80" and a thousand giant ants pour down the Mission 1 street](docs/media/horde-1000-ants.gif)
+
+*The in-game console (`` ` ``) spawning 1,000 ants in Mission 1.*
+
 A native Windows port of the Xbox 360 game *Earth Defense Force 2017*
 (USA/Europe), made by static recompilation with the
 [ReXGlue](https://github.com/rexglue/rexglue-sdk) SDK. The game's PowerPC code
@@ -40,6 +44,15 @@ on Windows or `sha1sum <file>.iso` elsewhere.
   runs at about 200 to 300 FPS on the development machine (Intel Core
   i7-14700, GeForce RTX 4070 Ti SUPER), depending on the scene and the
   settings.
+- **Faster recompiled game code.** The port's own build of the ReXGlue code
+  generator keeps the PowerPC registers in C++ locals instead of a shared
+  context structure. One 60 Hz simulation step takes about 25% less time in
+  Mission 1 and about 18% less with 1,000 ants on the map, with the same
+  results as the stock translation. The locked 60 FPS mode now holds a true
+  60 (it used to settle at about 57).
+- **In-game console.** Spawn enemies (hundreds at a time), bring buildings
+  down, set off effects, toggle cheats and run scripts
+  ([docs/console.md](docs/console.md)).
 - **Low input latency.** Low-latency presentation is on by default. With VSync
   on and the frame rate uncapped, the median input-to-photon time went from
   42 ms to 18 ms.
@@ -474,6 +487,16 @@ The generated C++ under `generated/default/` is tracked in git, so a normal
 build does not need the game files. The `edf2017_codegen` target runs
 `rexglue codegen edf2017_manifest.toml`. It is part of every build, and it
 re-runs only when one of its inputs changes.
+
+The tracked code is emitted by a modified build of the ReXGlue code generator
+(options in `edf2017_codegen_fork.toml`; design and measurements in
+[docs/codegen-fork.md](docs/codegen-fork.md)). Configure checks that
+`EDF_REXGLUE_CODEGEN_EXE` points to a `rexglue.exe` that reports the pinned
+version (`EDF_CODEGEN_FORK_VERSION` in `CMakeLists.txt`) and stops otherwise,
+so the stock generator can never silently replace the code. That generator
+build is not public yet. Until it is, setting the options in
+`edf2017_codegen_fork.toml` to `false` builds with the stock SDK tool, which
+regenerates the stock (slower) code from your own disc (steps below).
 
 To regenerate the code, for example after changing `edf2017_overrides.toml`:
 
